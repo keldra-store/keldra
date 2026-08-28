@@ -73,6 +73,11 @@ pub(super) fn validate_operation(
             "content_type exceeds {MAX_CONTENT_TYPE_BYTES} UTF-8 bytes"
         )));
     }
+    if content_type_value.is_some_and(|value| value == keldra_store::OBJECT_LINK_CONTENT_TYPE) {
+        return Err(Status::invalid_argument(
+            "the object-link descriptor content type is reserved for Keldra",
+        ));
+    }
     if payload_bytes > max_blob_bytes {
         return Err(Status::resource_exhausted(
             "bulk put item exceeds the object-size limit",

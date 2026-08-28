@@ -14,7 +14,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-keldra-api = { version = "=0.14.0", path = "../../crates/keldra-api" }
+jiff = "0.2.28"
+keldra-api = { version = "=0.15.0", path = "../../crates/keldra-api" }
 serde_json = "1.0"
 tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-native-roots"] }

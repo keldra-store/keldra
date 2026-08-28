@@ -70,7 +70,8 @@ image_gates() (
   cleanup_image_gate() {
     docker rm --force "${container}" >/dev/null 2>&1 || true
     docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
-      rm -rf /smoke/data /smoke/signing-key /smoke/payload >/dev/null 2>&1 || true
+      rm -rf /smoke/data /smoke/signing-key /smoke/payload /smoke/replacement \
+      >/dev/null 2>&1 || true
     rm -rf "${scratch}"
   }
   trap cleanup_image_gate EXIT INT TERM
@@ -82,7 +83,9 @@ image_gates() (
   docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
     chown 10001:10001 /smoke/signing-key
   printf 'keldra-0.1-smoke\n' >"${scratch}/payload"
+  printf 'keldra-0.15-linked-update\n' >"${scratch}/replacement"
   chmod 0444 "${scratch}/payload"
+  chmod 0444 "${scratch}/replacement"
   docker run --detach --name "${container}" \
     --env KELDRA_LISTEN=0.0.0.0:50051 \
     --env KELDRA_DATA_DIR=/var/lib/keldra \
@@ -120,6 +123,44 @@ image_gates() (
     return 1
   fi
 
+  local capabilities=""
+  for attempt in $(seq 1 30); do
+    capabilities="$(
+      docker run --rm --network "container:${container}" \
+        --volume "${scratch}/data:/var/lib/keldra:ro" \
+        "${image}" \
+        keldra --endpoint http://127.0.0.1:50051 \
+        --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
+        get-cluster-capabilities 2>/dev/null || true
+    )"
+    if grep -Eq 'active_protocol=1 active_storage=1 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
+      break
+    fi
+    sleep 1
+  done
+  if ! grep -Eq 'active_protocol=1 active_storage=1 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
+    echo "Keldra did not become ready for capability 2/2 activation: ${capabilities}" >&2
+    return 1
+  fi
+  local placement_term placement_index
+  placement_term="$(sed -n 's/.*placement_term=\([0-9][0-9]*\).*/\1/p' <<<"${capabilities}")"
+  placement_index="$(sed -n 's/.*placement_index=\([0-9][0-9]*\).*/\1/p' <<<"${capabilities}")"
+  if [[ ! "${placement_term}" =~ ^[1-9][0-9]*$ || ! "${placement_index}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Keldra returned an invalid capability placement fence: ${capabilities}" >&2
+    return 1
+  fi
+  run_step "image capability 2/2 activation" docker run --rm \
+    --network "container:${container}" \
+    --volume "${scratch}/data:/var/lib/keldra:ro" \
+    "${image}" \
+    keldra --endpoint http://127.0.0.1:50051 \
+    --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
+    activate-cluster-capabilities \
+      --protocol-version 2 \
+      --storage-format 2 \
+      --expected-placement-term "${placement_term}" \
+      --expected-placement-index "${placement_index}"
+
   run_step "image authenticated bucket provisioning" docker run --rm \
     --network "container:${container}" \
     --env KELDRA_CLIENT_ID="${owner_client_id}" \
@@ -155,6 +196,136 @@ image_gates() (
   )"
   if [[ "${value}" != 'keldra-0.1-smoke' ]]; then
     echo "image smoke read returned unexpected bytes" >&2
+    return 1
+  fi
+
+  local source_head source_version
+  source_head="$(
+    docker run --rm --network "container:${container}" \
+      --env KELDRA_CLIENT_ID="${owner_client_id}" \
+      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      "${image}" \
+      keldra --endpoint http://127.0.0.1:50051 \
+      head smoke objects hello
+  )"
+  source_version="$(sed -n 's/^present version=\([0-9][0-9]*\) .*/\1/p' <<<"${source_head}")"
+  if [[ ! "${source_version}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "image smoke could not resolve the source version: ${source_head}" >&2
+    return 1
+  fi
+
+  run_step "image zero-copy clone" docker run --rm \
+    --network "container:${container}" \
+    --env KELDRA_CLIENT_ID="${owner_client_id}" \
+    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    "${image}" \
+    keldra --endpoint http://127.0.0.1:50051 \
+    clone-object smoke objects hello "${source_version}" cloned \
+      --command-id image-smoke-clone --durability local --if-absent
+
+  run_step "image protected link" docker run --rm \
+    --network "container:${container}" \
+    --env KELDRA_CLIENT_ID="${owner_client_id}" \
+    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    "${image}" \
+    keldra --endpoint http://127.0.0.1:50051 \
+    link-object smoke objects linked hello \
+      --command-id image-smoke-link --durability local
+
+  local delete_output delete_status
+  set +e
+  delete_output="$(
+    docker run --rm --network "container:${container}" \
+      --env KELDRA_CLIENT_ID="${owner_client_id}" \
+      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      "${image}" \
+      keldra --endpoint http://127.0.0.1:50051 \
+      delete smoke objects hello --command-id image-smoke-blocked-delete 2>&1
+  )"
+  delete_status=$?
+  set -e
+  if [[ "${delete_status}" == "0" ]] || ! grep -Fq 'FailedPrecondition' <<<"${delete_output}"; then
+    echo "target delete was not fenced by its inbound link: ${delete_output}" >&2
+    return 1
+  fi
+
+  run_step "image link write-through" docker run --rm \
+    --network "container:${container}" \
+    --volume "${scratch}:/smoke:ro" \
+    --env KELDRA_CLIENT_ID="${owner_client_id}" \
+    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    "${image}" \
+    keldra --endpoint http://127.0.0.1:50051 \
+    put smoke objects linked /smoke/replacement \
+      --command-id image-smoke-linked-put --durability local
+
+  local canonical_value clone_value linked_value
+  canonical_value="$(
+    docker run --rm --network "container:${container}" \
+      --env KELDRA_CLIENT_ID="${owner_client_id}" \
+      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects hello
+  )"
+  linked_value="$(
+    docker run --rm --network "container:${container}" \
+      --env KELDRA_CLIENT_ID="${owner_client_id}" \
+      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects linked
+  )"
+  clone_value="$(
+    docker run --rm --network "container:${container}" \
+      --env KELDRA_CLIENT_ID="${owner_client_id}" \
+      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects cloned
+  )"
+  if [[ "${canonical_value}" != 'keldra-0.15-linked-update' \
+    || "${linked_value}" != "${canonical_value}" \
+    || "${clone_value}" != 'keldra-0.1-smoke' ]]; then
+    echo "clone independence or link write-through changed" >&2
+    return 1
+  fi
+
+  run_step "image protected unlink" docker run --rm \
+    --network "container:${container}" \
+    --env KELDRA_CLIENT_ID="${owner_client_id}" \
+    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    "${image}" \
+    keldra --endpoint http://127.0.0.1:50051 \
+    unlink-object smoke objects linked \
+      --command-id image-smoke-unlink --durability local
+
+  local unlinked_output unlinked_status
+  set +e
+  unlinked_output="$(
+    docker run --rm --network "container:${container}" \
+      --env KELDRA_CLIENT_ID="${owner_client_id}" \
+      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      "${image}" \
+      keldra --endpoint http://127.0.0.1:50051 get smoke objects linked 2>&1
+  )"
+  unlinked_status=$?
+  set -e
+  if [[ "${unlinked_status}" == "0" ]]; then
+    echo "unlinked path remained readable: ${unlinked_output}" >&2
+    return 1
+  fi
+
+  run_step "image target delete after unlink" docker run --rm \
+    --network "container:${container}" \
+    --env KELDRA_CLIENT_ID="${owner_client_id}" \
+    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    "${image}" \
+    keldra --endpoint http://127.0.0.1:50051 \
+    delete smoke objects hello --command-id image-smoke-delete-after-unlink
+
+  clone_value="$(
+    docker run --rm --network "container:${container}" \
+      --env KELDRA_CLIENT_ID="${owner_client_id}" \
+      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects cloned
+  )"
+  if [[ "${clone_value}" != 'keldra-0.1-smoke' ]]; then
+    echo "clone did not survive canonical target deletion" >&2
     return 1
   fi
 )

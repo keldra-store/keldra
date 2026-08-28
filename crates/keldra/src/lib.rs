@@ -9,6 +9,7 @@ mod authz_service;
 mod blob_maintenance;
 mod bootstrap;
 mod bucket_governance;
+mod cluster_capabilities;
 mod cluster_list_watch;
 mod cluster_object_read;
 mod cluster_peer;
@@ -260,6 +261,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .wait_for_leader(DECISION_LEADER_TIMEOUT)
         .await
         .context("elect decision leader")?;
+    let _capability_advertisement = cluster_capabilities::CapabilityAdvertisementTask::start(
+        decisions.clone(),
+        cluster_transport.clone(),
+        local_node,
+    );
     let cluster_id = cluster_startup::ensure_genesis_identity(&decisions).await?;
     tracing::info!(cluster.id = %hex::encode(cluster_id.0), "cluster identity is ready");
     cluster_startup::ensure_jwt_signing_key_fingerprint(
@@ -465,16 +471,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     .context("initialize distributed index runtime")?;
     let index_authorization: Arc<dyn index_service::IndexAuthorization> =
         Arc::new(authoritative_system.clone());
-    routed_index_query_handlers
-        .install(Arc::new(cluster_peer::AuthorizedIndexQueryHandler::new(
-            local_node,
-            config.token_manager.clone(),
-            name_resolver.clone(),
-            index_authorization.clone(),
-            Arc::new(object_reader.clone()),
-            index_runtime.local_queries.clone(),
-        )))
-        .map_err(|_| anyhow::anyhow!("routed index query handler was installed more than once"))?;
     let mut accounting_runtime = accounting::runtime::start(
         local_node,
         decisions.clone(),
@@ -536,6 +532,16 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         config.max_blob_bytes,
         config.atomic_program_timeout,
     );
+    routed_index_query_handlers
+        .install(Arc::new(cluster_peer::AuthorizedIndexQueryHandler::new(
+            local_node,
+            config.token_manager.clone(),
+            name_resolver.clone(),
+            index_authorization.clone(),
+            Arc::new(object_service.clone()),
+            index_runtime.local_queries.clone(),
+        )))
+        .map_err(|_| anyhow::anyhow!("routed index query handler was installed more than once"))?;
     let index_service = index_service::IndexServiceImpl::new(
         object_service.clone(),
         name_resolver.clone(),
@@ -545,7 +551,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             authorization: index_authorization,
             page_tokens: Arc::new(config.token_manager.clone()),
             definition_reader: Arc::new(object_reader.clone()),
-            live_versions: Arc::new(object_reader.clone()),
+            live_versions: Arc::new(object_service.clone()),
         },
         config.atomic_program_timeout,
         config.index_query_timeout,

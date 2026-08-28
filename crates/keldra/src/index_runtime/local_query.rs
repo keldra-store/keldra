@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use keldra_api::v1::{
-    IndexAggregateOperation, IndexAggregateResult, IndexFacetBucket, IndexFacetResult,
-    IndexFreshness, IndexQueryHit, IndexSourceFreshness, ObjectAddress,
+    IndexAggregateOperation, IndexAggregateResult, IndexFacetResult, IndexFreshness, IndexQueryHit,
+    IndexSourceFreshness, ObjectAddress,
 };
 use keldra_atomic_program::{
     MAX_OBJECT_BUCKET_BYTES, MAX_OBJECT_PATH_BYTES, MAX_OBJECT_TENANT_BYTES,
@@ -17,7 +17,7 @@ use keldra_index::v4::{
     AggregateOperation, ArtifactDirectoryRead, ArtifactPackReference, CandidateGate,
     CandidateGateEvidence, CandidateReference, FieldId, IndexKind, NativeQueryCursor,
     NativeQueryExecutionError, NativeQueryExecutor, NativeQueryLimits, NativeQueryPhase,
-    NativeQueryRequest, NativeQueryStatisticsRecorder, ScalarValue,
+    NativeQueryRequest, NativeQueryStatisticsRecorder,
 };
 use keldra_store::{BlobRef, CurrentObjectSnapshot, MAX_CONTENT_TYPE_BYTES, ObjectKey};
 use tonic::Status;
@@ -40,6 +40,7 @@ use super::directory::{ManifestArtifactDirectory, ManifestArtifactFile};
 use super::events::IndexBarrier;
 use super::publisher::{IndexCommitPublisher, SelectedCommittedIndexView};
 use super::query_budget::IndexQueryMemoryBudget;
+use super::query_response::{facet_result_to_api, scalar_json};
 use super::v4_query::compile_query;
 use super::v4_schema::compile_schema;
 
@@ -1336,7 +1337,7 @@ impl LocalRevisionQueryExecutor {
         let facet_results = page
             .facet_results
             .into_iter()
-            .map(|result| facet_result_to_api(&field_names, result))
+            .map(|result| facet_result_to_api(&native.schema.fields, result))
             .collect::<Result<Vec<_>, _>>()?;
         let aggregate_results = page
             .aggregate_results
@@ -1492,35 +1493,6 @@ fn empty_computation_results(
     Ok((facets, aggregates))
 }
 
-fn facet_result_to_api(
-    field_names: &[String],
-    result: keldra_index::v4::FacetResult,
-) -> Result<IndexFacetResult, Status> {
-    let mut buckets = result
-        .buckets
-        .into_iter()
-        .map(|bucket| {
-            Ok(IndexFacetBucket {
-                value_json: scalar_json(&bucket.value)?,
-                count: bucket.count,
-            })
-        })
-        .collect::<Result<Vec<_>, Status>>()?;
-    // The native engine keeps typed scalar ordering. The public contract is
-    // deliberately language-neutral: equal-count buckets use their canonical
-    // JSON bytes as the stable tie-break.
-    buckets.sort_by(|left, right| {
-        right
-            .count
-            .cmp(&left.count)
-            .then_with(|| left.value_json.cmp(&right.value_json))
-    });
-    Ok(IndexFacetResult {
-        field: field_name(field_names, result.field_id)?.to_owned(),
-        buckets,
-    })
-}
-
 fn aggregate_result_to_api(
     field_names: &[String],
     result: keldra_index::v4::AggregateResult,
@@ -1545,21 +1517,6 @@ fn field_name(field_names: &[String], field_id: FieldId) -> Result<&str, Status>
         .get(field_id.get() as usize)
         .map(String::as_str)
         .ok_or_else(|| Status::data_loss("native query result names an unknown field"))
-}
-
-fn scalar_json(value: &ScalarValue) -> Result<Vec<u8>, Status> {
-    let value = match value {
-        ScalarValue::Null => serde_json::Value::Null,
-        ScalarValue::Boolean(value) => serde_json::Value::Bool(*value),
-        ScalarValue::Signed(value) => serde_json::Value::Number((*value).into()),
-        ScalarValue::Unsigned(value) => serde_json::Value::Number((*value).into()),
-        ScalarValue::Number(bits) => serde_json::Number::from_f64(f64::from_bits(*bits))
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| Status::data_loss("native query returned a non-finite number"))?,
-        ScalarValue::String(value) => serde_json::Value::String(value.clone()),
-    };
-    serde_json::to_vec(&value)
-        .map_err(|error| Status::internal(format!("encode index computation result: {error}")))
 }
 
 async fn execute_native_query<D, G>(
@@ -1909,31 +1866,6 @@ mod tests {
                 .iter()
                 .all(|aggregate| aggregate.contributing_count == 0)
         );
-    }
-
-    #[test]
-    fn public_facet_ties_use_canonical_json_byte_order() {
-        let result = facet_result_to_api(
-            &["sequence".into()],
-            keldra_index::v4::FacetResult {
-                field_id: FieldId::new(0),
-                buckets: vec![
-                    keldra_index::v4::FacetBucket {
-                        value: ScalarValue::Unsigned(2),
-                        count: 1,
-                    },
-                    keldra_index::v4::FacetBucket {
-                        value: ScalarValue::Unsigned(10),
-                        count: 1,
-                    },
-                ],
-            },
-        )
-        .unwrap();
-
-        assert_eq!(result.field, "sequence");
-        assert_eq!(result.buckets[0].value_json, b"10");
-        assert_eq!(result.buckets[1].value_json, b"2");
     }
 
     #[test]

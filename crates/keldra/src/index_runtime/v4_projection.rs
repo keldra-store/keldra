@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index_service::path_matches_prefix;
 
+use super::date::parse_millis;
 use super::json_projection::{
     ProjectedJson, ProjectionSelection, SelectedScalarField, SelectedScalarFields, project_json,
     projection_floor_bytes,
@@ -1090,6 +1091,15 @@ fn normalize_scalar(
         (FieldType::Float, ScalarValue::Unsigned(value)) => {
             ScalarValue::exact_number_from_u64(value).ok_or_else(invalid)?
         }
+        (FieldType::Date, ScalarValue::String(value)) => ScalarValue::Signed(
+            parse_millis(
+                &value,
+                field.date_format.as_ref().ok_or_else(|| {
+                    IndexError::InvalidDefinition("Date field has no format".into())
+                })?,
+            )
+            .map_err(|_| invalid())?,
+        ),
         (FieldType::Keyword | FieldType::Text, ScalarValue::String(value)) => {
             if field.field_type == FieldType::Keyword
                 && value.len() > INDEX_TERM_BYTES
@@ -1262,7 +1272,7 @@ mod tests {
         VectorIndexSpec, VectorMetric as ApiVectorMetric, index_field,
     };
     use keldra_index::v4::{
-        FIELD_PRESENCE_TERM, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_NULL, TERM_TYPE_TEXT,
+        DateFormat, FIELD_PRESENCE_TERM, TERM_TYPE_FIELD_PRESENCE, TERM_TYPE_NULL, TERM_TYPE_TEXT,
         VectorNormalization,
     };
 
@@ -1887,5 +1897,28 @@ mod tests {
         assert!(normalize_scalar(&field, ScalarValue::Signed(1i64 << 53)).is_ok());
         assert!(normalize_scalar(&field, ScalarValue::Signed((1i64 << 53) + 1)).is_err());
         assert!(normalize_scalar(&field, ScalarValue::Unsigned(u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn date_projection_normalizes_strings_to_exact_signed_millis() {
+        let mut field = schema(Specification::TypedJson(TypedJsonIndexSpec {
+            fields: vec![keyword_field("value", "/value", false)],
+            physical_order: Vec::new(),
+        }))
+        .fields
+        .remove(0);
+        field.field_type = FieldType::Date;
+        field.date_format = Some(DateFormat::Iso8601);
+        assert_eq!(
+            normalize_scalar(&field, ScalarValue::String("1970-01-02".into())).unwrap(),
+            ScalarValue::Signed(86_400_000)
+        );
+        assert!(
+            normalize_scalar(
+                &field,
+                ScalarValue::String("1970-01-01T00:00:00.000001Z".into())
+            )
+            .is_err()
+        );
     }
 }

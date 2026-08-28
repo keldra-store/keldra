@@ -1,14 +1,14 @@
 # keldra
 
 The official Rust client for Keldra. It provides authenticated object upload
-helpers and the complete generated Keldra 0.13 protocol, including object,
+helpers and the complete generated Keldra 0.15 protocol, including object,
 authorization, administration, cluster-wide index, accounting, and PersonalDB
 clients.
 
 ## Install
 
 ```sh
-cargo add keldra@0.14.0
+cargo add keldra@0.15.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -56,6 +56,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 Use an HTTPS endpoint when exchanging client credentials.
 
+## Clone bytes or link a mutable name
+
+`CloneObject` creates an independent destination version which initially shares
+the source version's existing payload bytes. `LinkObject` instead creates a
+transparent name for the same mutable target: writes through either path update
+the target, and unlinking removes only the link.
+
+```rust,no_run
+use keldra::v1::{
+    CloneObjectRequest, Durability, LinkObjectRequest, ObjectAddress,
+    PutIfAbsentOperation, UnlinkObjectRequest, clone_object_request,
+};
+
+# async fn aliases(client: &mut keldra::RawClient) -> Result<(), tonic::Status> {
+let target = ObjectAddress {
+    tenant: "example".into(),
+    bucket: "documents".into(),
+    path: "reports/annual.pdf".into(),
+};
+let clone = ObjectAddress {
+    path: "archives/annual.pdf".into(),
+    ..target.clone()
+};
+client.clone_object(CloneObjectRequest {
+    source: Some(target.clone()),
+    source_version: 41,
+    destination: Some(clone),
+    command_id: "clone-annual-41".into(),
+    durability: Durability::Replicated as i32,
+    operation: Some(clone_object_request::Operation::PutIfAbsent(
+        PutIfAbsentOperation {},
+    )),
+}).await?;
+
+let link = ObjectAddress {
+    path: "reports/latest.pdf".into(),
+    ..target.clone()
+};
+client.link_object(LinkObjectRequest {
+    link: Some(link.clone()),
+    target: Some(target),
+    command_id: "link-latest".into(),
+    durability: Durability::Replicated as i32,
+}).await?;
+client.unlink_object(UnlinkObjectRequest {
+    link: Some(link),
+    command_id: "unlink-latest".into(),
+    durability: Durability::Replicated as i32,
+}).await?;
+# Ok(())
+# }
+```
+
+Clone and link require cluster protocol/storage capability `2/2`. Operators must
+complete the documented all-node 0.15 upgrade and explicit capability
+activation before applications invoke them.
+
 ## Define a typed index safely
 
 Typed JSON fields expose only capabilities valid for their logical type. The
@@ -63,10 +120,10 @@ builder below creates exact keyword postings and numeric order doc values; an
 invalid combination such as Boolean range search cannot be constructed.
 
 ```rust,no_run
-use keldra::{KeywordField, SignedIntegerField, TypedJsonIndexBuilder};
+use keldra::{DateField, KeywordField, TypedJsonIndexBuilder};
 
 # fn definition() -> Result<keldra::v1::CreateIndexRequest, Box<dyn std::error::Error + Send + Sync>> {
-let modified = SignedIntegerField::single("modified_at", "/modified_at")
+let modified = DateField::single("modified_at", "/modified_at")
     .range()
     .order();
 let newest_first = modified.descending();
@@ -88,7 +145,13 @@ ordinary object address and exact version; fetch selected source objects with
 `GetObject` or `BatchGet`.
 
 The concrete builders are `BooleanField`, `SignedIntegerField`,
-`UnsignedIntegerField`, `FloatField`, `KeywordField`, and `TextField`. Their
+`UnsignedIntegerField`, `FloatField`, `KeywordField`, `TextField`, and
+`DateField`. Date fields use ISO-8601 by default; pass a pattern created by
+`DateFormat::strftime(...)` to `DateField::format(...)` for one validated custom
+format. Offset-less inputs are UTC and precision finer than milliseconds is
+rejected. Date exact/range/order/facet operations use signed Unix epoch
+milliseconds internally, while facet values are returned in the configured
+format without storing source strings. Their
 available methods mirror Keldra's native capabilities: exact matching, keyword
 prefix and range matching, numeric ranges, ordering, facets, numeric
 aggregates, and analyzed full-text search. A field emits only the index

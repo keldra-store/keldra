@@ -184,6 +184,7 @@ fn change_at_path(
         tenant_id,
         bucket_id,
         exact_path: path.to_owned(),
+        canonical_path: None,
         path_version: VersionId(offset),
         kind: ObjectHeadChangeKind::Put,
         program_commit_cursor: None,

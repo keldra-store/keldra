@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use keldra_api::v1::administration_service_server::AdministrationService;
 use keldra_consensus::{
-    CapabilityRange, ClusterId, Command, CommittedPeerPins, JoinCapabilityHash, NodeDescriptor,
-    NodeState, PeerSpkiSha256,
+    ClusterId, Command, CommittedPeerPins, JoinCapabilityHash, NodeDescriptor, NodeState,
+    PeerSpkiSha256,
 };
 use keldra_store::{StoreOptions, SystemBootstrapRequest};
 
@@ -50,8 +50,8 @@ async fn service() -> (tempfile::TempDir, Store, AdministrationServiceImpl) {
                 current_peer_spki_sha256: PeerSpkiSha256([1; 32]),
                 overlap_peer_spki_sha256: None,
                 join_capability_hash: Some(JoinCapabilityHash([1; 32])),
-                supported_protocol: CapabilityRange { min: 1, max: 1 },
-                supported_storage_format: CapabilityRange { min: 1, max: 1 },
+                supported_protocol: PEER_PROTOCOL_CAPABILITY,
+                supported_storage_format: STORAGE_FORMAT_CAPABILITY,
             },
         })
         .await
@@ -84,6 +84,43 @@ fn prepare_request() -> api::PrepareNodeRequest {
         peer_address: "127.0.0.1:50062".into(),
         storage_weight_millionths: 500_000,
     }
+}
+
+#[tokio::test]
+async fn cluster_capability_status_and_activation_are_explicit_and_fenced() {
+    let (_directory, _store, service) = service().await;
+    let status = service
+        .get_cluster_capabilities(authenticated(
+            StorageTenantId::system(),
+            "bootstrap-app",
+            api::GetClusterCapabilitiesRequest {},
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.active_protocol_version, 1);
+    assert_eq!(status.active_storage_format, 1);
+    assert_eq!(status.target_protocol_version, 2);
+    assert_eq!(status.target_storage_format, 2);
+    assert!(status.ready_for_target_activation);
+    assert!(status.blocking_active_node_ids.is_empty());
+
+    let activated = service
+        .activate_cluster_capabilities(authenticated(
+            StorageTenantId::system(),
+            "bootstrap-app",
+            api::ActivateClusterCapabilitiesRequest {
+                protocol_version: status.target_protocol_version,
+                storage_format: status.target_storage_format,
+                expected_placement_term: status.active_placement_term,
+                expected_placement_index: status.active_placement_index,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(activated.active_protocol_version, 2);
+    assert_eq!(activated.active_storage_format, 2);
 }
 
 #[tokio::test]

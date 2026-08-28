@@ -669,6 +669,7 @@ mod tests {
             tenant_id: 2,
             bucket_id: 3,
             exact_path: "objects/value".into(),
+            canonical_path: None,
             path_version: VersionId(4),
             kind: ObjectHeadChangeKind::Put,
             program_commit_cursor: None,

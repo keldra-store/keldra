@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-scale-evidence.sh"
-requested_image="${KELDRA_IMAGE:-keldra:0.14.0}"
+requested_image="${KELDRA_IMAGE:-keldra:0.15.0}"
 keep="${KELDRA_QUALIFICATION_KEEP:-0}"
 qualification_mode="${KELDRA_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${KELDRA_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
@@ -160,9 +160,9 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
 fi
 server_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra-server --version)"
 client_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra --version)"
-if [[ "${server_version}" != "keldra-server 0.14.0" \
-  || "${client_version}" != "keldra 0.14.0" ]]; then
-  echo "qualification requires the exact Keldra 0.14.0 image" >&2
+if [[ "${server_version}" != "keldra-server 0.15.0" \
+  || "${client_version}" != "keldra 0.15.0" ]]; then
+  echo "qualification requires the exact Keldra 0.15.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2

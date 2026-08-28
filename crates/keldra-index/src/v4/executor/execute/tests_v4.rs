@@ -197,6 +197,7 @@ fn schema() -> Schema {
             .union(FieldCapabilities::ORDER)
             .union(FieldCapabilities::FACET),
         analyzer: None,
+        date_format: None,
         components: FieldComponents::TERMS.union(FieldComponents::DOC_VALUES),
     };
     state.components = state.compiled_components().unwrap();
@@ -215,6 +216,7 @@ fn schema() -> Schema {
             .union(FieldCapabilities::FACET)
             .union(FieldCapabilities::AGGREGATE),
         analyzer: None,
+        date_format: None,
         components: FieldComponents::POINTS.union(FieldComponents::DOC_VALUES),
     };
     priority.components = priority.compiled_components().unwrap();
@@ -331,6 +333,7 @@ fn keyword_schema(kind: IndexKind, semantics: IndexSemantics) -> Schema {
         collation: Collation::BinaryUtf8,
         capabilities: FieldCapabilities::EXACT.union(FieldCapabilities::PREFIX),
         analyzer: None,
+        date_format: None,
         components: FieldComponents::TERMS,
     };
     field.components = field.compiled_components().unwrap();
@@ -402,6 +405,7 @@ fn sparse_point_schema() -> Schema {
         collation: Collation::BinaryUtf8,
         capabilities: FieldCapabilities::EXACT,
         analyzer: None,
+        date_format: None,
         components: FieldComponents::TERMS,
     };
     object_kind.components = object_kind.compiled_components().unwrap();
@@ -416,6 +420,7 @@ fn sparse_point_schema() -> Schema {
         collation: Collation::BinaryUtf8,
         capabilities: FieldCapabilities::EXACT.union(FieldCapabilities::RANGE),
         analyzer: None,
+        date_format: None,
         components: FieldComponents::POINTS,
     };
     next_eval.components = next_eval.compiled_components().unwrap();

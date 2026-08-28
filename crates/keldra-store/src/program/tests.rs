@@ -103,6 +103,45 @@ async fn configured_store() -> (TempDir, Store, VerifiedProgramDefinition) {
     (temporary, store, verified_definition())
 }
 
+#[tokio::test]
+async fn descriptor_mime_without_target_sidecar_provenance_remains_an_ordinary_object() {
+    let (_temporary, store, _) = configured_store().await;
+    let requested = ObjectPath::new("tenant", "bucket", "historical/descriptor-shaped").unwrap();
+    let descriptor = crate::ObjectLinkDescriptor::new("historical/target").unwrap();
+    let receipt = store
+        .put(PutRequest {
+            key: object_key(&requested).unwrap(),
+            bytes: descriptor.encode(),
+            content_type: Some(crate::OBJECT_LINK_CONTENT_TYPE.into()),
+            mode: PutMode::Put,
+            command_id: Some("historical-descriptor-mime".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+
+    let bindings = store
+        .resolve_program_alias_bindings(&[ExpandedProgramPath {
+            path: requested.clone(),
+            intent: keldra_atomic_program::ProgramPathIntent {
+                get: true,
+                put: false,
+                delete: false,
+            },
+        }])
+        .await
+        .unwrap();
+
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].requested_path, requested);
+    assert_eq!(bindings[0].canonical_path, requested);
+    assert!(bindings[0].descriptor_version.is_none());
+    assert_eq!(
+        bindings[0].canonical_version.as_ref().map(|v| v.id),
+        Some(receipt.version)
+    );
+}
+
 async fn configure_policy(store: &Store) {
     store
         .set_bucket_policy(
@@ -191,9 +230,12 @@ fn commit(
     ProgramCommit {
         previous_commit_cursor,
         commit_cursor,
+        begin_cursor: commit_cursor,
         bundle_ref: prepared.bundle,
         bundle_hash: prepared.hash,
         program_hash: prepared.program_hash,
+        authority: prepared.authority,
+        participant_manifest_hash: prepared.participant_manifest_hash,
         durability_class: ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS),
         durability_evidence_hash: prepared.durability_evidence_hash,
     }
@@ -231,9 +273,12 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
     let wrong_class = ProgramCommit {
         previous_commit_cursor: None,
         commit_cursor: 1,
+        begin_cursor: 1,
         bundle_ref: prepared.bundle,
         bundle_hash: prepared.hash,
         program_hash: prepared.program_hash,
+        authority: prepared.authority,
+        participant_manifest_hash: prepared.participant_manifest_hash,
         durability_class: ProgramDurabilityClassHash::for_class("replicated"),
         durability_evidence_hash: prepared.durability_evidence_hash,
     };
@@ -265,6 +310,8 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
             bundle_ref: prepared.bundle,
             bundle_hash: prepared.hash,
             program_hash: prepared.program_hash,
+            authority: prepared.authority,
+            participant_manifest_hash: prepared.participant_manifest_hash,
             durability_class: local_commit.durability_class,
             durability_evidence_hash: prepared.durability_evidence_hash,
         })
@@ -364,9 +411,12 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
             ProgramCommit {
                 previous_commit_cursor: None,
                 commit_cursor: 1,
+                begin_cursor: 1,
                 bundle_ref: prepared.bundle,
                 bundle_hash: prepared.hash,
                 program_hash: prepared.program_hash,
+                authority: prepared.authority,
+                participant_manifest_hash: prepared.participant_manifest_hash,
                 durability_class: ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS),
                 durability_evidence_hash: prepared.durability_evidence_hash,
             },
@@ -632,6 +682,7 @@ async fn exact_head_is_rechecked_before_atomic_apply() {
         content_type: Some("application/json".into()),
         deleted: false,
         committed_at_unix_millis: now_unix_millis().unwrap(),
+        protected_link_descriptor: false,
     };
     let key = object_key(&counter_path()).unwrap();
     let identity = store
@@ -882,7 +933,7 @@ fn program_definition_must_match_loaded_immutable_bytes() {
 }
 
 #[tokio::test]
-async fn mutable_read_only_program_dependency_is_rejected_before_execution() {
+async fn mutable_read_only_program_dependency_is_evaluated_at_its_exact_version() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
         .await
@@ -928,17 +979,45 @@ async fn mutable_read_only_program_dependency_is_rejected_before_execution() {
         }],
     );
 
-    let error = store
+    let lease = store
         .program_engine(&verified)
         .unwrap()
         .prepare(&InvocationContext::new("tenant").unwrap(), &invocation)
         .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        EngineError::ProgramConcurrency { path, reason }
-            if path.path == "configuration/current" && reason.contains("PROGRAM_ONLY")
-    ));
+        .unwrap();
+    assert_eq!(
+        lease.bundle().head_preconditions,
+        vec![
+            HeadPrecondition {
+                path: counter_path(),
+                expected: ObservedHead::NeverExisted,
+            },
+            HeadPrecondition {
+                path: config_path.clone(),
+                expected: ObservedHead::Version {
+                    version: config.version.0.to_string(),
+                },
+            },
+        ]
+    );
+    assert_eq!(lease.bundle().writes.len(), 1);
+    assert_eq!(lease.bundle().writes[0].path, counter_path());
+    assert_eq!(
+        lease.bundle().writes[0].expected,
+        ObservedHead::NeverExisted
+    );
+    assert_eq!(
+        lease.bundle().writes[0].value,
+        Some(StoredValue::Json(json!({"value": 1})))
+    );
+    assert!(
+        lease
+            .bundle()
+            .writes
+            .iter()
+            .all(|write| write.path != config_path)
+    );
+    assert_eq!(lease.bundle().outputs.get("value"), Some(&json!(1)));
     assert_eq!(
         store.head(&object_key(&counter_path()).unwrap()).unwrap(),
         None
@@ -951,10 +1030,11 @@ async fn mutable_read_only_program_dependency_is_rejected_before_execution() {
             mutation_stamp: None,
         })
     );
+    drop(lease.release());
 }
 
 #[tokio::test]
-async fn immutable_read_only_program_dependency_still_requires_program_only_policy() {
+async fn immutable_read_only_program_dependency_is_evaluated_at_its_exact_version() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
         .await
@@ -1010,17 +1090,45 @@ async fn immutable_read_only_program_dependency_still_requires_program_only_poli
         }],
     );
 
-    let error = store
+    let lease = store
         .program_engine(&verified)
         .unwrap()
         .prepare(&InvocationContext::new("tenant").unwrap(), &invocation)
         .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        EngineError::ProgramConcurrency { path, reason }
-            if path.path == "configuration/current" && reason.contains("PROGRAM_ONLY")
-    ));
+        .unwrap();
+    assert_eq!(
+        lease.bundle().head_preconditions,
+        vec![
+            HeadPrecondition {
+                path: counter_path(),
+                expected: ObservedHead::NeverExisted,
+            },
+            HeadPrecondition {
+                path: config_path.clone(),
+                expected: ObservedHead::Version {
+                    version: config.version.0.to_string(),
+                },
+            },
+        ]
+    );
+    assert_eq!(lease.bundle().writes.len(), 1);
+    assert_eq!(lease.bundle().writes[0].path, counter_path());
+    assert_eq!(
+        lease.bundle().writes[0].expected,
+        ObservedHead::NeverExisted
+    );
+    assert_eq!(
+        lease.bundle().writes[0].value,
+        Some(StoredValue::Json(json!({"value": 1})))
+    );
+    assert!(
+        lease
+            .bundle()
+            .writes
+            .iter()
+            .all(|write| write.path != config_path)
+    );
+    assert_eq!(lease.bundle().outputs.get("value"), Some(&json!(1)));
     assert_eq!(
         store.head(&object_key(&counter_path()).unwrap()).unwrap(),
         None
@@ -1033,6 +1141,7 @@ async fn immutable_read_only_program_dependency_still_requires_program_only_poli
             mutation_stamp: None,
         })
     );
+    drop(lease.release());
 }
 
 #[tokio::test]
@@ -1068,13 +1177,50 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
     let stage = path_stage_from_prepared(
         &prepared,
         record.writes().first().unwrap(),
+        40,
         tenant_id,
         bucket_id,
     )
     .unwrap();
+    let reservations = record
+        .reservations(
+            40,
+            [1; 32],
+            prepared.hash,
+            1,
+            3,
+            PlacementLogId { term: 3, index: 7 },
+        )
+        .unwrap();
+    for reservation in &reservations {
+        store
+            .reserve_program_participant(reservation)
+            .await
+            .unwrap();
+        store
+            .commit_program_participant(reservation, 42)
+            .await
+            .unwrap();
+    }
 
     let persisted = store.persist_program_path_stage(&stage).await.unwrap();
     assert_eq!(persisted, stage.blob_ref().unwrap());
+    assert_eq!(
+        store.head(&object_key(&counter_path()).unwrap()).unwrap(),
+        None
+    );
+
+    let stale_fence = store
+        .coordinate_program_path_finalization(
+            stage.clone(),
+            42,
+            crate::ObjectMutationContext {
+                active_placement_log_id: crate::PlacementLogId { term: 3, index: 7 },
+                serving_fence_term: 2,
+            },
+        )
+        .await;
+    assert!(stale_fence.is_err());
     assert_eq!(
         store.head(&object_key(&counter_path()).unwrap()).unwrap(),
         None
@@ -1125,6 +1271,7 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
         &record,
         &[stage.clone()],
         &[finalized.mutation.clone()],
+        &[],
     )
     .unwrap();
     assert!(
@@ -1150,6 +1297,7 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
         &record,
         &[],
         &[],
+        &[],
     );
     assert_eq!(truncated, Err(ProgramStoreError::PreparedBundleMismatch));
 }
@@ -1171,13 +1319,20 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         content_type: Some("application/json".into()),
         deleted: false,
         committed_at_unix_millis: now_unix_millis().unwrap(),
+        protected_link_descriptor: false,
     };
     let first = store
         .coordinate_program_path_finalization(
             ProgramPathStage {
                 format: 1,
+                begin_cursor: 40,
                 bundle_hash: PreparedBundleHash([0x11; 32]),
                 program_hash: ProgramHash([0x22; 32]),
+                authority: ProgramBundleAuthority::LegacyProgramOnly {
+                    program_path_hash: [0x33; 32],
+                    program_hash: [0x22; 32],
+                },
+                participant_manifest_hash: [0x44; 32],
                 tenant_id,
                 bucket_id,
                 path: counter_path(),
@@ -1221,13 +1376,20 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         content_type: Some("application/json".into()),
         deleted: false,
         committed_at_unix_millis: now_unix_millis().unwrap(),
+        protected_link_descriptor: false,
     };
     let second = store
         .coordinate_program_path_finalization(
             ProgramPathStage {
                 format: 1,
+                begin_cursor: 41,
                 bundle_hash: PreparedBundleHash([0x33; 32]),
                 program_hash: ProgramHash([0x22; 32]),
+                authority: ProgramBundleAuthority::LegacyProgramOnly {
+                    program_path_hash: [0x33; 32],
+                    program_hash: [0x22; 32],
+                },
+                participant_manifest_hash: [0x44; 32],
                 tenant_id,
                 bucket_id,
                 path: counter_path(),

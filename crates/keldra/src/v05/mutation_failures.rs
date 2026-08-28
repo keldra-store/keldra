@@ -43,10 +43,14 @@ pub(super) fn api_failure(error: MutationError) -> MutationFailure {
         MutationError::ProgramConcurrencyViolation => {
             (MutationFailureCode::ProgramConcurrencyViolation, None)
         }
+        MutationError::AtomicReservationConflict { .. } => {
+            (MutationFailureCode::ProgramConcurrencyViolation, None)
+        }
         MutationError::CurrentTombstoneCannotBeDeleted => {
             (MutationFailureCode::ConditionFailed, None)
         }
         MutationError::ObjectVersioningNotEnabled => (MutationFailureCode::ConditionFailed, None),
+        MutationError::ObjectHasInboundAliases => (MutationFailureCode::ConditionFailed, None),
         MutationError::IdempotencyConflict => (MutationFailureCode::IdempotencyInputMismatch, None),
         MutationError::InvalidCommandId
         | MutationError::InvalidPolicy(_)

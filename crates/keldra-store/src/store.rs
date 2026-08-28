@@ -28,7 +28,7 @@ use crate::watch::{
 };
 use crate::{
     AWAITING_PUBLISH, AccountingHeadTransition, BatchOperation, BatchOutcome, BlobReader, BlobRef,
-    BlobReferenceState, BlobStore, BucketPolicy, DefinitionTransition, DeleteRequest,
+    BlobReferenceState, BlobStore, BucketPolicy, CloneRequest, DefinitionTransition, DeleteRequest,
     DeleteRetainedVersionOutcome, Durability, Head, INDEX_DEFINITION_PREFIX, MutationError,
     MutationReceipt, Object, ObjectKey, ObjectVersioning, Precondition, PublishRequest, PutMode,
     PutRequest, ReferenceDelta, SMALL_BLOB_MAX_BYTES, StorageTenantId, Version, VersionClock,
@@ -128,6 +128,7 @@ pub(crate) const CF_AUTHZ_RECEIPTS: &str = "authz_receipts";
 pub(crate) const CF_CREDENTIALS: &str = "credentials";
 pub(crate) const CF_DEFINITION_STATE: &str = "definition_state";
 pub(crate) const CF_JOURNAL_ROUTES: &str = "journal_routes";
+pub(crate) const CF_OBJECT_ALIAS_REGISTRIES: &str = "object_alias_registries";
 pub(crate) const VERSION_HIGH_WATERMARK_KEY: &[u8] = b"version_high_watermark";
 const MUTATION_RECEIPT_COUNT_KEY: &[u8] = b"mutation_receipt_count";
 const MUTATION_RECEIPT_BYTES_KEY: &[u8] = b"mutation_receipt_bytes";
@@ -160,6 +161,7 @@ pub(crate) const COLUMN_FAMILIES: &[&str] = &[
     CF_CREDENTIALS,
     CF_DEFINITION_STATE,
     CF_JOURNAL_ROUTES,
+    CF_OBJECT_ALIAS_REGISTRIES,
 ];
 
 struct MetadataMemoryResources {
@@ -285,6 +287,14 @@ pub(crate) enum PendingLocalChange {
         accounting_transition: Option<crate::AccountingHeadTransition>,
         definition_transition: Option<DefinitionTransition>,
     },
+    AliasObjectHead {
+        identity: BucketIdentity,
+        exact_path: String,
+        canonical_path: String,
+        path_version: VersionId,
+        deleted: bool,
+        program_commit_cursor: Option<u64>,
+    },
     RetainedVersionDeleted {
         identity: BucketIdentity,
         exact_path: String,
@@ -335,7 +345,9 @@ impl PendingLocalChange {
             | Self::ContentLifecycleChanged {
                 reference_deltas, ..
             } => !reference_deltas.is_empty(),
-            Self::AggregateChanged { .. } | Self::AtomicBatchPublished { .. } => false,
+            Self::AliasObjectHead { .. }
+            | Self::AggregateChanged { .. }
+            | Self::AtomicBatchPublished { .. } => false,
         }
     }
 }
@@ -537,6 +549,11 @@ enum PreparedOperation {
         identity: BucketIdentity,
         fingerprint: [u8; 32],
     },
+    Clone {
+        request: CloneRequest,
+        identity: BucketIdentity,
+        fingerprint: [u8; 32],
+    },
     Delete {
         request: DeleteRequest,
         identity: BucketIdentity,
@@ -578,6 +595,7 @@ impl PreparedOperation {
         match self {
             Self::Put { request, .. } => &request.key,
             Self::Publish { request, .. } => &request.key,
+            Self::Clone { request, .. } => &request.destination,
             Self::Delete { request, .. } => &request.key,
         }
     }
@@ -586,6 +604,7 @@ impl PreparedOperation {
         match self {
             Self::Put { request, .. } => request.command_id.as_deref(),
             Self::Publish { request, .. } => request.command_id.as_deref(),
+            Self::Clone { request, .. } => request.command_id.as_deref(),
             Self::Delete { request, .. } => request.command_id.as_deref(),
         }
     }
@@ -594,6 +613,7 @@ impl PreparedOperation {
         match self {
             Self::Put { identity, .. }
             | Self::Publish { identity, .. }
+            | Self::Clone { identity, .. }
             | Self::Delete { identity, .. } => *identity,
         }
     }
@@ -606,6 +626,7 @@ impl PreparedOperation {
         match self {
             Self::Put { request, .. } => request.mode.precondition(),
             Self::Publish { request, .. } => request.mode.precondition(),
+            Self::Clone { request, .. } => request.mode.precondition(),
             Self::Delete { request, .. } => request.precondition,
         }
     }
@@ -614,6 +635,7 @@ impl PreparedOperation {
         match self {
             Self::Put { request, .. } => Some(request.mode),
             Self::Publish { request, .. } => Some(request.mode),
+            Self::Clone { request, .. } => Some(request.mode),
             Self::Delete { .. } => None,
         }
     }
@@ -622,6 +644,7 @@ impl PreparedOperation {
         match self {
             Self::Put { fingerprint, .. }
             | Self::Publish { fingerprint, .. }
+            | Self::Clone { fingerprint, .. }
             | Self::Delete { fingerprint, .. } => *fingerprint,
         }
     }
@@ -630,7 +653,18 @@ impl PreparedOperation {
         match self {
             Self::Put { payload, .. } => Some(payload.reference()),
             Self::Publish { request, .. } => Some(&request.blob),
+            Self::Clone { request, .. } => Some(&request.blob),
             Self::Delete { .. } => None,
+        }
+    }
+
+    fn lock_paths(&self) -> Vec<ObjectPath> {
+        match self {
+            Self::Clone { request, .. } => vec![
+                object_path(&request.source),
+                object_path(&request.destination),
+            ],
+            _ => vec![object_path(self.key())],
         }
     }
 }
@@ -1160,10 +1194,13 @@ impl Store {
     ) -> Result<(), MutationError> {
         policy.validate()?;
         let _policy_guard = self.policy_gate.write().await;
-        let key = self.resolve_bucket_identity(tenant, bucket)?.encode();
+        let identity = self.resolve_bucket_identity(tenant, bucket)?;
+        let key = identity.encode();
         let policy_path = ObjectPath::new(tenant, bucket, "_keldra/policy")
             .map_err(MutationError::InvalidPolicy)?;
         let _guard = self.ordinary_locks.acquire(&[policy_path]).await;
+        let _commit_guard = self.lock_commit("bucket_policy").await;
+        self.require_unreserved_governance_locked(identity, None)?;
         if let Some(existing) = self.bucket_policy_by_key(&key)? {
             let requested_immutable = policy.immutable_prefixes.iter().collect::<BTreeSet<_>>();
             if existing
@@ -1246,15 +1283,19 @@ impl Store {
         tenant: &str,
         bucket: &str,
     ) -> Result<bool, MutationError> {
-        // Enabling version retention and an ordinary/program commit must have
-        // one order. Once this write returns, no mutation may still commit
-        // using the old unversioned replacement rule.
+        let _policy_guard = self.policy_gate.write().await;
+        let policy_path = ObjectPath::new(tenant, bucket, "_keldra/policy")
+            .map_err(MutationError::InvalidPolicy)?;
+        let _path_guard = self.ordinary_locks.acquire(&[policy_path]).await;
+        // Governance and object/program commits share this final persistence
+        // fence after canonical path locking.
         let _commit_guard = self.lock_commit("store_metadata").await;
         let _guard = self
             .bucket_options_lock
             .lock()
             .map_err(|_| MutationError::Storage("bucket-options lock is poisoned".into()))?;
         let identity = self.resolve_bucket_identity(tenant, bucket)?;
+        self.require_unreserved_governance_locked(identity, None)?;
         if self.bucket_versioning_by_key(&identity.encode())? == ObjectVersioning::Enabled {
             return Ok(false);
         }
@@ -1361,15 +1402,21 @@ mod index_orphan_scrub_due;
 mod index_retention_due;
 mod journal_capacity;
 mod journal_routes;
+mod mutation_fingerprint;
 mod mutation_helpers;
 mod mutation_prefetch;
 mod mutation_types;
+mod mutation_unary;
 mod mutations;
+use mutation_fingerprint::*;
+mod object_alias_registry;
 mod object_mutation_replica_batch;
 mod object_snapshot;
 mod object_snapshot_scan;
 mod payload;
 mod payload_handoff;
+mod pending_local_change;
+mod program_reservations;
 mod reads;
 mod reference_deltas;
 mod reference_proofs;
@@ -1886,100 +1933,6 @@ fn validate_selected_version_id(
     } else {
         Ok(())
     }
-}
-
-fn put_fingerprint(
-    encoded_head_key: &[u8],
-    mode: PutMode,
-    content_type: Option<&str>,
-    durability: Durability,
-    blob: &BlobRef,
-) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"keldra.put.v1");
-    hasher.update(encoded_head_key);
-    hash_put_mode(&mut hasher, mode);
-    hash_optional_string(&mut hasher, content_type);
-    hash_durability(&mut hasher, durability);
-    hasher.update(&blob.hash);
-    hasher.update(&blob.length.to_be_bytes());
-    *hasher.finalize().as_bytes()
-}
-
-fn delete_fingerprint(request: &DeleteRequest, identity: BucketIdentity) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"keldra.delete.v1");
-    hasher.update(&identity.head_key(request.key.path()));
-    hash_precondition(&mut hasher, request.precondition);
-    hash_durability(&mut hasher, request.durability);
-    *hasher.finalize().as_bytes()
-}
-
-fn publish_fingerprint(request: &PublishRequest, identity: BucketIdentity) -> [u8; 32] {
-    // Publish is an internal staging detail for a streamed Put. Its canonical
-    // idempotency identity must therefore be identical to an inline/bulk Put
-    // with the same logical input.
-    put_fingerprint(
-        &identity.head_key(request.key.path()),
-        request.mode,
-        request.content_type.as_deref(),
-        request.durability,
-        &request.blob,
-    )
-}
-
-fn hash_put_mode(hasher: &mut blake3::Hasher, mode: PutMode) {
-    match mode {
-        PutMode::Put => hasher.update(&[0]),
-        PutMode::PutIfAbsent => hasher.update(&[1]),
-        PutMode::PutIfVersion(version) => {
-            hasher.update(&[2]);
-            hasher.update(&version.0.to_be_bytes())
-        }
-        PutMode::PutImmutable => hasher.update(&[3]),
-    };
-}
-
-fn hash_precondition(hasher: &mut blake3::Hasher, precondition: Precondition) {
-    match precondition {
-        Precondition::Any => hasher.update(&[0]),
-        Precondition::Absent => hasher.update(&[1]),
-        Precondition::Version(version) => {
-            hasher.update(&[2]);
-            hasher.update(&version.0.to_be_bytes())
-        }
-    };
-}
-
-fn hash_optional_string(hasher: &mut blake3::Hasher, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            hasher.update(&[1]);
-            hash_string(hasher, value);
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
-}
-
-fn hash_durability(hasher: &mut blake3::Hasher, durability: Durability) {
-    hasher.update(&[match durability {
-        Durability::Local => 0,
-        Durability::Replicated => 1,
-    }]);
-}
-
-fn require_local_durability(durability: Durability) -> Result<(), MutationError> {
-    match durability {
-        Durability::Local => Ok(()),
-        Durability::Replicated => Err(MutationError::DurabilityUnavailable),
-    }
-}
-
-fn hash_string(hasher: &mut blake3::Hasher, value: &str) {
-    hasher.update(&(value.len() as u64).to_be_bytes());
-    hasher.update(value.as_bytes());
 }
 
 pub(crate) fn now_unix_millis() -> Result<u64, MutationError> {

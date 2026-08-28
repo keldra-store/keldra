@@ -11,7 +11,10 @@ pub(super) type AuthzRealmStream = std::pin::Pin<
     Box<dyn tokio_stream::Stream<Item = Result<wire::AuthzRealmFrame, Status>> + Send>,
 >;
 
-pub(crate) const DATA_PEER_SCHEMA_VERSION: u32 = 3;
+// 0.14 released schema 3. Alias-aware object mutation v3 and target-local
+// sidecar snapshot/handoff require an exact clean break so an older peer can
+// never acknowledge a mutation after silently dropping alias authority.
+pub(crate) const DATA_PEER_SCHEMA_VERSION: u32 = 4;
 pub(crate) const DATA_PEER_FRAME_BYTES: usize = 64 * 1024;
 pub(super) const MAX_TYPED_MUTATION_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_OBJECT_MUTATION_BATCH_ITEMS: usize = 1_000;

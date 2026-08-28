@@ -16,7 +16,7 @@ use keldra_store::ObjectKey;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
 
-use crate::authentication::Caller;
+use crate::authentication::{Caller, PluginObjectScope};
 use crate::authorization::ObjectPermission;
 use crate::distributed_list::OriginalBearer;
 
@@ -31,6 +31,7 @@ pub(crate) struct IndexRequestContext {
     caller: Caller,
     bearer: OriginalBearer,
     metadata: MetadataMap,
+    plugin_scope: Option<PluginObjectScope>,
     deadline: tokio::time::Instant,
 }
 
@@ -39,12 +40,14 @@ impl IndexRequestContext {
         caller: Caller,
         bearer: OriginalBearer,
         metadata: MetadataMap,
+        plugin_scope: Option<PluginObjectScope>,
         deadline: tokio::time::Instant,
     ) -> Self {
         Self {
             caller,
             bearer,
             metadata,
+            plugin_scope,
             deadline,
         }
     }
@@ -63,6 +66,10 @@ impl IndexRequestContext {
 
     pub(crate) fn metadata(&self) -> &MetadataMap {
         &self.metadata
+    }
+
+    pub(crate) fn plugin_scope(&self) -> Option<&PluginObjectScope> {
+        self.plugin_scope.as_ref()
     }
 
     pub(crate) fn remaining(&self) -> Result<std::time::Duration, Status> {
@@ -142,27 +149,19 @@ pub(crate) trait IndexDefinitionReader: Send + Sync + 'static {
 
 #[tonic::async_trait]
 pub(crate) trait IndexLiveVersionReader: Send + Sync + 'static {
-    async fn current_snapshots(
+    async fn resolved_current_snapshots(
         &self,
         keys: &[ObjectKey],
         tenant_id: u64,
         bucket_id: u64,
         budget: Duration,
-    ) -> Result<Vec<Option<keldra_store::CurrentObjectSnapshot>>, Status>;
+    ) -> Result<Vec<ResolvedIndexCurrentSnapshot>, Status>;
 }
 
-#[tonic::async_trait]
-impl IndexLiveVersionReader for crate::cluster_object_read::ClusterObjectReader {
-    async fn current_snapshots(
-        &self,
-        keys: &[ObjectKey],
-        tenant_id: u64,
-        bucket_id: u64,
-        budget: Duration,
-    ) -> Result<Vec<Option<keldra_store::CurrentObjectSnapshot>>, Status> {
-        self.current_head_snapshots_stable(keys, tenant_id, bucket_id, budget)
-            .await
-    }
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedIndexCurrentSnapshot {
+    pub(crate) canonical: ObjectKey,
+    pub(crate) snapshot: Option<keldra_store::CurrentObjectSnapshot>,
 }
 
 #[tonic::async_trait]

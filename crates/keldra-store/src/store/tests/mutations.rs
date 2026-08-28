@@ -2,6 +2,303 @@ use super::*;
 use crate::{ObjectMutation, ObjectMutationContext, PlacementLogId, ReplicaObjectMutationApplied};
 
 #[tokio::test]
+async fn clone_publishes_an_independent_destination_and_binds_replay_to_source() {
+    let (_temporary, store) = store().await;
+    let source_key = key("clone-source");
+    let destination_key = key("clone-destination");
+    let source = store
+        .put(put(
+            "clone-source",
+            b"shared bytes",
+            Precondition::Absent,
+            "source-command",
+        ))
+        .await
+        .unwrap();
+    let source_version = store
+        .version_metadata(&source_key, source.version)
+        .unwrap()
+        .unwrap();
+    let blob = source_version.blob.clone().unwrap();
+    let request = CloneRequest {
+        source: source_key.clone(),
+        source_version: source.version,
+        destination: destination_key.clone(),
+        blob: blob.clone(),
+        content_type: source_version.content_type.clone(),
+        mode: PutMode::PutIfAbsent,
+        command_id: Some("clone-command".into()),
+        durability: Durability::Local,
+    };
+
+    let cloned = store.clone_object(request.clone()).await.unwrap();
+    assert!(!cloned.replayed);
+    assert_eq!(
+        store
+            .blob_reference_state(&blob)
+            .unwrap()
+            .unwrap()
+            .ref_count,
+        2
+    );
+    let replay = store.clone_object(request.clone()).await.unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.version, cloned.version);
+
+    let mut conflicting = request;
+    conflicting.source = key("another-source");
+    assert_eq!(
+        store.clone_object(conflicting).await.unwrap_err(),
+        MutationError::IdempotencyConflict
+    );
+
+    store
+        .delete(DeleteRequest {
+            key: source_key,
+            precondition: Precondition::Version(source.version),
+            command_id: Some("delete-source".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(&destination_key).await.unwrap().unwrap().bytes,
+        b"shared bytes"
+    );
+    store
+        .put(put(
+            "clone-destination",
+            b"destination changed independently",
+            Precondition::Version(cloned.version),
+            "replace-destination",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(&destination_key).await.unwrap().unwrap().bytes,
+        b"destination changed independently"
+    );
+}
+
+#[tokio::test]
+async fn clone_destination_cas_is_an_ordinary_put_precondition() {
+    let (_temporary, store) = store().await;
+    let source = store
+        .put(put(
+            "clone-cas-source",
+            b"source",
+            Precondition::Absent,
+            "source",
+        ))
+        .await
+        .unwrap();
+    let destination = store
+        .put(put(
+            "clone-cas-destination",
+            b"old",
+            Precondition::Absent,
+            "old",
+        ))
+        .await
+        .unwrap();
+    let source_key = key("clone-cas-source");
+    let version = store
+        .version_metadata(&source_key, source.version)
+        .unwrap()
+        .unwrap();
+    let clone = |expected, command: &str| CloneRequest {
+        source: source_key.clone(),
+        source_version: source.version,
+        destination: key("clone-cas-destination"),
+        blob: version.blob.clone().unwrap(),
+        content_type: version.content_type.clone(),
+        mode: PutMode::PutIfVersion(expected),
+        command_id: Some(command.into()),
+        durability: Durability::Local,
+    };
+    assert!(matches!(
+        store
+            .clone_object(clone(VersionId(destination.version.0 + 1), "wrong"))
+            .await,
+        Err(MutationError::PreconditionFailed { .. })
+    ));
+    let applied = store
+        .clone_object(clone(destination.version, "right"))
+        .await
+        .unwrap();
+    assert!(applied.version > destination.version);
+}
+
+#[tokio::test]
+async fn clone_revalidates_the_exact_source_under_the_shared_path_commit_fence() {
+    let (_temporary, store) = store().await;
+    let source_key = key("clone-retired-source");
+    let source = store
+        .put(put(
+            source_key.path(),
+            b"source",
+            Precondition::Absent,
+            "source",
+        ))
+        .await
+        .unwrap();
+    let selected = store
+        .version_metadata(&source_key, source.version)
+        .unwrap()
+        .unwrap();
+    let blob = selected.blob.unwrap();
+    let request = CloneRequest {
+        source: source_key.clone(),
+        source_version: source.version,
+        destination: key("clone-after-retirement"),
+        blob: blob.clone(),
+        content_type: selected.content_type,
+        mode: PutMode::PutIfAbsent,
+        command_id: Some("stale-clone".into()),
+        durability: Durability::Local,
+    };
+
+    store
+        .delete(DeleteRequest {
+            key: source_key,
+            precondition: Precondition::Version(source.version),
+            command_id: Some("retire-source".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.clone_object(request).await,
+        Err(MutationError::InvalidObjectMutation(message))
+            if message.contains("source exact version")
+    ));
+    assert!(
+        store
+            .head(&key("clone-after-retirement"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .blob_reference_state(&blob)
+            .unwrap()
+            .unwrap()
+            .ref_count,
+        1,
+        "a rejected stale clone must not publish another reference"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_source_delete_and_clone_have_one_safe_linearization() {
+    let (_temporary, store) = store().await;
+    for ordinal in 0..16 {
+        let source_key = key(&format!("clone-race-source-{ordinal}"));
+        let destination_key = key(&format!("clone-race-destination-{ordinal}"));
+        // Blob reference counts are content-addressed across every object in
+        // the Store. Keep each race iteration on an independent BlobRef so
+        // this assertion measures only that iteration's source and clone.
+        let payload = format!("race payload {ordinal}");
+        let source = store
+            .put(put(
+                source_key.path(),
+                payload.as_bytes(),
+                Precondition::Absent,
+                &format!("race-source-{ordinal}"),
+            ))
+            .await
+            .unwrap();
+        let selected = store
+            .version_metadata(&source_key, source.version)
+            .unwrap()
+            .unwrap();
+        let blob = selected.blob.unwrap();
+        let clone_request = CloneRequest {
+            source: source_key.clone(),
+            source_version: source.version,
+            destination: destination_key.clone(),
+            blob: blob.clone(),
+            content_type: selected.content_type,
+            mode: PutMode::PutIfAbsent,
+            command_id: Some(format!("race-clone-{ordinal}")),
+            durability: Durability::Local,
+        };
+        let delete_request = DeleteRequest {
+            key: source_key,
+            precondition: Precondition::Version(source.version),
+            command_id: Some(format!("race-delete-{ordinal}")),
+            durability: Durability::Local,
+        };
+        let clone_store = store.clone();
+        let delete_store = store.clone();
+        let (cloned, deleted) = tokio::join!(
+            clone_store.clone_object(clone_request),
+            delete_store.delete(delete_request),
+        );
+        deleted.unwrap();
+
+        let clone_committed = cloned.is_ok();
+        if let Err(error) = cloned {
+            assert!(matches!(error, MutationError::InvalidObjectMutation(_)));
+        }
+        assert_eq!(
+            store.head(&destination_key).unwrap().is_some(),
+            clone_committed
+        );
+        assert_eq!(
+            store
+                .blob_reference_state(&blob)
+                .unwrap()
+                .unwrap()
+                .ref_count,
+            1 + u64::from(clone_committed),
+            "a committed clone must own its reference before source retirement can win"
+        );
+    }
+}
+
+#[tokio::test]
+async fn generic_distributed_mutation_cannot_bypass_clone_atomic_authority() {
+    let (_temporary, store) = store().await;
+    let source_key = key("distributed-clone-source");
+    let source = store
+        .put(put(
+            source_key.path(),
+            b"source",
+            Precondition::Absent,
+            "distributed-source",
+        ))
+        .await
+        .unwrap();
+    let selected = store
+        .version_metadata(&source_key, source.version)
+        .unwrap()
+        .unwrap();
+    let error = store
+        .coordinate_object_mutation(
+            BatchOperation::Clone(CloneRequest {
+                source: source_key,
+                source_version: source.version,
+                destination: key("distributed-clone-destination"),
+                blob: selected.blob.unwrap(),
+                content_type: selected.content_type,
+                mode: PutMode::PutIfAbsent,
+                command_id: Some("distributed-clone".into()),
+                durability: Durability::Replicated,
+            }),
+            distributed_context(29),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MutationError::InvalidObjectMutation(message)
+            if message.contains("exact retained-version atomic precondition")
+    ));
+}
+
+#[tokio::test]
 async fn idempotency_is_checked_before_the_precondition() {
     let (_temporary, store) = store().await;
     let request = put("a", b"one", Precondition::Absent, "same-command");
@@ -667,6 +964,15 @@ async fn distributed_metadata_coordination_retains_only_awaiting_source_content(
             .await
             .unwrap();
         let mutation = coordinated.mutation.unwrap();
+        assert_eq!(mutation.format, crate::LEGACY_OBJECT_MUTATION_FORMAT);
+        assert!(mutation.alias_snapshot.is_none());
+        let legacy_wire = serde_json::to_vec(&mutation).unwrap();
+        let legacy_wire_text = String::from_utf8_lossy(&legacy_wire);
+        assert!(!legacy_wire_text.contains("alias_snapshot"));
+        assert!(!legacy_wire_text.contains("protected_link_descriptor"));
+        let decoded_legacy: ObjectMutation = serde_json::from_slice(&legacy_wire).unwrap();
+        decoded_legacy.validate().unwrap();
+        assert_eq!(decoded_legacy, mutation);
         let reference = mutation.version.blob.as_ref().unwrap();
         assert_eq!(
             mutation.reference_deltas,

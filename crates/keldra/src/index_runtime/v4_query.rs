@@ -15,6 +15,8 @@ use keldra_index::v4::{
     Schema,
 };
 
+use super::date::parse_millis;
+
 const MAX_COMPUTATIONS: usize = 32;
 const MAX_FACET_BUCKETS: u32 = 1_000;
 const MAX_PREDICATE_DEPTH: u32 = 32;
@@ -500,6 +502,15 @@ fn decode_scalar(encoded: &[u8], field: &FieldSchema) -> Result<ScalarValue, Ind
             }
             _ => ScalarValue::number(value.as_f64().ok_or_else(invalid)?).map_err(|_| invalid())?,
         },
+        FieldType::Date => ScalarValue::Signed(
+            parse_millis(
+                value.as_str().ok_or_else(invalid)?,
+                field.date_format.as_ref().ok_or_else(|| {
+                    IndexError::InvalidDefinition("Date field has no format".into())
+                })?,
+            )
+            .map_err(|_| invalid())?,
+        ),
         FieldType::Keyword => ScalarValue::String(value.as_str().ok_or_else(invalid)?.to_owned()),
         FieldType::Text | FieldType::Vector => return Err(invalid()),
     })
@@ -561,6 +572,7 @@ mod tests {
         IndexPredicateNegation, KeywordIndexField, PathIndexQuery, PathIndexSpec, TextIndexField,
         TypedJsonIndexQuery, TypedJsonIndexSpec, index_field,
     };
+    use keldra_index::v4::DateFormat;
 
     use super::*;
     use crate::index_runtime::v4_schema::compile_schema;
@@ -779,6 +791,20 @@ mod tests {
         assert!(decode_scalar(b"4", &keyword_schema.fields[0]).is_err());
         assert!(decode_scalar(br#""\u0061ctive""#, &keyword_schema.fields[0]).is_err());
         assert!(decode_scalar(b" \"active\"", &keyword_schema.fields[0]).is_err());
+    }
+
+    #[test]
+    fn date_query_literals_use_the_fields_format() {
+        let (_, mut schema) = typed();
+        let field = &mut schema.fields[0];
+        field.field_type = FieldType::Date;
+        field.date_format = Some(DateFormat::Strftime("%d/%m/%Y".into()));
+        assert_eq!(
+            decode_scalar(br#""02/01/1970""#, field).unwrap(),
+            ScalarValue::Signed(86_400_000)
+        );
+        assert!(decode_scalar(br#""1970-01-02""#, field).is_err());
+        assert!(decode_scalar(b"86400000", field).is_err());
     }
 
     #[test]

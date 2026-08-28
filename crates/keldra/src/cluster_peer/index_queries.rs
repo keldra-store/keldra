@@ -155,7 +155,8 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
             call.request.bucket_id,
             call.request.definition.index_id,
         )?;
-        let caller = routed_caller(&self.tokens, &call.bearer, &call.request.storage_tenant)?;
+        let (caller, plugin_scope) =
+            routed_caller(&self.tokens, &call.bearer, &call.request.storage_tenant)?;
         let tenant = caller.storage_tenant().as_str();
         let resolved = self
             .names
@@ -209,6 +210,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
                 request.tenant_id,
                 request.bucket_id,
                 call.deadline,
+                plugin_scope,
                 self.authorization.clone(),
                 self.live_versions.clone(),
             ));
@@ -523,15 +525,21 @@ fn routed_caller(
     tokens: &JwtManager,
     bearer: &str,
     storage_tenant: &str,
-) -> Result<crate::authentication::Caller, Status> {
+) -> Result<
+    (
+        crate::authentication::Caller,
+        Option<crate::authentication::PluginObjectScope>,
+    ),
+    Status,
+> {
     let routed = OriginalBearer::from_signed_token(bearer);
-    let caller = if routed.is_anonymous() {
+    let (caller, plugin_scope) = if routed.is_anonymous() {
         let tenant = StorageTenantId::parse(storage_tenant)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        crate::authentication::Caller::from_anonymous(tenant)
+        (crate::authentication::Caller::from_anonymous(tenant), None)
     } else {
         tokens
-            .verify(routed.signed_token())
+            .verify_object_bearer(routed.signed_token())
             .map_err(|_| Status::unauthenticated("the routed bearer token is invalid or expired"))?
     };
     if caller.storage_tenant().as_str() != storage_tenant {
@@ -539,7 +547,7 @@ fn routed_caller(
             "routed index query does not belong to the authenticated tenant",
         ));
     }
-    Ok(caller)
+    Ok((caller, plugin_scope))
 }
 
 fn validate_result(
@@ -900,8 +908,9 @@ mod tests {
     #[test]
     fn routed_anonymous_marker_reconstructs_only_the_named_tenant() {
         let tokens = JwtManager::new(b"anonymous-index-route-secret-0123456789").unwrap();
-        let anonymous =
+        let (anonymous, plugin_scope) =
             routed_caller(&tokens, keldra_authz::ANONYMOUS_SUBJECT_ID, "tenant").unwrap();
+        assert!(plugin_scope.is_none());
         assert_eq!(anonymous.storage_tenant().as_str(), "tenant");
         assert_eq!(anonymous.subject(), &keldra_authz::ObjectRef::anonymous());
 
@@ -914,6 +923,25 @@ mod tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
+    }
+
+    #[test]
+    fn routed_plugin_bearer_preserves_its_object_scope() {
+        let tokens = JwtManager::new(b"plugin-index-route-secret-012345678901").unwrap();
+        let token = tokens
+            .mint_plugin_token(
+                StorageTenantId::parse("tenant").unwrap(),
+                "plugin",
+                "bucket",
+                "allowed/root",
+            )
+            .unwrap();
+        let (caller, plugin_scope) = routed_caller(&tokens, &token, "tenant").unwrap();
+
+        assert_eq!(caller.storage_tenant().as_str(), "tenant");
+        let plugin_scope = plugin_scope.expect("plugin bearer must retain its scope");
+        assert!(plugin_scope.allows("tenant", "bucket", "allowed/root/object"));
+        assert!(!plugin_scope.allows("tenant", "bucket", "another/object"));
     }
 
     #[test]

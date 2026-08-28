@@ -16,10 +16,10 @@ use std::time::Duration;
 
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
-    BatchOperation, BlobRef, CoordinatedObjectMutation, CoordinatedRetainedVersionDelete,
-    DefinitionMutationIntent, DeleteRetainedVersionOutcome, Durability, ErasureProfile,
-    MutationError, MutationReceipt, ObjectKey, ObjectMutationGovernance, PublishRequest,
-    PutRequest, Store, VersionId,
+    BatchOperation, BlobRef, CloneRequest, CoordinatedObjectMutation,
+    CoordinatedRetainedVersionDelete, DefinitionMutationIntent, DeleteRetainedVersionOutcome,
+    Durability, ErasureProfile, MutationError, MutationReceipt, ObjectKey,
+    ObjectMutationGovernance, PublishRequest, PutRequest, Store, VersionId,
 };
 use tonic::Status;
 
@@ -29,7 +29,7 @@ use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::payload_distribution::{
     PayloadDistribution, PayloadDistributionError, PayloadPeerTransport,
 };
-use crate::payload_placement::select_payload_placement;
+use crate::payload_placement::{NodePayloadEvidence, select_payload_placement};
 use crate::placement::PlacementKind;
 use crate::reference_delivery::ReferenceRuntimeHandle;
 use crate::serving_fence::ServingAuthority;
@@ -173,6 +173,26 @@ impl ObjectDistribution {
         };
         self.publish_from_source_with_governance(request, upload_source, governance)
             .await
+    }
+
+    /// Publishes a second logical reference to an already-placed immutable
+    /// payload. No payload bytes are read, reconstructed, or transferred.
+    pub(crate) async fn clone_reference(
+        &self,
+        request: CloneRequest,
+        governance: ObjectMutationGovernance,
+    ) -> Result<MutationReceipt, Status> {
+        if self.is_single_node()? {
+            let _permit = self.mutation_admission.enter()?;
+            return self
+                .store
+                .mutate_with_governance_and_backpressure(BatchOperation::Clone(request), governance)
+                .await
+                .map_err(mutation_status);
+        }
+        Err(Status::unavailable(
+            "distributed CloneObject requires an exact retained-version atomic precondition and is not enabled",
+        ))
     }
 
     pub(crate) async fn publish_from_source_with_governance(
@@ -374,7 +394,7 @@ impl ObjectDistribution {
                         Err(error) => Err(mutation_status(error)),
                         Ok(coordinated) => {
                             let replayed = coordinated.receipt.replayed;
-                            if let Some(position) = completion
+                            if let Some((source, positions)) = completion
                                 .replicate_without_settlement(
                                     &completion_placement,
                                     &completion_group,
@@ -383,7 +403,8 @@ impl ObjectDistribution {
                                 .await?
                                 && !replayed
                             {
-                                quorum_proven_positions.push(position);
+                                quorum_proven_positions
+                                    .extend(positions.into_iter().map(|offset| (source, offset)));
                             }
                             Ok(coordinated)
                         }
@@ -794,6 +815,11 @@ impl ObjectDistribution {
                     )
                     .await;
             }
+            BatchOperation::Clone(_) => {
+                return Err(Status::unavailable(
+                    "distributed CloneObject requires an exact retained-version atomic precondition and is not enabled",
+                ));
+            }
             operation => operation,
         };
         loop {
@@ -855,6 +881,11 @@ impl ObjectDistribution {
                         definition_intent,
                     )
                     .await;
+            }
+            BatchOperation::Clone(_) => {
+                return Err(Status::unavailable(
+                    "distributed CloneObject requires an exact retained-version atomic precondition and is not enabled",
+                ));
             }
             operation => operation,
         };
@@ -1113,18 +1144,32 @@ impl ObjectDistribution {
     /// Make an executor-local ordinary blob recoverable under the cluster's
     /// failure-tolerant payload rule before an atomic visibility decision.
     pub(crate) async fn prepare_program_blob(&self, reference: &BlobRef) -> Result<(), Status> {
-        let placement = self.placement()?;
-        let evidence = self
-            .payload
-            .prepare_on_upload_source(&placement, reference, Durability::Replicated)
+        self.prepare_program_blob_from_source(reference, self.local_node)
             .await
-            .map_err(payload_status)?;
+    }
+
+    /// Make a blob sealed by one exact ACTIVE upload source recoverable before
+    /// a built-in atomic transaction becomes visible on the nominated executor.
+    pub(crate) async fn prepare_program_blob_from_source(
+        &self,
+        reference: &BlobRef,
+        upload_source: NodeId,
+    ) -> Result<(), Status> {
+        let placement = self.placement()?;
+        if !placement.active_node_ids().contains(&upload_source) {
+            return Err(Status::failed_precondition(
+                "built-in transaction upload source is not ACTIVE",
+            ));
+        }
+        let evidence = self
+            .prepare_payload(&placement, upload_source, reference, Durability::Replicated)
+            .await?;
         self.payload
             .verify_on_path_coordinator(
                 &placement,
                 reference,
                 Durability::Replicated,
-                self.local_node,
+                upload_source,
                 &evidence,
             )
             .await
@@ -1205,6 +1250,22 @@ impl ObjectDistribution {
         evidence: &crate::payload_distribution::PreparedPayloadEvidence,
         coordinated: &CoordinatedObjectMutation,
     ) -> Result<(), Status> {
+        self.wait_for_replicated_reference_evidence(
+            placement,
+            reference,
+            evidence.artifacts(),
+            coordinated,
+        )
+        .await
+    }
+
+    async fn wait_for_replicated_reference_evidence(
+        &self,
+        placement: &ClusterPlacement,
+        reference: &BlobRef,
+        evidence: &[NodePayloadEvidence],
+        coordinated: &CoordinatedObjectMutation,
+    ) -> Result<(), Status> {
         let Some(mutation) = coordinated.mutation.as_ref() else {
             return Ok(());
         };
@@ -1221,7 +1282,7 @@ impl ObjectDistribution {
             self.erasure_profile,
             placement.placement_nodes(),
         )
-        .replicated_reference_owners(evidence.artifacts())
+        .replicated_reference_owners(evidence)
         .map_err(|error| payload_status(error.into()))?;
         self.references
             .wait_for_reference_effects(
@@ -1274,17 +1335,17 @@ impl ObjectDistribution {
         group: &MutableRecordReplicaGroup,
         coordinated: &CoordinatedObjectMutation,
     ) -> Result<(), Status> {
-        if let Some((source, offset)) = self
+        if let Some((source, offsets)) = self
             .replicate_without_settlement(placement, group, coordinated)
             .await?
             && let Err(error) = self
                 .store
-                .settle_source_journal_position_if_contiguous(source, offset)
+                .settle_source_journal_positions_if_contiguous(source, &offsets)
                 .await
         {
             tracing::warn!(
                 source = ?source,
-                offset,
+                offsets = ?offsets,
                 %error,
                 "metadata quorum succeeded but direct source settlement failed"
             );
@@ -1297,7 +1358,7 @@ impl ObjectDistribution {
         placement: &ClusterPlacement,
         group: &MutableRecordReplicaGroup,
         coordinated: &CoordinatedObjectMutation,
-    ) -> Result<Option<(keldra_store::SourceId, u64)>, Status> {
+    ) -> Result<Option<(keldra_store::SourceId, Vec<u64>)>, Status> {
         let Some(mutation) = coordinated.mutation.as_ref() else {
             // The local command receipt proved an exact idempotent replay.
             return Ok(None);
@@ -1335,7 +1396,7 @@ impl ObjectDistribution {
         if group.is_acknowledged_by(&durable) {
             return Ok(Some((
                 mutation.stamp.source_id,
-                mutation.stamp.source_journal_position,
+                mutation_journal_positions(mutation)?,
             )));
         }
         tracing::warn!(
@@ -1451,8 +1512,27 @@ fn operation_key(operation: &BatchOperation) -> &ObjectKey {
     match operation {
         BatchOperation::Put(request) => &request.key,
         BatchOperation::Publish(request) => &request.key,
+        BatchOperation::Clone(request) => &request.destination,
         BatchOperation::Delete(request) => &request.key,
     }
+}
+
+pub(super) fn mutation_journal_positions(
+    mutation: &keldra_store::ObjectMutation,
+) -> Result<Vec<u64>, Status> {
+    let count = 1 + mutation
+        .alias_snapshot
+        .as_ref()
+        .map_or(0, |snapshot| snapshot.registry.aliases.len());
+    (0..count)
+        .map(|offset| {
+            mutation
+                .stamp
+                .source_journal_position
+                .checked_add(offset as u64)
+                .ok_or_else(|| Status::data_loss("object mutation journal range is exhausted"))
+        })
+        .collect()
 }
 
 fn object_placement_key(tenant_id: u64, bucket_id: u64, path: &str) -> Vec<u8> {
@@ -1476,6 +1556,7 @@ fn mutation_status(error: MutationError) -> Status {
         | MutationError::ObjectMutationLineageGap { .. }
         | MutationError::ObjectMutationSibling { .. }
         | MutationError::ObjectVersioningNotEnabled
+        | MutationError::ObjectHasInboundAliases
         | MutationError::CurrentTombstoneCannotBeDeleted => {
             Status::failed_precondition(error.to_string())
         }

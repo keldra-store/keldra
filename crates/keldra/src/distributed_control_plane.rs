@@ -380,6 +380,21 @@ impl DistributedControlPlane {
         .map(|_| ())
     }
 
+    pub(crate) async fn authorize_cluster_capabilities(
+        &self,
+        caller: &Caller,
+    ) -> Result<(), Status> {
+        self.authorize_system(
+            caller.subject(),
+            ObjectRef::opaque("system", keldra_store::SYSTEM_STORAGE_TENANT_ID)
+                .map_err(authz_evaluation_status)?,
+            "manage_system",
+            "cluster capability management is not authorized",
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(crate) async fn exchange_client_credentials(
         &self,
         request: api::ExchangeClientCredentialsRequest,

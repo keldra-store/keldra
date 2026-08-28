@@ -41,10 +41,13 @@ fn snapshot(version: u64, predecessor: Option<u64>, branch: u8) -> ObjectPathSna
             content_type: None,
             deleted: false,
             committed_at_unix_millis: version,
+            protected_link_descriptor: false,
         }],
         journal_pending_versions: Vec::new(),
         journal_released_versions: Vec::new(),
         definition_locator: None,
+        alias_registry: None,
+        alias_registry_transition: None,
     }
 }
 
@@ -62,6 +65,7 @@ fn current_snapshot(version: u64, predecessor: Option<u64>, branch: u8) -> Curre
         exact_path: snapshot.exact_path,
         head: snapshot.head,
         version: snapshot.versions.into_iter().next().unwrap(),
+        alias_registry: None,
     }
 }
 

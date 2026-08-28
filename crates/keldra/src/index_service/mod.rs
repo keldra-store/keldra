@@ -11,7 +11,7 @@ pub(crate) use boundary::{
     ExecuteIndexQuery, ExecutedIndexQuery, IndexAuthorization, IndexAuthorizationEvidence,
     IndexDefinitionLister, IndexDefinitionScan, IndexDefinitionScanPage, IndexFreshnessRequirement,
     IndexLiveVersionReader, IndexPageCursor, IndexQueryExecutor, IndexServiceDependencies,
-    ListedIndexDefinition, RequiredIndexSourceCheckpoint,
+    ListedIndexDefinition, RequiredIndexSourceCheckpoint, ResolvedIndexCurrentSnapshot,
 };
 pub(crate) use candidate_visibility::{
     AuthorizedCurrentCandidates, CandidateVisibilityEvidence, IndexCandidateIdentity,

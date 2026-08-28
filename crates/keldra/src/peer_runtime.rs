@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use keldra_consensus::{
-    ApplyError, ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, Command,
+    ApplyError, ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, ClusterId, Command,
     CommittedPeerPinProvider, CommittedPeerPins, DecisionRaft, DecisionRaftError,
     ErasureCodeProfile, JoinCapabilityHash, MAX_PEER_ADDRESS_BYTES, MembershipTransitionKind,
     NodeDescriptor, NodeId, NodeState, PeerAddress, PeerNode, PeerRpcKind, PeerSpkiSha256,
@@ -24,6 +24,10 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use uuid::Uuid;
 
+use crate::cluster_capabilities::{
+    PEER_PROTOCOL_CAPABILITY, STORAGE_FORMAT_CAPABILITY, binary_supports_selected,
+    descriptor_supports_selected,
+};
 use crate::cluster_peer::{
     ClusterPeerService, LateBoundDistributedControl, LateBoundFreshAuthorization,
     RoutedAccountingHandlers, RoutedAuthzHandlers, RoutedIndexQueryHandlers, RoutedPublicHandlers,
@@ -42,8 +46,6 @@ use crate::personaldb::RoutedPersonalDbHandlers;
 use crate::programs::LateBoundProgramQuiescence;
 
 const GENESIS_STORAGE_WEIGHT_MILLIONTHS: u32 = 1_000_000;
-const PEER_PROTOCOL_VERSION: u16 = 1;
-const STORAGE_FORMAT_VERSION: u16 = 1;
 
 pub(crate) struct OpenPeerConfig<'a> {
     pub(crate) data_dir: &'a Path,
@@ -815,14 +817,8 @@ async fn admit_genesis_descriptor(
         current_peer_spki_sha256: peer_pin,
         overlap_peer_spki_sha256: None,
         join_capability_hash: Some(genesis_transition_hash(node_id, peer_pin)),
-        supported_protocol: CapabilityRange {
-            min: PEER_PROTOCOL_VERSION,
-            max: PEER_PROTOCOL_VERSION,
-        },
-        supported_storage_format: CapabilityRange {
-            min: STORAGE_FORMAT_VERSION,
-            max: STORAGE_FORMAT_VERSION,
-        },
+        supported_protocol: PEER_PROTOCOL_CAPABILITY,
+        supported_storage_format: STORAGE_FORMAT_CAPABILITY,
     };
     let begin = match decisions
         .submit(Command::BeginAddNode {
@@ -897,12 +893,20 @@ fn validate_restart_state(
         .get(&identity.node_id())
         .context("local node has no committed cluster descriptor")?;
     anyhow::ensure!(
+        binary_supports_selected(&state),
+        "running binary does not support the cluster's selected peer protocol or storage format"
+    );
+    anyhow::ensure!(
         descriptor.state == NodeState::Active,
         "local node is not ACTIVE in committed cluster state"
     );
     anyhow::ensure!(
         descriptor.peer_address == *configured_address,
         "configured peer advertise address does not match committed node descriptor"
+    );
+    anyhow::ensure!(
+        descriptor_supports_selected(&state, descriptor),
+        "committed node descriptor does not support the cluster's selected peer protocol or storage format"
     );
     let committed = CommittedPeerPins {
         current: descriptor.current_peer_spki_sha256,
@@ -946,6 +950,10 @@ fn validate_joining_restart_state(
         .get(&identity.node_id())
         .context("JOINING node has no committed cluster descriptor")?;
     anyhow::ensure!(
+        binary_supports_selected(&state),
+        "running JOINING binary does not support the cluster's selected peer protocol or storage format"
+    );
+    anyhow::ensure!(
         descriptor.peer_address == *configured_address
             && descriptor.peer_address == *pending.peer_address(),
         "JOINING peer address differs from its committed descriptor"
@@ -953,6 +961,10 @@ fn validate_joining_restart_state(
     anyhow::ensure!(
         descriptor.storage_weight_millionths == pending.storage_weight_millionths(),
         "JOINING storage weight differs from its committed descriptor"
+    );
+    anyhow::ensure!(
+        descriptor_supports_selected(&state, descriptor),
+        "JOINING descriptor does not support the cluster's selected peer protocol or storage format"
     );
     anyhow::ensure!(
         descriptor.current_peer_spki_sha256 == presented_pin,
@@ -1435,8 +1447,8 @@ mod tests {
                     current_peer_spki_sha256: bundle.peer_spki_sha256().unwrap(),
                     overlap_peer_spki_sha256: None,
                     join_capability_hash: Some(bundle.capability_hash()),
-                    supported_protocol: CapabilityRange { min: 1, max: 1 },
-                    supported_storage_format: CapabilityRange { min: 1, max: 1 },
+                    supported_protocol: PEER_PROTOCOL_CAPABILITY,
+                    supported_storage_format: STORAGE_FORMAT_CAPABILITY,
                 },
             })
             .await

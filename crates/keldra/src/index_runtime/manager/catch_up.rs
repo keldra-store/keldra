@@ -1,5 +1,8 @@
 //! Bounded exact-version journal catch-up.
 
+#[path = "catch_up/alias_paths.rs"]
+mod alias_paths;
+
 use keldra_store::MAX_OBJECT_RECORD_EXPORT_RECORDS;
 
 use crate::index_runtime::committed_view::MAX_PENDING_ATOMIC_BATCHES;
@@ -12,6 +15,7 @@ use super::rebuild::{
     partition_projection_lanes, receive_ordered_lane_item, run_projection_lanes,
 };
 use super::*;
+use alias_paths::{ExactSourcePath, atomic_source_paths, ordinary_journal_source_paths};
 
 pub(super) struct JournalPageWork {
     pub(super) changed: bool,
@@ -26,7 +30,7 @@ pub(super) struct JournalPageWork {
 pub(super) struct AtomicProjectionWork {
     cursor: u64,
     bundle_hash: keldra_store::PreparedBundleHash,
-    paths: Vec<(String, u64)>,
+    paths: Vec<ExactSourcePath>,
     next_path: usize,
     staged: CandidateCommit,
     builder: NativeSegmentBuild,
@@ -348,7 +352,7 @@ async fn start_atomic_projection(
     definition: &CatalogDefinition,
     kind: IndexKind,
     plan: SegmentMemoryPlan,
-    paths: Vec<(String, u64)>,
+    paths: Vec<ExactSourcePath>,
     batch: &keldra_store::AtomicBatchPublished,
     builder: &mut NativeSegmentBuild,
     candidate: &mut CandidateCommit,
@@ -524,12 +528,27 @@ fn atomic_staging_overhead_bytes(
             .ok_or_else(|| Status::resource_exhausted("atomic path count overflow"))?;
         path_dynamic_bytes = path_dynamic_bytes
             .checked_add(mutation.exact_path.len())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    mutation
+                        .canonical_path
+                        .as_ref()
+                        .map_or(mutation.exact_path.len(), String::len),
+                )
+            })
             .ok_or_else(|| Status::resource_exhausted("atomic path size overflow"))?;
         key_chunk_count += 1;
         key_chunk_dynamic_bytes = key_chunk_dynamic_bytes
             .checked_add(definition.stored.tenant.len())
             .and_then(|bytes| bytes.checked_add(definition.stored.bucket.len()))
-            .and_then(|bytes| bytes.checked_add(mutation.exact_path.len()))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    mutation
+                        .canonical_path
+                        .as_ref()
+                        .map_or(mutation.exact_path.len(), String::len),
+                )
+            })
             .ok_or_else(|| Status::resource_exhausted("atomic source-key size overflow"))?;
         if key_chunk_count == MAX_OBJECT_RECORD_EXPORT_RECORDS as usize {
             maximum_key_bytes = maximum_key_bytes.max(key_chunk_resident_bytes(
@@ -544,10 +563,10 @@ fn atomic_staging_overhead_bytes(
         key_chunk_count,
         key_chunk_dynamic_bytes,
     )?);
-    let path_bytes = std::mem::size_of::<Vec<(String, u64)>>()
+    let path_bytes = std::mem::size_of::<Vec<ExactSourcePath>>()
         .checked_add(
             relevant_count
-                .checked_mul(std::mem::size_of::<(String, u64)>())
+                .checked_mul(std::mem::size_of::<ExactSourcePath>())
                 .ok_or_else(|| Status::resource_exhausted("atomic path size overflow"))?,
         )
         .and_then(|bytes| bytes.checked_add(path_dynamic_bytes))
@@ -746,85 +765,6 @@ fn barrier_after_changes(
     Ok(through)
 }
 
-fn ordinary_journal_source_paths(
-    tenant_id: u64,
-    bucket_id: u64,
-    path_prefix: &str,
-    changes: &[IndexJournalChange],
-) -> Vec<(String, u64)> {
-    let mut paths = BTreeMap::<String, u64>::new();
-    for entry in changes {
-        let (change_tenant_id, change_bucket_id, path, version) = match &entry.change {
-            LocalChange::ObjectHead(change) if change.program_commit_cursor.is_none() => (
-                change.tenant_id,
-                change.bucket_id,
-                &change.exact_path,
-                change.path_version.0,
-            ),
-            LocalChange::RetainedVersionDeleted(change)
-                if change.resulting_head_version.is_some() =>
-            {
-                (
-                    change.tenant_id,
-                    change.bucket_id,
-                    &change.exact_path,
-                    change.resulting_head_version.unwrap().0,
-                )
-            }
-            _ => continue,
-        };
-        if change_tenant_id == tenant_id
-            && change_bucket_id == bucket_id
-            && path_matches_prefix(path, path_prefix)
-            && !contains_reserved_segment(path)
-        {
-            // A source journal, not the numeric VersionId, is the ordering
-            // authority. Repeated mutations to one path coalesce to the last
-            // record in this exact processed interval.
-            paths.insert(path.clone(), version);
-        }
-    }
-    paths.into_iter().collect()
-}
-
-fn atomic_source_paths(
-    tenant_id: u64,
-    bucket_id: u64,
-    path_prefix: &str,
-    batch: &keldra_store::AtomicBatchPublished,
-) -> Vec<(String, u64)> {
-    // Atomic mutation descriptors are canonically sorted at authoritative
-    // ingress. Preserve that order and coalesce adjacent duplicates without a
-    // second tree allocation.
-    let relevant_count = batch
-        .mutations
-        .iter()
-        .filter(|mutation| {
-            mutation.tenant_id == tenant_id
-                && mutation.bucket_id == bucket_id
-                && path_matches_prefix(&mutation.exact_path, path_prefix)
-                && !contains_reserved_segment(&mutation.exact_path)
-        })
-        .count();
-    let mut paths = Vec::<(String, u64)>::with_capacity(relevant_count);
-    for mutation in &batch.mutations {
-        if mutation.tenant_id == tenant_id
-            && mutation.bucket_id == bucket_id
-            && path_matches_prefix(&mutation.exact_path, path_prefix)
-            && !contains_reserved_segment(&mutation.exact_path)
-        {
-            if let Some((last_path, selected)) = paths.last_mut()
-                && last_path == &mutation.exact_path
-            {
-                *selected = (*selected).max(mutation.path_version.0);
-            } else {
-                paths.push((mutation.exact_path.clone(), mutation.path_version.0));
-            }
-        }
-    }
-    paths
-}
-
 #[cfg(test)]
 pub(super) fn journal_source_paths(
     tenant_id: u64,
@@ -905,15 +845,15 @@ pub(super) fn journal_page_resident_bytes(page: &IndexJournalPage) -> Result<u64
             LocalChange::ObjectHead(change) => change
                 .exact_path
                 .capacity()
-                .checked_add(
-                    change
-                        .reference_deltas
-                        .capacity()
-                        .checked_mul(std::mem::size_of::<keldra_store::ReferenceDelta>())
-                        .ok_or_else(|| {
-                            Status::resource_exhausted("journal page resident overflow")
-                        })?,
-                )
+                .checked_add(change.canonical_path.as_ref().map_or(0, String::capacity))
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        change
+                            .reference_deltas
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<keldra_store::ReferenceDelta>())?,
+                    )
+                })
                 .and_then(|bytes| {
                     bytes.checked_add(
                         change
@@ -959,7 +899,16 @@ pub(super) fn journal_page_resident_bytes(page: &IndexJournalPage) -> Result<u64
                     .and_then(|(routes, mutations)| routes.checked_add(mutations))
                     .and_then(|fixed| {
                         change.mutations.iter().try_fold(fixed, |bytes, mutation| {
-                            bytes.checked_add(mutation.exact_path.capacity())
+                            bytes
+                                .checked_add(mutation.exact_path.capacity())
+                                .and_then(|bytes| {
+                                    bytes.checked_add(
+                                        mutation
+                                            .canonical_path
+                                            .as_ref()
+                                            .map_or(0, String::capacity),
+                                    )
+                                })
                         })
                     })
             }
@@ -976,19 +925,23 @@ pub(super) fn journal_page_resident_bytes(page: &IndexJournalPage) -> Result<u64
 
 async fn load_exact_sources(
     definition: &CatalogDefinition,
-    paths: &[(String, u64)],
+    paths: &[ExactSourcePath],
     dependencies: &IndexBuilderDependencies,
 ) -> Result<Vec<IndexSourceMutation>, Status> {
     let keys = paths
         .iter()
-        .map(|(path, _)| {
-            ObjectKey::new(&definition.stored.tenant, &definition.stored.bucket, path)
-                .map_err(|error| Status::internal(error.to_string()))
+        .map(|path| {
+            ObjectKey::new(
+                &definition.stored.tenant,
+                &definition.stored.bucket,
+                &path.canonical_path,
+            )
+            .map_err(|error| Status::internal(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let versions = paths
         .iter()
-        .map(|(_, version)| VersionId(*version))
+        .map(|path| VersionId(path.version))
         .collect::<Vec<_>>();
     let selected = dependencies
         .reader
@@ -997,8 +950,15 @@ async fn load_exact_sources(
     paths
         .iter()
         .zip(selected)
-        .map(|((path, expected_version), version)| {
-            exact_source(definition, path, *expected_version, version)
+        .map(|(path, version)| {
+            if path.deleted {
+                Ok(IndexSourceMutation::Remove(ObjectIdentity {
+                    path: path.logical_path.clone(),
+                    version: path.version,
+                }))
+            } else {
+                exact_source(definition, &path.logical_path, path.version, version)
+            }
         })
         .collect()
 }
@@ -1574,6 +1534,7 @@ mod tests {
                     tenant_id: 2,
                     bucket_id: 3,
                     exact_path: path,
+                    canonical_path: None,
                     path_version: VersionId(4),
                     kind: keldra_store::ObjectHeadChangeKind::Put,
                     program_commit_cursor: None,
@@ -1631,6 +1592,7 @@ mod tests {
                 tenant_id: 2,
                 bucket_id: 3,
                 exact_path: "objects/a".into(),
+                canonical_path: None,
                 path_version: VersionId(4),
                 kind: keldra_store::ObjectHeadChangeKind::Put,
                 program_commit_cursor: None,
@@ -1647,6 +1609,7 @@ mod tests {
                 tenant_id: 2,
                 bucket_id: 3,
                 exact_path: "objects/b".into(),
+                canonical_path: None,
                 path_version: VersionId(5),
                 kind: keldra_store::ObjectHeadChangeKind::Put,
                 program_commit_cursor: None,
@@ -1674,6 +1637,7 @@ mod tests {
                 tenant_id: 2,
                 bucket_id: 3,
                 exact_path: path.into(),
+                canonical_path: None,
                 path_version: VersionId(offset),
                 kind: keldra_store::ObjectHeadChangeKind::Put,
                 program_commit_cursor: None,
@@ -1794,6 +1758,7 @@ mod tests {
                         tenant_id: 2,
                         bucket_id: 3,
                         exact_path: "objects/partial".into(),
+                        canonical_path: None,
                         path_version: VersionId(4),
                         kind: keldra_store::ObjectHeadChangeKind::Put,
                         program_commit_cursor: Some(70),
@@ -1821,6 +1786,7 @@ mod tests {
                             tenant_id: 2,
                             bucket_id: 3,
                             exact_path: "objects/complete".into(),
+                            canonical_path: None,
                             path_version: VersionId(5),
                             deleted: false,
                         }],
@@ -1865,28 +1831,6 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_coalescing_uses_journal_order_not_version_magnitude() {
-        let change = |offset, version| IndexJournalChange {
-            node: NodeId(1),
-            change: LocalChange::ObjectHead(keldra_store::ObjectHeadChange {
-                offset,
-                tenant_id: 2,
-                bucket_id: 3,
-                exact_path: "objects/current".into(),
-                path_version: VersionId(version),
-                kind: keldra_store::ObjectHeadChangeKind::Put,
-                program_commit_cursor: None,
-                reference_deltas: Vec::new(),
-                accounting_transition: None,
-                definition_transition: None,
-            }),
-        };
-        let paths =
-            ordinary_journal_source_paths(2, 3, "objects/", &[change(8, 100), change(9, 90)]);
-        assert_eq!(paths, vec![("objects/current".into(), 90)]);
-    }
-
-    #[test]
     fn finalized_atomic_replay_is_suppressed_but_conflicting_pending_hash_fails() {
         let from = IndexBarrier {
             fence: keldra_store::PlacementLogId { term: 1, index: 1 },
@@ -1914,6 +1858,7 @@ mod tests {
                 tenant_id: 2,
                 bucket_id: 3,
                 exact_path: "objects/complete".into(),
+                canonical_path: None,
                 path_version: VersionId(5),
                 deleted: false,
             }],

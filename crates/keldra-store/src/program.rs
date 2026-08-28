@@ -11,7 +11,7 @@ use rocksdb::{WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::key::BucketIdentity;
+use crate::key::{BucketId, BucketIdentity, TenantId};
 use crate::model::{MUTATION_STAMP_FORMAT, MutationStamp};
 use crate::store::{
     CF_HEADS, CF_METADATA, CF_VERSIONS, LocalReferenceEffects, PendingBlobReferences,
@@ -23,20 +23,39 @@ use crate::{
     ReferenceDelta, Store, Version, VersionId,
 };
 
-fn live_version_length(version: &Version) -> Option<u64> {
-    (!version.deleted)
-        .then(|| version.blob.as_ref().map(|blob| blob.length))
-        .flatten()
-}
-
+mod alias_resolution;
+mod builtin;
 mod distributed;
+mod publication;
+mod reservations;
+mod validation;
 
-pub use distributed::{
-    CoordinatedProgramPathFinalization, ProgramPathMutation, ProgramPathStage,
-    ReplicaProgramPathApplied, path_stage_from_prepared,
+use alias_resolution::{stored_alias_delete_binding, stored_alias_registry_transitions};
+use validation::{
+    conservative_atomic_source_journal_changes, live_version_length, prepared_alias_publications,
+    publishes_physical_write, validate_atomic_delivery_bound, validate_builtin_plan,
+    validate_builtin_record, validate_observed_head,
 };
 
-const PREPARED_BUNDLE_FORMAT: u16 = 4;
+pub use distributed::{
+    CoordinatedProgramPathFinalization, ProgramAliasRegistryMutation, ProgramAliasRegistryStage,
+    ProgramPathMutation, ProgramPathStage, ReplicaProgramPathApplied,
+    alias_registry_stages_from_prepared, path_stage_from_prepared,
+};
+pub use publication::SealedAtomicBatchPublication;
+pub use reservations::{
+    BuiltInAliasObservation, BuiltInAliasRegistryAccess, BuiltInObjectTransactionPlan,
+    BuiltInReadProof, BuiltInTransactionAssertion, BuiltInVersionWrite, BuiltInWritePayload,
+    ExistingReferenceWrite, PROGRAM_PARTICIPANT_MANIFEST_FORMAT, PROGRAM_PATH_RESERVATION_FORMAT,
+    ProgramAliasBinding, ProgramAliasRegistryCondition, ProgramBundleAuthority,
+    ProgramGovernanceParticipant, ProgramGovernanceReservation, ProgramObjectParticipant,
+    ProgramParticipantIntent, ProgramParticipantManifest, ProgramPathCondition,
+    ProgramPathReservation, ProgramReservation, ProgramReservationState,
+    StoredProgramAliasRegistryTransition,
+};
+
+const PREPARED_BUNDLE_FORMAT: u16 = 5;
+const LEGACY_PREPARED_BUNDLE_FORMAT: u16 = 4;
 const DURABILITY_EVIDENCE_FORMAT: u16 = 1;
 const APPLIED_PROGRAM_COMMIT_KEY: &[u8] = b"applied_program_commit";
 const ATOMIC_BATCH_PUBLISHED_KEY: &[u8] = b"atomic_batch_published";
@@ -152,7 +171,6 @@ pub struct VerifiedProgramDefinition {
 pub struct StoreProgramEngine {
     program_hash: ProgramHash,
     inner: AtomicProgramEngine<Store>,
-    store: Store,
     policy_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
@@ -186,8 +204,6 @@ impl StoreProgramEngine {
         invocation: &ProgramInvocation,
     ) -> Result<ProgramExecutionLease, EngineError> {
         let policy_guard = self.policy_gate.clone().read_owned().await;
-        let dependencies = self.inner.expanded_paths(context, invocation)?;
-        self.validate_dependency_policies(&dependencies)?;
         Ok(ProgramExecutionLease {
             program_hash: self.program_hash,
             inner: self.inner.prepare(context, invocation).await?,
@@ -195,24 +211,21 @@ impl StoreProgramEngine {
         })
     }
 
-    fn validate_dependency_policies(
+    pub async fn prepare_canonicalized(
         &self,
-        dependencies: &[ExpandedProgramPath],
-    ) -> Result<(), EngineError> {
-        for dependency in dependencies {
-            let policy = self
-                .store
-                .bucket_policy(&dependency.path.tenant, &dependency.path.bucket)
-                .map_err(|error| EngineError::Read(error.to_string()))?;
-            let path = dependency.path.path.as_str();
-            if !policy.is_program_only(path) {
-                return Err(EngineError::ProgramConcurrency {
-                    path: dependency.path.clone(),
-                    reason: "dependency must use PROGRAM_ONLY policy".into(),
-                });
-            }
-        }
-        Ok(())
+        context: &InvocationContext,
+        invocation: &ProgramInvocation,
+        canonical_paths: &BTreeMap<ObjectPath, ObjectPath>,
+    ) -> Result<ProgramExecutionLease, EngineError> {
+        let policy_guard = self.policy_gate.clone().read_owned().await;
+        Ok(ProgramExecutionLease {
+            program_hash: self.program_hash,
+            inner: self
+                .inner
+                .prepare_canonicalized(context, invocation, canonical_paths)
+                .await?,
+            _policy_guard: policy_guard,
+        })
     }
 }
 
@@ -233,6 +246,8 @@ pub struct PreparedProgramBundle {
     pub hash: PreparedBundleHash,
     pub source_bundle_hash: PreparedBundleHash,
     pub program_hash: ProgramHash,
+    pub authority: ProgramBundleAuthority,
+    pub participant_manifest_hash: [u8; 32],
     pub bundle: PreparedBundleRef,
     pub durability_evidence_hash: ProgramDurabilityEvidenceHash,
     pub durability: ProgramDurabilityEvidence,
@@ -261,103 +276,50 @@ impl PreparedProgramBundle {
 /// The only local finalization marker. It deliberately contains no program
 /// output, object path, or command receipt: the ordinary prepared bundle and
 /// Raft's bounded committed-invocation entry are authoritative for replay.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AppliedProgramCommit {
     pub commit_cursor: u64,
     pub bundle_ref: PreparedBundleRef,
     pub bundle_hash: PreparedBundleHash,
     pub program_hash: ProgramHash,
+    pub authority: ProgramBundleAuthority,
+    pub participant_manifest_hash: [u8; 32],
     pub durability_class: ProgramDurabilityClassHash,
     pub durability_evidence_hash: ProgramDurabilityEvidenceHash,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct AtomicBatchPublicationMarker {
-    cursor: u64,
+#[derive(Deserialize)]
+struct AppliedProgramCommitWire {
+    commit_cursor: u64,
+    bundle_ref: PreparedBundleRef,
     bundle_hash: PreparedBundleHash,
+    program_hash: ProgramHash,
+    #[serde(default)]
+    authority: Option<ProgramBundleAuthority>,
+    #[serde(default)]
+    participant_manifest_hash: Option<[u8; 32]>,
+    durability_class: ProgramDurabilityClassHash,
+    durability_evidence_hash: ProgramDurabilityEvidenceHash,
 }
 
-/// A complete atomic delivery unit whose descriptors have been proven to be
-/// the exact writes in one sealed prepared bundle.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SealedAtomicBatchPublication {
-    cursor: u64,
-    bundle_hash: PreparedBundleHash,
-    affected_routes: Vec<crate::AtomicBatchRoute>,
-    mutations: Vec<crate::AtomicBatchMutation>,
-}
-
-impl SealedAtomicBatchPublication {
-    pub fn from_prepared(
-        cursor: u64,
-        bundle_ref: PreparedBundleRef,
-        bundle_hash: PreparedBundleHash,
-        record: &PreparedProgramRecord,
-        stages: &[ProgramPathStage],
-        finalized: &[ProgramPathMutation],
-    ) -> Result<Self, ProgramStoreError> {
-        validate_prepared_record(record)?;
-        let encoded = serde_json::to_vec(record).map_err(program_storage_error)?;
-        if cursor == 0
-            || bundle_ref.length != encoded.len() as u64
-            || bundle_ref.hash != bundle_hash.0
-            || *blake3::hash(&encoded).as_bytes() != bundle_ref.hash
-            || stages.len() != record.writes.len()
-            || finalized.len() != stages.len()
-        {
-            return Err(ProgramStoreError::PreparedBundleMismatch);
-        }
-        for ((stage, mutation), write) in stages.iter().zip(finalized).zip(&record.writes) {
-            stage.validate()?;
-            mutation.validate()?;
-            if stage.bundle_hash != bundle_hash
-                || stage.program_hash != record.program_hash
-                || stage.path != write.path
-                || stage.expected != write.expected
-                || stage.previous_version != write.previous_version
-                || stage.version != write.version
-                || mutation.commit_cursor != cursor
-                || mutation.stage != *stage
-            {
-                return Err(ProgramStoreError::PreparedBundleMismatch);
-            }
-        }
-        let (affected_routes, mutations) = atomic_batch_descriptors(finalized);
-        let publication = Self {
-            cursor,
-            bundle_hash,
-            affected_routes,
-            mutations,
-        };
-        publication.validate_bound()?;
-        Ok(publication)
-    }
-
-    fn validate_bound(&self) -> Result<(), ProgramStoreError> {
-        if self.mutations.is_empty() && self.affected_routes.is_empty() {
-            return Ok(());
-        }
-        let event = crate::LocalChange::atomic_batch_published(
-            u64::MAX,
-            self.cursor,
-            self.bundle_hash,
-            self.affected_routes.clone(),
-            self.mutations.clone(),
-        );
-        let crate::LocalChange::AtomicBatchPublished(batch) = &event else {
-            unreachable!("atomic constructor returned another change kind");
-        };
-        batch
-            .validate()
-            .map_err(|message| ProgramStoreError::InvalidBundle(message.into()))?;
-        let bytes = crate::watch::encoded_change_len(&event).map_err(program_storage_error)?;
-        if bytes > crate::MAX_ATOMIC_BATCH_PUBLISHED_BYTES {
-            return Err(ProgramStoreError::InvalidBundle(format!(
-                "atomic batch publication requires {bytes} bytes; maximum is {}",
-                crate::MAX_ATOMIC_BATCH_PUBLISHED_BYTES
-            )));
-        }
-        Ok(())
+impl<'de> Deserialize<'de> for AppliedProgramCommit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = AppliedProgramCommitWire::deserialize(deserializer)?;
+        Ok(Self {
+            commit_cursor: wire.commit_cursor,
+            bundle_ref: wire.bundle_ref,
+            bundle_hash: wire.bundle_hash,
+            program_hash: wire.program_hash,
+            authority: wire
+                .authority
+                .unwrap_or(ProgramBundleAuthority::LegacyProgramOnly {
+                    program_path_hash: [0; 32],
+                    program_hash: wire.program_hash.0,
+                }),
+            participant_manifest_hash: wire.participant_manifest_hash.unwrap_or([0; 32]),
+            durability_class: wire.durability_class,
+            durability_evidence_hash: wire.durability_evidence_hash,
+        })
     }
 }
 
@@ -365,15 +327,20 @@ impl SealedAtomicBatchPublication {
 pub struct CommittedProgramResult {
     pub receipt: CommandReceipt,
     pub published_versions: BTreeMap<ObjectPath, PublishedProgramVersion>,
+    pub asserted_versions: BTreeMap<ObjectPath, Version>,
+    pub alias_targets: BTreeMap<ObjectPath, ObjectPath>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramCommit {
     pub previous_commit_cursor: Option<u64>,
     pub commit_cursor: u64,
+    pub begin_cursor: u64,
     pub bundle_ref: PreparedBundleRef,
     pub bundle_hash: PreparedBundleHash,
     pub program_hash: ProgramHash,
+    pub authority: ProgramBundleAuthority,
+    pub participant_manifest_hash: [u8; 32],
     pub durability_class: ProgramDurabilityClassHash,
     pub durability_evidence_hash: ProgramDurabilityEvidenceHash,
 }
@@ -390,8 +357,6 @@ pub enum ProgramStoreError {
     PreparedBundleMismatch,
     #[error("invalid prepared bundle: {0}")]
     InvalidBundle(String),
-    #[error("atomic path {path:?} is not covered by a program-only bucket policy")]
-    ProgramPolicy { path: ObjectPath },
     #[error("atomic write cannot replace or delete create-once path {path:?}")]
     Immutable { path: ObjectPath },
     #[error("program precondition failed for {path:?}; current version is {current:?}")]
@@ -434,6 +399,24 @@ pub enum ProgramStoreError {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredPreparedBundle {
+    format: u16,
+    source_bundle_hash: PreparedBundleHash,
+    program_hash: ProgramHash,
+    authority: ProgramBundleAuthority,
+    participant_manifest: ProgramParticipantManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    builtin_plan: Option<BuiltInObjectTransactionPlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    alias_bindings: Vec<ProgramAliasBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    alias_registry_transitions: Vec<StoredProgramAliasRegistryTransition>,
+    preconditions: Vec<HeadPrecondition>,
+    writes: Vec<PreparedVersionWrite>,
+    receipt: CommandReceipt,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct LegacyStoredPreparedBundleV4 {
     format: u16,
     source_bundle_hash: PreparedBundleHash,
     program_hash: ProgramHash,
@@ -502,7 +485,6 @@ impl Store {
         Ok(StoreProgramEngine {
             program_hash: program.hash,
             inner,
-            store: self.clone(),
             policy_gate: self.policy_gate.clone(),
         })
     }
@@ -690,11 +672,38 @@ fn validate_source_bundle(source: &AtomicWriteBundle) -> Result<(), ProgramStore
 }
 
 fn validate_prepared_record(record: &StoredPreparedBundle) -> Result<(), ProgramStoreError> {
-    if record.format != PREPARED_BUNDLE_FORMAT {
+    let legacy = record.format == LEGACY_PREPARED_BUNDLE_FORMAT
+        && matches!(
+            record.authority,
+            ProgramBundleAuthority::LegacyProgramOnly { .. }
+        );
+    if record.format != PREPARED_BUNDLE_FORMAT && !legacy {
         return Err(ProgramStoreError::InvalidBundle(
             "unsupported prepared record format".into(),
         ));
     }
+    record
+        .authority
+        .validate(legacy)
+        .map_err(|message| ProgramStoreError::InvalidBundle(message.into()))?;
+    validate_builtin_record(record)?;
+    if !legacy {
+        record
+            .participant_manifest
+            .validate()
+            .map_err(ProgramStoreError::InvalidBundle)?;
+    }
+    let manifest_heads = record
+        .participant_manifest
+        .objects
+        .iter()
+        .filter_map(|participant| {
+            participant
+                .condition
+                .observed_head()
+                .map(|head| (participant.path.clone(), head))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut preconditions = BTreeMap::new();
     for precondition in &record.preconditions {
         validate_observed_head(&precondition.expected)?;
@@ -707,12 +716,30 @@ fn validate_prepared_record(record: &StoredPreparedBundle) -> Result<(), Program
             ));
         }
     }
+    if !legacy && manifest_heads != preconditions {
+        return Err(ProgramStoreError::InvalidBundle(
+            "prepared participant manifest does not bind every head precondition".into(),
+        ));
+    }
     let mut write_paths = BTreeSet::new();
     let mut version_ids = BTreeSet::new();
     for write in &record.writes {
+        let participant = record
+            .participant_manifest
+            .objects
+            .iter()
+            .find(|participant| participant.path == write.path);
+        if !legacy && participant.is_none() {
+            return Err(ProgramStoreError::InvalidBundle(
+                "prepared write has no participant intent".into(),
+            ));
+        }
         if preconditions.get(&write.path) != Some(&write.expected)
             || !write_paths.insert(write.path.clone())
             || !version_ids.insert(write.version.id)
+            || participant.is_some_and(|participant| !participant.intent.put)
+            || participant
+                .is_some_and(|participant| participant.intent.delete != write.version.deleted)
         {
             return Err(ProgramStoreError::InvalidBundle(
                 "prepared write has no unique matching precondition or version".into(),
@@ -735,195 +762,42 @@ fn validate_prepared_record(record: &StoredPreparedBundle) -> Result<(), Program
             && write.version.content_type.is_none();
         let valid_live = !write.version.deleted
             && write.version.blob.is_some()
-            && write.version.content_type.is_some();
+            && (write.version.content_type.is_some()
+                || matches!(
+                    record.authority,
+                    ProgramBundleAuthority::BuiltInObjectTransaction { .. }
+                ));
         if !valid_tombstone && !valid_live {
             return Err(ProgramStoreError::InvalidBundle(
                 "prepared version has an invalid payload or tombstone shape".into(),
             ));
         }
+        let protected_link_descriptor = matches!(
+            record.authority,
+            ProgramBundleAuthority::BuiltInObjectTransaction {
+                kind: 2,
+                contract_version: 1
+            }
+        ) && !write.version.deleted
+            && write.version.content_type.as_deref() == Some(crate::OBJECT_LINK_CONTENT_TYPE);
+        if write.version.protected_link_descriptor != protected_link_descriptor {
+            return Err(ProgramStoreError::InvalidBundle(
+                "prepared version has unauthorized protected-link provenance".into(),
+            ));
+        }
+    }
+    if !legacy
+        && record
+            .participant_manifest
+            .objects
+            .iter()
+            .any(|participant| participant.intent.put && !write_paths.contains(&participant.path))
+    {
+        return Err(ProgramStoreError::InvalidBundle(
+            "participant put intent has no exact prepared write".into(),
+        ));
     }
     validate_atomic_delivery_bound(record)?;
-    Ok(())
-}
-
-fn validate_atomic_delivery_bound(record: &StoredPreparedBundle) -> Result<(), ProgramStoreError> {
-    if record.writes.is_empty() {
-        return Ok(());
-    }
-    if record.writes.len() > crate::MAX_ATOMIC_BATCH_MUTATIONS {
-        return Err(ProgramStoreError::InvalidBundle(format!(
-            "atomic batch has {} writes; maximum is {}",
-            record.writes.len(),
-            crate::MAX_ATOMIC_BATCH_MUTATIONS
-        )));
-    }
-    let mut affected_routes = Vec::with_capacity(record.writes.len());
-    let mut mutations = Vec::with_capacity(record.writes.len());
-    for (index, write) in record.writes.iter().enumerate() {
-        let ordinal = u64::try_from(index).map_err(|_| {
-            ProgramStoreError::InvalidBundle("atomic batch write count is exhausted".into())
-        })?;
-        let tenant_id = u64::MAX.checked_sub(ordinal).ok_or_else(|| {
-            ProgramStoreError::InvalidBundle("atomic batch route identity is exhausted".into())
-        })?;
-        affected_routes.push(crate::AtomicBatchRoute {
-            tenant_id,
-            bucket_id: u64::MAX,
-        });
-        mutations.push(crate::AtomicBatchMutation {
-            tenant_id,
-            bucket_id: u64::MAX,
-            exact_path: write.path.path.clone(),
-            path_version: VersionId(u64::MAX),
-            // `false` is the longer JSON spelling and therefore conservative.
-            deleted: false,
-            source_id: crate::SourceId {
-                node_id: u16::MAX,
-                source_epoch: [u8::MAX; 32],
-            },
-            source_journal_position: u64::MAX,
-        });
-    }
-    affected_routes.sort_unstable();
-    mutations.sort_unstable();
-    let event = crate::LocalChange::atomic_batch_published(
-        u64::MAX,
-        u64::MAX,
-        PreparedBundleHash([u8::MAX; 32]),
-        affected_routes,
-        mutations,
-    );
-    let bytes = crate::watch::encoded_change_len(&event).map_err(program_storage_error)?;
-    if bytes > crate::MAX_ATOMIC_BATCH_PUBLISHED_BYTES {
-        return Err(ProgramStoreError::InvalidBundle(format!(
-            "atomic batch publication requires at most {bytes} bytes; maximum is {}",
-            crate::MAX_ATOMIC_BATCH_PUBLISHED_BYTES
-        )));
-    }
-    Ok(())
-}
-
-fn conservative_atomic_source_journal_changes(
-    source: &AtomicWriteBundle,
-) -> Result<Vec<crate::LocalChange>, ProgramStoreError> {
-    if source.writes.is_empty() {
-        return Ok(Vec::new());
-    }
-    if source.writes.len() > crate::MAX_ATOMIC_BATCH_MUTATIONS {
-        return Err(ProgramStoreError::InvalidBundle(format!(
-            "atomic batch has {} writes; maximum is {}",
-            source.writes.len(),
-            crate::MAX_ATOMIC_BATCH_MUTATIONS
-        )));
-    }
-    let capacity = source.writes.len().checked_add(1).ok_or_else(|| {
-        ProgramStoreError::InvalidBundle("atomic batch count is exhausted".into())
-    })?;
-    let mut changes = Vec::with_capacity(capacity);
-    let mut routes = Vec::with_capacity(source.writes.len());
-    let mut mutations = Vec::with_capacity(source.writes.len());
-    for (index, write) in source.writes.iter().enumerate() {
-        let ordinal = u64::try_from(index).map_err(|_| {
-            ProgramStoreError::InvalidBundle("atomic batch write count is exhausted".into())
-        })?;
-        let tenant_id = u64::MAX.checked_sub(ordinal).ok_or_else(|| {
-            ProgramStoreError::InvalidBundle("atomic batch route identity is exhausted".into())
-        })?;
-        let bucket_id = u64::MAX;
-        let reference = BlobRef {
-            hash: [u8::MAX; 32],
-            length: u64::MAX,
-        };
-        changes.push(crate::LocalChange::object_head_with_program_cursor(
-            u64::MAX,
-            tenant_id,
-            bucket_id,
-            write.path.path.clone(),
-            VersionId(u64::MAX),
-            false,
-            Some(u64::MAX),
-            vec![
-                ReferenceDelta {
-                    blob: reference.clone(),
-                    change: i64::MIN,
-                },
-                ReferenceDelta {
-                    blob: reference,
-                    change: i64::MAX,
-                },
-            ],
-            Some(AccountingHeadTransition::new(
-                Some(u64::MAX),
-                Some(u64::MAX),
-            )),
-            None,
-        ));
-        routes.push(crate::AtomicBatchRoute {
-            tenant_id,
-            bucket_id,
-        });
-        mutations.push(crate::AtomicBatchMutation {
-            tenant_id,
-            bucket_id,
-            exact_path: write.path.path.clone(),
-            path_version: VersionId(u64::MAX),
-            deleted: false,
-            source_id: crate::SourceId {
-                node_id: u16::MAX,
-                source_epoch: [u8::MAX; 32],
-            },
-            source_journal_position: u64::MAX,
-        });
-    }
-    routes.sort_unstable();
-    mutations.sort_unstable();
-    changes.push(crate::LocalChange::atomic_batch_published(
-        u64::MAX,
-        u64::MAX,
-        PreparedBundleHash([u8::MAX; 32]),
-        routes,
-        mutations,
-    ));
-    Ok(changes)
-}
-
-fn atomic_batch_descriptors(
-    finalized: &[ProgramPathMutation],
-) -> (
-    Vec<crate::AtomicBatchRoute>,
-    Vec<crate::AtomicBatchMutation>,
-) {
-    let mut affected_routes = finalized
-        .iter()
-        .map(|mutation| crate::AtomicBatchRoute {
-            tenant_id: mutation.stage.tenant_id,
-            bucket_id: mutation.stage.bucket_id,
-        })
-        .collect::<Vec<_>>();
-    affected_routes.sort_unstable();
-    affected_routes.dedup();
-    let mut mutations = finalized
-        .iter()
-        .map(|mutation| crate::AtomicBatchMutation {
-            tenant_id: mutation.stage.tenant_id,
-            bucket_id: mutation.stage.bucket_id,
-            exact_path: mutation.stage.path.path.clone(),
-            path_version: mutation.stage.version.id,
-            deleted: mutation.stage.version.deleted,
-            source_id: mutation.stamp.source_id,
-            source_journal_position: mutation.stamp.source_journal_position,
-        })
-        .collect::<Vec<_>>();
-    mutations.sort_unstable();
-    (affected_routes, mutations)
-}
-
-fn validate_observed_head(head: &ObservedHead) -> Result<(), ProgramStoreError> {
-    if let ObservedHead::Version { version } = head {
-        version.parse::<u64>().map_err(|_| {
-            ProgramStoreError::InvalidBundle(format!("invalid store version `{version}`"))
-        })?;
-    }
     Ok(())
 }
 
@@ -978,6 +852,8 @@ fn committed_result(record: &StoredPreparedBundle) -> CommittedProgramResult {
     CommittedProgramResult {
         receipt: record.receipt.clone(),
         published_versions,
+        asserted_versions: record.asserted_versions(),
+        alias_targets: record.alias_targets(),
     }
 }
 
@@ -1004,6 +880,11 @@ fn verify_loaded_commit(
     if loaded.bundle != commit.bundle_ref
         || PreparedBundleHash(loaded.bundle.hash) != commit.bundle_hash
         || loaded.record.program_hash != commit.program_hash
+        || loaded.record.authority != commit.authority
+        || loaded
+            .record
+            .participant_manifest_hash(commit.bundle_hash)?
+            != commit.participant_manifest_hash
         || loaded.evidence.hash()? != commit.durability_evidence_hash
     {
         return Err(ProgramStoreError::PreparedBundleMismatch);
@@ -1019,6 +900,8 @@ fn verify_prepared_commit(
     if prepared.bundle != commit.bundle_ref
         || prepared.hash != commit.bundle_hash
         || prepared.program_hash != commit.program_hash
+        || prepared.authority != commit.authority
+        || prepared.participant_manifest_hash != commit.participant_manifest_hash
         || prepared.durability_evidence_hash != commit.durability_evidence_hash
         || prepared.durability.hash()? != commit.durability_evidence_hash
     {
@@ -1227,70 +1110,6 @@ impl Store {
             .map(|applied| applied.commit_cursor))
     }
 
-    /// Publish the one complete derived-consumer delivery unit after every
-    /// distributed path has reached its durability quorum. The compact marker
-    /// and source-journal record share one synced RocksDB batch, making retry
-    /// idempotent without retaining a second event stream.
-    pub async fn publish_atomic_batch(
-        &self,
-        publication: SealedAtomicBatchPublication,
-    ) -> Result<bool, ProgramStoreError> {
-        publication.validate_bound()?;
-        if publication.mutations.is_empty() {
-            return Ok(false);
-        }
-        let cursor = publication.cursor;
-        let bundle_hash = publication.bundle_hash;
-        let expected = AtomicBatchPublicationMarker {
-            cursor,
-            bundle_hash,
-        };
-        loop {
-            let _commit_guard = self.lock_commit("atomic_program").await;
-            if let Some(existing) = self.read_program_json::<AtomicBatchPublicationMarker>(
-                CF_METADATA,
-                ATOMIC_BATCH_PUBLISHED_KEY,
-            )? {
-                if existing == expected {
-                    return Ok(false);
-                }
-                if existing.cursor >= cursor {
-                    return Err(ProgramStoreError::CommitCorruption { cursor });
-                }
-            }
-
-            let mut batch = WriteBatch::default();
-            let pending = PendingLocalChange::AtomicBatchPublished {
-                cursor,
-                bundle_hash,
-                affected_routes: publication.affected_routes.clone(),
-                mutations: publication.mutations.clone(),
-            };
-            let attempt = self.stage_local_changes(
-                &mut batch,
-                &[pending],
-                LocalReferenceEffects::NoReferenceEffects,
-            );
-            match attempt {
-                Ok(()) => {
-                    batch.put_cf(
-                        self.program_cf(CF_METADATA)?,
-                        ATOMIC_BATCH_PUBLISHED_KEY,
-                        serde_json::to_vec(&expected).map_err(program_storage_error)?,
-                    );
-                    self.write_program_batch(batch)?;
-                    self.notify_local_invalidations();
-                    return Ok(true);
-                }
-                Err(MutationError::SourceJournalCapacity) => {
-                    drop(_commit_guard);
-                    self.wait_for_mutation_capacity().await;
-                }
-                Err(error) => return Err(program_mutation_error(error)),
-            }
-        }
-    }
-
     fn version_high_watermark(&self) -> Result<Option<VersionId>, ProgramStoreError> {
         self.read_program_json(CF_METADATA, VERSION_HIGH_WATERMARK_KEY)
     }
@@ -1300,10 +1119,26 @@ impl Store {
         existing: &AppliedProgramCommit,
         requested: &ProgramCommit,
     ) -> Result<(), ProgramStoreError> {
+        let legacy_authority_matches = matches!(
+            (existing.authority, requested.authority),
+            (
+                ProgramBundleAuthority::LegacyProgramOnly {
+                    program_path_hash: existing_path,
+                    program_hash: existing_hash,
+                },
+                ProgramBundleAuthority::LegacyProgramOnly {
+                    program_hash: requested_hash,
+                    ..
+                }
+            ) if existing_path == [0; 32] && existing_hash == requested_hash
+        ) && existing.participant_manifest_hash == [0; 32];
         if existing.commit_cursor == requested.commit_cursor
             && existing.bundle_ref == requested.bundle_ref
             && existing.bundle_hash == requested.bundle_hash
             && existing.program_hash == requested.program_hash
+            && ((existing.authority == requested.authority
+                && existing.participant_manifest_hash == requested.participant_manifest_hash)
+                || legacy_authority_matches)
             && existing.durability_class == requested.durability_class
             && existing.durability_evidence_hash == requested.durability_evidence_hash
         {
@@ -1382,6 +1217,11 @@ impl Store {
         verify_loaded_commit(loaded, commit)?;
 
         if commit.commit_cursor == 0
+            || (commit.begin_cursor == 0
+                && !matches!(
+                    record.authority,
+                    ProgramBundleAuthority::LegacyProgramOnly { .. }
+                ))
             || commit
                 .previous_commit_cursor
                 .is_some_and(|previous| previous >= commit.commit_cursor)
@@ -1410,6 +1250,39 @@ impl Store {
         }
         if commit.program_hash != record.program_hash {
             return Err(ProgramStoreError::PreparedBundleMismatch);
+        }
+
+        if !matches!(
+            record.authority,
+            ProgramBundleAuthority::LegacyProgramOnly { .. }
+        ) {
+            for participant in &record.participant_manifest.objects {
+                self.require_committed_program_reservation_locked(
+                    BucketIdentity {
+                        tenant_id: TenantId(participant.tenant_id),
+                        bucket_id: BucketId(participant.bucket_id),
+                    },
+                    &participant.path.path,
+                    commit.begin_cursor,
+                    commit.commit_cursor,
+                    mutation_context.serving_fence_term,
+                    mutation_context.active_placement_log_id,
+                )
+                .map_err(program_mutation_error)?;
+            }
+            for participant in &record.participant_manifest.governance {
+                self.require_committed_governance_reservation_locked(
+                    BucketIdentity {
+                        tenant_id: TenantId(participant.tenant_id),
+                        bucket_id: BucketId(participant.bucket_id),
+                    },
+                    commit.begin_cursor,
+                    commit.commit_cursor,
+                    mutation_context.serving_fence_term,
+                    mutation_context.active_placement_log_id,
+                )
+                .map_err(program_mutation_error)?;
+            }
         }
 
         let mut identities = BTreeMap::<(String, String), BucketIdentity>::new();
@@ -1485,11 +1358,6 @@ impl Store {
                 .bucket_policy_by_key(&identity.encode())
                 .map_err(program_mutation_error)?
                 .unwrap_or_default();
-            if !policy.is_program_only(&write.path.path) {
-                return Err(ProgramStoreError::ProgramPolicy {
-                    path: write.path.clone(),
-                });
-            }
             if is_program_definition_path(&write.path.path) {
                 return Err(ProgramStoreError::Immutable {
                     path: write.path.clone(),
@@ -1512,6 +1380,8 @@ impl Store {
             bundle_ref: commit.bundle_ref,
             bundle_hash: commit.bundle_hash,
             program_hash: record.program_hash,
+            authority: record.authority,
+            participant_manifest_hash: record.participant_manifest_hash(commit.bundle_hash)?,
             durability_class: commit.durability_class,
             durability_evidence_hash: commit.durability_evidence_hash,
         };
@@ -1687,10 +1557,44 @@ impl Store {
                 definition_transition: None,
             });
         }
+        for (target, expected, replacement_aliases) in record.alias_registry_writes()? {
+            let identity = BucketIdentity {
+                tenant_id: TenantId(target.tenant_id),
+                bucket_id: BucketId(target.bucket_id),
+            };
+            if !replacement_aliases.is_empty() {
+                let resulting_target = record
+                    .writes
+                    .iter()
+                    .find(|write| write.path == target.path)
+                    .map(|write| &write.version)
+                    .or_else(|| current_versions.get(&target.path).and_then(Option::as_ref))
+                    .ok_or_else(|| {
+                        ProgramStoreError::InvalidBundle(
+                            "nonempty alias registry has no canonical target version".into(),
+                        )
+                    })?;
+                if resulting_target.deleted || resulting_target.protected_link_descriptor {
+                    return Err(ProgramStoreError::InvalidBundle(
+                        "nonempty alias registry requires a live ordinary canonical target".into(),
+                    ));
+                }
+            }
+            self.stage_alias_registry_transition_locked(
+                &mut batch,
+                identity,
+                &target.path.path,
+                expected,
+                replacement_aliases,
+                commit.commit_cursor,
+            )
+            .map_err(program_mutation_error)?;
+        }
         let mut mutations = record
             .writes
             .iter()
             .enumerate()
+            .filter(|(_, write)| publishes_physical_write(record, &write.path))
             .map(|(write_index, write)| {
                 let identity = identities[&(write.path.tenant.clone(), write.path.bucket.clone())];
                 let source_journal_position = journal_status
@@ -1702,6 +1606,7 @@ impl Store {
                     tenant_id: identity.tenant_id.0,
                     bucket_id: identity.bucket_id.0,
                     exact_path: write.path.path.clone(),
+                    canonical_path: None,
                     path_version: write.version.id,
                     deleted: write.version.deleted,
                     source_id: journal_status.source_id,
@@ -1709,6 +1614,37 @@ impl Store {
                 }
             })
             .collect::<Vec<_>>();
+        let aliases = prepared_alias_publications(record)?;
+        for (alias_index, alias) in aliases.iter().enumerate() {
+            let source_journal_position = journal_status
+                .tail
+                .checked_add(u64::try_from(record.writes.len()).unwrap_or(u64::MAX))
+                .and_then(|offset| {
+                    offset.checked_add(u64::try_from(alias_index).unwrap_or(u64::MAX))
+                })
+                .and_then(|offset| offset.checked_add(1))
+                .ok_or_else(|| {
+                    ProgramStoreError::Storage("alias source-journal position is exhausted".into())
+                })?;
+            changes.push(PendingLocalChange::AliasObjectHead {
+                identity: alias.identity,
+                exact_path: alias.requested_path.clone(),
+                canonical_path: alias.canonical_path.clone(),
+                path_version: alias.canonical_version,
+                deleted: alias.deleted,
+                program_commit_cursor: Some(commit.commit_cursor),
+            });
+            mutations.push(crate::AtomicBatchMutation {
+                tenant_id: alias.identity.tenant_id.0,
+                bucket_id: alias.identity.bucket_id.0,
+                exact_path: alias.requested_path.clone(),
+                canonical_path: Some(alias.canonical_path.clone()),
+                path_version: alias.canonical_version,
+                deleted: alias.deleted,
+                source_id: journal_status.source_id,
+                source_journal_position,
+            });
+        }
         mutations.sort_unstable();
         let mut affected_routes = mutations
             .iter()
@@ -1784,22 +1720,48 @@ impl Store {
     ) -> Result<PreparedProgramBundle, ProgramStoreError> {
         let source = lease.bundle();
         self.validate_program_policies(source)?;
-        self.prepare_program_bundle_source(lease.program_hash, source, None)
+        self.prepare_program_bundle_source(lease.program_hash, source, None, &[])
+            .await
+    }
+
+    pub async fn prepare_program_bundle_with_aliases(
+        &self,
+        lease: &ProgramExecutionLease,
+        alias_bindings: &[ProgramAliasBinding],
+    ) -> Result<PreparedProgramBundle, ProgramStoreError> {
+        let source = lease.bundle();
+        self.validate_program_policies(source)?;
+        self.prepare_program_bundle_source(lease.program_hash, source, None, alias_bindings)
             .await
     }
 
     /// Distributed preparation uses the executor's shared exact-path lock
     /// manager and an authoritative cluster reader rather than this node's
-    /// local reader. Path authorities validate `PROGRAM_ONLY` again while
-    /// staging, before any Raft visibility decision.
+    /// local reader.
     pub async fn prepare_distributed_program_bundle(
         &self,
         program_hash: ProgramHash,
         source: &AtomicWriteBundle,
         previous_versions: &BTreeMap<ObjectPath, Version>,
     ) -> Result<PreparedProgramBundle, ProgramStoreError> {
-        self.prepare_program_bundle_source(program_hash, source, Some(previous_versions))
+        self.prepare_program_bundle_source(program_hash, source, Some(previous_versions), &[])
             .await
+    }
+
+    pub async fn prepare_distributed_program_bundle_with_aliases(
+        &self,
+        program_hash: ProgramHash,
+        source: &AtomicWriteBundle,
+        previous_versions: &BTreeMap<ObjectPath, Version>,
+        alias_bindings: &[ProgramAliasBinding],
+    ) -> Result<PreparedProgramBundle, ProgramStoreError> {
+        self.prepare_program_bundle_source(
+            program_hash,
+            source,
+            Some(previous_versions),
+            alias_bindings,
+        )
+        .await
     }
 
     async fn prepare_program_bundle_source(
@@ -1807,14 +1769,16 @@ impl Store {
         program_hash: ProgramHash,
         source: &AtomicWriteBundle,
         previous_versions: Option<&BTreeMap<ObjectPath, Version>>,
+        alias_bindings: &[ProgramAliasBinding],
     ) -> Result<PreparedProgramBundle, ProgramStoreError> {
         validate_source_bundle(source)?;
+        let alias_registry_transitions = stored_alias_registry_transitions(source, alias_bindings)?;
         // This is deliberately before payload staging and, critically, before
         // the prepared bundle can be proposed to consensus. The synthetic
         // records use worst-case route identities, reference deltas and
         // accounting widths, so every actual one-node atomic publication is
         // no larger than the transition proven here.
-        let journal_changes = conservative_atomic_source_journal_changes(source)?;
+        let journal_changes = conservative_atomic_source_journal_changes(source, alias_bindings)?;
         self.preflight_source_journal_transition(&journal_changes)
             .map_err(program_mutation_error)?;
         let source_encoded = serde_json::to_vec(source).map_err(program_storage_error)?;
@@ -1827,6 +1791,7 @@ impl Store {
         let mut writes = Vec::with_capacity(source.writes.len());
         let mut allocated_versions = Vec::with_capacity(source.writes.len());
         for write in &source.writes {
+            let alias_delete = stored_alias_delete_binding(write, alias_bindings);
             let (blob, deleted) = match &write.value {
                 Some(value) => {
                     let bytes = encode_stored_value(value)?;
@@ -1844,16 +1809,34 @@ impl Store {
             let version_id = self.clock.next().map_err(program_storage_error)?;
             allocated_versions.push(version_id);
             let descriptor = PreparedVersionWrite {
-                path: write.path.clone(),
-                expected: write.expected.clone(),
-                previous_version: previous_versions
-                    .and_then(|versions| versions.get(&write.path).cloned()),
+                path: alias_delete.map_or_else(
+                    || write.path.clone(),
+                    |binding| binding.requested_path.clone(),
+                ),
+                expected: alias_delete.map_or_else(
+                    || write.expected.clone(),
+                    |binding| ObservedHead::Version {
+                        version: binding
+                            .descriptor_version
+                            .as_ref()
+                            .expect("validated alias delete has a descriptor")
+                            .id
+                            .0
+                            .to_string(),
+                    },
+                ),
+                previous_version: alias_delete
+                    .and_then(|binding| binding.descriptor_version.clone())
+                    .or_else(|| {
+                        previous_versions.and_then(|versions| versions.get(&write.path).cloned())
+                    }),
                 version: Version {
                     id: version_id,
                     blob,
                     content_type: write.content_type.clone(),
                     deleted,
                     committed_at_unix_millis,
+                    protected_link_descriptor: false,
                 },
             };
             writes.push(descriptor);
@@ -1863,7 +1846,19 @@ impl Store {
             format: PREPARED_BUNDLE_FORMAT,
             source_bundle_hash,
             program_hash,
-            preconditions: source.head_preconditions.clone(),
+            authority: ProgramBundleAuthority::StoredProgram {
+                program_path_hash: source.receipt.program_path_hash,
+                program_hash: program_hash.0,
+            },
+            participant_manifest: self.program_participant_manifest(
+                source,
+                alias_bindings,
+                &alias_registry_transitions,
+            )?,
+            builtin_plan: None,
+            alias_bindings: alias_bindings.to_vec(),
+            alias_registry_transitions,
+            preconditions: prepared_preconditions(source, alias_bindings),
             writes,
             receipt: source.receipt.clone(),
         };
@@ -1897,6 +1892,11 @@ impl Store {
             hash,
             source_bundle_hash,
             program_hash,
+            authority: record.authority,
+            participant_manifest_hash: record
+                .participant_manifest
+                .hash()
+                .map_err(ProgramStoreError::InvalidBundle)?,
             bundle: bundle_ref,
             durability_evidence_hash,
             durability,
@@ -1917,6 +1917,8 @@ impl Store {
                 hash,
                 source_bundle_hash: loaded.record.source_bundle_hash,
                 program_hash: loaded.record.program_hash,
+                authority: loaded.record.authority,
+                participant_manifest_hash: loaded.record.participant_manifest_hash(hash)?,
                 bundle: loaded.bundle,
                 durability_evidence_hash,
                 durability: loaded.evidence,
@@ -1956,16 +1958,28 @@ impl Store {
                 path: write.path.clone(),
             });
         }
-        for path in source.writes.iter().map(|write| &write.path) {
-            let policy = self
-                .bucket_policy(&path.tenant, &path.bucket)
-                .map_err(program_mutation_error)?;
-            if !policy.is_program_only(&path.path) {
-                return Err(ProgramStoreError::ProgramPolicy { path: path.clone() });
-            }
-        }
         Ok(())
     }
+}
+
+fn prepared_preconditions(
+    source: &AtomicWriteBundle,
+    alias_bindings: &[ProgramAliasBinding],
+) -> Vec<HeadPrecondition> {
+    let mut preconditions = source.head_preconditions.clone();
+    preconditions.extend(alias_bindings.iter().filter_map(|binding| {
+        binding
+            .descriptor_version
+            .as_ref()
+            .map(|version| HeadPrecondition {
+                path: binding.requested_path.clone(),
+                expected: ObservedHead::Version {
+                    version: version.id.0.to_string(),
+                },
+            })
+    }));
+    preconditions.sort_by(|left, right| left.path.cmp(&right.path));
+    preconditions
 }
 
 #[cfg(test)]

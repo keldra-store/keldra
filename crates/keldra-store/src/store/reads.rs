@@ -509,6 +509,7 @@ impl Store {
                 content_type: None,
                 deleted: true,
                 committed_at_unix_millis: now,
+                protected_link_descriptor: false,
             };
             batch.put_cf(
                 self.cf(CF_VERSIONS)?,

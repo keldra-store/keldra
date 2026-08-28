@@ -7,6 +7,10 @@ message JoinRequest {
   bytes cluster_id = 2;
   uint64 source_node_id = 3;
   bytes join_capability = 4;
+  uint32 supported_protocol_min = 5;
+  uint32 supported_protocol_max = 6;
+  uint32 supported_storage_min = 7;
+  uint32 supported_storage_max = 8;
 }
 
 message JoinSeed {

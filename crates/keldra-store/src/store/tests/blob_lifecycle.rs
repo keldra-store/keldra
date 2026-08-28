@@ -479,6 +479,78 @@ async fn retirement_reaches_zero_but_gc_waits_for_the_inactivity_ttl() {
 }
 
 #[tokio::test]
+async fn deleting_source_and_clone_releases_both_shared_references_before_gc() {
+    let (_temporary, store) = store().await;
+    let source_key = key("clone-gc-source");
+    let source = store
+        .put(put(
+            source_key.path(),
+            b"shared clone payload",
+            Precondition::Absent,
+            "clone-gc-source",
+        ))
+        .await
+        .unwrap();
+    let source_version = store
+        .version_metadata(&source_key, source.version)
+        .unwrap()
+        .unwrap();
+    let blob = source_version.blob.unwrap();
+    let destination_key = key("clone-gc-destination");
+    let cloned = store
+        .clone_object(CloneRequest {
+            source: source_key.clone(),
+            source_version: source.version,
+            destination: destination_key.clone(),
+            blob: blob.clone(),
+            content_type: source_version.content_type,
+            mode: PutMode::PutIfAbsent,
+            command_id: Some("clone-gc".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .blob_reference_state(&blob)
+            .unwrap()
+            .unwrap()
+            .ref_count,
+        2
+    );
+
+    for (key, version, command) in [
+        (source_key, source.version, "delete-clone-gc-source"),
+        (
+            destination_key,
+            cloned.version,
+            "delete-clone-gc-destination",
+        ),
+    ] {
+        store
+            .delete(DeleteRequest {
+                key,
+                precondition: Precondition::Version(version),
+                command_id: Some(command.into()),
+                durability: Durability::Local,
+            })
+            .await
+            .unwrap();
+    }
+    deliver_retirement_effects(&store, &blob, 2);
+    let retired = store.blob_reference_state(&blob).unwrap().unwrap();
+    assert_eq!(retired.ref_count, 0);
+    assert_eq!(
+        store
+            .collect_blob_garbage_at(retired.updated_at + store.awaiting_publish_ttl_millis)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!store.contains_blob(&blob).await.unwrap());
+}
+
+#[tokio::test]
 async fn due_order_applies_the_ttl_configured_after_restart() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("store");

@@ -6,15 +6,17 @@ use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::object_alias_registry::{applied_key as alias_applied_key, decode_registry};
 use super::{
-    CF_DEFINITION_STATE, CF_HEADS, CF_METADATA, CF_RECEIPTS, CF_VERSIONS, RECEIPT_RECORD_PREFIX,
-    STORAGE_KEY_FORMAT_VERSION, StoredReceipt, VERSION_HIGH_WATERMARK_KEY, now_unix_millis,
-    receipt_key, version_blob_reference,
+    CF_DEFINITION_STATE, CF_HEADS, CF_METADATA, CF_OBJECT_ALIAS_REGISTRIES, CF_RECEIPTS,
+    CF_VERSIONS, RECEIPT_RECORD_PREFIX, STORAGE_KEY_FORMAT_VERSION, StoredReceipt,
+    VERSION_HIGH_WATERMARK_KEY, now_unix_millis, receipt_key, version_blob_reference,
 };
 use crate::key::{BucketId, BucketIdentity, TenantId};
 use crate::{
     DefinitionKind, DefinitionLocator, Head, MAX_CONTENT_TYPE_BYTES, MUTATION_STAMP_FORMAT,
-    MutationError, ObjectKey, ObjectMutation, Store, Version, VersionId,
+    MutationError, ObjectAliasRegistry, ObjectAliasRegistryTransition, ObjectKey, ObjectMutation,
+    Store, Version, VersionId,
 };
 
 pub const MAX_OBJECT_RECORD_EXPORT_RECORDS: u32 = 1_000;
@@ -85,6 +87,10 @@ pub struct ObjectPathSnapshot {
     pub journal_released_versions: Vec<VersionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition_locator: Option<DefinitionLocator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_registry: Option<ObjectAliasRegistry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_registry_transition: Option<ObjectAliasRegistryTransition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +186,8 @@ impl ObjectPathSnapshot {
         let mut previous = None;
         let mut current = None;
         for version in &self.versions {
+            crate::model::validate_version_descriptor(version)
+                .map_err(|error| invalid_snapshot(error.to_string()))?;
             if version.id.0 == 0
                 || previous.is_some_and(|previous| previous >= version.id)
                 || version.id > self.head.version
@@ -244,6 +252,40 @@ impl ObjectPathSnapshot {
                     "definition locator does not match the live snapshot head",
                 ));
             }
+        }
+        if let Some(registry) = self.alias_registry.as_ref() {
+            registry
+                .validate(&self.exact_path)
+                .map_err(|error| invalid_snapshot(error.to_string()))?;
+            if current.deleted || current.protected_link_descriptor {
+                return Err(invalid_snapshot(
+                    "alias registry cannot name a deleted or protected canonical target",
+                ));
+            }
+        }
+        if let Some(transition) = self.alias_registry_transition.as_ref() {
+            transition
+                .validate()
+                .map_err(|error| invalid_snapshot(error.to_string()))?;
+            if transition.replacement_hash
+                != self
+                    .alias_registry
+                    .as_ref()
+                    .map(ObjectAliasRegistry::canonical_hash)
+                    .transpose()
+                    .map_err(|error| invalid_snapshot(error.to_string()))?
+                || self.alias_registry.as_ref().is_some_and(|registry| {
+                    registry.program_commit_cursor != Some(transition.commit_cursor)
+                })
+            {
+                return Err(invalid_snapshot(
+                    "alias registry transition does not match the sidecar",
+                ));
+            }
+        } else if self.alias_registry.is_some() {
+            return Err(invalid_snapshot(
+                "alias registry is missing its idempotent transition marker",
+            ));
         }
         Ok(())
     }
@@ -400,6 +442,12 @@ impl Store {
                     self.cf(CF_DEFINITION_STATE).map_err(object_storage)?,
                     &key,
                 )?;
+                let (alias_registry, alias_registry_transition) = alias_snapshot_for_head_key(
+                    &snapshot,
+                    self.cf(CF_OBJECT_ALIAS_REGISTRIES)
+                        .map_err(object_storage)?,
+                    &key,
+                )?;
                 let record = ObjectRecordExport::ExactPath(decode_path_snapshot(
                     key.as_ref(),
                     encoded_head.as_ref(),
@@ -408,6 +456,8 @@ impl Store {
                         IteratorMode::From(&version_prefix_for_head(&key), Direction::Forward),
                     ),
                     locator,
+                    alias_registry,
+                    alias_registry_transition,
                 )?);
                 if !append_export_record(
                     &mut records,
@@ -555,6 +605,7 @@ impl Store {
             exact_path,
             selected.and_then(|snapshot| snapshot.definition_locator.as_ref()),
         )?;
+        stage_alias_snapshot(self, &mut batch, identity, exact_path, selected)?;
 
         if let Some(selected) = selected {
             for version in &selected.versions {
@@ -639,6 +690,7 @@ impl Store {
             &record.exact_path,
             record.definition_locator.as_ref(),
         )?;
+        stage_alias_snapshot(self, &mut batch, identity, &record.exact_path, Some(record))?;
         self.stage_object_high_watermark(&mut batch, record.head.version)?;
         self.write_object_snapshot_batch(batch)?;
         self.clock.observe(record.head.version);
@@ -725,6 +777,12 @@ impl Store {
             self.cf(CF_DEFINITION_STATE).map_err(object_storage)?,
             head_key,
         )?;
+        let (alias_registry, alias_registry_transition) = alias_snapshot_for_head_key(
+            &snapshot,
+            self.cf(CF_OBJECT_ALIAS_REGISTRIES)
+                .map_err(object_storage)?,
+            head_key,
+        )?;
         decode_path_snapshot(
             head_key,
             &encoded_head,
@@ -733,6 +791,8 @@ impl Store {
                 IteratorMode::From(&version_prefix_for_head(head_key), Direction::Forward),
             ),
             locator,
+            alias_registry,
+            alias_registry_transition,
         )
         .map(Some)
     }
@@ -854,6 +914,8 @@ fn decode_path_snapshot<I>(
     encoded_head: &[u8],
     versions: I,
     definition_locator: Option<DefinitionLocator>,
+    alias_registry: Option<ObjectAliasRegistry>,
+    alias_registry_transition: Option<ObjectAliasRegistryTransition>,
 ) -> Result<ObjectPathSnapshot, ObjectSnapshotError>
 where
     I: IntoIterator<Item = Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>>,
@@ -903,9 +965,78 @@ where
         journal_pending_versions,
         journal_released_versions,
         definition_locator,
+        alias_registry,
+        alias_registry_transition,
     };
     record.validate()?;
     Ok(record)
+}
+
+fn alias_snapshot_for_head_key(
+    snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
+    aliases_cf: &rocksdb::ColumnFamily,
+    encoded_head_key: &[u8],
+) -> Result<
+    (
+        Option<ObjectAliasRegistry>,
+        Option<ObjectAliasRegistryTransition>,
+    ),
+    ObjectSnapshotError,
+> {
+    if encoded_head_key.len() <= BucketIdentity::ENCODED_BYTES {
+        return Err(object_storage("object head key is malformed"));
+    }
+    let identity = BucketIdentity::decode(&encoded_head_key[..BucketIdentity::ENCODED_BYTES])
+        .map_err(object_storage)?;
+    let canonical_path = std::str::from_utf8(&encoded_head_key[BucketIdentity::ENCODED_BYTES..])
+        .map_err(object_storage)?;
+    let registry = snapshot
+        .get_cf(aliases_cf, encoded_head_key)
+        .map_err(object_storage)?
+        .map(|encoded| decode_registry(&encoded).map_err(object_storage))
+        .transpose()?;
+    if let Some(registry) = registry.as_ref() {
+        registry.validate(canonical_path).map_err(object_storage)?;
+    }
+    let transition = snapshot
+        .get_cf(aliases_cf, alias_applied_key(identity, canonical_path))
+        .map_err(object_storage)?
+        .map(|encoded| serde_json::from_slice(&encoded).map_err(object_storage))
+        .transpose()?;
+    Ok((registry, transition))
+}
+
+fn stage_alias_snapshot(
+    store: &Store,
+    batch: &mut WriteBatch,
+    identity: BucketIdentity,
+    canonical_path: &str,
+    selected: Option<&ObjectPathSnapshot>,
+) -> Result<(), ObjectSnapshotError> {
+    let aliases_cf = store
+        .cf(CF_OBJECT_ALIAS_REGISTRIES)
+        .map_err(object_storage)?;
+    let sidecar_key = identity.head_key(canonical_path);
+    let transition_key = alias_applied_key(identity, canonical_path);
+    batch.delete_cf(aliases_cf, &sidecar_key);
+    batch.delete_cf(aliases_cf, &transition_key);
+    if let Some(selected) = selected {
+        if let Some(registry) = selected.alias_registry.as_ref() {
+            batch.put_cf(
+                aliases_cf,
+                &sidecar_key,
+                registry.canonical_bytes().map_err(object_storage)?,
+            );
+        }
+        if let Some(transition) = selected.alias_registry_transition.as_ref() {
+            batch.put_cf(
+                aliases_cf,
+                transition_key,
+                serde_json::to_vec(transition).map_err(object_storage)?,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn definition_locator_for_head_key(

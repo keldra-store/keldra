@@ -189,6 +189,7 @@ fn journal_change(tenant_id: u64, bucket_id: u64, path: &str, offset: u64) -> In
             tenant_id,
             bucket_id,
             exact_path: path.to_owned(),
+            canonical_path: None,
             path_version: VersionId(offset),
             kind: ObjectHeadChangeKind::Put,
             program_commit_cursor: None,
@@ -226,7 +227,9 @@ fn snapshot_head(path: &str, version: u64) -> IndexSourceSnapshotHead {
             content_type: Some("application/json".to_owned()),
             deleted: false,
             committed_at_unix_millis: version,
+            protected_link_descriptor: false,
         },
+        alias_registry: None,
     }
 }
 
@@ -700,6 +703,7 @@ fn exact_projection_uses_the_journal_version_not_a_newer_head() {
         deleted: false,
         content_type: Some("application/json".into()),
         committed_at_unix_millis: 12,
+        protected_link_descriptor: false,
     };
     let selected = exact_source(&definition, "docs/a", 12, Some(at_n)).unwrap();
     let IndexSourceMutation::Upsert(selected) = selected else {
@@ -721,6 +725,7 @@ fn exact_projection_rejects_n_plus_one_at_checkpoint_n() {
         content_type: Some("application/json".into()),
         deleted: false,
         committed_at_unix_millis: 13,
+        protected_link_descriptor: false,
     };
     let error = exact_source(&definition, "docs/a", 12, Some(at_n_plus_one)).unwrap_err();
     assert_eq!(error.code(), tonic::Code::DataLoss);

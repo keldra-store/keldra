@@ -26,6 +26,7 @@ mod journal_route;
 mod key;
 mod logical_record;
 mod model;
+mod object_link;
 mod program;
 mod reference_delta;
 mod store;
@@ -95,24 +96,40 @@ pub use logical_record::{
     MAX_LOGICAL_RECORD_EXPORT_BYTES, MAX_LOGICAL_RECORD_EXPORT_RECORDS,
 };
 pub use model::{
-    BatchOperation, BatchOutcome, BucketPolicy, CoordinatedObjectMutation,
+    BatchOperation, BatchOutcome, BucketPolicy, CloneRequest, CoordinatedObjectMutation,
     CoordinatedRetainedVersionDelete, DeleteRequest, DeleteRetainedVersionOutcome, Durability,
-    Head, MAX_BUCKET_POLICY_PREFIX_BYTES, MAX_BUCKET_POLICY_PREFIXES, MAX_CONTENT_TYPE_BYTES,
-    MAX_OBJECT_MUTATION_REFERENCE_DELTAS, MUTATION_STAMP_FORMAT, MutationError, MutationReceipt,
-    MutationStamp, OBJECT_MUTATION_FORMAT, Object, ObjectMutation, ObjectMutationContext,
-    ObjectMutationGovernance, ObjectVersioning, PlacementLogId, Precondition, PublishRequest,
-    PutMode, PutRequest, RETAINED_VERSION_DELETE_FORMAT, ReplicaObjectMutationApplied,
+    Head, LEGACY_OBJECT_MUTATION_FORMAT, MAX_BUCKET_POLICY_PREFIX_BYTES,
+    MAX_BUCKET_POLICY_PREFIXES, MAX_CONTENT_TYPE_BYTES, MAX_OBJECT_MUTATION_REFERENCE_DELTAS,
+    MUTATION_STAMP_FORMAT, MutationError, MutationReceipt, MutationStamp,
+    OBJECT_ALIAS_REGISTRY_FORMAT, OBJECT_ALIAS_REGISTRY_TRANSITION_FORMAT, OBJECT_MUTATION_FORMAT,
+    Object, ObjectAliasRegistry, ObjectAliasRegistryTransition, ObjectAliasSnapshot,
+    ObjectMutation, ObjectMutationContext, ObjectMutationGovernance, ObjectVersioning,
+    PlacementLogId, Precondition, PublishRequest, PutMode, PutRequest,
+    RETAINED_VERSION_DELETE_FORMAT, ReplicaObjectMutationApplied,
     ReplicaRetainedVersionDeleteApplied, RetainedVersionDeleteMutation, SMALL_BLOB_MAX_BYTES,
     Version, VersionId,
 };
+pub use object_link::{
+    MAX_INBOUND_OBJECT_LINKS, OBJECT_LINK_CONTENT_TYPE, ObjectLinkDescriptor, ObjectLinkError,
+    ResolvedObjectLink, is_object_link_content_type, object_link_command_fingerprint,
+    resolve_descriptor,
+};
 pub use program::{
-    AppliedProgramCommit, CommittedProgramResult, CoordinatedProgramPathFinalization,
-    PreparedBundleHash, PreparedBundleRef, PreparedProgramBundle, PreparedProgramRecord,
-    PreparedProgramWrite, ProgramCommit, ProgramDurabilityClassHash, ProgramDurabilityEvidence,
-    ProgramDurabilityEvidenceHash, ProgramDurabilityScope, ProgramExecutionLease, ProgramHash,
-    ProgramPathMutation, ProgramPathStage, ProgramStoreError, PublishedProgramVersion,
+    AppliedProgramCommit, BuiltInAliasObservation, BuiltInAliasRegistryAccess,
+    BuiltInObjectTransactionPlan, BuiltInReadProof, BuiltInTransactionAssertion,
+    BuiltInVersionWrite, BuiltInWritePayload, CommittedProgramResult,
+    CoordinatedProgramPathFinalization, ExistingReferenceWrite,
+    PROGRAM_PARTICIPANT_MANIFEST_FORMAT, PROGRAM_PATH_RESERVATION_FORMAT, PreparedBundleHash,
+    PreparedBundleRef, PreparedProgramBundle, PreparedProgramRecord, PreparedProgramWrite,
+    ProgramAliasBinding, ProgramAliasRegistryCondition, ProgramAliasRegistryMutation,
+    ProgramAliasRegistryStage, ProgramBundleAuthority, ProgramCommit, ProgramDurabilityClassHash,
+    ProgramDurabilityEvidence, ProgramDurabilityEvidenceHash, ProgramDurabilityScope,
+    ProgramExecutionLease, ProgramGovernanceParticipant, ProgramGovernanceReservation, ProgramHash,
+    ProgramObjectParticipant, ProgramParticipantIntent, ProgramParticipantManifest,
+    ProgramPathCondition, ProgramPathMutation, ProgramPathReservation, ProgramPathStage,
+    ProgramReservation, ProgramReservationState, ProgramStoreError, PublishedProgramVersion,
     ReplicaProgramPathApplied, SealedAtomicBatchPublication, StoreProgramEngine,
-    VerifiedProgramDefinition, path_stage_from_prepared,
+    VerifiedProgramDefinition, alias_registry_stages_from_prepared, path_stage_from_prepared,
 };
 pub use reference_delta::{
     DestinationReferenceArtifact, DestinationReferenceDelta, ReferenceDelta, ReferenceDeltaApplied,

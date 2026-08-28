@@ -1,4 +1,4 @@
-//! Generated Rust types for the Keldra 0.13 gRPC API.
+//! Generated Rust types for the Keldra 0.15 gRPC API.
 
 pub mod v1 {
     tonic::include_proto!("keldra.v1");
@@ -80,7 +80,13 @@ impl v1::IndexPredicateExpression {
 
 #[cfg(test)]
 mod tests {
-    use super::v1::{DeletedObject, NeverExisted, ObjectHead, PresentObject, object_head};
+    use prost::Message;
+
+    use super::v1::{
+        CloneObjectRequest, DeletedObject, Durability, LinkObjectRequest, NeverExisted,
+        ObjectAddress, ObjectHead, PresentObject, PutIfVersionOperation, UnlinkObjectRequest,
+        clone_object_request, object_head,
+    };
 
     #[test]
     fn exact_path_states_are_distinct() {
@@ -113,6 +119,65 @@ mod tests {
             &states[2].state,
             Some(object_head::State::NeverExisted(_))
         ));
+    }
+
+    #[test]
+    fn clone_object_wire_round_trip_preserves_both_identities_and_exact_cas() {
+        let request = CloneObjectRequest {
+            source: Some(ObjectAddress {
+                tenant: "tenant".into(),
+                bucket: "bucket".into(),
+                path: "source".into(),
+            }),
+            source_version: 17,
+            destination: Some(ObjectAddress {
+                tenant: "tenant".into(),
+                bucket: "bucket".into(),
+                path: "destination".into(),
+            }),
+            command_id: "clone-17".into(),
+            durability: Durability::Replicated as i32,
+            operation: Some(clone_object_request::Operation::PutIfVersion(
+                PutIfVersionOperation {
+                    expected_version: 11,
+                },
+            )),
+        };
+
+        let decoded = CloneObjectRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn object_link_wire_contract_keeps_link_and_target_distinct() {
+        let link = ObjectAddress {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            path: "alias".into(),
+        };
+        let request = LinkObjectRequest {
+            link: Some(link.clone()),
+            target: Some(ObjectAddress {
+                tenant: "tenant".into(),
+                bucket: "bucket".into(),
+                path: "target".into(),
+            }),
+            command_id: "link-1".into(),
+            durability: Durability::Replicated as i32,
+        };
+        assert_eq!(
+            LinkObjectRequest::decode(request.encode_to_vec().as_slice()).unwrap(),
+            request
+        );
+        let unlink = UnlinkObjectRequest {
+            link: Some(link),
+            command_id: "unlink-1".into(),
+            durability: Durability::Local as i32,
+        };
+        assert_eq!(
+            UnlinkObjectRequest::decode(unlink.encode_to_vec().as_slice()).unwrap(),
+            unlink
+        );
     }
 
     #[test]
@@ -175,6 +240,7 @@ mod tests {
             "rpc checkpermissions",
             "rpc watchprefix",
             "rpc listobjects",
+            "rpc cloneobject",
             "rpc deleteversion",
             "rpc listobjectversions",
             "rpc setbucketversioning",
@@ -221,6 +287,14 @@ mod tests {
             Some(index_field::FieldType::Keyword(_))
         ));
         assert_eq!(field.capabilities, [IndexFieldCapability::Exact as i32]);
+
+        let date = super::v1::DateIndexField {
+            strftime_pattern: "%Y-%m-%d".into(),
+        };
+        assert!(matches!(
+            index_field::FieldType::Date(date),
+            index_field::FieldType::Date(value) if value.strftime_pattern == "%Y-%m-%d"
+        ));
 
         let schema = include_str!("../proto/keldra.proto").to_ascii_lowercase();
         assert!(schema.contains("rpc listindices(listindicesrequest)"));

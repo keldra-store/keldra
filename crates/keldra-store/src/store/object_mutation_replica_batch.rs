@@ -42,6 +42,7 @@ impl Store {
                 tenant_id: TenantId(mutation.tenant_id),
                 bucket_id: BucketId(mutation.bucket_id),
             };
+            self.require_unreserved_object_locked(identity, &mutation.exact_path, None)?;
             let encoded_head_key = identity.head_key(&mutation.exact_path);
             let encoded_version_key =
                 replica_version_key(identity, &mutation.exact_path, mutation.version.id);
@@ -150,6 +151,45 @@ impl Store {
                         current: Some(head.version),
                         predecessor: mutation.stamp.predecessor_version,
                     });
+                }
+            }
+
+            if !already_applied {
+                let predecessor = mutation
+                    .stamp
+                    .predecessor_version
+                    .map(|version| replica_version_key(identity, &mutation.exact_path, version))
+                    .map(|key| {
+                        read_replica_version(self, &pending_versions, &deleted_versions, &key)
+                    })
+                    .transpose()?
+                    .flatten();
+                if mutation.stamp.predecessor_version.is_some() && predecessor.is_none() {
+                    return Err(MutationError::Storage(
+                        "replicated predecessor references a missing version descriptor".into(),
+                    ));
+                }
+                if predecessor
+                    .as_ref()
+                    .is_some_and(|version| version.protected_link_descriptor)
+                {
+                    return Err(MutationError::InvalidObjectMutation(
+                        "protected alias descriptors must be mutated through sealed link authority"
+                            .into(),
+                    ));
+                }
+                if self.alias_registry_locked(identity, &mutation.exact_path)?
+                    != mutation
+                        .alias_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.registry.clone())
+                {
+                    return Err(MutationError::ObjectMutationConflict);
+                }
+                if let Some(snapshot) = mutation.alias_snapshot.as_ref() {
+                    if predecessor.as_ref() != Some(&snapshot.canonical_version) {
+                        return Err(MutationError::ObjectMutationConflict);
+                    }
                 }
             }
 
@@ -434,6 +474,7 @@ mod tests {
                 content_type: None,
                 deleted: true,
                 committed_at_unix_millis: first.version.committed_at_unix_millis + 1,
+                protected_link_descriptor: false,
             },
             stamp: crate::MutationStamp {
                 predecessor_version: Some(first.version.id),
@@ -481,6 +522,80 @@ mod tests {
                 .version,
             second.version.id
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_replica_mutations_cannot_replace_a_protected_descriptor() {
+        let first = mutations(vec![put("protected", "first")])
+            .await
+            .pop()
+            .unwrap();
+        let replica_dir = tempfile::tempdir().unwrap();
+        let replica = Store::open(StoreOptions::new(replica_dir.path(), 2))
+            .await
+            .unwrap();
+        replica.apply_object_mutation_replica(&first).await.unwrap();
+
+        let identity = BucketIdentity {
+            tenant_id: TenantId(first.tenant_id),
+            bucket_id: BucketId(first.bucket_id),
+        };
+        let predecessor_key = replica_version_key(identity, &first.exact_path, first.version.id);
+        let mut predecessor = replica
+            .stored_version_by_key(&predecessor_key)
+            .unwrap()
+            .unwrap();
+        predecessor.version.protected_link_descriptor = true;
+        replica
+            .db
+            .put_cf(
+                replica.cf(CF_VERSIONS).unwrap(),
+                &predecessor_key,
+                serde_json::to_vec(&predecessor).unwrap(),
+            )
+            .unwrap();
+
+        let mut second = ObjectMutation {
+            command_id: "second".into(),
+            version: Version {
+                id: VersionId(first.version.id.0 + 1),
+                blob: None,
+                content_type: None,
+                deleted: true,
+                committed_at_unix_millis: first.version.committed_at_unix_millis + 1,
+                protected_link_descriptor: false,
+            },
+            stamp: crate::MutationStamp {
+                predecessor_version: Some(first.version.id),
+                source_journal_position: first.stamp.source_journal_position + 1,
+                ..first.stamp
+            },
+            reference_deltas: first
+                .version
+                .blob
+                .clone()
+                .into_iter()
+                .map(|blob| crate::ReferenceDelta { blob, change: -1 })
+                .collect(),
+            accounting_transition: Some(crate::AccountingHeadTransition::new(
+                first.version.blob.as_ref().map(|blob| blob.length),
+                None,
+            )),
+            ..first.clone()
+        };
+        second.input_fingerprint = [9; 32];
+        second.set_computed_fingerprint();
+
+        assert!(matches!(
+            replica.apply_object_mutation_replica(&second).await,
+            Err(MutationError::InvalidObjectMutation(message))
+                if message.contains("sealed link authority")
+        ));
+        assert!(matches!(
+            replica.apply_object_mutation_replica_batch(&[second]).await,
+            Err(MutationError::InvalidObjectMutation(message))
+                if message.contains("sealed link authority")
+        ));
     }
 
     #[tokio::test]

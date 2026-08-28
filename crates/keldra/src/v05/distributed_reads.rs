@@ -114,6 +114,9 @@ pub(super) fn declared_payload_length(
     else {
         return Ok(0);
     };
+    if version.protected_link_descriptor {
+        return Ok(0);
+    }
     match (&version.blob, version.deleted) {
         (Some(blob), false) => Ok(blob.length),
         (None, true) => Ok(0),
@@ -147,6 +150,16 @@ pub(super) async fn read_batch_result(
             ))
         };
     };
+    if object.version.protected_link_descriptor {
+        return Ok((
+            BatchGetResult::Failure(ReadFailure {
+                code: ReadFailureCode::VersionNotFound as i32,
+                message: "requested version was not found".into(),
+            }),
+            0,
+            object.program_commit_cursor,
+        ));
+    }
     let head = api_head(&object.version)?;
     let program_commit_cursor = object.program_commit_cursor;
     let declared_length = object

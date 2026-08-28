@@ -522,6 +522,7 @@ fn validate_value_type(
         (field_type, value),
         (super::FieldType::Boolean, ScalarValue::Boolean(_))
             | (super::FieldType::SignedInteger, ScalarValue::Signed(_))
+            | (super::FieldType::Date, ScalarValue::Signed(_))
             | (super::FieldType::UnsignedInteger, ScalarValue::Unsigned(_))
             | (super::FieldType::Float, ScalarValue::Number(_))
             | (super::FieldType::Keyword, ScalarValue::String(_))
@@ -700,6 +701,7 @@ mod tests {
                 collation: Collation::BinaryUtf8,
                 capabilities: FieldCapabilities::EXACT,
                 analyzer: None,
+                date_format: None,
                 components: FieldComponents::TERMS,
             }],
             semantics: IndexSemantics::TypedJson,

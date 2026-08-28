@@ -312,6 +312,7 @@ mod tests {
                 collation: Collation::BinaryUtf8,
                 capabilities: FieldCapabilities::EXACT,
                 analyzer: None,
+                date_format: None,
                 components,
             }],
             semantics: IndexSemantics::TypedJson,

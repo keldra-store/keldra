@@ -2,7 +2,11 @@ use argon2::{Params, Version};
 use tempfile::TempDir;
 
 use super::*;
-use crate::{LocalChange, StoreOptions};
+use crate::{
+    LocalChange, PROGRAM_PATH_RESERVATION_FORMAT, ProgramBundleAuthority,
+    ProgramGovernanceParticipant, ProgramGovernanceReservation, ProgramReservationState,
+    StoreOptions,
+};
 
 async fn open_store(root: &TempDir, node_id: u16) -> Store {
     Store::open(StoreOptions::new(root.path(), node_id))
@@ -188,6 +192,72 @@ async fn journaled_logical_mutation_commits_one_typed_aggregate_change() {
             .replayed
     );
     assert_eq!(store.scan_local_changes(0, 10).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn journaled_governance_mutation_observes_atomic_reservation_after_exact_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let store = open_store(&root, 1).await;
+    let first = store
+        .construct_logical_record_mutation(policy_value(&["ledger"], &[]), context(100))
+        .unwrap();
+    store
+        .apply_logical_record_mutation_journaled(&first)
+        .await
+        .unwrap();
+    let reservation = ProgramGovernanceReservation {
+        format: PROGRAM_PATH_RESERVATION_FORMAT,
+        begin_cursor: 40,
+        invocation_id: [1; 32],
+        bundle_hash: [2; 32],
+        participant_manifest_hash: [3; 32],
+        authority: ProgramBundleAuthority::BuiltInObjectTransaction {
+            kind: 1,
+            contract_version: 1,
+        },
+        executor_node_id: 1,
+        nomination_log_index: 41,
+        placement: PlacementLogId { term: 3, index: 9 },
+        participant: ProgramGovernanceParticipant {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            tenant_id: 7,
+            bucket_id: 11,
+            policy: BucketPolicy {
+                immutable_prefixes: vec!["ledger".into()],
+                program_only_prefixes: Vec::new(),
+            },
+            versioning: ObjectVersioning::Unversioned,
+        },
+        state: ProgramReservationState::Prepared,
+    };
+    let mut reservation_key = b"atomic-reservation/governance/v1/".to_vec();
+    reservation_key.extend_from_slice(&identity(7, 11).encode());
+    put_raw(
+        &store,
+        CF_METADATA,
+        &reservation_key,
+        &serde_json::to_vec(&reservation).unwrap(),
+    );
+
+    assert!(
+        store
+            .apply_logical_record_mutation_journaled(&first)
+            .await
+            .unwrap()
+            .replayed
+    );
+    let second = store
+        .construct_logical_record_mutation(policy_value(&["ledger", "records"], &[]), context(101))
+        .unwrap();
+    let LogicalRecordError::Storage(message) = store
+        .apply_logical_record_mutation_journaled(&second)
+        .await
+        .unwrap_err()
+    else {
+        panic!("governance reservation must reject a new journaled mutation")
+    };
+    assert!(message.contains("reserved by atomic preparation"));
 }
 
 #[tokio::test]

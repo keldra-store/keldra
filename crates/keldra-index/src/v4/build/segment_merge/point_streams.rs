@@ -107,7 +107,7 @@ fn point_matches_type(value: &PointValue, field_type: FieldType) -> bool {
         (PointValue::Presence | PointValue::Null, _)
             | (
                 PointValue::Value(ScalarValue::Signed(_)),
-                FieldType::SignedInteger
+                FieldType::SignedInteger | FieldType::Date
             )
             | (
                 PointValue::Value(ScalarValue::Unsigned(_)),

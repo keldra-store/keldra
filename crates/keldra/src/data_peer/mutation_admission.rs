@@ -415,9 +415,7 @@ fn object_group(
 #[cfg(test)]
 mod tests {
     use keldra_consensus::PeerSpkiSha256;
-    use keldra_store::{
-        MUTATION_STAMP_FORMAT, MutationStamp, OBJECT_MUTATION_FORMAT, Version, VersionId,
-    };
+    use keldra_store::{MUTATION_STAMP_FORMAT, MutationStamp, Version, VersionId};
     use tonic::Code;
 
     use super::*;
@@ -457,7 +455,7 @@ mod tests {
 
     fn mutation(path: String, fence: PlacementLogId, coordinator: NodeId) -> ObjectMutation {
         ObjectMutation {
-            format: OBJECT_MUTATION_FORMAT,
+            format: keldra_store::LEGACY_OBJECT_MUTATION_FORMAT,
             tenant_id: 1,
             bucket_id: 2,
             exact_path: path,
@@ -469,6 +467,7 @@ mod tests {
                 content_type: None,
                 deleted: true,
                 committed_at_unix_millis: 1,
+                protected_link_descriptor: false,
             },
             receipt_expires_at_unix_millis: 1,
             stamp: MutationStamp {
@@ -484,6 +483,7 @@ mod tests {
             reference_deltas: Vec::new(),
             accounting_transition: None,
             definition_transition: None,
+            alias_snapshot: None,
         }
     }
 

@@ -608,7 +608,9 @@ mod tests {
                 content_type: Some("application/json".into()),
                 deleted: false,
                 committed_at_unix_millis: version,
+                protected_link_descriptor: false,
             },
+            alias_registry: None,
         }
     }
 

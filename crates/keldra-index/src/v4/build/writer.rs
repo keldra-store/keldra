@@ -551,6 +551,7 @@ fn scalar_matches_field(value: &ScalarValue, field_type: FieldType) -> bool {
         (value, field_type),
         (ScalarValue::Boolean(_), FieldType::Boolean)
             | (ScalarValue::Signed(_), FieldType::SignedInteger)
+            | (ScalarValue::Signed(_), FieldType::Date)
             | (ScalarValue::Unsigned(_), FieldType::UnsignedInteger)
             | (ScalarValue::Number(_), FieldType::Float)
             | (ScalarValue::String(_), FieldType::Keyword)

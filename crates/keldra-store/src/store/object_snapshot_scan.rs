@@ -8,15 +8,16 @@ use rocksdb::{Direction, IteratorMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+use super::object_alias_registry::decode_registry;
 use super::{
-    CF_HEADS, CF_METADATA, CF_VERSIONS, MAX_OBJECT_RECORD_EXPORT_BYTES,
+    CF_HEADS, CF_METADATA, CF_OBJECT_ALIAS_REGISTRIES, CF_VERSIONS, MAX_OBJECT_RECORD_EXPORT_BYTES,
     MAX_OBJECT_RECORD_EXPORT_RECORDS, StoredVersion,
 };
 use crate::key::{BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TenantId};
 use crate::watch::{LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_OFFSET_KEY};
 use crate::{
-    Head, MAX_CONTENT_TYPE_BYTES, MUTATION_STAMP_FORMAT, ObjectKey, SourceId, Store, Version,
-    VersionId,
+    Head, MAX_CONTENT_TYPE_BYTES, MUTATION_STAMP_FORMAT, ObjectAliasRegistry, ObjectKey, SourceId,
+    Store, Version, VersionId,
 };
 
 use super::object_snapshot::ObjectSnapshotError;
@@ -41,6 +42,8 @@ pub struct CurrentObjectSnapshot {
     pub exact_path: String,
     pub head: Head,
     pub version: Version,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_registry: Option<ObjectAliasRegistry>,
 }
 
 impl CurrentObjectSnapshot {
@@ -78,6 +81,18 @@ impl CurrentObjectSnapshot {
         }
         super::version_blob_reference(&self.version)
             .map_err(|error| invalid_snapshot(error.to_string()))?;
+        crate::model::validate_version_descriptor(&self.version)
+            .map_err(|error| invalid_snapshot(error.to_string()))?;
+        if let Some(registry) = self.alias_registry.as_ref() {
+            registry
+                .validate(&self.exact_path)
+                .map_err(|error| invalid_snapshot(error.to_string()))?;
+            if self.version.deleted || self.version.protected_link_descriptor {
+                return Err(invalid_snapshot(
+                    "alias registry cannot name a deleted or protected canonical target",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -239,6 +254,8 @@ impl Store {
             &encoded_head,
             &snapshot,
             self.cf(CF_VERSIONS).map_err(object_storage)?,
+            self.cf(CF_OBJECT_ALIAS_REGISTRIES)
+                .map_err(object_storage)?,
         )
         .map(Some)
     }
@@ -274,6 +291,9 @@ impl Store {
         let snapshot = self.db.snapshot();
         let heads_cf = self.cf(CF_HEADS).map_err(object_storage)?;
         let versions_cf = self.cf(CF_VERSIONS).map_err(object_storage)?;
+        let aliases_cf = self
+            .cf(CF_OBJECT_ALIAS_REGISTRIES)
+            .map_err(object_storage)?;
         let encoded_heads = snapshot.multi_get_cf(
             head_keys
                 .iter()
@@ -303,6 +323,16 @@ impl Store {
                 .iter()
                 .map(|(_, _, version_key)| (versions_cf, version_key.as_slice())),
         );
+        let encoded_aliases = snapshot.multi_get_cf(
+            present
+                .iter()
+                .map(|(index, _, _)| (aliases_cf, head_keys[*index].as_slice())),
+        );
+        if encoded_aliases.len() != present.len() {
+            return Err(object_storage(
+                "current-object alias multi-get returned the wrong result count",
+            ));
+        }
         if encoded_versions.len() != present.len() {
             return Err(object_storage(
                 "current-object version multi-get returned the wrong result count",
@@ -311,8 +341,10 @@ impl Store {
 
         let mut results = vec![None; exact_paths.len()];
         let mut encoded_bytes = 0_u64;
-        for ((index, head, _), encoded_version) in
-            present.into_iter().zip(encoded_versions.into_iter())
+        for (((index, head, _), encoded_version), encoded_alias) in present
+            .into_iter()
+            .zip(encoded_versions.into_iter())
+            .zip(encoded_aliases.into_iter())
         {
             let encoded_version = encoded_version.map_err(object_storage)?.ok_or_else(|| {
                 object_storage("current head references a missing version descriptor")
@@ -320,12 +352,17 @@ impl Store {
             let version = StoredVersion::decode(&encoded_version)
                 .map_err(object_storage)?
                 .version;
+            let alias_registry = encoded_alias
+                .map_err(object_storage)?
+                .map(|encoded| decode_registry(&encoded).map_err(object_storage))
+                .transpose()?;
             let record = CurrentObjectSnapshot {
                 tenant_id,
                 bucket_id,
                 exact_path: exact_paths[index].clone(),
                 head,
                 version,
+                alias_registry,
             };
             record.validate()?;
             encoded_bytes = encoded_bytes
@@ -427,6 +464,9 @@ impl Store {
         let snapshot = self.db.snapshot();
         let heads_cf = self.cf(CF_HEADS).map_err(object_storage)?;
         let versions_cf = self.cf(CF_VERSIONS).map_err(object_storage)?;
+        let aliases_cf = self
+            .cf(CF_OBJECT_ALIAS_REGISTRIES)
+            .map_err(object_storage)?;
         let mut heads = Vec::with_capacity(max_records as usize);
         let mut encoded_bytes = 0_u64;
         let mut last_key = None;
@@ -447,8 +487,14 @@ impl Store {
             }
             let identity = BucketIdentity::decode(&key[..BucketIdentity::ENCODED_BYTES])
                 .map_err(object_storage)?;
-            let record =
-                decode_current_head(identity, &key, &encoded_head, &snapshot, versions_cf)?;
+            let record = decode_current_head(
+                identity,
+                &key,
+                &encoded_head,
+                &snapshot,
+                versions_cf,
+                aliases_cf,
+            )?;
             let record_bytes = encoded_record_bytes(&record)?;
             if record_bytes > max_bytes {
                 return Err(ObjectSnapshotError::ExportRecordTooLarge {
@@ -505,6 +551,9 @@ impl Store {
         let snapshot = self.db.snapshot();
         let heads_cf = self.cf(CF_HEADS).map_err(object_storage)?;
         let versions_cf = self.cf(CF_VERSIONS).map_err(object_storage)?;
+        let aliases_cf = self
+            .cf(CF_OBJECT_ALIAS_REGISTRIES)
+            .map_err(object_storage)?;
         let mut heads = Vec::with_capacity(max_records as usize);
         let mut encoded_bytes = 0_u64;
         let mut last_key = None;
@@ -520,8 +569,14 @@ impl Store {
             {
                 continue;
             }
-            let record =
-                decode_current_head(identity, &key, &encoded_head, &snapshot, versions_cf)?;
+            let record = decode_current_head(
+                identity,
+                &key,
+                &encoded_head,
+                &snapshot,
+                versions_cf,
+                aliases_cf,
+            )?;
             if !path_is_within_prefix(&record.exact_path, path_prefix) {
                 continue;
             }
@@ -681,6 +736,9 @@ fn run_snapshot_worker<F>(
     let result: Result<(), ObjectSnapshotError> = (|| {
         let heads_cf = store.cf(CF_HEADS).map_err(object_storage)?;
         let versions_cf = store.cf(CF_VERSIONS).map_err(object_storage)?;
+        let aliases_cf = store
+            .cf(CF_OBJECT_ALIAS_REGISTRIES)
+            .map_err(object_storage)?;
         let mut iterator =
             snapshot.iterator_cf(heads_cf, IteratorMode::From(&start, Direction::Forward));
         let mut pending = None;
@@ -698,6 +756,7 @@ fn run_snapshot_worker<F>(
                 &heads_visited,
                 &snapshot,
                 versions_cf,
+                aliases_cf,
                 &mut pending,
                 &mut exhausted,
             );
@@ -727,6 +786,7 @@ fn pull_snapshot_frame<F, I>(
     heads_visited: &AtomicU64,
     snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
     versions_cf: &rocksdb::ColumnFamily,
+    aliases_cf: &rocksdb::ColumnFamily,
     pending: &mut Option<CurrentObjectSnapshot>,
     exhausted: &mut bool,
 ) -> Result<Option<CurrentObjectSnapshotFrame>, ObjectSnapshotError>
@@ -753,8 +813,14 @@ where
                     break None;
                 }
                 heads_visited.fetch_add(1, Ordering::Relaxed);
-                let record =
-                    decode_current_head(identity, &key, &encoded_head, snapshot, versions_cf)?;
+                let record = decode_current_head(
+                    identity,
+                    &key,
+                    &encoded_head,
+                    snapshot,
+                    versions_cf,
+                    aliases_cf,
+                )?;
                 if path_is_within_prefix(&record.exact_path, path_prefix)
                     && resume_after_path.is_none_or(|resume| record.exact_path.as_str() > resume)
                     && include(&record)
@@ -799,6 +865,7 @@ fn decode_current_head(
     encoded_head: &[u8],
     snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
     versions_cf: &rocksdb::ColumnFamily,
+    aliases_cf: &rocksdb::ColumnFamily,
 ) -> Result<CurrentObjectSnapshot, ObjectSnapshotError> {
     let exact_path = identity
         .decode_head_path(encoded_head_key)
@@ -815,12 +882,18 @@ fn decode_current_head(
     let version = StoredVersion::decode(&encoded_version)
         .map_err(object_storage)?
         .version;
+    let alias_registry = snapshot
+        .get_cf(aliases_cf, encoded_head_key)
+        .map_err(object_storage)?
+        .map(|encoded| decode_registry(&encoded).map_err(object_storage))
+        .transpose()?;
     let record = CurrentObjectSnapshot {
         tenant_id: identity.tenant_id.0,
         bucket_id: identity.bucket_id.0,
         exact_path,
         head,
         version,
+        alias_registry,
     };
     record.validate()?;
     Ok(record)

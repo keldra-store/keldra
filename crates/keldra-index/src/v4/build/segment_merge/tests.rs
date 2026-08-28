@@ -312,6 +312,7 @@ fn hybrid_schema() -> Schema {
                 collation: Collation::BinaryUtf8,
                 capabilities: FieldCapabilities::FULL_TEXT,
                 analyzer: Some(Analyzer::UnicodeAlphanumericLowercase),
+                date_format: None,
                 components: FieldComponents::TERMS
                     .union(FieldComponents::POSITIONS)
                     .union(FieldComponents::NORMS),
@@ -327,6 +328,7 @@ fn hybrid_schema() -> Schema {
                 collation: Collation::BinaryUtf8,
                 capabilities: FieldCapabilities::empty(),
                 analyzer: None,
+                date_format: None,
                 components: FieldComponents::VECTOR,
             },
         ],
@@ -567,6 +569,7 @@ fn numeric_point_schema() -> Schema {
             collation: Collation::BinaryUtf8,
             capabilities: FieldCapabilities::EXACT.union(FieldCapabilities::RANGE),
             analyzer: None,
+            date_format: None,
             components: FieldComponents::POINTS,
         }],
         semantics: IndexSemantics::TypedJson,
@@ -846,6 +849,7 @@ fn terms_only_keyword_schema() -> Schema {
             collation: Collation::BinaryUtf8,
             capabilities: FieldCapabilities::EXACT,
             analyzer: None,
+            date_format: None,
             components: FieldComponents::TERMS,
         }],
         semantics: IndexSemantics::TypedJson,
@@ -993,6 +997,7 @@ fn numeric_computation_schema() -> Schema {
                 .union(FieldCapabilities::FACET)
                 .union(FieldCapabilities::AGGREGATE),
             analyzer: None,
+            date_format: None,
             components: FieldComponents::POINTS.union(FieldComponents::DOC_VALUES),
         }],
         semantics: IndexSemantics::TypedJson,
@@ -1187,6 +1192,7 @@ fn doc_value_schema() -> Schema {
             collation: Collation::BinaryUtf8,
             capabilities: FieldCapabilities::ORDER,
             analyzer: None,
+            date_format: None,
             components: FieldComponents::DOC_VALUES,
         }],
         semantics: IndexSemantics::TypedJson,

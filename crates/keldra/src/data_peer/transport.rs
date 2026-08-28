@@ -1779,6 +1779,7 @@ mod tests {
             tenant_id: 3,
             bucket_id: 4,
             exact_path: format!("objects/{offset}"),
+            canonical_path: None,
             path_version: VersionId(offset),
             kind: ObjectHeadChangeKind::Put,
             program_commit_cursor: None,

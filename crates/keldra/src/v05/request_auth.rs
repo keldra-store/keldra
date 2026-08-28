@@ -3,6 +3,26 @@ use tonic::{Request, Status};
 
 use crate::authentication::{Caller, PluginObjectScope};
 
+pub(super) fn required_command_id(value: String) -> Result<String, Status> {
+    super::validate_command_id(&value)?;
+    Ok(value)
+}
+
+pub(super) fn content_type(value: String) -> Result<Option<String>, Status> {
+    if value.len() > super::MAX_CONTENT_TYPE_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "content_type exceeds {} UTF-8 bytes",
+            super::MAX_CONTENT_TYPE_BYTES
+        )));
+    }
+    if value.as_str() == keldra_store::OBJECT_LINK_CONTENT_TYPE {
+        return Err(Status::invalid_argument(
+            "the object-link descriptor content type is reserved for Keldra",
+        ));
+    }
+    Ok((!value.is_empty()).then_some(value))
+}
+
 pub(super) fn authenticated_caller<T>(request: &Request<T>) -> Result<Caller, Status> {
     request
         .extensions()

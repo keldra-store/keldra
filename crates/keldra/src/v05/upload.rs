@@ -10,12 +10,23 @@ pub(super) async fn start_put(
     let started = Instant::now();
     let result = async {
         let caller = authenticated_caller(&request)?;
-        let metadata = put_metadata(request.into_inner())?;
+        let mut metadata = put_metadata(request.into_inner())?;
         object_path_access::require_key(&path_access, &metadata.key)?;
         require_plugin_key_scope(plugin_scope.as_ref(), &metadata.key)?;
-        service
-            .authorize_object(&caller, &metadata.key, ObjectPermission::Put)
-            .await?;
+        let resolution = object_link::resolve_current(service, metadata.key.clone()).await?;
+        if let object_link::ResolvedAddress::Link(link) = resolution {
+            object_path_access::require_key(&path_access, &link.target)?;
+            require_plugin_key_scope(plugin_scope.as_ref(), &link.target)?;
+            service
+                .authorize_object(&caller, &link.target, ObjectPermission::Put)
+                .await?;
+            metadata.key = link.target.clone();
+            metadata.link = Some(link);
+        } else {
+            service
+                .authorize_object(&caller, &metadata.key, ObjectPermission::Put)
+                .await?;
+        }
         service
             .distribution
             .require_durability_available(metadata.durability)?;
@@ -51,6 +62,10 @@ pub(super) async fn put(
         let metadata = header.to_metadata()?;
         object_path_access::require_key(&path_access, &metadata.key)?;
         require_plugin_key_scope(plugin_scope.as_ref(), &metadata.key)?;
+        if let Some(link) = &metadata.link {
+            object_path_access::require_key(&path_access, &link.link)?;
+            require_plugin_key_scope(plugin_scope.as_ref(), &link.link)?;
+        }
         service
             .authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
@@ -131,6 +146,10 @@ pub(super) async fn put_end(
         let metadata = ready.header.to_metadata()?;
         object_path_access::require_key(&path_access, &metadata.key)?;
         require_plugin_key_scope(plugin_scope.as_ref(), &metadata.key)?;
+        if let Some(link) = &metadata.link {
+            object_path_access::require_key(&path_access, &link.link)?;
+            require_plugin_key_scope(plugin_scope.as_ref(), &link.link)?;
+        }
         service
             .authorize_object(&caller, &metadata.key, ObjectPermission::Put)
             .await?;
@@ -145,6 +164,20 @@ pub(super) async fn put_end(
             command_id: Some(metadata.command_id),
             durability: metadata.durability,
         };
+        if let Some(link) = metadata.link {
+            let receipt = object_link::publish_through_link(
+                service,
+                publish,
+                link,
+                ready.upload_source_node_id,
+                bearer.signed_token(),
+                token,
+                peer_routed,
+                deadline,
+            )
+            .await?;
+            return Ok(Response::new(receipt));
+        }
         let receipt = match service.distribution.routing_target(&publish.key)? {
             Some(_) if peer_routed => {
                 return Err(Status::failed_precondition(

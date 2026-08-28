@@ -28,6 +28,8 @@ rendezvous hashing.
 | Sparse index coordination | 0.10.0 | Non-blocking startup, transactional definition locators, routed change journals, scoped recovery, resumable accounting, and budgeted maintenance |
 | Scalable bulk indices | 0.10.0 | Direct bounded bulk builds, packed artifacts, stable compressed postings, authorized rebuilds, and lossless journal backpressure |
 | Native segment indices | 0.10.0 | Keldra-owned immutable segments, exact predicate intersection, optional physical ordering, stable cursors, bounded arbitrary sorting, and shared query-memory admission |
+| Dates, zero-copy clones, and protected links | 0.15.0 | ISO 8601 or configured date parsing, independent clones sharing immutable payload bytes, and transparent mutable aliases with deletion fencing |
+| General atomic paths | 0.15.0 | Durable path reservations let authorized ordinary paths participate in bounded atomic programs without requiring `PROGRAM_ONLY` policy |
 | Java client | — | TODO |
 | Python client | — | TODO |
 | Node.js client | — | TODO |
@@ -47,7 +49,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.14.0
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.15.0
 export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
@@ -159,7 +161,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add keldra@0.14.0
+cargo add keldra@0.15.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -224,6 +226,19 @@ the generated service clients let an application share one transport across
 object, index, authorization, and administration calls. The focused Rust guide
 is at [clients/rust/README.md](clients/rust/README.md).
 
+## Clone objects and link mutable names
+
+`CloneObject` publishes an independent destination version using an exact
+source version's existing payload reference; it does not copy the bytes.
+`LinkObject` creates a transparent path alias to one canonical target instead.
+Writes through any linked name update that target, deleting the link unlinks
+it, and the target cannot be deleted until every inbound link is removed.
+
+The complete Rust example is in
+[clients/rust/README.md](clients/rust/README.md#clone-bytes-or-link-a-mutable-name).
+Clone and link require cluster protocol/storage capability `2/2`; complete the
+0.15 activation runbook below before using them.
+
 ## Create a PersonalDB group
 
 PersonalDB gives an application a witnessed, predecessor-linked log for SQLite
@@ -234,7 +249,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add keldra@0.14.0 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.15.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -525,8 +540,11 @@ Keldra exposes separate operations so intent is visible in code:
 - `DeleteIfVersion(expected_version)` deletes only the expected current value.
 
 Bucket policies can also reserve immutable or `PROGRAM_ONLY` path prefixes.
-The latter may be changed only by an atomic program, preventing an ordinary
-writer from racing a program dependency.
+`PROGRAM_ONLY` is optional application policy: it prevents ordinary mutation
+while still allowing an authorized atomic program to change the path. Atomic
+programs can also use ordinary mutable or immutable paths; Keldra's durable
+path reservations prevent concurrent ordinary writers from racing the atomic
+decision.
 
 ## Atomic programs
 
@@ -539,9 +557,8 @@ The lifecycle is deliberately explicit:
 
 1. Put an immutable definition at `_keldra/programs/<name>@<version>`.
 2. `HeadObject` it and retain the returned BLAKE3 hash.
-3. Mark every path the program may read or write as `PROGRAM_ONLY`.
-4. Invoke the exact path and hash with a unique invocation ID and JSON bindings.
-5. Keldra authorizes and locks the declared paths, evaluates the bounded DSL on
+3. Invoke the exact path and hash with a unique invocation ID and JSON bindings.
+4. Keldra authorizes and reserves the declared paths, evaluates the bounded DSL on
    the nominated executor, and publishes every resulting head atomically.
 
 Ordinary uploads—including large media—continue to use `Put`; they never enter
@@ -694,6 +711,16 @@ println!("freshness: {:?}", response.freshness);
 # }
 ```
 
+Typed JSON Date fields accept ISO-8601 strings by default, or one validated
+POSIX strftime pattern selected in their definition. Values with an explicit
+offset are normalized to UTC; offset-less values are interpreted as UTC. Keldra
+stores exactly signed Unix epoch milliseconds in points and doc values, rejects
+inputs with finer-than-millisecond precision rather than truncating them, and
+does not retain the source date string. Date fields support exact and range
+predicates, ordering, and facets, but not aggregates. Date predicate literals
+use the field's configured format, and facet bucket values are formatted back
+with that same format.
+
 The repository's public-API qualification constructs, populates, paginates,
 updates, deletes, rebuilds, and restart-verifies all eight variants in
 [`crates/keldra/examples/cluster_index_qualification.rs`](crates/keldra/examples/cluster_index_qualification.rs).
@@ -714,7 +741,7 @@ bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
 queries every index type, and performs a rolling restart:
 
 ```sh
-KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.14.0 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.15.0 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -732,6 +759,40 @@ Production formation uses the same sequence:
 
 The public gRPC endpoint may sit behind an ordinary TLS terminator. Peer traffic
 uses mandatory certificates created and rotated by the cluster.
+
+### Upgrade from 0.14 and activate 0.15 capabilities
+
+The cluster and data-peer protocols changed in 0.15. Stop all 0.14 nodes before
+starting any 0.15 node; mixed-version operation is unsupported. First quiesce
+mutations, atomic invocations, and membership changes, and take a consistent
+backup of every node's data and operational keys. Install 0.15 everywhere,
+restart the complete cluster, and keep writes drained while ACTIVE nodes attest
+support.
+
+Inspect cluster capabilities. Activation is safe only when it reports active
+protocol/storage `1/1`, target `2/2`, no blocking ACTIVE node IDs,
+`activation_quiescent=true`, and `ready_for_target_activation=true`. Activate
+`2/2` using that same response's exact placement term and index, then re-read
+status and require active `2/2`. If placement changes, discard the old fence and
+inspect again. Never force activation past a blocker.
+
+```sh
+keldra --endpoint "$KELDRA_ENDPOINT" get-cluster-capabilities
+
+keldra --endpoint "$KELDRA_ENDPOINT" activate-cluster-capabilities \
+  --protocol-version 2 \
+  --storage-format 2 \
+  --expected-placement-term "$PLACEMENT_TERM" \
+  --expected-placement-index "$PLACEMENT_INDEX"
+```
+
+Supply the same system-operator credentials used for other protected
+administration commands. The status command prints the exact activation command
+when the cluster is ready.
+
+Before resuming traffic, smoke clone independence, link write-through,
+target-delete fencing, unlink, and date queries. Rollback requires restoring the
+complete pre-upgrade backup; never start 0.14 against storage touched by 0.15.
 
 ### Place storage by workload
 

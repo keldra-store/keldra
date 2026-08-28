@@ -48,6 +48,7 @@ http-body-util = "0.1.1"
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 jsonwebtoken = "9.3"
+jiff = "0.2.28"
 libc = "0.2"
 memmap2 = "0.9"
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }

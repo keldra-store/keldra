@@ -1521,6 +1521,7 @@ mod tests {
             collation: Collation::BinaryUtf8,
             capabilities: FieldCapabilities::EXACT,
             analyzer: None,
+            date_format: None,
             components: FieldComponents::TERMS,
         };
         field.components = field.compiled_components().unwrap();

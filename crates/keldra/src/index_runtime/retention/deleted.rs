@@ -484,6 +484,7 @@ mod tests {
                 content_type: None,
                 deleted,
                 committed_at_unix_millis,
+                protected_link_descriptor: false,
             },
             versions: Vec::new(),
         }

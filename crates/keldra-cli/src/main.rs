@@ -9,21 +9,24 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use keldra_storage::v1::application_role_request::Target as ApplicationRoleTarget;
+use keldra_storage::v1::clone_object_request::Operation as CloneOperation;
 use keldra_storage::v1::object_chunk::Value as ObjectChunkValue;
 use keldra_storage::v1::object_head::State as ObjectHeadState;
 use keldra_storage::v1::object_version::State as ObjectVersionState;
 use keldra_storage::v1::put_header::Operation as PutOperation;
 use keldra_storage::v1::watch_message::Message as WatchMessageValue;
 use keldra_storage::v1::{
-    ApplicationRoleRequest, BucketApplicationRole, BucketApplicationRoleTarget, BucketPolicy,
+    ActivateClusterCapabilitiesRequest, ApplicationRoleRequest, BucketApplicationRole,
+    BucketApplicationRoleTarget, BucketPolicy, CloneObjectRequest, ClusterCapabilities,
     CreateApplicationRequest, CreateBucketRequest, DeleteIfVersionRequest, DeleteRequest,
-    DeleteVersionRequest, DisableApplicationCredentialRequest, Durability, GetObjectRequest,
-    HeadObjectRequest, InvokeProgramRequest, ListObjectVersionsRequest, ListObjectsRequest,
-    ObjectAddress, ObjectVersioning, PrepareNodeRequest, ProvisionTenantRequest, PutHeader,
-    PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation,
-    PutOperation as UnconditionalPutOperation, PutRequest, RecoverApplicationCredentialRequest,
-    RotateApplicationCredentialRequest, SetBucketPolicyRequest, SetBucketPublicReadRequest,
-    SetBucketVersioningRequest, TenantApplicationRole, TenantApplicationRoleTarget, WatchNow,
+    DeleteVersionRequest, DisableApplicationCredentialRequest, Durability,
+    GetClusterCapabilitiesRequest, GetObjectRequest, HeadObjectRequest, InvokeProgramRequest,
+    LinkObjectRequest, ListObjectVersionsRequest, ListObjectsRequest, ObjectAddress,
+    ObjectVersioning, PrepareNodeRequest, ProvisionTenantRequest, PutHeader, PutIfAbsentOperation,
+    PutIfVersionOperation, PutImmutableOperation, PutOperation as UnconditionalPutOperation,
+    PutRequest, RecoverApplicationCredentialRequest, RotateApplicationCredentialRequest,
+    SetBucketPolicyRequest, SetBucketPublicReadRequest, SetBucketVersioningRequest,
+    TenantApplicationRole, TenantApplicationRoleTarget, UnlinkObjectRequest, WatchNow,
     WatchPrefixRequest, WatchRetainedBeginning, WatchStateHint,
 };
 use serde::Deserialize;
@@ -80,6 +83,43 @@ enum Command {
         if_version: Option<u64>,
         #[arg(long)]
         immutable: bool,
+    },
+    /// Publish an independent destination version that shares exact source bytes.
+    CloneObject {
+        tenant: String,
+        bucket: String,
+        source_path: String,
+        source_version: u64,
+        destination_path: String,
+        #[arg(long)]
+        command_id: String,
+        #[arg(long, value_enum, default_value = "local")]
+        durability: DurabilityArgument,
+        #[arg(long, conflicts_with = "if_version")]
+        if_absent: bool,
+        #[arg(long)]
+        if_version: Option<u64>,
+    },
+    /// Create a transparent mutable alias for one canonical target.
+    LinkObject {
+        tenant: String,
+        bucket: String,
+        link_path: String,
+        target_path: String,
+        #[arg(long)]
+        command_id: String,
+        #[arg(long, value_enum, default_value = "local")]
+        durability: DurabilityArgument,
+    },
+    /// Remove only an object alias, never its canonical target.
+    UnlinkObject {
+        tenant: String,
+        bucket: String,
+        link_path: String,
+        #[arg(long)]
+        command_id: String,
+        #[arg(long, value_enum, default_value = "local")]
+        durability: DurabilityArgument,
     },
     Get {
         tenant: String,
@@ -234,6 +274,19 @@ enum Command {
         peer_address: String,
         #[arg(long, default_value_t = 1_000_000)]
         storage_weight_millionths: u32,
+    },
+    /// Inspect the active and target cluster protocol/storage capabilities.
+    GetClusterCapabilities,
+    /// Activate one exact inspected target at one exact placement fence.
+    ActivateClusterCapabilities {
+        #[arg(long)]
+        protocol_version: u32,
+        #[arg(long)]
+        storage_format: u32,
+        #[arg(long)]
+        expected_placement_term: u64,
+        #[arg(long)]
+        expected_placement_index: u64,
     },
     /// Create one bucket and make the authenticated application its owner.
     CreateBucket {
@@ -392,6 +445,69 @@ async fn main() -> Result<()> {
                 file,
             )
             .await?;
+            println!("{}", receipt.version);
+        }
+        Command::CloneObject {
+            tenant,
+            bucket,
+            source_path,
+            source_version,
+            destination_path,
+            command_id,
+            durability,
+            if_absent,
+            if_version,
+        } => {
+            if source_version == 0 {
+                bail!("source version must be non-zero");
+            }
+            let receipt = client
+                .clone_object(CloneObjectRequest {
+                    source: Some(address(tenant.clone(), bucket.clone(), source_path)),
+                    source_version,
+                    destination: Some(address(tenant, bucket, destination_path)),
+                    command_id,
+                    durability: durability.into(),
+                    operation: Some(clone_operation(if_absent, if_version)),
+                })
+                .await?
+                .into_inner();
+            println!("{}", receipt.version);
+        }
+        Command::LinkObject {
+            tenant,
+            bucket,
+            link_path,
+            target_path,
+            command_id,
+            durability,
+        } => {
+            let receipt = client
+                .link_object(LinkObjectRequest {
+                    link: Some(address(tenant.clone(), bucket.clone(), link_path)),
+                    target: Some(address(tenant, bucket, target_path)),
+                    command_id,
+                    durability: durability.into(),
+                })
+                .await?
+                .into_inner();
+            println!("{}", receipt.version);
+        }
+        Command::UnlinkObject {
+            tenant,
+            bucket,
+            link_path,
+            command_id,
+            durability,
+        } => {
+            let receipt = client
+                .unlink_object(UnlinkObjectRequest {
+                    link: Some(address(tenant, bucket, link_path)),
+                    command_id,
+                    durability: durability.into(),
+                })
+                .await?
+                .into_inner();
             println!("{}", receipt.version);
         }
         Command::Get {
@@ -855,6 +971,48 @@ async fn main() -> Result<()> {
                 lower_hex(&response.peer_spki_sha256),
             );
         }
+        Command::GetClusterCapabilities => {
+            let capabilities = administration
+                .get_cluster_capabilities(GetClusterCapabilitiesRequest {})
+                .await?
+                .into_inner();
+            print_cluster_capabilities(&capabilities);
+            print_activation_guidance(&capabilities);
+        }
+        Command::ActivateClusterCapabilities {
+            protocol_version,
+            storage_format,
+            expected_placement_term,
+            expected_placement_index,
+        } => {
+            let request = activation_request(
+                protocol_version,
+                storage_format,
+                expected_placement_term,
+                expected_placement_index,
+            )?;
+            let inspected = administration
+                .get_cluster_capabilities(GetClusterCapabilitiesRequest {})
+                .await?
+                .into_inner();
+            validate_activation_preflight(&inspected, &request)?;
+            let capabilities = administration
+                .activate_cluster_capabilities(request)
+                .await?
+                .into_inner();
+            if capabilities.active_protocol_version != protocol_version
+                || capabilities.active_storage_format != storage_format
+                || capabilities.active_placement_term != expected_placement_term
+                || capabilities.active_placement_index != expected_placement_index
+            {
+                bail!("server returned capabilities that do not match the requested activation");
+            }
+            println!(
+                "activated protocol={} storage={} placement_term={} placement_index={}",
+                protocol_version, storage_format, expected_placement_term, expected_placement_index,
+            );
+            print_cluster_capabilities(&capabilities);
+        }
         Command::CreateBucket { bucket, versioning } => {
             let response = administration
                 .create_bucket(CreateBucketRequest {
@@ -949,6 +1107,123 @@ fn print_role_change(response: keldra_storage::v1::ApplicationRoleResponse) {
         "revision={} replayed={}",
         response.authorization_revision, response.replayed,
     );
+}
+
+fn activation_request(
+    protocol_version: u32,
+    storage_format: u32,
+    expected_placement_term: u64,
+    expected_placement_index: u64,
+) -> Result<ActivateClusterCapabilitiesRequest> {
+    if protocol_version == 0 || storage_format == 0 {
+        bail!("--protocol-version and --storage-format must be non-zero");
+    }
+    if expected_placement_term == 0 || expected_placement_index == 0 {
+        bail!("--expected-placement-term and --expected-placement-index must be non-zero");
+    }
+    Ok(ActivateClusterCapabilitiesRequest {
+        protocol_version,
+        storage_format,
+        expected_placement_term,
+        expected_placement_index,
+    })
+}
+
+fn validate_activation_preflight(
+    capabilities: &ClusterCapabilities,
+    request: &ActivateClusterCapabilitiesRequest,
+) -> Result<()> {
+    if request.protocol_version != capabilities.target_protocol_version
+        || request.storage_format != capabilities.target_storage_format
+    {
+        bail!(
+            "requested protocol/storage {}/{} does not match the inspected target {}/{}",
+            request.protocol_version,
+            request.storage_format,
+            capabilities.target_protocol_version,
+            capabilities.target_storage_format,
+        );
+    }
+    if request.expected_placement_term != capabilities.active_placement_term
+        || request.expected_placement_index != capabilities.active_placement_index
+    {
+        bail!(
+            "requested placement fence {}/{} does not match the inspected active fence {}/{}; inspect again before activating",
+            request.expected_placement_term,
+            request.expected_placement_index,
+            capabilities.active_placement_term,
+            capabilities.active_placement_index,
+        );
+    }
+    if capabilities.active_protocol_version == request.protocol_version
+        && capabilities.active_storage_format == request.storage_format
+    {
+        bail!("requested target capabilities are already active");
+    }
+    if !capabilities.ready_for_target_activation {
+        bail!(
+            "cluster is not ready for target activation; run get-cluster-capabilities for blocking nodes and quiescence status"
+        );
+    }
+    Ok(())
+}
+
+fn print_cluster_capabilities(capabilities: &ClusterCapabilities) {
+    let blocking_nodes = if capabilities.blocking_active_node_ids.is_empty() {
+        "none".to_owned()
+    } else {
+        capabilities
+            .blocking_active_node_ids
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    println!(
+        "active_protocol={} active_storage={} target_protocol={} target_storage={} placement_term={} placement_index={} ready={} quiescent={} blocking_active_nodes={}",
+        capabilities.active_protocol_version,
+        capabilities.active_storage_format,
+        capabilities.target_protocol_version,
+        capabilities.target_storage_format,
+        capabilities.active_placement_term,
+        capabilities.active_placement_index,
+        capabilities.ready_for_target_activation,
+        capabilities.activation_quiescent,
+        blocking_nodes,
+    );
+}
+
+fn print_activation_guidance(capabilities: &ClusterCapabilities) {
+    if capabilities.active_protocol_version == capabilities.target_protocol_version
+        && capabilities.active_storage_format == capabilities.target_storage_format
+    {
+        eprintln!("cluster target capabilities are already active");
+    } else if capabilities.ready_for_target_activation {
+        eprintln!(
+            "ready to activate; run: keldra activate-cluster-capabilities --protocol-version {} --storage-format {} --expected-placement-term {} --expected-placement-index {}",
+            capabilities.target_protocol_version,
+            capabilities.target_storage_format,
+            capabilities.active_placement_term,
+            capabilities.active_placement_index,
+        );
+    } else {
+        if !capabilities.blocking_active_node_ids.is_empty() {
+            eprintln!(
+                "activation blocked: ACTIVE nodes lacking target support: {}",
+                capabilities
+                    .blocking_active_node_ids
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        if !capabilities.activation_quiescent {
+            eprintln!(
+                "activation blocked: placement transition or atomic work is still in progress"
+            );
+        }
+    }
 }
 
 async fn resolve_access_token(
@@ -1212,6 +1487,17 @@ fn put_operation(
     }
 }
 
+fn clone_operation(if_absent: bool, if_version: Option<u64>) -> CloneOperation {
+    match (if_absent, if_version) {
+        (true, None) => CloneOperation::PutIfAbsent(PutIfAbsentOperation {}),
+        (false, Some(expected_version)) => {
+            CloneOperation::PutIfVersion(PutIfVersionOperation { expected_version })
+        }
+        (false, None) => CloneOperation::Put(UnconditionalPutOperation {}),
+        (true, Some(_)) => unreachable!("clap rejects conflicting clone conditions"),
+    }
+}
+
 fn parse_hex(value: &str) -> Result<Vec<u8>> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("program hash must be the 64-digit BLAKE3 hash of the stored definition bytes");
@@ -1249,12 +1535,13 @@ fn present_head_line(version: u64, content_length: u64, content_hash: &[u8]) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        Arguments, BucketRoleArgument, Command, PublicReadArgument, TenantRoleArgument,
-        VersioningArgument, decode_bootstrap_credential, load_client_secret_file,
-        load_credential_file, parse_hex, present_head_line, put_operation, versioning_name,
+        Arguments, BucketRoleArgument, Command, DurabilityArgument, PublicReadArgument,
+        TenantRoleArgument, VersioningArgument, activation_request, clone_operation,
+        decode_bootstrap_credential, load_client_secret_file, load_credential_file, parse_hex,
+        present_head_line, put_operation, validate_activation_preflight, versioning_name,
     };
     use clap::Parser as _;
-    use keldra_storage::v1::put_header::Operation;
+    use keldra_storage::v1::{ClusterCapabilities, clone_object_request, put_header::Operation};
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -1299,6 +1586,61 @@ mod tests {
         ));
         assert!(put_operation(true, Some(8), false).is_err());
         assert!(put_operation(true, None, true).is_err());
+    }
+
+    #[test]
+    fn clone_commands_preserve_addresses_version_and_condition() {
+        let clone = Arguments::try_parse_from(
+            "keldra --token t clone-object acme objects source 9 copy --command-id clone-1 --durability replicated --if-version 4"
+                .split_whitespace(),
+        ).unwrap();
+        assert!(matches!(clone.command, Command::CloneObject {
+            ref tenant, ref bucket, ref source_path, source_version: 9,
+            ref destination_path, ref command_id, durability: DurabilityArgument::Replicated,
+            if_absent: false, if_version: Some(4),
+        } if tenant == "acme" && bucket == "objects" && source_path == "source"
+            && destination_path == "copy" && command_id == "clone-1"));
+        assert!(matches!(
+            clone_operation(true, None),
+            clone_object_request::Operation::PutIfAbsent(_)
+        ));
+        assert!(matches!(
+            clone_operation(false, None),
+            clone_object_request::Operation::Put(_)
+        ));
+        assert!(matches!(
+            clone_operation(false, Some(4)),
+            clone_object_request::Operation::PutIfVersion(operation)
+                if operation.expected_version == 4
+        ));
+        assert!(
+            Arguments::try_parse_from(
+                "keldra --token t clone-object a b s 1 d --command-id c --if-absent --if-version 2"
+                    .split_whitespace(),
+            )
+            .is_err()
+        );
+
+        let link = Arguments::try_parse_from(
+            "keldra --token t link-object acme objects alias target --command-id link-1"
+                .split_whitespace(),
+        )
+        .unwrap();
+        assert!(matches!(link.command, Command::LinkObject {
+                ref tenant, ref bucket, ref link_path, ref target_path, ref command_id,
+                durability: DurabilityArgument::Local,
+            } if tenant == "acme" && bucket == "objects" && link_path == "alias"
+                && target_path == "target" && command_id == "link-1"));
+        let unlink = Arguments::try_parse_from(
+            "keldra --token t unlink-object acme objects alias --command-id unlink-1"
+                .split_whitespace(),
+        )
+        .unwrap();
+        assert!(matches!(unlink.command, Command::UnlinkObject {
+                ref tenant, ref bucket, ref link_path, ref command_id,
+                durability: DurabilityArgument::Local,
+            } if tenant == "acme" && bucket == "objects" && link_path == "alias"
+                && command_id == "unlink-1"));
     }
 
     #[test]
@@ -1407,6 +1749,71 @@ mod tests {
                 storage_weight_millionths: 500_000,
             } if peer_address == "node-2.internal:50052"
         ));
+
+        let inspect =
+            Arguments::try_parse_from(["keldra", "--token", "token", "get-cluster-capabilities"])
+                .unwrap();
+        assert!(matches!(inspect.command, Command::GetClusterCapabilities));
+
+        let activate = Arguments::try_parse_from([
+            "keldra",
+            "--token",
+            "token",
+            "activate-cluster-capabilities",
+            "--protocol-version",
+            "2",
+            "--storage-format",
+            "2",
+            "--expected-placement-term",
+            "7",
+            "--expected-placement-index",
+            "31",
+        ])
+        .unwrap();
+        assert!(matches!(
+            activate.command,
+            Command::ActivateClusterCapabilities {
+                protocol_version: 2,
+                storage_format: 2,
+                expected_placement_term: 7,
+                expected_placement_index: 31,
+            }
+        ));
+    }
+
+    #[test]
+    fn capability_activation_requires_nonzero_exact_values() {
+        assert!(activation_request(2, 2, 7, 31).is_ok());
+        assert!(activation_request(0, 2, 7, 31).is_err());
+        assert!(activation_request(2, 0, 7, 31).is_err());
+        assert!(activation_request(2, 2, 0, 31).is_err());
+        assert!(activation_request(2, 2, 7, 0).is_err());
+    }
+
+    #[test]
+    fn capability_activation_is_bound_to_the_inspected_target_and_fence() {
+        let mut capabilities = ClusterCapabilities {
+            active_protocol_version: 1,
+            active_storage_format: 1,
+            target_protocol_version: 2,
+            target_storage_format: 2,
+            active_placement_term: 7,
+            active_placement_index: 31,
+            ready_for_target_activation: true,
+            blocking_active_node_ids: Vec::new(),
+            activation_quiescent: true,
+        };
+        let request = activation_request(2, 2, 7, 31).unwrap();
+        assert!(validate_activation_preflight(&capabilities, &request).is_ok());
+
+        capabilities.active_placement_index = 32;
+        assert!(validate_activation_preflight(&capabilities, &request).is_err());
+        capabilities.active_placement_index = 31;
+        capabilities.target_storage_format = 3;
+        assert!(validate_activation_preflight(&capabilities, &request).is_err());
+        capabilities.target_storage_format = 2;
+        capabilities.ready_for_target_activation = false;
+        assert!(validate_activation_preflight(&capabilities, &request).is_err());
     }
 
     #[test]

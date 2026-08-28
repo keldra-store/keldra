@@ -45,6 +45,7 @@ impl Store {
             let key = match &operation {
                 BatchOperation::Put(request) => &request.key,
                 BatchOperation::Publish(request) => &request.key,
+                BatchOperation::Clone(request) => &request.destination,
                 BatchOperation::Delete(request) => &request.key,
             };
             let identity = BucketIdentity {
@@ -98,6 +99,20 @@ impl Store {
             )
             .await;
         let _commit_guard = self.lock_commit("distributed_publish").await;
+        let mut reserved = BTreeMap::new();
+        for item in &prepared {
+            if let Err(error) = self.require_unreserved_object_locked(
+                item.operation.identity(),
+                item.operation.key().path(),
+                None,
+            ) {
+                reserved.insert(item.index, error);
+            }
+        }
+        if !reserved.is_empty() {
+            prepared.retain(|item| !reserved.contains_key(&item.index));
+            early.extend(reserved);
+        }
         let source = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -178,8 +193,14 @@ impl Store {
                             "distributed batch source position changed during evaluation".into(),
                         ));
                     }
-                    next_source_position =
-                        next_source_position.checked_add(1).ok_or_else(|| {
+                    next_source_position = next_source_position
+                        .checked_add(
+                            1 + mutation
+                                .alias_snapshot
+                                .as_ref()
+                                .map_or(0, |snapshot| snapshot.registry.aliases.len() as u64),
+                        )
+                        .ok_or_else(|| {
                             MutationError::Storage("local invalidation offset is exhausted".into())
                         })?;
                     high_watermark = Some(
@@ -187,16 +208,10 @@ impl Store {
                             current.max(value.receipt.version)
                         }),
                     );
-                    pending_changes.push(PendingLocalChange::ObjectHead {
-                        identity: item.operation.identity(),
-                        exact_path: item.operation.key().path().to_owned(),
-                        path_version: value.receipt.version,
-                        deleted: value.receipt.deleted,
-                        program_commit_cursor: None,
-                        reference_deltas: value.reference_deltas.clone(),
-                        accounting_transition: value.accounting_transition,
-                        definition_transition: value.definition_transition.clone(),
-                    });
+                    pending_changes.extend(value.pending_head_changes(
+                        item.operation.identity(),
+                        item.operation.key().path(),
+                    ));
                 }
                 if let Some(mutation) = value.mutation.as_ref() {
                     self.stage_object_mutation_reference_proof(&mut batch, mutation)?;
@@ -416,8 +431,14 @@ impl Store {
                             "distributed batch source position changed during evaluation".into(),
                         ));
                     }
-                    next_source_position =
-                        next_source_position.checked_add(1).ok_or_else(|| {
+                    next_source_position = next_source_position
+                        .checked_add(
+                            1 + mutation
+                                .alias_snapshot
+                                .as_ref()
+                                .map_or(0, |snapshot| snapshot.registry.aliases.len() as u64),
+                        )
+                        .ok_or_else(|| {
                             MutationError::Storage("local invalidation offset is exhausted".into())
                         })?;
                     high_watermark = Some(
@@ -425,16 +446,8 @@ impl Store {
                             current.max(value.receipt.version)
                         }),
                     );
-                    pending_changes.push(PendingLocalChange::ObjectHead {
-                        identity,
-                        exact_path: operation.key().path().to_owned(),
-                        path_version: value.receipt.version,
-                        deleted: value.receipt.deleted,
-                        program_commit_cursor: None,
-                        reference_deltas: value.reference_deltas.clone(),
-                        accounting_transition: value.accounting_transition,
-                        definition_transition: value.definition_transition.clone(),
-                    });
+                    pending_changes
+                        .extend(value.pending_head_changes(identity, operation.key().path()));
                 }
                 if let Some(mutation) = value.mutation.as_ref() {
                     self.stage_object_mutation_reference_proof(&mut batch, mutation)?;

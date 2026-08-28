@@ -374,6 +374,7 @@ fn live_version(id: u64, reference: BlobRef) -> Version {
         content_type: Some("application/octet-stream".into()),
         deleted: false,
         committed_at_unix_millis: id,
+        protected_link_descriptor: false,
     }
 }
 
@@ -384,6 +385,7 @@ fn tombstone(id: u64) -> Version {
         content_type: None,
         deleted: true,
         committed_at_unix_millis: id,
+        protected_link_descriptor: false,
     }
 }
 
@@ -405,6 +407,8 @@ fn snapshot_at(exact_path: &str, head: &Version, versions: Vec<Version>) -> Obje
         journal_pending_versions: Vec::new(),
         journal_released_versions: Vec::new(),
         definition_locator: None,
+        alias_registry: None,
+        alias_registry_transition: None,
     }
 }
 
@@ -442,6 +446,7 @@ fn current_at(
             }),
         },
         version,
+        alias_registry: None,
     }
 }
 
@@ -472,6 +477,7 @@ fn reader_with_full_snapshot_counter(
         exact_path: snapshot.exact_path.clone(),
         head: snapshot.head.clone(),
         version,
+        alias_registry: None,
     };
     let full_snapshot_reads = Arc::new(AtomicU64::new(0));
     ClusterObjectReader::with_components(
@@ -597,6 +603,7 @@ async fn current_head_batch_fails_closed_when_the_placement_fence_changes() {
         exact_path: snapshot.exact_path,
         head: snapshot.head,
         version,
+        alias_registry: None,
     };
     let reader = ClusterObjectReader::with_components(
         Arc::new(FakeMetadata {
