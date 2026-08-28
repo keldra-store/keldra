@@ -881,6 +881,21 @@ impl<'a, D: ArtifactDirectoryRead> DocCursor<'a, D> {
         }
     }
 
+    pub(super) fn point_range(
+        directory: &'a D,
+        segment: &'a SegmentDescriptor,
+        field_id: FieldId,
+        bounds: PointBounds,
+        statistics: NativeQueryStatisticsRecorder,
+    ) -> Result<Self, IndexError> {
+        if optional_component_root(segment, ComponentKind::POINTS, Some(field_id)).is_none() {
+            return Ok(Self::Empty);
+        }
+        Ok(Self::PointRange(PointRangeStream::new(
+            directory, segment, field_id, bounds, statistics,
+        )?))
+    }
+
     pub(super) fn and(mut children: Vec<Self>, statistics: NativeQueryStatisticsRecorder) -> Self {
         if children.is_empty() {
             return Self::Empty;
@@ -1400,6 +1415,16 @@ pub(super) fn component_root(
     kind: ComponentKind,
     field_id: Option<FieldId>,
 ) -> Result<super::super::ArtifactDescriptor, IndexError> {
+    optional_component_root(segment, kind, field_id).ok_or(IndexError::InvalidFormat(
+        "format-v4 segment lacks a required component stream",
+    ))
+}
+
+pub(super) fn optional_component_root(
+    segment: &SegmentDescriptor,
+    kind: ComponentKind,
+    field_id: Option<FieldId>,
+) -> Option<super::super::ArtifactDescriptor> {
     segment
         .components
         .binary_search_by_key(&(kind, field_id, 0), |component| {
@@ -1407,9 +1432,6 @@ pub(super) fn component_root(
         })
         .ok()
         .map(|index| segment.components[index].artifact.clone())
-        .ok_or(IndexError::InvalidFormat(
-            "format-v4 segment lacks a required component stream",
-        ))
 }
 
 fn validate_ordinal_leaf(leaf: &StreamLeaf, expected: u32) -> Result<(), IndexError> {

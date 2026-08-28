@@ -12,8 +12,8 @@ use super::super::{
     scalar_term, text_term,
 };
 use super::posting::{
-    DocCursor, DocValuePresenceStream, PointBounds, PointRangeStream, PostingStream, TermBounds,
-    TermRangeStream, component_root,
+    DocCursor, DocValuePresenceStream, PointBounds, PostingStream, TermBounds, TermRangeStream,
+    optional_component_root,
 };
 
 pub(super) struct SegmentPlan<'a, D> {
@@ -283,13 +283,13 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
                     .get(field_id.get() as usize)
                     .ok_or_else(|| IndexError::InvalidQuery("unknown range field".into()))?;
                 if field_schema.components.contains(FieldComponents::POINTS) {
-                    DocCursor::PointRange(PointRangeStream::new(
+                    DocCursor::point_range(
                         directory,
                         segment,
                         *field_id,
                         PointBounds::new(lower.clone(), upper.clone())?,
                         statistics.clone(),
-                    )?)
+                    )?
                 } else {
                     field(schema, *field_id, FieldComponents::TERMS)?;
                     range_cursor(
@@ -318,13 +318,13 @@ fn plan_predicate<'a, D: ArtifactDirectoryRead>(
                     )
                     .await?
                 } else if field.components.contains(FieldComponents::POINTS) {
-                    DocCursor::PointRange(PointRangeStream::new(
+                    DocCursor::point_range(
                         directory,
                         segment,
                         *field_id,
                         PointBounds::presence(),
                         statistics.clone(),
-                    )?)
+                    )?
                 } else if field.components.contains(FieldComponents::DOC_VALUES) {
                     DocCursor::DocValuePresence(DocValuePresenceStream::new(
                         directory,
@@ -525,25 +525,25 @@ async fn exact_value_cursor<'a, D: ArtifactDirectoryRead>(
         .ok_or_else(|| IndexError::InvalidQuery("unknown exact field".into()))?;
     if field.components.contains(FieldComponents::POINTS) {
         if value == &ScalarValue::Null {
-            return Ok(DocCursor::PointRange(PointRangeStream::new(
+            return DocCursor::point_range(
                 directory,
                 segment,
                 field_id,
                 PointBounds::null(),
                 statistics.clone(),
-            )?));
+            );
         }
         let bound = RangeBound {
             value: value.clone(),
             inclusive: true,
         };
-        return Ok(DocCursor::PointRange(PointRangeStream::new(
+        return DocCursor::point_range(
             directory,
             segment,
             field_id,
             PointBounds::new(Some(bound.clone()), Some(bound))?,
             statistics.clone(),
-        )?));
+        );
     }
     if !field.components.contains(FieldComponents::TERMS) {
         return Err(IndexError::InvalidQuery(
@@ -822,14 +822,6 @@ where
         }
     }
     Ok(output)
-}
-
-fn optional_component_root(
-    segment: &SegmentDescriptor,
-    kind: ComponentKind,
-    field_id: Option<FieldId>,
-) -> Option<super::super::ArtifactDescriptor> {
-    component_root(segment, kind, field_id).ok()
 }
 
 fn field(
