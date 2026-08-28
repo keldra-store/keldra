@@ -332,6 +332,10 @@ jobs:
             changes, and aligning index publication with the Store commit
             authority.
 
+            Public Typed JSON and Metadata Filter queries now expose bounded
+            nested conjunction, disjunction, and negation expressions as a
+            clean protocol break from the former flat predicate list.
+
             It includes the multi-platform Keldra server image, CLI, Rust client,
             generated API crate, and the public contention qualification client.
 

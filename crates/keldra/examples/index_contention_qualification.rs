@@ -23,9 +23,9 @@ use keldra_storage::v1::index_service_client::IndexServiceClient;
 use keldra_storage::v1::object_head::State as ObjectHeadState;
 use keldra_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
-    Durability, HeadObjectRequest, IndexPredicate, IndexPredicateOperator, IndexQuery,
-    IndexSourceFreshness, ObjectAddress, ObjectVersioning, QueryIndexRequest, QueryIndexResponse,
-    TypedJsonIndexQuery,
+    Durability, HeadObjectRequest, IndexPredicate, IndexPredicateExpression,
+    IndexPredicateOperator, IndexQuery, IndexSourceFreshness, ObjectAddress, ObjectVersioning,
+    QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
 };
 use keldra_storage::{
     BearerToken, KeywordField, RawClient, TypedJsonIndexBuilder, UnsignedIntegerField,
@@ -1337,11 +1337,11 @@ async fn query(
             index_name: index_name.into(),
             query: Some(IndexQuery {
                 query: Some(QueryValue::TypedJson(TypedJsonIndexQuery {
-                    predicates: vec![IndexPredicate {
+                    predicate: Some(IndexPredicateExpression::leaf(IndexPredicate {
                         field: field.into(),
                         operator: IndexPredicateOperator::Equal as i32,
                         values_json: vec![value],
-                    }],
+                    })),
                     order: Vec::new(),
                     facets: Vec::new(),
                     aggregates: Vec::new(),

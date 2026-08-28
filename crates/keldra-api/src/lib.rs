@@ -4,6 +4,80 @@ pub mod v1 {
     tonic::include_proto!("keldra.v1");
 }
 
+/// A Boolean predicate expression rejected before it is sent to Keldra.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PredicateExpressionError {
+    EmptyConjunction,
+    EmptyDisjunction,
+}
+
+impl std::fmt::Display for PredicateExpressionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyConjunction => {
+                formatter.write_str("a predicate conjunction requires at least one child")
+            }
+            Self::EmptyDisjunction => {
+                formatter.write_str("a predicate disjunction requires at least one child")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PredicateExpressionError {}
+
+impl v1::IndexPredicateExpression {
+    /// Construct one leaf expression.
+    pub fn leaf(predicate: v1::IndexPredicate) -> Self {
+        Self {
+            expression: Some(v1::index_predicate_expression::Expression::Predicate(
+                predicate,
+            )),
+        }
+    }
+
+    /// Construct a non-empty conjunction.
+    pub fn all(
+        expressions: impl IntoIterator<Item = Self>,
+    ) -> Result<Self, PredicateExpressionError> {
+        let expressions = expressions.into_iter().collect::<Vec<_>>();
+        if expressions.is_empty() {
+            return Err(PredicateExpressionError::EmptyConjunction);
+        }
+        Ok(Self {
+            expression: Some(v1::index_predicate_expression::Expression::Conjunction(
+                v1::IndexPredicateConjunction { expressions },
+            )),
+        })
+    }
+
+    /// Construct a non-empty disjunction.
+    pub fn any(
+        expressions: impl IntoIterator<Item = Self>,
+    ) -> Result<Self, PredicateExpressionError> {
+        let expressions = expressions.into_iter().collect::<Vec<_>>();
+        if expressions.is_empty() {
+            return Err(PredicateExpressionError::EmptyDisjunction);
+        }
+        Ok(Self {
+            expression: Some(v1::index_predicate_expression::Expression::Disjunction(
+                v1::IndexPredicateDisjunction { expressions },
+            )),
+        })
+    }
+
+    /// Negate this complete expression.
+    pub fn negated(self) -> Self {
+        Self {
+            expression: Some(v1::index_predicate_expression::Expression::Negation(
+                Box::new(v1::IndexPredicateNegation {
+                    expression: Some(Box::new(self)),
+                }),
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::v1::{DeletedObject, NeverExisted, ObjectHead, PresentObject, object_head};
@@ -158,25 +232,32 @@ mod tests {
 
     #[test]
     fn typed_json_queries_expose_fielded_text_facets_and_aggregates() {
+        use super::v1::index_predicate_expression::Expression;
         use super::v1::{
             IndexAggregateOperation, IndexAggregateRequest, IndexAggregateResult, IndexFacetBucket,
-            IndexFacetRequest, IndexFacetResult, IndexPredicate, IndexPredicateOperator,
-            IndexQueryHit, QueryIndexResponse, TypedJsonIndexQuery,
+            IndexFacetRequest, IndexFacetResult, IndexPredicate, IndexPredicateConjunction,
+            IndexPredicateExpression, IndexPredicateOperator, IndexQueryHit, QueryIndexResponse,
+            TypedJsonIndexQuery,
         };
 
         let query = TypedJsonIndexQuery {
-            predicates: vec![
-                IndexPredicate {
-                    field: "summary".into(),
-                    operator: IndexPredicateOperator::FullText as i32,
-                    values_json: vec![br#""memory safety""#.to_vec()],
-                },
-                IndexPredicate {
-                    field: "summary".into(),
-                    operator: IndexPredicateOperator::Phrase as i32,
-                    values_json: vec![br#""memory safety""#.to_vec()],
-                },
-            ],
+            predicate: Some(IndexPredicateExpression {
+                expression: Some(Expression::Conjunction(IndexPredicateConjunction {
+                    expressions: [
+                        IndexPredicateOperator::FullText,
+                        IndexPredicateOperator::Phrase,
+                    ]
+                    .into_iter()
+                    .map(|operator| IndexPredicateExpression {
+                        expression: Some(Expression::Predicate(IndexPredicate {
+                            field: "summary".into(),
+                            operator: operator as i32,
+                            values_json: vec![br#""memory safety""#.to_vec()],
+                        })),
+                    })
+                    .collect(),
+                })),
+            }),
             order: Vec::new(),
             facets: vec![IndexFacetRequest {
                 field: "ecosystem".into(),
@@ -211,8 +292,54 @@ mod tests {
         };
 
         assert_eq!(query.facets[0].limit, 10);
+        assert!(matches!(
+            query.predicate.unwrap().expression,
+            Some(Expression::Conjunction(_))
+        ));
         assert_eq!(response.hits[0].object_version, 7);
         assert_eq!(response.aggregate_results[0].contributing_count, 4);
+
+        let schema = include_str!("../proto/keldra.proto").to_ascii_lowercase();
+        assert!(!schema.contains("repeated indexpredicate predicates"));
+        assert!(schema.contains("indexpredicateexpression predicate = 5"));
+        assert!(schema.contains("indexpredicateexpression predicate = 2"));
+    }
+
+    #[test]
+    fn predicate_expression_helpers_reject_empty_boolean_operators() {
+        use super::PredicateExpressionError;
+        use super::v1::index_predicate_expression::Expression;
+        use super::v1::{IndexPredicate, IndexPredicateExpression, IndexPredicateOperator};
+
+        let leaf = IndexPredicateExpression::leaf(IndexPredicate {
+            field: "status".into(),
+            operator: IndexPredicateOperator::Exists as i32,
+            values_json: Vec::new(),
+        });
+        assert!(matches!(
+            IndexPredicateExpression::all([leaf.clone()])
+                .unwrap()
+                .expression,
+            Some(Expression::Conjunction(_))
+        ));
+        assert!(matches!(
+            IndexPredicateExpression::any([leaf.clone()])
+                .unwrap()
+                .expression,
+            Some(Expression::Disjunction(_))
+        ));
+        assert!(matches!(
+            leaf.negated().expression,
+            Some(Expression::Negation(_))
+        ));
+        assert_eq!(
+            IndexPredicateExpression::all(Vec::new()).unwrap_err(),
+            PredicateExpressionError::EmptyConjunction
+        );
+        assert_eq!(
+            IndexPredicateExpression::any(Vec::new()).unwrap_err(),
+            PredicateExpressionError::EmptyDisjunction
+        );
     }
 
     #[test]

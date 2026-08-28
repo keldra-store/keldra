@@ -8,7 +8,7 @@ clients.
 ## Install
 
 ```sh
-cargo add keldra@0.13.0
+cargo add keldra@0.14.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -95,6 +95,46 @@ aggregates, and analyzed full-text search. A field emits only the index
 components required by the methods selected on its builder. Multi-valued
 keyword and numeric fields retain source multiplicity for aggregate operations,
 while one document contributes at most once to each distinct facet bucket.
+
+## Build bounded Boolean queries
+
+`PredicateExpression` encodes canonical typed scalar values and constructs only
+non-empty Boolean operators within Keldra's public 32-level/256-node bounds.
+Facets, aggregates, ordering, pagination, and freshness remain ordinary public
+query options and apply to the complete authorized Boolean match set.
+
+```rust,no_run
+use keldra::PredicateExpression;
+use keldra::v1::{
+    IndexAggregateOperation, IndexAggregateRequest, IndexFacetRequest,
+    TypedJsonIndexQuery,
+};
+
+# fn query() -> Result<TypedJsonIndexQuery, Box<dyn std::error::Error + Send + Sync>> {
+let runnable = PredicateExpression::all([
+    PredicateExpression::any([
+        PredicateExpression::equal("status", "pending")?,
+        PredicateExpression::equal("status", "retryable")?,
+    ])?,
+    PredicateExpression::less_than_or_equal("due_at", 1_800_000_000_u64)?,
+    PredicateExpression::exists("deleted_at")?.negated()?,
+])?;
+
+let query = TypedJsonIndexQuery {
+    predicate: Some(runnable.into_proto()),
+    order: vec![],
+    facets: vec![IndexFacetRequest {
+        field: "status".into(),
+        limit: 10,
+    }],
+    aggregates: vec![IndexAggregateRequest {
+        field: "duration".into(),
+        operation: IndexAggregateOperation::Average as i32,
+    }],
+};
+# Ok(query)
+# }
+```
 
 ## Upload with compare-and-swap
 

@@ -18,11 +18,13 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
 mod typed_json_index;
+mod typed_json_query;
 
 pub use typed_json_index::{
     BooleanField, FloatField, IndexDefinitionError, IndexOrderToken, KeywordField,
     SignedIntegerField, TextField, TypedJsonIndexBuilder, UnsignedIntegerField,
 };
+pub use typed_json_query::{PredicateBuildError, PredicateExpression, PredicateScalar};
 
 const MAX_MESSAGE_BYTES: usize = 72 * 1024 * 1024;
 

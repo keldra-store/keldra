@@ -9,8 +9,8 @@ use anyhow::{Context, Result, ensure};
 use keldra_storage::v1::index_query::Query as QueryValue;
 use keldra_storage::v1::{
     IndexAggregateOperation, IndexAggregateRequest, IndexFacetRequest, IndexOrder,
-    IndexOrderDirection, IndexPredicate, IndexPredicateOperator, IndexQuery, QueryIndexRequest,
-    QueryIndexResponse, TypedJsonIndexQuery,
+    IndexOrderDirection, IndexPredicate, IndexPredicateExpression, IndexPredicateOperator,
+    IndexQuery, QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -334,7 +334,7 @@ fn arbitrary_order(left: &ExpectedRecord, right: &ExpectedRecord) -> Ordering {
 
 fn incident_query() -> TypedJsonIndexQuery {
     TypedJsonIndexQuery {
-        predicates: incident_predicates(),
+        predicate: Some(predicate_conjunction(incident_predicates())),
         order: physical_order(),
         facets: Vec::new(),
         aggregates: Vec::new(),
@@ -362,7 +362,7 @@ fn zero_hit_query() -> TypedJsonIndexQuery {
         &["-1"],
     ));
     TypedJsonIndexQuery {
-        predicates,
+        predicate: Some(predicate_conjunction(predicates)),
         order: physical_order(),
         facets: Vec::new(),
         aggregates: Vec::new(),
@@ -371,7 +371,7 @@ fn zero_hit_query() -> TypedJsonIndexQuery {
 
 fn arbitrary_sort_query() -> TypedJsonIndexQuery {
     TypedJsonIndexQuery {
-        predicates: Vec::new(),
+        predicate: None,
         order: vec![
             IndexOrder {
                 field: "score".into(),
@@ -413,6 +413,13 @@ fn incident_predicates() -> Vec<IndexPredicate> {
             &["\"cargo\"", "\"npm\"", "\"pypi\""],
         ),
     ]
+}
+
+fn predicate_conjunction(
+    predicates: impl IntoIterator<Item = IndexPredicate>,
+) -> IndexPredicateExpression {
+    IndexPredicateExpression::all(predicates.into_iter().map(IndexPredicateExpression::leaf))
+        .expect("qualification predicate conjunction is non-empty")
 }
 
 fn predicate(
@@ -513,7 +520,7 @@ mod tests {
         assert!(selection.aggregates.is_empty());
 
         let computations = computation_query();
-        assert_eq!(computations.predicates, selection.predicates);
+        assert_eq!(computations.predicate, selection.predicate);
         assert_eq!(computations.order, selection.order);
         assert_eq!(computations.facets.len(), 1);
         assert_eq!(computations.facets[0].field, "active");

@@ -401,6 +401,35 @@ message IndexPredicate {
   repeated bytes values_json = 3;
 }
 
+// One bounded Boolean predicate expression. Leaves retain their declared field
+// capability checks. Conjunction and disjunction require at least one child;
+// negation requires exactly one child. Servers reject expressions deeper than
+// 32 levels or containing more than 256 total nodes.
+message IndexPredicateExpression {
+  oneof expression {
+    IndexPredicate predicate = 1;
+    IndexPredicateConjunction conjunction = 2;
+    IndexPredicateDisjunction disjunction = 3;
+    IndexPredicateNegation negation = 4;
+  }
+}
+
+message IndexPredicateConjunction {
+  repeated IndexPredicateExpression expressions = 1;
+}
+
+message IndexPredicateDisjunction {
+  repeated IndexPredicateExpression expressions = 1;
+}
+
+message IndexPredicateNegation {
+  // Negation is set complement over indexed live documents, not SQL
+  // three-valued logic. A document missing a field therefore matches the
+  // negation of an equality on that field. Mandatory authorization is still
+  // applied before any hit, facet, or aggregate is returned.
+  IndexPredicateExpression expression = 1;
+}
+
 enum IndexOrderDirection {
   INDEX_ORDER_DIRECTION_ASCENDING = 0;
   INDEX_ORDER_DIRECTION_DESCENDING = 1;
@@ -417,18 +446,21 @@ message PathIndexQuery {
 }
 
 message MetadataFilterIndexQuery {
-  repeated IndexPredicate predicates = 1;
+  reserved 1;
+  // Absent matches every indexed object.
+  IndexPredicateExpression predicate = 2;
 }
 
 message TypedJsonIndexQuery {
-  // Predicates in this list are ANDed. IN is the bounded same-field OR form.
-  // Arbitrary Boolean expression trees and NOT are not part of this contract.
-  repeated IndexPredicate predicates = 1;
+  reserved 1;
   repeated IndexOrder order = 2;
   // A request may contain at most 32 facet and aggregate computations in
   // total. Each facet limit must be in 1..=1000.
   repeated IndexFacetRequest facets = 3;
   repeated IndexAggregateRequest aggregates = 4;
+  // Absent matches every indexed document. Facets and aggregates apply to the
+  // complete authorized matching set produced by this expression.
+  IndexPredicateExpression predicate = 5;
 }
 
 message IndexFacetRequest {

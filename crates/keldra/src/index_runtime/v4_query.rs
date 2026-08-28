@@ -1,10 +1,12 @@
 //! Checked translation from the public protobuf query into the native v4 plan input.
 
+use keldra_api::v1::index_predicate_expression::Expression;
 use keldra_api::v1::index_query::Query;
 use keldra_api::v1::index_specification::Specification;
 use keldra_api::v1::{
     IndexAggregateOperation, IndexAggregateRequest, IndexFacetRequest, IndexOrder,
-    IndexOrderDirection, IndexPredicate, IndexPredicateOperator, IndexQuery, IndexSpecification,
+    IndexOrderDirection, IndexPredicate, IndexPredicateExpression, IndexPredicateOperator,
+    IndexQuery, IndexSpecification,
 };
 use keldra_index::IndexError;
 use keldra_index::v4::{
@@ -15,6 +17,8 @@ use keldra_index::v4::{
 
 const MAX_COMPUTATIONS: usize = 32;
 const MAX_FACET_BUCKETS: u32 = 1_000;
+const MAX_PREDICATE_DEPTH: u32 = 32;
+const MAX_PREDICATE_NODES: u32 = 256;
 
 pub(crate) struct CompiledQuery {
     pub(crate) query: NativeQuery,
@@ -23,7 +27,7 @@ pub(crate) struct CompiledQuery {
 }
 
 /// Compile one public query without retaining protobuf enum values or field
-/// names in the execution engine. Repeated public predicates are an exact AND.
+/// names in the execution engine.
 pub(crate) fn compile_query(
     schema: &Schema,
     specification: &IndexSpecification,
@@ -42,7 +46,7 @@ pub(crate) fn compile_query(
             ),
             (Some(Specification::MetadataFilter(_)), Some(Query::MetadataFilter(query))) => (
                 NativeQuery::Filter {
-                    predicate: compile_predicates(schema, &query.predicates)?,
+                    predicate: compile_predicate_expression(schema, query.predicate.as_ref())?,
                     order: Vec::new(),
                 },
                 Vec::new(),
@@ -56,7 +60,7 @@ pub(crate) fn compile_query(
                 }
                 (
                     NativeQuery::Filter {
-                        predicate: compile_predicates(schema, &query.predicates)?,
+                        predicate: compile_predicate_expression(schema, query.predicate.as_ref())?,
                         order: compile_order(schema, &query.order)?,
                     },
                     compile_facets(schema, &query.facets)?,
@@ -211,23 +215,97 @@ fn compile_aggregates(
         .collect()
 }
 
-fn compile_predicates(
+fn compile_predicate_expression(
     schema: &Schema,
-    predicates: &[IndexPredicate],
+    expression: Option<&IndexPredicateExpression>,
 ) -> Result<Option<Predicate>, IndexError> {
-    let mut compiled = Vec::with_capacity(predicates.len());
-    for (ordinal, predicate) in predicates.iter().enumerate() {
-        let id = PredicateId::new(
-            u32::try_from(ordinal)
-                .map_err(|_| IndexError::InvalidQuery("too many predicates".into()))?,
-        );
-        compiled.push(compile_predicate(schema, predicate, id)?);
+    expression
+        .map(|expression| {
+            let mut compiler = PredicateExpressionCompiler {
+                schema,
+                nodes: 0,
+                leaves: 0,
+            };
+            compiler.compile(expression, 1)
+        })
+        .transpose()
+}
+
+struct PredicateExpressionCompiler<'a> {
+    schema: &'a Schema,
+    nodes: u32,
+    leaves: u32,
+}
+
+impl PredicateExpressionCompiler<'_> {
+    fn compile(
+        &mut self,
+        expression: &IndexPredicateExpression,
+        depth: u32,
+    ) -> Result<Predicate, IndexError> {
+        if depth > MAX_PREDICATE_DEPTH {
+            return Err(IndexError::InvalidQuery(format!(
+                "predicate expression exceeds the maximum depth of {MAX_PREDICATE_DEPTH}"
+            )));
+        }
+        self.nodes = self
+            .nodes
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+        if self.nodes > MAX_PREDICATE_NODES {
+            return Err(IndexError::InvalidQuery(format!(
+                "predicate expression exceeds the maximum node count of {MAX_PREDICATE_NODES}"
+            )));
+        }
+
+        match expression.expression.as_ref() {
+            Some(Expression::Predicate(predicate)) => {
+                let id = PredicateId::new(self.leaves);
+                self.leaves = self
+                    .leaves
+                    .checked_add(1)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                compile_predicate(self.schema, predicate, id)
+            }
+            Some(Expression::Conjunction(conjunction)) => {
+                if conjunction.expressions.is_empty() {
+                    return Err(IndexError::InvalidQuery(
+                        "predicate conjunction requires at least one child".into(),
+                    ));
+                }
+                Ok(Predicate::And(
+                    conjunction
+                        .expressions
+                        .iter()
+                        .map(|child| self.compile(child, depth + 1))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ))
+            }
+            Some(Expression::Disjunction(disjunction)) => {
+                if disjunction.expressions.is_empty() {
+                    return Err(IndexError::InvalidQuery(
+                        "predicate disjunction requires at least one child".into(),
+                    ));
+                }
+                Ok(Predicate::Or(
+                    disjunction
+                        .expressions
+                        .iter()
+                        .map(|child| self.compile(child, depth + 1))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ))
+            }
+            Some(Expression::Negation(negation)) => {
+                let child = negation.expression.as_deref().ok_or_else(|| {
+                    IndexError::InvalidQuery("predicate negation requires one child".into())
+                })?;
+                Ok(Predicate::Not(Box::new(self.compile(child, depth + 1)?)))
+            }
+            None => Err(IndexError::InvalidQuery(
+                "predicate expression variant is required".into(),
+            )),
+        }
     }
-    Ok(match compiled.len() {
-        0 => None,
-        1 => compiled.pop(),
-        _ => Some(Predicate::And(compiled)),
-    })
 }
 
 fn compile_predicate(
@@ -474,12 +552,14 @@ fn text_value(value: ScalarValue) -> Result<String, IndexError> {
 
 #[cfg(test)]
 mod tests {
+    use keldra_api::v1::index_predicate_expression::Expression;
     use keldra_api::v1::index_query::Query;
     use keldra_api::v1::index_specification::Specification;
     use keldra_api::v1::{
-        IndexField, IndexFieldCapability, IndexFieldCardinality, IndexPredicate, KeywordIndexField,
-        PathIndexQuery, PathIndexSpec, TextIndexField, TypedJsonIndexQuery, TypedJsonIndexSpec,
-        index_field,
+        IndexField, IndexFieldCapability, IndexFieldCardinality, IndexPredicate,
+        IndexPredicateConjunction, IndexPredicateDisjunction, IndexPredicateExpression,
+        IndexPredicateNegation, KeywordIndexField, PathIndexQuery, PathIndexSpec, TextIndexField,
+        TypedJsonIndexQuery, TypedJsonIndexSpec, index_field,
     };
 
     use super::*;
@@ -526,11 +606,11 @@ mod tests {
     ) -> IndexQuery {
         IndexQuery {
             query: Some(Query::TypedJson(TypedJsonIndexQuery {
-                predicates: vec![IndexPredicate {
+                predicate: Some(leaf(IndexPredicate {
                     field: field.into(),
                     operator: operator as i32,
                     values_json,
-                }],
+                })),
                 order: Vec::new(),
                 facets: Vec::new(),
                 aggregates: Vec::new(),
@@ -538,23 +618,57 @@ mod tests {
         }
     }
 
+    fn leaf(predicate: IndexPredicate) -> IndexPredicateExpression {
+        IndexPredicateExpression {
+            expression: Some(Expression::Predicate(predicate)),
+        }
+    }
+
+    fn exists(field: &str) -> IndexPredicateExpression {
+        leaf(IndexPredicate {
+            field: field.into(),
+            operator: IndexPredicateOperator::Exists as i32,
+            values_json: Vec::new(),
+        })
+    }
+
+    fn all(expressions: Vec<IndexPredicateExpression>) -> IndexPredicateExpression {
+        IndexPredicateExpression {
+            expression: Some(Expression::Conjunction(IndexPredicateConjunction {
+                expressions,
+            })),
+        }
+    }
+
+    fn any(expressions: Vec<IndexPredicateExpression>) -> IndexPredicateExpression {
+        IndexPredicateExpression {
+            expression: Some(Expression::Disjunction(IndexPredicateDisjunction {
+                expressions,
+            })),
+        }
+    }
+
+    fn not(expression: IndexPredicateExpression) -> IndexPredicateExpression {
+        IndexPredicateExpression {
+            expression: Some(Expression::Negation(Box::new(IndexPredicateNegation {
+                expression: Some(Box::new(expression)),
+            }))),
+        }
+    }
+
     #[test]
-    fn repeated_public_predicates_compile_to_exact_and() {
+    fn public_boolean_expression_compiles_with_stable_preorder_leaf_ids() {
         let (specification, schema) = typed();
         let query = IndexQuery {
             query: Some(Query::TypedJson(TypedJsonIndexQuery {
-                predicates: vec![
-                    IndexPredicate {
+                predicate: Some(all(vec![
+                    leaf(IndexPredicate {
                         field: "state".into(),
                         operator: IndexPredicateOperator::Equal as i32,
                         values_json: vec![br#""active""#.to_vec()],
-                    },
-                    IndexPredicate {
-                        field: "state".into(),
-                        operator: IndexPredicateOperator::Exists as i32,
-                        values_json: Vec::new(),
-                    },
-                ],
+                    }),
+                    any(vec![exists("state"), not(exists("state"))]),
+                ])),
                 order: Vec::new(),
                 facets: Vec::new(),
                 aggregates: Vec::new(),
@@ -572,6 +686,69 @@ mod tests {
             panic!("expected predicate conjunction")
         };
         assert_eq!(predicates.len(), 2);
+        let Predicate::Equal { id: first, .. } = &predicates[0] else {
+            panic!("expected equality leaf")
+        };
+        let Predicate::Or(alternatives) = &predicates[1] else {
+            panic!("expected disjunction")
+        };
+        let Predicate::Exists { id: second, .. } = &alternatives[0] else {
+            panic!("expected existence leaf")
+        };
+        let Predicate::Not(negated) = &alternatives[1] else {
+            panic!("expected negation")
+        };
+        let Predicate::Exists { id: third, .. } = negated.as_ref() else {
+            panic!("expected negated existence leaf")
+        };
+        assert_eq!([first.get(), second.get(), third.get()], [0, 1, 2]);
+    }
+
+    #[test]
+    fn absent_predicate_matches_all_but_empty_boolean_nodes_are_rejected() {
+        let (specification, schema) = typed();
+        let match_all = IndexQuery {
+            query: Some(Query::TypedJson(TypedJsonIndexQuery {
+                predicate: None,
+                order: Vec::new(),
+                facets: Vec::new(),
+                aggregates: Vec::new(),
+            })),
+        };
+        let compiled = compile_query(&schema, &specification, &match_all).unwrap();
+        assert!(matches!(
+            compiled.query,
+            NativeQuery::Filter {
+                predicate: None,
+                ..
+            }
+        ));
+
+        for invalid in [
+            IndexPredicateExpression { expression: None },
+            all(Vec::new()),
+            any(Vec::new()),
+            IndexPredicateExpression {
+                expression: Some(Expression::Negation(Box::new(IndexPredicateNegation {
+                    expression: None,
+                }))),
+            },
+        ] {
+            assert!(compile_predicate_expression(&schema, Some(&invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn public_boolean_expression_depth_and_node_count_are_bounded() {
+        let (_, schema) = typed();
+        let mut too_deep = exists("state");
+        for _ in 0..MAX_PREDICATE_DEPTH {
+            too_deep = not(too_deep);
+        }
+        assert!(compile_predicate_expression(&schema, Some(&too_deep)).is_err());
+
+        let too_wide = all((0..MAX_PREDICATE_NODES).map(|_| exists("state")).collect());
+        assert!(compile_predicate_expression(&schema, Some(&too_wide)).is_err());
     }
 
     #[test]
@@ -621,11 +798,11 @@ mod tests {
         let (specification, schema) = typed();
         let query = IndexQuery {
             query: Some(Query::TypedJson(TypedJsonIndexQuery {
-                predicates: vec![IndexPredicate {
+                predicate: Some(leaf(IndexPredicate {
                     field: "state".into(),
                     operator: IndexPredicateOperator::Prefix as i32,
                     values_json: vec![br#""act""#.to_vec()],
-                }],
+                })),
                 order: Vec::new(),
                 facets: Vec::new(),
                 aggregates: Vec::new(),

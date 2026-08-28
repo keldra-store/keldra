@@ -977,7 +977,7 @@ mod tests {
     fn routed_computations_must_match_the_request_shape() {
         let query = IndexQuery {
             query: Some(index_query::Query::TypedJson(TypedJsonIndexQuery {
-                predicates: Vec::new(),
+                predicate: None,
                 order: Vec::new(),
                 facets: vec![IndexFacetRequest {
                     field: "ecosystem".into(),
