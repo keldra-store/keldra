@@ -104,14 +104,18 @@ impl ProgramCoordinator {
     }
 
     pub(super) fn require_generalized_atomic_paths(&self) -> Result<(), Status> {
-        let state = self.decisions.state().map_err(decision_status)?;
-        if crate::cluster_capabilities::generalized_atomic_paths_active(&state) {
+        if self.generalized_atomic_paths_active()? {
             Ok(())
         } else {
             Err(Status::failed_precondition(
                 "generalized atomic path reservations are not active for this cluster",
             ))
         }
+    }
+
+    pub(crate) fn generalized_atomic_paths_active(&self) -> Result<bool, Status> {
+        let state = self.decisions.state().map_err(decision_status)?;
+        Ok(crate::cluster_capabilities::generalized_atomic_paths_active(&state))
     }
 
     pub(super) async fn reserve_local_participants(

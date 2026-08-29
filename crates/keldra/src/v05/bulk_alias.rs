@@ -81,7 +81,7 @@ pub(super) async fn prepare_before_live_dispatch(
 
     let mut probes = Vec::new();
     let mut probe_positions = Vec::new();
-    if !replay_checked {
+    if !replay_checked && service.programs.generalized_atomic_paths_active()? {
         for (position, item) in pending.iter().enumerate() {
             let Some((_, operation, key, _, _)) = item else {
                 continue;

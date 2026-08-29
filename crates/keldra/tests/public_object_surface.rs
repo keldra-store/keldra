@@ -17,10 +17,11 @@ use keldra_api::v1::put_header::Operation as PutOperationValue;
 use keldra_api::v1::watch_message::Message as WatchMessageValue;
 use keldra_api::v1::watch_prefix_request::Start as WatchStart;
 use keldra_api::v1::{
-    ApplicationRoleRequest, BatchGetRequest, BucketApplicationRole, BucketApplicationRoleTarget,
-    BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest, CreateIndexRequest,
-    DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest, DisableAccountingRequest,
-    Durability, EnableAccountingRequest, GetAccountingRequest, GetIndexRequest, GetObjectRequest,
+    ActivateClusterCapabilitiesRequest, ApplicationRoleRequest, BatchGetRequest,
+    BucketApplicationRole, BucketApplicationRoleTarget, BucketPolicy, BulkOperation,
+    BulkPutRequest, BulkWriteRequest, CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest,
+    DeleteVersionRequest, DisableAccountingRequest, Durability, EnableAccountingRequest,
+    GetAccountingRequest, GetClusterCapabilitiesRequest, GetIndexRequest, GetObjectRequest,
     HeadObjectRequest, IndexQuery, IndexSpecification, InvokeProgramRequest,
     ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode, ObjectAddress,
     ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader,
@@ -588,6 +589,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
             .await,
     );
 
+    fixture.activate_cluster_capabilities().await;
     let rebuilt = indexes
         .rebuild_index(authorized(
             RebuildIndexRequest {
@@ -1492,6 +1494,7 @@ struct Fixture {
     _directory: TempDir,
     channel: Channel,
     access_token: String,
+    system_token: String,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
@@ -1503,6 +1506,9 @@ impl Fixture {
         let access_token = token_manager
             .mint(StorageTenantId::parse("acme").unwrap(), "owner-app")
             .unwrap();
+        let system_token = token_manager
+            .mint(StorageTenantId::system(), "bootstrap-app")
+            .unwrap();
         let listen = unused_loopback_address();
         let server = tokio::spawn(serve(test_server_config(&directory, listen, token_manager)));
         let channel = connect_when_ready(listen).await;
@@ -1510,8 +1516,43 @@ impl Fixture {
             _directory: directory,
             channel,
             access_token,
+            system_token,
             server,
         }
+    }
+
+    async fn activate_cluster_capabilities(&self) {
+        let mut administration = AdministrationServiceClient::new(self.channel.clone());
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = administration
+                    .get_cluster_capabilities(authorized(
+                        GetClusterCapabilitiesRequest {},
+                        &self.system_token,
+                    ))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if status.ready_for_target_activation {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("cluster capability advertisement did not become ready");
+        administration
+            .activate_cluster_capabilities(authorized(
+                ActivateClusterCapabilitiesRequest {
+                    protocol_version: status.target_protocol_version,
+                    storage_format: status.target_storage_format,
+                    expected_placement_term: status.active_placement_term,
+                    expected_placement_index: status.active_placement_index,
+                },
+                &self.system_token,
+            ))
+            .await
+            .unwrap();
     }
 
     async fn stop(self) {

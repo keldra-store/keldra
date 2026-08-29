@@ -301,6 +301,9 @@ pub(super) async fn route_or_replay_delete(
     if authenticated_executor_replay_checked(service, replay_marker)? {
         return Ok(DeleteReplayCheck::Checked);
     }
+    if !service.programs.generalized_atomic_paths_active()? {
+        return Ok(DeleteReplayCheck::Checked);
+    }
     match service.programs.executor_routing_target()? {
         Some(_) if peer_routed => {
             return Err(Status::failed_precondition(
@@ -575,6 +578,9 @@ pub(super) async fn route_or_replay_conditional_delete(
     budget: std::time::Duration,
 ) -> Result<DeleteReplayCheck, Status> {
     if authenticated_executor_replay_checked(service, replay_marker)? {
+        return Ok(DeleteReplayCheck::Checked);
+    }
+    if !service.programs.generalized_atomic_paths_active()? {
         return Ok(DeleteReplayCheck::Checked);
     }
     match service.programs.executor_routing_target()? {
