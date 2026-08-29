@@ -1578,6 +1578,7 @@ fn test_server_config(
         max_atomic_commit_entries: 128,
         max_atomic_commit_bytes: 1024 * 1024,
         atomic_program_timeout: Duration::from_secs(30),
+        bulk_write_timeout: Duration::from_secs(300),
         index_query_timeout: Duration::from_secs(300),
         token_manager,
         rate_limits: RateLimitConfig::default(),
