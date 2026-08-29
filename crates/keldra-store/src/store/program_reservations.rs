@@ -104,6 +104,22 @@ impl Store {
             .acquire(&[reservation.participant.path.clone()])
             .await;
         let _commit_guard = self.lock_commit("atomic_path_reservation").await;
+        let storage_key = object_reservation_key(identity, key.path());
+        // An exact durable reservation already proved this precondition and
+        // has excluded ordinary mutations ever since. Finalization may have
+        // intentionally changed the head before recovery refreshes it.
+        if let Some(existing) =
+            self.read_json::<ProgramPathReservation>(CF_METADATA, &storage_key)?
+        {
+            require_refreshable_path_reservation(&existing, reservation)?;
+            if reservation.nomination_log_index > existing.nomination_log_index {
+                let mut rebound = existing;
+                rebound.executor_node_id = reservation.executor_node_id;
+                rebound.nomination_log_index = reservation.nomination_log_index;
+                self.write_reservation(&storage_key, &rebound)?;
+            }
+            return Ok(());
+        }
         let policy = self
             .bucket_policy_by_key(&identity.encode())?
             .unwrap_or_default();
@@ -148,21 +164,6 @@ impl Store {
                 });
             }
         }
-        let storage_key = object_reservation_key(identity, key.path());
-        if let Some(existing) =
-            self.read_json::<ProgramPathReservation>(CF_METADATA, &storage_key)?
-        {
-            require_refreshable_path_reservation(&existing, reservation)?;
-            if matches!(existing.state, ProgramReservationState::Committed { .. }) {
-                if reservation.nomination_log_index > existing.nomination_log_index {
-                    let mut rebound = existing;
-                    rebound.executor_node_id = reservation.executor_node_id;
-                    rebound.nomination_log_index = reservation.nomination_log_index;
-                    self.write_reservation(&storage_key, &rebound)?;
-                }
-                return Ok(());
-            }
-        }
         self.write_reservation(&storage_key, reservation)
     }
 
@@ -190,6 +191,21 @@ impl Store {
         let _policy_guard = self.policy_gate.read().await;
         let _path_guard = self.ordinary_locks.acquire(&[path]).await;
         let _commit_guard = self.lock_commit("atomic_governance_reservation").await;
+        let storage_key = governance_reservation_key(identity);
+        // Refresh the existing authority before comparing live governance:
+        // the reservation itself is what fenced later policy mutations.
+        if let Some(existing) =
+            self.read_json::<ProgramGovernanceReservation>(CF_METADATA, &storage_key)?
+        {
+            require_refreshable_governance_reservation(&existing, reservation)?;
+            if reservation.nomination_log_index > existing.nomination_log_index {
+                let mut rebound = existing;
+                rebound.executor_node_id = reservation.executor_node_id;
+                rebound.nomination_log_index = reservation.nomination_log_index;
+                self.write_reservation(&storage_key, &rebound)?;
+            }
+            return Ok(());
+        }
         if self
             .bucket_policy_by_key(&identity.encode())?
             .unwrap_or_default()
@@ -198,21 +214,6 @@ impl Store {
                 != reservation.participant.versioning
         {
             return Err(MutationError::PreconditionFailed { current: None });
-        }
-        let storage_key = governance_reservation_key(identity);
-        if let Some(existing) =
-            self.read_json::<ProgramGovernanceReservation>(CF_METADATA, &storage_key)?
-        {
-            require_refreshable_governance_reservation(&existing, reservation)?;
-            if matches!(existing.state, ProgramReservationState::Committed { .. }) {
-                if reservation.nomination_log_index > existing.nomination_log_index {
-                    let mut rebound = existing;
-                    rebound.executor_node_id = reservation.executor_node_id;
-                    rebound.nomination_log_index = reservation.nomination_log_index;
-                    self.write_reservation(&storage_key, &rebound)?;
-                }
-                return Ok(());
-            }
         }
         self.write_reservation(&storage_key, reservation)
     }
