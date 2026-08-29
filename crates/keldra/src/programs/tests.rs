@@ -25,7 +25,7 @@ fn counter_definition() -> ProgramDefinition {
         schema_version: DEFINITION_SCHEMA_VERSION,
         documents: vec![DocumentSpec {
             name: "counter".into(),
-            path: PathTemplate::new("{tenant}", "bucket", "managed/{counter_id}"),
+            path: PathTemplate::new("{tenant}", "{bucket_name}", "managed/{counter_id}"),
             cardinality: Cardinality::One,
             access: DocumentAccess::ReadWrite,
             allow_initial_json: true,
@@ -65,9 +65,12 @@ fn counter_input() -> ProgramInput {
             "counter".into(),
             vec![PathBinding {
                 path: ObjectPath::new("tenant", "bucket", "managed/counter").unwrap(),
-                template_values: [("counter_id".into(), "counter".into())]
-                    .into_iter()
-                    .collect(),
+                template_values: [
+                    ("bucket_name".into(), "bucket".into()),
+                    ("counter_id".into(), "counter".into()),
+                ]
+                .into_iter()
+                .collect(),
                 expected_head: ExpectedHead::Absent,
                 initial_json: Some(json!({"value": 0})),
             }],
@@ -105,8 +108,19 @@ async fn configured_program_store(root: &Path) -> (Store, ObjectKey, [u8; 32], V
             storage_tenant: tenant,
             bucket: "bucket".into(),
             owner: owner.clone(),
-            principal: owner,
+            principal: owner.clone(),
             expected_authorization_revision: AuthzRevision(4),
+            expected_binding_generation: 1,
+            versioning: ObjectVersioning::Unversioned,
+        })
+        .unwrap();
+    store
+        .create_bucket(CreateBucketRequest {
+            storage_tenant: StorageTenantId::parse("tenant").unwrap(),
+            bucket: "bucket-2".into(),
+            owner: owner.clone(),
+            principal: owner,
+            expected_authorization_revision: AuthzRevision(5),
             expected_binding_generation: 1,
             versioning: ObjectVersioning::Unversioned,
         })
@@ -115,6 +129,17 @@ async fn configured_program_store(root: &Path) -> (Store, ObjectKey, [u8; 32], V
         .set_bucket_policy(
             "tenant",
             "bucket",
+            BucketPolicy {
+                immutable_prefixes: Vec::new(),
+                program_only_prefixes: vec!["managed".into()],
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .set_bucket_policy(
+            "tenant",
+            "bucket-2",
             BucketPolicy {
                 immutable_prefixes: Vec::new(),
                 program_only_prefixes: vec!["managed".into()],
@@ -564,7 +589,10 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
     // therefore use disjoint participants.
     let mut second_input = counter_input();
     let second_binding = &mut second_input.bindings.get_mut("counter").unwrap()[0];
-    second_binding.path = ObjectPath::new("tenant", "bucket", "managed/counter-2").unwrap();
+    second_binding.path = ObjectPath::new("tenant", "bucket-2", "managed/counter-2").unwrap();
+    second_binding
+        .template_values
+        .insert("bucket_name".into(), "bucket-2".into());
     second_binding
         .template_values
         .insert("counter_id".into(), "counter-2".into());
