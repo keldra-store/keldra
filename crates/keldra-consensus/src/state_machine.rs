@@ -562,6 +562,8 @@ impl StateMachine {
             proposal_at_unix_millis: legacy.proposal_at_unix_millis,
             replay_expires_at_unix_millis: legacy.replay_expires_at_unix_millis,
         };
+        let expired = self.expired_finalized_cursors(legacy.proposal_at_unix_millis);
+        self.prune_committed_invocations(&expired)?;
         if let Some(invocation) = self
             .committed_invocations
             .values()
@@ -583,7 +585,7 @@ impl StateMachine {
             begin_cursor: committed_log_index,
             request: batch,
         });
-        self.commit_prepared_batch(
+        let result = self.commit_prepared_batch(
             committed_log_index,
             CommitPreparedBatch {
                 executor: legacy.executor,
@@ -592,7 +594,14 @@ impl StateMachine {
                 invocation_id: legacy.invocation_id,
                 participant_manifest_hash: crate::ParticipantManifestHash(legacy.bundle_hash.0),
             },
-        )
+        );
+        if result.is_err() {
+            // CommitBatch is the released single-command lifecycle. A failed
+            // commit must not leave behind preparation state that only the new
+            // multi-command lifecycle knows how to recover or abort.
+            self.preparing_batch = None;
+        }
+        result
     }
 
     fn commit_prepared_batch(
@@ -925,20 +934,33 @@ fn validate_legacy_commit_batch(batch: CommitBatch) -> Result<(), ApplyError> {
     if batch.program_path_hash.0 == [0; 32] || batch.program_hash.0 == [0; 32] {
         return Err(ApplyError::InvalidBundleAuthority);
     }
-    if batch.invocation_id.0 == [0; 32]
-        || batch.input_fingerprint.0 == [0; 32]
-        || batch.bundle_ref.hash == [0; 32]
-        || batch.bundle_ref.length == 0
-        || batch.bundle_hash.0 == [0; 32]
-        || batch.durability_class.0 == [0; 32]
-        || batch.durability_evidence_hash.0 == [0; 32]
-        || batch.proposal_at_unix_millis == 0
-        || batch
-            .proposal_at_unix_millis
-            .checked_add(ATOMIC_REPLAY_RETENTION_MILLIS)
-            != Some(batch.replay_expires_at_unix_millis)
+    if batch.invocation_id.0 == [0; 32] {
+        return Err(ApplyError::InvalidInvocationId);
+    }
+    if batch.input_fingerprint.0 == [0; 32] {
+        return Err(ApplyError::InvalidInvocationFingerprint);
+    }
+    if batch.bundle_ref.hash == [0; 32] || batch.bundle_ref.length == 0 {
+        return Err(ApplyError::InvalidBundleRef);
+    }
+    if batch.bundle_hash.0 == [0; 32] {
+        return Err(ApplyError::InvalidBundleHash);
+    }
+    if batch.durability_class.0 == [0; 32] {
+        return Err(ApplyError::InvalidDurabilityClass);
+    }
+    if batch.durability_evidence_hash.0 == [0; 32] {
+        return Err(ApplyError::InvalidDurabilityEvidenceHash);
+    }
+    if batch.proposal_at_unix_millis == 0 {
+        return Err(ApplyError::InvalidProposalTime);
+    }
+    if batch
+        .proposal_at_unix_millis
+        .checked_add(ATOMIC_REPLAY_RETENTION_MILLIS)
+        != Some(batch.replay_expires_at_unix_millis)
     {
-        return Err(ApplyError::InvalidLegacyCommitBatch);
+        return Err(ApplyError::InvalidReplayExpiry);
     }
     Ok(())
 }

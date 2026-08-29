@@ -374,7 +374,6 @@ fn idempotent_retry_returns_the_original_commit_cursor_after_renomination() {
         hash: [88; 32],
         length: 88,
     };
-    recovered.bundle_hash = BundleHash([89; 32]);
     recovered.durability_class = DurabilityClass([90; 32]);
     recovered.durability_evidence_hash = DurabilityEvidenceHash([91; 32]);
     let replay = commit(&mut state, 9, recovered).unwrap();
