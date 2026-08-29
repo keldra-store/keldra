@@ -413,6 +413,7 @@ async fn startup_recovers_committed_bundle_before_advancing_finalized_through() 
     let (store, program_key, program_hash, input_json) =
         configured_program_store(temporary.path()).await;
     let coordinator = open_test_coordinator(store.clone(), temporary.path()).await;
+    coordinator.shutdown_recovery_worker().await;
     let input = serde_json::from_slice::<ProgramInput>(&input_json).unwrap();
     let path_hash = program_path_hash(&program_key);
     let invocation =
@@ -484,6 +485,7 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
     let temporary = tempfile::tempdir().unwrap();
     let (store, program_key, program_hash, _) = configured_program_store(temporary.path()).await;
     let coordinator = open_test_coordinator(store.clone(), temporary.path()).await;
+    coordinator.shutdown_recovery_worker().await;
     let path_hash = program_path_hash(&program_key);
     let program_object = store.get(&program_key).await.unwrap().unwrap();
     let verified =
