@@ -25,7 +25,7 @@ fn counter_definition() -> ProgramDefinition {
         schema_version: DEFINITION_SCHEMA_VERSION,
         documents: vec![DocumentSpec {
             name: "counter".into(),
-            path: PathTemplate::new("{tenant}", "bucket", "managed/counter"),
+            path: PathTemplate::new("{tenant}", "bucket", "managed/{counter_id}"),
             cardinality: Cardinality::One,
             access: DocumentAccess::ReadWrite,
             allow_initial_json: true,
@@ -65,7 +65,9 @@ fn counter_input() -> ProgramInput {
             "counter".into(),
             vec![PathBinding {
                 path: ObjectPath::new("tenant", "bucket", "managed/counter").unwrap(),
-                template_values: BTreeMap::new(),
+                template_values: [("counter_id".into(), "counter".into())]
+                    .into_iter()
+                    .collect(),
                 expected_head: ExpectedHead::Absent,
                 initial_json: Some(json!({"value": 0})),
             }],
@@ -556,15 +558,16 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
         .unwrap();
     require_result_matches_consensus(&first_applied, first_consensus.invocation).unwrap();
     let first_cursor = first_consensus.invocation.committed_batch.commit_cursor;
-    let counter_path = ObjectPath::new("tenant", "bucket", "managed/counter").unwrap();
-    let first_version = first_applied.published_versions[&counter_path];
 
+    // Committed reservations protect their participants until the global
+    // FinalizedThrough cursor advances. A valid multi-commit crash tail must
+    // therefore use disjoint participants.
     let mut second_input = counter_input();
     let second_binding = &mut second_input.bindings.get_mut("counter").unwrap()[0];
-    second_binding.expected_head = ExpectedHead::Version {
-        version: first_version.version.0.to_string(),
-    };
-    second_binding.initial_json = None;
+    second_binding.path = ObjectPath::new("tenant", "bucket", "managed/counter-2").unwrap();
+    second_binding
+        .template_values
+        .insert("counter_id".into(), "counter-2".into());
     let second_invocation =
         ProgramInvocation::from_input(path_hash, "partial-recovery-2", second_input).unwrap();
     let second_fingerprint = decode_fingerprint(&second_invocation.input_fingerprint).unwrap();
