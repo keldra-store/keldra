@@ -58,6 +58,12 @@ KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=8 \
 The evidence records all three settings. A result at one intensity must not be
 compared with another intensity as a before/after performance claim.
 
+`KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES` optionally pads each mutable
+JSON record to an exact minimum byte size. Its default `0` preserves the normal
+small-record corpus. Set it together with the batch size and worker count to
+reproduce large valid `BulkWrite` requests; the report records the value so a
+large-payload run cannot be compared silently with the default workload.
+
 To measure sustainable publication capacity instead of saturating ingress, set
 an explicit offered rate. The rate counts every public mutation operation,
 including the per-batch marker used for visibility measurement. Requests are

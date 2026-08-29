@@ -21,6 +21,7 @@ pub struct Config {
     pub seed: u64,
     pub mutation_workers: usize,
     pub mutation_batch_size: usize,
+    pub mutation_record_bytes: usize,
     pub mutation_queue_depth: usize,
     pub mutation_rate_operations_per_second: Option<f64>,
     pub query_rate: u64,
@@ -54,6 +55,7 @@ pub struct PublicConfig {
     pub seed_hex: String,
     pub mutation_workers: usize,
     pub mutation_batch_size: usize,
+    pub mutation_record_bytes: usize,
     pub mutation_queue_depth: usize,
     pub mutation_rate_operations_per_second: Option<f64>,
     pub query_rate_per_second: u64,
@@ -83,6 +85,7 @@ impl Config {
         let mutable_records = number("MUTABLE_RECORDS", 256)?;
         let mutation_workers = number("MUTATION_WORKERS", 4)?;
         let mutation_batch_size = number("MUTATION_BATCH_SIZE", 32)?;
+        let mutation_record_bytes = number("MUTATION_RECORD_BYTES", 0)?;
         let mutation_queue_depth = number("MUTATION_QUEUE_DEPTH", 32)?;
         let mutation_rate_operations_per_second =
             optional_positive("MUTATION_RATE_OPERATIONS_PER_SECOND")?;
@@ -102,6 +105,10 @@ impl Config {
             "mutable records must be 1..=1000 for exact final verification"
         );
         ensure!(mutation_workers > 0 && mutation_batch_size > 0);
+        ensure!(
+            mutation_record_bytes <= 64 * 1024 * 1024,
+            "mutation record bytes must not exceed 64 MiB"
+        );
         ensure!(
             mutation_queue_depth >= mutation_workers,
             "mutation queue depth must cover every worker"
@@ -156,6 +163,7 @@ impl Config {
             seed: number("SEED", 0x6b65_6c64_7261_0016)?,
             mutation_workers,
             mutation_batch_size,
+            mutation_record_bytes,
             mutation_queue_depth,
             mutation_rate_operations_per_second,
             query_rate,
@@ -193,6 +201,7 @@ impl Config {
             seed_hex: format!("0x{:016x}", self.seed),
             mutation_workers: self.mutation_workers,
             mutation_batch_size: self.mutation_batch_size,
+            mutation_record_bytes: self.mutation_record_bytes,
             mutation_queue_depth: self.mutation_queue_depth,
             mutation_rate_operations_per_second: self.mutation_rate_operations_per_second,
             query_rate_per_second: self.query_rate,

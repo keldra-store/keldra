@@ -34,6 +34,30 @@ pub fn payload(seed: u64, id: u64, class: &'static str, generation: u64) -> Vec<
     .expect("generated contention record is serializable")
 }
 
+pub fn payload_at_least(
+    seed: u64,
+    id: u64,
+    class: &'static str,
+    generation: u64,
+    minimum_bytes: usize,
+) -> Vec<u8> {
+    let mut encoded = payload(seed, id, class, generation);
+    if encoded.len() >= minimum_bytes {
+        return encoded;
+    }
+    let missing = minimum_bytes - encoded.len();
+    let mixed = mix64(seed ^ id.rotate_left(19) ^ generation.rotate_left(37));
+    encoded = serde_json::to_vec(&Record {
+        record_id: id,
+        class,
+        generation,
+        payload: format!("{mixed:016x}-{seed:016x}{}", "x".repeat(missing)),
+    })
+    .expect("generated contention record is serializable");
+    debug_assert_eq!(encoded.len(), minimum_bytes);
+    encoded
+}
+
 pub fn index_name(position: usize) -> String {
     format!("{INDEX_NAME_PREFIX}-{position:03}")
 }
@@ -73,5 +97,11 @@ mod tests {
         assert_eq!(corpus_digest(7, 4, 3), corpus_digest(7, 4, 3));
         assert_ne!(corpus_digest(7, 4, 3), corpus_digest(8, 4, 3));
         assert_ne!(payload(7, 2, "mutable", 1), payload(7, 2, "mutable", 2));
+        let padded = payload_at_least(7, 2, "mutable", 1, 25_000);
+        assert_eq!(padded.len(), 25_000);
+        assert_eq!(
+            payload_at_least(7, 2, "mutable", 1, 1),
+            payload(7, 2, "mutable", 1)
+        );
     }
 }
