@@ -7,7 +7,7 @@ use keldra_atomic_program::{
 };
 use keldra_authz::ObjectRef;
 use keldra_consensus::{
-    CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, CommitBatch, JoinCapabilityHash,
+    CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, JoinCapabilityHash,
     NodeDescriptor, NodeState, PeerAddress, PeerSpkiSha256,
 };
 use keldra_store::{
@@ -144,6 +144,81 @@ async fn configured_program_store(root: &Path) -> (Store, ObjectKey, [u8; 32], V
 
 async fn open_test_coordinator(store: Store, root: &Path) -> ProgramCoordinator {
     open_test_coordinator_with_limits(store, root, 8, 64 * 1024).await
+}
+
+async fn commit_prepared_for_recovery(
+    coordinator: &ProgramCoordinator,
+    store: &Store,
+    prepared: &keldra_store::PreparedProgramBundle,
+    invocation_id: InvocationId,
+    fingerprint: [u8; 32],
+    proposal_at_unix_millis: u64,
+) -> keldra_consensus::CommitResult {
+    let nomination = coordinator.current_nomination().unwrap();
+    let begun = coordinator
+        .decisions
+        .submit(Command::BeginBatch(BeginBatch {
+            executor: NodeId(1),
+            nomination_log_index: nomination.nomination_log_index,
+            authority: decision_bundle_authority(prepared.authority),
+            invocation_id,
+            input_fingerprint: InvocationFingerprint(fingerprint),
+            bundle_ref: BundleRef {
+                hash: prepared.bundle.hash,
+                length: prepared.bundle.length,
+            },
+            bundle_hash: BundleHash(prepared.hash.0),
+            durability_class: DurabilityClass(
+                ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS).0,
+            ),
+            durability_evidence_hash: DurabilityEvidenceHash(prepared.durability_evidence_hash.0),
+            participant_manifest_hash: ParticipantManifestHash(prepared.participant_manifest_hash),
+            proposal_at_unix_millis,
+            replay_expires_at_unix_millis: proposal_at_unix_millis + ATOMIC_REPLAY_RETENTION_MILLIS,
+        }))
+        .await
+        .unwrap();
+    let keldra_consensus::BeginResult::Prepared { batch, .. } =
+        expect_batch_begun(begun.result).unwrap()
+    else {
+        panic!("fresh recovery fixture unexpectedly replayed")
+    };
+    let record = store.prepared_program_record(prepared).await.unwrap();
+    let placement = PlacementLogId { term: 1, index: 1 };
+    let reservations = record
+        .reservations(
+            batch.begin_cursor,
+            invocation_id.0,
+            prepared.hash,
+            1,
+            nomination.nomination_log_index,
+            placement,
+        )
+        .unwrap();
+    coordinator
+        .reserve_local_participants(&reservations)
+        .await
+        .unwrap();
+    let committed = coordinator
+        .decisions
+        .submit(Command::CommitPreparedBatch(CommitPreparedBatch {
+            executor: NodeId(1),
+            nomination_log_index: nomination.nomination_log_index,
+            begin_cursor: batch.begin_cursor,
+            invocation_id,
+            participant_manifest_hash: ParticipantManifestHash(prepared.participant_manifest_hash),
+        }))
+        .await
+        .unwrap();
+    let committed = expect_batch_committed(committed.result).unwrap();
+    coordinator
+        .commit_local_participants(
+            &reservations,
+            committed.invocation.committed_batch.commit_cursor,
+        )
+        .await
+        .unwrap();
+    committed
 }
 
 async fn open_test_coordinator_with_limits(
@@ -354,36 +429,21 @@ async fn startup_recovers_committed_bundle_before_advancing_finalized_through() 
         .await
         .unwrap();
     let prepared = store.prepare_program_bundle(&lease).await.unwrap();
-    let nomination = coordinator.current_nomination().unwrap();
     let proposal_at_unix_millis = current_unix_millis().unwrap();
-    let committed = coordinator
-        .decisions
-        .submit(Command::CommitBatch(CommitBatch {
-            executor: NodeId(1),
-            nomination_log_index: nomination.nomination_log_index,
-            program_path_hash: ProgramPathHash(path_hash),
-            program_hash: DecisionProgramHash(program_hash),
-            invocation_id,
-            input_fingerprint: InvocationFingerprint(fingerprint),
-            bundle_ref: BundleRef {
-                hash: prepared.bundle.hash,
-                length: prepared.bundle.length,
-            },
-            bundle_hash: BundleHash(prepared.hash.0),
-            durability_class: DurabilityClass(
-                ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS).0,
-            ),
-            durability_evidence_hash: DurabilityEvidenceHash(prepared.durability_evidence_hash.0),
-            proposal_at_unix_millis,
-            replay_expires_at_unix_millis: proposal_at_unix_millis + ATOMIC_REPLAY_RETENTION_MILLIS,
-        }))
-        .await
-        .unwrap();
-    let committed = expect_batch_committed(committed.result).unwrap();
+    let committed = commit_prepared_for_recovery(
+        &coordinator,
+        &store,
+        &prepared,
+        invocation_id,
+        fingerprint,
+        proposal_at_unix_millis,
+    )
+    .await;
     let commit_cursor = committed.invocation.committed_batch.commit_cursor;
     assert!(!coordinator.cursor_is_visible(commit_cursor).unwrap());
     drop(lease);
     drop(engine);
+    coordinator.shutdown_recovery_worker().await;
     coordinator.decisions.shutdown().await.unwrap();
     drop(coordinator);
     drop(store);
@@ -415,6 +475,7 @@ async fn startup_recovers_committed_bundle_before_advancing_finalized_through() 
     assert!(replay.replayed);
     assert_eq!(replay.commit_log_index, commit_cursor);
     assert_eq!(replay.receipt.outputs["value"], json!(1));
+    reopened.shutdown_recovery_worker().await;
     reopened.decisions.shutdown().await.unwrap();
 }
 
@@ -438,35 +499,15 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
     let first_id = invocation_identity(&program_key, &first_invocation.command_id);
     let first_lease = engine.prepare(&context, &first_invocation).await.unwrap();
     let first_prepared = store.prepare_program_bundle(&first_lease).await.unwrap();
-    let first_consensus = expect_batch_committed(
-        coordinator
-            .decisions
-            .submit(Command::CommitBatch(CommitBatch {
-                executor: NodeId(1),
-                nomination_log_index: nomination.nomination_log_index,
-                program_path_hash: ProgramPathHash(path_hash),
-                program_hash: DecisionProgramHash(program_hash),
-                invocation_id: first_id,
-                input_fingerprint: InvocationFingerprint(first_fingerprint),
-                bundle_ref: BundleRef {
-                    hash: first_prepared.bundle.hash,
-                    length: first_prepared.bundle.length,
-                },
-                bundle_hash: BundleHash(first_prepared.hash.0),
-                durability_class: DurabilityClass(
-                    ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS).0,
-                ),
-                durability_evidence_hash: DurabilityEvidenceHash(
-                    first_prepared.durability_evidence_hash.0,
-                ),
-                proposal_at_unix_millis: 1_000,
-                replay_expires_at_unix_millis: 1_000 + ATOMIC_REPLAY_RETENTION_MILLIS,
-            }))
-            .await
-            .unwrap()
-            .result,
+    let first_consensus = commit_prepared_for_recovery(
+        &coordinator,
+        &store,
+        &first_prepared,
+        first_id,
+        first_fingerprint,
+        1_000,
     )
-    .unwrap();
+    .await;
     let first_applied = store
         .apply_program_bundle(
             first_lease,
@@ -496,35 +537,15 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
     let second_id = invocation_identity(&program_key, &second_invocation.command_id);
     let second_lease = engine.prepare(&context, &second_invocation).await.unwrap();
     let second_prepared = store.prepare_program_bundle(&second_lease).await.unwrap();
-    let second_consensus = expect_batch_committed(
-        coordinator
-            .decisions
-            .submit(Command::CommitBatch(CommitBatch {
-                executor: NodeId(1),
-                nomination_log_index: nomination.nomination_log_index,
-                program_path_hash: ProgramPathHash(path_hash),
-                program_hash: DecisionProgramHash(program_hash),
-                invocation_id: second_id,
-                input_fingerprint: InvocationFingerprint(second_fingerprint),
-                bundle_ref: BundleRef {
-                    hash: second_prepared.bundle.hash,
-                    length: second_prepared.bundle.length,
-                },
-                bundle_hash: BundleHash(second_prepared.hash.0),
-                durability_class: DurabilityClass(
-                    ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS).0,
-                ),
-                durability_evidence_hash: DurabilityEvidenceHash(
-                    second_prepared.durability_evidence_hash.0,
-                ),
-                proposal_at_unix_millis: 2_000,
-                replay_expires_at_unix_millis: 2_000 + ATOMIC_REPLAY_RETENTION_MILLIS,
-            }))
-            .await
-            .unwrap()
-            .result,
+    let second_consensus = commit_prepared_for_recovery(
+        &coordinator,
+        &store,
+        &second_prepared,
+        second_id,
+        second_fingerprint,
+        2_000,
     )
-    .unwrap();
+    .await;
     let second_applied = store
         .apply_program_bundle(
             second_lease,
@@ -556,6 +577,7 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
     );
 
     drop(engine);
+    coordinator.shutdown_recovery_worker().await;
     coordinator.decisions.shutdown().await.unwrap();
     drop(coordinator);
     drop(store);
@@ -567,6 +589,8 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
     let state = reopened.decisions.state().unwrap();
     assert_eq!(state.finalized_through(), Some(second_cursor));
     assert_eq!(state.unfinalized_commit_len(), 0);
+    drop(state);
+    reopened.shutdown_recovery_worker().await;
     reopened.decisions.shutdown().await.unwrap();
 }
 

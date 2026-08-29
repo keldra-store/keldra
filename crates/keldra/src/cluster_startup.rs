@@ -470,6 +470,7 @@ mod tests {
     }
 
     async fn stop_runtime(store: Store, decisions: DecisionRaft, programs: ProgramCoordinator) {
+        programs.shutdown_recovery_worker().await;
         drop(programs);
         decisions.shutdown().await.unwrap();
         drop(decisions);

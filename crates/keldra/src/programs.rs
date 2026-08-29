@@ -57,6 +57,7 @@ pub(crate) struct ProgramCoordinator {
     /// concurrent before this short boundary.
     commit_gate: Arc<tokio::sync::Mutex<()>>,
     distributed: Arc<std::sync::OnceLock<DistributedPrograms>>,
+    recovery_worker: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// Late binding used by the private join listener, which must begin accepting
@@ -296,6 +297,7 @@ impl ProgramCoordinator {
             node,
             commit_gate: Arc::new(tokio::sync::Mutex::new(())),
             distributed: Arc::new(std::sync::OnceLock::new()),
+            recovery_worker: Arc::new(std::sync::Mutex::new(None)),
         };
         coordinator
             .sweep_stale_local_reservations()

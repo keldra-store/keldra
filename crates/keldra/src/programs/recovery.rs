@@ -3,7 +3,7 @@ use super::*;
 impl ProgramCoordinator {
     pub(super) fn spawn_recovery_worker(&self) {
         let coordinator = self.clone();
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             let mut next_sweep = Instant::now();
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -40,6 +40,24 @@ impl ProgramCoordinator {
                 }
             }
         });
+        let replaced = self
+            .recovery_worker
+            .lock()
+            .expect("atomic recovery worker lock poisoned")
+            .replace(worker);
+        debug_assert!(replaced.is_none());
+    }
+
+    pub(crate) async fn shutdown_recovery_worker(&self) {
+        let worker = self
+            .recovery_worker
+            .lock()
+            .expect("atomic recovery worker lock poisoned")
+            .take();
+        if let Some(worker) = worker {
+            worker.abort();
+            let _ = worker.await;
+        }
     }
 
     pub(super) async fn sweep_stale_local_reservations(&self) -> Result<()> {

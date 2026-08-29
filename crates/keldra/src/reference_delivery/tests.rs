@@ -1386,7 +1386,7 @@ async fn program_proof_waits_for_nominated_executor_completion() {
     let payload = source.stage_blob(b"program payload").await.unwrap();
     let path = node_one_coordinator_path("managed/result");
     let stage = ProgramPathStage {
-        format: 1,
+        format: 2,
         begin_cursor: 41,
         bundle_hash: PreparedBundleHash([0x11; 32]),
         program_hash: ProgramHash([0x22; 32]),
