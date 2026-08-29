@@ -101,7 +101,7 @@ struct Arguments {
     atomic_program_timeout_seconds: NonZeroU64,
 
     /// Maximum wall time for one BulkWrite RPC; shorter client deadlines still win.
-    #[arg(long, env = "KELDRA_BULK_WRITE_TIMEOUT_SECONDS", default_value = "300")]
+    #[arg(long, env = "KELDRA_BULK_WRITE_TIMEOUT_SECONDS", default_value = "600")]
     bulk_write_timeout_seconds: NonZeroU64,
 
     /// Maximum wall time for one QueryIndex RPC; shorter client deadlines still win.
@@ -999,7 +999,7 @@ mod tests {
     fn request_timeout_classes_are_independent() {
         let defaults = parse(&[]);
         assert_eq!(defaults.atomic_program_timeout_seconds.get(), 30);
-        assert_eq!(defaults.bulk_write_timeout_seconds.get(), 300);
+        assert_eq!(defaults.bulk_write_timeout_seconds.get(), 600);
         assert_eq!(defaults.index_query_timeout_seconds.get(), 300);
 
         let configured = parse(&[

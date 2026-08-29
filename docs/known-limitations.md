@@ -259,7 +259,7 @@ one absolute deadline: the shorter of the client `grpc-timeout` and the
 startup-configured 30-second maximum. `QueryIndex` instead uses the shorter of
 the client deadline and `KELDRA_INDEX_QUERY_TIMEOUT_SECONDS`, whose default is
 five minutes. `BulkWrite` independently uses the shorter client deadline and
-`KELDRA_BULK_WRITE_TIMEOUT_SECONDS`, also five minutes by default, so a valid
+`KELDRA_BULK_WRITE_TIMEOUT_SECONDS`, ten minutes by default, so a valid
 64 MiB request does not inherit the atomic-program execution maximum on slow
 storage. Atomic link operations embedded in a bulk retain the atomic-program
 maximum. The same remaining budget is propagated across object and peer calls.
