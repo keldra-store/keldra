@@ -136,7 +136,7 @@ impl Store {
         let mut pending_versions = BTreeMap::new();
         let mut pending_receipts = BTreeMap::new();
         let mut pending_blob_references = PendingBlobReferences::new();
-        let mut pending_small_blobs = BTreeSet::new();
+        let mut pending_inline_payloads = BTreeSet::new();
         let mut policy_cache = bucket_governance
             .iter()
             .map(|(identity, governance)| (identity.clone(), Ok(governance.policy.clone())))
@@ -159,7 +159,7 @@ impl Store {
                     &mut pending_versions,
                     &mut pending_receipts,
                     &mut pending_blob_references,
-                    &mut pending_small_blobs,
+                    &mut pending_inline_payloads,
                     &read_cache,
                     &mut policy_cache,
                     &mut versioning_cache,
@@ -375,7 +375,7 @@ impl Store {
         let mut pending_versions = BTreeMap::new();
         let mut pending_receipts = BTreeMap::new();
         let mut pending_blob_references = PendingBlobReferences::new();
-        let mut pending_small_blobs = BTreeSet::new();
+        let mut pending_inline_payloads = BTreeSet::new();
         let encoded_bucket = identity.encode().to_vec();
         let mut policy_cache =
             BTreeMap::from([(encoded_bucket.clone(), Ok(governance.policy.clone()))]);
@@ -394,7 +394,7 @@ impl Store {
                     &mut pending_versions,
                     &mut pending_receipts,
                     &mut pending_blob_references,
-                    &mut pending_small_blobs,
+                    &mut pending_inline_payloads,
                     &read_cache,
                     &mut policy_cache,
                     &mut versioning_cache,

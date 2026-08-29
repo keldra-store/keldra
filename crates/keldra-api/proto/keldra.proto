@@ -142,9 +142,9 @@ service AdministrationService {
   rpc PrepareNode(PrepareNodeRequest) returns (PrepareNodeResponse);
   // Reports the Raft-selected cluster protocol/storage pair and the ACTIVE
   // nodes that have not yet attested support for the next atomic capability.
-  // The 0.14 to 0.15 schema-3 to schema-4 binary upgrade is offline/all-node; this
-  // endpoint coordinates feature activation after that upgrade, not mixed
-  // schema rolling compatibility.
+  // The 0.15 schema-3 to schema-4 binary transition is all-node; this
+  // endpoint coordinates feature activation after all nodes attest support,
+  // not mixed-schema rolling compatibility.
   rpc GetClusterCapabilities(GetClusterCapabilitiesRequest) returns (ClusterCapabilities);
   // Explicitly activates a supported capability pair at an exact placement
   // fence. All ACTIVE nodes must already attest support and the atomic tail

@@ -258,7 +258,7 @@ impl Store {
             let mut pending_versions = BTreeMap::<Vec<u8>, Version>::new();
             let mut pending_receipts = BTreeMap::<Vec<u8>, StoredReceipt>::new();
             let mut pending_blob_references = PendingBlobReferences::new();
-            let mut pending_small_blobs = BTreeSet::<Vec<u8>>::new();
+            let mut pending_inline_payloads = BTreeSet::<Vec<u8>>::new();
             let mut policy_cache = BTreeMap::<Vec<u8>, Result<BucketPolicy, MutationError>>::new();
             let mut versioning_cache =
                 BTreeMap::<Vec<u8>, Result<ObjectVersioning, MutationError>>::new();
@@ -295,7 +295,7 @@ impl Store {
                         &mut pending_versions,
                         &mut pending_receipts,
                         &mut pending_blob_references,
-                        &mut pending_small_blobs,
+                        &mut pending_inline_payloads,
                         &read_cache,
                         &mut policy_cache,
                         &mut versioning_cache,
@@ -609,7 +609,7 @@ impl Store {
         let mut pending_versions = BTreeMap::new();
         let mut pending_receipts = BTreeMap::new();
         let mut pending_blob_references = PendingBlobReferences::new();
-        let mut pending_small_blobs = BTreeSet::new();
+        let mut pending_inline_payloads = BTreeSet::new();
         let read_cache = MutationReadCache::default();
         let encoded_bucket = prepared.identity().encode().to_vec();
         let mut policy_cache = BTreeMap::from([(encoded_bucket.clone(), Ok(governance.policy))]);
@@ -622,7 +622,7 @@ impl Store {
                 &mut pending_versions,
                 &mut pending_receipts,
                 &mut pending_blob_references,
-                &mut pending_small_blobs,
+                &mut pending_inline_payloads,
                 &read_cache,
                 &mut policy_cache,
                 &mut versioning_cache,
@@ -1152,11 +1152,11 @@ impl Store {
                 let bytes = std::mem::take(&mut request.bytes);
                 let payload = if distributed_coordination {
                     PreparedPayload::Sealed(self.stage_blob(&bytes).await?)
-                } else if bytes.len() <= SMALL_BLOB_MAX_BYTES {
+                } else if bytes.len() <= PAYLOAD_ARTIFACT_CHUNK_BYTES {
                     let reference = blob_reference_for_bytes(&bytes);
-                    PreparedPayload::Small { reference, bytes }
+                    PreparedPayload::Inline { reference, bytes }
                 } else {
-                    PreparedPayload::Large(self.stage_blob(&bytes).await?)
+                    PreparedPayload::Installed(self.stage_blob(&bytes).await?)
                 };
                 let fingerprint = put_fingerprint(
                     &identity.head_key(request.key.path()),
@@ -1427,7 +1427,7 @@ impl Store {
         pending_versions: &mut BTreeMap<Vec<u8>, Version>,
         pending_receipts: &mut BTreeMap<Vec<u8>, StoredReceipt>,
         pending_blob_references: &mut PendingBlobReferences,
-        pending_small_blobs: &mut BTreeSet<Vec<u8>>,
+        pending_inline_payloads: &mut BTreeSet<Vec<u8>>,
         read_cache: &MutationReadCache,
         policy_cache: &mut BTreeMap<Vec<u8>, Result<BucketPolicy, MutationError>>,
         versioning_cache: &mut BTreeMap<Vec<u8>, Result<ObjectVersioning, MutationError>>,
@@ -1683,7 +1683,7 @@ impl Store {
             PreparedOperation::Delete { .. } => None,
         };
         if let PreparedOperation::Put { payload, .. } = operation
-            && payload.small_bytes().is_none()
+            && payload.inline_bytes().is_none()
             && !self.contains_blob(payload.reference()).await?
         {
             return Err(MutationError::BlobNotFound);
@@ -1821,14 +1821,14 @@ impl Store {
         let heads = self.cf(CF_HEADS)?;
         let encoded_version_key = version_key(operation.identity(), key, id);
         let mut blob_reference_updates = Vec::with_capacity(2);
-        let small_blob_value = if apply_content_lifecycle {
+        let inline_payload_value = if apply_content_lifecycle {
             match operation {
-                PreparedOperation::Put { payload, .. } => match payload.small_bytes() {
-                    Some(bytes) => self.prepare_hashed_small_blob_value_cached(
+                PreparedOperation::Put { payload, .. } => match payload.inline_bytes() {
+                    Some(bytes) => self.prepare_hashed_inline_payload_value_cached(
                         payload.reference(),
                         bytes,
-                        pending_small_blobs,
-                        read_cache.small_blob(payload.reference()),
+                        pending_inline_payloads,
+                        read_cache.inline_payload(payload.reference()),
                     )?,
                     None => None,
                 },
@@ -1879,9 +1879,13 @@ impl Store {
             receipt_status,
             pending_receipts,
         )?;
-        if let Some((key, bytes)) = small_blob_value {
-            batch.put_cf(self.cf(CF_SMALL_BLOBS)?, &key, bytes);
-            pending_small_blobs.insert(key);
+        if let Some((key, bytes)) = inline_payload_value {
+            let reference = match operation {
+                PreparedOperation::Put { payload, .. } => payload.reference(),
+                _ => unreachable!("only a put materializes inline payload bytes"),
+            };
+            self.stage_inline_complete_artifact(batch, reference, &bytes)?;
+            pending_inline_payloads.insert(key);
         }
         for (key, state) in blob_reference_updates {
             let prefetched = read_cache.blob_reference_by_key(&key);

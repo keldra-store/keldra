@@ -66,25 +66,24 @@ cargo package --locked -p keldra
 
 ## Release
 
-### Upgrade and activate capability 2/2
+### Initialize 0.15 and activate capability 2/2
 
-Keldra 0.15 changes the cluster and data-peer protocols. A 0.14 cluster must be
-upgraded offline; mixed 0.14/0.15 operation is unsupported.
+Keldra 0.15 changes the cluster/data-peer protocols and introduces a clean-break
+payload storage format. Every 0.15 node must use fresh authoritative volumes;
+mixed 0.14/0.15 operation and in-place 0.14 volume upgrades are unsupported.
 
-1. Quiesce mutations, atomic invocations, and membership changes, then take a
-   consistent backup of every node's data and operational keys.
-2. Stop every 0.14 node. Install 0.15 on every node before restarting the
-   cluster.
-3. Keep writes drained while ACTIVE nodes attest support. Inspect cluster
+1. Initialize a fresh 0.15 cluster. If application data must move from an older
+   cluster, import it through the public API as new writes.
+2. Keep production writes disabled while ACTIVE nodes attest support. Inspect cluster
    capabilities and require active `1/1`, target `2/2`, no blocking ACTIVE node
    IDs, `activation_quiescent=true`, and
    `ready_for_target_activation=true`.
-4. Activate protocol/storage `2/2` using the exact placement term and index from
+3. Activate protocol/storage `2/2` using the exact placement term and index from
    that status response. If placement changes, discard the old fence and inspect
    again.
-5. Re-read status and require active `2/2`. Smoke clone independence, link
+4. Re-read status and require active `2/2`. Smoke clone independence, link
    write-through, target-delete fencing, unlink, and date queries before
-   resuming traffic.
+   admitting production traffic.
 
 Use the authenticated CLI surface; the status command prints the exact safe
 activation command when the cluster is ready:
@@ -97,8 +96,8 @@ keldra --endpoint "$KELDRA_ENDPOINT" activate-cluster-capabilities \
   --expected-placement-index "$PLACEMENT_INDEX"
 ```
 
-Never force activation past a blocker. Rollback requires restoring the complete
-pre-upgrade backup; do not start 0.14 against storage touched by 0.15.
+Never force activation past a blocker, and never start 0.14 against storage
+initialized or touched by 0.15.
 
 The release tag must be the exact, unprefixed workspace version. After the
 validated commit is pushed, maintainers publish `0.15.0` with:

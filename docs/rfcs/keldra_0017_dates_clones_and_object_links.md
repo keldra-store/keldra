@@ -171,9 +171,10 @@ program. Reserved Keldra paths remain unavailable except for exact internal
 records derived and validated by a built-in capability.
 
 The released 0.14 cluster- and data-peer schemas are version 3 while this
-capability uses exact schema 4 for both. Deployment upgrade is therefore an
-offline, all-node in-place data upgrade, not a mixed-binary rolling upgrade.
-After every node runs the new binary, the cluster remains selected at protocol
+capability uses exact schema 4 for both. Keldra 0.15 is also a clean storage
+break under KELDRA-0018: nodes start on fresh authoritative volumes, and neither
+mixed-binary operation nor an in-place 0.14 volume upgrade is supported. After
+every fresh node runs the new binary, the cluster remains selected at protocol
 and storage version 1. Each ACTIVE node then attests its expanded `1..=2`
 support over mTLS to the Raft leader. An authorized operator inspects
 `GetClusterCapabilities`; only when it reports no blocking ACTIVE nodes and a

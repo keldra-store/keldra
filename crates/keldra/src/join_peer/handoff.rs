@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use keldra_consensus::{
@@ -14,7 +15,7 @@ use keldra_consensus::{
 };
 use keldra_store::{
     ErasureProfile, LocalChange, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, PlacementLogId, SourceId,
-    Store, WatchJournalStatus,
+    WatchJournalStatus,
 };
 use tonic::Status;
 
@@ -32,13 +33,13 @@ mod records;
 pub(crate) struct TypedAddHandoff {
     local_node: NodeId,
     decisions: DecisionRaft,
-    store: Store,
     peers: DataPeerTransport,
     leases: ServingLeaseIssuer,
     programs: LateBoundProgramQuiescence,
     mutation_admission: crate::mutation_admission::MutationAdmission,
     single_flight: Arc<tokio::sync::Mutex<()>>,
     profile: ErasureProfile,
+    payload_read_scratch: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -69,23 +70,23 @@ impl TypedAddHandoff {
     pub(crate) fn new(
         local_node: NodeId,
         decisions: DecisionRaft,
-        store: Store,
         peers: DataPeerTransport,
         leases: ServingLeaseIssuer,
         programs: LateBoundProgramQuiescence,
         mutation_admission: crate::mutation_admission::MutationAdmission,
         profile: ErasureProfile,
+        payload_read_scratch: PathBuf,
     ) -> Self {
         Self {
             local_node,
             decisions,
-            store,
             peers,
             leases,
             programs,
             mutation_admission,
             single_flight: Arc::new(tokio::sync::Mutex::new(())),
             profile,
+            payload_read_scratch,
         }
     }
 
@@ -440,9 +441,9 @@ impl JoinActivationGate for TypedAddHandoff {
         // final authoritative scan.
         self.release_stale_drains(&topology, &peers).await?;
         let payload_spools: Arc<dyn crate::payload_read::PayloadReadSpoolFactory> = Arc::new(
-            AnonymousPayloadReadSpools::new(self.store.payload_spool_directory()).map_err(
-                |error| Status::internal(format!("create payload-read spool directory: {error}")),
-            )?,
+            AnonymousPayloadReadSpools::new(&self.payload_read_scratch).map_err(|error| {
+                Status::internal(format!("create payload-read spool directory: {error}"))
+            })?,
         );
         let started = self.journal_tails(&topology, &peers).await?;
 

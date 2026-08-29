@@ -5,7 +5,7 @@
 //! latest locally applied committed node descriptors.
 
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -516,6 +516,7 @@ impl PeerRuntime {
         peer_listen: SocketAddr,
         decisions: DecisionRaft,
         store: Store,
+        payload_read_scratch: PathBuf,
         erasure_profile: ErasureProfile,
         maximum_unary_time: Duration,
         max_blob_bytes: u64,
@@ -528,12 +529,12 @@ impl PeerRuntime {
         let activation_gate = Arc::new(TypedAddHandoff::new(
             self.node_id,
             decisions.clone(),
-            store.clone(),
             self.data_transport.clone(),
             leases.clone(),
             self.program_quiescence.clone(),
             self.mutation_admission.clone(),
             erasure_profile,
+            payload_read_scratch,
         ));
         self.start_with_activation_gate(
             peer_listen,
@@ -1309,6 +1310,7 @@ mod tests {
                 peer_listen,
                 decisions.clone(),
                 store,
+                directory.path().join("payload-read-scratch"),
                 ErasureProfile::default(),
                 Duration::from_secs(30),
                 16 * 1024 * 1024,
@@ -1491,6 +1493,7 @@ mod tests {
                 second_address,
                 second_decisions.clone(),
                 second_store,
+                second_directory.path().join("payload-read-scratch"),
                 ErasureProfile::default(),
                 Duration::from_secs(30),
                 16 * 1024 * 1024,
@@ -1569,6 +1572,7 @@ mod tests {
                 second_address,
                 second_decisions.clone(),
                 second_store,
+                second_directory.path().join("payload-read-scratch"),
                 ErasureProfile::default(),
                 Duration::from_secs(30),
                 16 * 1024 * 1024,

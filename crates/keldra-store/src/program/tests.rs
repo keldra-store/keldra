@@ -400,7 +400,7 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
     assert_eq!(released_bundle.flags, 0);
     assert!(
         !store
-            .read_blob_bytes(&bundle_blob)
+            .read_retained_blob_bytes(&bundle_blob)
             .await
             .unwrap()
             .is_empty()
@@ -476,7 +476,7 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
             .unwrap(),
         0
     );
-    assert!(store.read_blob_bytes(&bundle_blob).await.is_ok());
+    assert!(store.read_retained_blob_bytes(&bundle_blob).await.is_ok());
     assert_eq!(
         store
             .collect_blob_garbage_at(released_bundle.updated_at + replay_grace_millis)
@@ -485,7 +485,10 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         1
     );
     assert_eq!(
-        store.read_blob_bytes(&bundle_blob).await.unwrap_err(),
+        store
+            .read_retained_blob_bytes(&bundle_blob)
+            .await
+            .unwrap_err(),
         MutationError::BlobNotFound
     );
 }

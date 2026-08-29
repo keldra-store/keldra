@@ -189,7 +189,7 @@ impl Store {
         artifact.validate()?;
         match &artifact.identity {
             PayloadArtifactIdentity::Complete(reference) => {
-                if self.open_blob(reference).await.is_err() {
+                if self.open_retained_blob(reference).await.is_err() {
                     return Err(storage_error(
                         "payload handoff lifecycle cannot precede verified complete bytes",
                     ));
@@ -204,19 +204,12 @@ impl Store {
         let _guard = self.lock_commit("payload_handoff").await;
         let key = artifact.identity.key();
         let present = match &artifact.identity {
-            PayloadArtifactIdentity::Complete(reference) if is_small_blob(reference) => self
-                .db
-                .get_cf(self.cf(CF_SMALL_BLOBS)?, &key)
-                .map_err(storage_error)?
-                .is_some(),
-            PayloadArtifactIdentity::Complete(reference) => self
-                .blobs
-                .contains(reference)
-                .await
-                .map_err(storage_error)?,
-            PayloadArtifactIdentity::Shard(identity) => self
-                .contains_shard_artifact(identity)
-                .map_err(storage_error)?,
+            PayloadArtifactIdentity::Complete(reference) => {
+                self.read_complete_manifest(reference)?.is_some()
+            }
+            PayloadArtifactIdentity::Shard(identity) => {
+                self.read_shard_manifest(identity)?.is_some()
+            }
         };
         if !present {
             return Err(MutationError::BlobNotFound);
@@ -634,7 +627,7 @@ mod tests {
                 store.complete_copy_state(&reference).await.unwrap(),
                 PayloadArtifactState::Missing
             );
-            store.open_blob(&reference).await.unwrap();
+            store.open_retained_blob(&reference).await.unwrap();
         }
     }
 
@@ -700,7 +693,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(store.contains_blob(&reference).await.unwrap());
+        assert!(store.read_complete_manifest(&reference).unwrap().is_some());
         assert_eq!(
             store
                 .collect_blob_garbage_at(retired.updated_at + 1_000)

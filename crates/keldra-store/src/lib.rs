@@ -50,7 +50,7 @@ pub use authz::{
     SYSTEM_STORAGE_TENANT_ID, SchemaDigest, SchemaId, SchemaRef, StorageTenantId,
     TupleBatchReceipt, TupleBatchRequest, TupleMutation, TupleMutationKind,
 };
-pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobStore, BlobUpload};
+pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobUpload};
 pub use blob_gc::{BlobGcBudget, BlobGcCursor, BlobGcTick};
 pub use bootstrap::{
     ApplicationCredential, ApplicationCredentialRequest, ApplicationRoleTarget,
@@ -138,22 +138,23 @@ pub use reference_delta::{
 pub use store::{
     BatchGetSelection, CompleteCopySealOutcome, CurrentHeadCursor, CurrentObjectSnapshot,
     CurrentObjectSnapshotFrame, CurrentObjectSnapshotPage, CurrentObjectSnapshotScan,
-    DEFAULT_AWAITING_PUBLISH_TTL_SECONDS, DEFAULT_MUTATION_RECEIPT_MAX_BYTES,
-    DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES, DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS,
-    ListObjectsPage, LocalPayloadPresence, MAX_CURRENT_HEAD_SNAPSHOT_BYTES,
-    MAX_CURRENT_HEAD_SNAPSHOT_RECORDS, MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS,
-    MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS,
+    DEFAULT_AWAITING_PUBLISH_TTL_SECONDS, DEFAULT_MAX_TOTAL_WAL_BYTES,
+    DEFAULT_MUTATION_RECEIPT_MAX_BYTES, DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES,
+    DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS, ListObjectsPage, LocalPayloadPresence,
+    MAX_CURRENT_HEAD_SNAPSHOT_BYTES, MAX_CURRENT_HEAD_SNAPSHOT_RECORDS, MAX_LIST_OBJECT_VERSIONS,
+    MAX_LIST_OBJECTS, MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS,
     MAX_PAYLOAD_HANDOFF_EXPORT_RECORDS, MAX_REFERENCE_PROOF_EXPORT_BYTES,
     MAX_REFERENCE_PROOF_EXPORT_RECORDS, MAX_REFERENCE_PROOF_PRUNE_BYTES,
     MAX_REFERENCE_PROOF_PRUNE_RECORDS, MetadataRuntimeMetrics, MutationReceiptRetention,
     ObjectPathSnapshot, ObjectRecordCursor, ObjectRecordExport, ObjectRecordExportPage,
-    ObjectSnapshotApplied, ObjectSnapshotError, OpenedObject, PayloadArtifactCursor,
-    PayloadArtifactIdentity, PayloadArtifactSnapshot, PayloadArtifactSnapshotPage,
-    PayloadArtifactState, PayloadStoreError, ReferenceProofCursor, ReferenceProofExportError,
-    ReferenceProofPage, ReferenceProofPruneError, ReferenceProofPruneResult, RetainedHeadState,
-    RetainedObjectCursor, RetainedObjectSnapshot, RetainedObjectSnapshotFrame,
-    RetainedObjectSnapshotPage, RetainedObjectSnapshotScan, RetainedVersionCursor, ShardIdentity,
-    ShardReader, ShardSealOutcome, ShardStoreError, Store, StoreOptions,
+    ObjectSnapshotApplied, ObjectSnapshotError, OpenedObject, PAYLOAD_ARTIFACT_CHUNK_BYTES,
+    PAYLOAD_BLOB_MIN_BYTES, PayloadArtifactCursor, PayloadArtifactIdentity,
+    PayloadArtifactSnapshot, PayloadArtifactSnapshotPage, PayloadArtifactState, PayloadStoreError,
+    ReferenceProofCursor, ReferenceProofExportError, ReferenceProofPage, ReferenceProofPruneError,
+    ReferenceProofPruneResult, RetainedHeadState, RetainedObjectCursor, RetainedObjectSnapshot,
+    RetainedObjectSnapshotFrame, RetainedObjectSnapshotPage, RetainedObjectSnapshotScan,
+    RetainedVersionCursor, ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError, Store,
+    StoreOptions,
 };
 pub use watch::{
     AccountingHeadTransition, AggregateChanged, AggregateKind, AtomicBatchMutation,

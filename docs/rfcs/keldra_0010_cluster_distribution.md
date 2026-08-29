@@ -9,6 +9,13 @@ Compatibility: An existing Keldra 0.5.0 data directory can become the first
 node of a 0.5.1 cluster in place. Keldra 0.5.1 does not restore an older product
 surface or introduce PersonalDB, index, gateway, region, or mesh APIs.
 
+0.15 note: [KELDRA-0018](keldra_0018_integrated_payload_storage.md) supersedes
+this RFC's physical `small_blobs`, complete-blob file, shard-file, lifecycle
+codec, filesystem staging, and filesystem GC design for fresh 0.15 volumes.
+This RFC remains authoritative for logical placement, erasure coding,
+durability evidence, reference delivery, repair, membership handoff, and the
+prohibition on physical RocksDB replication.
+
 ## 1. Decision
 
 Keldra 0.5.1 adds one flat cluster containing `N` heterogeneous Keldra nodes.

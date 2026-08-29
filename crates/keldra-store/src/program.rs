@@ -1167,7 +1167,7 @@ impl Store {
 
         let bundle_reference = BlobRef::from(bundle);
         let bundle_bytes = self
-            .read_blob_bytes(&bundle_reference)
+            .read_retained_blob_bytes(&bundle_reference)
             .await
             .map_err(|error| match error {
                 MutationError::BlobNotFound => ProgramStoreError::PreparedBundleNotFound(hash),
@@ -1934,7 +1934,7 @@ impl Store {
     ) -> Result<PreparedProgramRecord, ProgramStoreError> {
         let reference = BlobRef::from(prepared.bundle);
         let bytes = self
-            .read_blob_bytes(&reference)
+            .read_retained_blob_bytes(&reference)
             .await
             .map_err(program_mutation_error)?;
         PreparedProgramRecord::decode_distributed(

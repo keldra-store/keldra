@@ -501,7 +501,12 @@ mod tests {
             .stage_blob(&vec![0x7c; SMALL_BLOB_MAX_BYTES + 1])
             .await
             .unwrap();
-        store.blobs.remove(&blob).unwrap();
+        let manifest = store.read_complete_manifest(&blob).unwrap().unwrap();
+        let mut delete = WriteBatch::default();
+        store
+            .stage_artifact_delete(&mut delete, &blob_reference_key(&blob), &manifest)
+            .unwrap();
+        store.db.write(delete).unwrap();
 
         assert_eq!(
             store.apply_reference_deltas(batch(0, 1, &blob, 1)).await,

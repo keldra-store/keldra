@@ -18,7 +18,7 @@ crc32c = "0.6.8"
 hex = "0.4"
 getrandom = "0.3"
 reed-solomon-erasure = { version = "6.0.0", default-features = false, features = ["std"] }
-rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
+rocksdb = { version = "0.25", default-features = false, features = ["bindgen-runtime"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2.6"

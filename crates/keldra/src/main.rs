@@ -55,13 +55,9 @@ struct Arguments {
     #[arg(long, env = "KELDRA_CACHE_DIR")]
     cache_dir: Option<PathBuf>,
 
-    /// Restart-disposable spool for unfinished, unacknowledged uploads.
-    #[arg(long, env = "KELDRA_UPLOAD_SPOOL_DIR")]
-    upload_spool_dir: Option<PathBuf>,
-
-    /// Aggregate bytes admitted to the unfinished upload spool.
-    #[arg(long, env = "KELDRA_UPLOAD_SPOOL_MAX_BYTES")]
-    upload_spool_max_bytes: Option<NonZeroU64>,
+    /// Aggregate bytes admitted across active unfinished uploads.
+    #[arg(long, env = "KELDRA_PENDING_UPLOAD_MAX_BYTES")]
+    pending_upload_max_bytes: Option<NonZeroU64>,
 
     #[arg(long, env = "KELDRA_RUN_SYSTEM_BOOTSTRAP", default_value_t = false)]
     run_system_bootstrap: bool,
@@ -505,6 +501,13 @@ struct Arguments {
 
     #[arg(
         long,
+        env = "KELDRA_MAX_TOTAL_WAL_BYTES",
+        default_value_t = keldra_store::DEFAULT_MAX_TOTAL_WAL_BYTES
+    )]
+    max_total_wal_bytes: u64,
+
+    #[arg(
+        long,
         env = "KELDRA_ERASURE_DATA_SHARDS",
         default_value_t = keldra_store::DEFAULT_ERASURE_DATA_SHARDS
     )]
@@ -577,11 +580,11 @@ impl Arguments {
             metadata_wal: self.metadata_wal_dir.is_some(),
             payload: self.payload_dir.is_some(),
         };
-        let spool_max = self
-            .upload_spool_max_bytes
+        let pending_upload_max = self
+            .pending_upload_max_bytes
             .map(NonZeroU64::get)
             .unwrap_or(self.max_blob_bytes);
-        let mut paths = StoragePaths::under(&self.data_dir, spool_max);
+        let mut paths = StoragePaths::under(&self.data_dir, pending_upload_max);
         if let Some(path) = &self.state_dir {
             paths.state = path.clone();
         }
@@ -603,10 +606,6 @@ impl Arguments {
             .cache_dir
             .clone()
             .unwrap_or_else(|| self.data_dir.join("cache"));
-        paths.upload_spool = self
-            .upload_spool_dir
-            .clone()
-            .unwrap_or_else(|| self.data_dir.join("upload-spool"));
         (paths, explicit)
     }
 
@@ -824,6 +823,7 @@ async fn main() -> Result<()> {
         index_runtime,
         plugin_gateway,
         max_blob_bytes: arguments.max_blob_bytes,
+        max_total_wal_bytes: arguments.max_total_wal_bytes,
         erasure_profile,
         awaiting_publish_ttl_seconds: arguments.awaiting_publish_ttl_seconds,
         mutation_receipt_retention_seconds: arguments.mutation_receipt_retention_seconds,
@@ -906,9 +906,7 @@ mod tests {
             "/scratch",
             "--cache-dir",
             "/cache",
-            "--upload-spool-dir",
-            "/spool",
-            "--upload-spool-max-bytes",
+            "--pending-upload-max-bytes",
             "2097152",
         ]);
         let (paths, explicit) = arguments.storage_paths();
@@ -919,8 +917,7 @@ mod tests {
         assert_eq!(paths.payload, PathBuf::from("/payload"));
         assert_eq!(paths.scratch, PathBuf::from("/scratch"));
         assert_eq!(paths.cache, PathBuf::from("/cache"));
-        assert_eq!(paths.upload_spool, PathBuf::from("/spool"));
-        assert_eq!(paths.upload_spool_max_bytes, 2_097_152);
+        assert_eq!(paths.pending_upload_max_bytes, 2_097_152);
         assert_eq!(
             explicit,
             ExplicitAuthoritativePaths {

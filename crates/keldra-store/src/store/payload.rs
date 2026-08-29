@@ -1,8 +1,9 @@
-use std::fs::File;
 use std::io::Write;
 
 use thiserror::Error;
 
+use super::journal_capacity::SourceJournalAdmission;
+use super::payload_artifacts::RocksArtifactReader;
 use super::*;
 use crate::{ErasureCodec, ErasureError};
 
@@ -66,8 +67,9 @@ impl Store {
     /// Atomically publish one streamed complete large-object source only when
     /// its final bytes match the caller's exact immutable identity.
     ///
-    /// The upload already lives in the ordinary blob `.staging` directory.
-    /// No final path or lifecycle reservation is created for a mismatch.
+    /// The upload writes lifecycle-owned chunks directly into RocksDB. A hash
+    /// mismatch never binds those chunks to the caller's expected identity;
+    /// bounded GC reclaims any already-durable installation.
     pub async fn seal_complete_source_upload(
         &self,
         expected: &BlobRef,
@@ -86,31 +88,8 @@ impl Store {
                 "sealed complete source changed content identity".into(),
             ));
         }
-        loop {
-            let commit_guard = self.lock_commit("payload").await;
-            if !staged.path().is_file()
-                && !self
-                    .blobs
-                    .contains(expected)
-                    .await
-                    .map_err(|error| PayloadStoreError::Storage(error.to_string()))?
-            {
-                return Err(PayloadStoreError::CompleteCopyMissing);
-            }
-            let reservation = self.reserve_sealed_blob(expected, now_unix_millis()?);
-            drop(commit_guard);
-            match reservation {
-                Ok(()) => break,
-                Err(MutationError::SourceJournalCapacity) => {
-                    self.wait_for_mutation_capacity().await;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        self.blobs
-            .publish_staged(staged)
-            .await
-            .map_err(|error| PayloadStoreError::Storage(error.to_string()))?;
+        self.seal_staged_blob_with_admission(staged, SourceJournalAdmission::Bounded)
+            .await?;
         Ok(if previous == PayloadArtifactState::Valid {
             CompleteCopySealOutcome::AlreadyPresent
         } else {
@@ -118,7 +97,7 @@ impl Store {
         })
     }
 
-    /// Install one exact complete small-object copy in `small_blobs`.
+    /// Install one exact complete inline object in the payload artifact CF.
     ///
     /// The supplied content identity is authoritative. Hash or length
     /// disagreement fails before any write, and an existing corrupt value is
@@ -156,9 +135,14 @@ impl Store {
             .filter(|state| state.ref_count != 0)
             .ok_or(PayloadStoreError::CompleteCopyMissing)?;
         validate_blob_reference_state(state)?;
+        self.read_complete_manifest(reference)?
+            .ok_or(PayloadStoreError::CompleteCopyMissing)?;
         let bytes = self
             .db
-            .get_cf(self.cf(CF_SMALL_BLOBS)?, blob_reference_key(reference))
+            .get_cf(
+                self.cf(CF_PAYLOAD_ARTIFACTS)?,
+                complete_artifact_key(reference),
+            )
             .map_err(|error| PayloadStoreError::Storage(error.to_string()))?
             .ok_or(PayloadStoreError::CompleteCopyMissing)?
             .to_vec();
@@ -180,33 +164,39 @@ impl Store {
             return Ok(PayloadArtifactState::Missing);
         }
 
-        if is_small_blob(reference) {
+        if is_inline_payload_artifact(reference) {
+            if self.read_complete_manifest(reference)?.is_none() {
+                return Ok(PayloadArtifactState::Missing);
+            }
             let Some(bytes) = self
                 .db
-                .get_cf(self.cf(CF_SMALL_BLOBS)?, blob_reference_key(reference))
+                .get_cf(
+                    self.cf(CF_PAYLOAD_ARTIFACTS)?,
+                    complete_artifact_key(reference),
+                )
                 .map_err(|error| PayloadStoreError::Storage(error.to_string()))?
             else {
                 return Ok(PayloadArtifactState::Missing);
             };
-            return Ok(if validate_small_blob(reference, &bytes).is_ok() {
+            return Ok(if validate_complete_artifact(reference, &bytes).is_ok() {
                 PayloadArtifactState::Valid
             } else {
                 PayloadArtifactState::Corrupt
             });
         }
 
-        if !self
-            .blobs
-            .contains(reference)
-            .await
-            .map_err(|error| PayloadStoreError::Storage(error.to_string()))?
-        {
+        if self.read_complete_manifest(reference)?.is_none() {
             return Ok(PayloadArtifactState::Missing);
         }
-        Ok(match self.blobs.open_verified(reference).await {
-            Ok(_) => PayloadArtifactState::Valid,
-            Err(_) => PayloadArtifactState::Corrupt,
-        })
+        let mut reader = self.open_blob(reference).await?;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => return Ok(PayloadArtifactState::Valid),
+                Ok(_) => {}
+                Err(_) => return Ok(PayloadArtifactState::Corrupt),
+            }
+        }
     }
 
     /// Report every locally valid artifact for one content identity.
@@ -269,8 +259,10 @@ impl Store {
             PayloadArtifactState::Corrupt => return Err(PayloadStoreError::CompleteCopyCorrupt),
             PayloadArtifactState::Valid => {}
         }
-        let source = File::open(self.blobs.path(&reference.hash))
-            .map_err(|error| PayloadStoreError::Storage(error.to_string()))?;
+        let manifest = self
+            .read_complete_manifest(reference)?
+            .ok_or(PayloadStoreError::CompleteCopyMissing)?;
+        let source = RocksArtifactReader::new(self.db.clone(), manifest);
         codec.encode(source, reference, shards)?;
         Ok(())
     }
@@ -306,8 +298,9 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
+    use super::super::payload_artifacts::shard_inline_key;
     use super::*;
     use crate::{ErasureProfile, SMALL_BLOB_MAX_BYTES, StoreOptions};
 
@@ -322,15 +315,8 @@ mod tests {
         }
     }
 
-    fn shard_path(root: &Path, identity: &ShardIdentity) -> PathBuf {
-        let hash = hex::encode(identity.blob().hash);
-        root.join("blobs")
-            .join(&hash[..2])
-            .join(hex::encode(identity.encode()))
-    }
-
     #[tokio::test]
-    async fn exact_small_copy_survives_restart_in_small_blobs() {
+    async fn exact_inline_copy_survives_restart_in_integrated_payload_storage() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("store");
         let bytes = b"one exact small copy";
@@ -355,7 +341,7 @@ mod tests {
             PayloadArtifactState::Valid
         );
         assert_eq!(store.read_small_copy(&reference).unwrap(), bytes);
-        assert!(!store.blobs.path(&reference.hash).exists());
+        assert!(store.read_complete_manifest(&reference).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -368,8 +354,8 @@ mod tests {
         store
             .db
             .put_cf(
-                store.cf(CF_SMALL_BLOBS).unwrap(),
-                blob_reference_key(&reference),
+                store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(),
+                complete_artifact_key(&reference),
                 b"wrong value",
             )
             .unwrap();
@@ -456,8 +442,7 @@ mod tests {
     #[tokio::test]
     async fn insufficient_or_corrupt_shards_fail_closed() {
         let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path();
-        let store = open_store(root).await;
+        let store = open_store(temporary.path()).await;
         let source = vec![0x6d; SMALL_BLOB_MAX_BYTES + 31];
         let reference = store.stage_blob(&source).await.unwrap();
         let codec = ErasureCodec::new(ErasureProfile::default()).unwrap();
@@ -479,10 +464,16 @@ mod tests {
         }
 
         let corrupt = ShardIdentity::new(reference.clone(), 1);
-        let path = shard_path(root, &corrupt);
-        let mut bytes = std::fs::read(&path).unwrap();
+        let mut bytes = encoded[1].clone();
         *bytes.last_mut().unwrap() ^= 0xff;
-        std::fs::write(&path, bytes).unwrap();
+        store
+            .db
+            .put_cf(
+                store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(),
+                shard_inline_key(&corrupt),
+                bytes,
+            )
+            .unwrap();
         let presence = store
             .local_payload_presence(&codec, &reference)
             .await

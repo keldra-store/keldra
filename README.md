@@ -767,14 +767,13 @@ Production formation uses the same sequence:
 The public gRPC endpoint may sit behind an ordinary TLS terminator. Peer traffic
 uses mandatory certificates created and rotated by the cluster.
 
-### Upgrade from 0.14 and activate 0.15 capabilities
+### Start 0.15 on fresh volumes and activate its capabilities
 
-The cluster and data-peer protocols changed in 0.15. Stop all 0.14 nodes before
-starting any 0.15 node; mixed-version operation is unsupported. First quiesce
-mutations, atomic invocations, and membership changes, and take a consistent
-backup of every node's data and operational keys. Install 0.15 everywhere,
-restart the complete cluster, and keep writes drained while ACTIVE nodes attest
-support.
+Keldra 0.15 is a clean storage-format break. Start every 0.15 node with fresh
+authoritative volumes; it does not open, migrate, or reuse a 0.14 data volume.
+Mixed 0.14/0.15 clusters are unsupported. If application data must move from an
+older cluster, keep that cluster separate and import the data through the public
+API as new writes.
 
 Inspect cluster capabilities. Activation is safe only when it reports active
 protocol/storage `1/1`, target `2/2`, no blocking ACTIVE node IDs,
@@ -797,9 +796,9 @@ Supply the same system-operator credentials used for other protected
 administration commands. The status command prints the exact activation command
 when the cluster is ready.
 
-Before resuming traffic, smoke clone independence, link write-through,
-target-delete fencing, unlink, and date queries. Rollback requires restoring the
-complete pre-upgrade backup; never start 0.14 against storage touched by 0.15.
+Before admitting production traffic, smoke clone independence, link
+write-through, target-delete fencing, unlink, and date queries. Never start a
+0.14 binary against a volume initialized or touched by 0.15.
 
 ### Place storage by workload
 
@@ -812,22 +811,24 @@ operator can distribute I/O before that storage root is pinned:
 | `KELDRA_STATE_DIR` | Node identity, peer certificates, and Raft decisions | Authoritative; pinned at node initialization |
 | `KELDRA_METADATA_DIR` | RocksDB manifests, SSTs, object metadata, Zanzibar, and journals | Authoritative; pinned |
 | `KELDRA_METADATA_WAL_DIR` | RocksDB synchronous write-ahead log | Authoritative; pinned; prefer low-latency durable storage |
-| `KELDRA_PAYLOAD_DIR` | Canonical blobs, EC shards, and authoritative index artifacts | Authoritative; pinned; prefer capacity and sequential throughput |
+| `KELDRA_MAX_TOTAL_WAL_BYTES` | Shared RocksDB WAL flush target | Defaults to 50 GiB; administrator configurable |
+| `KELDRA_PAYLOAD_DIR` | Payload-artifact SSTs and integrated BlobDB files for complete values and EC shards | Authoritative; pinned; prefer capacity and sequential throughput |
 | `KELDRA_SCRATCH_DIR` | Index sort and merge scratch | Disposable; may use tmpfs or local scratch storage |
 | `KELDRA_CACHE_DIR` | Materialized index and gateway caches | Disposable; may be replaced between restarts |
-| `KELDRA_UPLOAD_SPOOL_DIR` | Unfinished, unacknowledged upload bytes | Disposable; may use bounded tmpfs |
-| `KELDRA_UPLOAD_SPOOL_MAX_BYTES` | Process-wide unfinished-upload capacity | Defaults to the configured maximum object size |
+| `KELDRA_PENDING_UPLOAD_MAX_BYTES` | Process-wide unfinished-upload admission | Defaults to the configured maximum object size; persisted chunks remain GC-owned in RocksDB |
 
 Each authoritative root carries a node-local identity marker. Restarting with a
 missing mount, an empty replacement directory, or another node's disk fails
 before RocksDB, Raft, or payload storage opens. Moving the same marked storage
-root to a different mount path is safe. Scratch, cache, and upload-spool paths
-are deliberately unpinned; losing them may abort active work or cause cache
-refetching, but cannot lose an acknowledged object.
+root to a different mount path is safe. Scratch and cache paths are deliberately
+unpinned; losing them may abort active work or cause cache refetching, but cannot
+lose an acknowledged object.
 
-The WAL must not use tmpfs. Identified blob/shard staging and garbage-collection
-recovery remain under `KELDRA_PAYLOAD_DIR`; only raw uploads which have not
-reached `PutEnd` use the disposable spool.
+The WAL must not use tmpfs. Complete payloads, erasure shards, and full chunks
+of unfinished uploads are written directly to the integrated RocksDB payload
+column family. Their installation, lifecycle, and garbage-collection records
+are in the same database. Keldra does not create filesystem upload-spool files;
+abandoned persisted chunks are reclaimed by the ordinary due-index GC.
 
 ## Public services
 
@@ -865,7 +866,10 @@ The architecture contracts live in
 [KELDRA-0009](docs/rfcs/keldra_0009_atomic_programs.md) and
 [KELDRA-0010](docs/rfcs/keldra_0010_cluster_distribution.md). The current
 clean-break native-segment index architecture is specified by
-[KELDRA-0014](docs/rfcs/keldra_0014_native_segment_indexes.md).
+[KELDRA-0014](docs/rfcs/keldra_0014_native_segment_indexes.md). The approved
+clean-break 0.15 payload layout, lifecycle, GC, replication boundary, and WAL
+contract is specified by
+[KELDRA-0018](docs/rfcs/keldra_0018_integrated_payload_storage.md).
 
 ## Build and qualify
 

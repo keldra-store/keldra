@@ -712,11 +712,79 @@ async fn bulk_returns_per_item_results_and_persists_successes_once() {
         store
             .db
             .get_cf(
-                store.cf(CF_SMALL_BLOBS).unwrap(),
-                blob_reference_key(&rejected),
+                store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(),
+                complete_artifact_key(&rejected),
             )
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn pathological_bulk_of_hundreds_of_values_above_64k_uses_integrated_storage() {
+    const OPERATIONS: usize = 807;
+    const PAYLOAD_BYTES: usize = 63_016_190;
+    let (temporary, store) = store().await;
+    let base = PAYLOAD_BYTES / OPERATIONS;
+    let remainder = PAYLOAD_BYTES % OPERATIONS;
+    let mut references = Vec::with_capacity(OPERATIONS);
+    let mut operations = Vec::with_capacity(OPERATIONS);
+
+    for ordinal in 0..OPERATIONS {
+        let length = base + usize::from(ordinal < remainder);
+        assert!(length > SMALL_BLOB_MAX_BYTES);
+        let mut bytes = vec![0x5a; length];
+        bytes[..8].copy_from_slice(&(ordinal as u64).to_be_bytes());
+        references.push(blob_reference_for_bytes(&bytes));
+        operations.push(BatchOperation::Put(put(
+            &format!("osv/{ordinal}"),
+            &bytes,
+            Precondition::Absent,
+            &format!("osv-{ordinal}"),
+        )));
+    }
+
+    let outcomes = store.bulk_write(operations).await;
+    assert_eq!(outcomes.len(), OPERATIONS);
+    assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+
+    let payload_cf = store.cf(CF_PAYLOAD_ARTIFACTS).unwrap();
+    store.db.flush_cf(payload_cf).unwrap();
+    for reference in &references {
+        assert!(
+            store
+                .db
+                .get_cf(payload_cf, complete_artifact_key(reference))
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.read_complete_manifest(reference).unwrap().is_some());
+        let encoded_hash = hex::encode(reference.hash);
+        assert!(
+            !temporary
+                .path()
+                .join("blobs")
+                .join(&encoded_hash[..2])
+                .join(encoded_hash)
+                .exists()
+        );
+    }
+
+    assert_eq!(
+        store
+            .db
+            .iterator_cf(payload_cf, IteratorMode::Start)
+            .count(),
+        OPERATIONS
+    );
+    let physical_payload_files = std::fs::read_dir(temporary.path().join("blobs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .count();
+    assert!(
+        (1..=4).contains(&physical_payload_files),
+        "807 logical payloads unexpectedly produced {physical_payload_files} physical payload files"
     );
 }
 
@@ -789,7 +857,7 @@ async fn bulk_wal_contains_one_high_watermark_and_replay_adds_no_write() {
     // version watermark, five watch counters, the locally-applied reference
     // cursor and two receipt counters. All metadata moves in this one physical
     // batch rather than once per mutation.
-    assert_eq!(counter.puts, 33);
+    assert_eq!(counter.puts, 36);
     assert_eq!(counter.high_watermark_puts, 1);
     assert_eq!(counter.invalidation_metadata_puts, 5);
     assert_eq!(counter.receipt_metadata_puts, 2);
@@ -823,7 +891,7 @@ async fn bulk_wal_contains_one_high_watermark_and_replay_adds_no_write() {
 }
 
 #[tokio::test]
-async fn prepared_put_keeps_small_bytes_in_memory_and_reserves_materialized_large_bytes() {
+async fn prepared_put_keeps_inline_bytes_in_memory_and_reuses_installed_bytes() {
     let (_temporary, store) = store().await;
     let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();
     let first_bytes = b"small payload".to_vec();
@@ -838,7 +906,7 @@ async fn prepared_put_keeps_small_bytes_in_memory_and_reserves_materialized_larg
     match first {
         PreparedOperation::Put {
             request,
-            payload: PreparedPayload::Small { reference, bytes },
+            payload: PreparedPayload::Inline { reference, bytes },
             ..
         } => {
             assert!(request.bytes.is_empty());
@@ -849,7 +917,7 @@ async fn prepared_put_keeps_small_bytes_in_memory_and_reserves_materialized_larg
         _ => panic!("small put was not retained in memory"),
     }
 
-    let blob_bytes = vec![9_u8; SMALL_BLOB_MAX_BYTES + 1];
+    let blob_bytes = vec![9_u8; PAYLOAD_ARTIFACT_CHUNK_BYTES + 1];
     let sequence_before_prepare = store.db.latest_sequence_number();
     let blob = store
         .prepare(
@@ -862,12 +930,12 @@ async fn prepared_put_keeps_small_bytes_in_memory_and_reserves_materialized_larg
     match blob {
         PreparedOperation::Put {
             request,
-            payload: PreparedPayload::Large(reference),
+            payload: PreparedPayload::Installed(reference),
             ..
         } => {
             assert!(request.bytes.is_empty());
             assert_eq!(reference.length, blob_bytes.len() as u64);
-            assert_eq!(store.blobs.get(&reference).await.unwrap(), blob_bytes);
+            assert_eq!(store.read_blob_bytes(&reference).await.unwrap(), blob_bytes);
             let state = store.blob_reference_state(&reference).unwrap().unwrap();
             assert_eq!((state.ref_count, state.flags), (1, AWAITING_PUBLISH));
             assert!(store.db.latest_sequence_number() > sequence_before_prepare);
@@ -1509,10 +1577,10 @@ async fn bulk_publishes_identical_large_payloads_after_durable_reservations() {
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
-    // Each large preparation durably records or refreshes its awaiting-publish
-    // reservation. Both object publications, their final reference count,
-    // journal entries and source cursor then share one final WAL batch.
-    assert_eq!(updates.len(), 3);
+    // Both modest payloads and their lifecycle records join the object
+    // publications, final reference count, journal entries and source cursor
+    // in one WAL batch.
+    assert_eq!(updates.len(), 1);
     let state = store.blob_reference_state(&reference).unwrap().unwrap();
     assert_eq!(state.ref_count, 2);
     assert_eq!(state.flags, 0);
@@ -1553,9 +1621,9 @@ async fn locally_applied_reference_effect_and_source_cursor_share_one_batch() {
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
-    // The first batch reserves the sealed bytes. Object publication, its final
-    // count, journal entry and source cursor share the second WAL batch.
-    assert_eq!(batches.len(), 2);
+    // The modest payload, object publication, final count, journal entry and
+    // source cursor share one WAL batch.
+    assert_eq!(batches.len(), 1);
     assert_eq!(
         store
             .blob_reference_state(&reference)
@@ -1572,7 +1640,7 @@ async fn locally_applied_reference_effect_and_source_cursor_share_one_batch() {
 }
 
 #[tokio::test]
-async fn rejected_large_inline_put_leaves_only_an_age_gated_orphan() {
+async fn rejected_modest_payload_put_leaves_no_artifact_or_lifecycle() {
     let temporary = tempfile::tempdir().unwrap();
     let store =
         Store::open(StoreOptions::new(temporary.path(), 1).with_awaiting_publish_ttl_seconds(1))
@@ -1598,26 +1666,9 @@ async fn rejected_large_inline_put_leaves_only_an_age_gated_orphan() {
         rejected,
         Err(MutationError::PreconditionFailed { .. })
     ));
-    let state = store.blob_reference_state(&reference).unwrap().unwrap();
-    assert_eq!((state.ref_count, state.flags), (1, AWAITING_PUBLISH));
-    assert!(store.blobs.contains(&reference).await.unwrap());
-    assert_eq!(
-        store
-            .collect_blob_garbage_at(state.updated_at + 999)
-            .await
-            .unwrap(),
-        0
-    );
-    assert!(store.blobs.contains(&reference).await.unwrap());
-    assert_eq!(
-        store
-            .collect_blob_garbage_at(state.updated_at + 1_000)
-            .await
-            .unwrap(),
-        1
-    );
-    assert!(!store.blobs.contains(&reference).await.unwrap());
     assert!(store.blob_reference_state(&reference).unwrap().is_none());
+    assert!(store.read_complete_manifest(&reference).unwrap().is_none());
+    assert!(!store.contains_blob(&reference).await.unwrap());
 }
 
 #[tokio::test]
@@ -1680,29 +1731,28 @@ async fn bulk_routes_payloads_to_the_deterministic_small_or_large_plane() {
         store
             .db
             .get_cf(
-                store.cf(CF_SMALL_BLOBS).unwrap(),
-                blob_reference_key(small_reference),
+                store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(),
+                complete_artifact_key(small_reference),
             )
             .unwrap()
             .unwrap()
             .as_slice(),
         small.as_slice()
     );
-    assert!(!store.blobs.contains(small_reference).await.unwrap());
+    assert!(store.contains_blob(small_reference).await.unwrap());
     assert!(
         store
             .db
             .get_cf(
-                store.cf(CF_SMALL_BLOBS).unwrap(),
-                blob_reference_key(large_version.blob.as_ref().unwrap()),
+                store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(),
+                complete_artifact_key(large_version.blob.as_ref().unwrap()),
             )
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert!(
         store
-            .blobs
-            .contains(large_version.blob.as_ref().unwrap())
+            .contains_blob(large_version.blob.as_ref().unwrap())
             .await
             .unwrap()
     );

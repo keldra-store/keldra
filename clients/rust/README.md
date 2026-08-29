@@ -110,8 +110,8 @@ client.unlink_object(UnlinkObjectRequest {
 ```
 
 Clone and link require cluster protocol/storage capability `2/2`. Operators must
-complete the documented all-node 0.15 upgrade and explicit capability
-activation before applications invoke them.
+start 0.15 on fresh authoritative volumes and complete the documented explicit
+capability activation before applications invoke them.
 
 ## Define a typed index safely
 

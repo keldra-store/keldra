@@ -87,3 +87,34 @@ async fn bounded_metadata_options_reopen_an_existing_store() {
         METADATA_WRITE_BUFFER_MANAGER_BYTES
     );
 }
+
+#[tokio::test]
+async fn configured_wal_target_and_payload_engine_properties_are_observable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let target = 96 * 1024 * 1024;
+    let store =
+        Store::open(StoreOptions::new(temporary.path(), 1).with_max_total_wal_bytes(target))
+            .await
+            .unwrap();
+    store
+        .put(put(
+            "blobdb",
+            &vec![0x71; PAYLOAD_BLOB_MIN_BYTES as usize + 1],
+            Precondition::Absent,
+            "blobdb",
+        ))
+        .await
+        .unwrap();
+    store
+        .db
+        .flush_cf(store.cf(CF_PAYLOAD_ARTIFACTS).unwrap())
+        .unwrap();
+
+    let metrics = store.metadata_runtime_metrics();
+
+    assert_eq!(metrics.max_total_wal_bytes, target);
+    assert!(metrics.total_wal_bytes.is_some());
+    assert!(metrics.payload_blob_files.is_some_and(|files| files >= 1));
+    assert!(metrics.payload_blob_bytes.is_some_and(|bytes| bytes > 0));
+    assert!(metrics.payload_sst_bytes.is_some_and(|bytes| bytes > 0));
+}

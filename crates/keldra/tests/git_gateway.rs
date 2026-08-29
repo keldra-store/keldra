@@ -308,6 +308,7 @@ fn test_server_config(
         index_runtime: keldra::IndexRuntimeConfig::default(),
         plugin_gateway: keldra::PluginGatewayConfig::default(),
         max_blob_bytes: 8 * 1024 * 1024,
+        max_total_wal_bytes: keldra_store::DEFAULT_MAX_TOTAL_WAL_BYTES,
         erasure_profile: ErasureProfile::default(),
         awaiting_publish_ttl_seconds: keldra_store::DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,
         mutation_receipt_retention_seconds: 60,

@@ -121,6 +121,7 @@ pub struct ServerConfig {
     pub index_runtime: IndexRuntimeConfig,
     pub plugin_gateway: PluginGatewayConfig,
     pub max_blob_bytes: u64,
+    pub max_total_wal_bytes: u64,
     pub erasure_profile: ErasureProfile,
     pub awaiting_publish_ttl_seconds: u64,
     pub mutation_receipt_retention_seconds: u64,
@@ -196,10 +197,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             .with_metadata_directory(&config.storage.metadata)
             .with_metadata_wal_directory(&config.storage.metadata_wal)
             .with_payload_directory(&config.storage.payload)
-            .with_upload_spool(
-                &config.storage.upload_spool,
-                config.storage.upload_spool_max_bytes,
-            )
+            .with_pending_upload_max_bytes(config.storage.pending_upload_max_bytes)
+            .with_max_total_wal_bytes(config.max_total_wal_bytes)
             .with_watch_retention(watch_retention)
             .with_mutation_receipt_retention(mutation_receipt_retention)
             .with_awaiting_publish_ttl_seconds(config.awaiting_publish_ttl_seconds),
@@ -249,6 +248,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             config.peer_listen,
             decisions.clone(),
             store.clone(),
+            config.storage.scratch.join("payload-read"),
             config.erasure_profile,
             config.atomic_program_timeout,
             config.max_blob_bytes,
@@ -844,8 +844,7 @@ fn log_storage_layout(config: &ServerConfig, binding: &storage_layout::StorageBi
     tracing::info!(
         storage.scratch = %config.storage.scratch.display(),
         storage.cache = %config.storage.cache.display(),
-        storage.upload_spool = %config.storage.upload_spool.display(),
-        storage.upload_spool_max_bytes = config.storage.upload_spool_max_bytes,
+        storage.pending_upload_max_bytes = config.storage.pending_upload_max_bytes,
         "disposable storage roots may be replaced between restarts"
     );
     if !binding.newly_initialized {
