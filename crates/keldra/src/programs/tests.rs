@@ -146,6 +146,40 @@ async fn open_test_coordinator(store: Store, root: &Path) -> ProgramCoordinator 
     open_test_coordinator_with_limits(store, root, 8, 64 * 1024).await
 }
 
+async fn prepare_with_canonical_bindings(
+    store: &Store,
+    engine: &keldra_store::StoreProgramEngine,
+    context: &InvocationContext,
+    invocation: &ProgramInvocation,
+) -> (
+    keldra_store::ProgramExecutionLease,
+    keldra_store::PreparedProgramBundle,
+) {
+    let expanded = engine.expanded_paths(context, invocation).unwrap();
+    let alias_bindings = store
+        .resolve_program_alias_bindings(&expanded)
+        .await
+        .unwrap();
+    let canonical_paths = alias_bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.requested_path.clone(),
+                binding.canonical_path.clone(),
+            )
+        })
+        .collect();
+    let lease = engine
+        .prepare_canonicalized(context, invocation, &canonical_paths)
+        .await
+        .unwrap();
+    let prepared = store
+        .prepare_program_bundle_with_aliases(&lease, &alias_bindings)
+        .await
+        .unwrap();
+    (lease, prepared)
+}
+
 async fn commit_prepared_for_recovery(
     coordinator: &ProgramCoordinator,
     store: &Store,
@@ -428,11 +462,9 @@ async fn startup_recovers_committed_bundle_before_advancing_finalized_through() 
         VerifiedProgramDefinition::from_bytes(&program_object.bytes, ProgramHash(program_hash))
             .unwrap();
     let engine = store.program_engine(&verified).unwrap();
-    let lease = engine
-        .prepare(&InvocationContext::new("tenant").unwrap(), &invocation)
-        .await
-        .unwrap();
-    let prepared = store.prepare_program_bundle(&lease).await.unwrap();
+    let context = InvocationContext::new("tenant").unwrap();
+    let (lease, prepared) =
+        prepare_with_canonical_bindings(&store, &engine, &context, &invocation).await;
     let proposal_at_unix_millis = current_unix_millis().unwrap();
     let committed = commit_prepared_for_recovery(
         &coordinator,
@@ -502,8 +534,8 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
         ProgramInvocation::from_input(path_hash, "partial-recovery-1", counter_input()).unwrap();
     let first_fingerprint = decode_fingerprint(&first_invocation.input_fingerprint).unwrap();
     let first_id = invocation_identity(&program_key, &first_invocation.command_id);
-    let first_lease = engine.prepare(&context, &first_invocation).await.unwrap();
-    let first_prepared = store.prepare_program_bundle(&first_lease).await.unwrap();
+    let (first_lease, first_prepared) =
+        prepare_with_canonical_bindings(&store, &engine, &context, &first_invocation).await;
     let first_consensus = commit_prepared_for_recovery(
         &coordinator,
         &store,
@@ -537,8 +569,8 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
         ProgramInvocation::from_input(path_hash, "partial-recovery-2", second_input).unwrap();
     let second_fingerprint = decode_fingerprint(&second_invocation.input_fingerprint).unwrap();
     let second_id = invocation_identity(&program_key, &second_invocation.command_id);
-    let second_lease = engine.prepare(&context, &second_invocation).await.unwrap();
-    let second_prepared = store.prepare_program_bundle(&second_lease).await.unwrap();
+    let (second_lease, second_prepared) =
+        prepare_with_canonical_bindings(&store, &engine, &context, &second_invocation).await;
     let second_consensus = commit_prepared_for_recovery(
         &coordinator,
         &store,
