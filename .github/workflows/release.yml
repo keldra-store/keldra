@@ -65,8 +65,8 @@ jobs:
     timeout-minutes: 120
     env:
       KELDRA_GATE_STEP_TIMEOUT_SECONDS: '5400'
-      KELDRA_RUST_TEST_THREADS: '8'
-      CARGO_BUILD_JOBS: '8'
+      KELDRA_RUST_TEST_THREADS: '2'
+      CARGO_BUILD_JOBS: '1'
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - name: Checkout release commit
@@ -343,9 +343,10 @@ jobs:
             incorrectly treating an omitted segment component as corruption
             (#259).
 
-            This release changes the cluster and data peer protocols. Upgrade
-            every node offline before restarting the cluster; mixed 0.14/0.15
-            operation is unsupported. After all ACTIVE nodes attest support,
+            This release is a clean storage-format break and changes the cluster
+            and data-peer protocols. Start 0.15 on fresh authoritative volumes;
+            in-place 0.14 volume upgrades and mixed 0.14/0.15 operation are
+            unsupported. After all ACTIVE nodes attest support,
             inspect GetClusterCapabilities and explicitly call
             ActivateClusterCapabilities with its exact placement fence to enable
             clone, link, and generalized ordinary-path atomic programs.
