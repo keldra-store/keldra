@@ -115,13 +115,7 @@ impl ObjectAliasSnapshot {
     pub fn validate(&self, canonical_path: &str) -> Result<(), MutationError> {
         self.registry.validate(canonical_path)?;
         validate_version_descriptor(&self.canonical_version)?;
-        if self.canonical_version.deleted
-            || self
-                .canonical_version
-                .content_type
-                .as_deref()
-                .is_some_and(crate::is_object_link_content_type)
-        {
+        if self.canonical_version.deleted || self.canonical_version.protected_link_descriptor {
             return Err(MutationError::InvalidObjectMutation(
                 "object alias snapshot canonical version is malformed".into(),
             ));
@@ -1170,5 +1164,52 @@ mod tests {
         }
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn alias_snapshot_uses_provenance_not_mime_to_reject_a_canonical_target() {
+        let registry = ObjectAliasRegistry {
+            format: OBJECT_ALIAS_REGISTRY_FORMAT,
+            revision: 1,
+            aliases: vec!["alias".into()],
+            program_commit_cursor: Some(1),
+        };
+        let historical_mime = Version {
+            id: VersionId(1),
+            blob: Some(BlobRef {
+                hash: [1; 32],
+                length: 1,
+            }),
+            content_type: Some(crate::OBJECT_LINK_CONTENT_TYPE.into()),
+            deleted: false,
+            committed_at_unix_millis: 1,
+            protected_link_descriptor: false,
+        };
+        ObjectAliasSnapshot {
+            registry: registry.clone(),
+            canonical_version: historical_mime,
+        }
+        .validate("target")
+        .unwrap();
+
+        let protected = Version {
+            id: VersionId(2),
+            blob: Some(BlobRef {
+                hash: [2; 32],
+                length: 1,
+            }),
+            content_type: Some(crate::OBJECT_LINK_CONTENT_TYPE.into()),
+            deleted: false,
+            committed_at_unix_millis: 2,
+            protected_link_descriptor: true,
+        };
+        assert!(matches!(
+            ObjectAliasSnapshot {
+                registry,
+                canonical_version: protected,
+            }
+            .validate("target"),
+            Err(MutationError::InvalidObjectMutation(_))
+        ));
     }
 }

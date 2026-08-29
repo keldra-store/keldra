@@ -925,7 +925,7 @@ mod tests {
         );
         let encoded = encode_local_change(&expected).unwrap();
         assert_eq!(&encoded[..4], b"ANVJ");
-        assert_eq!(u16::from_be_bytes(encoded[4..6].try_into().unwrap()), 5);
+        assert_eq!(u16::from_be_bytes(encoded[4..6].try_into().unwrap()), 6);
         assert_eq!(encoded[6], 1);
         assert_eq!(decode_local_change(&encoded).unwrap(), expected);
     }

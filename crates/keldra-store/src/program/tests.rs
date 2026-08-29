@@ -7,6 +7,7 @@ use keldra_atomic_program::{
 use serde_json::json;
 use tempfile::TempDir;
 
+use super::distributed::PROGRAM_PATH_STAGE_FORMAT;
 use super::*;
 use crate::{
     BucketPolicy, DeleteRetainedVersionOutcome, DestinationReferenceArtifact,
@@ -241,6 +242,36 @@ fn commit(
     }
 }
 
+async fn commit_prepared_reservations(
+    store: &Store,
+    prepared: &PreparedProgramBundle,
+    commit: &ProgramCommit,
+) -> Vec<ProgramReservation> {
+    let record = store.prepared_program_record(prepared).await.unwrap();
+    let context = mutation_context();
+    let reservations = record
+        .reservations(
+            commit.begin_cursor,
+            [0x51; 32],
+            prepared.hash,
+            1,
+            context.serving_fence_term,
+            context.active_placement_log_id,
+        )
+        .unwrap();
+    for reservation in &reservations {
+        store
+            .reserve_program_participant(reservation)
+            .await
+            .unwrap();
+        store
+            .commit_program_participant(reservation, commit.commit_cursor)
+            .await
+            .unwrap();
+    }
+    reservations
+}
+
 #[tokio::test]
 async fn ordinary_blob_plane_attests_executor_local_durability() {
     let temporary = tempfile::tempdir().unwrap();
@@ -291,6 +322,7 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         durability_class: ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS),
         ..wrong_class
     };
+    let _reservations = commit_prepared_reservations(&store, &prepared, &local_commit).await;
     let before_apply = store.db.latest_sequence_number();
     let applied = store
         .apply_program_bundle(lease, &prepared, local_commit.clone(), mutation_context())
@@ -330,11 +362,13 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
     assert_eq!(
         marker_fields,
         BTreeSet::from([
+            "authority",
             "bundle_hash",
             "bundle_ref",
             "commit_cursor",
             "durability_class",
             "durability_evidence_hash",
+            "participant_manifest_hash",
             "program_hash",
         ])
     );
@@ -550,10 +584,17 @@ async fn apply_is_all_old_or_all_new_and_records_only_the_compact_cursor() {
     let before = snapshot(&store).await;
     assert!(before.documents.is_empty());
     let first_commit = commit(&prepared, None, 1);
+    let first_reservations = commit_prepared_reservations(&store, &prepared, &first_commit).await;
     let first = store
         .apply_program_bundle(lease, &prepared, first_commit, mutation_context())
         .await
         .unwrap();
+    for reservation in &first_reservations {
+        store
+            .release_program_participant(reservation, Some(1))
+            .await
+            .unwrap();
+    }
     let after = snapshot(&store).await;
     assert_eq!(
         after.documents[&counter_path()].value,
@@ -570,6 +611,8 @@ async fn apply_is_all_old_or_all_new_and_records_only_the_compact_cursor() {
     let second_lease = engine.prepare(&context, &second_invocation).await.unwrap();
     let second_prepared = store.prepare_program_bundle(&second_lease).await.unwrap();
     let second_commit = commit(&second_prepared, Some(1), 2);
+    let _reservations =
+        commit_prepared_reservations(&store, &second_prepared, &second_commit).await;
     let second = store
         .apply_program_bundle(
             second_lease,
@@ -671,6 +714,8 @@ async fn exact_head_is_rechecked_before_atomic_apply() {
         .await
         .unwrap();
     let prepared = store.prepare_program_bundle(&lease).await.unwrap();
+    let stale_commit = commit(&prepared, None, 1);
+    let _reservations = commit_prepared_reservations(&store, &prepared, &stale_commit).await;
 
     let rogue_id = store.clock.next().unwrap();
     let rogue = Version {
@@ -710,7 +755,6 @@ async fn exact_head_is_rechecked_before_atomic_apply() {
     );
     store.write_program_batch(batch).unwrap();
 
-    let stale_commit = commit(&prepared, None, 1);
     assert_eq!(
         store
             .apply_program_bundle(lease, &prepared, stale_commit, mutation_context())
@@ -757,14 +801,16 @@ async fn ordinary_prepared_blobs_survive_reopen_for_recovery() {
             .unwrap(),
         Some(prepared.clone())
     );
+    let recovery_commit = commit(&prepared, None, 1);
+    let _reservations = commit_prepared_reservations(&reopened, &prepared, &recovery_commit).await;
     let applied = reopened
-        .recover_program_bundle(commit(&prepared, None, 1), mutation_context())
+        .recover_program_bundle(recovery_commit.clone(), mutation_context())
         .await
         .unwrap();
     assert_eq!(applied.receipt.command_id, "recover");
     assert_eq!(reopened.applied_program_commit_cursor().unwrap(), Some(1));
     let replayed = reopened
-        .committed_program_result(commit(&prepared, None, 1))
+        .committed_program_result(recovery_commit)
         .await
         .unwrap();
     assert_eq!(replayed, applied);
@@ -849,6 +895,7 @@ async fn finalization_is_idempotent_and_rejects_cursor_corruption() {
         .unwrap();
     let prepared = store.prepare_program_bundle(&lease).await.unwrap();
     let first_commit = commit(&prepared, None, 10);
+    let _reservations = commit_prepared_reservations(&store, &prepared, &first_commit).await;
     let first = store
         .apply_program_bundle(lease, &prepared, first_commit, mutation_context())
         .await
@@ -1324,7 +1371,7 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
     let first = store
         .coordinate_program_path_finalization(
             ProgramPathStage {
-                format: 1,
+                format: PROGRAM_PATH_STAGE_FORMAT,
                 begin_cursor: 40,
                 bundle_hash: PreparedBundleHash([0x11; 32]),
                 program_hash: ProgramHash([0x22; 32]),
@@ -1381,7 +1428,7 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
     let second = store
         .coordinate_program_path_finalization(
             ProgramPathStage {
-                format: 1,
+                format: PROGRAM_PATH_STAGE_FORMAT,
                 begin_cursor: 41,
                 bundle_hash: PreparedBundleHash([0x33; 32]),
                 program_hash: ProgramHash([0x22; 32]),

@@ -1146,7 +1146,6 @@ impl Store {
         match operation {
             BatchOperation::Put(mut request) => {
                 validate_command_id(request.command_id.as_deref())?;
-                reject_reserved_object_link_content_type(request.content_type.as_deref())?;
                 if !distributed_coordination {
                     require_local_durability(request.durability)?;
                 }
@@ -1175,7 +1174,6 @@ impl Store {
             }
             BatchOperation::Publish(request) => {
                 validate_command_id(request.command_id.as_deref())?;
-                reject_reserved_object_link_content_type(request.content_type.as_deref())?;
                 if !distributed_coordination {
                     require_local_durability(request.durability)?;
                 }
@@ -1191,7 +1189,6 @@ impl Store {
             }
             BatchOperation::Clone(request) => {
                 validate_clone_request(&request)?;
-                reject_reserved_object_link_content_type(request.content_type.as_deref())?;
                 if !distributed_coordination {
                     require_local_durability(request.durability)?;
                     if !self.contains_blob(&request.blob).await? {
@@ -1979,15 +1976,4 @@ impl Store {
             alias_snapshot,
         })
     }
-}
-
-fn reject_reserved_object_link_content_type(
-    content_type: Option<&str>,
-) -> Result<(), MutationError> {
-    if content_type.is_some_and(crate::is_object_link_content_type) {
-        return Err(MutationError::InvalidObjectMutation(
-            "object-link content types require sealed built-in transaction authority".into(),
-        ));
-    }
-    Ok(())
 }

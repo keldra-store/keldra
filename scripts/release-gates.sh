@@ -92,6 +92,10 @@ image_gates() (
     --env KELDRA_NODE_ID=1 \
     --env KELDRA_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
     --env KELDRA_RUN_SYSTEM_BOOTSTRAP=true \
+    --env KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE=1000000 \
+    --env KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=100000 \
+    --env KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=1000000 \
+    --env KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100000 \
     --volume "${scratch}/data:/var/lib/keldra" \
     --volume "${scratch}/signing-key:/run/secrets/keldra-token-signing-key:ro" \
     "${image}" >/dev/null
