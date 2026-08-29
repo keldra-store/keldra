@@ -248,7 +248,7 @@ image_gates() (
   )"
   delete_status=$?
   set -e
-  if [[ "${delete_status}" == "0" ]] || ! grep -Fq 'FailedPrecondition' <<<"${delete_output}"; then
+  if [[ "${delete_status}" == "0" ]] || ! grep -Fq 'object target cannot be deleted while inbound links exist' <<<"${delete_output}"; then
     echo "target delete was not fenced by its inbound link: ${delete_output}" >&2
     return 1
   fi
