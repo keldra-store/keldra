@@ -1392,6 +1392,7 @@ impl MetadataRuntimeMetrics {
 
 mod authz_journal;
 mod blob_references;
+mod bulk_phases;
 mod commit_lock;
 pub(crate) use commit_lock::{CommitLockGuard, OwnedCommitLockGuard};
 pub(crate) mod definition_state;

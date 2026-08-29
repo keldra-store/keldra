@@ -617,6 +617,13 @@ checked sum of the query and eight per-kind shares (2.5 GiB with defaults).
 Queries and builders can borrow idle bytes and derive their workspace from the
 actual grant, while queued mandatory work retains FIFO priority.
 
+`BulkWrite` accepts at most 1,000 operations and 64 MiB of encoded protobuf.
+Its independent server deadline defaults to five minutes and is configured with
+`KELDRA_BULK_WRITE_TIMEOUT_SECONDS`; a shorter client `grpc-timeout` still wins.
+This deadline is separate from `KELDRA_ATOMIC_PROGRAM_TIMEOUT_SECONDS`, so
+ordinary ingestion on slower durable storage does not weaken atomic-program
+execution bounds.
+
 Actual compaction concurrency is the minimum of that kind's configured cap,
 the process worker ceiling, the number of deterministic key ranges, and the
 memory admission `1 + floor((kind budget - shared workspace) / incremental

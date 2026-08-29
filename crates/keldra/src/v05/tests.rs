@@ -298,29 +298,29 @@ fn durability_is_a_closed_typed_choice() {
 }
 
 #[test]
-fn atomic_program_timeout_uses_the_shorter_client_or_server_budget() {
+fn request_timeout_uses_the_shorter_client_or_server_budget() {
     let server_maximum = Duration::from_secs(30);
     let mut metadata = MetadataMap::new();
     assert_eq!(
-        effective_atomic_program_timeout(&metadata, server_maximum),
+        effective_request_timeout(&metadata, server_maximum),
         server_maximum
     );
 
     metadata.insert("grpc-timeout", "250m".parse().unwrap());
     assert_eq!(
-        effective_atomic_program_timeout(&metadata, server_maximum),
+        effective_request_timeout(&metadata, server_maximum),
         Duration::from_millis(250)
     );
 
     metadata.insert("grpc-timeout", "2M".parse().unwrap());
     assert_eq!(
-        effective_atomic_program_timeout(&metadata, server_maximum),
+        effective_request_timeout(&metadata, server_maximum),
         server_maximum
     );
 
     metadata.insert("grpc-timeout", "invalid".parse().unwrap());
     assert_eq!(
-        effective_atomic_program_timeout(&metadata, server_maximum),
+        effective_request_timeout(&metadata, server_maximum),
         server_maximum
     );
 }

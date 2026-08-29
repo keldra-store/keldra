@@ -114,6 +114,7 @@ pub struct ServerConfig {
     pub max_atomic_commit_entries: u32,
     pub max_atomic_commit_bytes: u64,
     pub atomic_program_timeout: Duration,
+    pub bulk_write_timeout: Duration,
     pub index_query_timeout: Duration,
     pub token_manager: JwtManager,
     pub rate_limits: RateLimitConfig,
@@ -137,6 +138,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 .checked_add(config.atomic_program_timeout)
                 .is_some(),
         "atomic program timeout must be greater than zero and fit the server clock"
+    );
+    anyhow::ensure!(
+        !config.bulk_write_timeout.is_zero()
+            && tokio::time::Instant::now()
+                .checked_add(config.bulk_write_timeout)
+                .is_some(),
+        "bulk write timeout must be greater than zero and fit the server clock"
     );
     anyhow::ensure!(
         !config.index_query_timeout.is_zero()
@@ -531,6 +539,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         accounting_runtime.traffic.clone(),
         config.max_blob_bytes,
         config.atomic_program_timeout,
+        config.bulk_write_timeout,
     );
     routed_index_query_handlers
         .install(Arc::new(cluster_peer::AuthorizedIndexQueryHandler::new(

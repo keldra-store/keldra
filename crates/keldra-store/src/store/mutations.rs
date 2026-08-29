@@ -1,3 +1,4 @@
+use super::bulk_phases::{BulkStorePhase, BulkStorePhaseTracker};
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_helpers::{
     definition_mutation_error, definition_receipt_matches_intent, exact_version_key,
@@ -150,6 +151,7 @@ impl Store {
                 })
                 .collect();
         }
+        let mut phase = BulkStorePhaseTracker::start(operations.len());
         let prepare_started = std::time::Instant::now();
         let mut prepared = Vec::with_capacity(operations.len());
         let mut early = BTreeMap::new();
@@ -204,6 +206,7 @@ impl Store {
             let _policy_guard = self.policy_gate.read().await;
             let lock_started = std::time::Instant::now();
             let path_lock_started = lock_started;
+            phase.enter(BulkStorePhase::OrdinaryPathLock);
             let _guards = self
                 .ordinary_locks
                 .acquire(
@@ -214,6 +217,7 @@ impl Store {
                 )
                 .await;
             let path_lock_wait = path_lock_started.elapsed();
+            phase.enter(BulkStorePhase::CommitLock);
             let _commit_guard = self.lock_commit("bulk_mutation").await;
             let commit_lock_wait = _commit_guard.wait_duration();
             let lock_duration = lock_started.elapsed();
@@ -274,6 +278,7 @@ impl Store {
             let mut pending_changes = Vec::new();
             let mut receipt_capacity_at = None;
             let evaluate_started = std::time::Instant::now();
+            phase.enter(BulkStorePhase::Evaluation);
             for (prepared_index, (index, operation)) in prepared.iter().enumerate() {
                 if let Some(error) = operation.lock_paths().iter().find_map(|path| {
                     self.require_unreserved_object_locked(operation.identity(), &path.path, None)
@@ -328,6 +333,7 @@ impl Store {
             }
             let evaluate_duration = evaluate_started.elapsed();
             let persistence_started = std::time::Instant::now();
+            phase.enter(BulkStorePhase::Persistence);
             let persistence = (|| {
                 if receipt_status != initial_receipt_status {
                     self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
@@ -372,6 +378,7 @@ impl Store {
                         self.mutation_capacity_notify.notify_waiters();
                     }
                     if !pending_changes.is_empty() {
+                        phase.enter(BulkStorePhase::SourceSettlement);
                         if let Err(error) = self.settle_inline_source_changes() {
                             fail_unresolved_prepared(&mut results, &prepared, error);
                             completed.extend(results);
@@ -390,6 +397,7 @@ impl Store {
                     drop(_commit_guard);
                     drop(_guards);
                     drop(_policy_guard);
+                    phase.enter(BulkStorePhase::CapacityWait);
                     self.wait_for_capacity_with_metrics(capacity).await;
                     continue;
                 }
@@ -418,11 +426,13 @@ impl Store {
                 drop(_commit_guard);
                 drop(_guards);
                 drop(_policy_guard);
+                phase.enter(BulkStorePhase::CapacityWait);
                 self.wait_for_capacity_with_metrics("receipt").await;
                 continue;
             }
             completed.extend(results);
             completed.extend(early.into_iter().map(|(index, error)| (index, Err(error))));
+            phase.complete();
             return completed
                 .into_iter()
                 .map(|(index, result)| BatchOutcome { index, result })

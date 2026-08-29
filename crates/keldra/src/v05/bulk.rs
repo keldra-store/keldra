@@ -115,6 +115,23 @@ pub(super) fn record_phase_metrics(
     );
 }
 
+pub(super) fn record_dispatch_interruption(
+    error: &Status,
+    operation_count: usize,
+    encoded_bytes: u64,
+    dispatch_duration: Duration,
+) {
+    tracing::info!(
+        bulk.phase = "coordinator_dispatch",
+        grpc.code = ?error.code(),
+        operation_count,
+        encoded_bytes,
+        histogram.keldra_bulk_interrupted_phase_duration_seconds =
+            dispatch_duration.as_secs_f64(),
+        "bulk write ended before coordinator dispatch completed"
+    );
+}
+
 pub(super) async fn execute_coordinator_groups(
     distribution: ObjectDistribution,
     peers: ClusterPeerTransport,

@@ -100,6 +100,10 @@ struct Arguments {
     )]
     atomic_program_timeout_seconds: NonZeroU64,
 
+    /// Maximum wall time for one BulkWrite RPC; shorter client deadlines still win.
+    #[arg(long, env = "KELDRA_BULK_WRITE_TIMEOUT_SECONDS", default_value = "300")]
+    bulk_write_timeout_seconds: NonZeroU64,
+
     /// Maximum wall time for one QueryIndex RPC; shorter client deadlines still win.
     #[arg(
         long,
@@ -799,6 +803,9 @@ async fn main() -> Result<()> {
         atomic_program_timeout: std::time::Duration::from_secs(
             arguments.atomic_program_timeout_seconds.get(),
         ),
+        bulk_write_timeout: std::time::Duration::from_secs(
+            arguments.bulk_write_timeout_seconds.get(),
+        ),
         index_query_timeout: std::time::Duration::from_secs(
             arguments.index_query_timeout_seconds.get(),
         ),
@@ -989,18 +996,22 @@ mod tests {
     }
 
     #[test]
-    fn index_query_timeout_is_independent_from_the_ordinary_request_maximum() {
+    fn request_timeout_classes_are_independent() {
         let defaults = parse(&[]);
         assert_eq!(defaults.atomic_program_timeout_seconds.get(), 30);
+        assert_eq!(defaults.bulk_write_timeout_seconds.get(), 300);
         assert_eq!(defaults.index_query_timeout_seconds.get(), 300);
 
         let configured = parse(&[
             "--atomic-program-timeout-seconds",
             "12",
+            "--bulk-write-timeout-seconds",
+            "480",
             "--index-query-timeout-seconds",
             "600",
         ]);
         assert_eq!(configured.atomic_program_timeout_seconds.get(), 12);
+        assert_eq!(configured.bulk_write_timeout_seconds.get(), 480);
         assert_eq!(configured.index_query_timeout_seconds.get(), 600);
     }
 

@@ -114,6 +114,7 @@ pub struct ObjectServiceImpl {
     accounting_traffic: AccountingTraffic,
     max_blob_bytes: u64,
     atomic_program_timeout: Duration,
+    bulk_write_timeout: Duration,
 }
 
 impl ObjectServiceImpl {
@@ -132,6 +133,7 @@ impl ObjectServiceImpl {
         accounting_traffic: AccountingTraffic,
         max_blob_bytes: u64,
         atomic_program_timeout: Duration,
+        bulk_write_timeout: Duration,
     ) -> Self {
         Self {
             system_authorizer: SystemAuthorizer::new(store.authz()),
@@ -149,6 +151,7 @@ impl ObjectServiceImpl {
             accounting_traffic,
             max_blob_bytes,
             atomic_program_timeout,
+            bulk_write_timeout,
         }
     }
 
@@ -527,9 +530,9 @@ impl ObjectService for ObjectServiceImpl {
             let path_access = object_path_access::access_for(&request);
             let meter_public = !peer_routed && !object_path_access::is_internal(&path_access);
             let bearer = OriginalBearer::from_metadata(request.metadata())?;
-            let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
+            let deadline = request_deadline(request.metadata(), self.bulk_write_timeout)?;
             let route_budget =
-                effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+                effective_request_timeout(request.metadata(), self.bulk_write_timeout);
             let operations = request.into_inner().operations;
             validate_bulk_limits(&operations)?;
             object_path_access::validate_definition_intents(&path_access, operations.len())?;
@@ -708,24 +711,36 @@ impl ObjectService for ObjectServiceImpl {
             }
             let dispatch_started = Instant::now();
             let bearer_token = bearer.signed_token().to_owned();
-            outcomes.extend(
-                run_request_until(
-                    deadline,
-                    bulk::execute_coordinator_groups(
-                        self.distribution.clone(),
-                        self.cluster_peers.clone(),
-                        local_indices,
-                        local_operations,
-                        remote,
-                        bearer_token.clone(),
-                        object_path_access::is_internal(&path_access),
-                        started,
-                        route_budget,
-                    ),
-                    "bulk write deadline exceeded",
-                )
-                .await?,
-            );
+            let dispatch_operation_count = local_indices.len()
+                + remote
+                    .values()
+                    .map(|(_, _, items)| items.len())
+                    .sum::<usize>();
+            let dispatched = run_request_until(
+                deadline,
+                bulk::execute_coordinator_groups(
+                    self.distribution.clone(),
+                    self.cluster_peers.clone(),
+                    local_indices,
+                    local_operations,
+                    remote,
+                    bearer_token.clone(),
+                    object_path_access::is_internal(&path_access),
+                    started,
+                    route_budget,
+                ),
+                "bulk write deadline exceeded",
+            )
+            .await;
+            if let Err(error) = &dispatched {
+                bulk::record_dispatch_interruption(
+                    error,
+                    dispatch_operation_count,
+                    encoded_bytes,
+                    dispatch_started.elapsed(),
+                );
+            }
+            outcomes.extend(dispatched?);
             outcomes.extend(
                 bulk_alias::execute(
                     self.clone(),
@@ -972,8 +987,7 @@ impl ObjectService for ObjectServiceImpl {
             .is_some();
         let caller = authenticated_caller(&request)?;
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
-        let remaining =
-            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+        let remaining = effective_request_timeout(request.metadata(), self.atomic_program_timeout);
         let api_request = request.into_inner();
         let policy = api_request
             .policy
@@ -1036,7 +1050,7 @@ impl ObjectService for ObjectServiceImpl {
     }
 }
 
-fn effective_atomic_program_timeout(metadata: &MetadataMap, server_maximum: Duration) -> Duration {
+fn effective_request_timeout(metadata: &MetadataMap, server_maximum: Duration) -> Duration {
     client_grpc_timeout(metadata).map_or(server_maximum, |client| client.min(server_maximum))
 }
 
@@ -1045,7 +1059,7 @@ pub(crate) fn request_deadline(
     server_maximum: Duration,
 ) -> Result<tokio::time::Instant, Status> {
     tokio::time::Instant::now()
-        .checked_add(effective_atomic_program_timeout(metadata, server_maximum))
+        .checked_add(effective_request_timeout(metadata, server_maximum))
         .ok_or_else(|| Status::internal("configured request timeout exceeds clock"))
 }
 

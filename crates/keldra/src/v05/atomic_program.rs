@@ -17,7 +17,7 @@ pub(super) async fn invoke(
         .get::<routed_writes::RoutedDestination>()
         .is_some();
     let deadline = tokio::time::Instant::now()
-        .checked_add(effective_atomic_program_timeout(
+        .checked_add(effective_request_timeout(
             request.metadata(),
             service.atomic_program_timeout,
         ))

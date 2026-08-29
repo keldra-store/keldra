@@ -389,15 +389,17 @@ pub(super) async fn execute(
                 .map_err(|_| Status::internal("bulk alias dispatcher stopped"))?;
             let mut outcomes = Vec::with_capacity(items.len());
             for item in items {
+                let atomic_deadline =
+                    atomic_operation_deadline(deadline, service.atomic_program_timeout)?;
                 let result = run_request_until(
-                    deadline,
+                    atomic_deadline,
                     execute_one(
                         &service,
                         &caller,
                         &bearer,
                         item.operation,
                         item.link,
-                        deadline,
+                        atomic_deadline,
                         meter_public,
                     ),
                     "bulk alias mutation deadline exceeded",
@@ -422,6 +424,16 @@ pub(super) async fn execute(
         );
     }
     Ok(outcomes)
+}
+
+fn atomic_operation_deadline(
+    request_deadline: tokio::time::Instant,
+    atomic_maximum: std::time::Duration,
+) -> Result<tokio::time::Instant, Status> {
+    tokio::time::Instant::now()
+        .checked_add(atomic_maximum)
+        .map(|atomic| atomic.min(request_deadline))
+        .ok_or_else(|| Status::internal("configured atomic program timeout exceeds clock"))
 }
 
 fn group_by_target(items: Vec<AliasBulkItem>) -> BTreeMap<ObjectKey, Vec<AliasBulkItem>> {
@@ -676,5 +688,21 @@ mod tests {
             .map(|_| ()),
             None
         );
+    }
+
+    #[test]
+    fn alias_mutations_retain_the_atomic_maximum_inside_a_long_bulk() {
+        let now = tokio::time::Instant::now();
+        let short_request = now + std::time::Duration::from_secs(1);
+        assert_eq!(
+            atomic_operation_deadline(short_request, std::time::Duration::from_secs(30)).unwrap(),
+            short_request,
+        );
+
+        let long_request = now + std::time::Duration::from_secs(300);
+        let bounded =
+            atomic_operation_deadline(long_request, std::time::Duration::from_secs(30)).unwrap();
+        assert!(bounded < long_request);
+        assert!(bounded <= tokio::time::Instant::now() + std::time::Duration::from_secs(30));
     }
 }
