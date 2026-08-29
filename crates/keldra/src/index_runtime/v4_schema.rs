@@ -11,10 +11,12 @@ use keldra_api::v1::{
 };
 use keldra_index::IndexError;
 use keldra_index::v4::{
-    Analyzer, Cardinality, Collation, ComponentKind, ComponentVersion, FieldCapabilities,
-    FieldComponents, FieldId, FieldSchema, FieldType, IndexKind, IndexSemantics, OrderDirection,
-    OrderField, Schema, VectorMetric, VectorNormalization,
+    Analyzer, Cardinality, Collation, ComponentKind, ComponentVersion, DateFormat,
+    FieldCapabilities, FieldComponents, FieldId, FieldSchema, FieldType, IndexKind, IndexSemantics,
+    OrderDirection, OrderField, Schema, VectorMetric, VectorNormalization,
 };
+
+use super::date::validate_format;
 
 const COMPONENT_CODEC_VERSION: u16 = 1;
 const IDENTITY_COMPONENT_CODEC_VERSION: u16 = 2;
@@ -139,7 +141,7 @@ fn typed_json_schema(specification: &TypedJsonIndexSpec) -> Result<SchemaParts, 
         .enumerate()
         .map(|(ordinal, value)| {
             let (field_type, analyzer) = api_field_type(value)?;
-            field(
+            let mut field = field(
                 ordinal,
                 &value.name,
                 &value.json_pointer,
@@ -149,7 +151,18 @@ fn typed_json_schema(specification: &TypedJsonIndexSpec) -> Result<SchemaParts, 
                 true,
                 api_capabilities(&value.capabilities)?,
                 analyzer,
-            )
+            )?;
+            if let Some(ApiFieldType::Date(date)) = value.field_type.as_ref()
+                && !date.strftime_pattern.is_empty()
+            {
+                field.date_format = Some(DateFormat::Strftime(date.strftime_pattern.clone()));
+            }
+            if let Some(format) = field.date_format.as_ref() {
+                validate_format(format).map_err(|error| {
+                    IndexError::InvalidDefinition(format!("invalid Date format: {error}"))
+                })?;
+            }
+            Ok(field)
         })
         .collect::<Result<Vec<_>, IndexError>>()?;
     let physical_order = specification
@@ -205,6 +218,7 @@ fn api_field_type(
             };
             (FieldType::Text, Some(analyzer))
         }
+        Some(ApiFieldType::Date(_)) => (FieldType::Date, None),
         None => {
             return Err(IndexError::InvalidDefinition(
                 "Typed JSON field type is required".into(),
@@ -471,6 +485,7 @@ fn field(
         collation: Collation::BinaryUtf8,
         capabilities,
         analyzer,
+        date_format: (field_type == FieldType::Date).then_some(DateFormat::Iso8601),
         components: FieldComponents::TERMS,
     };
     value.components = value.compiled_components()?;
@@ -526,9 +541,9 @@ mod tests {
 
     use keldra_api::v1::index_specification::Specification as Spec;
     use keldra_api::v1::{
-        FullTextField, GitSourceIndexSpec, IndexField, IndexOrder, KeywordIndexField,
-        MetadataFilterIndexSpec, PathIndexSpec, SignedIntegerIndexField, TensorIndexSpec,
-        TypedJsonIndexSpec, VectorIndexSpec,
+        DateIndexField, FullTextField, GitSourceIndexSpec, IndexField, IndexOrder,
+        KeywordIndexField, MetadataFilterIndexSpec, PathIndexSpec, SignedIntegerIndexField,
+        TensorIndexSpec, TypedJsonIndexSpec, VectorIndexSpec,
     };
 
     use super::*;
@@ -732,6 +747,49 @@ mod tests {
                 .fingerprint()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn typed_date_format_is_preserved_as_schema_semantics() {
+        let specification = spec(Spec::TypedJson(TypedJsonIndexSpec {
+            fields: vec![IndexField {
+                name: "published".into(),
+                json_pointer: "/published".into(),
+                cardinality: IndexFieldCardinality::Single as i32,
+                capabilities: vec![
+                    IndexFieldCapability::Exact as i32,
+                    IndexFieldCapability::Range as i32,
+                    IndexFieldCapability::Order as i32,
+                    IndexFieldCapability::Facet as i32,
+                ],
+                field_type: Some(ApiFieldType::Date(DateIndexField {
+                    strftime_pattern: String::new(),
+                })),
+            }],
+            physical_order: vec![IndexOrder {
+                field: "published".into(),
+                direction: IndexOrderDirection::Ascending as i32,
+            }],
+        }));
+        let iso = compile_schema("", None, &specification).unwrap();
+        assert_eq!(iso.fields[0].field_type, FieldType::Date);
+        assert_eq!(iso.fields[0].date_format, Some(DateFormat::Iso8601));
+        assert!(iso.validate().is_ok());
+
+        let mut custom_specification = specification;
+        let Some(Spec::TypedJson(custom)) = custom_specification.specification.as_mut() else {
+            unreachable!();
+        };
+        let Some(ApiFieldType::Date(date)) = custom.fields[0].field_type.as_mut() else {
+            unreachable!();
+        };
+        date.strftime_pattern = "%Y-%m-%d".into();
+        let custom = compile_schema("", None, &custom_specification).unwrap();
+        assert_eq!(
+            custom.fields[0].date_format,
+            Some(DateFormat::Strftime("%Y-%m-%d".into()))
+        );
+        assert_ne!(iso.fingerprint().unwrap(), custom.fingerprint().unwrap());
     }
 
     #[test]

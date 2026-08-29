@@ -21,8 +21,8 @@ mod typed_json_index;
 mod typed_json_query;
 
 pub use typed_json_index::{
-    BooleanField, FloatField, IndexDefinitionError, IndexOrderToken, KeywordField,
-    SignedIntegerField, TextField, TypedJsonIndexBuilder, UnsignedIntegerField,
+    BooleanField, DateField, DateFormat, FloatField, IndexDefinitionError, IndexOrderToken,
+    KeywordField, SignedIntegerField, TextField, TypedJsonIndexBuilder, UnsignedIntegerField,
 };
 pub use typed_json_query::{PredicateBuildError, PredicateExpression, PredicateScalar};
 
@@ -210,8 +210,9 @@ mod tests {
     use tonic::transport::Endpoint;
 
     use super::v1::{
-        CreateBucketRequest, DeleteIfVersionRequest, DeleteVersionRequest, DeleteVersionResponse,
-        Durability, ObjectVersioning, PutHeader,
+        CloneObjectRequest, CreateBucketRequest, DeleteIfVersionRequest, DeleteVersionRequest,
+        DeleteVersionResponse, Durability, LinkObjectRequest, ObjectAddress, ObjectVersioning,
+        PutHeader, PutIfAbsentOperation, UnlinkObjectRequest, clone_object_request,
     };
     use super::{
         MAX_MESSAGE_BYTES, RawAdministrationClient, RawAuthzClient, RawClient, RawIndexClient,
@@ -253,6 +254,59 @@ mod tests {
         };
         assert_eq!(header.durability, Durability::Replicated as i32);
         assert_ne!(header.durability, Durability::Local as i32);
+    }
+
+    #[test]
+    fn clone_request_keeps_exact_source_and_destination_operation_explicit() {
+        let request = CloneObjectRequest {
+            source: Some(ObjectAddress {
+                tenant: "tenant".into(),
+                bucket: "bucket".into(),
+                path: "source".into(),
+            }),
+            source_version: 7,
+            destination: Some(ObjectAddress {
+                tenant: "tenant".into(),
+                bucket: "bucket".into(),
+                path: "destination".into(),
+            }),
+            command_id: "clone-7".into(),
+            durability: Durability::Local as i32,
+            operation: Some(clone_object_request::Operation::PutIfAbsent(
+                PutIfAbsentOperation {},
+            )),
+        };
+        assert_eq!(request.source_version, 7);
+        assert!(matches!(
+            request.operation,
+            Some(clone_object_request::Operation::PutIfAbsent(_))
+        ));
+    }
+
+    #[test]
+    fn link_requests_keep_namespace_operations_explicit() {
+        let link = ObjectAddress {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            path: "alias".into(),
+        };
+        let create = LinkObjectRequest {
+            link: Some(link.clone()),
+            target: Some(ObjectAddress {
+                tenant: "tenant".into(),
+                bucket: "bucket".into(),
+                path: "target".into(),
+            }),
+            command_id: "link".into(),
+            durability: Durability::Local as i32,
+        };
+        let remove = UnlinkObjectRequest {
+            link: Some(link),
+            command_id: "unlink".into(),
+            durability: Durability::Local as i32,
+        };
+        assert_eq!(create.target.unwrap().path, "target");
+        assert_eq!(remove.link.unwrap().path, "alias");
     }
 
     #[tokio::test]

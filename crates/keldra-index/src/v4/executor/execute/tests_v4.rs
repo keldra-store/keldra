@@ -197,6 +197,7 @@ fn schema() -> Schema {
             .union(FieldCapabilities::ORDER)
             .union(FieldCapabilities::FACET),
         analyzer: None,
+        date_format: None,
         components: FieldComponents::TERMS.union(FieldComponents::DOC_VALUES),
     };
     state.components = state.compiled_components().unwrap();
@@ -215,6 +216,7 @@ fn schema() -> Schema {
             .union(FieldCapabilities::FACET)
             .union(FieldCapabilities::AGGREGATE),
         analyzer: None,
+        date_format: None,
         components: FieldComponents::POINTS.union(FieldComponents::DOC_VALUES),
     };
     priority.components = priority.compiled_components().unwrap();
@@ -331,6 +333,7 @@ fn keyword_schema(kind: IndexKind, semantics: IndexSemantics) -> Schema {
         collation: Collation::BinaryUtf8,
         capabilities: FieldCapabilities::EXACT.union(FieldCapabilities::PREFIX),
         analyzer: None,
+        date_format: None,
         components: FieldComponents::TERMS,
     };
     field.components = field.compiled_components().unwrap();
@@ -383,6 +386,103 @@ fn keyword_source(path: &str, value: &str) -> ProjectedSource {
                 },
             ],
             points: Vec::new(),
+            doc_values: Vec::new(),
+            vectors: Vec::new(),
+            field_lengths: Vec::new(),
+        }],
+    }
+}
+
+fn sparse_point_schema() -> Schema {
+    let mut object_kind = FieldSchema {
+        id: FieldId::new(0),
+        name: "object_kind".into(),
+        source_selector: "/object_kind".into(),
+        field_type: FieldType::Keyword,
+        cardinality: Cardinality::Single,
+        allow_missing: false,
+        allow_null: false,
+        collation: Collation::BinaryUtf8,
+        capabilities: FieldCapabilities::EXACT,
+        analyzer: None,
+        date_format: None,
+        components: FieldComponents::TERMS,
+    };
+    object_kind.components = object_kind.compiled_components().unwrap();
+    let mut next_eval = FieldSchema {
+        id: FieldId::new(1),
+        name: "next_eval_at_unix_ms".into(),
+        source_selector: "/next_eval_at_unix_ms".into(),
+        field_type: FieldType::SignedInteger,
+        cardinality: Cardinality::Single,
+        allow_missing: true,
+        allow_null: false,
+        collation: Collation::BinaryUtf8,
+        capabilities: FieldCapabilities::EXACT.union(FieldCapabilities::RANGE),
+        analyzer: None,
+        date_format: None,
+        components: FieldComponents::POINTS,
+    };
+    next_eval.components = next_eval.compiled_components().unwrap();
+    Schema {
+        kind: IndexKind::TypedJson,
+        path_prefix: String::new(),
+        content_type_scope: Some("application/json".into()),
+        fields: vec![object_kind, next_eval],
+        semantics: IndexSemantics::TypedJson,
+        physical_order: Vec::new(),
+        component_versions: [
+            ComponentKind::ROUTING_NODE,
+            ComponentKind::IDENTITY_TABLE,
+            ComponentKind::LIVE_MASK,
+            ComponentKind::PATH_LOCATOR,
+            ComponentKind::TERM_DICTIONARY,
+            ComponentKind::POSTINGS,
+            ComponentKind::POINTS,
+            ComponentKind::SCORING_STATISTICS,
+        ]
+        .into_iter()
+        .map(version)
+        .collect(),
+    }
+}
+
+fn sparse_point_source(path: &str, next_eval: Option<i64>) -> ProjectedSource {
+    let object_kind = ScalarValue::String("task".into());
+    let (term_type, term) = scalar_term(&object_kind).unwrap();
+    ProjectedSource {
+        source_identity: ObjectIdentity {
+            path: path.into(),
+            version: 1,
+        },
+        records: vec![ProjectedRecord {
+            result_identity: None,
+            order_key: Vec::new(),
+            terms: vec![
+                crate::v4::build::ProjectedTerm {
+                    field_id: FieldId::new(0),
+                    term_type,
+                    term,
+                    frequency: 1,
+                    positions: Vec::new(),
+                },
+                crate::v4::build::ProjectedTerm {
+                    field_id: FieldId::new(0),
+                    term_type: TERM_TYPE_FIELD_PRESENCE,
+                    term: FIELD_PRESENCE_TERM.to_vec(),
+                    frequency: 1,
+                    positions: Vec::new(),
+                },
+            ],
+            points: next_eval
+                .map(|value| ProjectedPoint {
+                    field_id: FieldId::new(1),
+                    present: true,
+                    null: false,
+                    values: vec![ScalarValue::Signed(value)],
+                })
+                .into_iter()
+                .collect(),
             doc_values: Vec::new(),
             vectors: Vec::new(),
             field_lengths: Vec::new(),
@@ -857,6 +957,108 @@ async fn boolean_and_or_in_and_not_match_exact_sets() {
         .await
         .unwrap();
     assert_eq!(paths(&not), BTreeSet::from(["b"]));
+}
+
+#[tokio::test]
+async fn sparse_point_segments_obey_boolean_missing_field_semantics() {
+    let schema = sparse_point_schema();
+    let (_, sparse, sparse_directory) = build_segment_fixture(
+        schema.clone(),
+        93,
+        1,
+        vec![sparse_point_source("without-due", None)],
+    )
+    .await;
+    assert!(
+        sparse
+            .components
+            .iter()
+            .all(|component| component.role != ComponentKind::POINTS)
+    );
+    let (_, populated, populated_directory) = build_segment_fixture(
+        schema.clone(),
+        93,
+        2,
+        vec![
+            sparse_point_source("due-now", Some(10)),
+            sparse_point_source("due-later", Some(30)),
+        ],
+    )
+    .await;
+    let mut objects = sparse_directory.0;
+    objects.extend(populated_directory.0);
+    let mut directory = MemoryArtifacts(objects);
+    let executor =
+        NativeQueryExecutor::new(&directory, &AllowAll, NativeQueryLimits::default()).unwrap();
+    let mut query = request(
+        &schema,
+        &sparse,
+        NativeQuery::Filter {
+            predicate: Some(Predicate::And(vec![
+                Predicate::Equal {
+                    id: PredicateId::new(1),
+                    field_id: FieldId::new(0),
+                    value: ScalarValue::String("task".into()),
+                },
+                Predicate::Or(vec![
+                    Predicate::Not(Box::new(Predicate::Exists {
+                        id: PredicateId::new(2),
+                        field_id: FieldId::new(1),
+                    })),
+                    Predicate::Range {
+                        id: PredicateId::new(3),
+                        field_id: FieldId::new(1),
+                        lower: None,
+                        upper: Some(RangeBound {
+                            value: ScalarValue::Signed(20),
+                            inclusive: true,
+                        }),
+                    },
+                ]),
+            ])),
+            order: Vec::new(),
+        },
+    );
+    query.segments.push(populated.clone());
+    let page = executor.execute(&query).await.unwrap();
+    assert_eq!(paths(&page), BTreeSet::from(["due-now", "without-due"]));
+
+    query.query = NativeQuery::Filter {
+        predicate: Some(Predicate::Equal {
+            id: PredicateId::new(4),
+            field_id: FieldId::new(1),
+            value: ScalarValue::Signed(10),
+        }),
+        order: Vec::new(),
+    };
+    let exact = executor.execute(&query).await.unwrap();
+    assert_eq!(paths(&exact), BTreeSet::from(["due-now"]));
+
+    drop(executor);
+    let point_root = populated
+        .components
+        .iter()
+        .find(|component| component.role == ComponentKind::POINTS)
+        .unwrap()
+        .artifact
+        .clone();
+    let point_pack = point_root
+        .pack(populated.identity.index_id, &populated.packs)
+        .unwrap();
+    directory.0.get_mut(&point_pack.path).unwrap().bytes
+        [usize::try_from(point_root.offset).unwrap() + 16] ^= 1;
+    query.segments = vec![populated];
+    let corrupt = NativeQueryExecutor::new(&directory, &AllowAll, NativeQueryLimits::default())
+        .unwrap()
+        .execute(&query)
+        .await;
+    assert!(matches!(
+        corrupt,
+        Err(NativeQueryExecutionError::Index(IndexError::Integrity))
+            | Err(NativeQueryExecutionError::Index(IndexError::InvalidFormat(
+                _
+            )))
+    ));
 }
 
 #[tokio::test]

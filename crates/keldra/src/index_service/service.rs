@@ -25,7 +25,7 @@ use prost::Message;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
-use crate::authentication::{AnonymousIndexRequest, Caller};
+use crate::authentication::{AnonymousIndexRequest, Caller, PluginObjectScope};
 use crate::authorization::ObjectPermission;
 use crate::distributed_list::OriginalBearer;
 use crate::logical_name_resolution::LogicalNameResolver;
@@ -727,6 +727,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                         tenant_id,
                         bucket_id,
                         deadline,
+                        context.plugin_scope().cloned(),
                         self.dependencies.authorization.clone(),
                         self.dependencies.live_versions.clone(),
                     ));
@@ -864,6 +865,7 @@ fn request_context<T>(
         caller,
         bearer,
         request.metadata().clone(),
+        request.extensions().get::<PluginObjectScope>().cloned(),
         deadline,
     ))
 }
@@ -917,6 +919,7 @@ fn query_request_context<T>(
         caller,
         bearer,
         request.metadata().clone(),
+        request.extensions().get::<PluginObjectScope>().cloned(),
         deadline,
     ))
 }
@@ -926,6 +929,9 @@ fn forwarded_request<T>(context: &IndexRequestContext, value: T) -> Result<Reque
     *request.metadata_mut() = context.metadata().clone();
     request.set_timeout(context.remaining()?);
     request.extensions_mut().insert(context.caller().clone());
+    if let Some(scope) = context.plugin_scope() {
+        request.extensions_mut().insert(scope.clone());
+    }
     object_path_access::mark_index(&mut request);
     Ok(request)
 }

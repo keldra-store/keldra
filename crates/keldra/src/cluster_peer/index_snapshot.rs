@@ -5,8 +5,8 @@ use std::pin::Pin;
 use keldra_consensus::{DecisionRaft, NodeId, PeerSpkiSha256};
 use keldra_store::{
     CurrentObjectSnapshot, Head, MAX_CURRENT_HEAD_SNAPSHOT_BYTES,
-    MAX_CURRENT_HEAD_SNAPSHOT_RECORDS, MAX_OBJECT_RECORD_EXPORT_RECORDS, PlacementLogId,
-    RetainedObjectSnapshot, SourceId, Version,
+    MAX_CURRENT_HEAD_SNAPSHOT_RECORDS, MAX_OBJECT_RECORD_EXPORT_RECORDS, ObjectAliasRegistry,
+    PlacementLogId, RetainedObjectSnapshot, SourceId, Version,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -43,6 +43,8 @@ pub(crate) struct IndexSourceSnapshotHead {
     pub exact_path: String,
     pub head: Head,
     pub version: Version,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_registry: Option<ObjectAliasRegistry>,
 }
 
 impl From<CurrentObjectSnapshot> for IndexSourceSnapshotHead {
@@ -53,6 +55,7 @@ impl From<CurrentObjectSnapshot> for IndexSourceSnapshotHead {
             exact_path: value.exact_path,
             head: value.head,
             version: value.version,
+            alias_registry: value.alias_registry,
         }
     }
 }
@@ -728,6 +731,7 @@ fn validate_source_head(head: &IndexSourceSnapshotHead) -> Result<(), Status> {
         exact_path: head.exact_path.clone(),
         head: head.head.clone(),
         version: head.version.clone(),
+        alias_registry: head.alias_registry.clone(),
     }
     .validate()
     .map_err(|error| Status::data_loss(error.to_string()))

@@ -390,6 +390,51 @@ async fn evaluates_typed_updates_copy_views_and_outputs() {
 }
 
 #[tokio::test]
+async fn canonicalized_prepare_reads_and_writes_the_physical_target() {
+    let logical = path("summary");
+    let canonical = path("canonical-summary");
+    let mut canonical_snapshot = snapshot();
+    let document = canonical_snapshot.documents.remove(&logical).unwrap();
+    canonical_snapshot
+        .documents
+        .insert(canonical.clone(), document);
+    let reader = TestReader::new(canonical_snapshot);
+    let requested = reader.requested.clone();
+    let engine = AtomicProgramEngine::new(definition(), reader).unwrap();
+    let bundle = engine
+        .prepare_canonicalized(
+            &context(),
+            &invocation(),
+            &[(logical, canonical.clone())].into_iter().collect(),
+        )
+        .await
+        .unwrap()
+        .release();
+    assert!(requested.lock().unwrap().contains(&canonical));
+    assert!(bundle.writes.iter().any(|write| write.path == canonical));
+}
+
+#[tokio::test]
+async fn canonicalized_prepare_rejects_aliases_converging_on_one_object() {
+    let canonical = path("account");
+    let mapping = [
+        (path("account"), canonical.clone()),
+        (path("summary"), canonical),
+    ]
+    .into_iter()
+    .collect();
+    let reader = TestReader::new(snapshot());
+    let reads = reader.reads.clone();
+    let engine = AtomicProgramEngine::new(definition(), reader).unwrap();
+    let error = engine
+        .prepare_canonicalized(&context(), &invocation(), &mapping)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("bound more than once"));
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn accepts_any_bounded_path_matching_the_registered_template() {
     let reader = TestReader::new(snapshot());
     let reader_handle = reader.clone();

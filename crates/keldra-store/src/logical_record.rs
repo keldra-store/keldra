@@ -637,6 +637,21 @@ impl Store {
                 replayed: true,
             });
         }
+        if journal {
+            match &id {
+                LogicalRecordId::BucketOptions {
+                    tenant_id,
+                    bucket_id,
+                }
+                | LogicalRecordId::BucketPolicy {
+                    tenant_id,
+                    bucket_id,
+                } => self
+                    .require_unreserved_governance_locked(identity(*tenant_id, *bucket_id), None)
+                    .map_err(LogicalRecordError::from)?,
+                _ => {}
+            }
+        }
         if mutation.typed_value.is_write_once() {
             match current.as_ref() {
                 Some(LogicalRecordCandidate::Baseline { typed_value, .. })

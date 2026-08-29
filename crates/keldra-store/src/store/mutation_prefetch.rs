@@ -17,7 +17,7 @@ pub(super) struct MutationReadCache {
     versions: BTreeMap<Vec<u8>, Cached<Version>>,
     receipts: BTreeMap<Vec<u8>, Cached<StoredReceipt>>,
     blob_references: BTreeMap<Vec<u8>, Cached<BlobReferenceState>>,
-    small_blobs: BTreeMap<Vec<u8>, Cached<Vec<u8>>>,
+    inline_payloads: BTreeMap<Vec<u8>, Cached<Vec<u8>>>,
     policies: BTreeMap<Vec<u8>, Result<BucketPolicy, MutationError>>,
     versioning: BTreeMap<Vec<u8>, Result<ObjectVersioning, MutationError>>,
 }
@@ -28,14 +28,14 @@ struct PrefetchMetrics {
     version_keys: u64,
     receipt_keys: u64,
     blob_reference_keys: u64,
-    small_blob_keys: u64,
+    inline_payload_keys: u64,
     policy_keys: u64,
     versioning_keys: u64,
     head_seconds: f64,
     version_seconds: f64,
     receipt_seconds: f64,
     blob_reference_seconds: f64,
-    small_blob_seconds: f64,
+    inline_payload_seconds: f64,
     policy_seconds: f64,
     versioning_seconds: f64,
 }
@@ -128,13 +128,13 @@ impl MutationReadCache {
         metrics.versioning_seconds = started.elapsed().as_secs_f64();
 
         let mut blob_reference_keys = BTreeSet::new();
-        let mut small_blob_keys = BTreeSet::new();
+        let mut inline_payload_keys = BTreeSet::new();
         for operation in operations {
             if let Some(reference) = operation.payload_reference() {
                 let key = blob_reference_key(reference);
                 blob_reference_keys.insert(key.clone());
-                if is_small_blob(reference) {
-                    small_blob_keys.insert(key);
+                if is_inline_payload_artifact(reference) {
+                    inline_payload_keys.insert(complete_artifact_key(reference));
                 }
             }
         }
@@ -162,9 +162,9 @@ impl MutationReadCache {
         metrics.blob_reference_seconds = started.elapsed().as_secs_f64();
 
         let started = std::time::Instant::now();
-        let small_blobs = multi_get_raw(store, CF_SMALL_BLOBS, &small_blob_keys)?;
-        metrics.small_blob_keys = small_blob_keys.len() as u64;
-        metrics.small_blob_seconds = started.elapsed().as_secs_f64();
+        let inline_payloads = multi_get_raw(store, CF_PAYLOAD_ARTIFACTS, &inline_payload_keys)?;
+        metrics.inline_payload_keys = inline_payload_keys.len() as u64;
+        metrics.inline_payload_seconds = started.elapsed().as_secs_f64();
         metrics.emit();
 
         Ok(Self {
@@ -172,7 +172,7 @@ impl MutationReadCache {
             versions,
             receipts,
             blob_references,
-            small_blobs,
+            inline_payloads,
             policies,
             versioning,
         })
@@ -200,9 +200,9 @@ impl MutationReadCache {
         self.blob_references.get(key).cloned()
     }
 
-    pub(super) fn small_blob(&self, reference: &BlobRef) -> Option<Cached<Vec<u8>>> {
-        self.small_blobs
-            .get(&blob_reference_key(reference))
+    pub(super) fn inline_payload(&self, reference: &BlobRef) -> Option<Cached<Vec<u8>>> {
+        self.inline_payloads
+            .get(&complete_artifact_key(reference))
             .cloned()
     }
 
@@ -230,8 +230,8 @@ impl PrefetchMetrics {
             monotonic_counter.keldra_store_bulk_prefetch_receipt_keys_total = self.receipt_keys,
             monotonic_counter.keldra_store_bulk_prefetch_blob_reference_keys_total =
                 self.blob_reference_keys,
-            monotonic_counter.keldra_store_bulk_prefetch_small_blob_keys_total =
-                self.small_blob_keys,
+            monotonic_counter.keldra_store_bulk_prefetch_inline_payload_keys_total =
+                self.inline_payload_keys,
             monotonic_counter.keldra_store_bulk_prefetch_policy_keys_total = self.policy_keys,
             monotonic_counter.keldra_store_bulk_prefetch_versioning_keys_total =
                 self.versioning_keys,
@@ -240,8 +240,8 @@ impl PrefetchMetrics {
             histogram.keldra_store_bulk_prefetch_receipts_duration_seconds = self.receipt_seconds,
             histogram.keldra_store_bulk_prefetch_blob_references_duration_seconds =
                 self.blob_reference_seconds,
-            histogram.keldra_store_bulk_prefetch_small_blobs_duration_seconds =
-                self.small_blob_seconds,
+            histogram.keldra_store_bulk_prefetch_inline_payloads_duration_seconds =
+                self.inline_payload_seconds,
             histogram.keldra_store_bulk_prefetch_policies_duration_seconds = self.policy_seconds,
             histogram.keldra_store_bulk_prefetch_versioning_duration_seconds =
                 self.versioning_seconds,

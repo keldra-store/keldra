@@ -1,8 +1,8 @@
 //! Post-listener bounded blob lifecycle maintenance.
 //!
-//! This is the single runtime owner for ordinary due-ordered blob GC,
-//! `.staging`/`.gc` reconciliation, and former-placement retirement. Starting
-//! it is explicit so opening the Store never inventories filesystem state.
+//! This is the single runtime owner for ordinary due-ordered artifact GC and
+//! former-placement retirement. Payload discovery is entirely RocksDB-backed;
+//! starting this task never inventories payload files.
 
 use keldra_store::{BlobGcBudget, BlobGcCursor, Store};
 
@@ -61,8 +61,8 @@ async fn run_blob_gc(
     let mut delay = BLOB_GC_INTERVAL;
     loop {
         tokio::time::sleep(delay).await;
-        // This evidence is scoped to bounded maintenance directories and the
-        // due CF. It is never a canonical blob-directory inventory.
+        // This evidence is scoped to the due CF. It is never a payload-file
+        // inventory.
         startup_scan_evidence.record(StartupScanKind::Blobs, StartupScanExtent::Scoped);
         let outcome = collect_if_reference_safe(&store, &references, &mut cursor, budget).await;
         delay = if outcome == Some(false) {

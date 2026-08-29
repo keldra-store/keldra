@@ -9,6 +9,7 @@ mod authz_service;
 mod blob_maintenance;
 mod bootstrap;
 mod bucket_governance;
+mod cluster_capabilities;
 mod cluster_list_watch;
 mod cluster_object_read;
 mod cluster_peer;
@@ -113,12 +114,14 @@ pub struct ServerConfig {
     pub max_atomic_commit_entries: u32,
     pub max_atomic_commit_bytes: u64,
     pub atomic_program_timeout: Duration,
+    pub bulk_write_timeout: Duration,
     pub index_query_timeout: Duration,
     pub token_manager: JwtManager,
     pub rate_limits: RateLimitConfig,
     pub index_runtime: IndexRuntimeConfig,
     pub plugin_gateway: PluginGatewayConfig,
     pub max_blob_bytes: u64,
+    pub max_total_wal_bytes: u64,
     pub erasure_profile: ErasureProfile,
     pub awaiting_publish_ttl_seconds: u64,
     pub mutation_receipt_retention_seconds: u64,
@@ -136,6 +139,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 .checked_add(config.atomic_program_timeout)
                 .is_some(),
         "atomic program timeout must be greater than zero and fit the server clock"
+    );
+    anyhow::ensure!(
+        !config.bulk_write_timeout.is_zero()
+            && tokio::time::Instant::now()
+                .checked_add(config.bulk_write_timeout)
+                .is_some(),
+        "bulk write timeout must be greater than zero and fit the server clock"
     );
     anyhow::ensure!(
         !config.index_query_timeout.is_zero()
@@ -187,10 +197,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             .with_metadata_directory(&config.storage.metadata)
             .with_metadata_wal_directory(&config.storage.metadata_wal)
             .with_payload_directory(&config.storage.payload)
-            .with_upload_spool(
-                &config.storage.upload_spool,
-                config.storage.upload_spool_max_bytes,
-            )
+            .with_pending_upload_max_bytes(config.storage.pending_upload_max_bytes)
+            .with_max_total_wal_bytes(config.max_total_wal_bytes)
             .with_watch_retention(watch_retention)
             .with_mutation_receipt_retention(mutation_receipt_retention)
             .with_awaiting_publish_ttl_seconds(config.awaiting_publish_ttl_seconds),
@@ -240,6 +248,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             config.peer_listen,
             decisions.clone(),
             store.clone(),
+            config.storage.scratch.join("payload-read"),
             config.erasure_profile,
             config.atomic_program_timeout,
             config.max_blob_bytes,
@@ -260,6 +269,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .wait_for_leader(DECISION_LEADER_TIMEOUT)
         .await
         .context("elect decision leader")?;
+    let _capability_advertisement = cluster_capabilities::CapabilityAdvertisementTask::start(
+        decisions.clone(),
+        cluster_transport.clone(),
+        local_node,
+    );
     let cluster_id = cluster_startup::ensure_genesis_identity(&decisions).await?;
     tracing::info!(cluster.id = %hex::encode(cluster_id.0), "cluster identity is ready");
     cluster_startup::ensure_jwt_signing_key_fingerprint(
@@ -465,16 +479,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     .context("initialize distributed index runtime")?;
     let index_authorization: Arc<dyn index_service::IndexAuthorization> =
         Arc::new(authoritative_system.clone());
-    routed_index_query_handlers
-        .install(Arc::new(cluster_peer::AuthorizedIndexQueryHandler::new(
-            local_node,
-            config.token_manager.clone(),
-            name_resolver.clone(),
-            index_authorization.clone(),
-            Arc::new(object_reader.clone()),
-            index_runtime.local_queries.clone(),
-        )))
-        .map_err(|_| anyhow::anyhow!("routed index query handler was installed more than once"))?;
     let mut accounting_runtime = accounting::runtime::start(
         local_node,
         decisions.clone(),
@@ -535,7 +539,18 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         accounting_runtime.traffic.clone(),
         config.max_blob_bytes,
         config.atomic_program_timeout,
+        config.bulk_write_timeout,
     );
+    routed_index_query_handlers
+        .install(Arc::new(cluster_peer::AuthorizedIndexQueryHandler::new(
+            local_node,
+            config.token_manager.clone(),
+            name_resolver.clone(),
+            index_authorization.clone(),
+            Arc::new(object_service.clone()),
+            index_runtime.local_queries.clone(),
+        )))
+        .map_err(|_| anyhow::anyhow!("routed index query handler was installed more than once"))?;
     let index_service = index_service::IndexServiceImpl::new(
         object_service.clone(),
         name_resolver.clone(),
@@ -545,7 +560,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             authorization: index_authorization,
             page_tokens: Arc::new(config.token_manager.clone()),
             definition_reader: Arc::new(object_reader.clone()),
-            live_versions: Arc::new(object_reader.clone()),
+            live_versions: Arc::new(object_service.clone()),
         },
         config.atomic_program_timeout,
         config.index_query_timeout,
@@ -829,8 +844,7 @@ fn log_storage_layout(config: &ServerConfig, binding: &storage_layout::StorageBi
     tracing::info!(
         storage.scratch = %config.storage.scratch.display(),
         storage.cache = %config.storage.cache.display(),
-        storage.upload_spool = %config.storage.upload_spool.display(),
-        storage.upload_spool_max_bytes = config.storage.upload_spool_max_bytes,
+        storage.pending_upload_max_bytes = config.storage.pending_upload_max_bytes,
         "disposable storage roots may be replaced between restarts"
     );
     if !binding.newly_initialized {

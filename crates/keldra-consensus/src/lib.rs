@@ -38,13 +38,14 @@ pub use serving_lease::{
 pub use state_machine::{ApplyError, StateMachine};
 pub use tonic_peer::{TonicPeerTransport, TonicRaftPeerServer, TonicRaftPeerService};
 pub use types::{
-    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyResult, BundleHash, BundleRef,
-    CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterControlState, ClusterId, Command,
-    CommitBatch, CommitResult, CommittedBatch, CommittedInvocation, DurabilityClass,
-    DurabilityEvidenceHash, ErasureCodeProfile, ExecutorNomination, FIXED_VOTER_TARGET,
-    InvocationFingerprint, InvocationId, JoinCapabilityHash, JwtSigningKeyFingerprint,
-    MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS, MAX_PEER_ADDRESS_BYTES,
-    MembershipTransition, MembershipTransitionKind, NodeDescriptor, NodeId, NodeState, PeerAddress,
-    PeerSpkiSha256, ProgramHash, ProgramPathHash, SYSTEM_BOOTSTRAP_VERSION, SystemBootstrapState,
-    UsedNodeIds,
+    ATOMIC_REPLAY_RETENTION_MILLIS, AbortPreparedBatch, ApplyResult, AtomicBundleAuthority,
+    BeginBatch, BeginResult, BundleHash, BundleRef, CLUSTER_CONTROL_COMMAND_VERSION,
+    CapabilityRange, ClusterControlState, ClusterId, Command, CommitBatch, CommitPreparedBatch,
+    CommitResult, CommittedBatch, CommittedInvocation, DurabilityClass, DurabilityEvidenceHash,
+    ErasureCodeProfile, ExecutorNomination, FIXED_VOTER_TARGET, InvocationFingerprint,
+    InvocationId, JoinCapabilityHash, JwtSigningKeyFingerprint, MAX_COMMITTED_INVOCATION_BYTES,
+    MAX_COMMITTED_INVOCATIONS, MAX_PEER_ADDRESS_BYTES, MembershipTransition,
+    MembershipTransitionKind, NodeDescriptor, NodeId, NodeState, ParticipantManifestHash,
+    PeerAddress, PeerSpkiSha256, PreparedBatch, ProgramHash, ProgramPathHash,
+    SYSTEM_BOOTSTRAP_VERSION, SystemBootstrapState, UsedNodeIds,
 };

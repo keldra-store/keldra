@@ -25,6 +25,7 @@ struct InternalObjectRequest;
 
 /// Opaque access evidence captured before a streaming request is consumed.
 /// Its fields are private so another module cannot manufacture internal access.
+#[derive(Clone)]
 pub(crate) struct ObjectPathAccess {
     internal: bool,
     definition_intents: BTreeMap<usize, DefinitionMutationIntent>,

@@ -16,7 +16,8 @@ use crate::{
 };
 
 const MAGIC: &[u8; 4] = b"ANVJ";
-const FORMAT: u16 = 5;
+const FORMAT: u16 = 6;
+const LEGACY_FORMAT: u16 = 5;
 const RESERVED: u8 = 0;
 const HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 8 + 8;
 
@@ -78,7 +79,7 @@ pub(crate) fn decode_local_change_with_length(
         return Err(malformed("magic is invalid"));
     }
     let format = input.u16()?;
-    if format != FORMAT {
+    if format != FORMAT && format != LEGACY_FORMAT {
         return Err(LocalChangeCodecError::UnsupportedFormat(format));
     }
     let kind = input.u8()?;
@@ -93,7 +94,7 @@ pub(crate) fn decode_local_change_with_length(
     if body_bytes != input.remaining() {
         return Err(malformed("body length disagrees with the record length"));
     }
-    let change = decode_body(kind, &mut input)?;
+    let change = decode_body(format, kind, &mut input)?;
     input.finish()?;
     Ok(DecodedLocalChange {
         change,
@@ -115,6 +116,7 @@ fn encode_body(change: &LocalChange) -> Result<(u8, Vec<u8>), LocalChangeCodecEr
             put_u64(&mut body, change.tenant_id);
             put_u64(&mut body, change.bucket_id);
             put_string(&mut body, &change.exact_path)?;
+            put_optional_string(&mut body, change.canonical_path.as_deref())?;
             put_u64(&mut body, change.path_version.0);
             put_u8(
                 &mut body,
@@ -196,6 +198,7 @@ fn encode_body(change: &LocalChange) -> Result<(u8, Vec<u8>), LocalChangeCodecEr
                 put_u64(&mut body, mutation.tenant_id);
                 put_u64(&mut body, mutation.bucket_id);
                 put_string(&mut body, &mutation.exact_path)?;
+                put_optional_string(&mut body, mutation.canonical_path.as_deref())?;
                 put_u64(&mut body, mutation.path_version.0);
                 put_u8(&mut body, u8::from(mutation.deleted));
                 put_u16(&mut body, mutation.source_id.node_id);
@@ -207,13 +210,22 @@ fn encode_body(change: &LocalChange) -> Result<(u8, Vec<u8>), LocalChangeCodecEr
     }
 }
 
-fn decode_body(kind: u8, input: &mut Input<'_>) -> Result<LocalChange, LocalChangeCodecError> {
+fn decode_body(
+    format: u16,
+    kind: u8,
+    input: &mut Input<'_>,
+) -> Result<LocalChange, LocalChangeCodecError> {
     match kind {
         OBJECT_HEAD => Ok(LocalChange::ObjectHead(ObjectHeadChange {
             offset: input.u64()?,
             tenant_id: input.u64()?,
             bucket_id: input.u64()?,
             exact_path: input.string()?,
+            canonical_path: if format >= FORMAT {
+                input.optional_string()?
+            } else {
+                None
+            },
             path_version: VersionId(input.u64()?),
             kind: match input.u8()? {
                 PUT => ObjectHeadChangeKind::Put,
@@ -297,6 +309,11 @@ fn decode_body(kind: u8, input: &mut Input<'_>) -> Result<LocalChange, LocalChan
                     tenant_id: input.u64()?,
                     bucket_id: input.u64()?,
                     exact_path: input.string()?,
+                    canonical_path: if format >= FORMAT {
+                        input.optional_string()?
+                    } else {
+                        None
+                    },
                     path_version: VersionId(input.u64()?),
                     deleted: match input.u8()? {
                         0 => false,
@@ -379,6 +396,20 @@ fn put_optional_u64(output: &mut Vec<u8>, value: Option<u64>) {
         }
         None => put_u8(output, 0),
     }
+}
+
+fn put_optional_string(
+    output: &mut Vec<u8>,
+    value: Option<&str>,
+) -> Result<(), LocalChangeCodecError> {
+    match value {
+        Some(value) => {
+            put_u8(output, 1);
+            put_string(output, value)?;
+        }
+        None => put_u8(output, 0),
+    }
+    Ok(())
 }
 
 fn put_string(output: &mut Vec<u8>, value: &str) -> Result<(), LocalChangeCodecError> {
@@ -485,6 +516,14 @@ impl<'a> Input<'a> {
             0 => Ok(None),
             1 => Ok(Some(self.u64()?)),
             _ => Err(malformed("optional integer tag is invalid")),
+        }
+    }
+
+    fn optional_string(&mut self) -> Result<Option<String>, LocalChangeCodecError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.string()?)),
+            _ => Err(malformed("optional string tag is invalid")),
         }
     }
 
@@ -618,6 +657,16 @@ mod tests {
     fn every_change_kind_round_trips_with_exact_peer_length() {
         let changes = [
             object_change(),
+            LocalChange::alias_object_head_with_program_cursor(
+                12,
+                11,
+                12,
+                "documents/alias".into(),
+                "documents/target".into(),
+                VersionId(43),
+                false,
+                Some(74),
+            ),
             LocalChange::retained_version_deleted(
                 8,
                 11,
@@ -654,6 +703,7 @@ mod tests {
                     tenant_id: 11,
                     bucket_id: 12,
                     exact_path: "documents/two".into(),
+                    canonical_path: None,
                     path_version: VersionId(42),
                     deleted: false,
                     source_id: crate::SourceId {
@@ -686,7 +736,7 @@ mod tests {
             b'V',
             b'J', // magic
             0,
-            5, // format
+            6, // format
             AGGREGATE_CHANGED,
             0, // reserved
             0,
@@ -768,5 +818,55 @@ mod tests {
         let mut invalid_utf8 = encoded;
         invalid_utf8[HEADER_BYTES + 32] = 0xff;
         assert!(decode_local_change(&invalid_utf8).is_err());
+    }
+
+    #[test]
+    fn legacy_v5_object_head_decodes_without_canonical_path() {
+        let change = object_change();
+        let mut encoded = encode_local_change(&change).unwrap();
+        encoded[5] = LEGACY_FORMAT as u8;
+        let path_length = match &change {
+            LocalChange::ObjectHead(change) => change.exact_path.len(),
+            _ => unreachable!(),
+        };
+        let canonical_marker = HEADER_BYTES + 8 + 8 + 8 + 8 + path_length;
+        assert_eq!(encoded.remove(canonical_marker), 0);
+        let body_length = u64::from_be_bytes(encoded[8..16].try_into().unwrap()) - 1;
+        encoded[8..16].copy_from_slice(&body_length.to_be_bytes());
+        assert_eq!(decode_local_change(&encoded).unwrap(), change);
+    }
+
+    #[test]
+    fn legacy_v5_atomic_batch_decodes_without_canonical_paths() {
+        let change = LocalChange::atomic_batch_published(
+            11,
+            73,
+            crate::PreparedBundleHash([7; 32]),
+            vec![crate::AtomicBatchRoute {
+                tenant_id: 11,
+                bucket_id: 12,
+            }],
+            vec![crate::AtomicBatchMutation {
+                tenant_id: 11,
+                bucket_id: 12,
+                exact_path: "documents/two".into(),
+                canonical_path: None,
+                path_version: VersionId(42),
+                deleted: false,
+                source_id: crate::SourceId {
+                    node_id: 3,
+                    source_epoch: [9; 32],
+                },
+                source_journal_position: 17,
+            }],
+        );
+        let mut encoded = encode_local_change(&change).unwrap();
+        encoded[5] = LEGACY_FORMAT as u8;
+        let path_length = "documents/two".len();
+        let canonical_marker = HEADER_BYTES + 8 + 8 + 32 + 8 + 16 + 8 + 8 + 8 + 8 + path_length;
+        assert_eq!(encoded.remove(canonical_marker), 0);
+        let body_length = u64::from_be_bytes(encoded[8..16].try_into().unwrap()) - 1;
+        encoded[8..16].copy_from_slice(&body_length.to_be_bytes());
+        assert_eq!(decode_local_change(&encoded).unwrap(), change);
     }
 }

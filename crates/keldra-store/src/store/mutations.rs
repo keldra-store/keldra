@@ -1,3 +1,4 @@
+use super::bulk_phases::{BulkStorePhase, BulkStorePhaseTracker};
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_helpers::{
     definition_mutation_error, definition_receipt_matches_intent, exact_version_key,
@@ -16,30 +17,6 @@ const MAX_EXPIRED_RECEIPTS_PRUNED_PER_PASS: usize = 1_024;
 const MAX_EXPIRED_RECEIPT_BYTES_PRUNED_PER_PASS: u64 = 4 * 1024 * 1024;
 
 impl Store {
-    pub async fn put(&self, request: PutRequest) -> Result<MutationReceipt, MutationError> {
-        self.bulk_write(vec![BatchOperation::Put(request)])
-            .await
-            .pop()
-            .expect("one operation has one outcome")
-            .result
-    }
-
-    pub async fn publish(&self, request: PublishRequest) -> Result<MutationReceipt, MutationError> {
-        self.bulk_write(vec![BatchOperation::Publish(request)])
-            .await
-            .pop()
-            .expect("one operation has one outcome")
-            .result
-    }
-
-    pub async fn delete(&self, request: DeleteRequest) -> Result<MutationReceipt, MutationError> {
-        self.bulk_write(vec![BatchOperation::Delete(request)])
-            .await
-            .pop()
-            .expect("one operation has one outcome")
-            .result
-    }
-
     /// Preserve the one-node physical WriteBatch path while evaluating the
     /// coordinator-reconciled bucket options supplied by the cluster layer.
     pub async fn mutate_with_governance(
@@ -174,6 +151,7 @@ impl Store {
                 })
                 .collect();
         }
+        let mut phase = BulkStorePhaseTracker::start(operations.len());
         let prepare_started = std::time::Instant::now();
         let mut prepared = Vec::with_capacity(operations.len());
         let mut early = BTreeMap::new();
@@ -183,6 +161,7 @@ impl Store {
             let logical_key = match &operation {
                 BatchOperation::Put(request) => &request.key,
                 BatchOperation::Publish(request) => &request.key,
+                BatchOperation::Clone(request) => &request.destination,
                 BatchOperation::Delete(request) => &request.key,
             };
             let identity = governance.as_ref().map_or_else(
@@ -227,16 +206,18 @@ impl Store {
             let _policy_guard = self.policy_gate.read().await;
             let lock_started = std::time::Instant::now();
             let path_lock_started = lock_started;
+            phase.enter(BulkStorePhase::OrdinaryPathLock);
             let _guards = self
                 .ordinary_locks
                 .acquire(
                     &prepared
                         .iter()
-                        .map(|(_, operation)| object_path(operation.key()))
+                        .flat_map(|(_, operation)| operation.lock_paths())
                         .collect::<Vec<_>>(),
                 )
                 .await;
             let path_lock_wait = path_lock_started.elapsed();
+            phase.enter(BulkStorePhase::CommitLock);
             let _commit_guard = self.lock_commit("bulk_mutation").await;
             let commit_lock_wait = _commit_guard.wait_duration();
             let lock_duration = lock_started.elapsed();
@@ -277,7 +258,7 @@ impl Store {
             let mut pending_versions = BTreeMap::<Vec<u8>, Version>::new();
             let mut pending_receipts = BTreeMap::<Vec<u8>, StoredReceipt>::new();
             let mut pending_blob_references = PendingBlobReferences::new();
-            let mut pending_small_blobs = BTreeSet::<Vec<u8>>::new();
+            let mut pending_inline_payloads = BTreeSet::<Vec<u8>>::new();
             let mut policy_cache = BTreeMap::<Vec<u8>, Result<BucketPolicy, MutationError>>::new();
             let mut versioning_cache =
                 BTreeMap::<Vec<u8>, Result<ObjectVersioning, MutationError>>::new();
@@ -297,7 +278,15 @@ impl Store {
             let mut pending_changes = Vec::new();
             let mut receipt_capacity_at = None;
             let evaluate_started = std::time::Instant::now();
+            phase.enter(BulkStorePhase::Evaluation);
             for (prepared_index, (index, operation)) in prepared.iter().enumerate() {
+                if let Some(error) = operation.lock_paths().iter().find_map(|path| {
+                    self.require_unreserved_object_locked(operation.identity(), &path.path, None)
+                        .err()
+                }) {
+                    results.insert(*index, Err(error));
+                    continue;
+                }
                 let outcome = self
                     .evaluate_operation(
                         &operation,
@@ -306,7 +295,7 @@ impl Store {
                         &mut pending_versions,
                         &mut pending_receipts,
                         &mut pending_blob_references,
-                        &mut pending_small_blobs,
+                        &mut pending_inline_payloads,
                         &read_cache,
                         &mut policy_cache,
                         &mut versioning_cache,
@@ -335,21 +324,16 @@ impl Store {
                                 current.max(evaluated.receipt.version)
                             }),
                     );
-                    pending_changes.push(PendingLocalChange::ObjectHead {
-                        identity: operation.identity(),
-                        exact_path: operation.key().path().to_owned(),
-                        path_version: evaluated.receipt.version,
-                        deleted: evaluated.receipt.deleted,
-                        program_commit_cursor: None,
-                        reference_deltas: evaluated.reference_deltas.clone(),
-                        accounting_transition: evaluated.accounting_transition,
-                        definition_transition: evaluated.definition_transition.clone(),
-                    });
+                    pending_changes.extend(
+                        evaluated
+                            .pending_head_changes(operation.identity(), operation.key().path()),
+                    );
                 }
                 results.insert(*index, outcome.map(|evaluated| evaluated.receipt));
             }
             let evaluate_duration = evaluate_started.elapsed();
             let persistence_started = std::time::Instant::now();
+            phase.enter(BulkStorePhase::Persistence);
             let persistence = (|| {
                 if receipt_status != initial_receipt_status {
                     self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
@@ -394,6 +378,7 @@ impl Store {
                         self.mutation_capacity_notify.notify_waiters();
                     }
                     if !pending_changes.is_empty() {
+                        phase.enter(BulkStorePhase::SourceSettlement);
                         if let Err(error) = self.settle_inline_source_changes() {
                             fail_unresolved_prepared(&mut results, &prepared, error);
                             completed.extend(results);
@@ -412,6 +397,7 @@ impl Store {
                     drop(_commit_guard);
                     drop(_guards);
                     drop(_policy_guard);
+                    phase.enter(BulkStorePhase::CapacityWait);
                     self.wait_for_capacity_with_metrics(capacity).await;
                     continue;
                 }
@@ -440,11 +426,13 @@ impl Store {
                 drop(_commit_guard);
                 drop(_guards);
                 drop(_policy_guard);
+                phase.enter(BulkStorePhase::CapacityWait);
                 self.wait_for_capacity_with_metrics("receipt").await;
                 continue;
             }
             completed.extend(results);
             completed.extend(early.into_iter().map(|(index, error)| (index, Err(error))));
+            phase.complete();
             return completed
                 .into_iter()
                 .map(|(index, result)| BatchOutcome { index, result })
@@ -476,6 +464,7 @@ impl Store {
         let logical_key = match &operation {
             BatchOperation::Put(request) => &request.key,
             BatchOperation::Publish(request) => &request.key,
+            BatchOperation::Clone(request) => &request.destination,
             BatchOperation::Delete(request) => &request.key,
         };
         let identity = self.resolve_bucket_identity(logical_key.tenant(), logical_key.bucket())?;
@@ -497,6 +486,11 @@ impl Store {
         governance: ObjectMutationGovernance,
         context: ObjectMutationContext,
     ) -> Result<CoordinatedObjectMutation, MutationError> {
+        if matches!(&operation, BatchOperation::Clone(_)) {
+            return Err(MutationError::InvalidObjectMutation(
+                "distributed clone requires an exact retained-version atomic precondition".into(),
+            ));
+        }
         if context.serving_fence_term == 0 {
             return Err(MutationError::InvalidObjectMutation(
                 "serving-fence term must be non-zero".into(),
@@ -525,6 +519,11 @@ impl Store {
         context: ObjectMutationContext,
         intent: DefinitionMutationIntent,
     ) -> Result<CoordinatedObjectMutation, MutationError> {
+        if matches!(&operation, BatchOperation::Clone(_)) {
+            return Err(MutationError::InvalidObjectMutation(
+                "clone is not a definition mutation".into(),
+            ));
+        }
         if context.serving_fence_term == 0 {
             return Err(MutationError::InvalidObjectMutation(
                 "serving-fence term must be non-zero".into(),
@@ -542,59 +541,6 @@ impl Store {
             context,
             governance,
             Some(intent),
-            SourceJournalAdmission::Bounded,
-        )
-        .await
-    }
-
-    /// Coordinates a distributed publish whose payload evidence was verified
-    /// by the cluster layer; the metadata coordinator need not hold its bytes.
-    pub async fn coordinate_distributed_publish(
-        &self,
-        request: PublishRequest,
-        context: ObjectMutationContext,
-    ) -> Result<CoordinatedObjectMutation, MutationError> {
-        if context.serving_fence_term == 0 {
-            return Err(MutationError::InvalidObjectMutation(
-                "serving-fence term must be non-zero".into(),
-            ));
-        }
-        let _policy_guard = self.policy_gate.read().await;
-        let identity = self.resolve_bucket_identity(request.key.tenant(), request.key.bucket())?;
-        let governance = ObjectMutationGovernance {
-            tenant_id: identity.tenant_id.0,
-            bucket_id: identity.bucket_id.0,
-            versioning: self.bucket_versioning_by_key(&identity.encode())?,
-            policy: self
-                .bucket_policy_by_key(&identity.encode())?
-                .unwrap_or_default(),
-        };
-        self.coordinate_distributed_publish_with_governance(request, governance, context)
-            .await
-    }
-
-    pub async fn coordinate_distributed_publish_with_governance(
-        &self,
-        request: PublishRequest,
-        governance: ObjectMutationGovernance,
-        context: ObjectMutationContext,
-    ) -> Result<CoordinatedObjectMutation, MutationError> {
-        if context.serving_fence_term == 0 {
-            return Err(MutationError::InvalidObjectMutation(
-                "serving-fence term must be non-zero".into(),
-            ));
-        }
-        governance.validate()?;
-        let identity = BucketIdentity {
-            tenant_id: TenantId(governance.tenant_id),
-            bucket_id: BucketId(governance.bucket_id),
-        };
-        let prepared = self.prepare_verified_distributed_publish(request, identity)?;
-        self.coordinate_prepared_object_mutation(
-            prepared,
-            context,
-            governance,
-            None,
             SourceJournalAdmission::Bounded,
         )
         .await
@@ -629,20 +575,6 @@ impl Store {
         .await
     }
 
-    pub(super) fn prepare_verified_distributed_publish(
-        &self,
-        request: PublishRequest,
-        identity: BucketIdentity,
-    ) -> Result<PreparedOperation, MutationError> {
-        validate_command_id(request.command_id.as_deref())?;
-        let fingerprint = publish_fingerprint(&request, identity);
-        Ok(PreparedOperation::Publish {
-            request,
-            identity,
-            fingerprint,
-        })
-    }
-
     pub(super) async fn coordinate_prepared_object_mutation(
         &self,
         prepared: PreparedOperation,
@@ -656,11 +588,11 @@ impl Store {
         }
         let identity = prepared.identity();
 
-        let _path_guard = self
-            .ordinary_locks
-            .acquire(&[object_path(prepared.key())])
-            .await;
+        let _path_guard = self.ordinary_locks.acquire(&prepared.lock_paths()).await;
         let _commit_guard = self.lock_commit("coordinated_object_mutation").await;
+        for path in prepared.lock_paths() {
+            self.require_unreserved_object_locked(identity, &path.path, None)?;
+        }
         let source = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -677,7 +609,7 @@ impl Store {
         let mut pending_versions = BTreeMap::new();
         let mut pending_receipts = BTreeMap::new();
         let mut pending_blob_references = PendingBlobReferences::new();
-        let mut pending_small_blobs = BTreeSet::new();
+        let mut pending_inline_payloads = BTreeSet::new();
         let read_cache = MutationReadCache::default();
         let encoded_bucket = prepared.identity().encode().to_vec();
         let mut policy_cache = BTreeMap::from([(encoded_bucket.clone(), Ok(governance.policy))]);
@@ -690,7 +622,7 @@ impl Store {
                 &mut pending_versions,
                 &mut pending_receipts,
                 &mut pending_blob_references,
-                &mut pending_small_blobs,
+                &mut pending_inline_payloads,
                 &read_cache,
                 &mut policy_cache,
                 &mut versioning_cache,
@@ -718,16 +650,7 @@ impl Store {
             }
             self.stage_local_changes_with_admission(
                 &mut batch,
-                &[PendingLocalChange::ObjectHead {
-                    identity,
-                    exact_path: prepared.key().path().to_owned(),
-                    path_version: evaluated.receipt.version,
-                    deleted: evaluated.receipt.deleted,
-                    program_commit_cursor: None,
-                    reference_deltas: evaluated.reference_deltas.clone(),
-                    accounting_transition: evaluated.accounting_transition,
-                    definition_transition: evaluated.definition_transition.clone(),
-                }],
+                &evaluated.pending_head_changes(identity, prepared.key().path()),
                 LocalReferenceEffects::Deferred,
                 source_journal_admission,
             )?;
@@ -777,6 +700,7 @@ impl Store {
             exact_version_key(identity, &mutation.exact_path, mutation.version.id);
         let primary_receipt_key = receipt_key(identity, &mutation.command_id);
         let _commit_guard = self.lock_commit("object_mutation_replica").await;
+        self.require_unreserved_object_locked(identity, &mutation.exact_path, None)?;
         let now = now_unix_millis()?;
 
         let retained_identical_receipt = if let Some(existing) =
@@ -873,6 +797,47 @@ impl Store {
                     current: Some(head.version),
                     predecessor: mutation.stamp.predecessor_version,
                 });
+            }
+        }
+
+        if !already_applied {
+            let predecessor = match mutation.stamp.predecessor_version {
+                Some(version) => Some(
+                    self.stored_version_by_key(&exact_version_key(
+                        identity,
+                        &mutation.exact_path,
+                        version,
+                    ))?
+                    .map(|stored| stored.version)
+                    .ok_or_else(|| {
+                        MutationError::Storage(
+                            "replicated predecessor references a missing version descriptor".into(),
+                        )
+                    })?,
+                ),
+                None => None,
+            };
+            if predecessor
+                .as_ref()
+                .is_some_and(|version| version.protected_link_descriptor)
+            {
+                return Err(MutationError::InvalidObjectMutation(
+                    "protected alias descriptors must be mutated through sealed link authority"
+                        .into(),
+                ));
+            }
+            if self.alias_registry_locked(identity, &mutation.exact_path)?
+                != mutation
+                    .alias_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.registry.clone())
+            {
+                return Err(MutationError::ObjectMutationConflict);
+            }
+            if let Some(snapshot) = mutation.alias_snapshot.as_ref() {
+                if predecessor.as_ref() != Some(&snapshot.canonical_version) {
+                    return Err(MutationError::ObjectMutationConflict);
+                }
             }
         }
 
@@ -1082,80 +1047,7 @@ impl Store {
             status.tail = status.tail.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation offset is exhausted".into())
             })?;
-            let change = match pending {
-                PendingLocalChange::ObjectHead {
-                    identity,
-                    exact_path,
-                    path_version,
-                    deleted,
-                    program_commit_cursor,
-                    reference_deltas,
-                    accounting_transition,
-                    definition_transition,
-                } => LocalChange::object_head_with_program_cursor(
-                    status.tail,
-                    identity.tenant_id.0,
-                    identity.bucket_id.0,
-                    exact_path.clone(),
-                    *path_version,
-                    *deleted,
-                    *program_commit_cursor,
-                    reference_deltas.clone(),
-                    *accounting_transition,
-                    definition_transition.clone(),
-                ),
-                PendingLocalChange::RetainedVersionDeleted {
-                    identity,
-                    exact_path,
-                    deleted_version,
-                    resulting_head_version,
-                    reference_deltas,
-                    accounting_transition,
-                } => LocalChange::retained_version_deleted(
-                    status.tail,
-                    identity.tenant_id.0,
-                    identity.bucket_id.0,
-                    exact_path.clone(),
-                    *deleted_version,
-                    *resulting_head_version,
-                    reference_deltas.clone(),
-                    *accounting_transition,
-                ),
-                PendingLocalChange::AggregateChanged {
-                    aggregate_kind,
-                    aggregate_key,
-                    revision,
-                } => LocalChange::aggregate_changed(
-                    status.tail,
-                    *aggregate_kind,
-                    aggregate_key.clone(),
-                    *revision,
-                ),
-                PendingLocalChange::ContentLifecycleChanged {
-                    blob_identity,
-                    revision,
-                    reference_deltas,
-                    accounting_transition,
-                } => LocalChange::content_lifecycle_changed(
-                    status.tail,
-                    blob_identity.clone(),
-                    *revision,
-                    reference_deltas.clone(),
-                    accounting_transition.clone(),
-                ),
-                PendingLocalChange::AtomicBatchPublished {
-                    cursor,
-                    bundle_hash,
-                    affected_routes,
-                    mutations,
-                } => LocalChange::atomic_batch_published(
-                    status.tail,
-                    *cursor,
-                    *bundle_hash,
-                    affected_routes.clone(),
-                    mutations.clone(),
-                ),
-            };
+            let change = pending.at_offset(status.tail);
             let encoded = encode_local_change(&change).map_err(storage_error)?;
             let logical_bytes = invalidation_record_bytes(encoded.len())
                 .saturating_add(super::journal_routes::journal_route_logical_bytes(&change));
@@ -1260,11 +1152,11 @@ impl Store {
                 let bytes = std::mem::take(&mut request.bytes);
                 let payload = if distributed_coordination {
                     PreparedPayload::Sealed(self.stage_blob(&bytes).await?)
-                } else if bytes.len() <= SMALL_BLOB_MAX_BYTES {
+                } else if bytes.len() <= PAYLOAD_ARTIFACT_CHUNK_BYTES {
                     let reference = blob_reference_for_bytes(&bytes);
-                    PreparedPayload::Small { reference, bytes }
+                    PreparedPayload::Inline { reference, bytes }
                 } else {
-                    PreparedPayload::Large(self.stage_blob(&bytes).await?)
+                    PreparedPayload::Installed(self.stage_blob(&bytes).await?)
                 };
                 let fingerprint = put_fingerprint(
                     &identity.head_key(request.key.path()),
@@ -1290,6 +1182,21 @@ impl Store {
                 }
                 let fingerprint = publish_fingerprint(&request, identity);
                 Ok(PreparedOperation::Publish {
+                    request,
+                    identity,
+                    fingerprint,
+                })
+            }
+            BatchOperation::Clone(request) => {
+                validate_clone_request(&request)?;
+                if !distributed_coordination {
+                    require_local_durability(request.durability)?;
+                    if !self.contains_blob(&request.blob).await? {
+                        return Err(MutationError::BlobNotFound);
+                    }
+                }
+                let fingerprint = clone_fingerprint(&request, identity);
+                Ok(PreparedOperation::Clone {
                     request,
                     identity,
                     fingerprint,
@@ -1520,7 +1427,7 @@ impl Store {
         pending_versions: &mut BTreeMap<Vec<u8>, Version>,
         pending_receipts: &mut BTreeMap<Vec<u8>, StoredReceipt>,
         pending_blob_references: &mut PendingBlobReferences,
-        pending_small_blobs: &mut BTreeSet<Vec<u8>>,
+        pending_inline_payloads: &mut BTreeSet<Vec<u8>>,
         read_cache: &MutationReadCache,
         policy_cache: &mut BTreeMap<Vec<u8>, Result<BucketPolicy, MutationError>>,
         versioning_cache: &mut BTreeMap<Vec<u8>, Result<ObjectVersioning, MutationError>>,
@@ -1560,6 +1467,10 @@ impl Store {
                 ) {
                     return Err(MutationError::IdempotencyConflict);
                 }
+                let alias_snapshot = existing
+                    .object_mutation
+                    .as_ref()
+                    .and_then(|mutation| mutation.alias_snapshot.clone());
                 return Ok(EvaluatedOperation {
                     receipt: MutationReceipt {
                         command_id: operation.command_id().map(str::to_owned),
@@ -1573,7 +1484,27 @@ impl Store {
                     reference_deltas: Vec::new(),
                     accounting_transition: None,
                     definition_transition: existing.definition_transition,
+                    alias_snapshot,
                 });
+            }
+        }
+
+        if let PreparedOperation::Clone { request, .. } = operation {
+            let source = self.user_retained_version(
+                operation.identity(),
+                &request.source,
+                request.source_version,
+            )?;
+            if !source.as_ref().is_some_and(|source| {
+                !source.deleted
+                    && source.id == request.source_version
+                    && source.blob.as_ref() == Some(&request.blob)
+                    && source.content_type == request.content_type
+            }) {
+                return Err(MutationError::InvalidObjectMutation(
+                    "clone source exact version is no longer live or no longer matches its content identity"
+                        .into(),
+                ));
             }
         }
 
@@ -1614,6 +1545,35 @@ impl Store {
                 "head and current version descriptor disagree".into(),
             ));
         }
+        if current_version
+            .as_ref()
+            .is_some_and(|version| version.protected_link_descriptor)
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "protected alias descriptors must be mutated through sealed link authority".into(),
+            ));
+        }
+        let alias_registry = self.alias_registry_locked(operation.identity(), key.path())?;
+        let alias_snapshot = match alias_registry {
+            Some(registry) => {
+                if matches!(operation, PreparedOperation::Delete { .. }) {
+                    return Err(MutationError::ObjectHasInboundAliases);
+                }
+                let canonical_version = current_version
+                    .clone()
+                    .filter(|version| !version.deleted)
+                    .ok_or_else(|| {
+                        MutationError::Storage(
+                            "alias registry exists without a live canonical target".into(),
+                        )
+                    })?;
+                Some(crate::ObjectAliasSnapshot {
+                    registry,
+                    canonical_version,
+                })
+            }
+            None => None,
+        };
         let encoded_bucket = operation.identity().encode().to_vec();
         let policy = policy_cache
             .entry(encoded_bucket.clone())
@@ -1655,11 +1615,13 @@ impl Store {
             let requested_payload = match operation {
                 PreparedOperation::Put { payload, .. } => payload.reference().clone(),
                 PreparedOperation::Publish { request, .. } => request.blob.clone(),
+                PreparedOperation::Clone { request, .. } => request.blob.clone(),
                 PreparedOperation::Delete { .. } => unreachable!(),
             };
             let requested_content_type = match operation {
                 PreparedOperation::Put { request, .. } => request.content_type.as_ref(),
                 PreparedOperation::Publish { request, .. } => request.content_type.as_ref(),
+                PreparedOperation::Clone { request, .. } => request.content_type.as_ref(),
                 PreparedOperation::Delete { .. } => unreachable!(),
             };
             if !current.deleted
@@ -1705,6 +1667,7 @@ impl Store {
                     reference_deltas: Vec::new(),
                     accounting_transition: None,
                     definition_transition,
+                    alias_snapshot: None,
                 });
             }
             return Err(MutationError::Immutable);
@@ -1716,10 +1679,11 @@ impl Store {
         let new_blob = match operation {
             PreparedOperation::Put { payload, .. } => Some(payload.reference().clone()),
             PreparedOperation::Publish { request, .. } => Some(request.blob.clone()),
+            PreparedOperation::Clone { request, .. } => Some(request.blob.clone()),
             PreparedOperation::Delete { .. } => None,
         };
         if let PreparedOperation::Put { payload, .. } = operation
-            && payload.small_bytes().is_none()
+            && payload.inline_bytes().is_none()
             && !self.contains_blob(payload.reference()).await?
         {
             return Err(MutationError::BlobNotFound);
@@ -1730,10 +1694,12 @@ impl Store {
             content_type: match operation {
                 PreparedOperation::Put { request, .. } => request.content_type.clone(),
                 PreparedOperation::Publish { request, .. } => request.content_type.clone(),
+                PreparedOperation::Clone { request, .. } => request.content_type.clone(),
                 PreparedOperation::Delete { .. } => None,
             },
             deleted,
             committed_at_unix_millis: now_unix_millis,
+            protected_link_descriptor: false,
         };
         let accounting_transition = AccountingHeadTransition::new(
             current_version.as_ref().and_then(live_version_length),
@@ -1807,7 +1773,11 @@ impl Store {
                     .command_id()
                     .ok_or(MutationError::InvalidCommandId)?;
                 let mut mutation = ObjectMutation {
-                    format: OBJECT_MUTATION_FORMAT,
+                    format: if alias_snapshot.is_some() {
+                        OBJECT_MUTATION_FORMAT
+                    } else {
+                        crate::LEGACY_OBJECT_MUTATION_FORMAT
+                    },
                     tenant_id: operation.identity().tenant_id.0,
                     bucket_id: operation.identity().bucket_id.0,
                     exact_path: key.path().to_owned(),
@@ -1828,6 +1798,7 @@ impl Store {
                     reference_deltas: reference_deltas.clone(),
                     accounting_transition: Some(accounting_transition),
                     definition_transition: definition_transition.clone(),
+                    alias_snapshot: alias_snapshot.clone(),
                 };
                 mutation.set_computed_fingerprint();
                 mutation.validate()?;
@@ -1850,18 +1821,20 @@ impl Store {
         let heads = self.cf(CF_HEADS)?;
         let encoded_version_key = version_key(operation.identity(), key, id);
         let mut blob_reference_updates = Vec::with_capacity(2);
-        let small_blob_value = if apply_content_lifecycle {
+        let inline_payload_value = if apply_content_lifecycle {
             match operation {
-                PreparedOperation::Put { payload, .. } => match payload.small_bytes() {
-                    Some(bytes) => self.prepare_hashed_small_blob_value_cached(
+                PreparedOperation::Put { payload, .. } => match payload.inline_bytes() {
+                    Some(bytes) => self.prepare_hashed_inline_payload_value_cached(
                         payload.reference(),
                         bytes,
-                        pending_small_blobs,
-                        read_cache.small_blob(payload.reference()),
+                        pending_inline_payloads,
+                        read_cache.inline_payload(payload.reference()),
                     )?,
                     None => None,
                 },
-                PreparedOperation::Publish { .. } | PreparedOperation::Delete { .. } => None,
+                PreparedOperation::Publish { .. }
+                | PreparedOperation::Clone { .. }
+                | PreparedOperation::Delete { .. } => None,
             }
         } else {
             None
@@ -1884,6 +1857,12 @@ impl Store {
                         read_cache.blob_reference(reference),
                         now_unix_millis,
                     )?,
+                PreparedOperation::Clone { .. } => self.prepare_blob_reference_publication_cached(
+                    reference,
+                    pending_blob_references,
+                    read_cache.blob_reference(reference),
+                    now_unix_millis,
+                )?,
                 PreparedOperation::Delete { .. } => unreachable!(),
             };
             blob_reference_updates.push(update);
@@ -1900,9 +1879,13 @@ impl Store {
             receipt_status,
             pending_receipts,
         )?;
-        if let Some((key, bytes)) = small_blob_value {
-            batch.put_cf(self.cf(CF_SMALL_BLOBS)?, &key, bytes);
-            pending_small_blobs.insert(key);
+        if let Some((key, bytes)) = inline_payload_value {
+            let reference = match operation {
+                PreparedOperation::Put { payload, .. } => payload.reference(),
+                _ => unreachable!("only a put materializes inline payload bytes"),
+            };
+            self.stage_inline_complete_artifact(batch, reference, &bytes)?;
+            pending_inline_payloads.insert(key);
         }
         for (key, state) in blob_reference_updates {
             let prefetched = read_cache.blob_reference_by_key(&key);
@@ -1994,6 +1977,7 @@ impl Store {
             reference_deltas,
             accounting_transition: Some(accounting_transition),
             definition_transition,
+            alias_snapshot,
         })
     }
 }

@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use keldra_api::v1::object_service_server::ObjectService;
 use keldra_api::v1::{
-    BucketPolicy, BulkWriteRequest, BulkWriteResponse, DeleteIfVersionRequest, DeleteRequest,
-    DeleteVersionRequest, DeleteVersionResponse, InvokeProgramRequest, InvokeProgramResponse,
-    MutationReceipt, PutToken, SetBucketPolicyRequest,
+    BucketPolicy, BulkWriteRequest, BulkWriteResponse, CloneObjectRequest, DeleteIfVersionRequest,
+    DeleteRequest, DeleteVersionRequest, DeleteVersionResponse, InvokeProgramRequest,
+    InvokeProgramResponse, LinkObjectRequest, MutationReceipt, PutToken, SetBucketPolicyRequest,
+    UnlinkObjectRequest,
 };
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Status};
@@ -13,14 +14,36 @@ use super::ObjectServiceImpl;
 use crate::cluster_peer::{RoutedCall, RoutedPublicHandler};
 use crate::object_path_access;
 
-/// Marks a request that has already made its one permitted peer hop.
+/// Marks a request delivered by the authenticated peer listener.
 ///
 /// This marker is local process state, never a protobuf or trusted caller
-/// claim. The normal object-service path refuses to route it a second time if
-/// placement changed or a malicious peer supplied a request for another
-/// coordinator.
+/// claim. Most object-service paths permit only one hop; Delete may make the
+/// narrowly authenticated executor-to-path-owner hop described below.
 #[derive(Clone, Copy)]
 pub(super) struct RoutedDestination;
+
+pub(super) fn is_routed<T>(request: &Request<T>) -> bool {
+    request.extensions().get::<RoutedDestination>().is_some()
+}
+
+/// Authenticated peer evidence that the global atomic executor performed the
+/// exact Unlink replay lookup before forwarding an ordinary delete.
+#[derive(Clone, Copy)]
+pub(super) struct AtomicExecutorReplayChecked {
+    pub(super) source_node: keldra_consensus::NodeId,
+}
+
+pub(super) fn atomic_executor_replay_marker<T>(
+    request: &Request<T>,
+) -> Option<AtomicExecutorReplayChecked> {
+    request
+        .extensions()
+        .get::<AtomicExecutorReplayChecked>()
+        .copied()
+}
+
+#[derive(Clone)]
+pub(super) struct DeleteVersionOriginalAlias(pub(super) keldra_store::ObjectKey);
 
 #[derive(Clone)]
 struct RoutedObjectWrites {
@@ -42,6 +65,9 @@ impl RoutedObjectWrites {
         internal: bool,
     ) -> Result<Request<T>, Status> {
         let definition_intents = call.definition_intents().to_vec();
+        let replay_checked = call.atomic_executor_replay_checked();
+        let delete_version_original_alias = call.delete_version_original_alias().cloned();
+        let source_node = call.source_node();
         let bearer = call.bearer().to_owned();
         let (caller, plugin_scope) = self
             .service
@@ -60,6 +86,16 @@ impl RoutedObjectWrites {
             request.extensions_mut().insert(scope);
         }
         request.extensions_mut().insert(RoutedDestination);
+        if replay_checked {
+            request
+                .extensions_mut()
+                .insert(AtomicExecutorReplayChecked { source_node });
+        }
+        if let Some(alias) = delete_version_original_alias {
+            request
+                .extensions_mut()
+                .insert(DeleteVersionOriginalAlias(alias));
+        }
         if internal {
             if definition_intents.is_empty() {
                 object_path_access::mark_internal_peer_route(&mut request);
@@ -102,6 +138,39 @@ impl RoutedPublicHandler for RoutedObjectWrites {
         )
         .await?
         .into_inner())
+    }
+
+    async fn clone_object(
+        &self,
+        call: RoutedCall<CloneObjectRequest>,
+    ) -> Result<MutationReceipt, Status> {
+        Ok(
+            ObjectService::clone_object(&self.service, self.authenticated_request(call, false)?)
+                .await?
+                .into_inner(),
+        )
+    }
+
+    async fn link_object(
+        &self,
+        call: RoutedCall<LinkObjectRequest>,
+    ) -> Result<MutationReceipt, Status> {
+        Ok(
+            ObjectService::link_object(&self.service, self.authenticated_request(call, false)?)
+                .await?
+                .into_inner(),
+        )
+    }
+
+    async fn unlink_object(
+        &self,
+        call: RoutedCall<UnlinkObjectRequest>,
+    ) -> Result<MutationReceipt, Status> {
+        Ok(
+            ObjectService::unlink_object(&self.service, self.authenticated_request(call, false)?)
+                .await?
+                .into_inner(),
+        )
     }
 
     async fn bulk_write(
@@ -183,6 +252,16 @@ impl RoutedPublicHandler for RoutedObjectWrites {
                 .await?
                 .into_inner(),
         )
+    }
+
+    async fn replay_builtin_batch(
+        &self,
+        lookups: Vec<crate::programs::BuiltInReplayLookup>,
+    ) -> Result<Vec<Result<Option<crate::programs::InvokedProgramResult>, Status>>, Status> {
+        self.service
+            .programs
+            .replay_builtin_object_transactions(&lookups)
+            .await
     }
 }
 

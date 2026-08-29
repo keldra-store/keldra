@@ -53,6 +53,15 @@ pub enum FieldType {
     /// Internal fixed-width vector field used by Vector and Hybrid definitions.
     /// It is not one of the public Typed JSON field types.
     Vector = 7,
+    /// A public timestamp whose physical scalar is signed Unix epoch
+    /// milliseconds. Parsing and presentation use the field's DateFormat.
+    Date = 8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DateFormat {
+    Iso8601,
+    Strftime(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +164,7 @@ pub struct FieldSchema {
     pub collation: Collation,
     pub capabilities: FieldCapabilities,
     pub analyzer: Option<Analyzer>,
+    pub date_format: Option<DateFormat>,
     pub components: FieldComponents,
 }
 
@@ -200,6 +210,23 @@ impl FieldSchema {
                     value = value.union(FieldComponents::POINTS);
                 }
                 value
+            }
+            FieldType::Date => {
+                reject_capabilities(
+                    capabilities,
+                    FieldCapabilities::EXACT
+                        .union(FieldCapabilities::RANGE)
+                        .union(FieldCapabilities::ORDER)
+                        .union(FieldCapabilities::FACET),
+                    "date",
+                )?;
+                if capabilities.contains(FieldCapabilities::EXACT)
+                    || capabilities.contains(FieldCapabilities::RANGE)
+                {
+                    FieldComponents::POINTS
+                } else {
+                    FieldComponents(0)
+                }
             }
             FieldType::Keyword => {
                 reject_capabilities(
@@ -501,6 +528,24 @@ impl Schema {
                     ));
                 }
             }
+            match (field.field_type, field.date_format.as_ref()) {
+                (FieldType::Date, Some(DateFormat::Iso8601)) => {}
+                (FieldType::Date, Some(DateFormat::Strftime(pattern)))
+                    if !pattern.is_empty()
+                        && !pattern.contains('\0')
+                        && pattern.len() <= INDEX_ROUTING_KEY_BYTES => {}
+                (FieldType::Date, _) => {
+                    return Err(IndexError::InvalidDefinition(
+                        "date field requires a valid date format".into(),
+                    ));
+                }
+                (_, None) => {}
+                (_, Some(_)) => {
+                    return Err(IndexError::InvalidDefinition(
+                        "only date fields may declare a date format".into(),
+                    ));
+                }
+            }
             if field.field_type == FieldType::Vector
                 && !matches!(self.kind, IndexKind::Vector | IndexKind::Hybrid)
             {
@@ -650,7 +695,10 @@ impl Schema {
             // the exact worst case. Other scalar widths are fixed.
             let field_bytes = match field.field_type {
                 FieldType::Boolean => 3,
-                FieldType::SignedInteger | FieldType::UnsignedInteger | FieldType::Float => 10,
+                FieldType::SignedInteger
+                | FieldType::UnsignedInteger
+                | FieldType::Float
+                | FieldType::Date => 10,
                 FieldType::Keyword => INDEX_TERM_BYTES
                     .checked_mul(2)
                     .and_then(|bytes| bytes.checked_add(4))
@@ -697,6 +745,15 @@ impl Schema {
                     out.u8(analyzer as u8);
                 }
                 None => out.bool(false),
+            }
+            if field.field_type == FieldType::Date {
+                match field.date_format.as_ref().expect("validated date format") {
+                    DateFormat::Iso8601 => out.bool(false),
+                    DateFormat::Strftime(pattern) => {
+                        out.bool(true);
+                        out.string(pattern)?;
+                    }
+                }
             }
             out.u16(field.components.bits());
         }
@@ -878,6 +935,7 @@ mod tests {
                     capabilities,
                     analyzer: (field_type == FieldType::Text)
                         .then_some(Analyzer::UnicodeAlphanumericLowercase),
+                    date_format: (field_type == FieldType::Date).then_some(DateFormat::Iso8601),
                     components: FieldComponents(0),
                 };
                 field.components = field.compiled_components().unwrap();
@@ -928,6 +986,7 @@ mod tests {
                 collation: Collation::BinaryUtf8,
                 capabilities: FieldCapabilities::EXACT.union(FieldCapabilities::ORDER),
                 analyzer: None,
+                date_format: None,
                 components: FieldComponents::POINTS.union(FieldComponents::DOC_VALUES),
             }],
             semantics: IndexSemantics::TypedJson,
@@ -987,6 +1046,16 @@ mod tests {
                 FieldComponents::DOC_VALUES,
             ),
             (
+                FieldType::Date,
+                FieldCapabilities::EXACT.union(FieldCapabilities::RANGE),
+                FieldComponents::POINTS,
+            ),
+            (
+                FieldType::Date,
+                FieldCapabilities::ORDER.union(FieldCapabilities::FACET),
+                FieldComponents::DOC_VALUES,
+            ),
+            (
                 FieldType::Keyword,
                 FieldCapabilities::PREFIX,
                 FieldComponents::TERMS,
@@ -1008,6 +1077,23 @@ mod tests {
             let field = fields(1, field_type, capabilities).pop().unwrap();
             assert_eq!(field.components, expected);
         }
+    }
+
+    #[test]
+    fn date_format_is_semantic_and_date_rejects_aggregate() {
+        let mut iso = admission_schema(
+            1,
+            FieldType::Date,
+            FieldCapabilities::EXACT.union(FieldCapabilities::FACET),
+            false,
+        );
+        iso.validate().unwrap();
+        let mut custom = iso.clone();
+        custom.fields[0].date_format = Some(DateFormat::Strftime("%Y-%m-%d".into()));
+        assert_ne!(iso.fingerprint().unwrap(), custom.fingerprint().unwrap());
+
+        iso.fields[0].capabilities = FieldCapabilities::AGGREGATE;
+        assert!(iso.fields[0].compiled_components().is_err());
     }
 
     #[test]

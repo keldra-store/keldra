@@ -164,6 +164,8 @@ impl StateMachine {
         }
         let (finished, active_placement_changed) = match transition.kind {
             MembershipTransitionKind::Add => {
+                let active_protocol_version = self.cluster_control.active_protocol_version;
+                let active_storage_format = self.cluster_control.active_storage_format;
                 let descriptor = self
                     .cluster_control
                     .nodes
@@ -175,6 +177,14 @@ impl StateMachine {
                 }
                 match descriptor.state {
                     NodeState::Joining => {
+                        if !range_contains(descriptor.supported_protocol, active_protocol_version)
+                            || !range_contains(
+                                descriptor.supported_storage_format,
+                                active_storage_format,
+                            )
+                        {
+                            return Err(ApplyError::ActiveNodeLacksCapability);
+                        }
                         descriptor.state = NodeState::Active;
                         descriptor.join_capability_hash = None;
                         (false, true)
@@ -432,6 +442,84 @@ impl StateMachine {
         Ok(ApplyResult::ErasureCodeProfileBound(profile))
     }
 
+    pub(crate) fn update_node_capabilities(
+        &mut self,
+        format_version: u16,
+        node_id: NodeId,
+        expected_protocol: CapabilityRange,
+        expected_storage: CapabilityRange,
+        replacement_protocol: CapabilityRange,
+        replacement_storage: CapabilityRange,
+    ) -> Result<ApplyResult, ApplyError> {
+        self.require_cluster_control(format_version)?;
+        self.require_node_not_transitioning(node_id)?;
+        validate_capability_range(expected_protocol)?;
+        validate_capability_range(expected_storage)?;
+        validate_capability_range(replacement_protocol)?;
+        validate_capability_range(replacement_storage)?;
+        let descriptor = self.active_descriptor_mut(node_id)?;
+        if descriptor.supported_protocol == replacement_protocol
+            && descriptor.supported_storage_format == replacement_storage
+        {
+            return Ok(ApplyResult::NodeCapabilitiesUpdated(descriptor.clone()));
+        }
+        if descriptor.supported_protocol != expected_protocol
+            || descriptor.supported_storage_format != expected_storage
+        {
+            return Err(ApplyError::NodeCapabilityCasMismatch { node_id });
+        }
+        if replacement_protocol.min > expected_protocol.min
+            || replacement_protocol.max < expected_protocol.max
+            || replacement_storage.min > expected_storage.min
+            || replacement_storage.max < expected_storage.max
+        {
+            return Err(ApplyError::NodeCapabilitiesRegressed { node_id });
+        }
+        descriptor.supported_protocol = replacement_protocol;
+        descriptor.supported_storage_format = replacement_storage;
+        Ok(ApplyResult::NodeCapabilitiesUpdated(descriptor.clone()))
+    }
+
+    pub(crate) fn activate_cluster_capabilities(
+        &mut self,
+        format_version: u16,
+        protocol_version: u16,
+        storage_format: u16,
+        expected_active_placement_log_id: LogId<u64>,
+    ) -> Result<ApplyResult, ApplyError> {
+        self.require_cluster_control(format_version)?;
+        if protocol_version == 0 || storage_format == 0 {
+            return Err(ApplyError::InvalidActivatedCapabilities);
+        }
+        if self.cluster_control.transition.is_some()
+            || self.preparing_batch().is_some()
+            || self.unfinalized_commit_len() != 0
+        {
+            return Err(ApplyError::ClusterCapabilitiesNotQuiescent);
+        }
+        if self.cluster_control.active_placement_log_id != Some(expected_active_placement_log_id) {
+            return Err(ApplyError::ClusterCapabilityPlacementMismatch);
+        }
+        if protocol_version < self.cluster_control.active_protocol_version
+            || storage_format < self.cluster_control.active_storage_format
+        {
+            return Err(ApplyError::ClusterCapabilitiesRegressed);
+        }
+        if self.cluster_control.nodes.values().any(|descriptor| {
+            descriptor.state == NodeState::Active
+                && (!range_contains(descriptor.supported_protocol, protocol_version)
+                    || !range_contains(descriptor.supported_storage_format, storage_format))
+        }) {
+            return Err(ApplyError::ActiveNodeLacksCapability);
+        }
+        self.cluster_control.active_protocol_version = protocol_version;
+        self.cluster_control.active_storage_format = storage_format;
+        Ok(ApplyResult::ClusterCapabilitiesActivated {
+            protocol_version,
+            storage_format,
+        })
+    }
+
     fn require_cluster_control(&self, format_version: u16) -> Result<(), ApplyError> {
         if format_version != CLUSTER_CONTROL_COMMAND_VERSION {
             return Err(ApplyError::UnsupportedClusterControlVersion {
@@ -471,6 +559,10 @@ impl StateMachine {
         }
         Ok(descriptor)
     }
+}
+
+fn range_contains(range: CapabilityRange, version: u16) -> bool {
+    range.min <= version && version <= range.max
 }
 
 fn validate_descriptor(descriptor: &NodeDescriptor) -> Result<(), ApplyError> {

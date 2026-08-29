@@ -18,10 +18,130 @@ pub const SMALL_BLOB_MAX_BYTES: usize = 64 * 1024;
 pub struct VersionId(pub u64);
 
 pub const MUTATION_STAMP_FORMAT: u16 = 1;
-pub const OBJECT_MUTATION_FORMAT: u16 = 2;
+pub const LEGACY_OBJECT_MUTATION_FORMAT: u16 = 2;
+pub const OBJECT_MUTATION_FORMAT: u16 = 3;
 pub const RETAINED_VERSION_DELETE_FORMAT: u16 = 1;
 pub const MAX_OBJECT_MUTATION_REFERENCE_DELTAS: usize = 2;
 pub const MAX_CONTENT_TYPE_BYTES: usize = 512;
+
+pub const OBJECT_ALIAS_REGISTRY_FORMAT: u16 = 1;
+pub const OBJECT_ALIAS_REGISTRY_TRANSITION_FORMAT: u16 = 1;
+
+/// Target-local protected alias authority. Its revision is independent of
+/// public object versions and advances exactly once per committed Link/Unlink
+/// transition. The canonical hash binds its one persistent encoding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectAliasRegistry {
+    pub format: u16,
+    pub revision: u64,
+    pub aliases: Vec<String>,
+    pub program_commit_cursor: Option<u64>,
+}
+
+impl ObjectAliasRegistry {
+    pub fn validate(&self, canonical_path: &str) -> Result<(), MutationError> {
+        self.validate_structure()?;
+        if self.aliases.iter().any(|alias| alias == canonical_path) {
+            return Err(MutationError::InvalidObjectMutation(
+                "object alias registry contains its canonical target".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> Result<(), MutationError> {
+        if self.format != OBJECT_ALIAS_REGISTRY_FORMAT
+            || self.revision == 0
+            || self.program_commit_cursor.is_none_or(|cursor| cursor == 0)
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "object alias registry identity is malformed".into(),
+            ));
+        }
+        if self.aliases.is_empty()
+            || self.aliases.len() > crate::MAX_INBOUND_OBJECT_LINKS
+            || self.aliases.len().saturating_add(1) > crate::MAX_ATOMIC_BATCH_MUTATIONS
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "object alias registry exceeds the bounded logical mutation size".into(),
+            ));
+        }
+        let mut previous: Option<&str> = None;
+        for alias in &self.aliases {
+            validate_exact_path(alias)?;
+            if crate::key::contains_reserved_keldra_segment(alias)
+                || previous.is_some_and(|prior| prior >= alias.as_str())
+            {
+                return Err(MutationError::InvalidObjectMutation(
+                    "object alias registry paths must be sorted, unique, ordinary aliases".into(),
+                ));
+            }
+            previous = Some(alias);
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, MutationError> {
+        self.validate_structure()?;
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&self.format.to_be_bytes());
+        encoded.extend_from_slice(&self.revision.to_be_bytes());
+        encoded.extend_from_slice(
+            &self
+                .program_commit_cursor
+                .expect("validated program cursor")
+                .to_be_bytes(),
+        );
+        encoded.extend_from_slice(&(self.aliases.len() as u32).to_be_bytes());
+        for alias in &self.aliases {
+            encoded.extend_from_slice(&(alias.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(alias.as_bytes());
+        }
+        Ok(encoded)
+    }
+
+    pub fn canonical_hash(&self) -> Result<[u8; 32], MutationError> {
+        Ok(*blake3::hash(&self.canonical_bytes()?).as_bytes())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectAliasSnapshot {
+    pub registry: ObjectAliasRegistry,
+    pub canonical_version: Version,
+}
+
+impl ObjectAliasSnapshot {
+    pub fn validate(&self, canonical_path: &str) -> Result<(), MutationError> {
+        self.registry.validate(canonical_path)?;
+        validate_version_descriptor(&self.canonical_version)?;
+        if self.canonical_version.deleted || self.canonical_version.protected_link_descriptor {
+            return Err(MutationError::InvalidObjectMutation(
+                "object alias snapshot canonical version is malformed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectAliasRegistryTransition {
+    pub format: u16,
+    pub commit_cursor: u64,
+    pub expected_hash: Option<[u8; 32]>,
+    pub replacement_hash: Option<[u8; 32]>,
+}
+
+impl ObjectAliasRegistryTransition {
+    pub fn validate(&self) -> Result<(), MutationError> {
+        if self.format != OBJECT_ALIAS_REGISTRY_TRANSITION_FORMAT || self.commit_cursor == 0 {
+            return Err(MutationError::InvalidObjectMutation(
+                "object alias registry transition is malformed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Consensus-neutral identity of the Raft entry that activated one placement
 /// view. It is the complete OpenRaft LogId shape without coupling the store to
@@ -66,6 +186,10 @@ pub struct Version {
     pub content_type: Option<String>,
     pub deleted: bool,
     pub committed_at_unix_millis: u64,
+    /// True only for a version produced by the sealed built-in link-descriptor
+    /// authority. Released descriptors omit this field and remain ordinary.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub protected_link_descriptor: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +267,20 @@ pub struct PublishRequest {
     pub durability: Durability,
 }
 
+/// Publishes a new independent destination object from one exact source
+/// version while retaining only the source's immutable content identity.
+#[derive(Clone, Debug)]
+pub struct CloneRequest {
+    pub source: ObjectKey,
+    pub source_version: VersionId,
+    pub destination: ObjectKey,
+    pub blob: BlobRef,
+    pub content_type: Option<String>,
+    pub mode: PutMode,
+    pub command_id: Option<String>,
+    pub durability: Durability,
+}
+
 #[derive(Clone, Debug)]
 pub struct DeleteRequest {
     pub key: ObjectKey,
@@ -155,6 +293,7 @@ pub struct DeleteRequest {
 pub enum BatchOperation {
     Put(PutRequest),
     Publish(PublishRequest),
+    Clone(CloneRequest),
     Delete(DeleteRequest),
 }
 
@@ -223,6 +362,8 @@ pub struct ObjectMutation {
     pub accounting_transition: Option<crate::AccountingHeadTransition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition_transition: Option<DefinitionTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_snapshot: Option<ObjectAliasSnapshot>,
 }
 
 impl ObjectMutation {
@@ -232,7 +373,10 @@ impl ObjectMutation {
 
     pub fn computed_fingerprint(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"keldra.object-mutation.v2");
+        hasher.update(match self.format {
+            LEGACY_OBJECT_MUTATION_FORMAT => b"keldra.object-mutation.v2",
+            _ => b"keldra.object-mutation.v3",
+        });
         hash_u16(&mut hasher, self.format);
         hash_u64(&mut hasher, self.tenant_id);
         hash_u64(&mut hasher, self.bucket_id);
@@ -240,6 +384,9 @@ impl ObjectMutation {
         hash_bytes(&mut hasher, self.command_id.as_bytes());
         hasher.update(&self.input_fingerprint);
         hash_version(&mut hasher, &self.version);
+        if self.format == OBJECT_MUTATION_FORMAT {
+            hasher.update(&[u8::from(self.version.protected_link_descriptor)]);
+        }
         hash_u64(&mut hasher, self.receipt_expires_at_unix_millis);
         hash_u16(&mut hasher, self.stamp.format);
         hash_optional_version(&mut hasher, self.stamp.predecessor_version);
@@ -275,15 +422,39 @@ impl ObjectMutation {
                 hasher.update(&[0]);
             }
         }
+        match self.alias_snapshot.as_ref() {
+            Some(snapshot) => {
+                hasher.update(b"keldra.object-alias-snapshot.v1");
+                hash_bytes(
+                    &mut hasher,
+                    &snapshot.registry.canonical_bytes().unwrap_or_default(),
+                );
+                hash_version(&mut hasher, &snapshot.canonical_version);
+            }
+            None => {}
+        }
         *hasher.finalize().as_bytes()
     }
 
     pub fn validate(&self) -> Result<(), MutationError> {
-        if self.format != OBJECT_MUTATION_FORMAT {
+        if !matches!(
+            self.format,
+            LEGACY_OBJECT_MUTATION_FORMAT | OBJECT_MUTATION_FORMAT
+        ) {
             return Err(MutationError::InvalidObjectMutation(format!(
                 "unsupported object mutation format {}",
                 self.format
             )));
+        }
+        if self.format == LEGACY_OBJECT_MUTATION_FORMAT && self.alias_snapshot.is_some() {
+            return Err(MutationError::InvalidObjectMutation(
+                "legacy object mutation carries an alias snapshot".into(),
+            ));
+        }
+        if self.format == OBJECT_MUTATION_FORMAT && self.alias_snapshot.is_none() {
+            return Err(MutationError::InvalidObjectMutation(
+                "alias-aware object mutation is missing its alias snapshot".into(),
+            ));
         }
         if self.stamp.format != MUTATION_STAMP_FORMAT {
             return Err(MutationError::InvalidObjectMutation(format!(
@@ -307,6 +478,7 @@ impl ObjectMutation {
         }
         if self.version.id.0 == 0
             || self.version.deleted != self.version.blob.is_none()
+            || self.version.protected_link_descriptor
             || self
                 .version
                 .content_type
@@ -398,6 +570,30 @@ impl ObjectMutation {
             {
                 return Err(MutationError::InvalidObjectMutation(
                     "definition transition does not match its enclosing object mutation".into(),
+                ));
+            }
+        }
+        if let Some(snapshot) = self.alias_snapshot.as_ref() {
+            snapshot.validate(&self.exact_path)?;
+            if self
+                .stamp
+                .source_journal_position
+                .checked_add(snapshot.registry.aliases.len() as u64)
+                .is_none()
+            {
+                return Err(MutationError::InvalidObjectMutation(
+                    "object alias journal range is exhausted".into(),
+                ));
+            }
+            if snapshot.canonical_version.id
+                != self.stamp.predecessor_version.ok_or_else(|| {
+                    MutationError::InvalidObjectMutation(
+                        "object alias snapshot requires an exact canonical predecessor".into(),
+                    )
+                })?
+            {
+                return Err(MutationError::InvalidObjectMutation(
+                    "object alias snapshot differs from mutation lineage".into(),
                 ));
             }
         }
@@ -500,6 +696,16 @@ impl RetainedVersionDeleteMutation {
         ObjectKey::new("typed", "delete-version", &self.exact_path)
             .map_err(|error| MutationError::InvalidObjectMutation(error.to_string()))?;
         validate_version_descriptor(&self.target)?;
+        if self.target.protected_link_descriptor
+            || self
+                .replacement_tombstone
+                .as_ref()
+                .is_some_and(|version| version.protected_link_descriptor)
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "ordinary retained-version deletion names a protected link descriptor".into(),
+            ));
+        }
         if self.expected_head.version.0 == 0
             || self.stamp.format != MUTATION_STAMP_FORMAT
             || self.stamp.predecessor_version != Some(self.expected_head.version)
@@ -688,6 +894,10 @@ pub enum MutationError {
     ImmutablePolicyRequired,
     #[error("ordinary mutation cannot write a PROGRAM_ONLY path")]
     ProgramConcurrencyViolation,
+    #[error("path is reserved by atomic preparation at Raft cursor {begin_cursor}")]
+    AtomicReservationConflict { begin_cursor: u64 },
+    #[error("object target has inbound aliases")]
+    ObjectHasInboundAliases,
     #[error("command id was reused with different input")]
     IdempotencyConflict,
     #[error("invalid command id")]
@@ -805,7 +1015,7 @@ fn hash_head(hasher: &mut blake3::Hasher, head: &Head) {
     }
 }
 
-fn validate_version_descriptor(version: &Version) -> Result<(), MutationError> {
+pub(crate) fn validate_version_descriptor(version: &Version) -> Result<(), MutationError> {
     if version.id.0 == 0
         || version.deleted != version.blob.is_none()
         || version
@@ -813,12 +1023,19 @@ fn validate_version_descriptor(version: &Version) -> Result<(), MutationError> {
             .as_ref()
             .is_some_and(|value| value.len() > MAX_CONTENT_TYPE_BYTES)
         || version.deleted && version.content_type.is_some()
+        || version.protected_link_descriptor
+            && (version.deleted
+                || version.content_type.as_deref() != Some(crate::OBJECT_LINK_CONTENT_TYPE))
     {
         return Err(MutationError::InvalidObjectMutation(
             "version descriptor is malformed".into(),
         ));
     }
     Ok(())
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn hash_blob(hasher: &mut blake3::Hasher, blob: &BlobRef) {
@@ -947,5 +1164,52 @@ mod tests {
         }
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn alias_snapshot_uses_provenance_not_mime_to_reject_a_canonical_target() {
+        let registry = ObjectAliasRegistry {
+            format: OBJECT_ALIAS_REGISTRY_FORMAT,
+            revision: 1,
+            aliases: vec!["alias".into()],
+            program_commit_cursor: Some(1),
+        };
+        let historical_mime = Version {
+            id: VersionId(1),
+            blob: Some(BlobRef {
+                hash: [1; 32],
+                length: 1,
+            }),
+            content_type: Some(crate::OBJECT_LINK_CONTENT_TYPE.into()),
+            deleted: false,
+            committed_at_unix_millis: 1,
+            protected_link_descriptor: false,
+        };
+        ObjectAliasSnapshot {
+            registry: registry.clone(),
+            canonical_version: historical_mime,
+        }
+        .validate("target")
+        .unwrap();
+
+        let protected = Version {
+            id: VersionId(2),
+            blob: Some(BlobRef {
+                hash: [2; 32],
+                length: 1,
+            }),
+            content_type: Some(crate::OBJECT_LINK_CONTENT_TYPE.into()),
+            deleted: false,
+            committed_at_unix_millis: 2,
+            protected_link_descriptor: true,
+        };
+        assert!(matches!(
+            ObjectAliasSnapshot {
+                registry,
+                canonical_version: protected,
+            }
+            .validate("target"),
+            Err(MutationError::InvalidObjectMutation(_))
+        ));
     }
 }

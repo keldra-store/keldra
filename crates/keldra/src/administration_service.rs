@@ -6,9 +6,9 @@ use std::sync::Arc;
 use keldra_api::v1 as api;
 use keldra_api::v1::administration_service_server::AdministrationService;
 use keldra_consensus::{
-    ApplyError, ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, Command,
-    DecisionRaft, DecisionRaftError, MAX_PEER_ADDRESS_BYTES, MembershipTransitionKind,
-    NodeDescriptor, NodeId, NodeState, PeerAddress, StateMachine,
+    ApplyError, ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, Command, DecisionRaft,
+    DecisionRaftError, MAX_PEER_ADDRESS_BYTES, MembershipTransitionKind, NodeDescriptor, NodeId,
+    NodeState, PeerAddress, StateMachine,
 };
 use keldra_store::{
     ApplicationCredentialRequest, ApplicationRoleTarget, AuthzStoreError, BucketApplicationRole,
@@ -21,12 +21,13 @@ use tonic::{Request, Response, Status};
 
 use crate::authentication::Caller;
 use crate::authorization::{StorageTenantPermission, SystemAuthorizer};
+use crate::cluster_capabilities::{
+    GENERALIZED_ATOMIC_PEER_PROTOCOL_VERSION, GENERALIZED_ATOMIC_STORAGE_FORMAT_VERSION,
+    PEER_PROTOCOL_CAPABILITY, STORAGE_FORMAT_CAPABILITY, range_contains,
+};
 use crate::distributed_control_plane::DistributedControlPlane;
 use crate::distributed_list::OriginalBearer;
 use crate::join_bundle::{self, JoinBundle, JoinBundleError, JoinSeed};
-
-const PEER_PROTOCOL_VERSION: u16 = 1;
-const STORAGE_FORMAT_VERSION: u16 = 1;
 
 #[derive(Clone)]
 pub(crate) struct AdministrationServiceImpl {
@@ -60,6 +61,80 @@ impl AdministrationServiceImpl {
 
 #[tonic::async_trait]
 impl AdministrationService for AdministrationServiceImpl {
+    async fn get_cluster_capabilities(
+        &self,
+        request: Request<api::GetClusterCapabilitiesRequest>,
+    ) -> Result<Response<api::ClusterCapabilities>, Status> {
+        let caller = caller(&request)?;
+        self.authorize_capability_management(&caller).await?;
+        let state = self.decisions.state().map_err(decision_status)?;
+        Ok(Response::new(cluster_capabilities(&state)?))
+    }
+
+    async fn activate_cluster_capabilities(
+        &self,
+        request: Request<api::ActivateClusterCapabilitiesRequest>,
+    ) -> Result<Response<api::ClusterCapabilities>, Status> {
+        let caller = caller(&request)?;
+        self.authorize_capability_management(&caller).await?;
+        let request = request.into_inner();
+        let protocol_version = u16::try_from(request.protocol_version)
+            .map_err(|_| Status::invalid_argument("protocol version exceeds u16"))?;
+        let storage_format = u16::try_from(request.storage_format)
+            .map_err(|_| Status::invalid_argument("storage format exceeds u16"))?;
+        if !range_contains(PEER_PROTOCOL_CAPABILITY, protocol_version)
+            || !range_contains(STORAGE_FORMAT_CAPABILITY, storage_format)
+        {
+            return Err(Status::invalid_argument(
+                "requested capability is not supported by this server",
+            ));
+        }
+        if request.expected_placement_term == 0 || request.expected_placement_index == 0 {
+            return Err(Status::invalid_argument(
+                "expected placement term and index must be non-zero",
+            ));
+        }
+        self.decisions
+            .confirm_leadership()
+            .await
+            .map_err(decision_status)?;
+        let state = self.decisions.state().map_err(decision_status)?;
+        let expected_active_placement_log_id = state
+            .cluster_control()
+            .active_placement_log_id()
+            .ok_or_else(|| Status::failed_precondition("active placement is unavailable"))?;
+        if expected_active_placement_log_id.leader_id.term != request.expected_placement_term
+            || expected_active_placement_log_id.index != request.expected_placement_index
+        {
+            return Err(Status::failed_precondition(
+                "active placement differs from the requested capability fence",
+            ));
+        }
+        let committed = self
+            .decisions
+            .submit(Command::ActivateClusterCapabilities {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                protocol_version,
+                storage_format,
+                expected_active_placement_log_id,
+            })
+            .await
+            .map_err(decision_status)?;
+        if !matches!(
+            committed.result,
+            ApplyResult::ClusterCapabilitiesActivated {
+                protocol_version: committed_protocol,
+                storage_format: committed_storage,
+            } if committed_protocol == protocol_version && committed_storage == storage_format
+        ) {
+            return Err(Status::internal(
+                "capability activation returned an unexpected result",
+            ));
+        }
+        let state = self.decisions.state().map_err(decision_status)?;
+        Ok(Response::new(cluster_capabilities(&state)?))
+    }
+
     async fn prepare_node(
         &self,
         request: Request<api::PrepareNodeRequest>,
@@ -570,6 +645,64 @@ impl AdministrationService for AdministrationServiceImpl {
 }
 
 impl AdministrationServiceImpl {
+    async fn authorize_capability_management(&self, caller: &Caller) -> Result<(), Status> {
+        if let Some(distributed) = self.distributed.as_ref() {
+            distributed.authorize_cluster_capabilities(caller).await
+        } else {
+            let authorizer = self.system_authorizer.clone();
+            let caller = caller.clone();
+            run(move || {
+                let system = authorizer.load().map_err(authz_status)?;
+                require_allowed(
+                    system
+                        .allows_manage_system(caller.subject())
+                        .map_err(authz_evaluation_status)?,
+                    "cluster capability management is not authorized",
+                )
+            })
+            .await
+        }
+    }
+}
+
+fn cluster_capabilities(state: &StateMachine) -> Result<api::ClusterCapabilities, Status> {
+    let placement = state
+        .cluster_control()
+        .active_placement_log_id()
+        .ok_or_else(|| Status::failed_precondition("active placement is unavailable"))?;
+    let blocking_active_node_ids = state
+        .cluster_control()
+        .nodes()
+        .values()
+        .filter(|descriptor| {
+            descriptor.state == NodeState::Active
+                && (!range_contains(
+                    descriptor.supported_protocol,
+                    GENERALIZED_ATOMIC_PEER_PROTOCOL_VERSION,
+                ) || !range_contains(
+                    descriptor.supported_storage_format,
+                    GENERALIZED_ATOMIC_STORAGE_FORMAT_VERSION,
+                ))
+        })
+        .map(|descriptor| descriptor.node_id.0)
+        .collect::<Vec<_>>();
+    let activation_quiescent = state.cluster_control().transition().is_none()
+        && state.preparing_batch().is_none()
+        && state.unfinalized_commit_len() == 0;
+    Ok(api::ClusterCapabilities {
+        active_protocol_version: u32::from(state.cluster_control().active_protocol_version()),
+        active_storage_format: u32::from(state.cluster_control().active_storage_format()),
+        target_protocol_version: u32::from(GENERALIZED_ATOMIC_PEER_PROTOCOL_VERSION),
+        target_storage_format: u32::from(GENERALIZED_ATOMIC_STORAGE_FORMAT_VERSION),
+        active_placement_term: placement.leader_id.term,
+        active_placement_index: placement.index,
+        ready_for_target_activation: blocking_active_node_ids.is_empty() && activation_quiescent,
+        blocking_active_node_ids,
+        activation_quiescent,
+    })
+}
+
+impl AdministrationServiceImpl {
     async fn change_application_role(
         &self,
         request: Request<api::ApplicationRoleRequest>,
@@ -772,16 +905,8 @@ fn preflight_node_preparation(
         }
         if &existing.peer_address != peer_address
             || existing.storage_weight_millionths != storage_weight_millionths
-            || existing.supported_protocol
-                != (CapabilityRange {
-                    min: PEER_PROTOCOL_VERSION,
-                    max: PEER_PROTOCOL_VERSION,
-                })
-            || existing.supported_storage_format
-                != (CapabilityRange {
-                    min: STORAGE_FORMAT_VERSION,
-                    max: STORAGE_FORMAT_VERSION,
-                })
+            || existing.supported_protocol != PEER_PROTOCOL_CAPABILITY
+            || existing.supported_storage_format != STORAGE_FORMAT_CAPABILITY
             || existing.overlap_peer_spki_sha256.is_some()
             || existing.join_capability_hash.is_none()
         {
@@ -904,14 +1029,8 @@ fn joining_descriptor(bundle: &JoinBundle) -> Result<NodeDescriptor, Status> {
         current_peer_spki_sha256: bundle.peer_spki_sha256().map_err(join_bundle_status)?,
         overlap_peer_spki_sha256: None,
         join_capability_hash: Some(bundle.capability_hash()),
-        supported_protocol: CapabilityRange {
-            min: PEER_PROTOCOL_VERSION,
-            max: PEER_PROTOCOL_VERSION,
-        },
-        supported_storage_format: CapabilityRange {
-            min: STORAGE_FORMAT_VERSION,
-            max: STORAGE_FORMAT_VERSION,
-        },
+        supported_protocol: PEER_PROTOCOL_CAPABILITY,
+        supported_storage_format: STORAGE_FORMAT_CAPABILITY,
     })
 }
 

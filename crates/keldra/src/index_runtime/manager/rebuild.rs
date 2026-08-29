@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
+use std::io::Read;
 use std::sync::Arc;
 
 use keldra_store::Head;
@@ -638,14 +639,9 @@ async fn process_snapshot_frame(
             }
             return Err(error);
         }
-        if !source_matches_definition(
-            &definition.stored,
-            &head.exact_path,
-            head.version.content_type.as_deref(),
-        ) {
+        let Some(source) = rebuild_source(definition, barrier, head, dependencies).await? else {
             continue;
-        }
-        let source = IndexSourceMutation::Upsert(build_object(&head.exact_path, &head.version)?);
+        };
         source_payload_bytes = source_payload_bytes
             .checked_add(source_payload_bytes_for(&definition.schema, &source))
             .ok_or_else(|| Status::resource_exhausted("index source payload bytes overflow"))?;
@@ -668,6 +664,96 @@ async fn process_snapshot_frame(
         project_snapshot_batch(definition, plan, batch, builder, candidate, dependencies).await?;
     }
     Ok(source_payload_bytes)
+}
+
+async fn rebuild_source(
+    definition: &CatalogDefinition,
+    barrier: &IndexBarrier,
+    head: IndexSourceSnapshotHead,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<Option<IndexSourceMutation>, Status> {
+    if !head.version.protected_link_descriptor {
+        return source_matches_definition(
+            &definition.stored,
+            &head.exact_path,
+            head.version.content_type.as_deref(),
+        )
+        .then(|| build_object(&head.exact_path, &head.version))
+        .transpose()
+        .map(|value| value.map(IndexSourceMutation::Upsert));
+    }
+    if !crate::index_service::path_matches_prefix(&head.exact_path, &definition.stored.path_prefix)
+    {
+        return Ok(None);
+    }
+    let alias = ObjectKey::new(
+        &definition.stored.tenant,
+        &definition.stored.bucket,
+        &head.exact_path,
+    )
+    .map_err(|error| Status::data_loss(error.to_string()))?;
+    let opened = dependencies
+        .reader
+        .open(&alias, Some(head.version.id))
+        .await?
+        .ok_or_else(|| Status::unavailable("index rebuild link descriptor changed"))?;
+    if !opened.version.protected_link_descriptor
+        || opened.version.content_type.as_deref() != Some(keldra_store::OBJECT_LINK_CONTENT_TYPE)
+    {
+        return Err(Status::data_loss(
+            "index rebuild protected link descriptor metadata changed",
+        ));
+    }
+    let mut payload = opened
+        .payload
+        .ok_or_else(|| Status::data_loss("index rebuild link descriptor has no payload"))?
+        .into_spool();
+    let mut bytes = Vec::new();
+    payload
+        .read_to_end(&mut bytes)
+        .map_err(|error| Status::internal(format!("read index rebuild link: {error}")))?;
+    let descriptor = keldra_store::ObjectLinkDescriptor::decode(&bytes)
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+    let target = ObjectKey::new(alias.tenant(), alias.bucket(), descriptor.target_path())
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+    let current = dependencies
+        .reader
+        .current_head_snapshot_stable(&target, definition.tenant_id, definition.bucket_id)
+        .await?
+        .filter(|current| !current.head.deleted && !current.version.deleted)
+        .ok_or_else(|| Status::unavailable("index rebuild link target changed"))?;
+    require_visible_head(&current.head, barrier)?;
+    if current.version.protected_link_descriptor {
+        return Err(Status::data_loss("index rebuild encountered a link chain"));
+    }
+    let registry = current
+        .alias_registry
+        .as_ref()
+        .ok_or_else(|| Status::unavailable("index rebuild link target sidecar changed"))?;
+    registry
+        .validate(target.path())
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+    if !barrier.atomic.permits(registry.program_commit_cursor)
+        || registry
+            .aliases
+            .binary_search_by(|path| path.as_str().cmp(alias.path()))
+            .is_err()
+    {
+        return Err(Status::unavailable(
+            "index rebuild link sidecar is not visible at the captured barrier",
+        ));
+    }
+    if !source_matches_definition(
+        &definition.stored,
+        alias.path(),
+        current.version.content_type.as_deref(),
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(IndexSourceMutation::Upsert(build_object(
+        alias.path(),
+        &current.version,
+    )?)))
 }
 
 fn skip_post_baseline_head(error: &Status, resumed_from_durable_root: bool) -> bool {
@@ -1266,6 +1352,24 @@ pub(super) fn measure_snapshot_frame(
                         .as_ref()
                         .map_or(0, String::capacity),
                 )
+            })
+            .and_then(|bytes| {
+                head.alias_registry
+                    .as_ref()
+                    .map_or(Some(bytes), |registry| {
+                        bytes
+                            .checked_add(
+                                registry
+                                    .aliases
+                                    .capacity()
+                                    .checked_mul(std::mem::size_of::<String>())?,
+                            )
+                            .and_then(|bytes| {
+                                registry.aliases.iter().try_fold(bytes, |bytes, alias| {
+                                    bytes.checked_add(alias.capacity())
+                                })
+                            })
+                    })
             })
             .ok_or_else(|| Status::resource_exhausted("index snapshot resident overflow"))?;
     }

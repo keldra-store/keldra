@@ -26,6 +26,7 @@ mod journal_route;
 mod key;
 mod logical_record;
 mod model;
+mod object_link;
 mod program;
 mod reference_delta;
 mod store;
@@ -49,7 +50,7 @@ pub use authz::{
     SYSTEM_STORAGE_TENANT_ID, SchemaDigest, SchemaId, SchemaRef, StorageTenantId,
     TupleBatchReceipt, TupleBatchRequest, TupleMutation, TupleMutationKind,
 };
-pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobStore, BlobUpload};
+pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobUpload};
 pub use blob_gc::{BlobGcBudget, BlobGcCursor, BlobGcTick};
 pub use bootstrap::{
     ApplicationCredential, ApplicationCredentialRequest, ApplicationRoleTarget,
@@ -95,24 +96,40 @@ pub use logical_record::{
     MAX_LOGICAL_RECORD_EXPORT_BYTES, MAX_LOGICAL_RECORD_EXPORT_RECORDS,
 };
 pub use model::{
-    BatchOperation, BatchOutcome, BucketPolicy, CoordinatedObjectMutation,
+    BatchOperation, BatchOutcome, BucketPolicy, CloneRequest, CoordinatedObjectMutation,
     CoordinatedRetainedVersionDelete, DeleteRequest, DeleteRetainedVersionOutcome, Durability,
-    Head, MAX_BUCKET_POLICY_PREFIX_BYTES, MAX_BUCKET_POLICY_PREFIXES, MAX_CONTENT_TYPE_BYTES,
-    MAX_OBJECT_MUTATION_REFERENCE_DELTAS, MUTATION_STAMP_FORMAT, MutationError, MutationReceipt,
-    MutationStamp, OBJECT_MUTATION_FORMAT, Object, ObjectMutation, ObjectMutationContext,
-    ObjectMutationGovernance, ObjectVersioning, PlacementLogId, Precondition, PublishRequest,
-    PutMode, PutRequest, RETAINED_VERSION_DELETE_FORMAT, ReplicaObjectMutationApplied,
+    Head, LEGACY_OBJECT_MUTATION_FORMAT, MAX_BUCKET_POLICY_PREFIX_BYTES,
+    MAX_BUCKET_POLICY_PREFIXES, MAX_CONTENT_TYPE_BYTES, MAX_OBJECT_MUTATION_REFERENCE_DELTAS,
+    MUTATION_STAMP_FORMAT, MutationError, MutationReceipt, MutationStamp,
+    OBJECT_ALIAS_REGISTRY_FORMAT, OBJECT_ALIAS_REGISTRY_TRANSITION_FORMAT, OBJECT_MUTATION_FORMAT,
+    Object, ObjectAliasRegistry, ObjectAliasRegistryTransition, ObjectAliasSnapshot,
+    ObjectMutation, ObjectMutationContext, ObjectMutationGovernance, ObjectVersioning,
+    PlacementLogId, Precondition, PublishRequest, PutMode, PutRequest,
+    RETAINED_VERSION_DELETE_FORMAT, ReplicaObjectMutationApplied,
     ReplicaRetainedVersionDeleteApplied, RetainedVersionDeleteMutation, SMALL_BLOB_MAX_BYTES,
     Version, VersionId,
 };
+pub use object_link::{
+    MAX_INBOUND_OBJECT_LINKS, OBJECT_LINK_CONTENT_TYPE, ObjectLinkDescriptor, ObjectLinkError,
+    ResolvedObjectLink, is_object_link_content_type, object_link_command_fingerprint,
+    resolve_descriptor,
+};
 pub use program::{
-    AppliedProgramCommit, CommittedProgramResult, CoordinatedProgramPathFinalization,
-    PreparedBundleHash, PreparedBundleRef, PreparedProgramBundle, PreparedProgramRecord,
-    PreparedProgramWrite, ProgramCommit, ProgramDurabilityClassHash, ProgramDurabilityEvidence,
-    ProgramDurabilityEvidenceHash, ProgramDurabilityScope, ProgramExecutionLease, ProgramHash,
-    ProgramPathMutation, ProgramPathStage, ProgramStoreError, PublishedProgramVersion,
+    AppliedProgramCommit, BuiltInAliasObservation, BuiltInAliasRegistryAccess,
+    BuiltInObjectTransactionPlan, BuiltInReadProof, BuiltInTransactionAssertion,
+    BuiltInVersionWrite, BuiltInWritePayload, CommittedProgramResult,
+    CoordinatedProgramPathFinalization, ExistingReferenceWrite,
+    PROGRAM_PARTICIPANT_MANIFEST_FORMAT, PROGRAM_PATH_RESERVATION_FORMAT, PreparedBundleHash,
+    PreparedBundleRef, PreparedProgramBundle, PreparedProgramRecord, PreparedProgramWrite,
+    ProgramAliasBinding, ProgramAliasRegistryCondition, ProgramAliasRegistryMutation,
+    ProgramAliasRegistryStage, ProgramBundleAuthority, ProgramCommit, ProgramDurabilityClassHash,
+    ProgramDurabilityEvidence, ProgramDurabilityEvidenceHash, ProgramDurabilityScope,
+    ProgramExecutionLease, ProgramGovernanceParticipant, ProgramGovernanceReservation, ProgramHash,
+    ProgramObjectParticipant, ProgramParticipantIntent, ProgramParticipantManifest,
+    ProgramPathCondition, ProgramPathMutation, ProgramPathReservation, ProgramPathStage,
+    ProgramReservation, ProgramReservationState, ProgramStoreError, PublishedProgramVersion,
     ReplicaProgramPathApplied, SealedAtomicBatchPublication, StoreProgramEngine,
-    VerifiedProgramDefinition, path_stage_from_prepared,
+    VerifiedProgramDefinition, alias_registry_stages_from_prepared, path_stage_from_prepared,
 };
 pub use reference_delta::{
     DestinationReferenceArtifact, DestinationReferenceDelta, ReferenceDelta, ReferenceDeltaApplied,
@@ -121,22 +138,23 @@ pub use reference_delta::{
 pub use store::{
     BatchGetSelection, CompleteCopySealOutcome, CurrentHeadCursor, CurrentObjectSnapshot,
     CurrentObjectSnapshotFrame, CurrentObjectSnapshotPage, CurrentObjectSnapshotScan,
-    DEFAULT_AWAITING_PUBLISH_TTL_SECONDS, DEFAULT_MUTATION_RECEIPT_MAX_BYTES,
-    DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES, DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS,
-    ListObjectsPage, LocalPayloadPresence, MAX_CURRENT_HEAD_SNAPSHOT_BYTES,
-    MAX_CURRENT_HEAD_SNAPSHOT_RECORDS, MAX_LIST_OBJECT_VERSIONS, MAX_LIST_OBJECTS,
-    MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS,
+    DEFAULT_AWAITING_PUBLISH_TTL_SECONDS, DEFAULT_MAX_TOTAL_WAL_BYTES,
+    DEFAULT_MUTATION_RECEIPT_MAX_BYTES, DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES,
+    DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS, ListObjectsPage, LocalPayloadPresence,
+    MAX_CURRENT_HEAD_SNAPSHOT_BYTES, MAX_CURRENT_HEAD_SNAPSHOT_RECORDS, MAX_LIST_OBJECT_VERSIONS,
+    MAX_LIST_OBJECTS, MAX_OBJECT_RECORD_EXPORT_BYTES, MAX_OBJECT_RECORD_EXPORT_RECORDS,
     MAX_PAYLOAD_HANDOFF_EXPORT_RECORDS, MAX_REFERENCE_PROOF_EXPORT_BYTES,
     MAX_REFERENCE_PROOF_EXPORT_RECORDS, MAX_REFERENCE_PROOF_PRUNE_BYTES,
     MAX_REFERENCE_PROOF_PRUNE_RECORDS, MetadataRuntimeMetrics, MutationReceiptRetention,
     ObjectPathSnapshot, ObjectRecordCursor, ObjectRecordExport, ObjectRecordExportPage,
-    ObjectSnapshotApplied, ObjectSnapshotError, OpenedObject, PayloadArtifactCursor,
-    PayloadArtifactIdentity, PayloadArtifactSnapshot, PayloadArtifactSnapshotPage,
-    PayloadArtifactState, PayloadStoreError, ReferenceProofCursor, ReferenceProofExportError,
-    ReferenceProofPage, ReferenceProofPruneError, ReferenceProofPruneResult, RetainedHeadState,
-    RetainedObjectCursor, RetainedObjectSnapshot, RetainedObjectSnapshotFrame,
-    RetainedObjectSnapshotPage, RetainedObjectSnapshotScan, RetainedVersionCursor, ShardIdentity,
-    ShardReader, ShardSealOutcome, ShardStoreError, Store, StoreOptions,
+    ObjectSnapshotApplied, ObjectSnapshotError, OpenedObject, PAYLOAD_ARTIFACT_CHUNK_BYTES,
+    PAYLOAD_BLOB_MIN_BYTES, PayloadArtifactCursor, PayloadArtifactIdentity,
+    PayloadArtifactSnapshot, PayloadArtifactSnapshotPage, PayloadArtifactState, PayloadStoreError,
+    ReferenceProofCursor, ReferenceProofExportError, ReferenceProofPage, ReferenceProofPruneError,
+    ReferenceProofPruneResult, RetainedHeadState, RetainedObjectCursor, RetainedObjectSnapshot,
+    RetainedObjectSnapshotFrame, RetainedObjectSnapshotPage, RetainedObjectSnapshotScan,
+    RetainedVersionCursor, ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError, Store,
+    StoreOptions,
 };
 pub use watch::{
     AccountingHeadTransition, AggregateChanged, AggregateKind, AtomicBatchMutation,

@@ -89,9 +89,9 @@ pub use scan::{
     SortCursor, SortValue,
 };
 pub use schema::{
-    Analyzer, Cardinality, Collation, ComponentVersion, FieldCapabilities, FieldComponents,
-    FieldId, FieldSchema, FieldType, IndexKind, IndexSemantics, OrderDirection, OrderField, Schema,
-    VectorMetric, VectorNormalization,
+    Analyzer, Cardinality, Collation, ComponentVersion, DateFormat, FieldCapabilities,
+    FieldComponents, FieldId, FieldSchema, FieldType, IndexKind, IndexSemantics, OrderDirection,
+    OrderField, Schema, VectorMetric, VectorNormalization,
 };
 pub use segment_reader::SegmentComponentReader;
 pub use statistics::{

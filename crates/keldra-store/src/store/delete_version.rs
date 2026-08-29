@@ -71,6 +71,7 @@ impl Store {
         };
         let _path_guard = self.ordinary_locks.acquire(&[object_path(key)]).await;
         let _commit_guard = self.lock_commit("retained_version_delete").await;
+        self.require_unreserved_object_locked(identity, key.path(), None)?;
         let head_key = identity.head_key(key.path());
         let Some(expected_head) = self.head_by_storage_key(&head_key)? else {
             return Ok(not_found());
@@ -88,8 +89,18 @@ impl Store {
                 "retained version descriptor is malformed".into(),
             ));
         }
+        if target.protected_link_descriptor {
+            return Err(MutationError::InvalidObjectMutation(
+                "ordinary retained-version deletion names a protected link descriptor".into(),
+            ));
+        }
         if expected_head.version == version_id && target.deleted {
             return Err(MutationError::CurrentTombstoneCannotBeDeleted);
+        }
+        if expected_head.version == version_id
+            && self.alias_registry_locked(identity, key.path())?.is_some()
+        {
+            return Err(MutationError::ObjectHasInboundAliases);
         }
 
         let source = self
@@ -106,6 +117,7 @@ impl Store {
                 content_type: None,
                 deleted: true,
                 committed_at_unix_millis: now,
+                protected_link_descriptor: false,
             })
         } else {
             None
@@ -212,6 +224,7 @@ impl Store {
         let key = ObjectKey::new("typed", "delete-version", &mutation.exact_path)
             .map_err(|error| MutationError::InvalidObjectMutation(error.to_string()))?;
         let _commit_guard = self.lock_commit("retained_version_delete").await;
+        self.require_unreserved_object_locked(identity, &mutation.exact_path, None)?;
         let head_key = identity.head_key(&mutation.exact_path);
         let current = self.head_by_storage_key(&head_key)?;
         let replacement_head = mutation
@@ -236,6 +249,13 @@ impl Store {
             }
             true
         } else {
+            if mutation.replacement_tombstone.is_some()
+                && self
+                    .alias_registry_locked(identity, &mutation.exact_path)?
+                    .is_some()
+            {
+                return Err(MutationError::ObjectHasInboundAliases);
+            }
             if current.as_ref() != Some(&mutation.expected_head) {
                 return Err(MutationError::ObjectMutationLineageGap {
                     current: current.map(|head| head.version),

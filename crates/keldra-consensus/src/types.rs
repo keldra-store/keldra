@@ -136,7 +136,7 @@ impl UsedNodeIds {
 }
 
 /// Bounded cluster-control state retained by every Raft snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterControlState {
     pub(crate) nodes: std::collections::BTreeMap<NodeId, NodeDescriptor>,
     pub(crate) used_node_ids: UsedNodeIds,
@@ -144,6 +144,23 @@ pub struct ClusterControlState {
     pub(crate) jwt_signing_key_fingerprint: Option<JwtSigningKeyFingerprint>,
     pub(crate) erasure_code_profile: Option<ErasureCodeProfile>,
     pub(crate) active_placement_log_id: Option<LogId<u64>>,
+    pub(crate) active_protocol_version: u16,
+    pub(crate) active_storage_format: u16,
+}
+
+impl Default for ClusterControlState {
+    fn default() -> Self {
+        Self {
+            nodes: std::collections::BTreeMap::new(),
+            used_node_ids: UsedNodeIds::default(),
+            transition: None,
+            jwt_signing_key_fingerprint: None,
+            erasure_code_profile: None,
+            active_placement_log_id: None,
+            active_protocol_version: 1,
+            active_storage_format: 1,
+        }
+    }
 }
 
 impl ClusterControlState {
@@ -173,6 +190,14 @@ impl ClusterControlState {
     /// inferred from a snapshot's unrelated last-applied log index.
     pub fn active_placement_log_id(&self) -> Option<LogId<u64>> {
         self.active_placement_log_id
+    }
+
+    pub fn active_protocol_version(&self) -> u16 {
+        self.active_protocol_version
+    }
+
+    pub fn active_storage_format(&self) -> u16 {
+        self.active_storage_format
     }
 
     pub fn active_node_count(&self) -> usize {
@@ -232,6 +257,32 @@ pub struct InvocationId(pub [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InvocationFingerprint(pub [u8; 32]);
 
+/// Sealed authority under which an atomic bundle was produced. This identity
+/// is carried through preparation, path reservations, commit and replay so a
+/// stored program can never be replayed as a privileged built-in operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AtomicBundleAuthority {
+    StoredProgram {
+        program_path_hash: ProgramPathHash,
+        program_hash: ProgramHash,
+    },
+    BuiltInObjectTransaction {
+        kind: u16,
+        contract_version: u16,
+    },
+    /// Upgrade-only identity for a batch committed before durable path
+    /// reservations existed. New BeginBatch validation never admits it.
+    LegacyProgramOnly {
+        program_path_hash: ProgramPathHash,
+        program_hash: ProgramHash,
+    },
+}
+
+/// Hash of the canonical, externally stored participant manifest. The
+/// manifest includes read-only dependencies as well as mutated paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ParticipantManifestHash(pub [u8; 32]);
+
 /// The one cluster-wide atomic-program executor and its Raft-derived fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutorNomination {
@@ -275,10 +326,31 @@ impl SystemBootstrapState {
     }
 }
 
-/// A compact request to commit one already prepared atomic-program batch.
+/// A compact request to durably begin reservation of one prepared atomic batch.
 ///
 /// Object paths, payloads, version descriptors, locks, and the bundle itself
 /// remain outside Raft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeginBatch {
+    pub executor: NodeId,
+    pub nomination_log_index: u64,
+    pub authority: AtomicBundleAuthority,
+    pub invocation_id: InvocationId,
+    pub input_fingerprint: InvocationFingerprint,
+    pub bundle_ref: BundleRef,
+    pub bundle_hash: BundleHash,
+    pub durability_class: DurabilityClass,
+    pub durability_evidence_hash: DurabilityEvidenceHash,
+    pub participant_manifest_hash: ParticipantManifestHash,
+    /// Executor wall-clock observation committed as data so every Raft apply
+    /// prunes the same replay entries.
+    pub proposal_at_unix_millis: u64,
+    /// Exactly `proposal_at_unix_millis + ATOMIC_REPLAY_RETENTION_MILLIS`.
+    pub replay_expires_at_unix_millis: u64,
+}
+
+/// Released pre-reservation command retained at its original enum
+/// discriminant so an upgrade can replay an existing applied-state journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitBatch {
     pub executor: NodeId,
@@ -291,11 +363,34 @@ pub struct CommitBatch {
     pub bundle_hash: BundleHash,
     pub durability_class: DurabilityClass,
     pub durability_evidence_hash: DurabilityEvidenceHash,
-    /// Executor wall-clock observation committed as data so every Raft apply
-    /// prunes the same replay entries.
     pub proposal_at_unix_millis: u64,
-    /// Exactly `proposal_at_unix_millis + ATOMIC_REPLAY_RETENTION_MILLIS`.
     pub replay_expires_at_unix_millis: u64,
+}
+
+/// The one durable preparing transaction. Its Raft cursor is the fence carried
+/// by every HRW path reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedBatch {
+    pub begin_cursor: u64,
+    pub request: BeginBatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitPreparedBatch {
+    pub executor: NodeId,
+    pub nomination_log_index: u64,
+    pub begin_cursor: u64,
+    pub invocation_id: InvocationId,
+    pub participant_manifest_hash: ParticipantManifestHash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbortPreparedBatch {
+    pub executor: NodeId,
+    pub nomination_log_index: u64,
+    pub begin_cursor: u64,
+    pub invocation_id: InvocationId,
+    pub participant_manifest_hash: ParticipantManifestHash,
 }
 
 /// One retained, globally ordered compact batch decision.
@@ -305,12 +400,13 @@ pub struct CommittedBatch {
     pub commit_cursor: u64,
     pub executor: NodeId,
     pub nomination_log_index: u64,
-    pub program_path_hash: ProgramPathHash,
-    pub program_hash: ProgramHash,
+    pub begin_cursor: u64,
+    pub authority: AtomicBundleAuthority,
     pub bundle_ref: BundleRef,
     pub bundle_hash: BundleHash,
     pub durability_class: DurabilityClass,
     pub durability_evidence_hash: DurabilityEvidenceHash,
+    pub participant_manifest_hash: ParticipantManifestHash,
 }
 
 /// One bounded committed invocation retained for replay independently of the
@@ -331,6 +427,15 @@ pub struct CommitResult {
     pub replayed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BeginResult {
+    Prepared {
+        batch: PreparedBatch,
+        replayed: bool,
+    },
+    AlreadyCommitted(CommitResult),
+}
+
 /// Commands admitted to the replicated state machine.
 ///
 /// There is deliberately no transaction lifecycle or payload-bearing command.
@@ -344,7 +449,7 @@ pub enum Command {
     },
     CommitBatch(CommitBatch),
     /// Advance only the external recoverable-finalization watermark. Replay
-    /// entries remain until a later CommitBatch deterministically expires them.
+    /// entries remain until a later BeginBatch deterministically expires them.
     FinalizedThrough {
         executor: NodeId,
         nomination_log_index: u64,
@@ -425,18 +530,55 @@ pub enum Command {
         replacement_peer_spki_sha256: PeerSpkiSha256,
         replacement_join_capability_hash: JoinCapabilityHash,
     },
+    /// Begin one sealed transaction before acquiring durable HRW reservations.
+    BeginBatch(BeginBatch),
+    /// Commit only the exact active preparation after every reservation is proven.
+    CommitPreparedBatch(CommitPreparedBatch),
+    /// Deterministically abandon an uncommitted preparation.
+    AbortPreparedBatch(AbortPreparedBatch),
+    /// Monotonically expand one committed node's supported capabilities.
+    UpdateNodeCapabilities {
+        format_version: u16,
+        node_id: NodeId,
+        expected_protocol: CapabilityRange,
+        expected_storage: CapabilityRange,
+        replacement_protocol: CapabilityRange,
+        replacement_storage: CapabilityRange,
+    },
+    /// Activate one capability pair after a quiesced all-node proof.
+    ActivateClusterCapabilities {
+        format_version: u16,
+        protocol_version: u16,
+        storage_format: u16,
+        expected_active_placement_log_id: LogId<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApplyResult {
     ExecutorNominated(ExecutorNomination),
+    BatchBegun(BeginResult),
     BatchCommitted(CommitResult),
-    FinalizationAdvanced { through_commit_cursor: u64 },
-    ClusterInitialized { cluster_id: ClusterId },
+    BatchAborted {
+        begin_cursor: u64,
+    },
+    NodeCapabilitiesUpdated(NodeDescriptor),
+    ClusterCapabilitiesActivated {
+        protocol_version: u16,
+        storage_format: u16,
+    },
+    FinalizationAdvanced {
+        through_commit_cursor: u64,
+    },
+    ClusterInitialized {
+        cluster_id: ClusterId,
+    },
     SystemBootstrapCompleted(SystemBootstrapState),
     MembershipTransitionBegun(MembershipTransition),
     MembershipTransitionAdvanced(MembershipTransition),
-    MembershipTransitionFinished { started_log_index: u64 },
+    MembershipTransitionFinished {
+        started_log_index: u64,
+    },
     PeerSpkiChanged(NodeDescriptor),
     JwtSigningKeyFingerprintBound(JwtSigningKeyFingerprint),
     ErasureCodeProfileBound(ErasureCodeProfile),

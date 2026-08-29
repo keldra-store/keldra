@@ -253,6 +253,9 @@ impl ObjectDistribution {
                                 .await
                                 .map(BatchOperation::Publish)
                         }
+                        BatchOperation::Clone(_) => Err(Status::invalid_argument(
+                            "CloneObject is not a BulkWrite operation",
+                        )),
                         operation => Ok(operation),
                     }?;
                     Ok::<_, Status>(PreparedBatchItem {
@@ -430,6 +433,13 @@ impl ObjectDistribution {
                                 }
                             }
                             (BatchOperation::Delete(_), None) => {}
+                            (BatchOperation::Clone(_), _) => {
+                                outcomes.insert(
+                                    item.item.index,
+                                    Err(Status::internal("clone escaped unary mutation admission")),
+                                );
+                                continue;
+                            }
                             _ => {
                                 outcomes.insert(
                                     item.item.index,
@@ -530,6 +540,9 @@ impl ObjectDistribution {
                             Ok(Some(evidence))
                         }
                         BatchOperation::Delete(_) => Ok(None),
+                        BatchOperation::Clone(_) => Err(Status::invalid_argument(
+                            "CloneObject is not a BulkWrite operation",
+                        )),
                         BatchOperation::Put(_) => {
                             unreachable!("put was sealed before the attempt")
                         }
@@ -701,10 +714,14 @@ impl ObjectDistribution {
         for (mutation_index, (coordinated_index, mutation)) in indexed_mutations.iter().enumerate()
         {
             if group.is_acknowledged_by(&durable[mutation_index]) {
-                quorum_positions.push((
-                    mutation.stamp.source_id,
-                    mutation.stamp.source_journal_position,
-                ));
+                match super::mutation_journal_positions(mutation) {
+                    Ok(positions) => quorum_positions.extend(
+                        positions
+                            .into_iter()
+                            .map(|offset| (mutation.stamp.source_id, offset)),
+                    ),
+                    Err(error) => results[*coordinated_index] = Err(error),
+                }
             } else {
                 results[*coordinated_index] = Err(Status::unavailable(format!(
                     "object metadata reached {} of {} required replicas",

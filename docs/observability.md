@@ -65,7 +65,11 @@ The Keldra 0.9 process metric vocabulary covers:
 - watch-journal retained-entry and retained-byte gauges plus consumer-lag
   observations whenever a watch starts or advances;
 - bulk attempted operations and encoded request bytes, mutually exclusive
-  successful, failed, and replayed operation counts, and request latency; and
+  successful, failed, and replayed operation counts, and request latency;
+- interrupted bulk dispatch and Store duration with the bounded `bulk.phase`
+  values `coordinator_dispatch`, `payload_preparation`, `ordinary_path_lock`,
+  `commit_lock`, `operation_evaluation`, `rocksdb_persistence`,
+  `source_journal_settlement`, or `capacity_wait`; and
 - blob garbage-collection run, removal, and failure counts.
 
 Index runtime metrics use only the bounded `index.kind` attribute. Builder

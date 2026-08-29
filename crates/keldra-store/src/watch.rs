@@ -258,6 +258,10 @@ pub struct ObjectHeadChange {
     pub tenant_id: u64,
     pub bucket_id: u64,
     pub exact_path: String,
+    /// Canonical object path when `exact_path` is a transparent logical alias.
+    /// Physical object-head changes leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_path: Option<String>,
     pub path_version: VersionId,
     pub kind: ObjectHeadChangeKind,
     /// Present only when this path was finalized as part of an atomic program.
@@ -341,6 +345,9 @@ pub struct AtomicBatchMutation {
     pub tenant_id: u64,
     pub bucket_id: u64,
     pub exact_path: String,
+    /// Canonical object path when `exact_path` is a transparent logical alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_path: Option<String>,
     pub path_version: VersionId,
     pub deleted: bool,
     /// Source-local journal identity of the path finalization which made this
@@ -383,6 +390,10 @@ impl AtomicBatchPublished {
                 mutation.tenant_id == 0
                     || mutation.bucket_id == 0
                     || mutation.exact_path.is_empty()
+                    || mutation
+                        .canonical_path
+                        .as_ref()
+                        .is_some_and(|path| path.is_empty() || path == &mutation.exact_path)
                     || mutation.path_version.0 == 0
                     || mutation.source_id.node_id == 0
                     || mutation.source_id.source_epoch == [0; 32]
@@ -530,6 +541,7 @@ impl LocalChange {
             tenant_id,
             bucket_id,
             exact_path,
+            canonical_path: None,
             path_version,
             kind: if deleted {
                 ObjectHeadChangeKind::Delete
@@ -540,6 +552,36 @@ impl LocalChange {
             reference_deltas,
             accounting_transition,
             definition_transition,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn alias_object_head_with_program_cursor(
+        offset: u64,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: String,
+        canonical_path: String,
+        path_version: VersionId,
+        deleted: bool,
+        program_commit_cursor: Option<u64>,
+    ) -> Self {
+        Self::ObjectHead(ObjectHeadChange {
+            offset,
+            tenant_id,
+            bucket_id,
+            exact_path,
+            canonical_path: Some(canonical_path),
+            path_version,
+            kind: if deleted {
+                ObjectHeadChangeKind::Delete
+            } else {
+                ObjectHeadChangeKind::Put
+            },
+            program_commit_cursor,
+            reference_deltas: Vec::new(),
+            accounting_transition: None,
+            definition_transition: None,
         })
     }
 
@@ -883,7 +925,7 @@ mod tests {
         );
         let encoded = encode_local_change(&expected).unwrap();
         assert_eq!(&encoded[..4], b"ANVJ");
-        assert_eq!(u16::from_be_bytes(encoded[4..6].try_into().unwrap()), 5);
+        assert_eq!(u16::from_be_bytes(encoded[4..6].try_into().unwrap()), 6);
         assert_eq!(encoded[6], 1);
         assert_eq!(decode_local_change(&encoded).unwrap(), expected);
     }

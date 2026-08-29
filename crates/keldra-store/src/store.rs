@@ -1,16 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use keldra_atomic_program::{LocalLockManager, ObjectPath};
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DEFAULT_COLUMN_FAMILY_NAME, Direction,
-    IteratorMode, Options, WriteBatch, WriteBufferManager, WriteOptions, properties,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBPath, DEFAULT_COLUMN_FAMILY_NAME,
+    Direction, IteratorMode, Options, WriteBatch, WriteBufferManager, WriteOptions, properties,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::blob::BlobStore;
 use crate::key::{
     BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TenantId, bucket_name_key,
     contains_reserved_keldra_segment, tenant_name_key,
@@ -28,11 +29,19 @@ use crate::watch::{
 };
 use crate::{
     AWAITING_PUBLISH, AccountingHeadTransition, BatchOperation, BatchOutcome, BlobReader, BlobRef,
-    BlobReferenceState, BlobStore, BucketPolicy, DefinitionTransition, DeleteRequest,
+    BlobReferenceState, BucketPolicy, CloneRequest, DefinitionTransition, DeleteRequest,
     DeleteRetainedVersionOutcome, Durability, Head, INDEX_DEFINITION_PREFIX, MutationError,
     MutationReceipt, Object, ObjectKey, ObjectVersioning, Precondition, PublishRequest, PutMode,
     PutRequest, ReferenceDelta, SMALL_BLOB_MAX_BYTES, StorageTenantId, Version, VersionClock,
     VersionId,
+};
+use memory::METADATA_BLOCK_CACHE_BYTES;
+#[cfg(test)]
+use memory::{METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES, METADATA_WRITE_BUFFER_MANAGER_BYTES};
+use options::{validate_authoritative_roots, wal_directory_bytes};
+use payload_artifacts::{
+    complete_identity as blob_reference_key, complete_inline_key as complete_artifact_key,
+    is_inline_payload_artifact, validate_complete_artifact,
 };
 
 const PROGRAM_DEFINITION_PREFIX: &str = "_keldra/programs/";
@@ -90,30 +99,13 @@ impl Drop for MutationBackpressureWait {
     }
 }
 
-// RocksDB otherwise allocates one 64 MiB write buffer and one independent
-// block cache per column family. Keldra's metadata workload writes several
-// families together, so those defaults multiply native memory without buying
-// useful locality. These process-local resources are shared by every metadata
-// column family, including RocksDB's unused default family:
-//
-// - 64 MiB keeps frequently-read table blocks warm without one cache per CF;
-// - 128 MiB bounds all mutable and immutable memtables and stalls writers when
-//   flush pressure reaches that soft limit; and
-// - 16 MiB per memtable lets eight active families share the global allowance
-//   before the manager must flush, while avoiding the default 64 MiB per CF.
-//
-// The two dominant configurable native pools therefore total 192 MiB. This
-// leaves 320 MiB of the 512 MiB qualification allowance for table readers,
-// compaction buffers, allocator slack, and the rest of the process.
-const METADATA_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const METADATA_WRITE_BUFFER_MANAGER_BYTES: usize = 128 * 1024 * 1024;
-const METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
-
 pub(crate) const CF_HEADS: &str = "heads";
 pub(crate) const CF_VERSIONS: &str = "versions";
 pub(crate) const CF_BLOB_REFERENCES: &str = "blob_references";
 pub(crate) const CF_BLOB_GC_DUE: &str = "blob_gc_due";
-pub(crate) const CF_SMALL_BLOBS: &str = "small_blobs";
+pub(crate) const CF_PAYLOAD_ARTIFACTS: &str = "payload_artifacts";
+pub(crate) const CF_PAYLOAD_MANIFESTS: &str = "payload_manifests";
+pub(crate) const CF_PAYLOAD_INSTALLS: &str = "payload_installs";
 pub(crate) const CF_BUCKET_OPTIONS: &str = "bucket_options";
 pub(crate) const CF_NAMES: &str = "names";
 const CF_RECEIPTS: &str = "receipts";
@@ -128,7 +120,10 @@ pub(crate) const CF_AUTHZ_RECEIPTS: &str = "authz_receipts";
 pub(crate) const CF_CREDENTIALS: &str = "credentials";
 pub(crate) const CF_DEFINITION_STATE: &str = "definition_state";
 pub(crate) const CF_JOURNAL_ROUTES: &str = "journal_routes";
+pub(crate) const CF_OBJECT_ALIAS_REGISTRIES: &str = "object_alias_registries";
 pub(crate) const VERSION_HIGH_WATERMARK_KEY: &[u8] = b"version_high_watermark";
+const INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY: &[u8] = b"integrated_payload_storage_format";
+const INTEGRATED_PAYLOAD_STORAGE_FORMAT: u8 = 1;
 const MUTATION_RECEIPT_COUNT_KEY: &[u8] = b"mutation_receipt_count";
 const MUTATION_RECEIPT_BYTES_KEY: &[u8] = b"mutation_receipt_bytes";
 const RECEIPT_RECORD_PREFIX: u8 = 0;
@@ -138,6 +133,9 @@ pub const DEFAULT_MUTATION_RECEIPT_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES: u64 = 2_000_000;
 pub const DEFAULT_MUTATION_RECEIPT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_AWAITING_PUBLISH_TTL_SECONDS: u64 = 24 * 60 * 60;
+pub const DEFAULT_MAX_TOTAL_WAL_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+pub const PAYLOAD_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+pub const PAYLOAD_BLOB_MIN_BYTES: u64 = 64 * 1024;
 pub const MAX_LIST_OBJECTS: usize = 1_000;
 pub const MAX_LIST_OBJECT_VERSIONS: usize = 1_000;
 pub(crate) const COLUMN_FAMILIES: &[&str] = &[
@@ -145,7 +143,9 @@ pub(crate) const COLUMN_FAMILIES: &[&str] = &[
     CF_VERSIONS,
     CF_BLOB_REFERENCES,
     CF_BLOB_GC_DUE,
-    CF_SMALL_BLOBS,
+    CF_PAYLOAD_ARTIFACTS,
+    CF_PAYLOAD_MANIFESTS,
+    CF_PAYLOAD_INSTALLS,
     CF_BUCKET_OPTIONS,
     CF_NAMES,
     CF_RECEIPTS,
@@ -160,6 +160,7 @@ pub(crate) const COLUMN_FAMILIES: &[&str] = &[
     CF_CREDENTIALS,
     CF_DEFINITION_STATE,
     CF_JOURNAL_ROUTES,
+    CF_OBJECT_ALIAS_REGISTRIES,
 ];
 
 struct MetadataMemoryResources {
@@ -190,6 +191,13 @@ pub struct MetadataRuntimeMetrics {
     pub actual_delayed_write_rate_bytes_per_second: Option<u64>,
     pub write_stopped: Option<u64>,
     pub background_errors: Option<u64>,
+    pub total_wal_bytes: Option<u64>,
+    pub max_total_wal_bytes: u64,
+    pub payload_blob_files: Option<u64>,
+    pub payload_blob_bytes: Option<u64>,
+    pub payload_live_blob_bytes: Option<u64>,
+    pub payload_garbage_blob_bytes: Option<u64>,
+    pub payload_sst_bytes: Option<u64>,
     pub mutation_receipt_entries: Option<u64>,
     pub mutation_receipt_bytes: Option<u64>,
     pub mutation_receipt_max_entries: u64,
@@ -199,29 +207,6 @@ pub struct MetadataRuntimeMetrics {
     pub property_collection_failures: u64,
     pub first_unavailable_property: Option<&'static str>,
     pub first_collection_error: Option<String>,
-}
-
-impl MetadataMemoryResources {
-    fn new() -> Self {
-        Self {
-            block_cache: Cache::new_lru_cache(METADATA_BLOCK_CACHE_BYTES),
-            write_buffer_manager: WriteBufferManager::new_write_buffer_manager(
-                METADATA_WRITE_BUFFER_MANAGER_BYTES,
-                true,
-            ),
-        }
-    }
-
-    fn column_family_options(&self) -> Options {
-        let mut table = BlockBasedOptions::default();
-        table.set_block_cache(&self.block_cache);
-
-        let mut options = Options::default();
-        options.set_block_based_table_factory(&table);
-        options.set_write_buffer_manager(&self.write_buffer_manager);
-        options.set_write_buffer_size(METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES);
-        options
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,6 +270,14 @@ pub(crate) enum PendingLocalChange {
         accounting_transition: Option<crate::AccountingHeadTransition>,
         definition_transition: Option<DefinitionTransition>,
     },
+    AliasObjectHead {
+        identity: BucketIdentity,
+        exact_path: String,
+        canonical_path: String,
+        path_version: VersionId,
+        deleted: bool,
+        program_commit_cursor: Option<u64>,
+    },
     RetainedVersionDeleted {
         identity: BucketIdentity,
         exact_path: String,
@@ -335,26 +328,27 @@ impl PendingLocalChange {
             | Self::ContentLifecycleChanged {
                 reference_deltas, ..
             } => !reference_deltas.is_empty(),
-            Self::AggregateChanged { .. } | Self::AtomicBatchPublished { .. } => false,
+            Self::AliasObjectHead { .. }
+            | Self::AggregateChanged { .. }
+            | Self::AtomicBatchPublished { .. } => false,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
-    /// Legacy layout root retained for callers which use the default paths.
+    /// Root from which default authoritative paths are derived.
     pub root: PathBuf,
     /// RocksDB directory containing the metadata column families and SSTs.
     pub metadata_directory: PathBuf,
     /// RocksDB directory containing the metadata write-ahead log.
     pub metadata_wal_directory: PathBuf,
-    /// Directory containing complete blobs, erasure shards, and their lifecycle
-    /// staging directories.
+    /// RocksDB column-family path containing integrated payload SST/blob files.
     pub payload_directory: PathBuf,
-    /// Disposable directory containing only unfinished, unacknowledged uploads.
-    pub upload_spool_directory: PathBuf,
-    /// Aggregate hard capacity for unfinished upload bytes.
-    pub upload_spool_max_bytes: u64,
+    /// Aggregate hard capacity admitted across active unfinished uploads.
+    pub pending_upload_max_bytes: u64,
+    /// Shared RocksDB WAL flush/admission high-water target.
+    pub max_total_wal_bytes: u64,
     pub node_id: u16,
     pub sync_writes: bool,
     pub watch_retention: WatchRetention,
@@ -363,64 +357,6 @@ pub struct StoreOptions {
     /// its fixed 24-hour atomic-replay window; short values are only useful to
     /// embedded callers such as focused garbage-collection tests.
     pub awaiting_publish_ttl_seconds: u64,
-}
-
-impl StoreOptions {
-    pub fn new(root: impl AsRef<Path>, node_id: u16) -> Self {
-        let root = root.as_ref().to_path_buf();
-        Self {
-            metadata_directory: root.join("metadata"),
-            metadata_wal_directory: root.join("metadata"),
-            payload_directory: root.join("blobs"),
-            upload_spool_directory: root.join("blobs/.upload-spool"),
-            upload_spool_max_bytes: crate::blob::DEFAULT_UPLOAD_SPOOL_MAX_BYTES,
-            root,
-            node_id,
-            sync_writes: true,
-            watch_retention: WatchRetention::default(),
-            mutation_receipt_retention: MutationReceiptRetention::default(),
-            awaiting_publish_ttl_seconds: DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,
-        }
-    }
-
-    pub fn with_metadata_directory(mut self, directory: impl AsRef<Path>) -> Self {
-        self.metadata_directory = directory.as_ref().to_path_buf();
-        self
-    }
-
-    pub fn with_metadata_wal_directory(mut self, directory: impl AsRef<Path>) -> Self {
-        self.metadata_wal_directory = directory.as_ref().to_path_buf();
-        self
-    }
-
-    pub fn with_payload_directory(mut self, directory: impl AsRef<Path>) -> Self {
-        self.payload_directory = directory.as_ref().to_path_buf();
-        self
-    }
-
-    pub fn with_upload_spool(mut self, directory: impl AsRef<Path>, max_bytes: u64) -> Self {
-        self.upload_spool_directory = directory.as_ref().to_path_buf();
-        self.upload_spool_max_bytes = max_bytes;
-        self
-    }
-
-    pub fn with_watch_retention(mut self, watch_retention: WatchRetention) -> Self {
-        self.watch_retention = watch_retention;
-        self
-    }
-
-    pub fn with_mutation_receipt_retention(
-        mut self,
-        mutation_receipt_retention: MutationReceiptRetention,
-    ) -> Self {
-        self.mutation_receipt_retention = mutation_receipt_retention;
-        self
-    }
-
-    pub fn with_awaiting_publish_ttl_seconds(mut self, ttl_seconds: u64) -> Self {
-        self.awaiting_publish_ttl_seconds = ttl_seconds;
-        self
-    }
 }
 
 #[derive(Clone)]
@@ -449,6 +385,8 @@ pub struct Store {
     pub(crate) watch_retention: WatchRetention,
     pub(crate) mutation_receipt_retention: MutationReceiptRetention,
     awaiting_publish_ttl_millis: u64,
+    max_total_wal_bytes: u64,
+    metadata_wal_directory: PathBuf,
     watch_source_epoch: [u8; 32],
     watch_token_key: [u8; 32],
     /// Highest source-journal offset known safe for retention compaction.
@@ -537,6 +475,11 @@ enum PreparedOperation {
         identity: BucketIdentity,
         fingerprint: [u8; 32],
     },
+    Clone {
+        request: CloneRequest,
+        identity: BucketIdentity,
+        fingerprint: [u8; 32],
+    },
     Delete {
         request: DeleteRequest,
         identity: BucketIdentity,
@@ -546,11 +489,11 @@ enum PreparedOperation {
 
 #[derive(Clone)]
 enum PreparedPayload {
-    Small {
+    Inline {
         reference: BlobRef,
         bytes: Vec<u8>,
     },
-    Large(BlobRef),
+    Installed(BlobRef),
     /// Complete ordinary awaiting-publication source retained while a
     /// distributed metadata mutation is placed and delivered.
     Sealed(BlobRef),
@@ -559,16 +502,16 @@ enum PreparedPayload {
 impl PreparedPayload {
     fn reference(&self) -> &BlobRef {
         match self {
-            Self::Small { reference, .. } | Self::Large(reference) | Self::Sealed(reference) => {
-                reference
-            }
+            Self::Inline { reference, .. }
+            | Self::Installed(reference)
+            | Self::Sealed(reference) => reference,
         }
     }
 
-    fn small_bytes(&self) -> Option<&[u8]> {
+    fn inline_bytes(&self) -> Option<&[u8]> {
         match self {
-            Self::Small { bytes, .. } => Some(bytes),
-            Self::Large(_) | Self::Sealed(_) => None,
+            Self::Inline { bytes, .. } => Some(bytes),
+            Self::Installed(_) | Self::Sealed(_) => None,
         }
     }
 }
@@ -578,6 +521,7 @@ impl PreparedOperation {
         match self {
             Self::Put { request, .. } => &request.key,
             Self::Publish { request, .. } => &request.key,
+            Self::Clone { request, .. } => &request.destination,
             Self::Delete { request, .. } => &request.key,
         }
     }
@@ -586,6 +530,7 @@ impl PreparedOperation {
         match self {
             Self::Put { request, .. } => request.command_id.as_deref(),
             Self::Publish { request, .. } => request.command_id.as_deref(),
+            Self::Clone { request, .. } => request.command_id.as_deref(),
             Self::Delete { request, .. } => request.command_id.as_deref(),
         }
     }
@@ -594,6 +539,7 @@ impl PreparedOperation {
         match self {
             Self::Put { identity, .. }
             | Self::Publish { identity, .. }
+            | Self::Clone { identity, .. }
             | Self::Delete { identity, .. } => *identity,
         }
     }
@@ -606,6 +552,7 @@ impl PreparedOperation {
         match self {
             Self::Put { request, .. } => request.mode.precondition(),
             Self::Publish { request, .. } => request.mode.precondition(),
+            Self::Clone { request, .. } => request.mode.precondition(),
             Self::Delete { request, .. } => request.precondition,
         }
     }
@@ -614,6 +561,7 @@ impl PreparedOperation {
         match self {
             Self::Put { request, .. } => Some(request.mode),
             Self::Publish { request, .. } => Some(request.mode),
+            Self::Clone { request, .. } => Some(request.mode),
             Self::Delete { .. } => None,
         }
     }
@@ -622,6 +570,7 @@ impl PreparedOperation {
         match self {
             Self::Put { fingerprint, .. }
             | Self::Publish { fingerprint, .. }
+            | Self::Clone { fingerprint, .. }
             | Self::Delete { fingerprint, .. } => *fingerprint,
         }
     }
@@ -630,7 +579,18 @@ impl PreparedOperation {
         match self {
             Self::Put { payload, .. } => Some(payload.reference()),
             Self::Publish { request, .. } => Some(&request.blob),
+            Self::Clone { request, .. } => Some(&request.blob),
             Self::Delete { .. } => None,
+        }
+    }
+
+    fn lock_paths(&self) -> Vec<ObjectPath> {
+        match self {
+            Self::Clone { request, .. } => vec![
+                object_path(&request.source),
+                object_path(&request.destination),
+            ],
+            _ => vec![object_path(self.key())],
         }
     }
 }
@@ -661,12 +621,6 @@ impl Store {
         Ok(self.clock.next()?.0)
     }
 
-    /// Configured local directory for anonymous, non-authoritative payload
-    /// work files. Callers must not create durable records in this directory.
-    pub fn payload_spool_directory(&self) -> &std::path::Path {
-        self.blobs.root()
-    }
-
     /// Read bounded operational signals from RocksDB and its shared metadata
     /// memory resources.
     pub fn metadata_runtime_metrics(&self) -> MetadataRuntimeMetrics {
@@ -681,6 +635,7 @@ impl Store {
             write_buffer_usage_bytes: self._metadata_memory.write_buffer_manager.get_usage() as u64,
             mutation_receipt_max_entries: self.mutation_receipt_retention.max_entries,
             mutation_receipt_max_bytes: self.mutation_receipt_retention.max_bytes,
+            max_total_wal_bytes: self.max_total_wal_bytes,
             ..MetadataRuntimeMetrics::default()
         };
 
@@ -721,6 +676,35 @@ impl Store {
             &mut metrics,
         );
         metrics.background_errors = value;
+        metrics.total_wal_bytes = match wal_directory_bytes(&self.metadata_wal_directory) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                metrics.note_failure(format!("measure RocksDB WAL files: {error}"));
+                None
+            }
+        };
+        metrics.payload_blob_files =
+            self.payload_cf_property("rocksdb.num-blob-files", "payload_blob_files", &mut metrics);
+        metrics.payload_blob_bytes = self.payload_cf_property(
+            "rocksdb.total-blob-file-size",
+            "payload_blob_bytes",
+            &mut metrics,
+        );
+        metrics.payload_live_blob_bytes = self.payload_cf_property(
+            "rocksdb.live-blob-file-size",
+            "payload_live_blob_bytes",
+            &mut metrics,
+        );
+        metrics.payload_garbage_blob_bytes = self.payload_cf_property(
+            "rocksdb.live-blob-file-garbage-size",
+            "payload_garbage_blob_bytes",
+            &mut metrics,
+        );
+        metrics.payload_sst_bytes = self.payload_cf_property(
+            "rocksdb.live-sst-files-size",
+            "payload_sst_bytes",
+            &mut metrics,
+        );
         let value = self.column_family_property_sum(
             properties::CUR_SIZE_ACTIVE_MEM_TABLE,
             "active_memtable_bytes",
@@ -803,6 +787,29 @@ impl Store {
         Ok((status.entries, status.bytes, oldest_age_seconds))
     }
 
+    fn payload_cf_property(
+        &self,
+        property: &str,
+        signal: &'static str,
+        metrics: &mut MetadataRuntimeMetrics,
+    ) -> Option<u64> {
+        let Some(cf) = self.db.cf_handle(CF_PAYLOAD_ARTIFACTS) else {
+            metrics.note_failure("missing payload artifact column family".into());
+            return None;
+        };
+        match self.db.property_int_value_cf(cf, property) {
+            Ok(Some(value)) => Some(value),
+            Ok(None) => {
+                metrics.note_unavailable(signal);
+                None
+            }
+            Err(error) => {
+                metrics.note_failure(format!("read RocksDB property {signal}: {error}"));
+                None
+            }
+        }
+    }
+
     fn db_property(
         &self,
         property: &rocksdb::properties::PropName,
@@ -871,10 +878,25 @@ impl Store {
         if options.awaiting_publish_ttl_seconds == 0 {
             anyhow::bail!("awaiting-publish blob TTL must be non-zero");
         }
+        if options.max_total_wal_bytes == 0 {
+            anyhow::bail!("maximum total WAL bytes must be non-zero");
+        }
+        if options.pending_upload_max_bytes == 0 {
+            anyhow::bail!("pending upload maximum bytes must be non-zero");
+        }
         let awaiting_publish_ttl_millis = options
             .awaiting_publish_ttl_seconds
             .checked_mul(1_000)
             .context("awaiting-publish blob TTL is too large")?;
+        let existing_database = tokio::fs::try_exists(options.metadata_directory.join("CURRENT"))
+            .await
+            .with_context(|| {
+                format!(
+                    "inspect Keldra metadata root {}",
+                    options.metadata_directory.display()
+                )
+            })?;
+        validate_authoritative_roots(&options, existing_database).await?;
         tokio::fs::create_dir_all(&options.metadata_directory)
             .await
             .with_context(|| {
@@ -891,15 +913,45 @@ impl Store {
                     options.metadata_wal_directory.display()
                 )
             })?;
+        tokio::fs::create_dir_all(&options.payload_directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "create Keldra payload directory {}",
+                    options.payload_directory.display()
+                )
+            })?;
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
         db_options.set_wal_dir(&options.metadata_wal_directory);
+        db_options.set_max_total_wal_size(options.max_total_wal_bytes);
+        if existing_database {
+            let actual = DB::list_cf(&db_options, &options.metadata_directory)
+                .context("list existing Keldra column families")?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let expected = std::iter::once(DEFAULT_COLUMN_FAMILY_NAME.to_owned())
+                .chain(COLUMN_FAMILIES.iter().map(|name| (*name).to_owned()))
+                .collect::<BTreeSet<_>>();
+            if actual != expected {
+                anyhow::bail!(
+                    "existing Keldra volume does not use the exact 0.15 integrated payload layout"
+                );
+            }
+        }
         let metadata_memory = Arc::new(MetadataMemoryResources::new());
         let descriptors = std::iter::once(DEFAULT_COLUMN_FAMILY_NAME)
             .chain(COLUMN_FAMILIES.iter().copied())
-            .map(|name| ColumnFamilyDescriptor::new(name, metadata_memory.column_family_options()))
-            .collect::<Vec<_>>();
+            .map(|name| {
+                let cf_options = if name == CF_PAYLOAD_ARTIFACTS {
+                    metadata_memory.payload_column_family_options(&options.payload_directory)?
+                } else {
+                    metadata_memory.column_family_options()
+                };
+                Result::<_>::Ok(ColumnFamilyDescriptor::new(name, cf_options))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let db = DB::open_cf_descriptors(&db_options, &options.metadata_directory, descriptors)
             .with_context(|| {
                 format!(
@@ -910,6 +962,23 @@ impl Store {
         let metadata_cf = db
             .cf_handle(CF_METADATA)
             .context("missing metadata column family")?;
+        match db.get_cf(metadata_cf, INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY)? {
+            Some(encoded) if encoded.as_ref() == [INTEGRATED_PAYLOAD_STORAGE_FORMAT] => {}
+            Some(_) => anyhow::bail!("integrated payload storage format marker is unsupported"),
+            None if existing_database => {
+                anyhow::bail!("existing Keldra volume has no integrated payload storage marker")
+            }
+            None => {
+                let mut write = WriteOptions::default();
+                write.set_sync(options.sync_writes);
+                db.put_cf_opt(
+                    metadata_cf,
+                    INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY,
+                    [INTEGRATED_PAYLOAD_STORAGE_FORMAT],
+                    &write,
+                )?;
+            }
+        }
         let high_watermark = db
             .get_cf(metadata_cf, VERSION_HIGH_WATERMARK_KEY)?
             .map(|encoded| serde_json::from_slice::<VersionId>(&encoded))
@@ -918,12 +987,7 @@ impl Store {
             initialize_local_watch_metadata(&db, metadata_cf, options.sync_writes)?;
         initialize_mutation_receipt_metadata(&db, metadata_cf, options.sync_writes)?;
         let db = Arc::new(db);
-        let blobs = BlobStore::open_with_upload_spool(
-            &options.payload_directory,
-            &options.upload_spool_directory,
-            options.upload_spool_max_bytes,
-        )
-        .await?;
+        let blobs = BlobStore::new(options.pending_upload_max_bytes)?;
         let store = Self {
             db,
             _metadata_memory: metadata_memory,
@@ -944,6 +1008,8 @@ impl Store {
             watch_retention: options.watch_retention,
             mutation_receipt_retention: options.mutation_receipt_retention,
             awaiting_publish_ttl_millis,
+            max_total_wal_bytes: options.max_total_wal_bytes,
+            metadata_wal_directory: options.metadata_wal_directory.clone(),
             watch_source_epoch,
             watch_token_key,
             source_journal_reference_safe_through: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -967,6 +1033,16 @@ impl Store {
             .source_journal_reference_safe_through
             .store(durable_floor, std::sync::atomic::Ordering::Release);
         store.enforce_local_watch_retention()?;
+        tracing::info!(
+            storage.metadata_root = %options.metadata_directory.display(),
+            storage.wal_root = %options.metadata_wal_directory.display(),
+            storage.payload_root = %options.payload_directory.display(),
+            storage.max_total_wal_bytes = options.max_total_wal_bytes,
+            storage.pending_upload_max_bytes = options.pending_upload_max_bytes,
+            storage.payload_chunk_bytes = PAYLOAD_ARTIFACT_CHUNK_BYTES,
+            storage.payload_blob_min_bytes = PAYLOAD_BLOB_MIN_BYTES,
+            "opened integrated RocksDB payload storage"
+        );
         Ok(store)
     }
 
@@ -1160,10 +1236,13 @@ impl Store {
     ) -> Result<(), MutationError> {
         policy.validate()?;
         let _policy_guard = self.policy_gate.write().await;
-        let key = self.resolve_bucket_identity(tenant, bucket)?.encode();
+        let identity = self.resolve_bucket_identity(tenant, bucket)?;
+        let key = identity.encode();
         let policy_path = ObjectPath::new(tenant, bucket, "_keldra/policy")
             .map_err(MutationError::InvalidPolicy)?;
         let _guard = self.ordinary_locks.acquire(&[policy_path]).await;
+        let _commit_guard = self.lock_commit("bucket_policy").await;
+        self.require_unreserved_governance_locked(identity, None)?;
         if let Some(existing) = self.bucket_policy_by_key(&key)? {
             let requested_immutable = policy.immutable_prefixes.iter().collect::<BTreeSet<_>>();
             if existing
@@ -1246,15 +1325,19 @@ impl Store {
         tenant: &str,
         bucket: &str,
     ) -> Result<bool, MutationError> {
-        // Enabling version retention and an ordinary/program commit must have
-        // one order. Once this write returns, no mutation may still commit
-        // using the old unversioned replacement rule.
+        let _policy_guard = self.policy_gate.write().await;
+        let policy_path = ObjectPath::new(tenant, bucket, "_keldra/policy")
+            .map_err(MutationError::InvalidPolicy)?;
+        let _path_guard = self.ordinary_locks.acquire(&[policy_path]).await;
+        // Governance and object/program commits share this final persistence
+        // fence after canonical path locking.
         let _commit_guard = self.lock_commit("store_metadata").await;
         let _guard = self
             .bucket_options_lock
             .lock()
             .map_err(|_| MutationError::Storage("bucket-options lock is poisoned".into()))?;
         let identity = self.resolve_bucket_identity(tenant, bucket)?;
+        self.require_unreserved_governance_locked(identity, None)?;
         if self.bucket_versioning_by_key(&identity.encode())? == ObjectVersioning::Enabled {
             return Ok(false);
         }
@@ -1337,20 +1420,9 @@ impl Store {
     }
 }
 
-impl MetadataRuntimeMetrics {
-    fn note_unavailable(&mut self, property: &'static str) {
-        self.unavailable_properties = self.unavailable_properties.saturating_add(1);
-        self.first_unavailable_property.get_or_insert(property);
-    }
-
-    fn note_failure(&mut self, error: String) {
-        self.property_collection_failures = self.property_collection_failures.saturating_add(1);
-        self.first_collection_error.get_or_insert(error);
-    }
-}
-
 mod authz_journal;
 mod blob_references;
+mod bulk_phases;
 mod commit_lock;
 pub(crate) use commit_lock::{CommitLockGuard, OwnedCommitLockGuard};
 pub(crate) mod definition_state;
@@ -1361,15 +1433,24 @@ mod index_orphan_scrub_due;
 mod index_retention_due;
 mod journal_capacity;
 mod journal_routes;
+mod memory;
+mod mutation_fingerprint;
 mod mutation_helpers;
 mod mutation_prefetch;
 mod mutation_types;
+mod mutation_unary;
 mod mutations;
+mod options;
+use mutation_fingerprint::*;
+mod object_alias_registry;
 mod object_mutation_replica_batch;
 mod object_snapshot;
 mod object_snapshot_scan;
 mod payload;
+pub(crate) mod payload_artifacts;
 mod payload_handoff;
+mod pending_local_change;
+mod program_reservations;
 mod reads;
 mod reference_deltas;
 mod reference_proofs;
@@ -1623,13 +1704,6 @@ pub(crate) fn version_key(
     encoded
 }
 
-fn blob_reference_key(reference: &BlobRef) -> Vec<u8> {
-    let mut key = Vec::with_capacity(32 + size_of::<u64>());
-    key.extend_from_slice(&reference.hash);
-    key.extend_from_slice(&reference.length.to_be_bytes());
-    key
-}
-
 fn blob_reference_for_bytes(bytes: &[u8]) -> BlobRef {
     BlobRef {
         hash: *blake3::hash(bytes).as_bytes(),
@@ -1668,20 +1742,6 @@ fn blob_reference_from_key(encoded: &[u8]) -> Result<BlobRef, MutationError> {
             .expect("blob reference length was checked"),
     );
     Ok(BlobRef { hash, length })
-}
-
-fn remove_file_and_sync_parent(path: &Path) -> Result<(), MutationError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(storage_error(error)),
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| MutationError::Storage("blob path has no parent".into()))?;
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(storage_error)
 }
 
 fn encode_blob_reference_state(state: BlobReferenceState) -> [u8; 25] {
@@ -1886,100 +1946,6 @@ fn validate_selected_version_id(
     } else {
         Ok(())
     }
-}
-
-fn put_fingerprint(
-    encoded_head_key: &[u8],
-    mode: PutMode,
-    content_type: Option<&str>,
-    durability: Durability,
-    blob: &BlobRef,
-) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"keldra.put.v1");
-    hasher.update(encoded_head_key);
-    hash_put_mode(&mut hasher, mode);
-    hash_optional_string(&mut hasher, content_type);
-    hash_durability(&mut hasher, durability);
-    hasher.update(&blob.hash);
-    hasher.update(&blob.length.to_be_bytes());
-    *hasher.finalize().as_bytes()
-}
-
-fn delete_fingerprint(request: &DeleteRequest, identity: BucketIdentity) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"keldra.delete.v1");
-    hasher.update(&identity.head_key(request.key.path()));
-    hash_precondition(&mut hasher, request.precondition);
-    hash_durability(&mut hasher, request.durability);
-    *hasher.finalize().as_bytes()
-}
-
-fn publish_fingerprint(request: &PublishRequest, identity: BucketIdentity) -> [u8; 32] {
-    // Publish is an internal staging detail for a streamed Put. Its canonical
-    // idempotency identity must therefore be identical to an inline/bulk Put
-    // with the same logical input.
-    put_fingerprint(
-        &identity.head_key(request.key.path()),
-        request.mode,
-        request.content_type.as_deref(),
-        request.durability,
-        &request.blob,
-    )
-}
-
-fn hash_put_mode(hasher: &mut blake3::Hasher, mode: PutMode) {
-    match mode {
-        PutMode::Put => hasher.update(&[0]),
-        PutMode::PutIfAbsent => hasher.update(&[1]),
-        PutMode::PutIfVersion(version) => {
-            hasher.update(&[2]);
-            hasher.update(&version.0.to_be_bytes())
-        }
-        PutMode::PutImmutable => hasher.update(&[3]),
-    };
-}
-
-fn hash_precondition(hasher: &mut blake3::Hasher, precondition: Precondition) {
-    match precondition {
-        Precondition::Any => hasher.update(&[0]),
-        Precondition::Absent => hasher.update(&[1]),
-        Precondition::Version(version) => {
-            hasher.update(&[2]);
-            hasher.update(&version.0.to_be_bytes())
-        }
-    };
-}
-
-fn hash_optional_string(hasher: &mut blake3::Hasher, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            hasher.update(&[1]);
-            hash_string(hasher, value);
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
-}
-
-fn hash_durability(hasher: &mut blake3::Hasher, durability: Durability) {
-    hasher.update(&[match durability {
-        Durability::Local => 0,
-        Durability::Replicated => 1,
-    }]);
-}
-
-fn require_local_durability(durability: Durability) -> Result<(), MutationError> {
-    match durability {
-        Durability::Local => Ok(()),
-        Durability::Replicated => Err(MutationError::DurabilityUnavailable),
-    }
-}
-
-fn hash_string(hasher: &mut blake3::Hasher, value: &str) {
-    hasher.update(&(value.len() as u64).to_be_bytes());
-    hasher.update(value.as_bytes());
 }
 
 pub(crate) fn now_unix_millis() -> Result<u64, MutationError> {

@@ -1,27 +1,31 @@
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::blob::blob_reference_from_staging_name;
-use crate::blob_gc::{
-    BlobGcBudget, BlobGcCursor, BlobGcPhase, BlobGcTick, FilesystemGcCursor, FilesystemGcDirectory,
-};
+use crate::blob_gc::{BlobGcBudget, BlobGcCursor, BlobGcPhase, BlobGcTick};
 use crate::key::STORAGE_KEY_FORMAT_VERSION;
 
 use super::journal_capacity::SourceJournalAdmission;
+use super::payload_artifacts::{ArtifactKind, ArtifactManifest, RocksArtifactReader};
 use super::*;
 
-static NEXT_GC_QUARANTINE_ID: AtomicU64 = AtomicU64::new(1);
 const BLOB_GC_DUE_DOMAIN: u8 = b'B';
 const BLOB_GC_COMPLETE_KIND: u8 = 0;
 const BLOB_GC_SHARD_KIND: u8 = 1;
+const BLOB_GC_UPLOAD_KIND: u8 = 2;
 const BLOB_REFERENCE_IDENTITY_BYTES: usize = 32 + size_of::<u64>();
 const SHARD_REFERENCE_IDENTITY_BYTES: usize = 2 + 32 + size_of::<u64>() + size_of::<u16>();
+const UPLOAD_IDENTITY_BYTES: usize = 32;
 const BLOB_GC_DUE_PREFIX_BYTES: usize = 2;
 const BLOB_GC_DUE_FIXED_BYTES: usize = BLOB_GC_DUE_PREFIX_BYTES + size_of::<u64>() + 1;
 
 impl Store {
+    #[cfg(test)]
+    pub(crate) fn has_pending_upload_install(
+        &self,
+        upload_id: &[u8; 32],
+    ) -> Result<bool, MutationError> {
+        Ok(self.read_artifact_install_state(upload_id)?.is_some())
+    }
+
     pub async fn stage_blob(&self, bytes: &[u8]) -> Result<BlobRef, MutationError> {
         self.stage_blob_with_admission(bytes, SourceJournalAdmission::Bounded)
             .await
@@ -32,9 +36,9 @@ impl Store {
         bytes: &[u8],
         admission: SourceJournalAdmission,
     ) -> Result<BlobRef, MutationError> {
-        if bytes.len() <= SMALL_BLOB_MAX_BYTES {
+        if bytes.len() <= PAYLOAD_ARTIFACT_CHUNK_BYTES {
             let reference = blob_reference_for_bytes(bytes);
-            self.persist_small_blob_seal_with_admission(
+            self.persist_inline_payload_seal_with_admission(
                 &reference,
                 bytes,
                 now_unix_millis()?,
@@ -54,7 +58,7 @@ impl Store {
     }
 
     pub async fn begin_blob_upload(&self) -> Result<crate::BlobUpload, MutationError> {
-        self.blobs.begin_upload().await.map_err(storage_error)
+        self.blobs.begin_upload(self.clone()).map_err(storage_error)
     }
 
     /// Seals one physical upload and records its single awaiting-publication
@@ -72,61 +76,267 @@ impl Store {
         upload: crate::BlobUpload,
         admission: SourceJournalAdmission,
     ) -> Result<BlobRef, MutationError> {
-        // Hash and fsync under `.staging`, then make the lifecycle reservation
-        // durable before exposing the canonical content path.
         let staged = upload.finish_staged().await.map_err(storage_error)?;
+        self.seal_staged_blob_with_admission(staged, admission)
+            .await
+    }
+
+    pub(super) async fn seal_staged_blob_with_admission(
+        &self,
+        staged: crate::blob::StagedBlob,
+        admission: SourceJournalAdmission,
+    ) -> Result<BlobRef, MutationError> {
         let reference = staged.reference().clone();
         let now = now_unix_millis()?;
-        if is_small_blob(&reference) {
-            let bytes = tokio::fs::read(staged.path())
-                .await
-                .map_err(storage_error)?;
-            self.persist_small_blob_seal_with_admission(&reference, &bytes, now, admission)
-                .await?;
-            remove_file_and_sync_parent(staged.path())?;
+        if staged.persisted_chunks() == 0 {
+            self.persist_inline_payload_seal_with_admission(
+                &reference,
+                staged.final_chunk(),
+                now,
+                admission,
+            )
+            .await?;
         } else {
-            self.reserve_sealed_blob_with_admission_wait(&reference, now, admission)
+            if !staged.final_chunk().is_empty() {
+                self.persist_pending_upload_chunk(
+                    staged.upload_id(),
+                    staged.persisted_chunks(),
+                    staged.final_chunk().to_vec(),
+                )
                 .await?;
-            self.blobs
-                .publish_staged(staged)
-                .await
-                .map_err(storage_error)?;
+            }
+            self.finish_pending_upload(&staged, now, admission).await?;
         }
         Ok(reference)
+    }
+
+    pub(crate) async fn persist_pending_upload_chunk(
+        &self,
+        upload_id: [u8; 32],
+        ordinal: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), MutationError> {
+        if bytes.len() > PAYLOAD_ARTIFACT_CHUNK_BYTES {
+            return Err(MutationError::Storage(
+                "pending upload chunk exceeds the payload chunk bound".into(),
+            ));
+        }
+        let now = now_unix_millis()?;
+        let _guard = self.lock_commit("payload_upload").await;
+        let manifest = ArtifactManifest::upload(upload_id);
+        let (start, previous_updated_at) = if let Some((current, next, updated_at)) =
+            self.read_artifact_install_state(&upload_id)?
+        {
+            if current != manifest {
+                return Err(MutationError::Storage(
+                    "pending upload identity has a conflicting installation".into(),
+                ));
+            }
+            (next, updated_at)
+        } else {
+            let mut batch = WriteBatch::default();
+            let start =
+                self.begin_artifact_install(&mut batch, &upload_id, manifest.clone(), now)?;
+            batch.put_cf(
+                self.cf(CF_BLOB_GC_DUE)?,
+                upload_gc_due_key(&upload_id, now),
+                [],
+            );
+            let mut options = WriteOptions::default();
+            options.set_sync(self.sync_writes);
+            self.db.write_opt(batch, &options).map_err(storage_error)?;
+            (start, now)
+        };
+        if start != ordinal {
+            return Err(MutationError::Storage(
+                "pending upload chunk ordinal is not contiguous".into(),
+            ));
+        }
+        let previous_due = upload_gc_due_key(&upload_id, previous_updated_at);
+        let replacement_due = upload_gc_due_key(&upload_id, now);
+        self.advance_artifact_install(
+            &upload_id,
+            &manifest,
+            ordinal,
+            &bytes,
+            now,
+            Some((&previous_due, &replacement_due)),
+        )
+    }
+
+    async fn finish_pending_upload(
+        &self,
+        staged: &crate::blob::StagedBlob,
+        now: u64,
+        admission: SourceJournalAdmission,
+    ) -> Result<(), MutationError> {
+        let reference = staged.reference();
+        let manifest = ArtifactManifest::uploaded_complete(reference, staged.upload_id())?;
+        let mut verification = BlobReader::from_rocksdb(
+            reference,
+            RocksArtifactReader::new(self.db.clone(), manifest.clone()),
+        );
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            match verification.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => return Err(storage_error(error)),
+            }
+        }
+
+        loop {
+            let observed_existing = self.read_complete_manifest(reference)?;
+            if let Some(existing) = &observed_existing {
+                let mut reader = BlobReader::from_rocksdb(
+                    reference,
+                    RocksArtifactReader::new(self.db.clone(), existing.clone()),
+                );
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(error) => return Err(storage_error(error)),
+                    }
+                }
+            }
+            let guard = self.lock_commit("payload_upload").await;
+            let result = (|| {
+                let Some((upload_manifest, _, upload_updated_at)) =
+                    self.read_artifact_install_state(&staged.upload_id())?
+                else {
+                    return Err(MutationError::Storage(
+                        "pending upload disappeared before finalization".into(),
+                    ));
+                };
+                let current_existing = self.read_complete_manifest(reference)?;
+                if current_existing != observed_existing {
+                    return Ok(None);
+                }
+                let current_lifecycle =
+                    self.read_blob_reference_state(&blob_reference_key(reference))?;
+                match (current_existing.is_some(), current_lifecycle.is_some()) {
+                    (true, false) => {
+                        return Err(MutationError::Storage(
+                            "sealed payload manifest has no lifecycle authority".into(),
+                        ));
+                    }
+                    (false, true) => {
+                        return Err(MutationError::Storage(
+                            "sealed payload lifecycle has no published manifest".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+                let state = self
+                    .prepare_sealed_blob_reservation(reference, now)?
+                    .ok_or_else(|| {
+                        MutationError::Storage("sealed upload lifecycle is missing".into())
+                    })?;
+                let mut batch = WriteBatch::default();
+                if let Some(existing) = current_existing {
+                    if existing.storage_id == manifest.storage_id {
+                        return Err(MutationError::Storage(
+                            "pending upload storage identity collides with a sealed artifact"
+                                .into(),
+                        ));
+                    }
+                    self.stage_artifact_delete(&mut batch, &staged.upload_id(), &upload_manifest)?;
+                } else {
+                    self.stage_uploaded_complete_manifest(
+                        &mut batch,
+                        &staged.upload_id(),
+                        reference,
+                        &manifest,
+                    )?;
+                }
+                batch.delete_cf(
+                    self.cf(CF_BLOB_GC_DUE)?,
+                    upload_gc_due_key(&staged.upload_id(), upload_updated_at),
+                );
+                let mut pending = PendingBlobReferences::new();
+                let identity = blob_reference_key(reference);
+                self.stage_blob_reference_update(
+                    &mut batch,
+                    &mut pending,
+                    identity.clone(),
+                    state,
+                )?;
+                self.stage_local_changes_with_admission(
+                    &mut batch,
+                    &[PendingLocalChange::ContentLifecycleChanged {
+                        blob_identity: identity,
+                        revision: state.updated_at,
+                        reference_deltas: Vec::new(),
+                        accounting_transition: None,
+                    }],
+                    LocalReferenceEffects::NoReferenceEffects,
+                    admission,
+                )?;
+                let mut options = WriteOptions::default();
+                options.set_sync(self.sync_writes);
+                self.db.write_opt(batch, &options).map_err(storage_error)?;
+                self.notify_local_invalidations();
+                Ok(Some(()))
+            })();
+            drop(guard);
+            match result {
+                Ok(None) => continue,
+                Err(MutationError::SourceJournalCapacity)
+                    if admission == SourceJournalAdmission::Bounded =>
+                {
+                    self.wait_for_mutation_capacity().await;
+                }
+                Ok(Some(())) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub(crate) async fn read_blob_bytes(
         &self,
         reference: &BlobRef,
     ) -> Result<Vec<u8>, MutationError> {
-        if is_small_blob(reference) {
-            let bytes = self
-                .db
-                .get_cf(self.cf(CF_SMALL_BLOBS)?, blob_reference_key(reference))
-                .map_err(storage_error)?
-                .ok_or(MutationError::BlobNotFound)?
-                .to_vec();
-            validate_small_blob(reference, &bytes)?;
-            Ok(bytes)
-        } else {
-            self.blobs.get(reference).await.map_err(storage_error)
+        let mut reader = self.open_blob(reference).await?;
+        let capacity = usize::try_from(reference.length)
+            .map_err(|_| MutationError::Storage("blob length does not fit in memory".into()))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut buffer = vec![0_u8; PAYLOAD_ARTIFACT_CHUNK_BYTES.min(64 * 1024)];
+        loop {
+            let read = reader.read(&mut buffer).await.map_err(storage_error)?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
         }
+        Ok(bytes)
+    }
+
+    pub(crate) async fn read_retained_blob_bytes(
+        &self,
+        reference: &BlobRef,
+    ) -> Result<Vec<u8>, MutationError> {
+        let mut reader = self.open_retained_blob(reference).await?;
+        let capacity = usize::try_from(reference.length)
+            .map_err(|_| MutationError::Storage("blob length does not fit in memory".into()))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut buffer = vec![0_u8; PAYLOAD_ARTIFACT_CHUNK_BYTES.min(64 * 1024)];
+        loop {
+            let read = reader.read(&mut buffer).await.map_err(storage_error)?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        Ok(bytes)
     }
 
     pub(super) async fn contains_blob(&self, reference: &BlobRef) -> Result<bool, MutationError> {
-        if is_small_blob(reference) {
-            let Some(bytes) = self
-                .db
-                .get_cf(self.cf(CF_SMALL_BLOBS)?, blob_reference_key(reference))
-                .map_err(storage_error)?
-            else {
-                return Ok(false);
-            };
-            validate_small_blob(reference, &bytes)?;
-            Ok(true)
-        } else {
-            self.blobs.contains(reference).await.map_err(storage_error)
-        }
+        let Some(state) = self.blob_reference_state(reference)? else {
+            return Ok(false);
+        };
+        validate_blob_reference_state(state)?;
+        Ok(state.ref_count != 0 && self.read_complete_manifest(reference)?.is_some())
     }
 
     /// Returns the authoritative lifecycle state for one sealed blob.
@@ -188,12 +398,12 @@ impl Store {
                     let after = match &cursor.phase {
                         BlobGcPhase::Due => None,
                         BlobGcPhase::DueAfter(key) => Some(key.as_slice()),
-                        BlobGcPhase::Filesystem(_) => unreachable!(),
                     };
                     let cutoff = now_unix_millis.saturating_sub(self.awaiting_publish_ttl_millis);
                     let Some(due) = self.next_blob_gc_due(after, cutoff)? else {
-                        cursor.phase = BlobGcPhase::Filesystem(FilesystemGcCursor::default());
-                        continue;
+                        cursor.phase = BlobGcPhase::Due;
+                        tick.cycle_complete = true;
+                        break;
                     };
                     if tick.inspected_records != 0
                         && tick.inspected_bytes.saturating_add(due.encoded_bytes) > budget.max_bytes
@@ -204,26 +414,6 @@ impl Store {
                     cursor.phase = BlobGcPhase::DueAfter(due.due_key);
                     tick.inspected_records += 1;
                     tick.inspected_bytes = tick.inspected_bytes.saturating_add(due.encoded_bytes);
-                    tick.removed = tick.removed.saturating_add(u64::from(removed));
-                }
-                BlobGcPhase::Filesystem(filesystem) => {
-                    let Some(record) = self.next_filesystem_gc_record(filesystem)? else {
-                        cursor.phase = BlobGcPhase::Due;
-                        tick.cycle_complete = true;
-                        break;
-                    };
-                    let encoded_bytes = filesystem_record_bytes(&record);
-                    if tick.inspected_records != 0
-                        && tick.inspected_bytes.saturating_add(encoded_bytes) > budget.max_bytes
-                    {
-                        filesystem.replay = Some(record);
-                        break;
-                    }
-                    let removed = self
-                        .remove_filesystem_gc_record(record, now_unix_millis)
-                        .await?;
-                    tick.inspected_records += 1;
-                    tick.inspected_bytes = tick.inspected_bytes.saturating_add(encoded_bytes);
                     tick.removed = tick.removed.saturating_add(u64::from(removed));
                 }
             }
@@ -268,7 +458,10 @@ impl Store {
         due: &BlobGcDueRecord,
         now_unix_millis: u64,
     ) -> Result<bool, MutationError> {
-        let quarantined = {
+        if due.identity.len() == UPLOAD_IDENTITY_BYTES {
+            return self.collect_pending_upload_due(due).await;
+        }
+        {
             let _commit_guard = self.lock_commit("blob_reference").await;
             let Some(current) = self.read_blob_reference_state(&due.identity)? else {
                 self.delete_stale_blob_gc_due(&due.due_key)?;
@@ -286,26 +479,22 @@ impl Store {
                 return Ok(false);
             }
 
-            let physical = if due.identity.len() == BLOB_REFERENCE_IDENTITY_BYTES {
+            let manifest = if due.identity.len() == BLOB_REFERENCE_IDENTITY_BYTES {
                 let reference = blob_reference_from_key(&due.identity)?;
-                if is_small_blob(&reference) {
-                    None
-                } else {
-                    self.quarantine_gc_artifact(GcArtifact::Blob(reference))
-                        .await?
-                }
+                self.read_complete_manifest(&reference)?
             } else {
                 let identity = ShardIdentity::decode(&due.identity).map_err(storage_error)?;
-                self.quarantine_gc_artifact(GcArtifact::Shard(identity))
-                    .await?
-            };
-            let mut batch = WriteBatch::default();
-            if due.identity.len() == BLOB_REFERENCE_IDENTITY_BYTES {
-                let reference = blob_reference_from_key(&due.identity)?;
-                if is_small_blob(&reference) {
-                    batch.delete_cf(self.cf(CF_SMALL_BLOBS)?, &due.identity);
-                }
+                self.read_shard_manifest(&identity)?
             }
+            .or(self.read_artifact_install_manifest(&due.identity)?)
+            .ok_or_else(|| {
+                MutationError::Storage(
+                    "payload lifecycle has neither a sealed manifest nor an installation record"
+                        .into(),
+                )
+            })?;
+            let mut batch = WriteBatch::default();
+            self.stage_artifact_delete(&mut batch, &due.identity, &manifest)?;
             self.stage_blob_reference_delete(&mut batch, &due.identity, current)?;
             self.stage_local_changes(
                 &mut batch,
@@ -321,11 +510,46 @@ impl Store {
             options.set_sync(self.sync_writes);
             self.db.write_opt(batch, &options).map_err(storage_error)?;
             self.notify_local_invalidations();
-            physical
-        };
-        if let Some(path) = quarantined {
-            remove_file_and_sync_parent(&path)?;
         }
+        Ok(true)
+    }
+
+    async fn collect_pending_upload_due(
+        &self,
+        due: &BlobGcDueRecord,
+    ) -> Result<bool, MutationError> {
+        let _commit_guard = self.lock_commit("payload_upload_gc").await;
+        let Some((manifest, _, updated_at)) = self.read_artifact_install_state(&due.identity)?
+        else {
+            self.delete_stale_blob_gc_due(&due.due_key)?;
+            return Ok(false);
+        };
+        if manifest.kind != ArtifactKind::Upload
+            || manifest.storage_id.as_slice() != due.identity.as_slice()
+        {
+            return Err(MutationError::Storage(
+                "pending upload GC authority is malformed".into(),
+            ));
+        }
+        if updated_at != due.updated_at {
+            let mut batch = WriteBatch::default();
+            batch.delete_cf(self.cf(CF_BLOB_GC_DUE)?, &due.due_key);
+            batch.put_cf(
+                self.cf(CF_BLOB_GC_DUE)?,
+                upload_gc_due_key(&manifest.storage_id, updated_at),
+                [],
+            );
+            let mut options = WriteOptions::default();
+            options.set_sync(self.sync_writes);
+            self.db.write_opt(batch, &options).map_err(storage_error)?;
+            return Ok(false);
+        }
+        let mut batch = WriteBatch::default();
+        self.stage_artifact_delete(&mut batch, &due.identity, &manifest)?;
+        batch.delete_cf(self.cf(CF_BLOB_GC_DUE)?, &due.due_key);
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db.write_opt(batch, &options).map_err(storage_error)?;
         Ok(true)
     }
 
@@ -359,213 +583,6 @@ impl Store {
             return Ok(false);
         }
         self.collect_due_artifact(&due, now_unix_millis).await
-    }
-
-    fn next_filesystem_gc_record(
-        &self,
-        cursor: &mut FilesystemGcCursor,
-    ) -> Result<Option<crate::blob_gc::FilesystemGcRecord>, MutationError> {
-        use crate::blob_gc::FilesystemGcRecord;
-
-        if let Some(record) = cursor.replay.take() {
-            return Ok(Some(record));
-        }
-        loop {
-            if cursor.entries.is_none() {
-                let name = match cursor.directory {
-                    FilesystemGcDirectory::Staging => ".staging",
-                    FilesystemGcDirectory::Quarantine => ".gc",
-                    FilesystemGcDirectory::Complete => return Ok(None),
-                };
-                cursor.entries = match std::fs::read_dir(self.blobs.root().join(name)) {
-                    Ok(entries) => Some(entries),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        cursor.directory = next_filesystem_gc_directory(cursor.directory);
-                        continue;
-                    }
-                    Err(error) => return Err(storage_error(error)),
-                };
-            }
-            let Some(entry) = cursor
-                .entries
-                .as_mut()
-                .expect("maintenance directory was opened")
-                .next()
-            else {
-                cursor.entries = None;
-                cursor.directory = next_filesystem_gc_directory(cursor.directory);
-                continue;
-            };
-            let entry = entry.map_err(storage_error)?;
-            if !entry.file_type().map_err(storage_error)?.is_file() {
-                return Err(MutationError::Storage(
-                    "blob maintenance directory contains a non-file entry".into(),
-                ));
-            }
-            let path = entry.path();
-            let encoded_bytes = path_encoded_bytes(&path);
-            return Ok(Some(match cursor.directory {
-                FilesystemGcDirectory::Staging => FilesystemGcRecord::Staged {
-                    modified_at: modified_unix_millis(&entry)?,
-                    path,
-                    encoded_bytes,
-                },
-                FilesystemGcDirectory::Quarantine => FilesystemGcRecord::Quarantined {
-                    path,
-                    encoded_bytes,
-                },
-                FilesystemGcDirectory::Complete => unreachable!(),
-            }));
-        }
-    }
-
-    async fn remove_filesystem_gc_record(
-        &self,
-        record: crate::blob_gc::FilesystemGcRecord,
-        now_unix_millis: u64,
-    ) -> Result<bool, MutationError> {
-        use crate::blob_gc::FilesystemGcRecord;
-
-        match record {
-            FilesystemGcRecord::Quarantined { path, .. } => {
-                return self.reconcile_quarantined_file(&path).await;
-            }
-            FilesystemGcRecord::Staged {
-                path, modified_at, ..
-            } => {
-                self.reconcile_staged_file(&path, modified_at, now_unix_millis)
-                    .await
-            }
-        }
-    }
-
-    async fn quarantine_gc_artifact(
-        &self,
-        artifact: GcArtifact,
-    ) -> Result<Option<PathBuf>, MutationError> {
-        let source = artifact.canonical_path(self.blobs.root());
-        if !source.exists() {
-            return Ok(None);
-        }
-        let quarantine = self.blobs.root().join(".gc");
-        crate::blob::create_directory_all_durable(&quarantine)
-            .await
-            .map_err(storage_error)?;
-        let destination = quarantine.join(gc_quarantine_name(
-            &artifact,
-            std::process::id(),
-            self.blobs.upload_boot_nonce(),
-            NEXT_GC_QUARANTINE_ID.fetch_add(1, Ordering::Relaxed),
-        ));
-        let _directory_guard = self.blobs.directory_lock.lock().await;
-        match std::fs::rename(&source, &destination) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(storage_error(error)),
-        }
-        sync_directory(source.parent().ok_or_else(|| {
-            MutationError::Storage("garbage-collected blob has no parent".into())
-        })?)?;
-        sync_directory(&quarantine)?;
-        Ok(Some(destination))
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn quarantine_blob_for_test(
-        &self,
-        reference: &BlobRef,
-    ) -> Result<Option<PathBuf>, MutationError> {
-        self.quarantine_gc_artifact(GcArtifact::Blob(reference.clone()))
-            .await
-    }
-
-    pub(super) async fn quarantine_shard_for_removal(
-        &self,
-        identity: &ShardIdentity,
-    ) -> Result<Option<PathBuf>, MutationError> {
-        self.quarantine_gc_artifact(GcArtifact::Shard(identity.clone()))
-            .await
-    }
-
-    pub(super) fn remove_quarantined_artifact(&self, path: &Path) -> Result<(), MutationError> {
-        remove_file_and_sync_parent(path)
-    }
-
-    async fn reconcile_staged_file(
-        &self,
-        path: &Path,
-        modified_at: u64,
-        now_unix_millis: u64,
-    ) -> Result<bool, MutationError> {
-        if let Some(artifact) = staged_artifact_from_path(path)? {
-            let _commit_guard = self.lock_commit("blob_reference").await;
-            if self
-                .read_blob_reference_state(&artifact.lifecycle_key())?
-                .is_some()
-            {
-                match &artifact {
-                    GcArtifact::Blob(reference) if is_small_blob(reference) => {
-                        let present = self
-                            .db
-                            .get_cf(self.cf(CF_SMALL_BLOBS)?, blob_reference_key(reference))
-                            .map_err(storage_error)?
-                            .is_some();
-                        if !present {
-                            return Err(MutationError::Storage(
-                                "small-blob lifecycle exists without inline bytes".into(),
-                            ));
-                        }
-                        remove_file_and_sync_parent(path)?;
-                    }
-                    GcArtifact::Blob(reference) => {
-                        self.blobs
-                            .publish_identified_staging(path, reference)
-                            .await
-                            .map_err(storage_error)?;
-                    }
-                    GcArtifact::Shard(identity) => {
-                        self.publish_identified_staged_shard(identity, path)
-                            .await
-                            .map_err(storage_error)?;
-                    }
-                }
-                return Ok(true);
-            }
-        }
-        if now_unix_millis.saturating_sub(modified_at) < self.awaiting_publish_ttl_millis {
-            return Ok(false);
-        }
-        remove_file_and_sync_parent(path)?;
-        Ok(true)
-    }
-
-    async fn reconcile_quarantined_file(&self, path: &Path) -> Result<bool, MutationError> {
-        let Some(artifact) = quarantined_artifact_from_path(path)? else {
-            remove_file_and_sync_parent(path)?;
-            return Ok(true);
-        };
-        let _commit_guard = self.lock_commit("blob_reference").await;
-        if self
-            .read_blob_reference_state(&artifact.lifecycle_key())?
-            .is_none()
-        {
-            remove_file_and_sync_parent(path)?;
-            return Ok(true);
-        }
-        match artifact {
-            GcArtifact::Blob(reference) => {
-                self.blobs
-                    .publish_identified_staging(path, &reference)
-                    .await
-                    .map_err(storage_error)?;
-            }
-            GcArtifact::Shard(identity) => {
-                self.publish_identified_staged_shard(&identity, path)
-                    .await
-                    .map_err(storage_error)?;
-            }
-        }
-        Ok(true)
     }
 
     fn prepare_sealed_blob_reservation(
@@ -616,16 +633,62 @@ impl Store {
         Ok(Some(next))
     }
 
-    pub(super) fn reserve_sealed_artifact(
+    pub(super) async fn begin_sealed_artifact_install_with_admission_wait(
         &self,
-        key: &[u8],
+        identity: &[u8],
+        manifest: ArtifactManifest,
         now_unix_millis: u64,
-    ) -> Result<BlobReferenceState, MutationError> {
-        self.reserve_sealed_artifact_with_admission(
-            key,
-            now_unix_millis,
-            SourceJournalAdmission::Bounded,
-        )
+        admission: SourceJournalAdmission,
+    ) -> Result<u32, MutationError> {
+        loop {
+            let guard = self.lock_commit("payload_install").await;
+            let result = (|| {
+                let state = self
+                    .prepare_sealed_artifact_reservation(identity, now_unix_millis)?
+                    .ok_or_else(|| {
+                        MutationError::Storage("sealed lifecycle state is missing".into())
+                    })?;
+                let mut batch = WriteBatch::default();
+                let start = self.begin_artifact_install(
+                    &mut batch,
+                    identity,
+                    manifest.clone(),
+                    now_unix_millis,
+                )?;
+                let mut pending = PendingBlobReferences::new();
+                self.stage_blob_reference_update(
+                    &mut batch,
+                    &mut pending,
+                    identity.to_vec(),
+                    state,
+                )?;
+                self.stage_local_changes_with_admission(
+                    &mut batch,
+                    &[PendingLocalChange::ContentLifecycleChanged {
+                        blob_identity: identity.to_vec(),
+                        revision: state.updated_at,
+                        reference_deltas: Vec::new(),
+                        accounting_transition: None,
+                    }],
+                    LocalReferenceEffects::NoReferenceEffects,
+                    admission,
+                )?;
+                let mut options = WriteOptions::default();
+                options.set_sync(self.sync_writes);
+                self.db.write_opt(batch, &options).map_err(storage_error)?;
+                self.notify_local_invalidations();
+                Ok(start)
+            })();
+            drop(guard);
+            match result {
+                Err(MutationError::SourceJournalCapacity)
+                    if admission == SourceJournalAdmission::Bounded =>
+                {
+                    self.wait_for_mutation_capacity().await;
+                }
+                result => return result,
+            }
+        }
     }
 
     fn reserve_sealed_artifact_with_admission(
@@ -658,6 +721,7 @@ impl Store {
         Ok(next)
     }
 
+    #[cfg(test)]
     pub(super) fn reserve_sealed_blob(
         &self,
         reference: &BlobRef,
@@ -670,6 +734,7 @@ impl Store {
         )
     }
 
+    #[cfg(test)]
     fn reserve_sealed_blob_with_admission(
         &self,
         reference: &BlobRef,
@@ -681,16 +746,40 @@ impl Store {
             .map(|_| ())
     }
 
-    async fn reserve_sealed_blob_with_admission_wait(
+    pub(super) async fn reserve_sealed_artifact_with_admission_wait(
+        &self,
+        identity: &[u8],
+        now_unix_millis: u64,
+        admission: SourceJournalAdmission,
+    ) -> Result<(), MutationError> {
+        loop {
+            let guard = self.lock_commit("blob_reference").await;
+            let result = self
+                .reserve_sealed_artifact_with_admission(identity, now_unix_millis, admission)
+                .map(|_| ());
+            drop(guard);
+            match result {
+                Err(MutationError::SourceJournalCapacity)
+                    if admission == SourceJournalAdmission::Bounded =>
+                {
+                    self.wait_for_mutation_capacity().await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn persist_inline_payload_seal_with_admission(
         &self,
         reference: &BlobRef,
+        bytes: &[u8],
         now_unix_millis: u64,
         admission: SourceJournalAdmission,
     ) -> Result<(), MutationError> {
         loop {
             let guard = self.lock_commit("blob_reference").await;
             let result =
-                self.reserve_sealed_blob_with_admission(reference, now_unix_millis, admission);
+                self.persist_inline_payload_seal(reference, bytes, now_unix_millis, admission);
             drop(guard);
             match result {
                 Err(MutationError::SourceJournalCapacity)
@@ -703,45 +792,25 @@ impl Store {
         }
     }
 
-    async fn persist_small_blob_seal_with_admission(
+    fn persist_inline_payload_seal(
         &self,
         reference: &BlobRef,
         bytes: &[u8],
         now_unix_millis: u64,
         admission: SourceJournalAdmission,
     ) -> Result<(), MutationError> {
-        loop {
-            let guard = self.lock_commit("blob_reference").await;
-            let result = self.persist_small_blob_seal(reference, bytes, now_unix_millis, admission);
-            drop(guard);
-            match result {
-                Err(MutationError::SourceJournalCapacity)
-                    if admission == SourceJournalAdmission::Bounded =>
-                {
-                    self.wait_for_mutation_capacity().await;
-                }
-                result => return result,
-            }
-        }
-    }
-
-    fn persist_small_blob_seal(
-        &self,
-        reference: &BlobRef,
-        bytes: &[u8],
-        now_unix_millis: u64,
-        admission: SourceJournalAdmission,
-    ) -> Result<(), MutationError> {
-        validate_small_blob(reference, bytes)?;
+        validate_complete_artifact(reference, bytes)?;
         let pending = BTreeSet::new();
-        let value = self.prepare_small_blob_value(reference, bytes, &pending)?;
+        let value = self.prepare_inline_payload_value(reference, bytes, &pending)?;
         let state = self
             .prepare_sealed_blob_reservation(reference, now_unix_millis)?
-            .ok_or_else(|| MutationError::Storage("small blob reservation is missing".into()))?;
+            .ok_or_else(|| {
+                MutationError::Storage("inline payload reservation is missing".into())
+            })?;
         let key = blob_reference_key(reference);
         let mut batch = WriteBatch::default();
-        if let Some((small_key, small_bytes)) = value {
-            batch.put_cf(self.cf(CF_SMALL_BLOBS)?, &small_key, small_bytes);
+        if let Some((_artifact_key, artifact_bytes)) = value {
+            self.stage_inline_complete_artifact(&mut batch, reference, &artifact_bytes)?;
         }
         let mut references = PendingBlobReferences::new();
         self.stage_blob_reference_update(&mut batch, &mut references, key.clone(), state)?;
@@ -820,36 +889,36 @@ impl Store {
         Ok((key, state))
     }
 
-    pub(super) fn prepare_small_blob_value(
+    pub(super) fn prepare_inline_payload_value(
         &self,
         reference: &BlobRef,
         bytes: &[u8],
         pending: &BTreeSet<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, MutationError> {
-        validate_small_blob(reference, bytes)?;
-        self.prepare_hashed_small_blob_value(reference, bytes, pending)
+        validate_complete_artifact(reference, bytes)?;
+        self.prepare_hashed_inline_payload_value(reference, bytes, pending)
     }
 
     /// Prepares bytes whose reference was computed from this exact immutable
     /// slice during the current put preparation. Existing stored bytes remain
     /// independently verified before content-address reuse.
-    pub(super) fn prepare_hashed_small_blob_value(
+    pub(super) fn prepare_hashed_inline_payload_value(
         &self,
         reference: &BlobRef,
         bytes: &[u8],
         pending: &BTreeSet<Vec<u8>>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, MutationError> {
-        self.prepare_hashed_small_blob_value_cached(reference, bytes, pending, None)
+        self.prepare_hashed_inline_payload_value_cached(reference, bytes, pending, None)
     }
 
-    pub(super) fn prepare_hashed_small_blob_value_cached(
+    pub(super) fn prepare_hashed_inline_payload_value_cached(
         &self,
         reference: &BlobRef,
         bytes: &[u8],
         pending: &BTreeSet<Vec<u8>>,
         prefetched: Option<Result<Option<Vec<u8>>, MutationError>>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, MutationError> {
-        let key = blob_reference_key(reference);
+        let key = complete_artifact_key(reference);
         if pending.contains(&key) {
             return Ok(None);
         }
@@ -857,16 +926,27 @@ impl Store {
             Some(cached) => cached?,
             None => self
                 .db
-                .get_cf(self.cf(CF_SMALL_BLOBS)?, &key)
+                .get_cf(self.cf(CF_PAYLOAD_ARTIFACTS)?, &key)
                 .map_err(storage_error)?
                 .map(|encoded| encoded.to_vec()),
         };
         match existing {
             Some(existing) => {
-                validate_small_blob(reference, &existing)?;
+                validate_complete_artifact(reference, &existing)?;
+                self.read_complete_manifest(reference)?.ok_or_else(|| {
+                    MutationError::Storage(
+                        "complete payload bytes exist without their manifest".into(),
+                    )
+                })?;
+                let state = self.blob_reference_state(reference)?.ok_or_else(|| {
+                    MutationError::Storage(
+                        "complete payload bytes exist without lifecycle authority".into(),
+                    )
+                })?;
+                validate_blob_reference_state(state)?;
                 if existing.as_slice() != bytes {
                     return Err(MutationError::Storage(
-                        "small blob content-address collision".into(),
+                        "inline payload content-address collision".into(),
                     ));
                 }
                 Ok(None)
@@ -1020,15 +1100,29 @@ impl Store {
     }
 
     pub async fn open_blob(&self, reference: &BlobRef) -> Result<BlobReader, MutationError> {
-        if is_small_blob(reference) {
-            BlobReader::from_bytes(reference, self.read_blob_bytes(reference).await?)
-                .map_err(storage_error)
-        } else {
-            self.blobs
-                .open_verified(reference)
-                .await
-                .map_err(storage_error)
-        }
+        let state = self
+            .blob_reference_state(reference)?
+            .filter(|state| state.ref_count != 0)
+            .ok_or(MutationError::BlobNotFound)?;
+        validate_blob_reference_state(state)?;
+        self.open_retained_blob(reference).await
+    }
+
+    pub(crate) async fn open_retained_blob(
+        &self,
+        reference: &BlobRef,
+    ) -> Result<BlobReader, MutationError> {
+        let state = self
+            .blob_reference_state(reference)?
+            .ok_or(MutationError::BlobNotFound)?;
+        validate_blob_reference_state(state)?;
+        let manifest = self
+            .read_complete_manifest(reference)?
+            .ok_or(MutationError::BlobNotFound)?;
+        Ok(BlobReader::from_rocksdb(
+            reference,
+            RocksArtifactReader::new(self.db.clone(), manifest),
+        ))
     }
 }
 
@@ -1039,70 +1133,6 @@ fn validate_blob_gc_budget(budget: BlobGcBudget) -> Result<(), MutationError> {
         ));
     }
     Ok(())
-}
-
-fn filesystem_record_bytes(record: &crate::blob_gc::FilesystemGcRecord) -> u64 {
-    use crate::blob_gc::FilesystemGcRecord;
-    match record {
-        FilesystemGcRecord::Staged { encoded_bytes, .. }
-        | FilesystemGcRecord::Quarantined { encoded_bytes, .. } => *encoded_bytes,
-    }
-}
-
-fn next_filesystem_gc_directory(directory: FilesystemGcDirectory) -> FilesystemGcDirectory {
-    match directory {
-        FilesystemGcDirectory::Staging => FilesystemGcDirectory::Quarantine,
-        FilesystemGcDirectory::Quarantine | FilesystemGcDirectory::Complete => {
-            FilesystemGcDirectory::Complete
-        }
-    }
-}
-
-fn path_encoded_bytes(path: &Path) -> u64 {
-    path.as_os_str().as_encoded_bytes().len() as u64 + 32
-}
-
-fn modified_unix_millis(entry: &std::fs::DirEntry) -> Result<u64, MutationError> {
-    entry
-        .metadata()
-        .map_err(storage_error)?
-        .modified()
-        .map_err(storage_error)?
-        .duration_since(UNIX_EPOCH)
-        .map_err(storage_error)?
-        .as_millis()
-        .try_into()
-        .map_err(|_| MutationError::Storage("blob modification time exceeds u64".into()))
-}
-
-fn shard_file_path(root: &Path, identity: &ShardIdentity) -> PathBuf {
-    let hash = hex::encode(identity.blob().hash);
-    root.join(&hash[..2]).join(hex::encode(identity.encode()))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum GcArtifact {
-    Blob(BlobRef),
-    Shard(ShardIdentity),
-}
-
-impl GcArtifact {
-    fn lifecycle_key(&self) -> Vec<u8> {
-        match self {
-            Self::Blob(reference) => blob_reference_key(reference),
-            Self::Shard(identity) => identity.encode().to_vec(),
-        }
-    }
-
-    fn canonical_path(&self, root: &Path) -> PathBuf {
-        match self {
-            Self::Blob(reference) => {
-                let encoded = hex::encode(reference.hash);
-                root.join(&encoded[..2]).join(encoded)
-            }
-            Self::Shard(identity) => shard_file_path(root, identity),
-        }
-    }
 }
 
 struct BlobGcDueRecord {
@@ -1151,6 +1181,15 @@ pub(super) fn blob_gc_due_key(
     Ok(Some(key))
 }
 
+pub(super) fn upload_gc_due_key(upload_id: &[u8; 32], updated_at: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(BLOB_GC_DUE_FIXED_BYTES + upload_id.len());
+    key.extend_from_slice(&blob_gc_due_prefix());
+    key.extend_from_slice(&updated_at.to_be_bytes());
+    key.push(BLOB_GC_UPLOAD_KIND);
+    key.extend_from_slice(upload_id);
+    key
+}
+
 fn decode_blob_gc_due_key(encoded: &[u8]) -> Result<(u64, Vec<u8>), MutationError> {
     if encoded.len() < BLOB_GC_DUE_FIXED_BYTES || !encoded.starts_with(&blob_gc_due_prefix()) {
         return Err(MutationError::Storage(
@@ -1171,6 +1210,7 @@ fn decode_blob_gc_due_key(encoded: &[u8]) -> Result<(u64, Vec<u8>), MutationErro
         BLOB_GC_SHARD_KIND if identity.len() == SHARD_REFERENCE_IDENTITY_BYTES => {
             ShardIdentity::decode(identity).map_err(storage_error)?;
         }
+        BLOB_GC_UPLOAD_KIND if identity.len() == UPLOAD_IDENTITY_BYTES => {}
         _ => {
             return Err(MutationError::Storage(
                 "blob GC due identity is malformed".into(),
@@ -1178,111 +1218,4 @@ fn decode_blob_gc_due_key(encoded: &[u8]) -> Result<(u64, Vec<u8>), MutationErro
         }
     }
     Ok((updated_at, identity.to_vec()))
-}
-
-fn staged_artifact_from_path(path: &Path) -> Result<Option<GcArtifact>, MutationError> {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(None);
-    };
-    if let Some(reference) = blob_reference_from_staging_name(name) {
-        return Ok(Some(GcArtifact::Blob(reference)));
-    }
-    shard_identity_from_staging_name(name)
-        .map(|identity| identity.map(GcArtifact::Shard))
-        .map_err(storage_error)
-}
-
-fn shard_identity_from_staging_name(name: &str) -> Result<Option<ShardIdentity>, ShardStoreError> {
-    let Some(body) = name
-        .strip_prefix("shard-")
-        .and_then(|name| name.strip_suffix(".tmp"))
-    else {
-        return Ok(None);
-    };
-    let fields = body.split('-').collect::<Vec<_>>();
-    let identity = match fields.as_slice() {
-        [process_id, upload_id, identity]
-            if process_id.parse::<u32>().is_ok() && upload_id.parse::<u64>().is_ok() =>
-        {
-            *identity
-        }
-        [process_id, nonce, upload_id, identity]
-            if process_id.parse::<u32>().is_ok()
-                && nonce.len() == 32
-                && upload_id.parse::<u64>().is_ok() =>
-        {
-            *identity
-        }
-        _ => return Ok(None),
-    };
-    if identity.len() != SHARD_REFERENCE_IDENTITY_BYTES * 2 {
-        return Ok(None);
-    }
-    let mut encoded = [0_u8; SHARD_REFERENCE_IDENTITY_BYTES];
-    if hex::decode_to_slice(identity, &mut encoded).is_err() {
-        return Ok(None);
-    }
-    ShardIdentity::decode(&encoded).map(Some)
-}
-
-fn gc_quarantine_name(
-    artifact: &GcArtifact,
-    process_id: u32,
-    boot_nonce: &[u8],
-    sequence: u64,
-) -> String {
-    let (kind, identity) = match artifact {
-        GcArtifact::Blob(reference) => ("blob", blob_reference_key(reference)),
-        GcArtifact::Shard(identity) => ("shard", identity.encode().to_vec()),
-    };
-    format!(
-        "gc-{kind}-{process_id}-{}-{sequence}-{}.tmp",
-        hex::encode(boot_nonce),
-        hex::encode(identity),
-    )
-}
-
-fn quarantined_artifact_from_path(path: &Path) -> Result<Option<GcArtifact>, MutationError> {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(None);
-    };
-    let Some(body) = name
-        .strip_prefix("gc-")
-        .and_then(|name| name.strip_suffix(".tmp"))
-    else {
-        return Ok(None);
-    };
-    let fields = body.split('-').collect::<Vec<_>>();
-    let [kind, process_id, nonce, sequence, identity] = fields.as_slice() else {
-        return Ok(None);
-    };
-    if process_id.parse::<u32>().is_err() || nonce.len() != 32 || sequence.parse::<u64>().is_err() {
-        return Ok(None);
-    }
-    let expected = match *kind {
-        "blob" => BLOB_REFERENCE_IDENTITY_BYTES,
-        "shard" => SHARD_REFERENCE_IDENTITY_BYTES,
-        _ => return Ok(None),
-    };
-    if identity.len() != expected * 2 {
-        return Ok(None);
-    }
-    let mut encoded = vec![0_u8; expected];
-    if hex::decode_to_slice(identity, &mut encoded).is_err() {
-        return Ok(None);
-    }
-    match *kind {
-        "blob" => blob_reference_from_key(&encoded).map(GcArtifact::Blob),
-        "shard" => ShardIdentity::decode(&encoded)
-            .map(GcArtifact::Shard)
-            .map_err(storage_error),
-        _ => unreachable!(),
-    }
-    .map(Some)
-}
-
-fn sync_directory(path: &Path) -> Result<(), MutationError> {
-    std::fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(storage_error)
 }

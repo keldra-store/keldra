@@ -14,7 +14,7 @@ use keldra_storage::v1::index_specification::Specification as SpecificationValue
 use keldra_storage::v1::put_header::Operation as PutOperationValue;
 use keldra_storage::v1::{
     BooleanIndexField, CreateApplicationRequest, CreateBucketRequest, CreateIndexRequest,
-    DeleteRequest, Durability, FloatIndexField, FullTextField, FullTextIndexQuery,
+    DateIndexField, DeleteRequest, Durability, FloatIndexField, FullTextField, FullTextIndexQuery,
     FullTextIndexSpec, GetIndexRequest, GitSourceIndexQuery, GitSourceIndexSpec, HybridIndexQuery,
     HybridIndexSpec, IndexAggregateOperation, IndexAggregateRequest, IndexDefinition,
     IndexFacetRequest, IndexField, IndexFieldCapability, IndexFieldCardinality, IndexFreshness,
@@ -42,8 +42,9 @@ mod definition_lifecycle;
 #[path = "cluster_index_qualification/typed_capabilities.rs"]
 mod typed_capabilities;
 use typed_capabilities::{
-    boolean_field, float_field, keyword_field, keyword_multi_field, signed_integer_field,
-    signed_integer_multi_field, text_field, typed_json_order, unsigned_integer_field,
+    boolean_field, custom_date_field, date_field, float_field, keyword_field, keyword_multi_field,
+    signed_integer_field, signed_integer_multi_field, text_field, typed_json_order,
+    unsigned_integer_field,
 };
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -1663,6 +1664,24 @@ fn engine_cases() -> Vec<EngineCase> {
                             IndexFieldCapability::Aggregate,
                         ],
                     ),
+                    date_field(
+                        "published_at",
+                        "/published_at",
+                        &[
+                            IndexFieldCapability::Exact,
+                            IndexFieldCapability::Range,
+                            IndexFieldCapability::Order,
+                            IndexFieldCapability::Facet,
+                        ],
+                    ),
+                    custom_date_field(
+                        "reviewed_at", "/reviewed_at", "%d/%m/%Y %H:%M",
+                        &[
+                            IndexFieldCapability::Exact,
+                            IndexFieldCapability::Range,
+                            IndexFieldCapability::Facet,
+                        ],
+                    ),
                     keyword_field(
                         "source_record_id",
                         "/source_record_id",
@@ -1728,10 +1747,10 @@ fn engine_cases() -> Vec<EngineCase> {
                 aggregates: Vec::new(),
             })),
             documents: vec![
-                ("docs/active-a.json", br#"{"status":"active","modified_at":100,"source_record_id":"b","sequence":1,"score":1.5,"enabled":true,"labels":["stable","stable","alpha"],"measurements":[1,1],"summary":"durable journal alpha"}"#),
-                ("docs/inactive.json", br#"{"status":"inactive","modified_at":400,"source_record_id":"x","sequence":4,"score":9.0,"enabled":false,"labels":["archived"],"measurements":[9],"summary":"unrelated material"}"#),
-                ("docs/active-b.json", br#"{"status":"active","modified_at":200,"source_record_id":"z","sequence":2,"score":2.5,"enabled":true,"labels":["stable","beta"],"measurements":[2,3],"summary":"durable journal beta"}"#),
-                ("docs/active-c.json", br#"{"status":"active","modified_at":200,"source_record_id":"a","sequence":3,"score":3.5,"enabled":true,"labels":["stable","gamma"],"measurements":[4],"summary":"durable journal gamma"}"#),
+                ("docs/active-a.json", br#"{"status":"active","modified_at":100,"published_at":"2024-01-01","reviewed_at":"15/01/2024 09:30","source_record_id":"b","sequence":1,"score":1.5,"enabled":true,"labels":["stable","stable","alpha"],"measurements":[1,1],"summary":"durable journal alpha"}"#),
+                ("docs/inactive.json", br#"{"status":"inactive","modified_at":400,"published_at":"2024-03-01T00:00:00Z","reviewed_at":"15/03/2024 09:30","source_record_id":"x","sequence":4,"score":9.0,"enabled":false,"labels":["archived"],"measurements":[9],"summary":"unrelated material"}"#),
+                ("docs/active-b.json", br#"{"status":"active","modified_at":200,"published_at":"2024-02-01T00:00:00Z","reviewed_at":"15/02/2024 09:30","source_record_id":"z","sequence":2,"score":2.5,"enabled":true,"labels":["stable","beta"],"measurements":[2,3],"summary":"durable journal beta"}"#),
+                ("docs/active-c.json", br#"{"status":"active","modified_at":200,"published_at":"2024-02-01T00:00:00Z","reviewed_at":"15/02/2024 09:30","source_record_id":"a","sequence":3,"score":3.5,"enabled":true,"labels":["stable","gamma"],"measurements":[4],"summary":"durable journal gamma"}"#),
             ],
             expected_paths: vec![
                 "docs/active-c.json",
@@ -1740,7 +1759,7 @@ fn engine_cases() -> Vec<EngineCase> {
             ],
             replacement: (
                 "docs/active-a.json",
-                br#"{"status":"active","modified_at":100,"source_record_id":"b","sequence":1,"score":1.5,"enabled":true,"labels":["stable","stable","alpha"],"measurements":[1,1],"summary":"durable journal alpha","revision":2}"#,
+                br#"{"status":"active","modified_at":100,"published_at":"2024-01-01","reviewed_at":"15/01/2024 09:30","source_record_id":"b","sequence":1,"score":1.5,"enabled":true,"labels":["stable","stable","alpha"],"measurements":[1,1],"summary":"durable journal alpha","revision":2}"#,
             ),
             replacement_hit_path: "docs/active-a.json",
             delete_path: "docs/active-b.json",

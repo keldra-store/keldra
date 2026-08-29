@@ -15,19 +15,20 @@ const MAX_PARALLEL_READS: usize = 32;
 
 struct SelectedRead {
     index: usize,
-    key: ObjectKey,
+    response_key: ObjectKey,
+    read_key: ObjectKey,
     requested_version: Option<VersionId>,
 }
 
 pub(super) async fn read_accepted(
     distribution: ObjectDistribution,
     reader: ClusterObjectReader,
-    accepted: Vec<(usize, ObjectKey, Option<VersionId>)>,
+    accepted: Vec<(usize, ObjectKey, ObjectKey, Option<VersionId>)>,
     maximum_payload_bytes: u64,
 ) -> Result<(Vec<BatchGetOutcome>, Option<u64>), Status> {
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_READS));
     let mut declarations = tokio::task::JoinSet::new();
-    for (index, key, requested_version) in accepted {
+    for (index, response_key, read_key, requested_version) in accepted {
         let distribution = distribution.clone();
         let permits = permits.clone();
         declarations.spawn(async move {
@@ -36,16 +37,16 @@ pub(super) async fn read_accepted(
                 .await
                 .map_err(|_| Status::internal("batch-read scheduler stopped"))?;
             let result = distribution
-                .reconciled_object_snapshot(&key)
+                .reconciled_object_snapshot(&read_key)
                 .await
                 .and_then(|snapshot| {
                     distributed_reads::declared_payload_length(
                         snapshot.as_ref(),
-                        &key,
+                        &read_key,
                         requested_version,
                     )
                 });
-            Ok::<_, Status>((index, key, requested_version, result))
+            Ok::<_, Status>((index, response_key, read_key, requested_version, result))
         });
     }
 
@@ -53,18 +54,19 @@ pub(super) async fn read_accepted(
     let mut selected = Vec::new();
     let mut declared_total = 0_u64;
     while let Some(joined) = declarations.join_next().await {
-        let (index, key, requested_version, result) = joined
+        let (index, response_key, read_key, requested_version, result) = joined
             .map_err(|error| Status::internal(format!("batch-read task failed: {error}")))??;
         match result {
             Ok(declared_bytes) => {
                 declared_total = declared_total.saturating_add(declared_bytes);
                 selected.push(SelectedRead {
                     index,
-                    key,
+                    response_key,
+                    read_key,
                     requested_version,
                 });
             }
-            Err(error) => outcomes.push(failed(index, &key, error)),
+            Err(error) => outcomes.push(failed(index, &response_key, error)),
         }
     }
     enforce_limit(declared_total, maximum_payload_bytes)?;
@@ -81,7 +83,7 @@ pub(super) async fn read_accepted(
                 .map_err(|_| Status::internal("batch-read scheduler stopped"))?;
             let result = distributed_reads::read_batch_result(
                 &reader,
-                &selected.key,
+                &selected.read_key,
                 selected.requested_version,
             )
             .await;
@@ -104,7 +106,7 @@ pub(super) async fn read_accepted(
         };
         outcomes.push(BatchGetOutcome {
             index: selected.index as u32,
-            address: Some(api_address(&selected.key)),
+            address: Some(api_address(&selected.response_key)),
             outcome: Some(outcome),
         });
     }

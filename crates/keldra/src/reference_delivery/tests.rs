@@ -6,9 +6,9 @@ use keldra_atomic_program::{ObjectPath, ObservedHead};
 use keldra_store::{
     BatchOperation, BlobReferenceState, BucketPolicy, DeleteRequest, Durability,
     LogicalRecordMutationContext, LogicalRecordValue, ObjectHeadChangeKind, ObjectKey,
-    ObjectMutationContext, PlacementLogId, Precondition, PreparedBundleHash, ProgramHash,
-    ProgramPathStage, PublishRequest, PutMode, PutRequest, ReferenceDelta, StorageTenantId,
-    StoreOptions, Version, VersionId, WatchRetention,
+    ObjectMutationContext, PlacementLogId, Precondition, PreparedBundleHash,
+    ProgramBundleAuthority, ProgramHash, ProgramPathStage, PublishRequest, PutMode, PutRequest,
+    ReferenceDelta, StorageTenantId, StoreOptions, Version, VersionId, WatchRetention,
 };
 use tempfile::TempDir;
 
@@ -1386,9 +1386,15 @@ async fn program_proof_waits_for_nominated_executor_completion() {
     let payload = source.stage_blob(b"program payload").await.unwrap();
     let path = node_one_coordinator_path("managed/result");
     let stage = ProgramPathStage {
-        format: 1,
+        format: 2,
+        begin_cursor: 41,
         bundle_hash: PreparedBundleHash([0x11; 32]),
         program_hash: ProgramHash([0x22; 32]),
+        authority: ProgramBundleAuthority::LegacyProgramOnly {
+            program_path_hash: [0x33; 32],
+            program_hash: [0x22; 32],
+        },
+        participant_manifest_hash: [0x44; 32],
         tenant_id: 1,
         bucket_id: 1,
         path: ObjectPath::new("tenant", "bucket", path).unwrap(),
@@ -1400,6 +1406,7 @@ async fn program_proof_waits_for_nominated_executor_completion() {
             content_type: Some("application/octet-stream".into()),
             deleted: false,
             committed_at_unix_millis: 1,
+            protected_link_descriptor: false,
         },
     };
     let finalized = source

@@ -31,6 +31,65 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
     type ScanIndexSourceSnapshotStream = super::index_snapshot::IndexSourceSnapshotRpcStream;
     type ScanRetainedSourceSnapshotStream = super::index_snapshot::RetainedSourceSnapshotRpcStream;
 
+    async fn update_local_capabilities(
+        &self,
+        request: Request<wire::UpdateLocalCapabilitiesRequest>,
+    ) -> Result<Response<wire::LocalCapabilitiesUpdated>, Status> {
+        let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
+        let source = admitted.authenticated.node_id;
+        if self.decisions.current_leader() != Some(self.local_node.0) {
+            let hint = self
+                .decisions
+                .current_leader()
+                .map_or_else(|| "unknown".into(), |node| node.to_string());
+            return Err(Status::unavailable(format!(
+                "local capability attestation must be sent to current leader node {hint}"
+            )));
+        }
+        let value = request.into_inner();
+        let expected_protocol =
+            capability_range(value.expected_protocol_min, value.expected_protocol_max)?;
+        let expected_storage =
+            capability_range(value.expected_storage_min, value.expected_storage_max)?;
+        let replacement_protocol = capability_range(
+            value.replacement_protocol_min,
+            value.replacement_protocol_max,
+        )?;
+        let replacement_storage =
+            capability_range(value.replacement_storage_min, value.replacement_storage_max)?;
+        let committed = self
+            .decisions
+            .submit(keldra_consensus::Command::UpdateNodeCapabilities {
+                format_version: keldra_consensus::CLUSTER_CONTROL_COMMAND_VERSION,
+                node_id: source,
+                expected_protocol,
+                expected_storage,
+                replacement_protocol,
+                replacement_storage,
+            })
+            .await
+            .map_err(capability_decision_status)?;
+        let keldra_consensus::ApplyResult::NodeCapabilitiesUpdated(descriptor) = committed.result
+        else {
+            return Err(Status::internal(
+                "local capability update returned an unexpected result",
+            ));
+        };
+        if descriptor.node_id != source {
+            return Err(Status::internal(
+                "local capability update returned another node descriptor",
+            ));
+        }
+        Ok(Response::new(wire::LocalCapabilitiesUpdated {
+            schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+            node_id: source.0,
+            protocol_min: u32::from(descriptor.supported_protocol.min),
+            protocol_max: u32::from(descriptor.supported_protocol.max),
+            storage_min: u32::from(descriptor.supported_storage_format.min),
+            storage_max: u32::from(descriptor.supported_storage_format.max),
+        }))
+    }
+
     async fn publish_index_artifact(
         &self,
         request: Request<wire::PublishIndexArtifactRequest>,
@@ -745,6 +804,27 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         self.route_delete_if_version_call(request).await
     }
 
+    async fn route_clone_object(
+        &self,
+        request: Request<wire::RouteCloneObjectRequest>,
+    ) -> Result<Response<keldra_api::v1::MutationReceipt>, Status> {
+        self.route_clone_object_call(request).await
+    }
+
+    async fn route_link_object(
+        &self,
+        request: Request<wire::RouteLinkObjectRequest>,
+    ) -> Result<Response<keldra_api::v1::MutationReceipt>, Status> {
+        self.route_link_object_call(request).await
+    }
+
+    async fn route_unlink_object(
+        &self,
+        request: Request<wire::RouteUnlinkObjectRequest>,
+    ) -> Result<Response<keldra_api::v1::MutationReceipt>, Status> {
+        self.route_unlink_object_call(request).await
+    }
+
     async fn route_bulk_write(
         &self,
         request: Request<wire::RouteBulkWriteRequest>,
@@ -920,11 +1000,39 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         self.route_invoke_program_call(request).await
     }
 
+    async fn route_built_in_replay_batch(
+        &self,
+        request: Request<wire::RouteBuiltInReplayBatchRequest>,
+    ) -> Result<Response<wire::RouteBuiltInReplayBatchResponse>, Status> {
+        self.route_builtin_replay_batch_call(request).await
+    }
+
     async fn stage_program_path(
         &self,
         request: Request<wire::ProgramStagePathRequest>,
     ) -> Result<Response<wire::ProgramStagePathResponse>, Status> {
         self.stage_program_path_call(request).await
+    }
+
+    async fn reserve_program_participant(
+        &self,
+        request: Request<wire::ProgramReserveParticipantRequest>,
+    ) -> Result<Response<wire::ProgramParticipantReservationApplied>, Status> {
+        self.reserve_program_participant_call(request).await
+    }
+
+    async fn commit_program_participant(
+        &self,
+        request: Request<wire::ProgramCommitParticipantRequest>,
+    ) -> Result<Response<wire::ProgramParticipantReservationApplied>, Status> {
+        self.commit_program_participant_call(request).await
+    }
+
+    async fn release_program_participant(
+        &self,
+        request: Request<wire::ProgramReleaseParticipantRequest>,
+    ) -> Result<Response<wire::ProgramParticipantReservationApplied>, Status> {
+        self.release_program_participant_call(request).await
     }
 
     async fn coordinate_program_path_finalization(
@@ -940,6 +1048,29 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::ProgramApplyPathFinalizationRequest>,
     ) -> Result<Response<wire::ProgramPathFinalizationApplied>, Status> {
         self.apply_program_path_finalization_call(request).await
+    }
+
+    async fn coordinate_program_alias_registry_finalization(
+        &self,
+        request: Request<wire::ProgramCoordinateAliasRegistryFinalizationRequest>,
+    ) -> Result<Response<wire::ProgramCoordinatedAliasRegistryFinalization>, Status> {
+        self.coordinate_program_alias_registry_finalization_call(request)
+            .await
+    }
+
+    async fn apply_program_alias_registry_finalization(
+        &self,
+        request: Request<wire::ProgramApplyAliasRegistryFinalizationRequest>,
+    ) -> Result<Response<wire::ProgramAliasRegistryFinalizationApplied>, Status> {
+        self.apply_program_alias_registry_finalization_call(request)
+            .await
+    }
+
+    async fn read_program_alias_registry(
+        &self,
+        request: Request<wire::ProgramReadAliasRegistryRequest>,
+    ) -> Result<Response<wire::ProgramAliasRegistryRead>, Status> {
+        self.read_program_alias_registry_call(request).await
     }
 
     async fn coordinate_logical_record(
@@ -961,6 +1092,33 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::CoordinateSystemGrantRequest>,
     ) -> Result<Response<wire::CoordinateSystemGrantResponse>, Status> {
         self.coordinate_system_grant_call(request).await
+    }
+}
+
+fn capability_range(min: u32, max: u32) -> Result<keldra_consensus::CapabilityRange, Status> {
+    let min = u16::try_from(min)
+        .map_err(|_| Status::invalid_argument("capability minimum exceeds u16"))?;
+    let max = u16::try_from(max)
+        .map_err(|_| Status::invalid_argument("capability maximum exceeds u16"))?;
+    if min == 0 || min > max {
+        return Err(Status::invalid_argument("capability range is invalid"));
+    }
+    Ok(keldra_consensus::CapabilityRange { min, max })
+}
+
+fn capability_decision_status(error: keldra_consensus::DecisionRaftError) -> Status {
+    use keldra_consensus::DecisionRaftError;
+    match error {
+        DecisionRaftError::ForwardToLeader { .. }
+        | DecisionRaftError::Unavailable(_)
+        | DecisionRaftError::LeaderTimeout => Status::unavailable(error.to_string()),
+        DecisionRaftError::Rejected(_) | DecisionRaftError::Configuration(_) => {
+            Status::failed_precondition(error.to_string())
+        }
+        DecisionRaftError::InvalidNodeId => Status::invalid_argument(error.to_string()),
+        DecisionRaftError::Storage(_)
+        | DecisionRaftError::SnapshotTimeout
+        | DecisionRaftError::StatePoisoned => Status::internal(error.to_string()),
     }
 }
 

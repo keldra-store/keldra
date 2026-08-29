@@ -1,5 +1,3 @@
-use std::fs::ReadDir;
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// Hard work limits for one ordinary blob garbage-collection tick.
@@ -23,8 +21,7 @@ impl BlobGcBudget {
 /// Caller-owned progress for incremental local lifecycle maintenance.
 ///
 /// The authoritative due order is durable. This cursor is deliberately
-/// process-local: losing it merely restarts a prefix seek and bounded scans of
-/// `.staging` and `.gc`; canonical content directories are never inventoried.
+/// process-local: losing it merely restarts a durable due-index prefix seek.
 #[derive(Default)]
 pub struct BlobGcCursor {
     pub(crate) phase: BlobGcPhase,
@@ -43,7 +40,6 @@ impl std::fmt::Debug for BlobGcCursor {
 pub(crate) enum BlobGcPhaseName {
     #[default]
     Due,
-    Filesystem,
 }
 
 #[derive(Default)]
@@ -51,43 +47,14 @@ pub(crate) enum BlobGcPhase {
     #[default]
     Due,
     DueAfter(Vec<u8>),
-    Filesystem(FilesystemGcCursor),
 }
 
 impl BlobGcPhase {
     fn name(&self) -> BlobGcPhaseName {
         match self {
             Self::Due | Self::DueAfter(_) => BlobGcPhaseName::Due,
-            Self::Filesystem(_) => BlobGcPhaseName::Filesystem,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum FilesystemGcDirectory {
-    #[default]
-    Staging,
-    Quarantine,
-    Complete,
-}
-
-#[derive(Default)]
-pub(crate) struct FilesystemGcCursor {
-    pub(crate) directory: FilesystemGcDirectory,
-    pub(crate) entries: Option<ReadDir>,
-    pub(crate) replay: Option<FilesystemGcRecord>,
-}
-
-pub(crate) enum FilesystemGcRecord {
-    Staged {
-        path: PathBuf,
-        modified_at: u64,
-        encoded_bytes: u64,
-    },
-    Quarantined {
-        path: PathBuf,
-        encoded_bytes: u64,
-    },
 }
 
 /// Work completed by one bounded collector tick.

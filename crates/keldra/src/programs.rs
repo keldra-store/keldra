@@ -12,22 +12,27 @@ use keldra_atomic_program::{
     ProgramInvocation,
 };
 use keldra_consensus::{
-    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, BundleHash, BundleRef, Command,
-    CommitBatch, CommittedBatch, CommittedInvocation, DecisionRaft, DecisionRaftError,
-    DurabilityClass, DurabilityEvidenceHash, ExecutorNomination, InvocationFingerprint,
-    InvocationId, NodeId, ProgramHash as DecisionProgramHash, ProgramPathHash,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, AtomicBundleAuthority, BeginBatch,
+    BundleHash, BundleRef, Command, CommitPreparedBatch, CommittedBatch, CommittedInvocation,
+    DecisionRaft, DecisionRaftError, DurabilityClass, DurabilityEvidenceHash, ExecutorNomination,
+    InvocationFingerprint, InvocationId, NodeId, ParticipantManifestHash,
+    ProgramHash as DecisionProgramHash, ProgramPathHash,
 };
 use keldra_store::{
     CommittedProgramResult, ObjectKey, ObjectMutationContext, PlacementLogId, PreparedBundleHash,
-    PreparedBundleRef, ProgramCommit, ProgramDurabilityClassHash, ProgramDurabilityEvidenceHash,
-    ProgramDurabilityScope, ProgramHash, ProgramStoreError, PublishedProgramVersion, Store,
-    VerifiedProgramDefinition,
+    PreparedBundleRef, ProgramBundleAuthority, ProgramCommit, ProgramDurabilityClassHash,
+    ProgramDurabilityEvidenceHash, ProgramDurabilityScope, ProgramHash, ProgramReservation,
+    ProgramStoreError, PublishedProgramVersion, Store, VerifiedProgramDefinition,
 };
+use serde::{Deserialize, Serialize};
 use tonic::Status;
 use tracing::Instrument as _;
 
+mod builtin;
 mod distributed;
+mod recovery;
 
+pub(crate) use builtin::builtin_invocation_identity;
 use distributed::DistributedPrograms;
 
 pub(crate) const MAX_PROGRAM_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -52,6 +57,7 @@ pub(crate) struct ProgramCoordinator {
     /// concurrent before this short boundary.
     commit_gate: Arc<tokio::sync::Mutex<()>>,
     distributed: Arc<std::sync::OnceLock<DistributedPrograms>>,
+    recovery_worker: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// Late binding used by the private join listener, which must begin accepting
@@ -82,15 +88,26 @@ impl LateBoundProgramQuiescence {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct InvokedProgramResult {
     pub receipt: CommandReceipt,
     pub executor_nomination_log_index: u64,
     pub commit_log_index: u64,
     pub program_hash: [u8; 32],
     pub published_versions: BTreeMap<ObjectPath, PublishedProgramVersion>,
+    pub asserted_versions: BTreeMap<ObjectPath, keldra_store::Version>,
+    pub alias_targets: BTreeMap<ObjectPath, ObjectPath>,
     pub replayed: bool,
     pub replay_guarantee_expires_at_unix_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BuiltInReplayLookup {
+    pub original_index: u32,
+    pub authority_kind: u16,
+    pub contract_version: u16,
+    pub invocation_id: [u8; 32],
+    pub input_fingerprint: [u8; 32],
 }
 
 /// True only when this node's applied Raft state has no committed atomic batch
@@ -98,7 +115,7 @@ pub(crate) struct InvokedProgramResult {
 /// when this returns false.
 pub(crate) fn atomic_tail_is_clear(decisions: &DecisionRaft) -> Result<bool, Status> {
     let state = decisions.state().map_err(decision_status)?;
-    Ok(state.unfinalized_commit_len() == 0)
+    Ok(state.preparing_batch().is_none() && state.unfinalized_commit_len() == 0)
 }
 
 /// Wait for the locally applied atomic tail to become fully finalized. The
@@ -231,9 +248,22 @@ impl ProgramCoordinator {
                 .await
                 .map_err(internal)?;
         }
+        self.sweep_stale_local_reservations()
+            .await
+            .map_err(internal)?;
         if !atomic_tail_is_clear(&self.decisions)? {
             return Err(Status::unavailable(
                 "atomic program tail is not finalized before membership cutover",
+            ));
+        }
+        if !self
+            .store
+            .program_reservations()
+            .map_err(mutation_status)?
+            .is_empty()
+        {
+            return Err(Status::unavailable(
+                "durable atomic reservations remain before membership cutover",
             ));
         }
         self.decisions
@@ -267,7 +297,12 @@ impl ProgramCoordinator {
             node,
             commit_gate: Arc::new(tokio::sync::Mutex::new(())),
             distributed: Arc::new(std::sync::OnceLock::new()),
+            recovery_worker: Arc::new(std::sync::Mutex::new(None)),
         };
+        coordinator
+            .sweep_stale_local_reservations()
+            .await
+            .context("clear reservations whose Raft authority is finalized or aborted")?;
         if coordinator
             .decisions
             .state()?
@@ -281,6 +316,7 @@ impl ProgramCoordinator {
                 .await
                 .context("recover committed atomic-program bundles")?;
         }
+        coordinator.spawn_recovery_worker();
         coordinator.emit_bounded_state_metrics();
         Ok(coordinator)
     }
@@ -320,17 +356,19 @@ impl ProgramCoordinator {
     /// Execute only on the nominated node. The API layer performs Zanzibar
     /// checks through `authorize` after deterministic path expansion and
     /// before the evaluator takes locks or reads payloads.
-    pub async fn invoke<F>(
+    pub async fn invoke<L, C>(
         &self,
         program_key: ObjectKey,
         expected_program_hash: [u8; 32],
         invocation_id: String,
         input_json: &[u8],
         durability_class: &str,
-        authorize: F,
+        authorize_logical: L,
+        authorize_canonical: C,
     ) -> Result<InvokedProgramResult, Status>
     where
-        F: Fn(&ExpandedProgramPath) -> Result<(), Status>,
+        L: Fn(&ExpandedProgramPath) -> Result<(), Status>,
+        C: Fn(&ExpandedProgramPath) -> Result<(), Status>,
     {
         let invocation_hash = invocation_identity(&program_key, &invocation_id);
         let invocation_hash = hex::encode(invocation_hash.0);
@@ -350,7 +388,8 @@ impl ProgramCoordinator {
                 invocation_id,
                 input_json,
                 durability_class,
-                authorize,
+                authorize_logical,
+                authorize_canonical,
             )
             .instrument(span.clone())
             .await;
@@ -364,17 +403,19 @@ impl ProgramCoordinator {
         result
     }
 
-    async fn invoke_in_span<F>(
+    async fn invoke_in_span<L, C>(
         &self,
         program_key: ObjectKey,
         expected_program_hash: [u8; 32],
         invocation_id: String,
         input_json: &[u8],
         durability_class: &str,
-        authorize: F,
+        authorize_logical: L,
+        authorize_canonical: C,
     ) -> Result<InvokedProgramResult, Status>
     where
-        F: Fn(&ExpandedProgramPath) -> Result<(), Status>,
+        L: Fn(&ExpandedProgramPath) -> Result<(), Status>,
+        C: Fn(&ExpandedProgramPath) -> Result<(), Status>,
     {
         tracing::info!(
             monotonic_counter.keldra_atomic_program_invocations_total = 1_u64,
@@ -387,6 +428,7 @@ impl ProgramCoordinator {
             durability_class,
             ProgramRuntimeTopology::OneNode,
         )?;
+        self.require_generalized_atomic_paths()?;
         let nomination = self.current_nomination()?;
         tracing::Span::current().record("nomination.log_index", nomination.nomination_log_index);
 
@@ -418,11 +460,11 @@ impl ProgramCoordinator {
         self.recover_committed_tail().await.map_err(internal)?;
 
         loop {
-            for path in engine
+            let expanded = engine
                 .expanded_paths(&context, &invocation)
-                .map_err(engine_status)?
-            {
-                authorize(&path)?;
+                .map_err(engine_status)?;
+            for path in &expanded {
+                authorize_logical(path)?;
             }
             let replay_clock = current_unix_millis().map_err(internal)?;
             if let Some(invocation) = self
@@ -431,25 +473,47 @@ impl ProgramCoordinator {
                 .map_err(decision_status)?
                 .replay_entry(consensus_invocation_id, replay_clock)
             {
-                return self
+                let result = self
                     .replay_committed_invocation(
                         invocation,
                         fingerprint,
                         program_path_hash,
                         expected_program_hash,
                     )
-                    .await;
+                    .await?;
+                authorize_sealed_canonical_paths(
+                    &expanded,
+                    &result.alias_targets,
+                    &authorize_canonical,
+                )?;
+                return Ok(result);
             }
+
+            let alias_bindings = self
+                .store
+                .resolve_program_alias_bindings(&expanded)
+                .await
+                .map_err(program_store_status)?;
+            let canonical_paths = alias_bindings
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.requested_path.clone(),
+                        binding.canonical_path.clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            authorize_canonical_bindings(&expanded, &canonical_paths, &authorize_canonical)?;
 
             let prepare_started = Instant::now();
             let lease = engine
-                .prepare(&context, &invocation)
+                .prepare_canonicalized(&context, &invocation, &canonical_paths)
                 .await
                 .map_err(engine_status)?;
 
             let prepared = self
                 .store
-                .prepare_program_bundle(&lease)
+                .prepare_program_bundle_with_aliases(&lease, &alias_bindings)
                 .await
                 .map_err(program_store_status)?;
             tracing::info!(
@@ -464,6 +528,11 @@ impl ProgramCoordinator {
                 durability_class,
                 self.node,
             )?;
+            let record = self
+                .store
+                .prepared_program_record(&prepared)
+                .await
+                .map_err(program_store_status)?;
 
             let _commit_guard = self.commit_gate.lock().await;
             let replay_clock = current_unix_millis().map_err(internal)?;
@@ -522,13 +591,12 @@ impl ProgramCoordinator {
                 .checked_add(ATOMIC_REPLAY_RETENTION_MILLIS)
                 .ok_or_else(|| Status::internal("atomic replay expiry overflow"))?;
             let commit_started = Instant::now();
-            let committed = self
+            let begun = self
                 .decisions
-                .submit(Command::CommitBatch(CommitBatch {
+                .submit(Command::BeginBatch(BeginBatch {
                     executor: self.node,
                     nomination_log_index: nomination.nomination_log_index,
-                    program_path_hash: ProgramPathHash(program_path_hash),
-                    program_hash: DecisionProgramHash(expected_program_hash),
+                    authority: decision_bundle_authority(prepared.authority),
                     invocation_id: consensus_invocation_id,
                     input_fingerprint: InvocationFingerprint(fingerprint),
                     bundle_ref: BundleRef {
@@ -540,6 +608,9 @@ impl ProgramCoordinator {
                         ProgramDurabilityClassHash::for_class(durability_class).0,
                     ),
                     durability_evidence_hash: DurabilityEvidenceHash(evidence_hash.0),
+                    participant_manifest_hash: ParticipantManifestHash(
+                        prepared.participant_manifest_hash,
+                    ),
                     proposal_at_unix_millis,
                     replay_expires_at_unix_millis,
                 }))
@@ -550,7 +621,44 @@ impl ProgramCoordinator {
                 "atomic program decision completed"
             );
             self.emit_bounded_state_metrics();
-            let committed = committed.map_err(decision_status)?;
+            let begun = begun.map_err(decision_status)?;
+            let prepared_batch = match expect_batch_begun(begun.result)? {
+                keldra_consensus::BeginResult::AlreadyCommitted(committed) => {
+                    drop(lease);
+                    return self
+                        .load_committed_invocation_result(committed.invocation, true)
+                        .await;
+                }
+                keldra_consensus::BeginResult::Prepared { batch, .. } => batch,
+            };
+            let reservations = record
+                .reservations(
+                    prepared_batch.begin_cursor,
+                    consensus_invocation_id.0,
+                    prepared.hash,
+                    self.node.0,
+                    nomination.nomination_log_index,
+                    mutation_context.active_placement_log_id,
+                )
+                .map_err(program_store_status)?;
+            if let Err(error) = self.reserve_local_participants(&reservations).await {
+                self.abort_prepared_batch(prepared_batch).await?;
+                self.release_local_participants(&reservations, None).await?;
+                return Err(error);
+            }
+            let committed = self
+                .decisions
+                .submit(Command::CommitPreparedBatch(CommitPreparedBatch {
+                    executor: self.node,
+                    nomination_log_index: nomination.nomination_log_index,
+                    begin_cursor: prepared_batch.begin_cursor,
+                    invocation_id: consensus_invocation_id,
+                    participant_manifest_hash: ParticipantManifestHash(
+                        prepared.participant_manifest_hash,
+                    ),
+                }))
+                .await
+                .map_err(decision_status)?;
             let committed = expect_batch_committed(committed.result)?;
             record_committed_span(committed.invocation);
             if committed.replayed {
@@ -562,6 +670,12 @@ impl ProgramCoordinator {
                     .load_committed_invocation_result(committed.invocation, true)
                     .await;
             }
+
+            self.commit_local_participants(
+                &reservations,
+                committed.invocation.committed_batch.commit_cursor,
+            )
+            .await?;
 
             let result = self
                 .store
@@ -577,6 +691,11 @@ impl ProgramCoordinator {
             self.advance_finalized_through(
                 nomination,
                 committed.invocation.committed_batch.commit_cursor,
+            )
+            .await?;
+            self.release_local_participants(
+                &reservations,
+                Some(committed.invocation.committed_batch.commit_cursor),
             )
             .await?;
             return Ok(invoked_result(result, committed.invocation, false));
@@ -608,126 +727,6 @@ impl ProgramCoordinator {
             .map_err(program_store_status)?;
         require_result_matches_consensus(&result, invocation)?;
         Ok(invoked_result(result, invocation, replayed))
-    }
-
-    fn current_nomination(&self) -> Result<ExecutorNomination, Status> {
-        let nomination = self
-            .decisions
-            .state()
-            .map_err(decision_status)?
-            .executor()
-            .ok_or_else(|| {
-                Status::unavailable("EXECUTOR_MOVED: no atomic executor is nominated")
-            })?;
-        if nomination.executor != self.node {
-            return Err(Status::unavailable(format!(
-                "EXECUTOR_MOVED: atomic request belongs on nominated executor node {}",
-                nomination.executor.0
-            )));
-        }
-        Ok(nomination)
-    }
-
-    fn one_node_mutation_context(
-        &self,
-        nomination: ExecutorNomination,
-    ) -> Result<ObjectMutationContext, Status> {
-        let state = self.decisions.state().map_err(decision_status)?;
-        let placement = state
-            .cluster_control()
-            .active_placement_log_id()
-            .ok_or_else(|| Status::unavailable("ACTIVE placement has no committed log identity"))?;
-        Ok(ObjectMutationContext {
-            active_placement_log_id: PlacementLogId {
-                term: placement.leader_id.term,
-                index: placement.index,
-            },
-            // As on the distributed path, executor nomination is the atomic
-            // mutation's serving fence while the commit gate excludes a
-            // membership cutover.
-            serving_fence_term: nomination.nomination_log_index,
-        })
-    }
-
-    async fn recover_committed_tail(&self) -> Result<()> {
-        let _guard = self.commit_gate.lock().await;
-        self.recover_committed_tail_locked().await
-    }
-
-    async fn recover_committed_tail_locked(&self) -> Result<()> {
-        let nomination = self
-            .current_nomination()
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let mutation_context = self
-            .one_node_mutation_context(nomination)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let state = self.decisions.state().context("read decision state")?;
-        let mut applied = self
-            .store
-            .applied_program_commit_cursor()
-            .context("read applied atomic commit cursor")?;
-        if let Some(finalized) = state.finalized_through()
-            && applied.is_none_or(|cursor| cursor < finalized)
-        {
-            bail!(
-                "local atomic view is behind finalized cursor {finalized}; compacted recovery data is unavailable"
-            );
-        }
-        if let (Some(applied), Some(last)) = (applied, state.last_commit_cursor())
-            && applied > last
-        {
-            bail!("local atomic cursor {applied} is ahead of consensus cursor {last}");
-        }
-
-        let mut finalized_through = None;
-        for invocation in state.unfinalized_invocations() {
-            tracing::info!(
-                monotonic_counter.keldra_atomic_program_finalization_retries_total = 1_u64,
-                "retry atomic program finalization"
-            );
-            let batch = invocation.committed_batch;
-            if applied.is_some_and(|cursor| cursor >= batch.commit_cursor) {
-                // The local atomic batch and compact applied cursor were
-                // already installed before the previous process stopped.
-                // FinalizedThrough is the only remaining work; old replay
-                // entries are never reapplied.
-                finalized_through = Some(batch.commit_cursor);
-                continue;
-            }
-            let result = self
-                .store
-                .recover_program_bundle(program_commit(applied, batch), mutation_context)
-                .await
-                .with_context(|| format!("finalize atomic commit {}", batch.commit_cursor))?;
-            require_result_matches_consensus(&result, invocation)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            applied = Some(batch.commit_cursor);
-            finalized_through = Some(batch.commit_cursor);
-        }
-        if let Some(through_commit_cursor) = finalized_through {
-            self.advance_finalized_through(nomination, through_commit_cursor)
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        }
-        Ok(())
-    }
-
-    async fn advance_finalized_through(
-        &self,
-        nomination: ExecutorNomination,
-        through_commit_cursor: u64,
-    ) -> Result<(), Status> {
-        let result = self
-            .decisions
-            .submit(Command::FinalizedThrough {
-                executor: self.node,
-                nomination_log_index: nomination.nomination_log_index,
-                through_commit_cursor,
-            })
-            .await;
-        self.emit_bounded_state_metrics();
-        let result = result.map_err(finalization_decision_status)?;
-        expect_finalization(result.result, through_commit_cursor)
     }
 
     fn emit_bounded_state_metrics(&self) {
@@ -856,16 +855,73 @@ fn program_commit(previous_commit_cursor: Option<u64>, committed: CommittedBatch
     ProgramCommit {
         previous_commit_cursor,
         commit_cursor: committed.commit_cursor,
+        begin_cursor: committed.begin_cursor,
         bundle_ref: PreparedBundleRef {
             hash: committed.bundle_ref.hash,
             length: committed.bundle_ref.length,
         },
         bundle_hash: PreparedBundleHash(committed.bundle_hash.0),
-        program_hash: ProgramHash(committed.program_hash.0),
+        program_hash: ProgramHash(match committed.authority {
+            AtomicBundleAuthority::StoredProgram { program_hash, .. }
+            | AtomicBundleAuthority::LegacyProgramOnly { program_hash, .. } => program_hash.0,
+            AtomicBundleAuthority::BuiltInObjectTransaction { .. } => [0; 32],
+        }),
+        authority: store_bundle_authority(committed.authority),
+        participant_manifest_hash: committed.participant_manifest_hash.0,
         durability_class: ProgramDurabilityClassHash(committed.durability_class.0),
         durability_evidence_hash: ProgramDurabilityEvidenceHash(
             committed.durability_evidence_hash.0,
         ),
+    }
+}
+
+pub(crate) fn store_bundle_authority(authority: AtomicBundleAuthority) -> ProgramBundleAuthority {
+    match authority {
+        AtomicBundleAuthority::StoredProgram {
+            program_path_hash,
+            program_hash,
+        } => ProgramBundleAuthority::StoredProgram {
+            program_path_hash: program_path_hash.0,
+            program_hash: program_hash.0,
+        },
+        AtomicBundleAuthority::BuiltInObjectTransaction {
+            kind,
+            contract_version,
+        } => ProgramBundleAuthority::BuiltInObjectTransaction {
+            kind,
+            contract_version,
+        },
+        AtomicBundleAuthority::LegacyProgramOnly {
+            program_path_hash,
+            program_hash,
+        } => ProgramBundleAuthority::LegacyProgramOnly {
+            program_path_hash: program_path_hash.0,
+            program_hash: program_hash.0,
+        },
+    }
+}
+
+pub(crate) fn decision_bundle_authority(
+    authority: ProgramBundleAuthority,
+) -> AtomicBundleAuthority {
+    match authority {
+        ProgramBundleAuthority::StoredProgram {
+            program_path_hash,
+            program_hash,
+        } => AtomicBundleAuthority::StoredProgram {
+            program_path_hash: ProgramPathHash(program_path_hash),
+            program_hash: DecisionProgramHash(program_hash),
+        },
+        ProgramBundleAuthority::BuiltInObjectTransaction {
+            kind,
+            contract_version,
+        } => AtomicBundleAuthority::BuiltInObjectTransaction {
+            kind,
+            contract_version,
+        },
+        ProgramBundleAuthority::LegacyProgramOnly { .. } => {
+            unreachable!("new atomic preparation cannot use legacy authority")
+        }
     }
 }
 
@@ -890,6 +946,37 @@ fn decode_fingerprint(encoded: &str) -> Result<[u8; 32], Status> {
     Ok(fingerprint)
 }
 
+fn authorize_canonical_bindings<F>(
+    expanded: &[ExpandedProgramPath],
+    canonical_paths: &BTreeMap<ObjectPath, ObjectPath>,
+    authorize: &F,
+) -> Result<(), Status>
+where
+    F: Fn(&ExpandedProgramPath) -> Result<(), Status>,
+{
+    for logical in expanded {
+        let canonical = canonical_paths
+            .get(&logical.path)
+            .ok_or_else(|| Status::data_loss("stored-program canonical path binding is absent"))?;
+        authorize(&ExpandedProgramPath {
+            path: canonical.clone(),
+            intent: logical.intent,
+        })?;
+    }
+    Ok(())
+}
+
+fn authorize_sealed_canonical_paths<F>(
+    expanded: &[ExpandedProgramPath],
+    sealed: &BTreeMap<ObjectPath, ObjectPath>,
+    authorize: &F,
+) -> Result<(), Status>
+where
+    F: Fn(&ExpandedProgramPath) -> Result<(), Status>,
+{
+    authorize_canonical_bindings(expanded, sealed, authorize)
+}
+
 fn require_same_invocation(
     invocation: CommittedInvocation,
     fingerprint: [u8; 32],
@@ -901,9 +988,18 @@ fn require_same_invocation(
             "IDEMPOTENCY_INPUT_MISMATCH: invocation id was reused with different input",
         ));
     }
-    if invocation.committed_batch.program_path_hash != ProgramPathHash(program_path_hash)
-        || invocation.committed_batch.program_hash != DecisionProgramHash(program_hash)
-    {
+    let same_program = matches!(
+        invocation.committed_batch.authority,
+        AtomicBundleAuthority::StoredProgram {
+            program_path_hash: committed_path,
+            program_hash: committed_program,
+        } | AtomicBundleAuthority::LegacyProgramOnly {
+            program_path_hash: committed_path,
+            program_hash: committed_program,
+        } if committed_path == ProgramPathHash(program_path_hash)
+            && committed_program == DecisionProgramHash(program_hash)
+    );
+    if !same_program {
         return Err(Status::already_exists(
             "IDEMPOTENCY_INPUT_MISMATCH: invocation id was reused for a different program",
         ));
@@ -916,7 +1012,16 @@ fn require_result_matches_consensus(
     invocation: CommittedInvocation,
 ) -> Result<(), Status> {
     let receipt_fingerprint = decode_fingerprint(&result.receipt.input_fingerprint)?;
-    if result.receipt.program_path_hash != invocation.committed_batch.program_path_hash.0
+    let committed_path = match invocation.committed_batch.authority {
+        AtomicBundleAuthority::StoredProgram {
+            program_path_hash, ..
+        }
+        | AtomicBundleAuthority::LegacyProgramOnly {
+            program_path_hash, ..
+        } => program_path_hash.0,
+        AtomicBundleAuthority::BuiltInObjectTransaction { .. } => [0; 32],
+    };
+    if result.receipt.program_path_hash != committed_path
         || receipt_fingerprint != invocation.input_fingerprint.0
         || result
             .published_versions
@@ -939,8 +1044,14 @@ fn invoked_result(
         receipt: result.receipt,
         executor_nomination_log_index: invocation.committed_batch.nomination_log_index,
         commit_log_index: invocation.committed_batch.commit_cursor,
-        program_hash: invocation.committed_batch.program_hash.0,
+        program_hash: match invocation.committed_batch.authority {
+            AtomicBundleAuthority::StoredProgram { program_hash, .. }
+            | AtomicBundleAuthority::LegacyProgramOnly { program_hash, .. } => program_hash.0,
+            AtomicBundleAuthority::BuiltInObjectTransaction { .. } => [0; 32],
+        },
         published_versions: result.published_versions,
+        asserted_versions: result.asserted_versions,
+        alias_targets: result.alias_targets,
         replayed,
         replay_guarantee_expires_at_unix_millis: invocation.replay_expires_at_unix_millis,
     }
@@ -978,6 +1089,15 @@ fn expect_batch_committed(result: ApplyResult) -> Result<keldra_consensus::Commi
     }
 }
 
+fn expect_batch_begun(result: ApplyResult) -> Result<keldra_consensus::BeginResult, Status> {
+    match result {
+        ApplyResult::BatchBegun(result) => Ok(result),
+        other => Err(Status::internal(format!(
+            "unexpected atomic begin response: {other:?}"
+        ))),
+    }
+}
+
 fn expect_finalization(result: ApplyResult, expected_cursor: u64) -> Result<(), Status> {
     match result {
         ApplyResult::FinalizationAdvanced {
@@ -1011,14 +1131,16 @@ fn engine_status(error: EngineError) -> Status {
     }
 }
 
-fn mutation_status(error: keldra_store::MutationError) -> Status {
+pub(super) fn mutation_status(error: keldra_store::MutationError) -> Status {
     match error {
         keldra_store::MutationError::ProgramConcurrencyViolation => {
             Status::failed_precondition(format!("PROGRAM_CONCURRENCY_VIOLATION: {error}"))
         }
         keldra_store::MutationError::PreconditionFailed { .. }
+        | keldra_store::MutationError::AtomicReservationConflict { .. }
         | keldra_store::MutationError::Immutable
         | keldra_store::MutationError::ImmutablePolicyRequired
+        | keldra_store::MutationError::ObjectHasInboundAliases
         | keldra_store::MutationError::ObjectVersioningNotEnabled => {
             Status::failed_precondition(error.to_string())
         }
@@ -1076,7 +1198,7 @@ fn program_store_status(error: ProgramStoreError) -> Status {
         ProgramStoreError::SourceJournalTransitionTooLarge { .. } => {
             Status::resource_exhausted(format!("RESOURCE_LIMIT: {error}"))
         }
-        ProgramStoreError::ProgramPolicy { .. } | ProgramStoreError::PreconditionFailed { .. } => {
+        ProgramStoreError::PreconditionFailed { .. } => {
             Status::failed_precondition(format!("PROGRAM_CONCURRENCY_VIOLATION: {error}"))
         }
         ProgramStoreError::Immutable { .. }
@@ -1136,835 +1258,4 @@ fn internal(error: impl std::fmt::Display) -> Status {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use keldra_atomic_program::{
-        Cardinality, DEFINITION_SCHEMA_VERSION, DocumentAccess, DocumentRef, DocumentSpec,
-        DocumentValueRef, DocumentView, ExpectedHead, InputValue, IntegerType, JsonPointerRef,
-        Operation, PathBinding, PathTemplate, ProgramCaps, ProgramDefinition, ReturnDefinition,
-    };
-    use keldra_authz::ObjectRef;
-    use keldra_consensus::{
-        CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, JoinCapabilityHash,
-        NodeDescriptor, NodeState, PeerAddress, PeerSpkiSha256,
-    };
-    use keldra_store::{
-        AuthzRevision, BucketPolicy, CreateBucketRequest, Durability, ObjectVersioning,
-        ProvisionTenantRequest, PutMode, PutRequest, StorageTenantId, StoreOptions,
-        SystemBootstrapRequest,
-    };
-    use serde_json::json;
-
-    use super::*;
-
-    fn counter_definition() -> ProgramDefinition {
-        let counter = DocumentRef::one("counter");
-        ProgramDefinition {
-            schema_version: DEFINITION_SCHEMA_VERSION,
-            documents: vec![DocumentSpec {
-                name: "counter".into(),
-                path: PathTemplate::new("{tenant}", "bucket", "managed/counter"),
-                cardinality: Cardinality::One,
-                access: DocumentAccess::ReadWrite,
-                allow_initial_json: true,
-            }],
-            assertions: Vec::new(),
-            operations: vec![Operation::CheckedIntegerAdd {
-                target: JsonPointerRef::new(counter.clone(), "/value"),
-                delta: InputValue::Input {
-                    name: "delta".into(),
-                },
-                numeric_type: IntegerType::U64 {
-                    min: Some(0),
-                    max: None,
-                },
-            }],
-            returns: vec![ReturnDefinition {
-                name: "value".into(),
-                value: DocumentValueRef {
-                    value: JsonPointerRef::new(counter, "/value"),
-                    view: DocumentView::Current,
-                },
-            }],
-            caps: ProgramCaps {
-                max_paths: 1,
-                max_writes: 1,
-                max_operations: 2,
-                max_input_bytes: 64 * 1024,
-                max_document_bytes: 64 * 1024,
-            },
-        }
-    }
-
-    fn counter_input() -> ProgramInput {
-        ProgramInput {
-            inputs: [("delta".into(), json!(1))].into_iter().collect(),
-            bindings: [(
-                "counter".into(),
-                vec![PathBinding {
-                    path: ObjectPath::new("tenant", "bucket", "managed/counter").unwrap(),
-                    template_values: BTreeMap::new(),
-                    expected_head: ExpectedHead::Absent,
-                    initial_json: Some(json!({"value": 0})),
-                }],
-            )]
-            .into_iter()
-            .collect(),
-            ..ProgramInput::default()
-        }
-    }
-
-    async fn configured_program_store(root: &Path) -> (Store, ObjectKey, [u8; 32], Vec<u8>) {
-        let store = Store::open(StoreOptions::new(root, 1)).await.unwrap();
-        store
-            .bootstrap_system(SystemBootstrapRequest {
-                app_id: "bootstrap-app".into(),
-                client_id: "bootstrap-client".into(),
-                client_secret: "bootstrap-secret-0123456789abcdef0123456789abcdef".into(),
-            })
-            .unwrap();
-        let tenant = StorageTenantId::parse("tenant").unwrap();
-        let owner = ObjectRef::opaque("app", "owner-app").unwrap();
-        store
-            .provision_tenant(ProvisionTenantRequest {
-                storage_tenant: tenant.clone(),
-                owner_app_id: "owner-app".into(),
-                owner_client_id: "owner-client".into(),
-                owner_client_secret: "owner-secret-0123456789abcdef0123456789abcdef".into(),
-                principal: ObjectRef::opaque("app", "bootstrap-app").unwrap(),
-                expected_authorization_revision: AuthzRevision(3),
-                expected_binding_generation: 1,
-            })
-            .unwrap();
-        store
-            .create_bucket(CreateBucketRequest {
-                storage_tenant: tenant,
-                bucket: "bucket".into(),
-                owner: owner.clone(),
-                principal: owner,
-                expected_authorization_revision: AuthzRevision(4),
-                expected_binding_generation: 1,
-                versioning: ObjectVersioning::Unversioned,
-            })
-            .unwrap();
-        store
-            .set_bucket_policy(
-                "tenant",
-                "bucket",
-                BucketPolicy {
-                    immutable_prefixes: Vec::new(),
-                    program_only_prefixes: vec!["managed".into()],
-                },
-            )
-            .await
-            .unwrap();
-        let program_key = ObjectKey::new("tenant", "bucket", "_keldra/programs/counter@1").unwrap();
-        let definition = serde_json::to_vec(&counter_definition()).unwrap();
-        let program_hash = ProgramHash::for_definition_bytes(&definition).0;
-        store
-            .put(PutRequest {
-                key: program_key.clone(),
-                bytes: definition,
-                content_type: Some("application/json".into()),
-                mode: PutMode::PutImmutable,
-                command_id: Some("install-counter-program".into()),
-                durability: Durability::Local,
-            })
-            .await
-            .unwrap();
-        (
-            store,
-            program_key,
-            program_hash,
-            serde_json::to_vec(&counter_input()).unwrap(),
-        )
-    }
-
-    async fn open_test_coordinator(store: Store, root: &Path) -> ProgramCoordinator {
-        open_test_coordinator_with_limits(store, root, 8, 64 * 1024).await
-    }
-
-    async fn open_test_coordinator_with_limits(
-        store: Store,
-        root: &Path,
-        max_commit_entries: u32,
-        max_commit_bytes: u64,
-    ) -> ProgramCoordinator {
-        let decisions = DecisionRaft::open(
-            root.join("decisions"),
-            1,
-            max_commit_entries,
-            max_commit_bytes,
-        )
-        .await
-        .unwrap();
-        decisions.ensure_one_node().await.unwrap();
-        decisions
-            .wait_for_leader(Duration::from_secs(10))
-            .await
-            .unwrap();
-        commit_test_active_placement(&decisions).await;
-        ProgramCoordinator::start(store, decisions, NodeId(1))
-            .await
-            .unwrap()
-    }
-
-    async fn commit_test_active_placement(decisions: &DecisionRaft) {
-        let state = decisions.state().unwrap();
-        if state.cluster_control().active_placement_log_id().is_some() {
-            return;
-        }
-        if state.cluster_id().is_none() {
-            decisions
-                .submit(Command::InitializeCluster {
-                    cluster_id: ClusterId([1; 16]),
-                })
-                .await
-                .unwrap();
-        }
-        let begun = decisions
-            .submit(Command::BeginAddNode {
-                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
-                descriptor: NodeDescriptor {
-                    node_id: NodeId(1),
-                    peer_address: PeerAddress("keldra-local://1".into()),
-                    storage_weight_millionths: 1_000_000,
-                    state: NodeState::Joining,
-                    current_peer_spki_sha256: PeerSpkiSha256([1; 32]),
-                    overlap_peer_spki_sha256: None,
-                    join_capability_hash: Some(JoinCapabilityHash([2; 32])),
-                    supported_protocol: CapabilityRange { min: 1, max: 1 },
-                    supported_storage_format: CapabilityRange { min: 1, max: 1 },
-                },
-            })
-            .await
-            .unwrap();
-        for _ in 0..2 {
-            decisions
-                .submit(Command::CompleteMembershipTransition {
-                    format_version: CLUSTER_CONTROL_COMMAND_VERSION,
-                    started_log_index: begun.log_index,
-                })
-                .await
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn public_coordinator_retains_replay_then_compacts_the_recovery_tail() {
-        let temporary = tempfile::tempdir().unwrap();
-        let (store, program_key, program_hash, input) =
-            configured_program_store(temporary.path()).await;
-        let coordinator = open_test_coordinator(store.clone(), temporary.path()).await;
-        let intents = Mutex::new(Vec::new());
-
-        let first = coordinator
-            .invoke(
-                program_key.clone(),
-                program_hash,
-                "increment-1".into(),
-                &input,
-                LOCAL_DURABILITY_CLASS,
-                |dependency| {
-                    intents.lock().unwrap().push(dependency.intent);
-                    Ok(())
-                },
-            )
-            .await
-            .unwrap();
-        assert!(!first.replayed);
-        assert_eq!(first.receipt.outputs["value"], json!(1));
-        assert_eq!(
-            intents.into_inner().unwrap(),
-            vec![keldra_atomic_program::ProgramPathIntent {
-                get: true,
-                put: true,
-                delete: false,
-            }]
-        );
-        let decision_state = coordinator.decisions.state().unwrap();
-        assert_eq!(decision_state.unfinalized_commit_len(), 0);
-        assert_eq!(
-            decision_state.finalized_through(),
-            Some(first.commit_log_index)
-        );
-        assert!(first.replay_guarantee_expires_at_unix_millis > current_unix_millis().unwrap());
-
-        let replay = coordinator
-            .invoke(
-                program_key,
-                program_hash,
-                "increment-1".into(),
-                &input,
-                LOCAL_DURABILITY_CLASS,
-                |_| Ok(()),
-            )
-            .await
-            .unwrap();
-        assert!(replay.replayed);
-        assert_eq!(replay.commit_log_index, first.commit_log_index);
-        assert_eq!(
-            replay.replay_guarantee_expires_at_unix_millis,
-            first.replay_guarantee_expires_at_unix_millis
-        );
-        assert_eq!(replay.published_versions, first.published_versions);
-        coordinator.decisions.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn each_success_advances_finalized_through_before_the_next_commit() {
-        let temporary = tempfile::tempdir().unwrap();
-        let (store, program_key, program_hash, first_input) =
-            configured_program_store(temporary.path()).await;
-        let coordinator =
-            open_test_coordinator_with_limits(store, temporary.path(), 1, 64 * 1024).await;
-
-        let mut input = serde_json::from_slice::<ProgramInput>(&first_input).unwrap();
-        let mut previous_version: Option<u64> = None;
-        for index in 0..4 {
-            if let Some(version) = previous_version {
-                let binding = &mut input.bindings.get_mut("counter").unwrap()[0];
-                binding.expected_head = ExpectedHead::Version {
-                    version: version.to_string(),
-                };
-                binding.initial_json = None;
-            }
-            let result = coordinator
-                .invoke(
-                    program_key.clone(),
-                    program_hash,
-                    format!("bounded-tail-{index}"),
-                    &serde_json::to_vec(&input).unwrap(),
-                    LOCAL_DURABILITY_CLASS,
-                    |_| Ok(()),
-                )
-                .await
-                .unwrap();
-            previous_version = result
-                .published_versions
-                .values()
-                .next()
-                .map(|published| published.version.0);
-            let state = coordinator.decisions.state().unwrap();
-            assert_eq!(state.unfinalized_commit_len(), 0);
-            assert_eq!(state.finalized_through(), Some(result.commit_log_index));
-        }
-        coordinator.decisions.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn startup_recovers_committed_bundle_before_advancing_finalized_through() {
-        let temporary = tempfile::tempdir().unwrap();
-        let (store, program_key, program_hash, input_json) =
-            configured_program_store(temporary.path()).await;
-        let coordinator = open_test_coordinator(store.clone(), temporary.path()).await;
-        let input = serde_json::from_slice::<ProgramInput>(&input_json).unwrap();
-        let path_hash = program_path_hash(&program_key);
-        let invocation =
-            ProgramInvocation::from_input(path_hash, "crash-before-finalize", input).unwrap();
-        let fingerprint = decode_fingerprint(&invocation.input_fingerprint).unwrap();
-        let invocation_id = invocation_identity(&program_key, &invocation.command_id);
-        let program_object = store.get(&program_key).await.unwrap().unwrap();
-        let verified =
-            VerifiedProgramDefinition::from_bytes(&program_object.bytes, ProgramHash(program_hash))
-                .unwrap();
-        let engine = store.program_engine(&verified).unwrap();
-        let lease = engine
-            .prepare(&InvocationContext::new("tenant").unwrap(), &invocation)
-            .await
-            .unwrap();
-        let prepared = store.prepare_program_bundle(&lease).await.unwrap();
-        let nomination = coordinator.current_nomination().unwrap();
-        let proposal_at_unix_millis = current_unix_millis().unwrap();
-        let committed = coordinator
-            .decisions
-            .submit(Command::CommitBatch(CommitBatch {
-                executor: NodeId(1),
-                nomination_log_index: nomination.nomination_log_index,
-                program_path_hash: ProgramPathHash(path_hash),
-                program_hash: DecisionProgramHash(program_hash),
-                invocation_id,
-                input_fingerprint: InvocationFingerprint(fingerprint),
-                bundle_ref: BundleRef {
-                    hash: prepared.bundle.hash,
-                    length: prepared.bundle.length,
-                },
-                bundle_hash: BundleHash(prepared.hash.0),
-                durability_class: DurabilityClass(
-                    ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS).0,
-                ),
-                durability_evidence_hash: DurabilityEvidenceHash(
-                    prepared.durability_evidence_hash.0,
-                ),
-                proposal_at_unix_millis,
-                replay_expires_at_unix_millis: proposal_at_unix_millis
-                    + ATOMIC_REPLAY_RETENTION_MILLIS,
-            }))
-            .await
-            .unwrap();
-        let committed = expect_batch_committed(committed.result).unwrap();
-        let commit_cursor = committed.invocation.committed_batch.commit_cursor;
-        assert!(!coordinator.cursor_is_visible(commit_cursor).unwrap());
-        drop(lease);
-        drop(engine);
-        coordinator.decisions.shutdown().await.unwrap();
-        drop(coordinator);
-        drop(store);
-
-        let reopened_store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
-            .unwrap();
-        let reopened = open_test_coordinator(reopened_store.clone(), temporary.path()).await;
-        let state = reopened.decisions.state().unwrap();
-        assert_eq!(state.finalized_through(), Some(commit_cursor));
-        assert_eq!(state.unfinalized_commit_len(), 0);
-        assert!(reopened.cursor_is_visible(commit_cursor).unwrap());
-        assert_eq!(
-            reopened_store.applied_program_commit_cursor().unwrap(),
-            Some(commit_cursor)
-        );
-        let replay = reopened
-            .invoke(
-                program_key,
-                program_hash,
-                "crash-before-finalize".into(),
-                &input_json,
-                LOCAL_DURABILITY_CLASS,
-                |_| Ok(()),
-            )
-            .await
-            .unwrap();
-        assert!(replay.replayed);
-        assert_eq!(replay.commit_log_index, commit_cursor);
-        assert_eq!(replay.receipt.outputs["value"], json!(1));
-        reopened.decisions.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
-        let temporary = tempfile::tempdir().unwrap();
-        let (store, program_key, program_hash, _) =
-            configured_program_store(temporary.path()).await;
-        let coordinator = open_test_coordinator(store.clone(), temporary.path()).await;
-        let path_hash = program_path_hash(&program_key);
-        let program_object = store.get(&program_key).await.unwrap().unwrap();
-        let verified =
-            VerifiedProgramDefinition::from_bytes(&program_object.bytes, ProgramHash(program_hash))
-                .unwrap();
-        let engine = store.program_engine(&verified).unwrap();
-        let context = InvocationContext::new("tenant").unwrap();
-        let nomination = coordinator.current_nomination().unwrap();
-
-        let first_invocation =
-            ProgramInvocation::from_input(path_hash, "partial-recovery-1", counter_input())
-                .unwrap();
-        let first_fingerprint = decode_fingerprint(&first_invocation.input_fingerprint).unwrap();
-        let first_id = invocation_identity(&program_key, &first_invocation.command_id);
-        let first_lease = engine.prepare(&context, &first_invocation).await.unwrap();
-        let first_prepared = store.prepare_program_bundle(&first_lease).await.unwrap();
-        let first_consensus = expect_batch_committed(
-            coordinator
-                .decisions
-                .submit(Command::CommitBatch(CommitBatch {
-                    executor: NodeId(1),
-                    nomination_log_index: nomination.nomination_log_index,
-                    program_path_hash: ProgramPathHash(path_hash),
-                    program_hash: DecisionProgramHash(program_hash),
-                    invocation_id: first_id,
-                    input_fingerprint: InvocationFingerprint(first_fingerprint),
-                    bundle_ref: BundleRef {
-                        hash: first_prepared.bundle.hash,
-                        length: first_prepared.bundle.length,
-                    },
-                    bundle_hash: BundleHash(first_prepared.hash.0),
-                    durability_class: DurabilityClass(
-                        ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS).0,
-                    ),
-                    durability_evidence_hash: DurabilityEvidenceHash(
-                        first_prepared.durability_evidence_hash.0,
-                    ),
-                    proposal_at_unix_millis: 1_000,
-                    replay_expires_at_unix_millis: 1_000 + ATOMIC_REPLAY_RETENTION_MILLIS,
-                }))
-                .await
-                .unwrap()
-                .result,
-        )
-        .unwrap();
-        let first_applied = store
-            .apply_program_bundle(
-                first_lease,
-                &first_prepared,
-                program_commit(None, first_consensus.invocation.committed_batch),
-                ObjectMutationContext {
-                    active_placement_log_id: PlacementLogId { term: 1, index: 1 },
-                    serving_fence_term: nomination.nomination_log_index,
-                },
-            )
-            .await
-            .unwrap();
-        require_result_matches_consensus(&first_applied, first_consensus.invocation).unwrap();
-        let first_cursor = first_consensus.invocation.committed_batch.commit_cursor;
-        let counter_path = ObjectPath::new("tenant", "bucket", "managed/counter").unwrap();
-        let first_version = first_applied.published_versions[&counter_path];
-
-        let mut second_input = counter_input();
-        let second_binding = &mut second_input.bindings.get_mut("counter").unwrap()[0];
-        second_binding.expected_head = ExpectedHead::Version {
-            version: first_version.version.0.to_string(),
-        };
-        second_binding.initial_json = None;
-        let second_invocation =
-            ProgramInvocation::from_input(path_hash, "partial-recovery-2", second_input).unwrap();
-        let second_fingerprint = decode_fingerprint(&second_invocation.input_fingerprint).unwrap();
-        let second_id = invocation_identity(&program_key, &second_invocation.command_id);
-        let second_lease = engine.prepare(&context, &second_invocation).await.unwrap();
-        let second_prepared = store.prepare_program_bundle(&second_lease).await.unwrap();
-        let second_consensus = expect_batch_committed(
-            coordinator
-                .decisions
-                .submit(Command::CommitBatch(CommitBatch {
-                    executor: NodeId(1),
-                    nomination_log_index: nomination.nomination_log_index,
-                    program_path_hash: ProgramPathHash(path_hash),
-                    program_hash: DecisionProgramHash(program_hash),
-                    invocation_id: second_id,
-                    input_fingerprint: InvocationFingerprint(second_fingerprint),
-                    bundle_ref: BundleRef {
-                        hash: second_prepared.bundle.hash,
-                        length: second_prepared.bundle.length,
-                    },
-                    bundle_hash: BundleHash(second_prepared.hash.0),
-                    durability_class: DurabilityClass(
-                        ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS).0,
-                    ),
-                    durability_evidence_hash: DurabilityEvidenceHash(
-                        second_prepared.durability_evidence_hash.0,
-                    ),
-                    proposal_at_unix_millis: 2_000,
-                    replay_expires_at_unix_millis: 2_000 + ATOMIC_REPLAY_RETENTION_MILLIS,
-                }))
-                .await
-                .unwrap()
-                .result,
-        )
-        .unwrap();
-        let second_applied = store
-            .apply_program_bundle(
-                second_lease,
-                &second_prepared,
-                program_commit(
-                    Some(first_cursor),
-                    second_consensus.invocation.committed_batch,
-                ),
-                ObjectMutationContext {
-                    active_placement_log_id: PlacementLogId { term: 1, index: 1 },
-                    serving_fence_term: nomination.nomination_log_index,
-                },
-            )
-            .await
-            .unwrap();
-        require_result_matches_consensus(&second_applied, second_consensus.invocation).unwrap();
-        let second_cursor = second_consensus.invocation.committed_batch.commit_cursor;
-        assert_eq!(
-            store.applied_program_commit_cursor().unwrap(),
-            Some(second_cursor)
-        );
-        assert_eq!(
-            coordinator
-                .decisions
-                .state()
-                .unwrap()
-                .unfinalized_commit_len(),
-            2
-        );
-
-        drop(engine);
-        coordinator.decisions.shutdown().await.unwrap();
-        drop(coordinator);
-        drop(store);
-
-        let reopened_store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
-            .unwrap();
-        let reopened = open_test_coordinator(reopened_store, temporary.path()).await;
-        let state = reopened.decisions.state().unwrap();
-        assert_eq!(state.finalized_through(), Some(second_cursor));
-        assert_eq!(state.unfinalized_commit_len(), 0);
-        reopened.decisions.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn program_and_invocation_identities_include_the_full_object_address() {
-        let left = ObjectKey::new("tenant-a", "bucket", "_keldra/programs/import_osv@1").unwrap();
-        let other_tenant =
-            ObjectKey::new("tenant-b", "bucket", "_keldra/programs/import_osv@1").unwrap();
-        let other_bucket =
-            ObjectKey::new("tenant-a", "other", "_keldra/programs/import_osv@1").unwrap();
-
-        assert_ne!(program_path_hash(&left), program_path_hash(&other_tenant));
-        assert_ne!(program_path_hash(&left), program_path_hash(&other_bucket));
-        assert_ne!(
-            invocation_identity(&left, "same"),
-            invocation_identity(&other_tenant, "same")
-        );
-    }
-
-    #[test]
-    fn only_nonempty_reserved_program_paths_are_accepted() {
-        let valid = ObjectKey::new("tenant", "bucket", "_keldra/programs/import_osv@1").unwrap();
-        assert!(
-            validate_program_request(
-                &valid,
-                "invoke-1",
-                b"{}",
-                LOCAL_DURABILITY_CLASS,
-                ProgramRuntimeTopology::OneNode,
-            )
-            .is_ok()
-        );
-
-        let outside = ObjectKey::new("tenant", "bucket", "programs/import_osv@1").unwrap();
-        assert!(
-            validate_program_request(
-                &outside,
-                "invoke-1",
-                b"{}",
-                LOCAL_DURABILITY_CLASS,
-                ProgramRuntimeTopology::OneNode,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn program_durability_class_is_a_closed_exact_choice() {
-        let key = ObjectKey::new("tenant", "bucket", "_keldra/programs/import_osv@1").unwrap();
-        assert!(
-            validate_program_request(
-                &key,
-                "invoke-1",
-                b"{}",
-                LOCAL_DURABILITY_CLASS,
-                ProgramRuntimeTopology::OneNode,
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            validate_program_request(
-                &key,
-                "invoke-1",
-                b"{}",
-                REPLICATED_DURABILITY_CLASS,
-                ProgramRuntimeTopology::OneNode,
-            )
-            .unwrap_err()
-            .code(),
-            tonic::Code::Unavailable
-        );
-        for supported in [LOCAL_DURABILITY_CLASS, REPLICATED_DURABILITY_CLASS] {
-            assert!(
-                validate_program_request(
-                    &key,
-                    "invoke-1",
-                    b"{}",
-                    supported,
-                    ProgramRuntimeTopology::Clustered,
-                )
-                .is_ok()
-            );
-        }
-        for invalid in ["", " local", "local ", "LOCAL", "remote"] {
-            assert_eq!(
-                validate_program_request(
-                    &key,
-                    "invoke-1",
-                    b"{}",
-                    invalid,
-                    ProgramRuntimeTopology::Clustered,
-                )
-                .unwrap_err()
-                .code(),
-                tonic::Code::InvalidArgument
-            );
-        }
-    }
-
-    #[test]
-    fn atomic_failure_statuses_expose_stable_outcome_names() {
-        let assertion = engine_status(EngineError::Assertion {
-            index: 0,
-            reason: "no".into(),
-        });
-        assert_eq!(assertion.code(), tonic::Code::FailedPrecondition);
-        assert!(assertion.message().starts_with("ASSERTION_FAILED:"));
-
-        let concurrency = engine_status(EngineError::ProgramConcurrency {
-            path: ObjectPath::new("tenant", "bucket", "managed/value").unwrap(),
-            reason: "dependency must use PROGRAM_ONLY policy".into(),
-        });
-        assert!(
-            concurrency
-                .message()
-                .starts_with("PROGRAM_CONCURRENCY_VIOLATION:")
-        );
-
-        let version = program_store_status(ProgramStoreError::ProgramHashMismatch);
-        assert!(version.message().starts_with("PROGRAM_VERSION_MISMATCH:"));
-
-        let capacity = decision_status(DecisionRaftError::Rejected(
-            ApplyError::CommittedInvocationWindowFull {
-                entries: keldra_consensus::MAX_COMMITTED_INVOCATIONS,
-                bytes: keldra_consensus::MAX_COMMITTED_INVOCATION_BYTES,
-                required_bytes: 1,
-            },
-        ));
-        assert_eq!(capacity.code(), tonic::Code::ResourceExhausted);
-        assert!(capacity.message().starts_with("RESOURCE_LIMIT:"));
-
-        let lag = decision_status(DecisionRaftError::Rejected(ApplyError::CommitTailFull {
-            entries: 1,
-            bytes: 1,
-            required_bytes: 1,
-            max_entries: 1,
-            max_bytes: 1,
-        }));
-        assert_eq!(lag.code(), tonic::Code::ResourceExhausted);
-        assert!(lag.message().starts_with("FINALIZATION_LAG:"));
-    }
-
-    #[test]
-    fn local_durability_requires_synced_evidence_from_the_executor() {
-        let evidence_hash = ProgramDurabilityEvidenceHash([7; 32]);
-        assert_eq!(
-            accepted_program_evidence_hash(
-                &ProgramDurabilityScope::ExecutorLocal {
-                    node_id: 3,
-                    synced: true,
-                },
-                evidence_hash,
-                LOCAL_DURABILITY_CLASS,
-                NodeId(3),
-            )
-            .unwrap(),
-            evidence_hash
-        );
-
-        let unsynced = accepted_program_evidence_hash(
-            &ProgramDurabilityScope::ExecutorLocal {
-                node_id: 3,
-                synced: false,
-            },
-            evidence_hash,
-            LOCAL_DURABILITY_CLASS,
-            NodeId(3),
-        )
-        .unwrap_err();
-        assert_eq!(unsynced.code(), tonic::Code::Unavailable);
-
-        let wrong_node = accepted_program_evidence_hash(
-            &ProgramDurabilityScope::ExecutorLocal {
-                node_id: 4,
-                synced: true,
-            },
-            evidence_hash,
-            LOCAL_DURABILITY_CLASS,
-            NodeId(3),
-        )
-        .unwrap_err();
-        assert_eq!(wrong_node.code(), tonic::Code::FailedPrecondition);
-    }
-
-    #[test]
-    fn commit_cursor_comparison_detects_pending_recovery() {
-        assert_eq!(compare_commit_cursors(None, None), Ordering::Equal);
-        assert_eq!(compare_commit_cursors(None, Some(10)), Ordering::Less);
-        assert_eq!(compare_commit_cursors(Some(9), Some(10)), Ordering::Less);
-        assert_eq!(compare_commit_cursors(Some(10), Some(10)), Ordering::Equal);
-        assert_eq!(
-            compare_commit_cursors(Some(11), Some(10)),
-            Ordering::Greater
-        );
-        assert_eq!(compare_commit_cursors(Some(10), None), Ordering::Greater);
-    }
-
-    #[test]
-    fn committed_batch_mapping_retains_every_storage_identity() {
-        let committed = CommittedBatch {
-            commit_cursor: 12,
-            executor: NodeId(3),
-            nomination_log_index: 7,
-            program_path_hash: ProgramPathHash([1; 32]),
-            program_hash: DecisionProgramHash([2; 32]),
-            bundle_ref: BundleRef {
-                hash: [3; 32],
-                length: 33,
-            },
-            bundle_hash: BundleHash([4; 32]),
-            durability_class: DurabilityClass([5; 32]),
-            durability_evidence_hash: DurabilityEvidenceHash([6; 32]),
-        };
-
-        assert_eq!(
-            program_commit(Some(11), committed),
-            ProgramCommit {
-                previous_commit_cursor: Some(11),
-                commit_cursor: 12,
-                bundle_ref: PreparedBundleRef {
-                    hash: [3; 32],
-                    length: 33,
-                },
-                bundle_hash: PreparedBundleHash([4; 32]),
-                program_hash: ProgramHash([2; 32]),
-                durability_class: ProgramDurabilityClassHash([5; 32]),
-                durability_evidence_hash: ProgramDurabilityEvidenceHash([6; 32]),
-            }
-        );
-    }
-
-    #[test]
-    fn prepared_replay_result_must_match_the_committed_invocation() {
-        let fingerprint = [9; 32];
-        let committed = CommittedBatch {
-            commit_cursor: 12,
-            executor: NodeId(3),
-            nomination_log_index: 7,
-            program_path_hash: ProgramPathHash([1; 32]),
-            program_hash: DecisionProgramHash([2; 32]),
-            bundle_ref: BundleRef {
-                hash: [3; 32],
-                length: 33,
-            },
-            bundle_hash: BundleHash([4; 32]),
-            durability_class: DurabilityClass([5; 32]),
-            durability_evidence_hash: DurabilityEvidenceHash([6; 32]),
-        };
-        let invocation = CommittedInvocation {
-            invocation_id: InvocationId([8; 32]),
-            input_fingerprint: InvocationFingerprint(fingerprint),
-            proposal_at_unix_millis: 1_000,
-            replay_expires_at_unix_millis: 1_000 + ATOMIC_REPLAY_RETENTION_MILLIS,
-            committed_batch: committed,
-        };
-        let result = CommittedProgramResult {
-            receipt: CommandReceipt {
-                program_path_hash: committed.program_path_hash.0,
-                command_id: "recover-identity".into(),
-                input_fingerprint: hex::encode(fingerprint),
-                outputs: BTreeMap::new(),
-            },
-            published_versions: BTreeMap::new(),
-        };
-
-        require_result_matches_consensus(&result, invocation).unwrap();
-        let mut wrong = result;
-        wrong.receipt.input_fingerprint = hex::encode([99; 32]);
-        assert_eq!(
-            require_result_matches_consensus(&wrong, invocation)
-                .unwrap_err()
-                .code(),
-            tonic::Code::DataLoss
-        );
-    }
-}
+mod tests;

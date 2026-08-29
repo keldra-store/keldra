@@ -2,16 +2,17 @@ use std::time::Duration;
 
 use keldra_api::v1::{
     AccountingDefinition, AccountingSnapshot, BucketPolicy as ApiBucketPolicy, BulkWriteRequest,
-    BulkWriteResponse, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
-    DeleteVersionResponse, DisableAccountingRequest, DisableAccountingResponse,
-    EnableAccountingRequest, GetAccountingRequest, MutationReceipt, PutToken,
-    SetBucketPolicyRequest,
+    BulkWriteResponse, CloneObjectRequest, DeleteIfVersionRequest, DeleteRequest,
+    DeleteVersionRequest, DeleteVersionResponse, DisableAccountingRequest,
+    DisableAccountingResponse, EnableAccountingRequest, GetAccountingRequest, LinkObjectRequest,
+    MutationReceipt, PutToken, SetBucketPolicyRequest, UnlinkObjectRequest,
 };
-use keldra_consensus::{DecisionRaft, NodeId};
+use keldra_consensus::{CapabilityRange, DecisionRaft, NodeId};
 use keldra_store::{
     AuthzSchemaPublicationMutation, DefinitionKind, DefinitionMutationIntent, LogicalRecordApplied,
     LogicalRecordCandidate, LogicalRecordId, LogicalRecordMutation, LogicalRecordSnapshotApplied,
-    LogicalRecordValue, ObjectHeadChange, PlacementLogId, ProgramPathMutation, ProgramPathStage,
+    LogicalRecordValue, ObjectHeadChange, PlacementLogId, ProgramAliasRegistryMutation,
+    ProgramAliasRegistryStage, ProgramPathMutation, ProgramPathStage, ProgramReservation,
     ReferenceProof, ReplicaAuthzSchemaPublicationApplied, SourceId, TupleBatchReceipt,
     TupleBatchRequest, VersionId, WatchJournalStatus,
 };
@@ -48,6 +49,43 @@ pub(crate) struct ClusterPeerTransport {
 }
 
 impl ClusterPeerTransport {
+    pub(crate) async fn update_local_capabilities(
+        &self,
+        leader: NodeId,
+        address: &str,
+        expected_protocol: CapabilityRange,
+        expected_storage: CapabilityRange,
+        replacement_protocol: CapabilityRange,
+        replacement_storage: CapabilityRange,
+    ) -> Result<(CapabilityRange, CapabilityRange), Status> {
+        let placement = self.placement()?;
+        let response = self
+            .client(leader, address)?
+            .update_local_capabilities(wire::UpdateLocalCapabilitiesRequest {
+                peer: Some(self.context(placement.fence(), 0, MAX_CLUSTER_OPERATION_TIME)?),
+                expected_protocol_min: u32::from(expected_protocol.min),
+                expected_protocol_max: u32::from(expected_protocol.max),
+                expected_storage_min: u32::from(expected_storage.min),
+                expected_storage_max: u32::from(expected_storage.max),
+                replacement_protocol_min: u32::from(replacement_protocol.min),
+                replacement_protocol_max: u32::from(replacement_protocol.max),
+                replacement_storage_min: u32::from(replacement_storage.min),
+                replacement_storage_max: u32::from(replacement_storage.max),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        if response.node_id != self.data.peer_identity().1.0 {
+            return Err(Status::data_loss(
+                "capability attestation returned another node",
+            ));
+        }
+        Ok((
+            wire_capability_range(response.protocol_min, response.protocol_max)?,
+            wire_capability_range(response.storage_min, response.storage_max)?,
+        ))
+    }
+
     pub(crate) async fn route_enable_accounting(
         &self,
         target: NodeId,
@@ -642,12 +680,14 @@ impl ClusterPeerTransport {
         address: &str,
         bearer: &str,
         value: DeleteRequest,
+        atomic_executor_replay_checked: bool,
         remaining: Duration,
     ) -> Result<MutationReceipt, Status> {
         let fence = self.placement()?.fence();
         let mut request = Request::new(wire::RouteDeleteRequest {
             peer: Some(self.context(fence, 1, remaining)?),
             request: Some(value),
+            atomic_executor_replay_checked,
         });
         add_bearer_and_timeout(&mut request, bearer, remaining)?;
         Ok(self
@@ -663,17 +703,82 @@ impl ClusterPeerTransport {
         address: &str,
         bearer: &str,
         value: DeleteIfVersionRequest,
+        atomic_executor_replay_checked: bool,
         remaining: Duration,
     ) -> Result<MutationReceipt, Status> {
         let fence = self.placement()?.fence();
         let mut request = Request::new(wire::RouteDeleteIfVersionRequest {
             peer: Some(self.context(fence, 1, remaining)?),
             request: Some(value),
+            atomic_executor_replay_checked,
         });
         add_bearer_and_timeout(&mut request, bearer, remaining)?;
         Ok(self
             .client(target, address)?
             .route_delete_if_version(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_clone_object(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: CloneObjectRequest,
+        remaining: Duration,
+    ) -> Result<MutationReceipt, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteCloneObjectRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_clone_object(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_link_object(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: LinkObjectRequest,
+        remaining: Duration,
+    ) -> Result<MutationReceipt, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteLinkObjectRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_link_object(request)
+            .await?
+            .into_inner())
+    }
+
+    pub(crate) async fn route_unlink_object(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        value: UnlinkObjectRequest,
+        remaining: Duration,
+    ) -> Result<MutationReceipt, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteUnlinkObjectRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            request: Some(value),
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        Ok(self
+            .client(target, address)?
+            .route_unlink_object(request)
             .await?
             .into_inner())
     }
@@ -706,12 +811,14 @@ impl ClusterPeerTransport {
         address: &str,
         bearer: &str,
         value: DeleteIfVersionRequest,
+        atomic_executor_replay_checked: bool,
         remaining: Duration,
     ) -> Result<MutationReceipt, Status> {
         let fence = self.placement()?.fence();
         let mut request = Request::new(wire::RouteDeleteIfVersionRequest {
             peer: Some(self.context(fence, 1, remaining)?),
             request: Some(value),
+            atomic_executor_replay_checked,
         });
         add_bearer_and_timeout(&mut request, bearer, remaining)?;
         Ok(self
@@ -788,12 +895,14 @@ impl ClusterPeerTransport {
         address: &str,
         bearer: &str,
         value: DeleteVersionRequest,
+        original_alias: Option<keldra_api::v1::ObjectAddress>,
         remaining: Duration,
     ) -> Result<DeleteVersionResponse, Status> {
         let fence = self.placement()?.fence();
         let mut request = Request::new(wire::RouteDeleteVersionRequest {
             peer: Some(self.context(fence, 1, remaining)?),
             request: Some(value),
+            original_alias,
         });
         add_bearer_and_timeout(&mut request, bearer, remaining)?;
         Ok(self
@@ -886,6 +995,83 @@ impl ClusterPeerTransport {
             .into_inner())
     }
 
+    pub(crate) async fn route_built_in_replay_batch(
+        &self,
+        target: NodeId,
+        address: &str,
+        executor_nomination_log_index: u64,
+        lookups: &[crate::programs::BuiltInReplayLookup],
+        remaining: Duration,
+    ) -> Result<Vec<Result<Option<crate::programs::InvokedProgramResult>, Status>>, Status> {
+        if lookups.len() > keldra_store::MAX_ATOMIC_BATCH_MUTATIONS {
+            return Err(Status::resource_exhausted(
+                "built-in replay batch exceeds the atomic mutation bound",
+            ));
+        }
+        let lookup_count = lookups.len();
+        let expected_indices = lookups
+            .iter()
+            .map(|lookup| lookup.original_index)
+            .collect::<Vec<_>>();
+        if expected_indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Status::invalid_argument(
+                "built-in replay original indices must be strictly increasing",
+            ));
+        }
+        let fence = self.placement()?.fence();
+        let lookups = lookups
+            .iter()
+            .map(|lookup| {
+                Ok(wire::BuiltInReplayLookup {
+                    original_index: lookup.original_index,
+                    authority_kind: u32::from(lookup.authority_kind),
+                    contract_version: u32::from(lookup.contract_version),
+                    invocation_id: lookup.invocation_id.to_vec(),
+                    input_fingerprint: lookup.input_fingerprint.to_vec(),
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let mut request = Request::new(wire::RouteBuiltInReplayBatchRequest {
+            peer: Some(self.context(fence, 0, remaining)?),
+            executor_nomination_log_index,
+            lookups,
+        });
+        request.set_timeout(remaining.min(MAX_CLUSTER_OPERATION_TIME));
+        let response = self
+            .client(target, address)?
+            .route_built_in_replay_batch(request)
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        if response.outcomes.len() != lookup_count {
+            return Err(Status::data_loss(
+                "built-in replay batch response cardinality differs from its request",
+            ));
+        }
+        response
+            .outcomes
+            .into_iter()
+            .zip(expected_indices)
+            .map(|(outcome, expected_index)| {
+                if outcome.original_index != expected_index {
+                    return Err(Status::data_loss(
+                        "built-in replay batch response order is malformed",
+                    ));
+                }
+                if outcome.error_code != 0 {
+                    Ok(Err(Status::new(
+                        tonic::Code::from_i32(outcome.error_code),
+                        outcome.error_message,
+                    )))
+                } else if outcome.result_json.is_empty() {
+                    Ok(Ok(None))
+                } else {
+                    decode_json(&outcome.result_json).map(Some).map(Ok)
+                }
+            })
+            .collect()
+    }
+
     pub(crate) async fn stage_program_path(
         &self,
         target: NodeId,
@@ -913,6 +1099,73 @@ impl ClusterPeerTransport {
             hash,
             length: response.stage_blob_length,
         })
+    }
+
+    pub(crate) async fn reserve_program_participant(
+        &self,
+        target: NodeId,
+        address: &str,
+        executor_nomination_log_index: u64,
+        reservation: &ProgramReservation,
+        remaining: Duration,
+    ) -> Result<(), Status> {
+        let fence = self.placement()?.fence();
+        let response = self
+            .client(target, address)?
+            .reserve_program_participant(wire::ProgramReserveParticipantRequest {
+                peer: Some(self.context(fence, 0, remaining)?),
+                executor_nomination_log_index,
+                reservation_json: encode_json(reservation)?,
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)
+    }
+
+    pub(crate) async fn commit_program_participant(
+        &self,
+        target: NodeId,
+        address: &str,
+        executor_nomination_log_index: u64,
+        commit_cursor: u64,
+        reservation: &ProgramReservation,
+        remaining: Duration,
+    ) -> Result<(), Status> {
+        let fence = self.placement()?.fence();
+        let response = self
+            .client(target, address)?
+            .commit_program_participant(wire::ProgramCommitParticipantRequest {
+                peer: Some(self.context(fence, 0, remaining)?),
+                executor_nomination_log_index,
+                commit_cursor,
+                reservation_json: encode_json(reservation)?,
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)
+    }
+
+    pub(crate) async fn release_program_participant(
+        &self,
+        target: NodeId,
+        address: &str,
+        executor_nomination_log_index: u64,
+        finalized_commit_cursor: Option<u64>,
+        reservation: &ProgramReservation,
+        remaining: Duration,
+    ) -> Result<(), Status> {
+        let fence = self.placement()?.fence();
+        let response = self
+            .client(target, address)?
+            .release_program_participant(wire::ProgramReleaseParticipantRequest {
+                peer: Some(self.context(fence, 0, remaining)?),
+                executor_nomination_log_index,
+                reservation_json: encode_json(reservation)?,
+                finalized_commit_cursor: finalized_commit_cursor.unwrap_or(0),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)
     }
 
     pub(crate) async fn coordinate_program_path_finalization(
@@ -962,6 +1215,86 @@ impl ClusterPeerTransport {
             version: VersionId(response.version),
             replayed: response.replayed,
         })
+    }
+
+    pub(crate) async fn coordinate_program_alias_registry_finalization(
+        &self,
+        target: NodeId,
+        address: &str,
+        executor_nomination_log_index: u64,
+        commit_cursor: u64,
+        stage: &ProgramAliasRegistryStage,
+        remaining: Duration,
+    ) -> Result<ProgramAliasRegistryMutation, Status> {
+        let fence = self.placement()?.fence();
+        let response = self
+            .client(target, address)?
+            .coordinate_program_alias_registry_finalization(
+                wire::ProgramCoordinateAliasRegistryFinalizationRequest {
+                    peer: Some(self.context(fence, 0, remaining)?),
+                    executor_nomination_log_index,
+                    commit_cursor,
+                    stage_json: encode_json(stage)?,
+                },
+            )
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        decode_json(&response.mutation_json)
+    }
+
+    pub(crate) async fn apply_program_alias_registry_finalization(
+        &self,
+        target: NodeId,
+        address: &str,
+        executor_nomination_log_index: u64,
+        mutation: &ProgramAliasRegistryMutation,
+        remaining: Duration,
+    ) -> Result<bool, Status> {
+        let fence = self.placement()?.fence();
+        let response = self
+            .client(target, address)?
+            .apply_program_alias_registry_finalization(
+                wire::ProgramApplyAliasRegistryFinalizationRequest {
+                    peer: Some(self.context(fence, 0, remaining)?),
+                    executor_nomination_log_index,
+                    mutation_json: encode_json(mutation)?,
+                },
+            )
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        Ok(response.changed)
+    }
+
+    pub(crate) async fn read_program_alias_registry(
+        &self,
+        target: NodeId,
+        address: &str,
+        executor_nomination_log_index: u64,
+        tenant_id: u64,
+        bucket_id: u64,
+        canonical_path: &str,
+        remaining: Duration,
+    ) -> Result<Option<keldra_store::ObjectAliasRegistry>, Status> {
+        let fence = self.placement()?.fence();
+        let response = self
+            .client(target, address)?
+            .read_program_alias_registry(wire::ProgramReadAliasRegistryRequest {
+                peer: Some(self.context(fence, 0, remaining)?),
+                executor_nomination_log_index,
+                tenant_id,
+                bucket_id,
+                canonical_path: canonical_path.to_owned(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        response
+            .registry_json
+            .as_deref()
+            .map(decode_json)
+            .transpose()
     }
 
     pub(crate) async fn coordinate_logical_record(
@@ -1496,6 +1829,19 @@ fn validate_index_head(head: &super::IndexCurrentHead) -> Result<(), Status> {
         ));
     }
     Ok(())
+}
+
+fn wire_capability_range(min: u32, max: u32) -> Result<CapabilityRange, Status> {
+    let min =
+        u16::try_from(min).map_err(|_| Status::data_loss("capability minimum exceeds u16"))?;
+    let max =
+        u16::try_from(max).map_err(|_| Status::data_loss("capability maximum exceeds u16"))?;
+    if min == 0 || min > max {
+        return Err(Status::data_loss(
+            "capability response contains an invalid range",
+        ));
+    }
+    Ok(CapabilityRange { min, max })
 }
 
 pub(super) fn add_bearer_and_timeout<T>(

@@ -258,12 +258,16 @@ Index definition create, update, inspect, list, delete, and rebuild requests use
 one absolute deadline: the shorter of the client `grpc-timeout` and the
 startup-configured 30-second maximum. `QueryIndex` instead uses the shorter of
 the client deadline and `KELDRA_INDEX_QUERY_TIMEOUT_SECONDS`, whose default is
-five minutes. The same remaining budget is propagated across object and peer
-calls. These maxima are deliberately not transport-wide timeouts because `Put`
-and `WatchPrefix` are long-lived streams. Local authorization, administration,
-and credential unary requests still rely on their client or external TLS
-terminator to supply a deadline; extending the shared deadline wrapper to those
-existing services is deferred.
+five minutes. `BulkWrite` independently uses the shorter client deadline and
+`KELDRA_BULK_WRITE_TIMEOUT_SECONDS`, ten minutes by default, so a valid
+64 MiB request does not inherit the atomic-program execution maximum on slow
+storage. Atomic link operations embedded in a bulk retain the atomic-program
+maximum. The same remaining budget is propagated across object and peer calls.
+These maxima are deliberately not transport-wide timeouts because `Put` and
+`WatchPrefix` are long-lived streams. Local authorization, administration, and
+credential unary requests still rely on their client or external TLS terminator
+to supply a deadline; extending the shared deadline wrapper to those existing
+services is deferred.
 
 Authorization-aware index pagination batches the common case where every
 candidate is visible. If Zanzibar filters or reorders a candidate, Keldra falls
@@ -668,21 +672,3 @@ that same accounting path scope. The last complete rollup remains readable;
 ordinary restarts resume valid rollups, and no unrelated object heads or startup
 inventory are scanned. Operators can retry after peer health returns. A
 resumable cross-node snapshot protocol is deferred.
-
-## Abandoned raw upload-spool cleanup
-
-Keldra removes at most 256 recognized abandoned raw-upload files while opening
-one node. The bound prevents a crash-created disposable directory from turning
-into an unbounded startup inventory. If repeated hard process failures leave
-more files, later restarts remove further bounded pages; the remaining files
-consume only the configured disposable spool filesystem and are never treated
-as acknowledged objects. Operators using persistent spool storage may clear it
-while Keldra is stopped. A size-bounded tmpfs naturally discards the files on
-host reboot.
-
-`KELDRA_UPLOAD_SPOOL_MAX_BYTES` bounds bytes held by active uploads in one
-process. Because streaming puts intentionally declare no content length, Keldra
-fails the affected unacknowledged stream when its next chunk would exceed the
-shared capacity instead of allowing several partially admitted streams to wait
-on one another indefinitely. Clients may retry after another upload completes;
-no published object or durable identified stage is removed.

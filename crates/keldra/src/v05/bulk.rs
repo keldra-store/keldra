@@ -73,6 +73,11 @@ pub(super) fn validate_operation(
             "content_type exceeds {MAX_CONTENT_TYPE_BYTES} UTF-8 bytes"
         )));
     }
+    if content_type_value.is_some_and(|value| value == keldra_store::OBJECT_LINK_CONTENT_TYPE) {
+        return Err(Status::invalid_argument(
+            "the object-link descriptor content type is reserved for Keldra",
+        ));
+    }
     if payload_bytes > max_blob_bytes {
         return Err(Status::resource_exhausted(
             "bulk put item exceeds the object-size limit",
@@ -107,6 +112,23 @@ pub(super) fn record_phase_metrics(
         histogram.keldra_bulk_routing_duration_seconds = routing.as_secs_f64(),
         histogram.keldra_bulk_dispatch_duration_seconds = dispatch.as_secs_f64(),
         "bulk write phases completed"
+    );
+}
+
+pub(super) fn record_dispatch_interruption(
+    error: &Status,
+    operation_count: usize,
+    encoded_bytes: u64,
+    dispatch_duration: Duration,
+) {
+    tracing::info!(
+        bulk.phase = "coordinator_dispatch",
+        grpc.code = ?error.code(),
+        operation_count,
+        encoded_bytes,
+        histogram.keldra_bulk_interrupted_phase_duration_seconds =
+            dispatch_duration.as_secs_f64(),
+        "bulk write ended before coordinator dispatch completed"
     );
 }
 

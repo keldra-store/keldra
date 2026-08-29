@@ -1082,6 +1082,7 @@ mod tests {
                 tenant_id: 1,
                 bucket_id: 2,
                 exact_path: path.into(),
+                canonical_path: None,
                 path_version: keldra_store::VersionId(9),
                 kind: keldra_store::ObjectHeadChangeKind::Put,
                 program_commit_cursor: None,

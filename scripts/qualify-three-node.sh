@@ -6,7 +6,7 @@ source "${repo_root}/scripts/qualification-scale-evidence.sh"
 source "${repo_root}/scripts/qualification-three-node-phases.sh"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${KELDRA_IMAGE:-keldra:0.14.0}"
+requested_image="${KELDRA_IMAGE:-keldra:0.15.0}"
 qualification_mode="${KELDRA_QUALIFICATION_MODE:-smoke}"
 index_disk_cache_bytes="${KELDRA_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
 index_memory_percent="${KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
@@ -206,9 +206,9 @@ client_version="$(
   docker run --rm --platform "${KELDRA_DOCKER_PLATFORM}" \
     "${image_id}" keldra --version
 )"
-if [[ "${server_version}" != "keldra-server 0.14.0" \
-  || "${client_version}" != "keldra 0.14.0" ]]; then
-  echo "qualification requires the exact Keldra 0.14.0 image" >&2
+if [[ "${server_version}" != "keldra-server 0.15.0" \
+  || "${client_version}" != "keldra 0.15.0" ]]; then
+  echo "qualification requires the exact Keldra 0.15.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
@@ -304,12 +304,108 @@ for required in --peer-listen --peer-advertise --join-bundle; do
   fi
 done
 cli_help="$(docker run --rm "${image_id}" keldra --help)"
-for required in prepare-node provision-tenant create-bucket; do
+for required in \
+  prepare-node \
+  provision-tenant \
+  create-bucket \
+  get-cluster-capabilities \
+  activate-cluster-capabilities \
+  clone-object \
+  link-object \
+  unlink-object
+do
   if ! grep -Fq -- "${required}" <<<"${cli_help}"; then
     echo "qualification image is missing required CLI command ${required}" >&2
     exit 1
   fi
 done
+
+qualify_generalized_object_paths() {
+  local capabilities=""
+  local attempt
+  for attempt in $(seq 1 60); do
+    capabilities="$(run_bootstrap_cli keldra-1 get-cluster-capabilities 2>/dev/null || true)"
+    if grep -Eq 'active_protocol=1 active_storage=1 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
+      break
+    fi
+    sleep 1
+  done
+  if ! grep -Eq 'active_protocol=1 active_storage=1 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
+    echo "three-node cluster did not become ready for capability 2/2: ${capabilities}" >&2
+    return 1
+  fi
+  local placement_term placement_index
+  placement_term="$(sed -n 's/.*placement_term=\([0-9][0-9]*\).*/\1/p' <<<"${capabilities}")"
+  placement_index="$(sed -n 's/.*placement_index=\([0-9][0-9]*\).*/\1/p' <<<"${capabilities}")"
+  if [[ ! "${placement_term}" =~ ^[1-9][0-9]*$ || ! "${placement_index}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "three-node capability status omitted an exact placement fence: ${capabilities}" >&2
+    return 1
+  fi
+  run_bootstrap_cli keldra-1 activate-cluster-capabilities \
+    --protocol-version 2 \
+    --storage-format 2 \
+    --expected-placement-term "${placement_term}" \
+    --expected-placement-index "${placement_index}" >/dev/null
+
+  printf 'three-node-clone-source\n' >"${KELDRA_QUALIFICATION_DIR}/artifacts/link-source.txt"
+  printf 'three-node-linked-update\n' >"${KELDRA_QUALIFICATION_DIR}/artifacts/link-update.txt"
+  chmod 0444 \
+    "${KELDRA_QUALIFICATION_DIR}/artifacts/link-source.txt" \
+    "${KELDRA_QUALIFICATION_DIR}/artifacts/link-update.txt"
+  local source_version
+  source_version="$(run_cli keldra-1 qprobe-client "${qprobe_secret}" \
+    put qprobe objects links/target \
+      /qualification/artifacts/link-source.txt \
+      --command-id qprobe-link-source --durability replicated --if-absent)"
+  if [[ ! "${source_version}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "three-node qualification received an invalid source version: ${source_version}" >&2
+    return 1
+  fi
+  run_cli keldra-2 qprobe-client "${qprobe_secret}" \
+    clone-object qprobe objects links/target "${source_version}" links/clone \
+      --command-id qprobe-clone --durability replicated --if-absent >/dev/null
+  run_cli keldra-3 qprobe-client "${qprobe_secret}" \
+    link-object qprobe objects links/alias links/target \
+      --command-id qprobe-link --durability replicated >/dev/null
+  expect_failure "target delete with an inbound link" \
+    run_cli keldra-2 qprobe-client "${qprobe_secret}" \
+      delete qprobe objects links/target \
+        --command-id qprobe-linked-target-delete --durability replicated
+  run_cli keldra-2 qprobe-client "${qprobe_secret}" \
+    put qprobe objects links/alias /qualification/artifacts/link-update.txt \
+      --command-id qprobe-link-write --durability replicated >/dev/null
+  run_cli keldra-1 qprobe-client "${qprobe_secret}" \
+    get qprobe objects links/target \
+      --output /qualification/artifacts/link-target-read.txt
+  run_cli keldra-3 qprobe-client "${qprobe_secret}" \
+    get qprobe objects links/alias \
+      --output /qualification/artifacts/link-alias-read.txt
+  run_cli keldra-2 qprobe-client "${qprobe_secret}" \
+    get qprobe objects links/clone \
+      --output /qualification/artifacts/link-clone-read.txt
+  cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/link-update.txt" \
+    "${KELDRA_QUALIFICATION_DIR}/artifacts/link-target-read.txt"
+  cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/link-update.txt" \
+    "${KELDRA_QUALIFICATION_DIR}/artifacts/link-alias-read.txt"
+  cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/link-source.txt" \
+    "${KELDRA_QUALIFICATION_DIR}/artifacts/link-clone-read.txt"
+  run_cli keldra-3 qprobe-client "${qprobe_secret}" \
+    unlink-object qprobe objects links/alias \
+      --command-id qprobe-unlink --durability replicated >/dev/null
+  expect_failure "unlinked alias read" \
+    run_cli keldra-1 qprobe-client "${qprobe_secret}" \
+      get qprobe objects links/alias
+  run_cli keldra-1 qprobe-client "${qprobe_secret}" \
+    delete qprobe objects links/target \
+      --command-id qprobe-target-delete-after-unlink --durability replicated >/dev/null
+  rm -f "${KELDRA_QUALIFICATION_DIR}/artifacts/link-clone-read.txt"
+  run_cli keldra-3 qprobe-client "${qprobe_secret}" \
+    get qprobe objects links/clone \
+      --output /qualification/artifacts/link-clone-read.txt
+  cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/link-source.txt" \
+    "${KELDRA_QUALIFICATION_DIR}/artifacts/link-clone-read.txt"
+  echo "[keldra-qualification] capability 2/2 clone and protected-link paths passed across three nodes"
+}
 for directory in node-1 node-2 node-3 artifacts; do
   mkdir "${KELDRA_QUALIFICATION_DIR}/${directory}"
   chmod 0777 "${KELDRA_QUALIFICATION_DIR}/${directory}"
@@ -1688,6 +1784,7 @@ done
 echo "[keldra-qualification] three-node 2+1 reads preserved both large object heads and bytes without complete copies after every one-shard loss"
 
 echo "[keldra-qualification] three-node cluster is ACTIVE"
+qualify_generalized_object_paths
 case "${index_resource_scope}" in
   release-corpus)
     echo "[keldra-qualification] index resource scope=release-corpus records=839980 indexed_fields=12"

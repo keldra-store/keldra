@@ -1,6 +1,6 @@
 services:
   keldra:
-    image: ${KELDRA_IMAGE:-ghcr.io/keldra-store/keldra:0.14.0}
+    image: ${KELDRA_IMAGE:-ghcr.io/keldra-store/keldra:0.15.0}
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       KELDRA_LISTEN: 0.0.0.0:50051

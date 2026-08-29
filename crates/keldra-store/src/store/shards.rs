@@ -1,18 +1,17 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{self, Read};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
+use super::journal_capacity::SourceJournalAdmission;
+#[cfg(test)]
+use super::payload_artifacts::shard_inline_key;
+use super::payload_artifacts::{ArtifactLayout, ArtifactManifest, RocksArtifactReader};
 use super::*;
-use crate::blob::create_directory_all_durable;
 use crate::{ErasureCodec, ErasureError, FRAGMENT_FORMAT_VERSION};
 
 const SHARD_IDENTITY_BYTES: usize = 2 + 32 + 8 + 2;
-static NEXT_SHARD_UPLOAD_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The complete stable identity of one erasure-coded shard.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -102,11 +101,6 @@ impl ShardIdentity {
         }
         Ok(())
     }
-
-    fn path(&self, root: &Path) -> PathBuf {
-        let hash = hex::encode(self.blob.hash);
-        root.join(&hash[..2]).join(hex::encode(self.encode()))
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,12 +112,12 @@ pub enum ShardSealOutcome {
 /// A complete shard that was validated before being returned.
 #[derive(Debug)]
 pub struct ShardReader {
-    file: File,
+    reader: RocksArtifactReader,
 }
 
 impl Read for ShardReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buffer)
+        self.reader.read(buffer)
     }
 }
 
@@ -144,7 +138,7 @@ pub enum ShardStoreError {
 impl Store {
     /// Durably seals one already-encoded shard.
     ///
-    /// Retrying the same identity validates the existing immutable file and
+    /// Retrying the same identity validates the existing immutable artifact and
     /// refreshes its one awaiting-publication reservation without increasing
     /// the reference count.
     pub async fn seal_shard<R: Read>(
@@ -154,30 +148,36 @@ impl Store {
         mut encoded_shard: R,
     ) -> Result<ShardSealOutcome, ShardStoreError> {
         identity.validate_for(codec)?;
-        let staging = self.blobs.root().join(".staging");
-        create_directory_all_durable(&staging)
-            .await
-            .map_err(shard_storage_error)?;
-        let temporary = staging.join(format!(
-            "shard-{}-{}-{}-{}.tmp",
-            std::process::id(),
-            hex::encode(self.blobs.upload_boot_nonce()),
-            NEXT_SHARD_UPLOAD_ID.fetch_add(1, Ordering::Relaxed),
-            hex::encode(identity.encode())
-        ));
-        let temporary_guard = TemporaryShard::new(temporary.clone());
-        let mut output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(shard_storage_error)?;
-        io::copy(&mut encoded_shard, &mut output).map_err(shard_storage_error)?;
-        output.sync_all().map_err(shard_storage_error)?;
-        drop(output);
-        validate_shard_file(codec, identity, &temporary)?;
-
-        self.commit_staged_shard(codec, identity, &temporary, temporary_guard)
-            .await
+        let Some((manifest, start)) = self.prepare_shard_install(codec, identity).await? else {
+            return Ok(ShardSealOutcome::AlreadyPresent);
+        };
+        discard_exact(
+            &mut encoded_shard,
+            u64::from(start) * PAYLOAD_ARTIFACT_CHUNK_BYTES as u64,
+        )?;
+        let total = artifact_chunk_count(&manifest);
+        let mut buffer = vec![0_u8; PAYLOAD_ARTIFACT_CHUNK_BYTES];
+        for ordinal in start..total {
+            let expected = artifact_chunk_length(&manifest, ordinal)?;
+            encoded_shard
+                .read_exact(&mut buffer[..expected])
+                .map_err(shard_storage_error)?;
+            self.persist_shard_chunk(identity, &manifest, ordinal, &buffer[..expected])
+                .await?;
+        }
+        let mut trailing = [0_u8; 1];
+        if encoded_shard
+            .read(&mut trailing)
+            .map_err(shard_storage_error)?
+            != 0
+        {
+            return Err(ShardStoreError::Storage(
+                "encoded shard exceeds its exact expected length".into(),
+            ));
+        }
+        self.finish_shard_install(codec, identity, &manifest)
+            .await?;
+        Ok(ShardSealOutcome::Created)
     }
 
     /// Durably seals one already-encoded shard from an asynchronous source.
@@ -192,85 +192,138 @@ impl Store {
         mut encoded_shard: R,
     ) -> Result<ShardSealOutcome, ShardStoreError> {
         identity.validate_for(codec)?;
-        let staging = self.blobs.root().join(".staging");
-        create_directory_all_durable(&staging)
+        let Some((manifest, start)) = self.prepare_shard_install(codec, identity).await? else {
+            return Ok(ShardSealOutcome::AlreadyPresent);
+        };
+        let mut buffer = vec![0_u8; PAYLOAD_ARTIFACT_CHUNK_BYTES];
+        let mut discard = u64::from(start) * PAYLOAD_ARTIFACT_CHUNK_BYTES as u64;
+        while discard != 0 {
+            let count =
+                usize::try_from(discard.min(buffer.len() as u64)).map_err(shard_storage_error)?;
+            encoded_shard
+                .read_exact(&mut buffer[..count])
+                .await
+                .map_err(shard_storage_error)?;
+            discard -= count as u64;
+        }
+        let total = artifact_chunk_count(&manifest);
+        for ordinal in start..total {
+            let expected = artifact_chunk_length(&manifest, ordinal)?;
+            encoded_shard
+                .read_exact(&mut buffer[..expected])
+                .await
+                .map_err(shard_storage_error)?;
+            self.persist_shard_chunk(identity, &manifest, ordinal, &buffer[..expected])
+                .await?;
+        }
+        let mut trailing = [0_u8; 1];
+        if encoded_shard
+            .read(&mut trailing)
             .await
-            .map_err(shard_storage_error)?;
-        let temporary = staging.join(format!(
-            "shard-{}-{}-{}-{}.tmp",
-            std::process::id(),
-            hex::encode(self.blobs.upload_boot_nonce()),
-            NEXT_SHARD_UPLOAD_ID.fetch_add(1, Ordering::Relaxed),
-            hex::encode(identity.encode())
-        ));
-        let temporary_guard = TemporaryShard::new(temporary.clone());
-        let mut output = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .await
-            .map_err(shard_storage_error)?;
-        tokio::io::copy(&mut encoded_shard, &mut output)
-            .await
-            .map_err(shard_storage_error)?;
-        output.sync_all().await.map_err(shard_storage_error)?;
-        drop(output);
-        validate_shard_file(codec, identity, &temporary)?;
-
-        self.commit_staged_shard(codec, identity, &temporary, temporary_guard)
-            .await
+            .map_err(shard_storage_error)?
+            != 0
+        {
+            return Err(ShardStoreError::Storage(
+                "encoded shard exceeds its exact expected length".into(),
+            ));
+        }
+        self.finish_shard_install(codec, identity, &manifest)
+            .await?;
+        Ok(ShardSealOutcome::Created)
     }
 
-    async fn commit_staged_shard(
+    async fn prepare_shard_install(
         &self,
         codec: &ErasureCodec,
         identity: &ShardIdentity,
-        temporary: &Path,
-        temporary_guard: TemporaryShard,
-    ) -> Result<ShardSealOutcome, ShardStoreError> {
-        let final_path = identity.path(self.blobs.root());
-        let parent = final_path
-            .parent()
-            .ok_or_else(|| ShardStoreError::Storage("shard path has no parent".into()))?;
+    ) -> Result<Option<(ArtifactManifest, u32)>, ShardStoreError> {
+        if self
+            .read_shard_manifest(identity)
+            .map_err(shard_error)?
+            .is_some()
         {
-            let _directory_guard = self.blobs.directory_lock.lock().await;
-            create_directory_all_durable(parent)
-                .await
-                .map_err(shard_storage_error)?;
-            if final_path.exists() {
-                validate_shard_file(codec, identity, &final_path)?;
-            }
-        }
-
-        // The awaiting lifecycle and its due entry become durable while the
-        // validated bytes are still recoverably named under `.staging`.
-        loop {
-            let commit_guard = self.lock_commit("shard_state").await;
-            if !temporary.is_file() && !final_path.is_file() {
-                return Err(ShardStoreError::NotFound);
-            }
-            let reservation = self.reserve_sealed_artifact(
+            self.validate_shard(codec, identity)?;
+            let state = self.shard_reference_state(identity)?.ok_or_else(|| {
+                ShardStoreError::Storage("shard manifest exists without lifecycle authority".into())
+            })?;
+            validate_blob_reference_state(state).map_err(shard_error)?;
+            self.reserve_sealed_artifact_with_admission_wait(
                 &identity.encode(),
                 now_unix_millis().map_err(shard_error)?,
-            );
-            drop(commit_guard);
-            match reservation {
-                Ok(_) => break,
-                Err(MutationError::SourceJournalCapacity) => {
-                    self.wait_for_mutation_capacity().await;
-                }
-                Err(error) => return Err(shard_error(error)),
-            }
+                SourceJournalAdmission::Bounded,
+            )
+            .await
+            .map_err(shard_error)?;
+            return Ok(None);
         }
-        let created = self
-            .publish_identified_staged_shard(identity, temporary)
-            .await?;
-        drop(temporary_guard);
-        Ok(if created {
-            ShardSealOutcome::Created
-        } else {
-            ShardSealOutcome::AlreadyPresent
-        })
+        let encoded_length = codec.encoded_shard_length(identity.blob(), identity.ordinal())?;
+        let manifest = ArtifactManifest::shard(identity, encoded_length).map_err(shard_error)?;
+        let start = self
+            .begin_sealed_artifact_install_with_admission_wait(
+                &identity.encode(),
+                manifest.clone(),
+                now_unix_millis().map_err(shard_error)?,
+                SourceJournalAdmission::Bounded,
+            )
+            .await
+            .map_err(shard_error)?;
+        Ok(Some((manifest, start)))
+    }
+
+    async fn persist_shard_chunk(
+        &self,
+        identity: &ShardIdentity,
+        manifest: &ArtifactManifest,
+        ordinal: u32,
+        bytes: &[u8],
+    ) -> Result<(), ShardStoreError> {
+        let _guard = self.lock_commit("shard_install").await;
+        self.advance_artifact_install(
+            &identity.encode(),
+            manifest,
+            ordinal,
+            bytes,
+            now_unix_millis().map_err(shard_error)?,
+            None,
+        )
+        .map_err(shard_error)
+    }
+
+    async fn finish_shard_install(
+        &self,
+        codec: &ErasureCodec,
+        identity: &ShardIdentity,
+        manifest: &ArtifactManifest,
+    ) -> Result<(), ShardStoreError> {
+        let mut validation = RocksArtifactReader::new(self.db.clone(), manifest.clone());
+        if let Err(error) =
+            codec.validate_shard(identity.blob(), identity.ordinal(), &mut validation)
+        {
+            let _guard = self.lock_commit("shard_install").await;
+            let mut batch = WriteBatch::default();
+            self.reset_artifact_install(
+                &mut batch,
+                &identity.encode(),
+                manifest,
+                now_unix_millis().map_err(shard_error)?,
+            )
+            .map_err(shard_error)?;
+            let mut options = WriteOptions::default();
+            options.set_sync(self.sync_writes);
+            self.db
+                .write_opt(batch, &options)
+                .map_err(shard_storage_error)?;
+            return Err(error.into());
+        }
+        let _guard = self.lock_commit("shard_install").await;
+        let mut batch = WriteBatch::default();
+        self.finish_artifact_install(&mut batch, &identity.encode(), manifest)
+            .map_err(shard_error)?;
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db
+            .write_opt(batch, &options)
+            .map_err(shard_storage_error)
     }
 
     /// Validates the complete persisted shard identity and every inline CRC.
@@ -280,7 +333,10 @@ impl Store {
         identity: &ShardIdentity,
     ) -> Result<(), ShardStoreError> {
         identity.validate_for(codec)?;
-        validate_shard_file(codec, identity, &identity.path(self.blobs.root()))
+        let mut reader = self.open_shard_artifact(identity)?;
+        codec
+            .validate_shard(identity.blob(), identity.ordinal(), &mut reader)
+            .map_err(Into::into)
     }
 
     /// Opens one complete shard only after validating its framing and CRCs.
@@ -296,11 +352,11 @@ impl Store {
             return Err(ShardStoreError::NotFound);
         }
         identity.validate_for(codec)?;
-        let path = identity.path(self.blobs.root());
-        let mut file = open_shard_file(&path)?;
-        codec.validate_shard(identity.blob(), identity.ordinal(), &mut file)?;
-        file.seek(SeekFrom::Start(0)).map_err(shard_storage_error)?;
-        Ok(ShardReader { file })
+        let mut validation = self.open_shard_artifact(identity)?;
+        codec.validate_shard(identity.blob(), identity.ordinal(), &mut validation)?;
+        Ok(ShardReader {
+            reader: self.open_shard_artifact(identity)?,
+        })
     }
 
     pub fn shard_reference_state(
@@ -315,49 +371,20 @@ impl Store {
         &self,
         identity: &ShardIdentity,
     ) -> Result<bool, ShardStoreError> {
-        match std::fs::symlink_metadata(identity.path(self.blobs.root())) {
-            Ok(metadata) => Ok(metadata.file_type().is_file()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(shard_storage_error(error)),
-        }
+        self.read_shard_manifest(identity)
+            .map(|manifest| manifest.is_some())
+            .map_err(shard_error)
     }
 
-    /// Complete or recover publication of one validated, identity-named shard
-    /// stage after its lifecycle reservation is durable.
-    pub(super) async fn publish_identified_staged_shard(
+    fn open_shard_artifact(
         &self,
         identity: &ShardIdentity,
-        temporary: &Path,
-    ) -> Result<bool, ShardStoreError> {
-        let final_path = identity.path(self.blobs.root());
-        let parent = final_path
-            .parent()
-            .ok_or_else(|| ShardStoreError::Storage("shard path has no parent".into()))?;
-        let staging = temporary
-            .parent()
-            .ok_or_else(|| ShardStoreError::Storage("shard staging path has no parent".into()))?;
-        let _directory_guard = self.blobs.directory_lock.lock().await;
-        create_directory_all_durable(parent)
-            .await
-            .map_err(shard_storage_error)?;
-        if final_path.is_file() {
-            match std::fs::remove_file(temporary) {
-                Ok(()) => sync_directory(staging)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(shard_storage_error(error)),
-            }
-            return Ok(false);
-        }
-        match std::fs::rename(temporary, &final_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound && final_path.is_file() => {
-                return Ok(false);
-            }
-            Err(error) => return Err(shard_storage_error(error)),
-        }
-        sync_directory(parent)?;
-        sync_directory(staging)?;
-        Ok(true)
+    ) -> Result<RocksArtifactReader, ShardStoreError> {
+        let manifest = self
+            .read_shard_manifest(identity)
+            .map_err(shard_error)?
+            .ok_or(ShardStoreError::NotFound)?;
+        Ok(RocksArtifactReader::new(self.db.clone(), manifest))
     }
 
     /// Removes one local shard and its local lifecycle record.
@@ -365,17 +392,18 @@ impl Store {
     /// Placement and reference-delta callers decide when removal is safe; this
     /// byte-plane primitive deliberately has no cluster policy.
     pub async fn remove_shard(&self, identity: &ShardIdentity) -> Result<bool, ShardStoreError> {
-        let (had_state, quarantined) = {
+        let had_state = {
             let _commit_guard = self.lock_commit("shard_state").await;
             let key = identity.encode();
             let state = self.read_blob_reference_state(&key).map_err(shard_error)?;
             let had_state = state.is_some();
-            let quarantined = self
-                .quarantine_shard_for_removal(identity)
-                .await
-                .map_err(shard_error)?;
+            let manifest = self.read_shard_manifest(identity).map_err(shard_error)?;
             if let Some(state) = state {
                 let mut batch = WriteBatch::default();
+                if let Some(manifest) = manifest.as_ref() {
+                    self.stage_artifact_delete(&mut batch, &key, manifest)
+                        .map_err(shard_error)?;
+                }
                 self.stage_blob_reference_delete(&mut batch, &key, state)
                     .map_err(shard_error)?;
                 let mut options = WriteOptions::default();
@@ -384,40 +412,43 @@ impl Store {
                     .write_opt(batch, &options)
                     .map_err(shard_storage_error)?;
             }
-            (had_state, quarantined)
+            had_state || manifest.is_some()
         };
-        let removed = quarantined.is_some();
-        if let Some(path) = quarantined {
-            self.remove_quarantined_artifact(&path)
-                .map_err(shard_error)?;
-        }
-        Ok(had_state || removed)
+        Ok(had_state)
     }
 }
 
-fn open_shard_file(path: &Path) -> Result<File, ShardStoreError> {
-    match File::open(path) {
-        Ok(file) => Ok(file),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(ShardStoreError::NotFound),
-        Err(error) => Err(shard_storage_error(error)),
+fn artifact_chunk_count(manifest: &ArtifactManifest) -> u32 {
+    match manifest.layout {
+        ArtifactLayout::Inline => 1,
+        ArtifactLayout::Chunked { chunk_count } => chunk_count,
     }
 }
 
-fn validate_shard_file(
-    codec: &ErasureCodec,
-    identity: &ShardIdentity,
-    path: &Path,
-) -> Result<(), ShardStoreError> {
-    let file = open_shard_file(path)?;
-    codec
-        .validate_shard(identity.blob(), identity.ordinal(), file)
-        .map_err(Into::into)
+fn artifact_chunk_length(
+    manifest: &ArtifactManifest,
+    ordinal: u32,
+) -> Result<usize, ShardStoreError> {
+    let offset = u64::from(ordinal) * PAYLOAD_ARTIFACT_CHUNK_BYTES as u64;
+    usize::try_from(
+        manifest
+            .encoded_length
+            .saturating_sub(offset)
+            .min(PAYLOAD_ARTIFACT_CHUNK_BYTES as u64),
+    )
+    .map_err(shard_storage_error)
 }
 
-fn sync_directory(path: &Path) -> Result<(), ShardStoreError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(shard_storage_error)
+fn discard_exact(reader: &mut impl Read, mut bytes: u64) -> Result<(), ShardStoreError> {
+    let mut buffer = vec![0_u8; PAYLOAD_ARTIFACT_CHUNK_BYTES];
+    while bytes != 0 {
+        let count = usize::try_from(bytes.min(buffer.len() as u64)).map_err(shard_storage_error)?;
+        reader
+            .read_exact(&mut buffer[..count])
+            .map_err(shard_storage_error)?;
+        bytes -= count as u64;
+    }
+    Ok(())
 }
 
 fn shard_error(error: MutationError) -> ShardStoreError {
@@ -428,25 +459,10 @@ fn shard_storage_error(error: impl std::fmt::Display) -> ShardStoreError {
     ShardStoreError::Storage(error.to_string())
 }
 
-struct TemporaryShard {
-    path: PathBuf,
-}
-
-impl TemporaryShard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for TemporaryShard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read};
+    use std::path::Path;
 
     use super::*;
     use crate::{AWAITING_PUBLISH, ErasureProfile, StoreOptions};
@@ -541,40 +557,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_maintenance_recovers_lifecycle_backed_shard_stage() {
+    async fn erasure_shard_above_eight_mib_uses_the_same_chunked_artifact_store() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(
-            StoreOptions::new(temporary.path(), 1).with_awaiting_publish_ttl_seconds(1),
-        )
-        .await
-        .unwrap();
-        let source = vec![0x6a; SMALL_BLOB_MAX_BYTES + 23];
+        let store = open_store(temporary.path()).await;
+        let source = vec![0x2c; 17 * 1024 * 1024];
         let (codec, reference, shards) = encoded_shards(&source);
         let identity = ShardIdentity::new(reference, 0);
-        let staging = store.blobs.root().join(".staging");
-        create_directory_all_durable(&staging).await.unwrap();
-        let path = staging.join(format!(
-            "shard-1-{}-1-{}.tmp",
-            hex::encode(store.blobs.upload_boot_nonce()),
-            hex::encode(identity.encode())
-        ));
-        std::fs::write(&path, &shards[0]).unwrap();
-        File::open(&path).unwrap().sync_all().unwrap();
-        validate_shard_file(&codec, &identity, &path).unwrap();
-        let now = now_unix_millis().unwrap();
-        {
-            let _guard = store.lock_commit("shard_state").await;
-            store
-                .reserve_sealed_artifact(&identity.encode(), now)
-                .unwrap();
-        }
+        assert!(shards[0].len() > PAYLOAD_ARTIFACT_CHUNK_BYTES);
 
-        assert_eq!(store.collect_blob_garbage_at(now).await.unwrap(), 1);
-        assert!(!path.exists());
-        let mut reader = store.get_shard(&codec, &identity).unwrap();
-        let mut actual = Vec::new();
-        reader.read_to_end(&mut actual).unwrap();
-        assert_eq!(actual, shards[0]);
+        store
+            .seal_shard(&codec, &identity, Cursor::new(&shards[0]))
+            .await
+            .unwrap();
+
+        let manifest = store.read_shard_manifest(&identity).unwrap().unwrap();
+        assert!(matches!(
+            manifest.layout,
+            ArtifactLayout::Chunked { chunk_count } if chunk_count >= 2
+        ));
+        let mut persisted = Vec::new();
+        store
+            .get_shard(&codec, &identity)
+            .unwrap()
+            .read_to_end(&mut persisted)
+            .unwrap();
+        assert_eq!(persisted, shards[0]);
+        assert!(store.remove_shard(&identity).await.unwrap());
+        assert!(store.read_shard_manifest(&identity).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -589,11 +598,17 @@ mod tests {
             .await
             .unwrap();
 
-        let path = identity.path(store.blobs.root());
-        let mut corrupted = std::fs::read(&path).unwrap();
+        let mut corrupted = shards[0].clone();
         let last = corrupted.last_mut().unwrap();
         *last ^= 0xff;
-        std::fs::write(&path, corrupted).unwrap();
+        store
+            .db
+            .put_cf(
+                store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(),
+                shard_inline_key(&identity),
+                corrupted,
+            )
+            .unwrap();
 
         assert!(matches!(
             store.validate_shard(&codec, &identity),
@@ -610,6 +625,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_first_install_resets_to_enumerable_retryable_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = open_store(temporary.path()).await;
+        let source = vec![0x38; SMALL_BLOB_MAX_BYTES + 5];
+        let (codec, reference, shards) = encoded_shards(&source);
+        let identity = ShardIdentity::new(reference, 0);
+        let mut malformed = shards[0].clone();
+        *malformed.last_mut().unwrap() ^= 0xff;
+
+        assert!(
+            store
+                .seal_shard(&codec, &identity, Cursor::new(malformed))
+                .await
+                .is_err()
+        );
+        assert!(store.shard_reference_state(&identity).unwrap().is_some());
+        assert!(store.read_shard_manifest(&identity).unwrap().is_none());
+        assert!(
+            store
+                .read_artifact_install_manifest(&identity.encode())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .db
+                .get_cf(
+                    store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(),
+                    shard_inline_key(&identity),
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            store
+                .seal_shard(&codec, &identity, Cursor::new(&shards[0]))
+                .await
+                .unwrap(),
+            ShardSealOutcome::Created
+        );
+        store.validate_shard(&codec, &identity).unwrap();
+    }
+
+    #[tokio::test]
     async fn truncated_existing_shard_is_rejected() {
         let temporary = tempfile::tempdir().unwrap();
         let store = open_store(temporary.path()).await;
@@ -621,15 +681,19 @@ mod tests {
             .await
             .unwrap();
 
-        let path = identity.path(store.blobs.root());
-        let file = OpenOptions::new().write(true).open(path).unwrap();
-        file.set_len(shards[1].len() as u64 - 1).unwrap();
-        file.sync_all().unwrap();
+        store
+            .db
+            .put_cf(
+                store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(),
+                shard_inline_key(&identity),
+                &shards[1][..shards[1].len() - 1],
+            )
+            .unwrap();
 
         assert!(matches!(
             store.validate_shard(&codec, &identity),
             Err(ShardStoreError::Erasure(ErasureError::Io(error)))
-                if error.kind() == io::ErrorKind::UnexpectedEof
+                if error.kind() == io::ErrorKind::InvalidData
         ));
         assert!(store.get_shard(&codec, &identity).is_err());
     }
@@ -645,10 +709,7 @@ mod tests {
         let first = ShardIdentity::new(reference.clone(), 0);
         let second = ShardIdentity::new(reference, 1);
         assert_ne!(first.encode(), second.encode());
-        assert_ne!(
-            first.path(store.blobs.root()),
-            second.path(store.blobs.root())
-        );
+        assert_ne!(shard_inline_key(&first), shard_inline_key(&second));
 
         store
             .seal_shard(&codec, &first, Cursor::new(&shards[0]))

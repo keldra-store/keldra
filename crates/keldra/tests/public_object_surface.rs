@@ -17,10 +17,11 @@ use keldra_api::v1::put_header::Operation as PutOperationValue;
 use keldra_api::v1::watch_message::Message as WatchMessageValue;
 use keldra_api::v1::watch_prefix_request::Start as WatchStart;
 use keldra_api::v1::{
-    ApplicationRoleRequest, BatchGetRequest, BucketApplicationRole, BucketApplicationRoleTarget,
-    BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest, CreateIndexRequest,
-    DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest, DisableAccountingRequest,
-    Durability, EnableAccountingRequest, GetAccountingRequest, GetIndexRequest, GetObjectRequest,
+    ActivateClusterCapabilitiesRequest, ApplicationRoleRequest, BatchGetRequest,
+    BucketApplicationRole, BucketApplicationRoleTarget, BucketPolicy, BulkOperation,
+    BulkPutRequest, BulkWriteRequest, CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest,
+    DeleteVersionRequest, DisableAccountingRequest, Durability, EnableAccountingRequest,
+    GetAccountingRequest, GetClusterCapabilitiesRequest, GetIndexRequest, GetObjectRequest,
     HeadObjectRequest, IndexQuery, IndexSpecification, InvokeProgramRequest,
     ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode, ObjectAddress,
     ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader,
@@ -33,6 +34,7 @@ use keldra_store::{
     AuthzRevision, CreateBucketRequest, ObjectVersioning as StoreObjectVersioning,
     ProvisionTenantRequest, StorageTenantId, Store, StoreOptions, SystemBootstrapRequest,
 };
+use prost::Message;
 use serde::Serialize;
 use tempfile::TempDir;
 use tonic::transport::{Channel, Endpoint};
@@ -588,6 +590,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
             .await,
     );
 
+    fixture.activate_cluster_capabilities().await;
     let rebuilt = indexes
         .rebuild_index(authorized(
             RebuildIndexRequest {
@@ -1157,6 +1160,86 @@ async fn explicit_put_modes_cas_delete_head_batch_bulk_and_list_work_over_grpc()
 }
 
 #[tokio::test]
+async fn pathological_807_item_63mb_bulk_completes_inside_the_server_deadline() {
+    const OPERATIONS: usize = 807;
+    const ENCODED_BYTES: usize = 63_016_190;
+    let fixture = Fixture::start_with(|config| {
+        config.bulk_write_timeout = Duration::from_secs(30);
+        config.max_atomic_commit_entries = 1_000;
+        config.max_atomic_commit_bytes = keldra_store::MAX_ATOMIC_BATCH_PUBLISHED_BYTES;
+        config.max_mutation_receipt_entries = 2_000;
+        config.max_mutation_receipt_bytes = 16 * 1024 * 1024;
+        config.source_journal_max_entries = 10_000_000;
+        config.source_journal_max_bytes = 5 * 1024 * 1024 * 1024;
+    })
+    .await;
+    let mut client = ObjectServiceClient::new(fixture.channel.clone());
+    let base_payload_bytes = ENCODED_BYTES / OPERATIONS - 128;
+    let mut request = BulkWriteRequest {
+        operations: (0..OPERATIONS)
+            .map(|ordinal| {
+                let mut bytes = vec![0x6d; base_payload_bytes];
+                bytes[..8].copy_from_slice(&(ordinal as u64).to_be_bytes());
+                BulkOperation {
+                    operation: Some(BulkOperationValue::Put(bulk_put(
+                        address(&format!("pathological/{ordinal}")),
+                        &bytes,
+                        &format!("pathological-{ordinal}"),
+                    ))),
+                }
+            })
+            .collect(),
+    };
+    for _ in 0..8 {
+        let encoded = request.encoded_len();
+        if encoded == ENCODED_BYTES {
+            break;
+        }
+        let put = match request
+            .operations
+            .last_mut()
+            .and_then(|operation| operation.operation.as_mut())
+        {
+            Some(BulkOperationValue::Put(put)) => put,
+            _ => panic!("last pathological operation is not a put"),
+        };
+        if encoded < ENCODED_BYTES {
+            put.bytes
+                .resize(put.bytes.len() + (ENCODED_BYTES - encoded), 0x7a);
+        } else {
+            put.bytes
+                .truncate(put.bytes.len() - (encoded - ENCODED_BYTES));
+        }
+    }
+    assert_eq!(request.encoded_len(), ENCODED_BYTES);
+    assert!(request.operations.iter().all(|operation| {
+        matches!(
+            operation.operation.as_ref(),
+            Some(BulkOperationValue::Put(put)) if put.bytes.len() > 64 * 1024
+        )
+    }));
+
+    let started = Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(35),
+        client.bulk_write(authorized(request, &fixture.access_token)),
+    )
+    .await
+    .expect("public pathological bulk exceeded its 30-second server deadline")
+    .unwrap()
+    .into_inner();
+
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(response.outcomes.len(), OPERATIONS);
+    assert!(
+        response.outcomes.iter().all(|outcome| {
+            matches!(outcome.outcome.as_ref(), Some(BulkOutcomeValue::Receipt(_)))
+        })
+    );
+    fixture.stop().await;
+}
+
+#[tokio::test]
 async fn versioned_delete_version_never_resurrects_an_older_payload() {
     let fixture = Fixture::start().await;
     let token = fixture.access_token.as_str();
@@ -1492,26 +1575,74 @@ struct Fixture {
     _directory: TempDir,
     channel: Channel,
     access_token: String,
+    system_token: String,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with(|_| {}).await
+    }
+
+    async fn start_with(configure: impl FnOnce(&mut ServerConfig)) -> Self {
         let directory = tempfile::tempdir().unwrap();
         seed_authorized_bucket(&directory).await;
         let token_manager = JwtManager::new(SIGNING_KEY).unwrap();
         let access_token = token_manager
             .mint(StorageTenantId::parse("acme").unwrap(), "owner-app")
             .unwrap();
+        let system_token = token_manager
+            .mint(StorageTenantId::system(), "bootstrap-app")
+            .unwrap();
         let listen = unused_loopback_address();
-        let server = tokio::spawn(serve(test_server_config(&directory, listen, token_manager)));
-        let channel = connect_when_ready(listen).await;
+        let mut config = test_server_config(&directory, listen, token_manager);
+        configure(&mut config);
+        let mut server = tokio::spawn(serve(config));
+        let channel = tokio::select! {
+            result = &mut server => panic!("Keldra test server exited during startup: {result:?}"),
+            channel = connect_when_ready(listen) => channel,
+        };
         Self {
             _directory: directory,
             channel,
             access_token,
+            system_token,
             server,
         }
+    }
+
+    async fn activate_cluster_capabilities(&self) {
+        let mut administration = AdministrationServiceClient::new(self.channel.clone());
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = administration
+                    .get_cluster_capabilities(authorized(
+                        GetClusterCapabilitiesRequest {},
+                        &self.system_token,
+                    ))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if status.ready_for_target_activation {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("cluster capability advertisement did not become ready");
+        administration
+            .activate_cluster_capabilities(authorized(
+                ActivateClusterCapabilitiesRequest {
+                    protocol_version: status.target_protocol_version,
+                    storage_format: status.target_storage_format,
+                    expected_placement_term: status.active_placement_term,
+                    expected_placement_index: status.active_placement_index,
+                },
+                &self.system_token,
+            ))
+            .await
+            .unwrap();
     }
 
     async fn stop(self) {
@@ -1578,12 +1709,14 @@ fn test_server_config(
         max_atomic_commit_entries: 128,
         max_atomic_commit_bytes: 1024 * 1024,
         atomic_program_timeout: Duration::from_secs(30),
+        bulk_write_timeout: Duration::from_secs(300),
         index_query_timeout: Duration::from_secs(300),
         token_manager,
         rate_limits: RateLimitConfig::default(),
         index_runtime: keldra::IndexRuntimeConfig::default(),
         plugin_gateway: keldra::PluginGatewayConfig::default(),
         max_blob_bytes: 1024 * 1024,
+        max_total_wal_bytes: keldra_store::DEFAULT_MAX_TOTAL_WAL_BYTES,
         erasure_profile: keldra_store::ErasureProfile::default(),
         awaiting_publish_ttl_seconds: keldra_store::DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,
         mutation_receipt_retention_seconds: 60,

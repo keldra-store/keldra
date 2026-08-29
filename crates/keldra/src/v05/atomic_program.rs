@@ -6,6 +6,7 @@ use keldra_api::v1::{
 use tonic::{Request, Response, Status};
 
 use super::*;
+use crate::authentication::PluginObjectScope;
 
 pub(super) async fn invoke(
     service: &ObjectServiceImpl,
@@ -16,12 +17,14 @@ pub(super) async fn invoke(
         .get::<routed_writes::RoutedDestination>()
         .is_some();
     let deadline = tokio::time::Instant::now()
-        .checked_add(effective_atomic_program_timeout(
+        .checked_add(effective_request_timeout(
             request.metadata(),
             service.atomic_program_timeout,
         ))
         .ok_or_else(|| Status::internal("configured atomic program timeout exceeds clock"))?;
     let caller = authenticated_caller(&request)?;
+    let path_access = object_path_access::access_for(&request);
+    let plugin_scope = plugin_object_scope(&request);
     let bearer = OriginalBearer::from_metadata(request.metadata())?;
     let api_request = request.into_inner();
     let durability = durability(api_request.durability)?;
@@ -68,6 +71,11 @@ pub(super) async fn invoke(
         let authorization = service.authoritative_system.clone();
         let governance = service.bucket_governance.clone();
         let dependency_caller = caller.clone();
+        let logical_caller = caller.clone();
+        let logical_access = path_access.clone();
+        let logical_scope = plugin_scope.clone();
+        let canonical_access = path_access.clone();
+        let canonical_scope = plugin_scope.clone();
         run_atomic_program_until(
             deadline,
             service.programs.invoke_distributed(
@@ -78,14 +86,34 @@ pub(super) async fn invoke(
                 durability_name(durability),
                 deadline_remaining(deadline)?,
                 move |dependencies| {
+                    let caller = logical_caller.clone();
+                    let access = logical_access.clone();
+                    let scope = logical_scope.clone();
+                    async move {
+                        for dependency in dependencies {
+                            authorize_program_dependency_capability(
+                                &caller,
+                                &access,
+                                scope.as_ref(),
+                                &dependency,
+                            )?;
+                        }
+                        Ok(())
+                    }
+                },
+                move |dependencies| {
                     let authorization = authorization.clone();
                     let governance = governance.clone();
                     let caller = dependency_caller.clone();
+                    let access = canonical_access.clone();
+                    let scope = canonical_scope.clone();
                     async move {
                         authorize_program_dependencies_authoritatively(
                             &authorization,
                             &governance,
                             &caller,
+                            &access,
+                            scope.as_ref(),
                             dependencies,
                         )
                         .await
@@ -104,7 +132,24 @@ pub(super) async fn invoke(
                 api_request.invocation_id,
                 &api_request.input_json,
                 durability_name(durability),
-                |dependency| authorize_program_dependency(&authorization, &caller, dependency),
+                |dependency| {
+                    authorize_program_dependency_capability(
+                        &caller,
+                        &path_access,
+                        plugin_scope.as_ref(),
+                        dependency,
+                    )
+                    .map(|_| ())
+                },
+                |dependency| {
+                    authorize_program_dependency(
+                        &authorization,
+                        &caller,
+                        &path_access,
+                        plugin_scope.as_ref(),
+                        dependency,
+                    )
+                },
             ),
         )
         .await?
@@ -139,4 +184,96 @@ pub(super) async fn invoke(
         replayed: result.replayed,
         replay_guarantee_expires_at: Some(replay_expiration.into()),
     }))
+}
+
+fn authorize_program_dependency(
+    authorization: &SystemAuthorization,
+    caller: &Caller,
+    path_access: &object_path_access::ObjectPathAccess,
+    plugin_scope: Option<&PluginObjectScope>,
+    dependency: &ExpandedProgramPath,
+) -> Result<(), Status> {
+    let key =
+        authorize_program_dependency_capability(caller, path_access, plugin_scope, dependency)?;
+    for (required, permission, message) in [
+        (
+            dependency.intent.get,
+            ObjectPermission::Get,
+            "atomic program dependency read is not authorized",
+        ),
+        (
+            dependency.intent.put,
+            ObjectPermission::Put,
+            "atomic program dependency put is not authorized",
+        ),
+        (
+            dependency.intent.delete,
+            ObjectPermission::Delete,
+            "atomic program dependency delete is not authorized",
+        ),
+    ] {
+        if required {
+            require_authorized(
+                authorization
+                    .allows_object(caller.subject(), &key, permission)
+                    .map_err(crate::authz_api::authz_status)?,
+                message,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn authorize_program_dependency_capability(
+    caller: &Caller,
+    path_access: &object_path_access::ObjectPathAccess,
+    plugin_scope: Option<&PluginObjectScope>,
+    dependency: &ExpandedProgramPath,
+) -> Result<ObjectKey, Status> {
+    let key = ObjectKey::new(
+        &dependency.path.tenant,
+        &dependency.path.bucket,
+        &dependency.path.path,
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    object_path_access::require_key(path_access, &key)?;
+    require_plugin_key_scope(plugin_scope, &key)?;
+    require_caller_tenant(caller, &key)?;
+    Ok(key)
+}
+
+async fn authorize_program_dependencies_authoritatively(
+    authorization: &AuthoritativeSystemAuthorization,
+    _governance: &BucketGovernance,
+    caller: &Caller,
+    path_access: &object_path_access::ObjectPathAccess,
+    plugin_scope: Option<&PluginObjectScope>,
+    dependencies: Vec<ExpandedProgramPath>,
+) -> Result<(), Status> {
+    let mut requests = Vec::new();
+    for dependency in dependencies {
+        let key = authorize_program_dependency_capability(
+            caller,
+            path_access,
+            plugin_scope,
+            &dependency,
+        )?;
+        for (required, permission) in [
+            (dependency.intent.get, ObjectPermission::Get),
+            (dependency.intent.put, ObjectPermission::Put),
+            (dependency.intent.delete, ObjectPermission::Delete),
+        ] {
+            if required {
+                requests.push((key.clone(), permission));
+            }
+        }
+    }
+    let allowed = authorization.allows_objects(caller, &requests).await?;
+    if allowed.into_iter().all(|allowed| allowed) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "atomic program dependency is not authorized",
+        ))
+    }
 }

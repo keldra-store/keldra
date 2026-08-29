@@ -2678,8 +2678,9 @@ dependencies = [
 
 [[package]]
 name = "keldra"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
+ "jiff",
  "keldra-api",
  "serde_json",
  "tokio",
@@ -2689,7 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-api"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -2700,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-atomic-program"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2711,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-authz"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2719,7 +2720,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-cli"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2735,7 +2736,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-consensus"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "bincode",
  "hyper-util",
@@ -2757,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-index"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "futures-util",
@@ -2768,7 +2769,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-osv-qualification"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2788,7 +2789,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-server"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2811,6 +2812,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.11.0",
  "hyper-util",
+ "jiff",
  "jsonwebtoken",
  "keldra",
  "keldra-api",
@@ -2851,7 +2853,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-store"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2937,15 +2939,16 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "librocksdb-sys"
-version = "0.17.3+10.4.2"
+version = "0.19.0+11.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cef2a00ee60fe526157c9023edab23943fae1ce2ab6f4abb2a807c1746835de9"
+checksum = "4f45e86edad8e88efe97dbf384b4e48e1ff0f111eabf154c7b09d7a1e5fb573c"
 dependencies = [
  "bindgen",
  "bzip2-sys",
  "cc",
  "libc",
  "libz-sys",
+ "rustflags",
 ]
 
 [[package]]
@@ -4246,9 +4249,9 @@ dependencies = [
 
 [[package]]
 name = "rocksdb"
-version = "0.24.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddb7af00d2b17dbd07d82c0063e25411959748ff03e8d4f96134c2ff41fce34f"
+checksum = "d8d90add70d1d420ee487bce4a1449880a8d147451c6051b2ee5f8354553dcbf"
 dependencies = [
  "libc",
  "librocksdb-sys",
@@ -4285,6 +4288,12 @@ checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
 ]
+
+[[package]]
+name = "rustflags"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a39e0e9135d7a7208ee80aa4e3e4b88f0f5ad7be92153ed70686c38a03db2e63"
 
 [[package]]
 name = "rustix"

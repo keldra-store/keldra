@@ -12,11 +12,12 @@ use keldra_api::v1 as api;
 use keldra_authz::{AuthorizationCheck, ObjectRef};
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
-    ApplicationCredentialRequest, ApplicationRoleTarget, AuthzConsistency, AuthzRevision,
-    AuthzScope, CoordinatedAuthzRealmResult, CreateBucketRequest, LogicalApplicationRecord,
-    LogicalCredentialRecord, LogicalRecordId, LogicalRecordValue, ObjectVersioning, PlacementLogId,
-    ProvisionTenantRequest, SetApplicationRoleRequest, SetBucketPublicReadRequest, StorageTenantId,
-    Store, TupleBatchReceipt, TupleBatchRequest,
+    ApplicationCredential, ApplicationCredentialRequest, ApplicationRoleTarget, AuthzConsistency,
+    AuthzRevision, AuthzScope, CoordinatedAuthzRealmResult, CreateBucketRequest,
+    CredentialRepositoryError, LogicalApplicationRecord, LogicalCredentialRecord, LogicalRecordId,
+    LogicalRecordValue, ObjectVersioning, PlacementLogId, ProvisionTenantRequest,
+    SetApplicationRoleRequest, SetBucketPublicReadRequest, StorageTenantId, Store,
+    TupleBatchReceipt, TupleBatchRequest,
 };
 use tonic::Status;
 
@@ -380,6 +381,21 @@ impl DistributedControlPlane {
         .map(|_| ())
     }
 
+    pub(crate) async fn authorize_cluster_capabilities(
+        &self,
+        caller: &Caller,
+    ) -> Result<(), Status> {
+        self.authorize_system(
+            caller.subject(),
+            ObjectRef::opaque("system", keldra_store::SYSTEM_STORAGE_TENANT_ID)
+                .map_err(authz_evaluation_status)?,
+            "manage_system",
+            "cluster capability management is not authorized",
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(crate) async fn exchange_client_credentials(
         &self,
         request: api::ExchangeClientCredentialsRequest,
@@ -499,20 +515,18 @@ impl DistributedControlPlane {
                 }
                 None => system.revision,
             };
-            self.store
-                .prepare_tenant_provisioning(
-                    ProvisionTenantRequest {
-                        storage_tenant: storage_tenant.clone(),
-                        owner_app_id: request.owner_app_id.clone(),
-                        owner_client_id: request.owner_client_id.clone(),
-                        owner_client_secret: request.owner_client_secret.clone(),
-                        principal: caller.subject().clone(),
-                        expected_authorization_revision: expected,
-                        expected_binding_generation: system.binding_generation,
-                    },
-                    tenant_id,
-                )
-                .map_err(credential_status)?
+            let store = self.store.clone();
+            let preparation = ProvisionTenantRequest {
+                storage_tenant: storage_tenant.clone(),
+                owner_app_id: request.owner_app_id.clone(),
+                owner_client_id: request.owner_client_id.clone(),
+                owner_client_secret: request.owner_client_secret.clone(),
+                principal: caller.subject().clone(),
+                expected_authorization_revision: expected,
+                expected_binding_generation: system.binding_generation,
+            };
+            run_credential_task(move || store.prepare_tenant_provisioning(preparation, tenant_id))
+                .await?
         } else {
             self.require_identity_absent(&request.owner_app_id, &request.owner_client_id)
                 .await?;
@@ -521,20 +535,18 @@ impl DistributedControlPlane {
                 .allocate_logical_record_version()
                 .map_err(|error| Status::internal(error.to_string()))?
                 .0;
-            self.store
-                .prepare_tenant_provisioning(
-                    ProvisionTenantRequest {
-                        storage_tenant: storage_tenant.clone(),
-                        owner_app_id: request.owner_app_id.clone(),
-                        owner_client_id: request.owner_client_id.clone(),
-                        owner_client_secret: request.owner_client_secret.clone(),
-                        principal: caller.subject().clone(),
-                        expected_authorization_revision: system.revision,
-                        expected_binding_generation: system.binding_generation,
-                    },
-                    tenant_id,
-                )
-                .map_err(credential_status)?
+            let store = self.store.clone();
+            let preparation = ProvisionTenantRequest {
+                storage_tenant: storage_tenant.clone(),
+                owner_app_id: request.owner_app_id.clone(),
+                owner_client_id: request.owner_client_id.clone(),
+                owner_client_secret: request.owner_client_secret.clone(),
+                principal: caller.subject().clone(),
+                expected_authorization_revision: system.revision,
+                expected_binding_generation: system.binding_generation,
+            };
+            run_credential_task(move || store.prepare_tenant_provisioning(preparation, tenant_id))
+                .await?
         };
 
         install_sigv4_secret(
@@ -719,10 +731,11 @@ impl DistributedControlPlane {
                 &storage_tenant,
                 &request.app_id,
                 &request.client_id,
-            )?
-            .verify_secret(&request.client_secret)
-            .map_err(credential_status)?
-            .ok_or_else(|| Status::already_exists("client identity is already claimed"))?;
+            )?;
+            let credential =
+                verify_credential_record(credential.clone(), request.client_secret.clone())
+                    .await?
+                    .ok_or_else(|| Status::already_exists("client identity is already claimed"))?;
             Some(credential)
         } else {
             None
@@ -732,15 +745,15 @@ impl DistributedControlPlane {
         {
             return Ok(credential_to_api(credential, true));
         }
-        let mut prepared = self
-            .store
-            .prepare_application_creation(ApplicationCredentialRequest {
-                storage_tenant: storage_tenant.clone(),
-                app_id: request.app_id.clone(),
-                client_id: request.client_id.clone(),
-                client_secret: request.client_secret.clone(),
-            })
-            .map_err(credential_status)?;
+        let store = self.store.clone();
+        let preparation = ApplicationCredentialRequest {
+            storage_tenant: storage_tenant.clone(),
+            app_id: request.app_id.clone(),
+            client_id: request.client_id.clone(),
+            client_secret: request.client_secret.clone(),
+        };
+        let mut prepared =
+            run_credential_task(move || store.prepare_application_creation(preparation)).await?;
         install_sigv4_secret(
             &self.tokens,
             &mut prepared.logical_records,
@@ -803,21 +816,20 @@ impl DistributedControlPlane {
             &request.app_id,
             &request.client_id,
         )?;
-        if let Some(credential) = current
-            .verify_secret(&request.client_secret)
-            .map_err(credential_status)?
+        if let Some(credential) =
+            verify_credential_record(current.clone(), request.client_secret.clone()).await?
         {
             return Ok(credential_to_api(credential, true));
         }
-        let mut prepared = self
-            .store
-            .prepare_credential_rotation(ApplicationCredentialRequest {
-                storage_tenant: storage_tenant.clone(),
-                app_id: request.app_id.clone(),
-                client_id: request.client_id.clone(),
-                client_secret: request.client_secret.clone(),
-            })
-            .map_err(credential_status)?;
+        let store = self.store.clone();
+        let preparation = ApplicationCredentialRequest {
+            storage_tenant: storage_tenant.clone(),
+            app_id: request.app_id.clone(),
+            client_id: request.client_id.clone(),
+            client_secret: request.client_secret.clone(),
+        };
+        let mut prepared =
+            run_credential_task(move || store.prepare_credential_rotation(preparation)).await?;
         install_sigv4_secret(
             &self.tokens,
             &mut prepared.logical_records,
@@ -896,21 +908,20 @@ impl DistributedControlPlane {
             &request.app_id,
             &request.client_id,
         )?;
-        if let Some(credential) = current
-            .verify_secret(&request.client_secret)
-            .map_err(credential_status)?
+        if let Some(credential) =
+            verify_credential_record(current.clone(), request.client_secret.clone()).await?
         {
             return Ok(credential_to_api(credential, true));
         }
-        let mut prepared = self
-            .store
-            .prepare_credential_rotation(ApplicationCredentialRequest {
-                storage_tenant: storage_tenant.clone(),
-                app_id: request.app_id.clone(),
-                client_id: request.client_id.clone(),
-                client_secret: request.client_secret.clone(),
-            })
-            .map_err(credential_status)?;
+        let store = self.store.clone();
+        let preparation = ApplicationCredentialRequest {
+            storage_tenant: storage_tenant.clone(),
+            app_id: request.app_id.clone(),
+            client_id: request.client_id.clone(),
+            client_secret: request.client_secret.clone(),
+        };
+        let mut prepared =
+            run_credential_task(move || store.prepare_credential_rotation(preparation)).await?;
         install_sigv4_secret(
             &self.tokens,
             &mut prepared.logical_records,
@@ -1148,9 +1159,8 @@ impl DistributedControlPlane {
             Some(_) => return Err(Status::data_loss("credential record has the wrong type")),
             None => return Err(invalid_credentials()),
         };
-        let verified = credential
-            .verify_secret(&request.client_secret)
-            .map_err(credential_status)?
+        let verified = verify_credential_record(credential, request.client_secret)
+            .await?
             .ok_or_else(invalid_credentials)?;
         let application = self
             .read_record(&LogicalRecordId::Application {
@@ -1256,9 +1266,8 @@ impl DistributedControlPlane {
         let LogicalRecordValue::Credential(record) = value else {
             return Err(Status::data_loss("credential record has the wrong type"));
         };
-        let credential = record
-            .verify_secret(secret)
-            .map_err(credential_status)?
+        let credential = verify_credential_record(record, secret.to_owned())
+            .await?
             .ok_or_else(|| Status::already_exists("credential does not match the request"))?;
         if credential.app_id != app_id || credential.storage_tenant != *storage_tenant {
             return Err(Status::already_exists(
@@ -1306,9 +1315,8 @@ impl DistributedControlPlane {
             Some(secret),
         ) = (&current, &expected, credential_secret)
         {
-            let verified = current
-                .verify_secret(secret)
-                .map_err(credential_status)?
+            let verified = verify_credential_record(current.clone(), secret.to_owned())
+                .await?
                 .ok_or_else(|| Status::already_exists("client identity is already claimed"))?;
             if verified.app_id == expected.app_id()
                 && verified.client_id == expected.client_id()
@@ -1733,6 +1741,22 @@ fn credential_status(error: keldra_store::CredentialRepositoryError) -> Status {
         AlreadyBootstrapped => Status::already_exists("system bootstrap has already completed"),
         Entropy(_) | Storage(_) => Status::internal(error.to_string()),
     }
+}
+
+async fn run_credential_task<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, CredentialRepositoryError> + Send + 'static,
+) -> Result<T, Status> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|_| Status::internal("credential task failed"))?
+        .map_err(credential_status)
+}
+
+async fn verify_credential_record(
+    record: LogicalCredentialRecord,
+    secret: String,
+) -> Result<Option<ApplicationCredential>, Status> {
+    run_credential_task(move || record.verify_secret(&secret)).await
 }
 
 fn invalid_credentials() -> Status {

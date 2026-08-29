@@ -13,8 +13,10 @@ use crate::{
     ReferenceProofMutation, SourceId,
 };
 
-pub const PROGRAM_PATH_STAGE_FORMAT: u16 = 1;
-pub const PROGRAM_PATH_MUTATION_FORMAT: u16 = 2;
+pub const PROGRAM_PATH_STAGE_FORMAT: u16 = 2;
+pub const PROGRAM_PATH_MUTATION_FORMAT: u16 = 3;
+pub const PROGRAM_ALIAS_REGISTRY_STAGE_FORMAT: u16 = 1;
+pub const PROGRAM_ALIAS_REGISTRY_MUTATION_FORMAT: u16 = 1;
 
 /// One immutable, path-scoped slice of the ordinary prepared bundle.
 ///
@@ -24,8 +26,11 @@ pub const PROGRAM_PATH_MUTATION_FORMAT: u16 = 2;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramPathStage {
     pub format: u16,
+    pub begin_cursor: u64,
     pub bundle_hash: PreparedBundleHash,
     pub program_hash: ProgramHash,
+    pub authority: ProgramBundleAuthority,
+    pub participant_manifest_hash: [u8; 32],
     pub tenant_id: u64,
     pub bucket_id: u64,
     pub path: ObjectPath,
@@ -50,8 +55,10 @@ impl ProgramPathStage {
 
     pub fn validate(&self) -> Result<(), ProgramStoreError> {
         if self.format != PROGRAM_PATH_STAGE_FORMAT
+            || self.begin_cursor == 0
             || self.bundle_hash.0 == [0; 32]
             || self.program_hash.0 == [0; 32]
+            || self.participant_manifest_hash == [0; 32]
             || self.tenant_id == 0
             || self.bucket_id == 0
             || self.version.id.0 == 0
@@ -67,6 +74,12 @@ impl ProgramPathStage {
                 "distributed program path stage is malformed".into(),
             ));
         }
+        self.authority
+            .validate(matches!(
+                self.authority,
+                ProgramBundleAuthority::LegacyProgramOnly { .. }
+            ))
+            .map_err(|message| ProgramStoreError::InvalidBundle(message.into()))?;
         ObjectKey::new(&self.path.tenant, &self.path.bucket, &self.path.path)
             .map_err(|error| ProgramStoreError::InvalidBundle(error.to_string()))?;
         match (&self.expected, &self.previous_version) {
@@ -153,6 +166,90 @@ pub struct ReplicaProgramPathApplied {
     pub replayed: bool,
 }
 
+/// Sealed target-coordinator sidecar transition selected by a built-in plan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramAliasRegistryStage {
+    pub format: u16,
+    pub begin_cursor: u64,
+    pub bundle_hash: PreparedBundleHash,
+    pub program_hash: ProgramHash,
+    pub authority: ProgramBundleAuthority,
+    pub participant_manifest_hash: [u8; 32],
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+    pub target: ObjectPath,
+    pub expected: Option<crate::ObjectAliasRegistry>,
+    pub replacement_aliases: Vec<String>,
+}
+
+impl ProgramAliasRegistryStage {
+    pub fn validate(&self) -> Result<(), ProgramStoreError> {
+        if self.format != PROGRAM_ALIAS_REGISTRY_STAGE_FORMAT
+            || self.begin_cursor == 0
+            || self.bundle_hash.0 == [0; 32]
+            || self.participant_manifest_hash == [0; 32]
+            || self.tenant_id == 0
+            || self.bucket_id == 0
+            || self
+                .expected
+                .as_ref()
+                .is_some_and(|value| value.validate(&self.target.path).is_err())
+            || !valid_alias_replacement(&self.target.path, &self.replacement_aliases)
+            || self
+                .expected
+                .as_ref()
+                .is_some_and(|value| value.aliases == self.replacement_aliases)
+        {
+            return Err(ProgramStoreError::InvalidBundle(
+                "program alias-registry stage is malformed".into(),
+            ));
+        }
+        self.authority
+            .validate(false)
+            .map_err(|message| ProgramStoreError::InvalidBundle(message.into()))?;
+        ObjectKey::new(&self.target.tenant, &self.target.bucket, &self.target.path)
+            .map_err(|error| ProgramStoreError::InvalidBundle(error.to_string()))?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramAliasRegistryMutation {
+    pub format: u16,
+    pub commit_cursor: u64,
+    pub stage: ProgramAliasRegistryStage,
+    pub replacement: Option<crate::ObjectAliasRegistry>,
+}
+
+impl ProgramAliasRegistryMutation {
+    pub fn validate(&self) -> Result<(), ProgramStoreError> {
+        self.stage.validate()?;
+        let valid_replacement = match &self.replacement {
+            None => self.stage.replacement_aliases.is_empty(),
+            Some(replacement) => {
+                let expected_revision = self
+                    .stage
+                    .expected
+                    .as_ref()
+                    .map_or(Some(1), |expected| expected.revision.checked_add(1));
+                replacement.validate(&self.stage.target.path).is_ok()
+                    && replacement.aliases == self.stage.replacement_aliases
+                    && replacement.program_commit_cursor == Some(self.commit_cursor)
+                    && Some(replacement.revision) == expected_revision
+            }
+        };
+        if self.format != PROGRAM_ALIAS_REGISTRY_MUTATION_FORMAT
+            || self.commit_cursor == 0
+            || !valid_replacement
+        {
+            return Err(ProgramStoreError::InvalidBundle(
+                "program alias-registry mutation is malformed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl StoredPreparedBundle {
     pub fn decode_distributed(
         bytes: &[u8],
@@ -166,7 +263,38 @@ impl StoredPreparedBundle {
         {
             return Err(ProgramStoreError::PreparedBundleMismatch);
         }
-        let record: Self = serde_json::from_slice(bytes).map_err(program_storage_error)?;
+        let record: Self = match serde_json::from_slice(bytes) {
+            Ok(record) => record,
+            Err(_) => {
+                let legacy: LegacyStoredPreparedBundleV4 =
+                    serde_json::from_slice(bytes).map_err(program_storage_error)?;
+                if legacy.format != LEGACY_PREPARED_BUNDLE_FORMAT {
+                    return Err(ProgramStoreError::InvalidBundle(
+                        "unsupported prepared record format".into(),
+                    ));
+                }
+                Self {
+                    format: legacy.format,
+                    source_bundle_hash: legacy.source_bundle_hash,
+                    program_hash: legacy.program_hash,
+                    authority: ProgramBundleAuthority::LegacyProgramOnly {
+                        program_path_hash: legacy.receipt.program_path_hash,
+                        program_hash: legacy.program_hash.0,
+                    },
+                    participant_manifest: ProgramParticipantManifest {
+                        format: PROGRAM_PARTICIPANT_MANIFEST_FORMAT,
+                        objects: Vec::new(),
+                        governance: Vec::new(),
+                    },
+                    builtin_plan: None,
+                    alias_bindings: Vec::new(),
+                    alias_registry_transitions: Vec::new(),
+                    preconditions: legacy.preconditions,
+                    writes: legacy.writes,
+                    receipt: legacy.receipt,
+                }
+            }
+        };
         validate_prepared_record(&record)?;
         if record.program_hash != program_hash {
             return Err(ProgramStoreError::PreparedBundleMismatch);
@@ -182,8 +310,176 @@ impl StoredPreparedBundle {
         &self.writes
     }
 
+    pub fn builtin_plan(&self) -> Option<&BuiltInObjectTransactionPlan> {
+        self.builtin_plan.as_ref()
+    }
+
+    pub fn alias_bindings(&self) -> &[ProgramAliasBinding] {
+        &self.alias_bindings
+    }
+
+    pub(super) fn alias_registry_writes(
+        &self,
+    ) -> Result<
+        Vec<(
+            &ProgramObjectParticipant,
+            Option<&crate::ObjectAliasRegistry>,
+            &[String],
+        )>,
+        ProgramStoreError,
+    > {
+        if let Some(plan) = self.builtin_plan() {
+            return plan
+                .alias_registries
+                .iter()
+                .filter_map(|access| match access {
+                    BuiltInAliasRegistryAccess::Read { .. } => None,
+                    BuiltInAliasRegistryAccess::Write {
+                        target_participant_index,
+                        expected,
+                        replacement_aliases,
+                    } => Some(
+                        plan.participant_manifest
+                            .objects
+                            .get(*target_participant_index as usize)
+                            .map(|target| {
+                                (target, expected.as_ref(), replacement_aliases.as_slice())
+                            })
+                            .ok_or_else(|| {
+                                ProgramStoreError::InvalidBundle(
+                                    "alias-registry target participant is absent".into(),
+                                )
+                            }),
+                    ),
+                })
+                .collect();
+        }
+        self.alias_registry_transitions
+            .iter()
+            .map(|transition| {
+                let target = self
+                    .participant_manifest
+                    .objects
+                    .iter()
+                    .find(|participant| participant.path == transition.target)
+                    .ok_or_else(|| {
+                        ProgramStoreError::InvalidBundle(
+                            "stored alias transition target participant is absent".into(),
+                        )
+                    })?;
+                Ok((
+                    target,
+                    Some(&transition.expected),
+                    transition.replacement_aliases.as_slice(),
+                ))
+            })
+            .collect()
+    }
+
+    pub fn asserted_versions(&self) -> BTreeMap<ObjectPath, Version> {
+        let Some(plan) = self.builtin_plan.as_ref() else {
+            return BTreeMap::new();
+        };
+        plan.assertions
+            .iter()
+            .filter_map(|assertion| match assertion {
+                BuiltInTransactionAssertion::ClonePaths { .. } => None,
+                BuiltInTransactionAssertion::PutImmutableMatches {
+                    target_participant_index,
+                    ..
+                } => plan
+                    .participant_manifest
+                    .objects
+                    .get(*target_participant_index as usize)
+                    .and_then(|participant| {
+                        participant
+                            .condition
+                            .head_version()
+                            .cloned()
+                            .map(|version| (participant.path.clone(), version))
+                    }),
+            })
+            .collect()
+    }
+
+    pub fn alias_targets(&self) -> BTreeMap<ObjectPath, ObjectPath> {
+        let mut targets = self
+            .alias_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.requested_path.clone(),
+                    binding.canonical_path.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let Some(plan) = self.builtin_plan.as_ref() else {
+            return targets;
+        };
+        targets.extend(
+            plan.alias_observations
+                .iter()
+                .filter_map(|observation| {
+                    plan.participant_manifest
+                        .objects
+                        .get(observation.canonical_participant_index as usize)
+                        .map(|canonical| {
+                            (observation.requested_path.clone(), canonical.path.clone())
+                        })
+                })
+                .collect::<BTreeMap<_, _>>(),
+        );
+        for assertion in &plan.assertions {
+            if let BuiltInTransactionAssertion::ClonePaths {
+                source_requested_path,
+                destination_requested_path,
+                source_participant_index,
+                destination_participant_index,
+            } = assertion
+            {
+                for (requested, participant_index) in [
+                    (source_requested_path, source_participant_index),
+                    (destination_requested_path, destination_participant_index),
+                ] {
+                    if let Some(canonical) = plan
+                        .participant_manifest
+                        .objects
+                        .get(*participant_index as usize)
+                    {
+                        targets.insert(requested.clone(), canonical.path.clone());
+                    }
+                }
+            }
+        }
+        targets
+    }
+
     pub fn source_bundle_hash(&self) -> PreparedBundleHash {
         self.source_bundle_hash
+    }
+
+    pub fn authority(&self) -> ProgramBundleAuthority {
+        self.authority
+    }
+
+    pub fn participant_manifest(&self) -> &ProgramParticipantManifest {
+        &self.participant_manifest
+    }
+
+    pub fn participant_manifest_hash(
+        &self,
+        bundle_hash: PreparedBundleHash,
+    ) -> Result<[u8; 32], ProgramStoreError> {
+        if matches!(
+            self.authority,
+            ProgramBundleAuthority::LegacyProgramOnly { .. }
+        ) {
+            Ok(bundle_hash.0)
+        } else {
+            self.participant_manifest
+                .hash()
+                .map_err(ProgramStoreError::InvalidBundle)
+        }
     }
 }
 
@@ -224,6 +520,58 @@ impl PreparedProgramBundle {
 }
 
 impl Store {
+    pub async fn coordinate_program_alias_registry_finalization(
+        &self,
+        stage: ProgramAliasRegistryStage,
+        commit_cursor: u64,
+        context: ObjectMutationContext,
+    ) -> Result<ProgramAliasRegistryMutation, ProgramStoreError> {
+        stage.validate()?;
+        let target = stage_key_from_path(&stage.target)?;
+        let replacement = self
+            .apply_alias_registry_transition(
+                stage.tenant_id,
+                stage.bucket_id,
+                &target,
+                stage.expected.as_ref(),
+                &stage.replacement_aliases,
+                stage.begin_cursor,
+                commit_cursor,
+                context,
+            )
+            .await
+            .map_err(program_mutation_error)?;
+        let mutation = ProgramAliasRegistryMutation {
+            format: PROGRAM_ALIAS_REGISTRY_MUTATION_FORMAT,
+            commit_cursor,
+            stage,
+            replacement,
+        };
+        mutation.validate()?;
+        Ok(mutation)
+    }
+
+    pub async fn apply_program_alias_registry_finalization_replica(
+        &self,
+        mutation: &ProgramAliasRegistryMutation,
+        context: ObjectMutationContext,
+    ) -> Result<bool, ProgramStoreError> {
+        mutation.validate()?;
+        let target = stage_key_from_path(&mutation.stage.target)?;
+        self.apply_alias_registry_replica_transition(
+            mutation.stage.tenant_id,
+            mutation.stage.bucket_id,
+            &target,
+            mutation.stage.expected.as_ref(),
+            mutation.replacement.as_ref(),
+            mutation.stage.begin_cursor,
+            mutation.commit_cursor,
+            context,
+        )
+        .await
+        .map_err(program_mutation_error)
+    }
+
     pub async fn persist_program_path_stage(
         &self,
         stage: &ProgramPathStage,
@@ -255,6 +603,20 @@ impl Store {
             self.validate_program_path_policy(&stage)?;
             let identity = stage_identity(&stage);
             let key = stage_key(&stage)?;
+            if !matches!(
+                stage.authority,
+                ProgramBundleAuthority::LegacyProgramOnly { .. }
+            ) {
+                self.require_committed_program_reservation_locked(
+                    identity,
+                    key.path(),
+                    stage.begin_cursor,
+                    commit_cursor,
+                    context.serving_fence_term,
+                    context.active_placement_log_id,
+                )
+                .map_err(program_mutation_error)?;
+            }
             let current = self
                 .head_by_storage_key(&identity.head_key(key.path()))
                 .map_err(program_mutation_error)?;
@@ -321,6 +683,20 @@ impl Store {
         self.persist_program_path_stage(&mutation.stage).await?;
         let _commit_guard = self.lock_commit("distributed_program").await;
         self.validate_program_path_policy(&mutation.stage)?;
+        if !matches!(
+            mutation.stage.authority,
+            ProgramBundleAuthority::LegacyProgramOnly { .. }
+        ) {
+            self.require_committed_program_reservation_locked(
+                stage_identity(&mutation.stage),
+                &mutation.stage.path.path,
+                mutation.stage.begin_cursor,
+                mutation.commit_cursor,
+                mutation.stamp.serving_fence_term,
+                mutation.stamp.active_placement_log_id,
+            )
+            .map_err(program_mutation_error)?;
+        }
         self.apply_program_path_mutation_locked(mutation, false)
     }
 
@@ -544,8 +920,10 @@ impl Store {
             .bucket_policy_by_key(&stage_identity(stage).encode())
             .map_err(program_mutation_error)?
             .unwrap_or_default();
-        if !policy.is_program_only(&stage.path.path) {
-            return Err(ProgramStoreError::ProgramPolicy {
+        if policy.is_immutable(&stage.path.path)
+            && (stage.version.deleted || !matches!(stage.expected, ObservedHead::NeverExisted))
+        {
+            return Err(ProgramStoreError::Immutable {
                 path: stage.path.clone(),
             });
         }
@@ -645,13 +1023,17 @@ fn stage_accounting_transition(stage: &ProgramPathStage) -> AccountingHeadTransi
 pub fn path_stage_from_prepared(
     prepared: &PreparedProgramBundle,
     write: &PreparedVersionWrite,
+    begin_cursor: u64,
     tenant_id: u64,
     bucket_id: u64,
 ) -> Result<ProgramPathStage, ProgramStoreError> {
     let stage = ProgramPathStage {
         format: PROGRAM_PATH_STAGE_FORMAT,
+        begin_cursor,
         bundle_hash: prepared.hash,
         program_hash: prepared.program_hash,
+        authority: prepared.authority,
+        participant_manifest_hash: prepared.participant_manifest_hash,
         tenant_id,
         bucket_id,
         path: write.path.clone(),
@@ -661,4 +1043,49 @@ pub fn path_stage_from_prepared(
     };
     stage.validate()?;
     Ok(stage)
+}
+
+pub fn alias_registry_stages_from_prepared(
+    prepared: &PreparedProgramBundle,
+    record: &PreparedProgramRecord,
+    begin_cursor: u64,
+) -> Result<Vec<ProgramAliasRegistryStage>, ProgramStoreError> {
+    record
+        .alias_registry_writes()?
+        .into_iter()
+        .map(|(target, expected, replacement_aliases)| {
+            let stage = ProgramAliasRegistryStage {
+                format: PROGRAM_ALIAS_REGISTRY_STAGE_FORMAT,
+                begin_cursor,
+                bundle_hash: prepared.hash,
+                program_hash: prepared.program_hash,
+                authority: prepared.authority,
+                participant_manifest_hash: prepared.participant_manifest_hash,
+                tenant_id: target.tenant_id,
+                bucket_id: target.bucket_id,
+                target: target.path.clone(),
+                expected: expected.cloned(),
+                replacement_aliases: replacement_aliases.to_vec(),
+            };
+            stage.validate()?;
+            Ok(stage)
+        })
+        .collect()
+}
+
+fn valid_alias_replacement(canonical_path: &str, aliases: &[String]) -> bool {
+    aliases.is_empty()
+        || crate::ObjectAliasRegistry {
+            format: crate::OBJECT_ALIAS_REGISTRY_FORMAT,
+            revision: 1,
+            aliases: aliases.to_vec(),
+            program_commit_cursor: Some(1),
+        }
+        .validate(canonical_path)
+        .is_ok()
+}
+
+fn stage_key_from_path(path: &ObjectPath) -> Result<ObjectKey, ProgramStoreError> {
+    ObjectKey::new(&path.tenant, &path.bucket, &path.path)
+        .map_err(|error| ProgramStoreError::InvalidBundle(error.to_string()))
 }

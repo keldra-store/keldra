@@ -1014,7 +1014,13 @@ async fn execute_mutation(
             .saturating_mul(config.mutation_batch_size as u64)
             .saturating_add(offset as u64);
         let id = ordinal % config.mutable_records;
-        let payload = data::payload(config.seed, id, "mutable", job.sequence + 1);
+        let payload = data::payload_at_least(
+            config.seed,
+            id,
+            "mutable",
+            job.sequence + 1,
+            config.mutation_record_bytes,
+        );
         bytes = bytes.saturating_add(payload.len() as u64);
         operations.push(put(
             config,

@@ -2,7 +2,7 @@ use super::*;
 use keldra_api::v1::{
     PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation,
 };
-use keldra_store::{Head, ObjectPathSnapshot};
+use keldra_store::{Head, MAX_LIST_OBJECTS, ObjectPathSnapshot};
 use tokio_stream::StreamExt;
 
 fn address(path: &str) -> Option<ObjectAddress> {
@@ -25,6 +25,7 @@ fn never_existed_and_deleted_remain_distinct() {
         content_type: None,
         deleted: true,
         committed_at_unix_millis: 0,
+        protected_link_descriptor: false,
     };
     assert!(matches!(
         api_head(&deleted).unwrap().state,
@@ -98,6 +99,7 @@ fn present_head_contains_public_hash_and_length_without_a_blob_reference() {
         content_type: Some("application/octet-stream".into()),
         deleted: false,
         committed_at_unix_millis: 0,
+        protected_link_descriptor: false,
     };
     let Some(ObjectState::Present(head)) = api_head(&present).unwrap().state else {
         panic!("present version must produce a present head");
@@ -121,6 +123,7 @@ fn retained_version_metadata_and_delete_outcomes_preserve_public_semantics() {
         content_type: Some("application/octet-stream".into()),
         deleted: false,
         committed_at_unix_millis: 0,
+        protected_link_descriptor: false,
     };
     assert!(matches!(
         api_object_version(&present).unwrap().state,
@@ -255,6 +258,16 @@ fn content_type_is_bounded_by_utf8_bytes_before_a_put_token_can_be_issued() {
     )
     .unwrap_err();
     assert_eq!(bulk_rejected.code(), tonic::Code::InvalidArgument);
+
+    let rejected = put_metadata(PutHeader {
+        address: address("object"),
+        content_type: keldra_store::OBJECT_LINK_CONTENT_TYPE.into(),
+        command_id: "command".into(),
+        operation: Some(ApiPutOperation::Put(PutOperation {})),
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
 }
 
 #[test]
@@ -285,29 +298,29 @@ fn durability_is_a_closed_typed_choice() {
 }
 
 #[test]
-fn atomic_program_timeout_uses_the_shorter_client_or_server_budget() {
+fn request_timeout_uses_the_shorter_client_or_server_budget() {
     let server_maximum = Duration::from_secs(30);
     let mut metadata = MetadataMap::new();
     assert_eq!(
-        effective_atomic_program_timeout(&metadata, server_maximum),
+        effective_request_timeout(&metadata, server_maximum),
         server_maximum
     );
 
     metadata.insert("grpc-timeout", "250m".parse().unwrap());
     assert_eq!(
-        effective_atomic_program_timeout(&metadata, server_maximum),
+        effective_request_timeout(&metadata, server_maximum),
         Duration::from_millis(250)
     );
 
     metadata.insert("grpc-timeout", "2M".parse().unwrap());
     assert_eq!(
-        effective_atomic_program_timeout(&metadata, server_maximum),
+        effective_request_timeout(&metadata, server_maximum),
         server_maximum
     );
 
     metadata.insert("grpc-timeout", "invalid".parse().unwrap());
     assert_eq!(
-        effective_atomic_program_timeout(&metadata, server_maximum),
+        effective_request_timeout(&metadata, server_maximum),
         server_maximum
     );
 }
@@ -560,6 +573,7 @@ fn canonical_token_header_preserves_caller_selected_operation() {
         operation: TokenPutOperation::PutIfVersion {
             expected_version: 31,
         },
+        link: None,
     };
     let metadata = header.to_metadata().unwrap();
     assert_eq!(metadata.mode, PutMode::PutIfVersion(VersionId(31)));
@@ -576,6 +590,7 @@ fn upload_and_ready_tokens_have_disjoint_strict_phases() {
         command_id: "command".into(),
         durability: TokenDurability::Local,
         operation: TokenPutOperation::Put,
+        link: None,
     };
     let upload = CanonicalPutCapability {
         format_version: PUT_TOKEN_FORMAT_VERSION,
@@ -646,6 +661,7 @@ fn distributed_batch_preflight_selects_current_and_exact_descriptors() {
         content_type: None,
         deleted: false,
         committed_at_unix_millis: 4,
+        protected_link_descriptor: false,
     };
     let deleted = Version {
         id: VersionId(5),
@@ -653,6 +669,7 @@ fn distributed_batch_preflight_selects_current_and_exact_descriptors() {
         content_type: None,
         deleted: true,
         committed_at_unix_millis: 5,
+        protected_link_descriptor: false,
     };
     let snapshot = ObjectPathSnapshot {
         tenant_id: 11,
@@ -667,6 +684,8 @@ fn distributed_batch_preflight_selects_current_and_exact_descriptors() {
         journal_pending_versions: Vec::new(),
         journal_released_versions: Vec::new(),
         definition_locator: None,
+        alias_registry: None,
+        alias_registry_transition: None,
     };
 
     assert_eq!(
@@ -694,6 +713,7 @@ fn distributed_read_preflight_rejects_another_exact_path() {
         content_type: None,
         deleted: true,
         committed_at_unix_millis: 4,
+        protected_link_descriptor: false,
     };
     let snapshot = ObjectPathSnapshot {
         tenant_id: 11,
@@ -708,6 +728,8 @@ fn distributed_read_preflight_rejects_another_exact_path() {
         journal_pending_versions: Vec::new(),
         journal_released_versions: Vec::new(),
         definition_locator: None,
+        alias_registry: None,
+        alias_registry_transition: None,
     };
 
     let error =

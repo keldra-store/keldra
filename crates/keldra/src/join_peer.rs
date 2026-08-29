@@ -14,16 +14,19 @@ use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use keldra_consensus::{
-    ApplyResult, AuthenticatedPeer, CLUSTER_CONTROL_COMMAND_VERSION, ClusterId, CommittedPeerPins,
-    DecisionRaft, DecisionRaftError, MAX_PEER_ADDRESS_BYTES, MembershipTransition,
-    MembershipTransitionKind, NodeDescriptor, NodeId, NodeState, PeerAddress, PeerRpcKind,
-    PeerSpkiSha256, PeerTlsConnector, PeerTlsError, authorize_peer_rpc,
+    ApplyResult, AuthenticatedPeer, CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId,
+    CommittedPeerPins, DecisionRaft, DecisionRaftError, MAX_PEER_ADDRESS_BYTES,
+    MembershipTransition, MembershipTransitionKind, NodeDescriptor, NodeId, NodeState, PeerAddress,
+    PeerRpcKind, PeerSpkiSha256, PeerTlsConnector, PeerTlsError, authorize_peer_rpc,
 };
 use tonic::codegen::Service;
 use tonic::codegen::http::Uri;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
+use crate::cluster_capabilities::{
+    PEER_PROTOCOL_CAPABILITY, STORAGE_FORMAT_CAPABILITY, range_contains,
+};
 use crate::join_bundle::hash_capability;
 use crate::node_identity::{PendingJoinIdentity, PendingJoinSeed};
 
@@ -34,8 +37,16 @@ pub(crate) mod wire {
     tonic::include_proto!("keldra.join_peer.v1");
 }
 
-const JOIN_PEER_SCHEMA_VERSION: u32 = 1;
+const JOIN_PEER_SCHEMA_VERSION: u32 = 2;
 const MAX_JOIN_PEER_MESSAGE_BYTES: usize = 4 * 1024;
+
+#[derive(Clone, Copy)]
+struct JoiningCapabilityAttestation {
+    peer: AuthenticatedPeer,
+    join_capability: [u8; 32],
+    supported_protocol: CapabilityRange,
+    supported_storage: CapabilityRange,
+}
 
 /// Temporary trust copied from the operator bundle. It is consulted only
 /// while the local Raft state has not yet installed committed descriptors.
@@ -248,7 +259,7 @@ impl JoinPeerService {
     fn authorize(
         &self,
         request: &mut Request<wire::JoinRequest>,
-    ) -> Result<(AuthenticatedPeer, [u8; 32]), Status> {
+    ) -> Result<JoiningCapabilityAttestation, Status> {
         let presented_pin = request
             .extensions()
             .get::<PeerSpkiSha256>()
@@ -275,20 +286,32 @@ impl JoinPeerService {
             .as_slice()
             .try_into()
             .map_err(|_| Status::invalid_argument("join capability must contain 32 bytes"))?;
+        let supported_protocol = joining_capability_range(
+            envelope.supported_protocol_min,
+            envelope.supported_protocol_max,
+        )?;
+        let supported_storage = joining_capability_range(
+            envelope.supported_storage_min,
+            envelope.supported_storage_max,
+        )?;
         request.extensions_mut().insert(peer);
-        Ok((peer, capability))
+        Ok(JoiningCapabilityAttestation {
+            peer,
+            join_capability: capability,
+            supported_protocol,
+            supported_storage,
+        })
     }
 
     fn validate_admission(
         &self,
-        peer: AuthenticatedPeer,
-        capability: [u8; 32],
+        attestation: JoiningCapabilityAttestation,
     ) -> Result<(NodeDescriptor, Option<MembershipTransition>), Status> {
         let state = self
             .decisions
             .state()
             .map_err(|error| Status::unavailable(error.to_string()))?;
-        if state.cluster_id() != Some(peer.cluster_id) {
+        if state.cluster_id() != Some(attestation.peer.cluster_id) {
             return Err(Status::permission_denied(
                 "joining peer belongs to another cluster",
             ));
@@ -296,11 +319,36 @@ impl JoinPeerService {
         let descriptor = state
             .cluster_control()
             .nodes()
-            .get(&peer.node_id)
+            .get(&attestation.peer.node_id)
             .cloned()
             .ok_or_else(|| Status::permission_denied("joining node is not admitted"))?;
         let transition = state.cluster_control().transition().cloned();
-        validate_descriptor_admission(&descriptor, transition.as_ref(), peer, capability)?;
+        validate_descriptor_admission(
+            &descriptor,
+            transition.as_ref(),
+            attestation.peer,
+            attestation.join_capability,
+            state.cluster_control().active_protocol_version(),
+            state.cluster_control().active_storage_format(),
+        )?;
+        if !range_contains(
+            attestation.supported_protocol,
+            state.cluster_control().active_protocol_version(),
+        ) || !range_contains(
+            attestation.supported_storage,
+            state.cluster_control().active_storage_format(),
+        ) {
+            return Err(Status::failed_precondition(
+                "joining binary does not support the cluster's selected peer protocol or storage format",
+            ));
+        }
+        if descriptor.supported_protocol != attestation.supported_protocol
+            || descriptor.supported_storage_format != attestation.supported_storage
+        {
+            return Err(Status::failed_precondition(
+                "joining binary capability attestation differs from its committed descriptor",
+            ));
+        }
         Ok((descriptor, transition))
     }
 
@@ -331,12 +379,34 @@ impl JoinPeerService {
     }
 }
 
+fn joining_capability_range(min: u32, max: u32) -> Result<CapabilityRange, Status> {
+    let min = u16::try_from(min)
+        .map_err(|_| Status::invalid_argument("joining capability minimum exceeds u16"))?;
+    let max = u16::try_from(max)
+        .map_err(|_| Status::invalid_argument("joining capability maximum exceeds u16"))?;
+    if min == 0 || min > max {
+        return Err(Status::invalid_argument(
+            "joining capability range is invalid",
+        ));
+    }
+    Ok(CapabilityRange { min, max })
+}
+
 fn validate_descriptor_admission(
     descriptor: &NodeDescriptor,
     transition: Option<&MembershipTransition>,
     peer: AuthenticatedPeer,
     capability: [u8; 32],
+    active_protocol_version: u16,
+    active_storage_format: u16,
 ) -> Result<(), Status> {
+    if !range_contains(descriptor.supported_protocol, active_protocol_version)
+        || !range_contains(descriptor.supported_storage_format, active_storage_format)
+    {
+        return Err(Status::failed_precondition(
+            "joining descriptor does not support the cluster's selected peer protocol and storage format",
+        ));
+    }
     if descriptor.node_id != peer.node_id
         || (descriptor.current_peer_spki_sha256 != peer.spki_sha256
             && descriptor.overlap_peer_spki_sha256 != Some(peer.spki_sha256))
@@ -367,8 +437,8 @@ impl wire::join_peer_server::JoinPeer for JoinPeerService {
         &self,
         mut request: Request<wire::JoinRequest>,
     ) -> Result<Response<wire::JoinResponse>, Status> {
-        let (peer, capability) = self.authorize(&mut request)?;
-        let (descriptor, transition) = self.validate_admission(peer, capability)?;
+        let attestation = self.authorize(&mut request)?;
+        let (descriptor, transition) = self.validate_admission(attestation)?;
         if descriptor.state == NodeState::Active {
             if let Some(transition) = transition.as_ref()
                 && transition.kind == MembershipTransitionKind::Add
@@ -407,8 +477,8 @@ impl wire::join_peer_server::JoinPeer for JoinPeerService {
         &self,
         mut request: Request<wire::JoinRequest>,
     ) -> Result<Response<wire::JoinResponse>, Status> {
-        let (peer, capability) = self.authorize(&mut request)?;
-        let (descriptor, transition) = self.validate_admission(peer, capability)?;
+        let attestation = self.authorize(&mut request)?;
+        let (descriptor, transition) = self.validate_admission(attestation)?;
         if descriptor.state == NodeState::Active && transition.is_none() {
             return Ok(Response::new(response(wire::JoinState::Active, 0, None)));
         }
@@ -624,6 +694,10 @@ impl JoinPeerTransport {
             cluster_id: self.cluster_id.into_bytes().to_vec(),
             source_node_id: self.source_node_id.0,
             join_capability: self.pending.capability().to_vec(),
+            supported_protocol_min: u32::from(PEER_PROTOCOL_CAPABILITY.min),
+            supported_protocol_max: u32::from(PEER_PROTOCOL_CAPABILITY.max),
+            supported_storage_min: u32::from(STORAGE_FORMAT_CAPABILITY.min),
+            supported_storage_max: u32::from(STORAGE_FORMAT_CAPABILITY.max),
         }
     }
 
@@ -801,8 +875,6 @@ fn map_consensus_status(error: DecisionRaftError) -> Status {
 
 #[cfg(test)]
 mod tests {
-    use keldra_consensus::CapabilityRange;
-
     use super::*;
 
     fn seed() -> PendingJoinSeed {
@@ -823,8 +895,8 @@ mod tests {
             current_peer_spki_sha256: PeerSpkiSha256([8; 32]),
             overlap_peer_spki_sha256: None,
             join_capability_hash: Some(hash_capability(capability)),
-            supported_protocol: CapabilityRange { min: 1, max: 1 },
-            supported_storage_format: CapabilityRange { min: 1, max: 1 },
+            supported_protocol: PEER_PROTOCOL_CAPABILITY,
+            supported_storage_format: STORAGE_FORMAT_CAPABILITY,
         }
     }
 
@@ -844,10 +916,11 @@ mod tests {
             spki_sha256: PeerSpkiSha256([8; 32]),
         };
         assert!(
-            validate_descriptor_admission(&descriptor, Some(&transition), peer, capability).is_ok()
+            validate_descriptor_admission(&descriptor, Some(&transition), peer, capability, 1, 1)
+                .is_ok()
         );
         assert_eq!(
-            validate_descriptor_admission(&descriptor, Some(&transition), peer, [4; 32])
+            validate_descriptor_admission(&descriptor, Some(&transition), peer, [4; 32], 1, 1)
                 .unwrap_err()
                 .code(),
             tonic::Code::PermissionDenied
@@ -857,9 +930,16 @@ mod tests {
             ..peer
         };
         assert_eq!(
-            validate_descriptor_admission(&descriptor, Some(&transition), wrong_pin, capability)
-                .unwrap_err()
-                .code(),
+            validate_descriptor_admission(
+                &descriptor,
+                Some(&transition),
+                wrong_pin,
+                capability,
+                1,
+                1,
+            )
+            .unwrap_err()
+            .code(),
             tonic::Code::PermissionDenied
         );
         let wrong_transition = MembershipTransition {
@@ -867,9 +947,16 @@ mod tests {
             ..transition
         };
         assert_eq!(
-            validate_descriptor_admission(&descriptor, Some(&wrong_transition), peer, capability)
-                .unwrap_err()
-                .code(),
+            validate_descriptor_admission(
+                &descriptor,
+                Some(&wrong_transition),
+                peer,
+                capability,
+                1,
+                1,
+            )
+            .unwrap_err()
+            .code(),
             tonic::Code::FailedPrecondition
         );
     }

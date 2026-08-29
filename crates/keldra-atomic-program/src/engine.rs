@@ -109,7 +109,22 @@ where
         context: &InvocationContext,
         invocation: &ProgramInvocation,
     ) -> Result<ExecutionLease, EngineError> {
-        let resolved = self.resolve(context, invocation)?;
+        self.prepare_canonicalized(context, invocation, &BTreeMap::new())
+            .await
+    }
+
+    /// Evaluate logical bindings against caller-proven canonical object paths.
+    /// The map is exact: every entry must name one resolved logical path. After
+    /// replacement the ordinary duplicate-path invariant is re-applied, so two
+    /// aliases cannot smuggle the same physical object into separate slots.
+    pub async fn prepare_canonicalized(
+        &self,
+        context: &InvocationContext,
+        invocation: &ProgramInvocation,
+        canonical_paths: &BTreeMap<ObjectPath, ObjectPath>,
+    ) -> Result<ExecutionLease, EngineError> {
+        let mut resolved = self.resolve(context, invocation)?;
+        canonicalize_resolved_paths(&mut resolved, canonical_paths)?;
         let locks = self.locks.acquire(&resolved.all_paths).await;
         let snapshot = self
             .reader
@@ -342,6 +357,35 @@ where
             outputs,
         }))
     }
+}
+
+fn canonicalize_resolved_paths(
+    resolved: &mut ResolvedInvocation,
+    canonical_paths: &BTreeMap<ObjectPath, ObjectPath>,
+) -> Result<(), EngineError> {
+    if canonical_paths
+        .keys()
+        .any(|logical| !resolved.document_paths.contains(logical))
+    {
+        return Err(invalid_invocation(
+            "canonical path map names an unresolved logical object",
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    for document in &mut resolved.documents {
+        if let Some(canonical) = canonical_paths.get(&document.path) {
+            document.path = canonical.clone();
+        }
+        if !unique.insert(document.path.clone()) {
+            return Err(invalid_invocation(format!(
+                "object path {:?} is bound more than once after canonical resolution",
+                document.path
+            )));
+        }
+    }
+    resolved.document_paths = unique.iter().cloned().collect();
+    resolved.all_paths = resolved.document_paths.clone();
+    Ok(())
 }
 
 impl ProgramDefinition {

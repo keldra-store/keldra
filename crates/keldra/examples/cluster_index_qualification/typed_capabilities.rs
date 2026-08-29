@@ -54,6 +54,35 @@ pub(super) fn signed_integer_multi_field(
     field
 }
 
+pub(super) fn date_field(
+    name: &str,
+    json_pointer: &str,
+    capabilities: &[IndexFieldCapability],
+) -> IndexField {
+    IndexField {
+        name: name.into(),
+        json_pointer: json_pointer.into(),
+        cardinality: IndexFieldCardinality::Single as i32,
+        capabilities: capabilities.iter().map(|value| *value as i32).collect(),
+        field_type: Some(IndexFieldType::Date(DateIndexField {
+            strftime_pattern: String::new(),
+        })),
+    }
+}
+
+pub(super) fn custom_date_field(
+    name: &str,
+    json_pointer: &str,
+    strftime_pattern: &str,
+    capabilities: &[IndexFieldCapability],
+) -> IndexField {
+    let mut field = date_field(name, json_pointer, capabilities);
+    field.field_type = Some(IndexFieldType::Date(DateIndexField {
+        strftime_pattern: strftime_pattern.into(),
+    }));
+    field
+}
+
 pub(super) fn unsigned_integer_field(
     name: &str,
     json_pointer: &str,
@@ -113,7 +142,7 @@ pub(super) fn text_field(name: &str, json_pointer: &str) -> IndexField {
 pub(super) fn typed_json_order() -> Vec<IndexOrder> {
     vec![
         IndexOrder {
-            field: "modified_at".into(),
+            field: "published_at".into(),
             direction: IndexOrderDirection::Descending as i32,
         },
         IndexOrder {
@@ -181,6 +210,50 @@ pub(super) async fn qualify(
                 "modified_at",
                 IndexPredicateOperator::GreaterThanOrEqual,
                 &["200"],
+            )]),
+            &[
+                "docs/inactive.json",
+                "docs/active-c.json",
+                "docs/active-b.json",
+            ],
+        ),
+        (
+            "date exact point",
+            predicates([predicate(
+                "published_at",
+                IndexPredicateOperator::Equal,
+                &["\"2024-01-01T00:00:00Z\""],
+            )]),
+            &["docs/active-a.json"],
+        ),
+        (
+            "date range point",
+            predicates([predicate(
+                "published_at",
+                IndexPredicateOperator::GreaterThanOrEqual,
+                &["\"2024-02-01\""],
+            )]),
+            &[
+                "docs/inactive.json",
+                "docs/active-c.json",
+                "docs/active-b.json",
+            ],
+        ),
+        (
+            "custom date exact point",
+            predicates([predicate(
+                "reviewed_at",
+                IndexPredicateOperator::Equal,
+                &["\"15/01/2024 09:30\""],
+            )]),
+            &["docs/active-a.json"],
+        ),
+        (
+            "custom date range point",
+            predicates([predicate(
+                "reviewed_at",
+                IndexPredicateOperator::GreaterThanOrEqual,
+                &["\"15/02/2024 09:30\""],
             )]),
             &[
                 "docs/inactive.json",
@@ -286,6 +359,14 @@ pub(super) async fn qualify(
         },
         IndexFacetRequest {
             field: "modified_at".into(),
+            limit: 10,
+        },
+        IndexFacetRequest {
+            field: "published_at".into(),
+            limit: 10,
+        },
+        IndexFacetRequest {
+            field: "reviewed_at".into(),
             limit: 10,
         },
         IndexFacetRequest {
@@ -459,7 +540,7 @@ fn verify_pages(
 }
 
 fn verify_computations(response: &QueryIndexResponse) -> TestResult<()> {
-    if response.facet_results.len() != 8 || response.aggregate_results.len() != 20 {
+    if response.facet_results.len() != 10 || response.aggregate_results.len() != 20 {
         return Err(invalid("Typed JSON computation result count changed"));
     }
     let expected_facets: &[(&str, &[(&[u8], u64)])] = &[
@@ -469,6 +550,17 @@ fn verify_computations(response: &QueryIndexResponse) -> TestResult<()> {
             &[(b"\"a\"", 1), (b"\"b\"", 1), (b"\"z\"", 1)],
         ),
         ("modified_at", &[(b"200", 2), (b"100", 1)]),
+        (
+            "published_at",
+            &[
+                (b"\"2024-02-01T00:00:00Z\"", 2),
+                (b"\"2024-01-01T00:00:00Z\"", 1),
+            ],
+        ),
+        (
+            "reviewed_at",
+            &[(b"\"15/02/2024 09:30\"", 2), (b"\"15/01/2024 09:30\"", 1)],
+        ),
         ("sequence", &[(b"1", 1), (b"2", 1), (b"3", 1)]),
         ("score", &[(b"1.5", 1), (b"2.5", 1), (b"3.5", 1)]),
         ("enabled", &[(b"true", 3)]),

@@ -5,13 +5,15 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::marker::PhantomData;
 
+use jiff::Timestamp;
+use jiff::fmt::strtime::{self, BrokenDownTime};
 use keldra_api::v1::index_field::FieldType;
 use keldra_api::v1::index_specification::Specification;
 use keldra_api::v1::{
-    BooleanIndexField, CreateIndexRequest, FloatIndexField, IndexField, IndexFieldCapability,
-    IndexFieldCardinality, IndexOrder, IndexOrderDirection, IndexSpecification, KeywordIndexField,
-    SignedIntegerIndexField, TextAnalyzer, TextIndexField, TypedJsonIndexSpec,
-    UnsignedIntegerIndexField,
+    BooleanIndexField, CreateIndexRequest, DateIndexField, FloatIndexField, IndexField,
+    IndexFieldCapability, IndexFieldCardinality, IndexOrder, IndexOrderDirection,
+    IndexSpecification, KeywordIndexField, SignedIntegerIndexField, TextAnalyzer, TextIndexField,
+    TypedJsonIndexSpec, UnsignedIntegerIndexField,
 };
 
 const MAX_INDEX_NAME_BYTES: usize = 128;
@@ -34,6 +36,7 @@ pub enum IndexDefinitionError {
     DuplicatePhysicalOrder(String),
     UnknownPhysicalOrderField(String),
     UnorderablePhysicalOrderField(String),
+    InvalidDateFormat,
 }
 
 impl Display for IndexDefinitionError {
@@ -74,6 +77,9 @@ impl Display for IndexDefinitionError {
             Self::UnorderablePhysicalOrderField(name) => write!(
                 formatter,
                 "physical-order field `{name}` must be single-valued and declare ORDER"
+            ),
+            Self::InvalidDateFormat => formatter.write_str(
+                "date strftime pattern must be valid, bounded, and describe a complete date",
             ),
         }
     }
@@ -359,6 +365,218 @@ numeric_field!(
     UnsignedInteger
 );
 numeric_field!(FloatField, FloatIndexField, Float);
+
+/// Input and facet presentation format for a Date field.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DateFormat(DateFormatKind);
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum DateFormatKind {
+    #[default]
+    Iso8601,
+    Strftime(String),
+}
+
+impl DateFormat {
+    /// ISO-8601 input and canonical UTC ISO-8601 facet output.
+    pub fn iso8601() -> Self {
+        Self(DateFormatKind::Iso8601)
+    }
+
+    /// Construct one validated POSIX strftime/strptime pattern.
+    pub fn strftime(pattern: impl Into<String>) -> Result<Self, IndexDefinitionError> {
+        let pattern = pattern.into();
+        if !valid_date_pattern(&pattern) {
+            return Err(IndexDefinitionError::InvalidDateFormat);
+        }
+        Ok(Self(DateFormatKind::Strftime(pattern)))
+    }
+
+    fn strftime_pattern(&self) -> String {
+        match &self.0 {
+            DateFormatKind::Iso8601 => String::new(),
+            DateFormatKind::Strftime(pattern) => pattern.clone(),
+        }
+    }
+}
+
+fn valid_date_pattern(pattern: &str) -> bool {
+    if pattern.is_empty()
+        || pattern.len() > 256
+        || pattern.contains('\0')
+        || uses_unsupported_date_directive(pattern)
+    {
+        return false;
+    }
+    let Ok(sample) = Timestamp::from_millisecond(1_721_016_123_456) else {
+        return false;
+    };
+    let Ok(encoded) = strtime::format(pattern, sample) else {
+        return false;
+    };
+    let Ok(parsed) = BrokenDownTime::parse(pattern, encoded) else {
+        return false;
+    };
+    parsed.to_date().is_ok() && parsed.to_datetime().is_ok()
+}
+
+fn uses_unsupported_date_directive(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if index == bytes.len() {
+            return true;
+        }
+        if bytes[index] == b'%' {
+            index += 1;
+            continue;
+        }
+        while index < bytes.len() && !bytes[index].is_ascii_alphabetic() && bytes[index] != b'+' {
+            index += 1;
+        }
+        if index == bytes.len()
+            || matches!(
+                bytes[index],
+                b'a' | b'A'
+                    | b'b'
+                    | b'B'
+                    | b'h'
+                    | b'c'
+                    | b'x'
+                    | b'X'
+                    | b'p'
+                    | b'P'
+                    | b's'
+                    | b'Z'
+                    | b'Q'
+                    | b'E'
+                    | b'O'
+            )
+        {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// A timestamp field stored as signed Unix epoch milliseconds.
+pub struct DateField<
+    const MULTI: bool = false,
+    const EXACT: bool = false,
+    const RANGE: bool = false,
+    const ORDER: bool = false,
+    const FACET: bool = false,
+    const CONFIGURED: bool = false,
+> {
+    core: FieldCore,
+    format: DateFormat,
+}
+
+impl DateField {
+    pub fn single(name: impl Into<String>, json_pointer: impl Into<String>) -> Self {
+        Self {
+            core: FieldCore::new(name, json_pointer),
+            format: DateFormat::iso8601(),
+        }
+    }
+
+    pub fn multi(name: impl Into<String>, json_pointer: impl Into<String>) -> DateField<true> {
+        DateField {
+            core: FieldCore::new(name, json_pointer),
+            format: DateFormat::iso8601(),
+        }
+    }
+}
+
+impl<const M: bool, const E: bool, const R: bool, const O: bool, const F: bool, const C: bool>
+    DateField<M, E, R, O, F, C>
+{
+    pub fn format(mut self, format: DateFormat) -> Self {
+        self.format = format;
+        self
+    }
+}
+
+impl<const M: bool, const R: bool, const O: bool, const F: bool, const C: bool>
+    DateField<M, false, R, O, F, C>
+{
+    pub fn exact(self) -> DateField<M, true, R, O, F, true> {
+        DateField {
+            core: self.core,
+            format: self.format,
+        }
+    }
+}
+
+impl<const M: bool, const E: bool, const O: bool, const F: bool, const C: bool>
+    DateField<M, E, false, O, F, C>
+{
+    pub fn range(self) -> DateField<M, E, true, O, F, true> {
+        DateField {
+            core: self.core,
+            format: self.format,
+        }
+    }
+}
+
+impl<const E: bool, const R: bool, const F: bool, const C: bool>
+    DateField<false, E, R, false, F, C>
+{
+    pub fn order(self) -> DateField<false, E, R, true, F, true> {
+        DateField {
+            core: self.core,
+            format: self.format,
+        }
+    }
+}
+
+impl<const M: bool, const E: bool, const R: bool, const O: bool, const C: bool>
+    DateField<M, E, R, O, false, C>
+{
+    pub fn facet(self) -> DateField<M, E, R, O, true, true> {
+        DateField {
+            core: self.core,
+            format: self.format,
+        }
+    }
+}
+
+impl<const E: bool, const R: bool, const F: bool, const C: bool>
+    DateField<false, E, R, true, F, C>
+{
+    pub fn ascending(&self) -> IndexOrderToken {
+        IndexOrderToken::new(&self.core.name, IndexOrderDirection::Ascending)
+    }
+
+    pub fn descending(&self) -> IndexOrderToken {
+        IndexOrderToken::new(&self.core.name, IndexOrderDirection::Descending)
+    }
+}
+
+impl<const M: bool, const E: bool, const R: bool, const O: bool, const F: bool> private::Sealed
+    for DateField<M, E, R, O, F, true>
+{
+}
+
+impl<const M: bool, const E: bool, const R: bool, const O: bool, const F: bool> TypedJsonField
+    for DateField<M, E, R, O, F, true>
+{
+    fn into_index_field(self) -> IndexField {
+        self.core.into_proto(
+            M,
+            capabilities::<E, false, R, O, F, false, false>(),
+            FieldType::Date(DateIndexField {
+                strftime_pattern: self.format.strftime_pattern(),
+            }),
+        )
+    }
+}
 
 /// An uninterpreted UTF-8 field with binary UTF-8 collation.
 pub struct KeywordField<
@@ -701,8 +919,8 @@ mod tests {
     use keldra_api::v1::{IndexFieldCapability, IndexFieldCardinality, TextAnalyzer};
 
     use super::{
-        BooleanField, FloatField, IndexDefinitionError, KeywordField, SignedIntegerField,
-        TextField, TypedJsonIndexBuilder, UnsignedIntegerField,
+        BooleanField, DateField, DateFormat, FloatField, IndexDefinitionError, KeywordField,
+        SignedIntegerField, TextField, TypedJsonIndexBuilder, UnsignedIntegerField,
     };
 
     #[test]
@@ -866,5 +1084,70 @@ mod tests {
             specification.fields[2].field_type,
             Some(FieldType::Float(_))
         ));
+    }
+
+    #[test]
+    fn date_builder_emits_format_and_non_aggregate_capabilities() {
+        let published = DateField::single("published", "/published")
+            .format(DateFormat::strftime("%Y-%m-%dT%H:%M:%S%:z").unwrap())
+            .exact()
+            .range()
+            .order()
+            .facet();
+        let order = published.descending();
+        let request = TypedJsonIndexBuilder::new("tenant", "dated")
+            .field(published)
+            .physical_order([order])
+            .finish("dated")
+            .unwrap();
+        let Specification::TypedJson(specification) =
+            request.specification.unwrap().specification.unwrap()
+        else {
+            panic!("expected typed JSON specification")
+        };
+        let Some(FieldType::Date(date)) = specification.fields[0].field_type.as_ref() else {
+            panic!("expected Date field")
+        };
+        assert_eq!(date.strftime_pattern, "%Y-%m-%dT%H:%M:%S%:z");
+        assert_eq!(
+            specification.fields[0].capabilities,
+            [
+                IndexFieldCapability::Exact as i32,
+                IndexFieldCapability::Range as i32,
+                IndexFieldCapability::Order as i32,
+                IndexFieldCapability::Facet as i32,
+            ]
+        );
+        assert_eq!(specification.physical_order[0].field, "published");
+    }
+
+    #[test]
+    fn date_format_is_opaque_and_defaults_to_iso8601() {
+        assert_eq!(
+            DateFormat::strftime("").unwrap_err(),
+            IndexDefinitionError::InvalidDateFormat
+        );
+        assert_eq!(
+            DateFormat::strftime("%Y\0%m").unwrap_err(),
+            IndexDefinitionError::InvalidDateFormat
+        );
+        assert_eq!(
+            DateFormat::strftime("%Y-%B-%d").unwrap_err(),
+            IndexDefinitionError::InvalidDateFormat
+        );
+
+        let request = TypedJsonIndexBuilder::new("tenant", "dated")
+            .field(DateField::single("published", "/published").exact())
+            .finish("dated")
+            .unwrap();
+        let Specification::TypedJson(specification) =
+            request.specification.unwrap().specification.unwrap()
+        else {
+            panic!("expected typed JSON specification")
+        };
+        let Some(FieldType::Date(date)) = specification.fields[0].field_type.as_ref() else {
+            panic!("expected Date field")
+        };
+        assert!(date.strftime_pattern.is_empty());
     }
 }

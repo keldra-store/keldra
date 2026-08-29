@@ -291,6 +291,7 @@ mod tests {
                 content_type: None,
                 deleted: false,
                 committed_at_unix_millis: version,
+                protected_link_descriptor: false,
             },
             current_head: RetainedHeadState {
                 version: VersionId(3),

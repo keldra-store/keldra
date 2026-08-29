@@ -93,6 +93,7 @@ fn ranked_field(
         collation: Collation::BinaryUtf8,
         capabilities,
         analyzer,
+        date_format: None,
         components: FieldComponents::TERMS,
     };
     field.components = field.compiled_components().unwrap();

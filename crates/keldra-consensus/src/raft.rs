@@ -59,6 +59,65 @@ struct MachineState {
     snapshot_generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct LegacyCommittedBatch {
+    commit_cursor: u64,
+    executor: crate::NodeId,
+    nomination_log_index: u64,
+    program_path_hash: crate::ProgramPathHash,
+    program_hash: crate::ProgramHash,
+    bundle_ref: crate::BundleRef,
+    bundle_hash: crate::BundleHash,
+    durability_class: crate::DurabilityClass,
+    durability_evidence_hash: crate::DurabilityEvidenceHash,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct LegacyCommittedInvocation {
+    invocation_id: crate::InvocationId,
+    input_fingerprint: crate::InvocationFingerprint,
+    proposal_at_unix_millis: u64,
+    replay_expires_at_unix_millis: u64,
+    committed_batch: LegacyCommittedBatch,
+}
+
+fn migrate_legacy_invocations(
+    legacy: BTreeMap<u64, LegacyCommittedInvocation>,
+) -> BTreeMap<u64, CommittedInvocation> {
+    legacy
+        .into_iter()
+        .map(|(cursor, invocation)| {
+            let batch = invocation.committed_batch;
+            (
+                cursor,
+                CommittedInvocation {
+                    invocation_id: invocation.invocation_id,
+                    input_fingerprint: invocation.input_fingerprint,
+                    proposal_at_unix_millis: invocation.proposal_at_unix_millis,
+                    replay_expires_at_unix_millis: invocation.replay_expires_at_unix_millis,
+                    committed_batch: crate::CommittedBatch {
+                        commit_cursor: batch.commit_cursor,
+                        executor: batch.executor,
+                        nomination_log_index: batch.nomination_log_index,
+                        begin_cursor: batch.commit_cursor,
+                        authority: crate::AtomicBundleAuthority::LegacyProgramOnly {
+                            program_path_hash: batch.program_path_hash,
+                            program_hash: batch.program_hash,
+                        },
+                        bundle_ref: batch.bundle_ref,
+                        bundle_hash: batch.bundle_hash,
+                        durability_class: batch.durability_class,
+                        durability_evidence_hash: batch.durability_evidence_hash,
+                        participant_manifest_hash: crate::ParticipantManifestHash(
+                            batch.bundle_hash.0,
+                        ),
+                    },
+                },
+            )
+        })
+        .collect()
+}
+
 /// Exact state-machine layout in version-one enveloped snapshots.
 #[derive(Debug, Serialize, Deserialize)]
 struct LegacyStateMachinePreClusterControl {
@@ -67,7 +126,7 @@ struct LegacyStateMachinePreClusterControl {
     cluster_id: Option<crate::ClusterId>,
     system_bootstrap: crate::SystemBootstrapState,
     executor: Option<ExecutorNomination>,
-    committed_invocations: BTreeMap<u64, CommittedInvocation>,
+    committed_invocations: BTreeMap<u64, LegacyCommittedInvocation>,
     committed_invocation_bytes: u64,
     last_commit_cursor: Option<u64>,
     finalized_through: Option<u64>,
@@ -101,7 +160,7 @@ struct LegacyStateMachineV2 {
     system_bootstrap: crate::SystemBootstrapState,
     cluster_control: LegacyClusterControlStateV2,
     executor: Option<ExecutorNomination>,
-    committed_invocations: BTreeMap<u64, CommittedInvocation>,
+    committed_invocations: BTreeMap<u64, LegacyCommittedInvocation>,
     committed_invocation_bytes: u64,
     last_commit_cursor: Option<u64>,
     finalized_through: Option<u64>,
@@ -116,13 +175,46 @@ struct LegacyMachineStateV2 {
     snapshot_generation: u64,
 }
 
+/// Exact released version-three snapshot, before durable atomic preparation.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyClusterControlStateV3 {
+    nodes: BTreeMap<crate::NodeId, crate::NodeDescriptor>,
+    used_node_ids: crate::UsedNodeIds,
+    transition: Option<crate::MembershipTransition>,
+    jwt_signing_key_fingerprint: Option<crate::JwtSigningKeyFingerprint>,
+    erasure_code_profile: Option<crate::ErasureCodeProfile>,
+    active_placement_log_id: Option<LogId<u64>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyStateMachineV3 {
+    max_commit_entries: u32,
+    max_commit_bytes: u64,
+    cluster_id: Option<crate::ClusterId>,
+    system_bootstrap: crate::SystemBootstrapState,
+    cluster_control: LegacyClusterControlStateV3,
+    executor: Option<ExecutorNomination>,
+    committed_invocations: BTreeMap<u64, LegacyCommittedInvocation>,
+    committed_invocation_bytes: u64,
+    last_commit_cursor: Option<u64>,
+    finalized_through: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyMachineStateV3 {
+    decisions: LegacyStateMachineV3,
+    last_applied_log_id: Option<LogId<u64>>,
+    membership: StoredMembership<u64, BasicNode>,
+    snapshot_generation: u64,
+}
+
 /// Exact state-machine layout written by Keldra 0.5.0 snapshots.
 #[derive(Debug, Serialize, Deserialize)]
 struct LegacyStateMachineV050 {
     max_commit_entries: u32,
     max_commit_bytes: u64,
     executor: Option<ExecutorNomination>,
-    committed_invocations: BTreeMap<u64, CommittedInvocation>,
+    committed_invocations: BTreeMap<u64, LegacyCommittedInvocation>,
     committed_invocation_bytes: u64,
     last_commit_cursor: Option<u64>,
     finalized_through: Option<u64>,
@@ -140,13 +232,16 @@ struct LegacyMachineStateV050 {
 impl From<LegacyMachineStateV050> for MachineState {
     fn from(legacy: LegacyMachineStateV050) -> Self {
         let decisions = legacy.decisions;
+        let committed_invocations = migrate_legacy_invocations(decisions.committed_invocations);
+        let committed_invocation_bytes = codec::encoded_len(&committed_invocations)
+            .expect("migrated bounded invocation map remains encodable");
         Self {
             decisions: StateMachine::from_v050_snapshot(
                 decisions.max_commit_entries,
                 decisions.max_commit_bytes,
                 decisions.executor,
-                decisions.committed_invocations,
-                decisions.committed_invocation_bytes,
+                committed_invocations,
+                committed_invocation_bytes,
                 decisions.last_commit_cursor,
                 decisions.finalized_through,
             ),
@@ -160,6 +255,9 @@ impl From<LegacyMachineStateV050> for MachineState {
 impl From<LegacyMachineStatePreClusterControl> for MachineState {
     fn from(legacy: LegacyMachineStatePreClusterControl) -> Self {
         let decisions = legacy.decisions;
+        let committed_invocations = migrate_legacy_invocations(decisions.committed_invocations);
+        let committed_invocation_bytes = codec::encoded_len(&committed_invocations)
+            .expect("migrated bounded invocation map remains encodable");
         Self {
             decisions: StateMachine::from_pre_cluster_control_snapshot(
                 decisions.max_commit_entries,
@@ -167,8 +265,8 @@ impl From<LegacyMachineStatePreClusterControl> for MachineState {
                 decisions.cluster_id,
                 decisions.system_bootstrap,
                 decisions.executor,
-                decisions.committed_invocations,
-                decisions.committed_invocation_bytes,
+                committed_invocations,
+                committed_invocation_bytes,
                 decisions.last_commit_cursor,
                 decisions.finalized_through,
             ),
@@ -183,6 +281,9 @@ impl From<LegacyMachineStateV2> for MachineState {
     fn from(legacy: LegacyMachineStateV2) -> Self {
         let decisions = legacy.decisions;
         let cluster_control = decisions.cluster_control;
+        let committed_invocations = migrate_legacy_invocations(decisions.committed_invocations);
+        let committed_invocation_bytes = codec::encoded_len(&committed_invocations)
+            .expect("migrated bounded invocation map remains encodable");
         Self {
             decisions: StateMachine::from_v2_snapshot(
                 decisions.max_commit_entries,
@@ -196,10 +297,48 @@ impl From<LegacyMachineStateV2> for MachineState {
                     jwt_signing_key_fingerprint: cluster_control.jwt_signing_key_fingerprint,
                     erasure_code_profile: cluster_control.erasure_code_profile,
                     active_placement_log_id: None,
+                    active_protocol_version: 1,
+                    active_storage_format: 1,
                 },
                 decisions.executor,
-                decisions.committed_invocations,
-                decisions.committed_invocation_bytes,
+                committed_invocations,
+                committed_invocation_bytes,
+                decisions.last_commit_cursor,
+                decisions.finalized_through,
+            ),
+            last_applied_log_id: legacy.last_applied_log_id,
+            membership: legacy.membership,
+            snapshot_generation: legacy.snapshot_generation,
+        }
+    }
+}
+
+impl From<LegacyMachineStateV3> for MachineState {
+    fn from(legacy: LegacyMachineStateV3) -> Self {
+        let decisions = legacy.decisions;
+        let cluster_control = decisions.cluster_control;
+        let committed_invocations = migrate_legacy_invocations(decisions.committed_invocations);
+        let committed_invocation_bytes = codec::encoded_len(&committed_invocations)
+            .expect("migrated bounded invocation map remains encodable");
+        Self {
+            decisions: StateMachine::from_v2_snapshot(
+                decisions.max_commit_entries,
+                decisions.max_commit_bytes,
+                decisions.cluster_id,
+                decisions.system_bootstrap,
+                crate::ClusterControlState {
+                    nodes: cluster_control.nodes,
+                    used_node_ids: cluster_control.used_node_ids,
+                    transition: cluster_control.transition,
+                    jwt_signing_key_fingerprint: cluster_control.jwt_signing_key_fingerprint,
+                    erasure_code_profile: cluster_control.erasure_code_profile,
+                    active_placement_log_id: cluster_control.active_placement_log_id,
+                    active_protocol_version: 1,
+                    active_storage_format: 1,
+                },
+                decisions.executor,
+                committed_invocations,
+                committed_invocation_bytes,
                 decisions.last_commit_cursor,
                 decisions.finalized_through,
             ),
@@ -578,7 +717,7 @@ impl RaftSnapshotBuilder<DecisionRaftConfig> for OpenRaftSnapshotBuilder {
             .validate_cluster_membership()
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
         let data =
-            codec::encode_record_at_version(&snapshot_state, codec::SNAPSHOT_RECORD_FORMAT_V3)
+            codec::encode_record_at_version(&snapshot_state, codec::SNAPSHOT_RECORD_FORMAT_V4)
                 .map_err(|error| {
                     storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
                 })?;
@@ -1132,9 +1271,7 @@ fn load_machine(store: &DurableStore) -> Result<MachineState, DecisionRaftError>
     Ok(state)
 }
 
-/// Decode a self-identifying current snapshot or the released raw 0.5.0 body.
-/// A body beginning with the record magic is always treated as an envelope, so
-/// malformed or unknown current records cannot silently fall back to legacy.
+/// Decode current snapshots and explicitly migrate released predecessors.
 fn decode_machine_snapshot(data: &[u8]) -> Result<MachineState, codec::CodecError> {
     let (version, payload) = codec::record_version_and_payload(data)?;
     match version {
@@ -1143,7 +1280,10 @@ fn decode_machine_snapshot(data: &[u8]) -> Result<MachineState, codec::CodecErro
         Some(codec::SNAPSHOT_RECORD_FORMAT_V2) => {
             codec::decode::<LegacyMachineStateV2>(payload).map(Into::into)
         }
-        Some(codec::SNAPSHOT_RECORD_FORMAT_V3) => codec::decode(payload),
+        Some(codec::SNAPSHOT_RECORD_FORMAT_V3) => {
+            codec::decode::<LegacyMachineStateV3>(payload).map(Into::into)
+        }
+        Some(codec::SNAPSHOT_RECORD_FORMAT_V4) => codec::decode(payload),
         Some(version) => Err(codec::CodecError::UnsupportedRecordVersion(version)),
     }
 }
@@ -1198,6 +1338,9 @@ fn validate_membership_command(
     let executor = match command {
         Command::NominateExecutor { executor } => Some(*executor),
         Command::CommitBatch(batch) => Some(batch.executor),
+        Command::BeginBatch(batch) => Some(batch.executor),
+        Command::CommitPreparedBatch(batch) => Some(batch.executor),
+        Command::AbortPreparedBatch(batch) => Some(batch.executor),
         Command::FinalizedThrough { executor, .. } => Some(*executor),
         Command::InitializeCluster { .. } => None,
         Command::CompleteSystemBootstrap { executor, .. } => Some(*executor),
@@ -1210,7 +1353,9 @@ fn validate_membership_command(
         | Command::ClearPeerSpkiOverlap { .. }
         | Command::BindJwtSigningKeyFingerprint { .. }
         | Command::BindErasureCodeProfile { .. }
-        | Command::RefreshJoiningNodePreparation { .. } => None,
+        | Command::RefreshJoiningNodePreparation { .. }
+        | Command::UpdateNodeCapabilities { .. }
+        | Command::ActivateClusterCapabilities { .. } => None,
     };
     if let Some(executor) = executor
         && membership.membership().get_node(&executor.0).is_none()
@@ -1556,13 +1701,49 @@ mod snapshot_compatibility_tests {
             "v2 migration must not invent placement lineage from last_applied"
         );
 
-        let mut current = MachineState::new(config).unwrap();
-        current.decisions.cluster_control.active_placement_log_id =
-            Some(LogId::new(openraft::CommittedLeaderId::new(9, 3), 41));
-        let current_record =
-            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V3).unwrap();
-        let decoded = decode_machine_snapshot(&current_record).unwrap();
-        assert_eq!(decoded, current);
+        let v3_placement = LogId::new(openraft::CommittedLeaderId::new(9, 3), 41);
+        let v3 = LegacyMachineStateV3 {
+            decisions: LegacyStateMachineV3 {
+                max_commit_entries: config.max_commit_entries,
+                max_commit_bytes: config.max_commit_bytes,
+                cluster_id: Some(crate::ClusterId([8; 16])),
+                system_bootstrap: crate::SystemBootstrapState::Missing,
+                cluster_control: LegacyClusterControlStateV3 {
+                    nodes: BTreeMap::new(),
+                    used_node_ids: crate::UsedNodeIds::default(),
+                    transition: None,
+                    jwt_signing_key_fingerprint: None,
+                    erasure_code_profile: None,
+                    active_placement_log_id: Some(v3_placement),
+                },
+                executor: None,
+                committed_invocations: BTreeMap::new(),
+                committed_invocation_bytes: codec::encoded_len(&BTreeMap::<
+                    u64,
+                    LegacyCommittedInvocation,
+                >::new())
+                .unwrap(),
+                last_commit_cursor: None,
+                finalized_through: None,
+            },
+            last_applied_log_id: Some(v3_placement),
+            membership: StoredMembership::default(),
+            snapshot_generation: 10,
+        };
+        let v3_record =
+            codec::encode_record_at_version(&v3, codec::SNAPSHOT_RECORD_FORMAT_V3).unwrap();
+        let decoded = decode_machine_snapshot(&v3_record).unwrap();
+        assert_eq!(
+            decoded
+                .decisions
+                .cluster_control()
+                .active_protocol_version(),
+            1
+        );
+        assert_eq!(
+            decoded.decisions.cluster_control().active_storage_format(),
+            1
+        );
         let placement = decoded
             .decisions
             .cluster_control()
@@ -1571,17 +1752,19 @@ mod snapshot_compatibility_tests {
         assert_eq!(placement.leader_id.term, 9);
         assert_eq!(placement.index, 41);
 
+        let current = MachineState::new(config).unwrap();
         let unsupported =
-            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V3 + 1)
+            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V4 + 1)
                 .unwrap();
         assert_eq!(
             decode_machine_snapshot(&unsupported),
             Err(codec::CodecError::UnsupportedRecordVersion(
-                codec::SNAPSHOT_RECORD_FORMAT_V3 + 1
+                codec::SNAPSHOT_RECORD_FORMAT_V4 + 1
             ))
         );
 
-        let mut malformed_current = current_record;
+        let mut malformed_current =
+            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V4).unwrap();
         malformed_current.pop();
         assert!(matches!(
             decode_machine_snapshot(&malformed_current),

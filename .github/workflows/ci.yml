@@ -60,11 +60,11 @@ jobs:
     name: Keldra workspace tests
     needs: static
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
-      KELDRA_GATE_STEP_TIMEOUT_SECONDS: '4800'
-      KELDRA_RUST_TEST_THREADS: '8'
-      CARGO_BUILD_JOBS: '8'
+      KELDRA_GATE_STEP_TIMEOUT_SECONDS: '6600'
+      KELDRA_RUST_TEST_THREADS: '2'
+      CARGO_BUILD_JOBS: '1'
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - name: Checkout repository

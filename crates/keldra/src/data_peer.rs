@@ -1,7 +1,6 @@
 //! Typed storage operations on Keldra's mandatory-mTLS private peer listener.
 //!
-//! This is deliberately not a RocksDB endpoint. Each method decodes one
-//! versioned logical store type and invokes the corresponding storage-kernel boundary.
+//! This is not a RocksDB endpoint; methods decode versioned logical store types.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -1644,10 +1643,13 @@ mod tests {
                 content_type: None,
                 deleted: true,
                 committed_at_unix_millis: 1,
+                protected_link_descriptor: false,
             }],
             journal_pending_versions: Vec::new(),
             journal_released_versions: Vec::new(),
             definition_locator: None,
+            alias_registry: None,
+            alias_registry_transition: None,
         });
         store
             .repair_object_path_snapshot(tenant_id, bucket_id, exact_path, None, snapshot.as_ref())

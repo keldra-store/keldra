@@ -1,8 +1,8 @@
 use keldra_consensus::{
-    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, BundleHash, BundleRef, Command,
-    CommitBatch, CommitResult, DurabilityClass, DurabilityEvidenceHash, ExecutorNomination,
-    InvocationFingerprint, InvocationId, MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS,
-    NodeId, ProgramHash, ProgramPathHash, StateMachine,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, AtomicBundleAuthority, BundleHash,
+    BundleRef, Command, CommitBatch, CommitResult, DurabilityClass, DurabilityEvidenceHash,
+    ExecutorNomination, InvocationFingerprint, InvocationId, MAX_COMMITTED_INVOCATION_BYTES,
+    MAX_COMMITTED_INVOCATIONS, NodeId, ProgramHash, ProgramPathHash, StateMachine,
 };
 use openraft::{CommittedLeaderId, LogId};
 
@@ -326,12 +326,11 @@ fn commit_is_fenced_by_the_current_executor_and_pins_an_external_program() {
     assert_eq!(committed.invocation.committed_batch.commit_cursor, 7);
     assert_eq!(state.last_commit_cursor(), Some(7));
     assert_eq!(
-        committed.invocation.committed_batch.program_path_hash,
-        code.path_hash
-    );
-    assert_eq!(
-        committed.invocation.committed_batch.program_hash,
-        code.object_hash
+        committed.invocation.committed_batch.authority,
+        AtomicBundleAuthority::LegacyProgramOnly {
+            program_path_hash: code.path_hash,
+            program_hash: code.object_hash,
+        }
     );
 }
 
@@ -375,7 +374,6 @@ fn idempotent_retry_returns_the_original_commit_cursor_after_renomination() {
         hash: [88; 32],
         length: 88,
     };
-    recovered.bundle_hash = BundleHash([89; 32]);
     recovered.durability_class = DurabilityClass([90; 32]);
     recovered.durability_evidence_hash = DurabilityEvidenceHash([91; 32]);
     let replay = commit(&mut state, 9, recovered).unwrap();

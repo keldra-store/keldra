@@ -17,17 +17,17 @@ use keldra_api::v1::{
     BulkWriteResponse, DeleteIfVersionRequest, DeleteRequest as ApiDeleteRequest,
     DeleteVersionRequest, DeleteVersionResponse, DeletedObject, Durability as ApiDurability,
     GetObjectRequest, HeadObjectRequest, InvokeProgramRequest, InvokeProgramResponse,
-    ListObjectVersionsRequest, ListObjectsRequest, ListObjectsResponse, MutationFailure,
-    MutationFailureCode, MutationReceipt as ApiMutationReceipt, NeverExisted, ObjectAddress,
-    ObjectChunk, ObjectHead, ObjectVersion, PresentObject, PutHeader, PutRequest as ApiPutRequest,
-    PutToken, ReadFailure, ReadFailureCode, SetBucketPolicyRequest, WatchInvalidation,
-    WatchPrefixRequest, WatchStateHint,
+    LinkObjectRequest, ListObjectVersionsRequest, ListObjectsRequest, ListObjectsResponse,
+    MutationFailure, MutationFailureCode, MutationReceipt as ApiMutationReceipt, NeverExisted,
+    ObjectAddress, ObjectChunk, ObjectHead, ObjectVersion, PresentObject, PutHeader,
+    PutRequest as ApiPutRequest, PutToken, ReadFailure, ReadFailureCode, SetBucketPolicyRequest,
+    UnlinkObjectRequest, WatchInvalidation, WatchPrefixRequest, WatchStateHint,
 };
-use keldra_atomic_program::{ExpandedProgramPath, MAX_OBJECT_PATH_BYTES};
+use keldra_atomic_program::ExpandedProgramPath;
 use keldra_store::{
     AuthzStoreError, BatchOperation, BlobRef, BlobUpload, DeleteRequest as StoreDeleteRequest,
     DeleteRetainedVersionOutcome, Durability as StoreDurability, InvalidationStateHint,
-    LocalInvalidation, MAX_LIST_OBJECTS, MutationError, MutationReceipt, ObjectKey,
+    LocalInvalidation, MutationError, MutationReceipt, ObjectKey,
     ObjectVersioning as StoreObjectVersioning, Precondition, PublishRequest, PutMode,
     PutRequest as StorePutRequest, Store, Version, VersionId, WatchError, WatchScope,
 };
@@ -60,22 +60,30 @@ mod accounting_traffic;
 mod atomic_program;
 mod batch_get;
 mod bulk;
+mod bulk_alias;
+mod clone;
+mod delete_version;
 mod distributed_reads;
 mod distributed_watch_stream;
 mod gateway;
+mod list_query;
 mod mutation_failures;
+mod object_link;
+mod object_read;
 mod read_identity;
 mod request_auth;
 mod routed_writes;
 mod upload;
 
+use list_query::{list_objects_query, list_objects_scoped};
 #[cfg(test)]
 use mutation_failures::api_failure;
 use mutation_failures::{api_mutation_failure, api_request_failure};
 use read_identity::ObjectReadIdentity;
 use request_auth::{
-    authenticated_caller, plugin_object_scope, reject_plugin_token, require_authorized,
-    require_caller_tenant, require_plugin_key_scope, require_plugin_list_scope,
+    authenticated_caller, content_type, plugin_object_scope, reject_plugin_token,
+    require_authorized, require_caller_tenant, require_plugin_key_scope, require_plugin_list_scope,
+    required_command_id,
 };
 
 pub(crate) use gateway::{GatewayIdentity, GatewayObjectAdapter, GatewayPutMode};
@@ -106,6 +114,7 @@ pub struct ObjectServiceImpl {
     accounting_traffic: AccountingTraffic,
     max_blob_bytes: u64,
     atomic_program_timeout: Duration,
+    bulk_write_timeout: Duration,
 }
 
 impl ObjectServiceImpl {
@@ -124,6 +133,7 @@ impl ObjectServiceImpl {
         accounting_traffic: AccountingTraffic,
         max_blob_bytes: u64,
         atomic_program_timeout: Duration,
+        bulk_write_timeout: Duration,
     ) -> Self {
         Self {
             system_authorizer: SystemAuthorizer::new(store.authz()),
@@ -141,6 +151,7 @@ impl ObjectServiceImpl {
             accounting_traffic,
             max_blob_bytes,
             atomic_program_timeout,
+            bulk_write_timeout,
         }
     }
 
@@ -167,6 +178,15 @@ struct CanonicalPutHeader {
     command_id: String,
     durability: TokenDurability,
     operation: TokenPutOperation,
+    #[serde(default)]
+    link: Option<CanonicalLinkBinding>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalLinkBinding {
+    path: String,
+    descriptor_version: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -217,19 +237,11 @@ enum TokenPutOperation {
 #[derive(Clone, Debug)]
 struct PutMetadata {
     key: ObjectKey,
+    link: Option<keldra_store::ResolvedObjectLink>,
     content_type: Option<String>,
     command_id: String,
     durability: StoreDurability,
     mode: PutMode,
-}
-
-#[derive(Debug)]
-struct ListObjectsQuery {
-    tenant: String,
-    bucket: String,
-    prefix: String,
-    start_after: Option<String>,
-    limit: usize,
 }
 
 pub(crate) type GetObjectStream =
@@ -258,31 +270,76 @@ impl ObjectService for ObjectServiceImpl {
         upload::put_end(self, request).await
     }
 
+    async fn clone_object(
+        &self,
+        request: Request<keldra_api::v1::CloneObjectRequest>,
+    ) -> Result<Response<ApiMutationReceipt>, Status> {
+        clone::clone_object(self, request).await
+    }
+
+    async fn link_object(
+        &self,
+        request: Request<LinkObjectRequest>,
+    ) -> Result<Response<ApiMutationReceipt>, Status> {
+        object_link::link_object(self, request).await
+    }
+
+    async fn unlink_object(
+        &self,
+        request: Request<UnlinkObjectRequest>,
+    ) -> Result<Response<ApiMutationReceipt>, Status> {
+        object_link::unlink_object(self, request).await
+    }
+
     async fn delete(
         &self,
         request: Request<ApiDeleteRequest>,
     ) -> Result<Response<ApiMutationReceipt>, Status> {
         let plugin_scope = plugin_object_scope(&request);
-        let peer_routed = request
-            .extensions()
-            .get::<routed_writes::RoutedDestination>()
-            .is_some();
+        let peer_routed = routed_writes::is_routed(&request);
+        let replay_marker = routed_writes::atomic_executor_replay_marker(&request);
         let caller = authenticated_caller(&request)?;
         let path_access = object_path_access::access_for(&request);
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
-        let api_request = request.into_inner();
+        let api_request = request.get_ref().clone();
         let mutation = delete_request(api_request.clone(), Precondition::Any)?;
         object_path_access::require_key(&path_access, &mutation.key)?;
         require_plugin_key_scope(plugin_scope.as_ref(), &mutation.key)?;
+        match object_link::route_or_replay_delete(
+            self,
+            &caller,
+            &path_access,
+            plugin_scope.as_ref(),
+            peer_routed,
+            replay_marker,
+            bearer.signed_token(),
+            &api_request,
+            &mutation,
+            deadline_remaining(deadline)?,
+        )
+        .await?
+        {
+            object_link::DeleteReplayCheck::Response(response) => return Ok(response),
+            object_link::DeleteReplayCheck::Checked => {}
+        }
+        if let object_link::ResolvedAddress::Link(_) =
+            object_link::resolve_current(self, mutation.key.clone()).await?
+        {
+            return object_link::unlink_object(
+                self,
+                request.map(|request| UnlinkObjectRequest {
+                    link: request.address,
+                    command_id: request.command_id,
+                    durability: request.durability,
+                }),
+            )
+            .await;
+        }
         self.authorize_object(&caller, &mutation.key, ObjectPermission::Delete)
             .await?;
+        object_link::require_no_inbound_links(self, &mutation.key).await?;
         let receipt = match self.distribution.routing_target(&mutation.key)? {
-            Some(_) if peer_routed => {
-                return Err(Status::failed_precondition(
-                    "a routed Delete reached a node that is not its coordinator",
-                ));
-            }
             Some((target, address)) => {
                 self.cluster_peers
                     .route_delete(
@@ -290,6 +347,7 @@ impl ObjectService for ObjectServiceImpl {
                         &address,
                         bearer.signed_token(),
                         api_request,
+                        true,
                         deadline_remaining(deadline)?,
                     )
                     .await?
@@ -311,27 +369,44 @@ impl ObjectService for ObjectServiceImpl {
         request: Request<DeleteIfVersionRequest>,
     ) -> Result<Response<ApiMutationReceipt>, Status> {
         let plugin_scope = plugin_object_scope(&request);
-        let peer_routed = request
-            .extensions()
-            .get::<routed_writes::RoutedDestination>()
-            .is_some();
+        let peer_routed = routed_writes::is_routed(&request);
+        let replay_marker = routed_writes::atomic_executor_replay_marker(&request);
         let caller = authenticated_caller(&request)?;
         let path_access = object_path_access::access_for(&request);
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
-        let api_request = request.into_inner();
+        let api_request = request.get_ref().clone();
         let precondition = Precondition::Version(VersionId(api_request.expected_version));
         let mutation = delete_if_version_request(api_request.clone(), precondition)?;
         object_path_access::require_key(&path_access, &mutation.key)?;
         require_plugin_key_scope(plugin_scope.as_ref(), &mutation.key)?;
+        match object_link::route_or_replay_conditional_delete(
+            self,
+            &caller,
+            &path_access,
+            plugin_scope.as_ref(),
+            peer_routed,
+            replay_marker,
+            object_path_access::is_internal(&path_access),
+            bearer.signed_token(),
+            &api_request,
+            &mutation,
+            deadline_remaining(deadline)?,
+        )
+        .await?
+        {
+            object_link::DeleteReplayCheck::Response(response) => return Ok(response),
+            object_link::DeleteReplayCheck::Checked => {}
+        }
+        if let object_link::ResolvedAddress::Link(_) =
+            object_link::resolve_current(self, mutation.key.clone()).await?
+        {
+            return object_link::delete_if_version_link(self, request).await;
+        }
         self.authorize_object(&caller, &mutation.key, ObjectPermission::Delete)
             .await?;
+        object_link::require_no_inbound_links(self, &mutation.key).await?;
         let receipt = match self.distribution.routing_target(&mutation.key)? {
-            Some(_) if peer_routed => {
-                return Err(Status::failed_precondition(
-                    "a routed DeleteIfVersion reached a node that is not its coordinator",
-                ));
-            }
             Some((target, address)) => {
                 if object_path_access::is_internal(&path_access) {
                     self.cluster_peers
@@ -340,6 +415,7 @@ impl ObjectService for ObjectServiceImpl {
                             &address,
                             bearer.signed_token(),
                             api_request,
+                            true,
                             deadline_remaining(deadline)?,
                         )
                         .await?
@@ -350,6 +426,7 @@ impl ObjectService for ObjectServiceImpl {
                             &address,
                             bearer.signed_token(),
                             api_request,
+                            true,
                             deadline_remaining(deadline)?,
                         )
                         .await?
@@ -371,98 +448,14 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<DeleteVersionRequest>,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
-        let plugin_scope = plugin_object_scope(&request);
-        let peer_routed = request
-            .extensions()
-            .get::<routed_writes::RoutedDestination>()
-            .is_some();
-        let caller = authenticated_caller(&request)?;
-        let path_access = object_path_access::access_for(&request);
-        let bearer = OriginalBearer::from_metadata(request.metadata())?;
-        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
-        let api_request = request.into_inner();
-        let durability = durability(api_request.durability)?;
-        let key = object_key(api_request.address.clone())?;
-        object_path_access::require_key(&path_access, &key)?;
-        require_plugin_key_scope(plugin_scope.as_ref(), &key)?;
-        self.authorize_object(&caller, &key, ObjectPermission::Delete)
-            .await?;
-        let governance = self
-            .bucket_governance
-            .resolve(key.tenant(), key.bucket())
-            .await?;
-        require_governance_versioning_enabled(&governance)?;
-        self.distribution.require_durability_available(durability)?;
-        let outcome = match self.distribution.routing_target_stable(
-            &key,
-            governance.tenant_id,
-            governance.bucket_id,
-        )? {
-            Some(_) if peer_routed => {
-                return Err(Status::failed_precondition(
-                    "a routed DeleteVersion reached a node that is not its coordinator",
-                ));
-            }
-            Some((target, address)) => {
-                return self
-                    .cluster_peers
-                    .route_delete_version(
-                        target,
-                        &address,
-                        bearer.signed_token(),
-                        api_request,
-                        deadline_remaining(deadline)?,
-                    )
-                    .await
-                    .map(Response::new);
-            }
-            None => {
-                run_request_until(
-                    deadline,
-                    self.distribution.delete_retained_version_with_governance(
-                        &key,
-                        VersionId(api_request.version),
-                        governance,
-                    ),
-                    "delete version deadline exceeded",
-                )
-                .await?
-            }
-        };
-        Ok(Response::new(api_delete_version_outcome(outcome)))
+        delete_version::delete_version(self, request).await
     }
 
     async fn head_object(
         &self,
         request: Request<HeadObjectRequest>,
     ) -> Result<Response<ObjectHead>, Status> {
-        let plugin_scope = plugin_object_scope(&request);
-        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
-        let identity = ObjectReadIdentity::from_request(&request)?;
-        let path_access = object_path_access::access_for(&request);
-        let key = object_key(request.into_inner().address)?;
-        let caller = identity.caller_for_tenant(key.tenant())?;
-        object_path_access::require_key(&path_access, &key)?;
-        require_plugin_key_scope(plugin_scope.as_ref(), &key)?;
-        self.authorize_object(&caller, &key, ObjectPermission::Get)
-            .await?;
-        loop {
-            let (version, cursor) = self.reader.head_with_program_cursor(&key).await?;
-            match cursor {
-                Some(cursor) if !self.programs.cursor_is_visible(cursor)? => {
-                    self.programs
-                        .wait_for_cursor(cursor, deadline_remaining(deadline)?)
-                        .await?;
-                    continue;
-                }
-                _ => {
-                    return version.map_or_else(
-                        || Ok(Response::new(never_existed())),
-                        |version| api_head(&version).map(Response::new),
-                    );
-                }
-            }
-        }
+        object_read::head_object(self, request).await
     }
 
     async fn list_objects(
@@ -489,23 +482,17 @@ impl ObjectService for ObjectServiceImpl {
             .name_resolver
             .resolve_bucket_ids(&query.tenant, &query.bucket)
             .await?;
-        let page = self
-            .lister
-            .list_objects(
+        Ok(Response::new(
+            list_objects_scoped(
+                self,
                 bearer,
-                &query.tenant,
-                &query.bucket,
                 tenant_id,
                 bucket_id,
-                &query.prefix,
-                query.start_after.as_deref(),
-                query.limit,
+                query,
+                plugin_scope.as_ref(),
             )
-            .await?;
-        Ok(Response::new(ListObjectsResponse {
-            paths: page.paths,
-            has_more: page.has_more,
-        }))
+            .await?,
+        ))
     }
 
     type GetObjectStream = GetObjectStream;
@@ -514,51 +501,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<GetObjectRequest>,
     ) -> Result<Response<Self::GetObjectStream>, Status> {
-        let plugin_scope = plugin_object_scope(&request);
-        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
-        let identity = ObjectReadIdentity::from_request(&request)?;
-        let path_access = object_path_access::access_for(&request);
-        let request = request.into_inner();
-        let key = object_key(request.address)?;
-        let caller = identity.caller_for_tenant(key.tenant())?;
-        object_path_access::require_key(&path_access, &key)?;
-        require_plugin_key_scope(plugin_scope.as_ref(), &key)?;
-        if !object_path_access::is_internal(&path_access) {
-            self.authorize_object(&caller, &key, ObjectPermission::Get)
-                .await?;
-        }
-        if request.version.is_some() {
-            require_versioning_enabled(&self.store, &key)?;
-        }
-        let requested_version = request.version.map(VersionId);
-        let meter_public = !object_path_access::is_internal(&path_access);
-        loop {
-            let selected = self.reader.open(&key, requested_version).await?;
-            let cursor = selected
-                .as_ref()
-                .and_then(|object| object.program_commit_cursor);
-            match cursor {
-                Some(cursor) if !self.programs.cursor_is_visible(cursor)? => {
-                    self.programs
-                        .wait_for_cursor(cursor, deadline_remaining(deadline)?)
-                        .await?;
-                }
-                _ => {
-                    if meter_public
-                        && let Some(bytes) = selected
-                            .as_ref()
-                            .and_then(|object| object.version.blob.as_ref())
-                            .map(|blob| blob.length)
-                    {
-                        self.record_accounting_outbound(&key, bytes);
-                    }
-                    return distributed_reads::get_object_response(
-                        selected,
-                        requested_version.is_some(),
-                    );
-                }
-            }
-        }
+        object_read::get_object(self, request).await
     }
 
     type ListObjectVersionsStream = ListObjectVersionsStream;
@@ -567,39 +510,7 @@ impl ObjectService for ObjectServiceImpl {
         &self,
         request: Request<ListObjectVersionsRequest>,
     ) -> Result<Response<Self::ListObjectVersionsStream>, Status> {
-        let plugin_scope = plugin_object_scope(&request);
-        let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
-        let identity = ObjectReadIdentity::from_request(&request)?;
-        let path_access = object_path_access::access_for(&request);
-        let key = object_key(request.into_inner().address)?;
-        let caller = identity.caller_for_tenant(key.tenant())?;
-        object_path_access::require_key(&path_access, &key)?;
-        require_plugin_key_scope(plugin_scope.as_ref(), &key)?;
-        self.authorize_object(&caller, &key, ObjectPermission::Get)
-            .await?;
-        let governance = self
-            .bucket_governance
-            .resolve(key.tenant(), key.bucket())
-            .await?;
-        require_governance_versioning_enabled(&governance)?;
-
-        loop {
-            let snapshot = self.distribution.reconciled_object_snapshot(&key).await?;
-            let cursor = snapshot.as_ref().and_then(|snapshot| {
-                snapshot
-                    .head
-                    .mutation_stamp
-                    .and_then(|stamp| stamp.program_commit_cursor)
-            });
-            match cursor {
-                Some(cursor) if !self.programs.cursor_is_visible(cursor)? => {
-                    self.programs
-                        .wait_for_cursor(cursor, deadline_remaining(deadline)?)
-                        .await?;
-                }
-                _ => return distributed_reads::list_object_versions_response(snapshot, &key),
-            }
-        }
+        object_read::list_object_versions(self, request).await
     }
 
     async fn bulk_write(
@@ -619,14 +530,12 @@ impl ObjectService for ObjectServiceImpl {
             let path_access = object_path_access::access_for(&request);
             let meter_public = !peer_routed && !object_path_access::is_internal(&path_access);
             let bearer = OriginalBearer::from_metadata(request.metadata())?;
-            let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
+            let deadline = request_deadline(request.metadata(), self.bulk_write_timeout)?;
             let route_budget =
-                effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+                effective_request_timeout(request.metadata(), self.bulk_write_timeout);
             let operations = request.into_inner().operations;
             validate_bulk_limits(&operations)?;
             object_path_access::validate_definition_intents(&path_access, operations.len())?;
-            let validation_started = Instant::now();
-
             let mut local = Vec::with_capacity(operations.len());
             let mut remote = BTreeMap::<
                 Vec<u64>,
@@ -640,52 +549,28 @@ impl ObjectService for ObjectServiceImpl {
                     )>,
                 ),
             >::new();
-            let mut outcomes = Vec::new();
-            let mut pending = Vec::with_capacity(operations.len());
-            for (index, operation) in operations.into_iter().enumerate() {
-                match bulk::validate_operation(&operation, self.max_blob_bytes) {
-                    Ok((key, permission)) => {
-                        match object_path_access::require_key(&path_access, &key)
-                            .and_then(|()| require_plugin_key_scope(plugin_scope.as_ref(), &key))
-                            .and_then(|()| require_caller_tenant(&caller, &key))
-                        {
-                            Ok(()) => pending.push((
-                                index,
-                                operation,
-                                key.clone(),
-                                permission,
-                                object_path_access::definition_intent(&path_access, index),
-                            )),
-                            Err(error) => outcomes.push(bulk_authorization_failure(index, &error)),
-                        }
-                    }
-                    Err(error) => outcomes.push(BulkOutcome {
-                        index: index as u32,
-                        outcome: Some(keldra_api::v1::bulk_outcome::Outcome::Failure(
-                            api_request_failure(error),
-                        )),
-                    }),
-                }
-            }
-            let validation_duration = validation_started.elapsed();
-            let authorization_requests = pending
-                .iter()
-                .map(|(_, _, key, permission, _)| (key.clone(), *permission))
-                .collect::<Vec<_>>();
-            let authorization_started = Instant::now();
-            let allowed = if object_path_access::is_internal(&path_access) {
-                vec![true; authorization_requests.len()]
-            } else if authorization_requests.is_empty() {
-                Vec::new()
-            } else {
-                self.authoritative_system
-                    .allows_objects(&caller, &authorization_requests)
-                    .await?
-            };
-            let authorization_duration = authorization_started.elapsed();
+            let prepared = bulk_alias::prepare_before_live_dispatch(
+                self,
+                &caller,
+                &path_access,
+                plugin_scope.as_ref(),
+                operations,
+                peer_routed,
+                deadline,
+            )
+            .await?;
+            let validation_duration = prepared.validation_duration;
+            let authorization_duration = prepared.authorization_duration;
+            let replay_identity_duration = prepared.identity_resolution_duration;
+            let mut outcomes = prepared.outcomes;
+            let prepared_items = prepared.items;
             let identity_started = Instant::now();
             let mut stable_buckets = BTreeMap::<String, BTreeMap<String, (u64, u64)>>::new();
-            for (_, _, key, _, _) in &pending {
+            for item in &prepared_items {
+                let key = &item.requested;
+                if item.operation.is_none() {
+                    continue;
+                }
                 let known = stable_buckets
                     .get(key.tenant())
                     .is_some_and(|tenant| tenant.contains_key(key.bucket()));
@@ -702,17 +587,37 @@ impl ObjectService for ObjectServiceImpl {
             }
             let placement = self.distribution.current_program_placement()?;
             let single_node = placement.active_node_ids().len() == 1;
-            let identity_duration = identity_started.elapsed();
+            let identity_duration =
+                replay_identity_duration.saturating_add(identity_started.elapsed());
             let routing_started = Instant::now();
             let mut accounting_inbound = Vec::<(u64, u64, String, u64)>::new();
-            for ((index, operation, key, _permission, definition_intent), allowed) in
-                pending.into_iter().zip(allowed)
-            {
-                if !allowed {
-                    outcomes.push(bulk_authorization_failure(
+            let mut alias_items = Vec::new();
+            for item in prepared_items {
+                let index = item.index;
+                let key = item.requested;
+                if let Some(receipt) = item.replay_receipt {
+                    if meter_public && item.inbound_bytes != 0 {
+                        self.record_accounting_inbound(&key, item.inbound_bytes);
+                    }
+                    outcomes.push(BulkOutcome {
+                        index: index as u32,
+                        outcome: Some(keldra_api::v1::bulk_outcome::Outcome::Receipt(receipt)),
+                    });
+                    continue;
+                }
+                let operation = item
+                    .operation
+                    .ok_or_else(|| Status::internal("prepared bulk operation is absent"))?;
+                let definition_intent = item.definition_intent;
+                let resolution = item
+                    .resolution
+                    .ok_or_else(|| Status::internal("prepared bulk resolution is absent"))?;
+                if let object_link::ResolvedAddress::Link(link) = resolution {
+                    alias_items.push(bulk_alias::AliasBulkItem {
                         index,
-                        &Status::permission_denied("bulk object operation is not authorized"),
-                    ));
+                        operation,
+                        link,
+                    });
                     continue;
                 }
                 let (tenant_id, bucket_id) = stable_buckets
@@ -805,21 +710,45 @@ impl ObjectService for ObjectServiceImpl {
                 ));
             }
             let dispatch_started = Instant::now();
+            let bearer_token = bearer.signed_token().to_owned();
+            let dispatch_operation_count = local_indices.len()
+                + remote
+                    .values()
+                    .map(|(_, _, items)| items.len())
+                    .sum::<usize>();
+            let dispatched = run_request_until(
+                deadline,
+                bulk::execute_coordinator_groups(
+                    self.distribution.clone(),
+                    self.cluster_peers.clone(),
+                    local_indices,
+                    local_operations,
+                    remote,
+                    bearer_token.clone(),
+                    object_path_access::is_internal(&path_access),
+                    started,
+                    route_budget,
+                ),
+                "bulk write deadline exceeded",
+            )
+            .await;
+            if let Err(error) = &dispatched {
+                bulk::record_dispatch_interruption(
+                    error,
+                    dispatch_operation_count,
+                    encoded_bytes,
+                    dispatch_started.elapsed(),
+                );
+            }
+            outcomes.extend(dispatched?);
             outcomes.extend(
-                run_request_until(
+                bulk_alias::execute(
+                    self.clone(),
+                    caller.clone(),
+                    bearer_token,
+                    alias_items,
                     deadline,
-                    bulk::execute_coordinator_groups(
-                        self.distribution.clone(),
-                        self.cluster_peers.clone(),
-                        local_indices,
-                        local_operations,
-                        remote,
-                        bearer.signed_token().to_owned(),
-                        object_path_access::is_internal(&path_access),
-                        started,
-                        route_budget,
-                    ),
-                    "bulk write deadline exceeded",
+                    meter_public,
                 )
                 .await?,
             );
@@ -932,7 +861,17 @@ impl ObjectService for ObjectServiceImpl {
             let candidate = identity.caller_for_tenant(key.tenant())?;
             let caller = caller.get_or_insert(candidate);
             match require_caller_tenant(caller, &key) {
-                Ok(()) => pending.push((index, key, request.version.map(VersionId))),
+                Ok(()) => {
+                    let resolution = object_link::resolve_current(self, key.clone()).await?;
+                    let canonical = resolution.canonical();
+                    if let Err(error) = object_path_access::require_key(&path_access, canonical)
+                        .and_then(|()| require_plugin_key_scope(plugin_scope.as_ref(), canonical))
+                    {
+                        outcomes.push(batch_get_authorization_failure(index, &key, &error));
+                        continue;
+                    }
+                    pending.push((index, key, resolution, request.version.map(VersionId)));
+                }
                 Err(error) if error.code() == tonic::Code::PermissionDenied => {
                     outcomes.push(batch_get_authorization_failure(index, &key, &error));
                 }
@@ -941,7 +880,7 @@ impl ObjectService for ObjectServiceImpl {
         }
         let authorization_requests = pending
             .iter()
-            .map(|(_, key, _)| (key.clone(), ObjectPermission::Get))
+            .map(|(_, _, resolution, _)| (resolution.canonical().clone(), ObjectPermission::Get))
             .collect::<Vec<_>>();
         let allowed = if authorization_requests.is_empty() {
             Vec::new()
@@ -955,7 +894,10 @@ impl ObjectService for ObjectServiceImpl {
                 )
                 .await?
         };
-        for ((index, key, requested_version), allowed) in pending.into_iter().zip(allowed) {
+        let mut link_bindings = Vec::new();
+        for ((index, key, resolution, requested_version), allowed) in
+            pending.into_iter().zip(allowed)
+        {
             if !allowed {
                 outcomes.push(batch_get_authorization_failure(
                     index,
@@ -965,7 +907,8 @@ impl ObjectService for ObjectServiceImpl {
                 continue;
             }
             if requested_version.is_some()
-                && !bucket_versioning_enabled(&self.store, &key).map_err(status)?
+                && !bucket_versioning_enabled(&self.store, resolution.canonical())
+                    .map_err(status)?
             {
                 outcomes.push(BatchGetOutcome {
                     index: index as u32,
@@ -978,7 +921,15 @@ impl ObjectService for ObjectServiceImpl {
                 });
                 continue;
             }
-            accepted.push((index, key, requested_version));
+            if matches!(resolution, object_link::ResolvedAddress::Link(_)) {
+                link_bindings.push(resolution.clone());
+            }
+            accepted.push((
+                index,
+                key,
+                resolution.canonical().clone(),
+                requested_version,
+            ));
         }
         loop {
             let (read_outcomes, cursor) = batch_get::read_accepted(
@@ -995,6 +946,13 @@ impl ObjectService for ObjectServiceImpl {
                     .wait_for_cursor(cursor, deadline_remaining(deadline)?)
                     .await?;
                 continue;
+            }
+            for binding in &link_bindings {
+                if !object_link::revalidate(self, binding).await? {
+                    return Err(Status::aborted(
+                        "object-link binding changed during BatchGet",
+                    ));
+                }
             }
             outcomes.extend(read_outcomes);
             outcomes.sort_unstable_by_key(|outcome| outcome.index);
@@ -1029,8 +987,7 @@ impl ObjectService for ObjectServiceImpl {
             .is_some();
         let caller = authenticated_caller(&request)?;
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
-        let remaining =
-            effective_atomic_program_timeout(request.metadata(), self.atomic_program_timeout);
+        let remaining = effective_request_timeout(request.metadata(), self.atomic_program_timeout);
         let api_request = request.into_inner();
         let policy = api_request
             .policy
@@ -1093,7 +1050,7 @@ impl ObjectService for ObjectServiceImpl {
     }
 }
 
-fn effective_atomic_program_timeout(metadata: &MetadataMap, server_maximum: Duration) -> Duration {
+fn effective_request_timeout(metadata: &MetadataMap, server_maximum: Duration) -> Duration {
     client_grpc_timeout(metadata).map_or(server_maximum, |client| client.min(server_maximum))
 }
 
@@ -1102,7 +1059,7 @@ pub(crate) fn request_deadline(
     server_maximum: Duration,
 ) -> Result<tokio::time::Instant, Status> {
     tokio::time::Instant::now()
-        .checked_add(effective_atomic_program_timeout(metadata, server_maximum))
+        .checked_add(effective_request_timeout(metadata, server_maximum))
         .ok_or_else(|| Status::internal("configured request timeout exceeds clock"))
 }
 
@@ -1115,9 +1072,6 @@ pub(crate) fn deadline_remaining(deadline: tokio::time::Instant) -> Result<Durat
     }
 }
 
-// Tonic enforces the same grpc-timeout grammar at the transport boundary. We
-// parse it here as well so InvokeProgram has one explicit absolute budget that
-// can be shorter than, but never longer than, the configured server maximum.
 fn client_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
     let encoded = metadata.get("grpc-timeout")?.to_str().ok()?;
     if encoded.is_empty() {
@@ -1212,6 +1166,10 @@ impl ObjectServiceImpl {
             command_id: metadata.command_id.clone(),
             durability: token_durability(metadata.durability)?,
             operation,
+            link: metadata.link.as_ref().map(|link| CanonicalLinkBinding {
+                path: link.link.path().to_owned(),
+                descriptor_version: link.descriptor_version.0,
+            }),
         };
         self.issue_put_capability(
             caller,
@@ -1314,7 +1272,27 @@ impl CanonicalPutHeader {
         Ok(PutMetadata {
             key: ObjectKey::new(&self.tenant, &self.bucket, &self.path)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
-            content_type: self.content_type.clone(),
+            link: self
+                .link
+                .as_ref()
+                .map(|binding| {
+                    if binding.descriptor_version == 0 {
+                        return Err(Status::invalid_argument(
+                            "put token link descriptor version is zero",
+                        ));
+                    }
+                    let target = ObjectKey::new(&self.tenant, &self.bucket, &self.path)
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                    let link = ObjectKey::new(&self.tenant, &self.bucket, &binding.path)
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                    Ok(keldra_store::ResolvedObjectLink {
+                        link,
+                        descriptor_version: VersionId(binding.descriptor_version),
+                        target,
+                    })
+                })
+                .transpose()?,
+            content_type: content_type(self.content_type.clone().unwrap_or_default())?,
             command_id: required_command_id(self.command_id.clone())?,
             durability,
             mode,
@@ -1324,7 +1302,9 @@ impl CanonicalPutHeader {
 
 fn batch_operation_permission(operation: &BatchOperation) -> ObjectPermission {
     match operation {
-        BatchOperation::Put(_) | BatchOperation::Publish(_) => ObjectPermission::Put,
+        BatchOperation::Put(_) | BatchOperation::Publish(_) | BatchOperation::Clone(_) => {
+            ObjectPermission::Put
+        }
         BatchOperation::Delete(_) => ObjectPermission::Delete,
     }
 }
@@ -1333,6 +1313,7 @@ fn batch_operation_key(operation: &BatchOperation) -> &ObjectKey {
     match operation {
         BatchOperation::Put(request) => &request.key,
         BatchOperation::Publish(request) => &request.key,
+        BatchOperation::Clone(request) => &request.destination,
         BatchOperation::Delete(request) => &request.key,
     }
 }
@@ -1362,90 +1343,6 @@ fn batch_get_authorization_failure(
             code: ReadFailureCode::AuthorizationDenied as i32,
             message: error.message().to_owned(),
         })),
-    }
-}
-
-fn authorize_program_dependency(
-    authorization: &SystemAuthorization,
-    caller: &Caller,
-    dependency: &ExpandedProgramPath,
-) -> Result<(), Status> {
-    let key = ObjectKey::new(
-        &dependency.path.tenant,
-        &dependency.path.bucket,
-        &dependency.path.path,
-    )
-    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    object_path_access::require_public_key(&key)?;
-    require_caller_tenant(caller, &key)?;
-    for (required, permission, message) in [
-        (
-            dependency.intent.get,
-            ObjectPermission::Get,
-            "atomic program dependency read is not authorized",
-        ),
-        (
-            dependency.intent.put,
-            ObjectPermission::Put,
-            "atomic program dependency put is not authorized",
-        ),
-        (
-            dependency.intent.delete,
-            ObjectPermission::Delete,
-            "atomic program dependency delete is not authorized",
-        ),
-    ] {
-        if required {
-            require_authorized(
-                authorization
-                    .allows_object(caller.subject(), &key, permission)
-                    .map_err(crate::authz_api::authz_status)?,
-                message,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-async fn authorize_program_dependencies_authoritatively(
-    authorization: &AuthoritativeSystemAuthorization,
-    governance: &BucketGovernance,
-    caller: &Caller,
-    dependencies: Vec<ExpandedProgramPath>,
-) -> Result<(), Status> {
-    let mut requests = Vec::new();
-    for dependency in dependencies {
-        let key = ObjectKey::new(
-            &dependency.path.tenant,
-            &dependency.path.bucket,
-            &dependency.path.path,
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        object_path_access::require_public_key(&key)?;
-        require_caller_tenant(caller, &key)?;
-        let policy = governance.resolve(key.tenant(), key.bucket()).await?;
-        if !policy.policy.is_program_only(key.path()) {
-            return Err(Status::failed_precondition(
-                "PROGRAM_CONCURRENCY_VIOLATION: every atomic program dependency must be PROGRAM_ONLY",
-            ));
-        }
-        for (required, permission) in [
-            (dependency.intent.get, ObjectPermission::Get),
-            (dependency.intent.put, ObjectPermission::Put),
-            (dependency.intent.delete, ObjectPermission::Delete),
-        ] {
-            if required {
-                requests.push((key.clone(), permission));
-            }
-        }
-    }
-    let allowed = authorization.allows_objects(caller, &requests).await?;
-    if allowed.into_iter().all(|allowed| allowed) {
-        Ok(())
-    } else {
-        Err(Status::permission_denied(
-            "atomic program dependency is not authorized",
-        ))
     }
 }
 
@@ -1613,6 +1510,7 @@ fn put_metadata(request: PutHeader) -> Result<PutMetadata, Status> {
     };
     Ok(PutMetadata {
         key: object_key(request.address)?,
+        link: None,
         content_type: content_type(request.content_type)?,
         command_id: required_command_id(request.command_id)?,
         durability: durability(request.durability)?,
@@ -1706,7 +1604,7 @@ fn batch_operation(
                 ));
             }
         }
-        BatchOperation::Publish(_) | BatchOperation::Delete(_) => {}
+        BatchOperation::Publish(_) | BatchOperation::Clone(_) | BatchOperation::Delete(_) => {}
     }
     Ok(operation)
 }
@@ -1725,33 +1623,6 @@ fn object_key(address: Option<ObjectAddress>) -> Result<ObjectKey, Status> {
     let address = address.ok_or_else(|| Status::invalid_argument("object address is required"))?;
     ObjectKey::new(address.tenant, address.bucket, address.path)
         .map_err(|error| Status::invalid_argument(error.to_string()))
-}
-
-fn list_objects_query(request: ListObjectsRequest) -> Result<ListObjectsQuery, Status> {
-    if request.prefix.len() > MAX_OBJECT_PATH_BYTES {
-        return Err(Status::invalid_argument(format!(
-            "list prefix exceeds {MAX_OBJECT_PATH_BYTES} UTF-8 bytes"
-        )));
-    }
-    let validation_path = request.start_after.as_deref().unwrap_or("_list");
-    ObjectKey::new(&request.tenant, &request.bucket, validation_path)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let limit = match request.limit as usize {
-        0 => DEFAULT_LIST_OBJECTS_LIMIT,
-        limit if limit <= MAX_LIST_OBJECTS => limit,
-        _ => {
-            return Err(Status::invalid_argument(format!(
-                "list limit must not exceed {MAX_LIST_OBJECTS}"
-            )));
-        }
-    };
-    Ok(ListObjectsQuery {
-        tenant: request.tenant,
-        bucket: request.bucket,
-        prefix: request.prefix,
-        start_after: request.start_after,
-        limit,
-    })
 }
 
 fn required_hash(value: &[u8], name: &'static str) -> Result<[u8; 32], Status> {
@@ -1869,11 +1740,11 @@ fn status(error: MutationError) -> Status {
             Status::failed_precondition(format!("PROGRAM_CONCURRENCY_VIOLATION: {error}"))
         }
         MutationError::PreconditionFailed { .. }
+        | MutationError::AtomicReservationConflict { .. }
         | MutationError::Immutable
         | MutationError::ImmutablePolicyRequired
-        | MutationError::ObjectVersioningNotEnabled => {
-            Status::failed_precondition(error.to_string())
-        }
+        | MutationError::ObjectVersioningNotEnabled
+        | MutationError::ObjectHasInboundAliases => Status::failed_precondition(error.to_string()),
         MutationError::CurrentTombstoneCannotBeDeleted => Status::failed_precondition(format!(
             "CURRENT_TOMBSTONE_VERSION_CANNOT_BE_DELETED: {error}"
         )),
@@ -1975,21 +1846,6 @@ fn enforce_batch_get_payload_limit(declared_payload_bytes: u64) -> Result<(), St
 
 fn internal(error: impl std::fmt::Display) -> Status {
     Status::internal(error.to_string())
-}
-
-fn content_type(value: String) -> Result<Option<String>, Status> {
-    if value.len() > MAX_CONTENT_TYPE_BYTES {
-        Err(Status::invalid_argument(format!(
-            "content_type exceeds {MAX_CONTENT_TYPE_BYTES} UTF-8 bytes"
-        )))
-    } else {
-        Ok((!value.is_empty()).then_some(value))
-    }
-}
-
-fn required_command_id(value: String) -> Result<String, Status> {
-    validate_command_id(&value)?;
-    Ok(value)
 }
 
 #[cfg(test)]

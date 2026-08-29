@@ -35,6 +35,7 @@ fn text_schema() -> Schema {
             collation: Collation::BinaryUtf8,
             capabilities: FieldCapabilities::FULL_TEXT,
             analyzer: Some(Analyzer::UnicodeAlphanumericLowercase),
+            date_format: None,
             components: FieldComponents::TERMS
                 .union(FieldComponents::POSITIONS)
                 .union(FieldComponents::NORMS),
@@ -184,6 +185,7 @@ fn statistics_limit_is_enforced_before_writer_buffers_are_allocated() {
                 .union(FieldCapabilities::FACET)
                 .union(FieldCapabilities::AGGREGATE),
             analyzer: None,
+            date_format: None,
             components: FieldComponents::POINTS.union(FieldComponents::DOC_VALUES),
         })
         .collect();

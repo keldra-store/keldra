@@ -20,6 +20,27 @@ message PeerContext {
   uint32 remaining_deadline_millis = 7;
 }
 
+message UpdateLocalCapabilitiesRequest {
+  PeerContext peer = 1;
+  uint32 expected_protocol_min = 2;
+  uint32 expected_protocol_max = 3;
+  uint32 expected_storage_min = 4;
+  uint32 expected_storage_max = 5;
+  uint32 replacement_protocol_min = 6;
+  uint32 replacement_protocol_max = 7;
+  uint32 replacement_storage_min = 8;
+  uint32 replacement_storage_max = 9;
+}
+
+message LocalCapabilitiesUpdated {
+  uint32 schema_version = 1;
+  uint64 node_id = 2;
+  uint32 protocol_min = 3;
+  uint32 protocol_max = 4;
+  uint32 storage_min = 5;
+  uint32 storage_max = 6;
+}
+
 message LogicalRecordReadRequest {
   PeerContext peer = 1;
   bytes id_json = 2;
@@ -295,11 +316,32 @@ message RoutePutEndRequest {
 message RouteDeleteRequest {
   PeerContext peer = 1;
   keldra.v1.DeleteRequest request = 2;
+  // Set only by the authenticated atomic executor after an exact built-in
+  // replay miss, when forwarding the ordinary mutation to its path owner.
+  bool atomic_executor_replay_checked = 3;
 }
 
 message RouteDeleteIfVersionRequest {
   PeerContext peer = 1;
   keldra.v1.DeleteIfVersionRequest request = 2;
+  // Set only by the authenticated atomic executor after an exact built-in
+  // replay miss, when forwarding the ordinary mutation to its path owner.
+  bool atomic_executor_replay_checked = 3;
+}
+
+message RouteCloneObjectRequest {
+  PeerContext peer = 1;
+  keldra.v1.CloneObjectRequest request = 2;
+}
+
+message RouteLinkObjectRequest {
+  PeerContext peer = 1;
+  keldra.v1.LinkObjectRequest request = 2;
+}
+
+message RouteUnlinkObjectRequest {
+  PeerContext peer = 1;
+  keldra.v1.UnlinkObjectRequest request = 2;
 }
 
 message RouteBulkWriteRequest {
@@ -422,6 +464,9 @@ message RouteSetBucketPolicyRequest {
 message RouteDeleteVersionRequest {
   PeerContext peer = 1;
   keldra.v1.DeleteVersionRequest request = 2;
+  // Present only when an authenticated ingress resolved a public alias to the
+  // canonical target routed in request.address.
+  keldra.v1.ObjectAddress original_alias = 3;
 }
 
 message CoordinateLogicalRecordRequest {
@@ -459,10 +504,66 @@ message RouteInvokeProgramRequest {
   keldra.v1.InvokeProgramRequest request = 2;
 }
 
+message BuiltInReplayLookup {
+  uint32 original_index = 1;
+  uint32 authority_kind = 2;
+  uint32 contract_version = 3;
+  bytes invocation_id = 4;
+  bytes input_fingerprint = 5;
+}
+
+message RouteBuiltInReplayBatchRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  repeated BuiltInReplayLookup lookups = 3;
+}
+
+message BuiltInReplayOutcome {
+  uint32 original_index = 1;
+  // Empty means an authoritative miss; a hit is the exact sealed result JSON.
+  bytes result_json = 2;
+  int32 error_code = 3;
+  string error_message = 4;
+}
+
+message RouteBuiltInReplayBatchResponse {
+  uint32 schema_version = 1;
+  repeated BuiltInReplayOutcome outcomes = 2;
+}
+
 message ProgramStagePathRequest {
   PeerContext peer = 1;
   uint64 executor_nomination_log_index = 2;
   bytes stage_json = 3;
+}
+
+// Durable HRW participant reservations are opaque typed Store values on the
+// mandatory-mTLS lane. The receiver validates their complete identity against
+// the current Raft Begin/Commit/Abort decision before touching local storage.
+message ProgramReserveParticipantRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  bytes reservation_json = 3;
+}
+
+message ProgramCommitParticipantRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  uint64 commit_cursor = 3;
+  bytes reservation_json = 4;
+}
+
+message ProgramReleaseParticipantRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  bytes reservation_json = 3;
+  // Zero releases an aborted preparation. Non-zero releases only after
+  // FinalizedThrough has durably crossed this exact commit cursor.
+  uint64 finalized_commit_cursor = 4;
+}
+
+message ProgramParticipantReservationApplied {
+  uint32 schema_version = 1;
 }
 
 message ProgramStagePathResponse {
@@ -494,6 +595,42 @@ message ProgramPathFinalizationApplied {
   uint32 schema_version = 1;
   uint64 version = 2;
   bool replayed = 3;
+}
+
+message ProgramCoordinateAliasRegistryFinalizationRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  uint64 commit_cursor = 3;
+  bytes stage_json = 4;
+}
+
+message ProgramCoordinatedAliasRegistryFinalization {
+  uint32 schema_version = 1;
+  bytes mutation_json = 2;
+}
+
+message ProgramApplyAliasRegistryFinalizationRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  bytes mutation_json = 3;
+}
+
+message ProgramAliasRegistryFinalizationApplied {
+  uint32 schema_version = 1;
+  bool changed = 2;
+}
+
+message ProgramReadAliasRegistryRequest {
+  PeerContext peer = 1;
+  uint64 executor_nomination_log_index = 2;
+  uint64 tenant_id = 3;
+  uint64 bucket_id = 4;
+  string canonical_path = 5;
+}
+
+message ProgramAliasRegistryRead {
+  uint32 schema_version = 1;
+  optional bytes registry_json = 2;
 }
 
 // Narrow internal route for one immutable index artifact or CAS current
@@ -884,6 +1021,9 @@ message AccountingMatcherCacheInvalidated {
 // It exposes typed logical operations, never RocksDB keys, column-family
 // values, or a generic public-method tunnel.
 service ClusterPeer {
+  // One ACTIVE mTLS-authenticated node may attest only its own expanded
+  // support range. The current Raft leader commits the exact CAS update.
+  rpc UpdateLocalCapabilities(UpdateLocalCapabilitiesRequest) returns (LocalCapabilitiesUpdated);
   rpc ResolveTenantName(ResolveTenantNameRequest) returns (ResolveTenantNameResult);
   rpc ResolveBucketName(ResolveBucketNameRequest) returns (ResolveBucketNameResult);
   rpc ReadLogicalRecord(LogicalRecordReadRequest) returns (LogicalRecordCandidate);
@@ -907,6 +1047,9 @@ service ClusterPeer {
   rpc RoutePutEnd(RoutePutEndRequest) returns (keldra.v1.MutationReceipt);
   rpc RouteDelete(RouteDeleteRequest) returns (keldra.v1.MutationReceipt);
   rpc RouteDeleteIfVersion(RouteDeleteIfVersionRequest) returns (keldra.v1.MutationReceipt);
+  rpc RouteCloneObject(RouteCloneObjectRequest) returns (keldra.v1.MutationReceipt);
+  rpc RouteLinkObject(RouteLinkObjectRequest) returns (keldra.v1.MutationReceipt);
+  rpc RouteUnlinkObject(RouteUnlinkObjectRequest) returns (keldra.v1.MutationReceipt);
   rpc RouteBulkWrite(RouteBulkWriteRequest) returns (keldra.v1.BulkWriteResponse);
   // Dedicated mandatory-mTLS routes for an in-process trusted adapter. The
   // internal capability is reconstructed at the destination and is never a
@@ -925,6 +1068,7 @@ service ClusterPeer {
   rpc RouteAdminSetBucketPublicRead(RouteAdminSetBucketPublicReadRequest) returns (keldra.v1.SetBucketPublicReadResponse);
   rpc RouteAdminChangeApplicationRole(RouteAdminChangeApplicationRoleRequest) returns (keldra.v1.ApplicationRoleResponse);
   rpc RouteInvokeProgram(RouteInvokeProgramRequest) returns (keldra.v1.InvokeProgramResponse);
+  rpc RouteBuiltInReplayBatch(RouteBuiltInReplayBatchRequest) returns (RouteBuiltInReplayBatchResponse);
   rpc RouteAuthzPutSchema(RouteAuthzPutSchemaRequest) returns (keldra.v1.PutSchemaResponse);
   rpc RouteAuthzBindSchema(RouteAuthzBindSchemaRequest) returns (keldra.v1.BindSchemaResponse);
   rpc RouteAuthzGetBinding(RouteAuthzGetBindingRequest) returns (keldra.v1.GetBindingResponse);
@@ -936,9 +1080,15 @@ service ClusterPeer {
   rpc RouteSetBucketPolicy(RouteSetBucketPolicyRequest) returns (keldra.v1.BucketPolicy);
   rpc RouteDeleteVersion(RouteDeleteVersionRequest) returns (keldra.v1.DeleteVersionResponse);
 
+  rpc ReserveProgramParticipant(ProgramReserveParticipantRequest) returns (ProgramParticipantReservationApplied);
+  rpc CommitProgramParticipant(ProgramCommitParticipantRequest) returns (ProgramParticipantReservationApplied);
+  rpc ReleaseProgramParticipant(ProgramReleaseParticipantRequest) returns (ProgramParticipantReservationApplied);
   rpc StageProgramPath(ProgramStagePathRequest) returns (ProgramStagePathResponse);
   rpc CoordinateProgramPathFinalization(ProgramCoordinatePathFinalizationRequest) returns (ProgramCoordinatedPathFinalization);
   rpc ApplyProgramPathFinalization(ProgramApplyPathFinalizationRequest) returns (ProgramPathFinalizationApplied);
+  rpc CoordinateProgramAliasRegistryFinalization(ProgramCoordinateAliasRegistryFinalizationRequest) returns (ProgramCoordinatedAliasRegistryFinalization);
+  rpc ApplyProgramAliasRegistryFinalization(ProgramApplyAliasRegistryFinalizationRequest) returns (ProgramAliasRegistryFinalizationApplied);
+  rpc ReadProgramAliasRegistry(ProgramReadAliasRegistryRequest) returns (ProgramAliasRegistryRead);
 
   rpc PublishIndexArtifact(PublishIndexArtifactRequest) returns (IndexArtifactPublished);
   rpc PublishIndexArtifacts(PublishIndexArtifactsRequest) returns (IndexArtifactsPublished);

@@ -6,12 +6,14 @@ use keldra_api::v1::{
     UpdateIndexRequest,
 };
 use keldra_atomic_program::MAX_OBJECT_PATH_BYTES;
+use keldra_index::v4::DateFormat;
 use keldra_store::INDEX_DEFINITION_PREFIX;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use tonic::Status;
 
+use crate::index_runtime::date::validate_format;
 use crate::index_runtime::v4_schema::compile_schema;
 
 const STORED_DEFINITION_FORMAT: u16 = 4;
@@ -395,6 +397,15 @@ fn validate_typed_json_field(field: &IndexField) -> Result<(), Status> {
         TextAnalyzer::try_from(text.analyzer)
             .map_err(|_| Status::invalid_argument("typed JSON text analyzer is unknown"))?;
     }
+    if let FieldType::Date(date) = field_type {
+        let format = if date.strftime_pattern.is_empty() {
+            DateFormat::Iso8601
+        } else {
+            DateFormat::Strftime(date.strftime_pattern.clone())
+        };
+        validate_format(&format)
+            .map_err(|error| Status::invalid_argument(format!("invalid Date format: {error}")))?;
+    }
 
     if field.capabilities.is_empty() {
         return Err(Status::invalid_argument(
@@ -451,6 +462,13 @@ fn capability_allowed(field_type: &FieldType, capability: IndexFieldCapability) 
                 | IndexFieldCapability::Facet
         ),
         FieldType::Text(_) => capability == IndexFieldCapability::FullText,
+        FieldType::Date(_) => matches!(
+            capability,
+            IndexFieldCapability::Exact
+                | IndexFieldCapability::Range
+                | IndexFieldCapability::Order
+                | IndexFieldCapability::Facet
+        ),
     }
 }
 
@@ -604,8 +622,8 @@ fn validate_explicit_rebuild(accepted_at_unix_millis: u64) -> Result<(), Status>
 #[cfg(test)]
 mod tests {
     use keldra_api::v1::{
-        IndexOrder, KeywordIndexField, PathIndexSpec, SignedIntegerIndexField, TensorIndexSpec,
-        TypedJsonIndexSpec, index_specification,
+        DateIndexField, IndexOrder, KeywordIndexField, PathIndexSpec, SignedIntegerIndexField,
+        TensorIndexSpec, TypedJsonIndexSpec, index_specification,
     };
 
     use super::*;
@@ -805,6 +823,49 @@ mod tests {
             .push(IndexFieldCapability::Order as i32);
         assert_eq!(
             validate_create_definition(&duplicate).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn typed_date_accepts_only_date_capabilities() {
+        let mut request = typed_json_request();
+        let Some(IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(specification)),
+        }) = request.specification.as_mut()
+        else {
+            unreachable!();
+        };
+        specification.fields[0].field_type = Some(FieldType::Date(DateIndexField {
+            strftime_pattern: String::new(),
+        }));
+        specification.fields[0].capabilities = vec![
+            IndexFieldCapability::Exact as i32,
+            IndexFieldCapability::Range as i32,
+            IndexFieldCapability::Order as i32,
+            IndexFieldCapability::Facet as i32,
+        ];
+        assert!(validate_typed_json_field(&specification.fields[0]).is_ok());
+
+        specification.fields[0]
+            .capabilities
+            .push(IndexFieldCapability::Aggregate as i32);
+        assert_eq!(
+            validate_typed_json_field(&specification.fields[0])
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        specification.fields[0].capabilities.pop();
+        let Some(FieldType::Date(date)) = specification.fields[0].field_type.as_mut() else {
+            unreachable!();
+        };
+        date.strftime_pattern = "%Y-%B-%d".into();
+        assert_eq!(
+            validate_typed_json_field(&specification.fields[0])
+                .unwrap_err()
+                .code(),
             tonic::Code::InvalidArgument
         );
     }

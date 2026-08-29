@@ -65,8 +65,8 @@ jobs:
     timeout-minutes: 120
     env:
       KELDRA_GATE_STEP_TIMEOUT_SECONDS: '5400'
-      KELDRA_RUST_TEST_THREADS: '8'
-      CARGO_BUILD_JOBS: '8'
+      KELDRA_RUST_TEST_THREADS: '2'
+      CARGO_BUILD_JOBS: '1'
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - name: Checkout release commit
@@ -326,18 +326,33 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Keldra ${{ needs.release-context.outputs.tag }} keeps public index
-            queries responsive during sustained mutation load by publishing
-            journal-backed immutable segment cohorts, coalescing live-mask
-            changes, and aligning index publication with the Store commit
-            authority.
+            Keldra ${{ needs.release-context.outputs.tag }} adds typed date
+            fields, zero-copy object clones, protected transparent object links,
+            and durable reservations that let atomic programs safely operate on
+            authorized ordinary paths without requiring PROGRAM_ONLY policy.
 
-            Public Typed JSON and Metadata Filter queries now expose bounded
-            nested conjunction, disjunction, and negation expressions as a
-            clean protocol break from the former flat predicate list.
+            Date fields accept ISO 8601 by default or one configured strftime
+            format, normalize to signed Unix epoch milliseconds in the index,
+            and support exact, range, order, and facet queries. Clones share the
+            source payload without copying bytes but retain independent version
+            lineages. Links are mutable aliases to one canonical target: writes
+            through any linked name update that target, unlink removes only the
+            alias, and target deletion is fenced while inbound links exist.
+
+            This release also fixes sparse optional point-field queries
+            incorrectly treating an omitted segment component as corruption
+            (#259).
+
+            This release is a clean storage-format break and changes the cluster
+            and data-peer protocols. Start 0.15 on fresh authoritative volumes;
+            in-place 0.14 volume upgrades and mixed 0.14/0.15 operation are
+            unsupported. After all ACTIVE nodes attest support,
+            inspect GetClusterCapabilities and explicitly call
+            ActivateClusterCapabilities with its exact placement fence to enable
+            clone, link, and generalized ordinary-path atomic programs.
 
             It includes the multi-platform Keldra server image, CLI, Rust client,
-            generated API crate, and the public contention qualification client.
+            generated API crate, and public qualification clients.
 
             - Image: `${{ steps.image.outputs.image }}`
             - Manifest digest: `${{ steps.image.outputs.digest }}`

@@ -4,7 +4,7 @@ package keldra.v1;
 
 import "google/protobuf/timestamp.proto";
 
-// The public Keldra 0.9 network contract. Peer and storage-coordination services
+// The public Keldra 0.15 network contract. Peer and storage-coordination services
 // remain private. Ordinary object calls are independent. Only InvokeProgram
 // requests atomic multi-path visibility; indices are asynchronous derived views
 // over the same visible object state.
@@ -29,6 +29,19 @@ service ObjectService {
   // cannot call PutEnd and a READY token cannot start Put. PutEnd revalidates
   // caller identity, current authorization, operation policy and final CAS.
   rpc PutEnd(PutToken) returns (MutationReceipt);
+
+  // Publishes a new independent destination object using the immutable
+  // content identity of one exact source version. No payload bytes are
+  // uploaded or copied. Source and destination must share a tenant and bucket.
+  rpc CloneObject(CloneObjectRequest) returns (MutationReceipt);
+
+  // Creates a transparent mutable alias for one canonical ordinary target in
+  // the same tenant and bucket. If target names a link, Keldra stores its
+  // canonical target instead; committed links never form chains or dangle.
+  rpc LinkObject(LinkObjectRequest) returns (MutationReceipt);
+  // Removes only an object-link descriptor and its inbound registration. It
+  // never deletes or publishes a version of the canonical target.
+  rpc UnlinkObject(UnlinkObjectRequest) returns (MutationReceipt);
 
   // Publish the next tombstone version, including when the path never existed.
   rpc Delete(DeleteRequest) returns (MutationReceipt);
@@ -127,6 +140,16 @@ service AdministrationService {
   // authorization. The server writes a mode-0600 one-time bundle and returns
   // its local path for the administrator to copy to the new node and delete.
   rpc PrepareNode(PrepareNodeRequest) returns (PrepareNodeResponse);
+  // Reports the Raft-selected cluster protocol/storage pair and the ACTIVE
+  // nodes that have not yet attested support for the next atomic capability.
+  // The 0.15 schema-3 to schema-4 binary transition is all-node; this
+  // endpoint coordinates feature activation after all nodes attest support,
+  // not mixed-schema rolling compatibility.
+  rpc GetClusterCapabilities(GetClusterCapabilitiesRequest) returns (ClusterCapabilities);
+  // Explicitly activates a supported capability pair at an exact placement
+  // fence. All ACTIVE nodes must already attest support and the atomic tail
+  // must be quiescent.
+  rpc ActivateClusterCapabilities(ActivateClusterCapabilitiesRequest) returns (ClusterCapabilities);
   rpc ProvisionTenant(ProvisionTenantRequest) returns (ProvisionTenantResponse);
   rpc CreateApplication(CreateApplicationRequest) returns (ApplicationCredential);
   rpc RotateApplicationCredential(RotateApplicationCredentialRequest) returns (ApplicationCredential);
@@ -165,6 +188,27 @@ message PrepareNodeResponse {
   bytes cluster_id = 2;
   uint64 node_id = 3;
   bytes peer_spki_sha256 = 4;
+}
+
+message GetClusterCapabilitiesRequest {}
+
+message ActivateClusterCapabilitiesRequest {
+  uint32 protocol_version = 1;
+  uint32 storage_format = 2;
+  uint64 expected_placement_term = 3;
+  uint64 expected_placement_index = 4;
+}
+
+message ClusterCapabilities {
+  uint32 active_protocol_version = 1;
+  uint32 active_storage_format = 2;
+  uint32 target_protocol_version = 3;
+  uint32 target_storage_format = 4;
+  uint64 active_placement_term = 5;
+  uint64 active_placement_index = 6;
+  bool ready_for_target_activation = 7;
+  repeated uint64 blocking_active_node_ids = 8;
+  bool activation_quiescent = 9;
 }
 
 message ObjectAddress {
@@ -207,6 +251,13 @@ message UnsignedIntegerIndexField {}
 message FloatIndexField {}
 message KeywordIndexField {}
 
+// A timestamp stored physically as signed Unix epoch milliseconds. An empty
+// pattern accepts and emits ISO-8601; otherwise this is one validated POSIX
+// strftime/strptime pattern. Offset-less values are interpreted as UTC.
+message DateIndexField {
+  string strftime_pattern = 1;
+}
+
 enum TextAnalyzer {
   TEXT_ANALYZER_UNICODE_ALPHANUMERIC_LOWERCASE = 0;
 }
@@ -227,6 +278,7 @@ message IndexField {
     FloatIndexField float = 13;
     KeywordIndexField keyword = 14;
     TextIndexField text = 15;
+    DateIndexField date = 16;
   }
 }
 
@@ -729,6 +781,32 @@ message PutIfVersionOperation {
 // policy.
 message PutImmutableOperation {}
 
+message CloneObjectRequest {
+  ObjectAddress source = 1;
+  uint64 source_version = 2;
+  ObjectAddress destination = 3;
+  string command_id = 4;
+  Durability durability = 5;
+  oneof operation {
+    PutOperation put = 6;
+    PutIfAbsentOperation put_if_absent = 7;
+    PutIfVersionOperation put_if_version = 8;
+  }
+}
+
+message LinkObjectRequest {
+  ObjectAddress link = 1;
+  ObjectAddress target = 2;
+  string command_id = 3;
+  Durability durability = 4;
+}
+
+message UnlinkObjectRequest {
+  ObjectAddress link = 1;
+  string command_id = 2;
+  Durability durability = 3;
+}
+
 // Opaque upload capability returned by StartPut. Clients must not parse
 // `value`. A token is bound to its authenticated caller and one protocol phase.
 // StartPut returns an UPLOAD token; Put returns a fresh READY token for PutEnd.
@@ -1022,8 +1100,10 @@ message SetBucketPolicyRequest {
 }
 
 // Prefixes are bucket-relative. Anything below an immutable prefix is
-// write-once; anything below a program-only prefix is writable only through a
-// pinned atomic program. Overlap validation belongs to the server.
+// write-once. A program-only prefix is an optional exclusivity policy: direct
+// ordinary writes are rejected there, while authorized atomic programs may
+// also operate on ordinary mutable or create-once paths. Overlap validation
+// belongs to the server.
 message BucketPolicy {
   repeated string immutable_path_prefixes = 1;
   repeated string program_only_path_prefixes = 2;

@@ -52,11 +52,6 @@ fn publish(path: &str, blob: BlobRef, command: &str) -> PublishRequest {
     }
 }
 
-fn blob_file_path(store: &Store, reference: &BlobRef) -> PathBuf {
-    let hash = hex::encode(reference.hash);
-    store.blobs.root().join(&hash[..2]).join(hash)
-}
-
 #[derive(Default)]
 struct WalOperationCounter {
     puts: usize,

@@ -24,12 +24,11 @@ pub struct StoragePaths {
     pub payload: PathBuf,
     pub scratch: PathBuf,
     pub cache: PathBuf,
-    pub upload_spool: PathBuf,
-    pub upload_spool_max_bytes: u64,
+    pub pending_upload_max_bytes: u64,
 }
 
 impl StoragePaths {
-    pub fn under(root: impl AsRef<Path>, upload_spool_max_bytes: u64) -> Self {
+    pub fn under(root: impl AsRef<Path>, pending_upload_max_bytes: u64) -> Self {
         let root = root.as_ref();
         Self {
             state: root.to_path_buf(),
@@ -38,8 +37,7 @@ impl StoragePaths {
             payload: root.join("blobs"),
             scratch: root.join("index-scratch"),
             cache: root.join("cache"),
-            upload_spool: root.join("upload-spool"),
-            upload_spool_max_bytes,
+            pending_upload_max_bytes,
         }
     }
 }
@@ -110,8 +108,8 @@ pub(crate) fn bind_authoritative_roots(
     node_id: u16,
 ) -> Result<StorageBinding> {
     ensure!(
-        paths.upload_spool_max_bytes > 0,
-        "upload spool maximum must be non-zero"
+        paths.pending_upload_max_bytes > 0,
+        "pending upload maximum must be non-zero"
     );
     for role in StorageRole::ALL {
         fs::create_dir_all(role_path(paths, role))
@@ -119,7 +117,6 @@ pub(crate) fn bind_authoritative_roots(
     }
     fs::create_dir_all(&paths.scratch).context("create disposable scratch root")?;
     fs::create_dir_all(&paths.cache).context("create disposable cache root")?;
-    fs::create_dir_all(&paths.upload_spool).context("create disposable upload spool root")?;
 
     let layout_path = paths.state.join(LAYOUT_FILE);
     if layout_path.exists() {
