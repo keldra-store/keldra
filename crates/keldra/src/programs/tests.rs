@@ -184,7 +184,10 @@ async fn commit_prepared_for_recovery(
         panic!("fresh recovery fixture unexpectedly replayed")
     };
     let record = store.prepared_program_record(prepared).await.unwrap();
-    let placement = PlacementLogId { term: 1, index: 1 };
+    let placement = coordinator
+        .one_node_mutation_context(nomination)
+        .unwrap()
+        .active_placement_log_id;
     let reservations = record
         .reservations(
             batch.begin_cursor,
@@ -515,10 +518,7 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
             first_lease,
             &first_prepared,
             program_commit(None, first_consensus.invocation.committed_batch),
-            ObjectMutationContext {
-                active_placement_log_id: PlacementLogId { term: 1, index: 1 },
-                serving_fence_term: nomination.nomination_log_index,
-            },
+            coordinator.one_node_mutation_context(nomination).unwrap(),
         )
         .await
         .unwrap();
@@ -556,10 +556,7 @@ async fn startup_finalizes_a_partially_recovered_multi_commit_tail() {
                 Some(first_cursor),
                 second_consensus.invocation.committed_batch,
             ),
-            ObjectMutationContext {
-                active_placement_log_id: PlacementLogId { term: 1, index: 1 },
-                serving_fence_term: nomination.nomination_log_index,
-            },
+            coordinator.one_node_mutation_context(nomination).unwrap(),
         )
         .await
         .unwrap();
