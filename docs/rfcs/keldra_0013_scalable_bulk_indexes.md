@@ -944,9 +944,9 @@ placement fence, initial-build completion, and rebuild state. Lag returns valid
 results plus evidence; it is not by itself an `INDEX_LAGGING` failure.
 
 `QueryIndex` has a separate startup-configured server execution maximum,
-defaulting to 600 seconds. A valid shorter client `grpc-timeout` still wins and
+defaulting to 300 seconds. A valid shorter client `grpc-timeout` still wins and
 is propagated through downstream work. Other bounded unary APIs retain the
-30-second server maximum, except `BulkWrite`, whose independent 300-second
+30-second server maximum, except `BulkWrite`, whose independent 600-second
 maximum covers valid requests up to the 64 MiB encoded ingress bound. This
 separation allows cold pack materialization, authorized first-page filtering,
 and durable large-bulk ingestion to make bounded progress without weakening
