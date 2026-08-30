@@ -532,3 +532,51 @@ This RFC does not:
 - weaken exact-version result reads, query authorization, or freshness
   semantics; or
 - preserve legacy derived-index physical formats.
+
+## 18. Implementation milestones
+
+The physical-format replacement is delivered in measured milestones. Passing
+an earlier milestone does not weaken the completion criteria in section 16.
+
+### 18.1 Milestone A: equivalent complete projections
+
+Implemented on `feat/shared-index-projection`:
+
+- a logical definition has a deterministic tenant/bucket-scoped physical
+  projection identity derived from its complete canonical schema;
+- every equivalent definition maps to one scheduler representative, builder,
+  manifest/current stream, artifact owner, retention identity, and query reader;
+- queries authorize and paginate using the requested logical definition, then
+  resolve to the shared physical identity before execution;
+- source placement is by tenant/bucket projection partition rather than logical
+  definition ID;
+- catalog changes compile immutable path-prefix/content-type selector routes;
+  source processing performs direct route lookup and shares exact payload
+  projection results rather than scanning all logical definitions; and
+- the disposable projection cache has bounded logarithmic recency maintenance.
+
+This milestone is intended to prove that D640 equivalent definitions remain
+close to D1 physical work. It deliberately does not claim component sharing
+between different schemas or projection-preserving updates.
+
+### 18.2 Milestone B: recipe catalog and component generations
+
+Replace complete-schema physical ownership with canonical membership and field
+recipe records. A projection-family generation references independently reusable
+membership, field, document-head, and liveness components. Logical bindings map
+public field IDs and names to those physical recipes. Qualification must include
+different public names, field subsets, and incompatible-recipe isolation.
+
+### 18.3 Milestone C: projected-document state
+
+Persist the disposable exact projected state and stable document indirection
+described in section 7. The writer compares canonical prior/current state and
+emits no component mutation for an unindexed change, or only the changed recipe
+subset for a material change. This is the Keldra HOT-equivalent milestone.
+
+### 18.4 Milestone D: lifecycle and scale completion
+
+Complete last-reference physical GC, incremental recipe backfill, bounded
+catalog paging/restart, churn/crash recovery, and every scale gate in section
+15. Only this milestone changes this RFC's status from implementation in
+progress to implemented.
