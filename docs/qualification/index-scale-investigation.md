@@ -1,7 +1,7 @@
 # Index scale investigation
 
-Status: evidence-backed design investigation; no replacement architecture has
-been approved or implemented.
+Status: evidence-backed design investigation; replacement architecture approved
+by KELDRA-0020 and implementation in progress.
 
 This report explains why Keldra's current index runtime does not scale from one
 to many simultaneously affected logical definitions, and defines the minimum
@@ -399,9 +399,10 @@ physical view.
    and recipe work; make the definition catalog sparse and independently
    scalable.
 
-Stages 2 and 3 change persistent index formats and physical ownership. They
-require an approved RFC before implementation. Stage 1 is a necessary hot-path
-fix but cannot by itself meet the scale target.
+Stages 2 and 3 change persistent index formats and physical ownership. Their
+authority, recovery rules, projection-preserving update semantics, and complete
+qualification gates are approved in KELDRA-0020. Stage 1 remains useful but
+cannot by itself meet the scale target.
 
 ## Qualification gates
 

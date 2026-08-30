@@ -2,6 +2,11 @@
 
 Status: Accepted architecture for Keldra 0.8.0
 
+Historical note: KELDRA-0020 replaces the definition-owned construction and
+catch-up unit with source-partition writers and shared physical projection
+recipes. This RFC remains the format-v3 record and is already superseded by
+KELDRA-0014 for current component/query behavior.
+
 Supersedes: KELDRA-0012 in full
 
 Audience: Keldra implementors, operators, client authors, and reviewers

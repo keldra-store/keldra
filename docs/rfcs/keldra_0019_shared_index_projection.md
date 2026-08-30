@@ -1,8 +1,15 @@
 # KELDRA-0019: Shared source projection and definition-local assembly
 
-Status: Implemented
+Status: Superseded by KELDRA-0020
 
 Audience: Keldra implementors, operators, reviewers, and performance engineers
+
+KELDRA-0020 replaces this definition-local optimization with a logical index
+catalog, shared physical recipes, source-partition writers, and
+projection-preserving updates. This RFC remains the record of the 0.15.0
+payload-parse optimization and its qualification; its prohibition on shared
+segments, manifests, checkpoints, or physical ownership is no longer the target
+architecture.
 
 Post-implementation scale finding: this optimization materially reduced JSON
 fetch/parse duplication, but its current planner reconstructs the selector

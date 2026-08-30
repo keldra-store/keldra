@@ -2,6 +2,13 @@
 
 Status: Accepted
 
+KELDRA-0020 amends physical ownership and update granularity. Format-v4 remains
+the authority for component/query semantics until its replacement lands, but a
+logical definition is no longer the required owner of a complete independent
+segment tree. Canonically compatible definitions may share document,
+membership, field, and generation components, and projection-preserving source
+updates do not rewrite unchanged components.
+
 Supersedes: KELDRA-0013 in full
 
 Audience: Keldra implementors, operators, client authors, and reviewers

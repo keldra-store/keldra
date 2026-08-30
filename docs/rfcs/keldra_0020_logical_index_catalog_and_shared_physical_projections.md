@@ -1,0 +1,534 @@
+# KELDRA-0020: Logical Index Catalog and Shared Physical Projections
+
+Status: Accepted; implementation in progress
+
+Supersedes: KELDRA-0019 in full
+
+Amends: KELDRA-0013, KELDRA-0014, and KELDRA-0016 where they make one
+logical definition the unit of source consumption, physical segment ownership,
+manifest publication, checkpointing, scheduling, or rebuild
+
+Audience: Keldra implementors, operators, client authors, and reviewers
+
+## 1. Decision
+
+Keldra separates a public logical index definition from the physical projection
+components which satisfy it. A logical definition is durable catalog metadata.
+It does not own an autonomous source-journal consumer, builder, mutable buffer,
+segment tree, manifest stream, checkpoint, or query cache.
+
+Assigned source partitions consume their source journal once. A bounded writer
+projects each exact source version once, compares its canonical indexed state
+with the preceding projected state, and updates each distinct changed physical
+recipe once. Equivalent logical definitions reference the same physical state.
+
+The physical model has four layers:
+
+```text
+logical definition catalog
+        |
+        v
+canonical membership and field recipes
+        |
+        v
+source-partition writer and projected-document state
+        |
+        v
+immutable component segments + atomic projection generation
+```
+
+The public index-definition and query contracts remain logical. A query first
+resolves its authorized definition to an exact physical generation and field
+bindings. Shared bytes do not merge authorization domains or make another
+definition visible.
+
+This is a clean derived-index format and ownership change. There is no dual
+writer, mixed physical generation, legacy physical reader, or artifact
+conversion path. Ordinary objects and retained source journals remain the
+rebuild authority. An upgrade discards incompatible derived index artifacts and
+rebuilds the new projections; it does not migrate them as authoritative data.
+
+## 2. Why the previous unit is wrong
+
+KELDRA-0019 shared payload parsing but deliberately retained definition-local
+assembly and publication. Production-shaped D1, D16, and D64 profiling proved
+that parsing was not the dominant remaining cost. Equivalent definitions still
+independently read prior artifacts, update locators and live masks, seal
+segments, publish manifests, mutate references, materialize query cache files,
+and advance checkpoints.
+
+That makes work proportional to logical definition count even when additional
+definitions introduce no new indexed semantics. It also creates many short
+durable operations which queue behind the Store commit authority. The evidence
+and exact profiles are recorded in
+`../qualification/index-scale-investigation.md`.
+
+The corrected separation follows three proven lessons:
+
+1. PostgreSQL keeps index definitions and lifecycle state in catalogs. A
+   catalog row is not a permanent worker. A row update maintains only the
+   physical indexes it affects.
+2. PostgreSQL HOT avoids new index entries when indexed values did not change,
+   and follows a stable row indirection to the current tuple version.
+3. Lucene uses bounded writers, in-memory indexing buffers, immutable segments,
+   point-in-time reader generations, tombstones, and background merging.
+
+Keldra adopts those ownership and lifecycle principles without adopting
+PostgreSQL's heap format, Lucene's file format, or Elasticsearch's
+logical-index-to-shard mapping.
+
+## 3. Vocabulary
+
+**Logical definition** is the public named index contract: source scope, public
+field names, query capabilities, authorization, definition version, and
+lifecycle state.
+
+**Source partition** is the existing authoritative journal and object-placement
+scope over which one assigned projection writer consumes ordered changes.
+
+**Document universe** is the stable mapping between a source record identity
+and a physical document identity within one source partition.
+
+**Membership recipe** is the canonical semantic rule deciding whether a source
+record belongs to a logical view. Identical membership semantics share one
+physical membership component.
+
+**Field recipe** is the canonical semantic rule selecting, normalizing, and
+encoding one indexed value. Identical field semantics share one physical field
+component.
+
+**Projection family** is one source partition's document universe plus its set
+of referenced membership and field recipes.
+
+**Projected-document state** is disposable, rebuildable state containing the
+last exact canonical membership and field values for a stable source record.
+It is used to decide which physical recipes actually changed.
+
+**Projection generation** is one immutable, query-visible root binding a
+complete source barrier to document-state, membership, and field component
+segments.
+
+**Logical binding** maps one exact logical-definition version to one projection
+family generation, membership recipe, field recipes, and public field IDs.
+
+## 4. Durable logical catalog
+
+The ordinary index-definition object remains the public mutation and
+authorization authority. The runtime derives compact durable catalog records:
+
+```text
+LogicalDefinitionRecord {
+    tenant_id
+    bucket_id
+    index_id
+    definition_object_version
+    definition_version
+    source_scope_id
+    membership_recipe_id
+    field_bindings[]       // public field ID/name -> field recipe ID
+    query_contract_hash
+    physical_family_id
+    state                  // building, ready, replacing, deleting, failed
+}
+```
+
+Catalog records are stored in the existing Store/RocksDB authority and are read
+in bounded pages. Process memory holds compact immutable routing pages and
+point-lookup caches, not one complete builder object per catalog entry.
+
+Catalog cardinality must not create an equal number of:
+
+- Tokio tasks;
+- journal cursors;
+- retained source pages;
+- mutable segment writers;
+- publication timers;
+- manifest/current objects; or
+- filesystem query-cache files.
+
+Creating a definition whose complete physical semantics already exist adds a
+logical binding and references the ready physical generation. It performs no
+source rebuild. Creating a genuinely new recipe schedules only the new physical
+recipe's bounded backfill.
+
+Catalog changes compile a new immutable routing snapshot. A source mutation
+never scans all logical definitions and never takes a process-wide mutable
+catalog lock.
+
+## 5. Canonical physical identities
+
+Recipe sharing is allowed only when every result-affecting semantic input is
+identical. The stored canonical specification is authoritative; hashes are
+content addresses and lookup accelerators, not unchecked equality proofs.
+
+A source-scope identity includes:
+
+- tenant and bucket physical authority;
+- canonical path-prefix membership;
+- accepted content type;
+- source-record expansion rules; and
+- codec/result identity versions.
+
+A membership-recipe identity includes its source-scope identity and canonical
+membership predicate. A field-recipe identity includes:
+
+- source selector;
+- scalar/vector type and cardinality;
+- missing and null semantics;
+- analyzer, normalization, collation, and date format;
+- exact, prefix, range, full-text, order, facet, aggregate, vector, scoring,
+  positions, and norms capabilities; and
+- physical codec and query-semantic versions.
+
+Field IDs are logical binding IDs, not physical ownership. Two definitions can
+expose the same physical field recipe under different public names or IDs.
+
+Sharing is limited to one tenant/bucket authority. Cross-authority sharing is
+not permitted by this RFC.
+
+## 6. Source-driven routing and projection
+
+For each assigned source partition, the runtime maintains an immutable compiled
+plan:
+
+```text
+path/content-type router
+    -> applicable source scopes
+    -> union selector trie
+    -> membership recipe ordinals
+    -> field recipe ordinals
+```
+
+The plan is rebuilt from catalog deltas outside source processing and swapped
+atomically. The source hot path performs direct prefix/content-type routing. It
+does not enumerate unrelated definitions.
+
+For each source-journal mutation, the writer:
+
+1. reads the journal evidence once;
+2. resolves the exact source version once;
+3. streams the payload once through the applicable union selector plan;
+4. produces exact canonical membership and field values;
+5. compares them with projected-document state;
+6. updates only distinct changed recipes;
+7. appends those deltas to bounded projection-family buffers; and
+8. advances the physical source barrier only when all routed work is represented.
+
+The complexity target for a mutation is:
+
+```text
+O(route lookup + payload bytes + distinct changed recipes)
+```
+
+It must not be `O(total definitions)`, `O(matching definitions squared)`, or
+`O(matching aliases)`.
+
+## 7. Keldra projection-preserving updates
+
+Keldra's HOT equivalent is called a **projection-preserving update**.
+
+Every projected source record has a stable physical document key and exact
+projected state:
+
+```text
+ProjectedDocumentState {
+    stable_document_key
+    source_path
+    source_record
+    current_source_version
+    live
+    membership_values[]
+    canonical_field_values[]
+}
+```
+
+Canonical values are compared exactly. A bounded digest may reject obvious
+differences quickly, but digest equality cannot by itself authorize skipping a
+physical update.
+
+Four outcomes are defined:
+
+1. **No relevant change.** Only unindexed payload or source metadata changed.
+   Update the shared document-head/source-version state and source barrier. Do
+   not write postings, points, doc values, facets, order keys, vectors, or
+   membership data.
+2. **Field subset changed.** Update only those field recipes. Reuse every
+   unchanged field and membership component.
+3. **Membership only changed.** Update only the affected membership recipes.
+   Reuse unchanged field components.
+4. **Insert, delete, path, expansion, or material indexed change.** Append the
+   required document, component, and liveness deltas. Obsolete immutable data is
+   reclaimed by merge and reference GC.
+
+Queries use:
+
+```text
+physical field/membership entry -> stable document key
+stable document key -> generation-pinned live state and exact result identity
+```
+
+This is the analogue of an index entry continuing to reach a newer PostgreSQL
+tuple through HOT indirection. An unchanged indexed value remains valid when an
+ordinary object's version changes.
+
+Projected-document state is not an object-data authority. Losing it causes
+replay or bounded rebuild from ordinary objects and source journals.
+
+## 8. Physical segments and generations
+
+One source-partition writer owns bounded RAM across all dirty projection
+families. Admission is byte based and shared; it does not reserve a fixed buffer
+per logical definition. Flush boundaries use accounted memory, maximum wall
+age, and explicit operation safety caps.
+
+A flush writes immutable integrated-payload packs containing the changed
+document, membership, and field components. It does not create a filesystem
+file per component or per logical definition.
+
+One projection generation contains:
+
+```text
+ProjectionGeneration {
+    family_id
+    revision
+    source_barrier
+    placement_fence
+    document_state_segments[]
+    membership_roots[]
+    field_roots[]
+    physical_order_roots[]
+    previous_generation_hash
+    encoded/logical byte accounting
+}
+```
+
+An unchanged component root is referenced from the previous generation rather
+than rewritten. Publication atomically installs the complete generation and
+then makes eligible logical bindings visible. No query can combine component
+roots from different source barriers.
+
+Segments are immutable. Updates and deletes append deltas/tombstones; automatic
+tiered merges combine small segments, fold document-state chains, and reclaim
+obsolete entries. Merge concurrency and I/O are globally bounded and
+throttled. A merge changes physical shape without changing logical results or
+the represented source barrier.
+
+## 9. Query resolution
+
+A query follows this exact sequence:
+
+1. authorize and load the requested logical definition;
+2. resolve its exact logical binding;
+3. pin the referenced projection generation;
+4. compile public field IDs through the binding to physical recipes;
+5. execute predicates, ordering, facets, aggregates, text, and vectors against
+   those component roots;
+6. intersect candidates with the definition's membership component and the
+   generation's live-document state;
+7. map stable document keys to exact visible result identities; and
+8. perform the existing result-object authorization/refill behavior.
+
+Pagination binds logical definition version, projection generation, query
+shape, order, and search-after state. A definition replacement cannot continue
+an old cursor against a different binding.
+
+The query cache keys physical component identity and generation. Equivalent
+definitions reuse opened physical readers while retaining separate logical
+authorization and query contracts.
+
+## 10. Rebuild and definition changes
+
+A new source scope or recipe is built from a source snapshot plus its retained
+journal suffix. Work is scheduled by missing physical recipe/family, not by
+logical definition.
+
+Definition changes behave as follows:
+
+- an identical physical contract changes only logical metadata;
+- adding a field references an existing recipe when available, otherwise builds
+  that recipe once;
+- removing a field drops a logical reference without rewriting other fields;
+- changing source membership creates or reuses the new membership recipe;
+- changing incompatible analysis/type semantics creates a new field recipe;
+- deletion removes the logical binding and decrements physical references.
+
+A definition becomes ready only when every referenced physical component has an
+exact complete source barrier compatible with the binding. Rebuild publication
+is all-or-none at the logical binding.
+
+## 11. Distribution, durability, and recovery
+
+The source journal and ordinary objects remain input authority. Integrated
+payload storage remains immutable artifact authority. Existing placement,
+integrity, erasure/replication, reference delivery, and Store commit fencing
+apply to projection packs and generation roots.
+
+Assignment is by source partition/projection family rather than definition.
+Only the assigned writer may publish that family's next generation under the
+exact placement fence. Logical bindings are independently authorized catalog
+state and cannot grant publication authority.
+
+Crash points are recovered as follows:
+
+- a lost RAM buffer replays its unadvanced source window;
+- an uploaded but unattached pack is an ordinary bounded orphan and is reclaimed
+  by artifact GC;
+- a complete generation uploaded before current publication is unattached and
+  reclaimed unless retry attaches the exact content identity;
+- a published physical generation without a new logical binding remains valid
+  physical state and can be bound on retry;
+- a logical binding never names a partially published generation;
+- restart rebuilds immutable routing pages from the durable catalog in bounded
+  pages and resumes source partitions from physical barriers.
+
+GC deletes a pack only after no retained projection generation, logical
+binding, in-flight query lease, rebuild root, or publication attempt references
+it. Reference updates are batched per physical publication rather than repeated
+for every logical definition.
+
+## 12. Resource bounds and fairness
+
+The node enforces explicit bounds for:
+
+- catalog page and routing-snapshot residency;
+- source windows and exact payload bytes;
+- canonical projected-document state;
+- dirty recipe/component buffers;
+- immutable pack assembly;
+- merge input/output and scratch;
+- opened physical readers and query work;
+- concurrently active source partitions and backfills; and
+- queued catalog changes.
+
+Inactive logical definitions consume durable catalog bytes and bounded cache
+entries only. They do not reserve workers or construction memory.
+
+Fair scheduling rotates source windows and backfills by source partition and
+oldest wall-clock lag. A hot family cannot monopolize the writer, and a large
+catalog cannot dilute service for the bounded set of dirty families.
+
+## 13. Telemetry
+
+Required counters and histograms are labelled by physical family/recipe class,
+not by high-cardinality recipe IDs:
+
+- catalog definitions, source scopes, membership recipes, and field recipes;
+- resident routing pages and compiled-plan rebuild duration;
+- source records read, exact objects fetched, and payloads parsed;
+- projection-preserving updates;
+- membership-only, field-subset, insert, and delete updates;
+- distinct recipes considered and changed;
+- buffer bytes, flush reasons, packs, components, and fill ratio;
+- physical generations and logical bindings published;
+- physical bytes and Store/reference mutations per accepted source mutation;
+- source receipt-to-projection visibility lag;
+- merge debt, bytes, duration, throttling, and reclaimed tombstones;
+- opened physical readers, logical reader reuse, and cache bytes; and
+- source-partition runnable, wait, I/O, Store-lock, and publication phase time.
+
+Periodic INFO summaries provide qualification evidence without enabling
+per-object logs. DEBUG spans retain exact phase attribution.
+
+## 14. Required correctness tests
+
+The implementation must prove:
+
+1. equivalent definitions share one physical generation and return identical
+   authorized query results;
+2. different public field names can bind one physical recipe;
+3. field subsets and predicates share only compatible components;
+4. incompatible types, analyzers, formats, cardinality, or capabilities never
+   share;
+5. an unindexed payload update emits no field/membership physical mutation;
+6. one changed field updates only that recipe;
+7. membership-only changes preserve unchanged field components;
+8. insert, overwrite, delete, path reuse, arrays, expanded records, aliases,
+   dates, facets, aggregates, order, text, vectors, and pagination retain exact
+   released semantics;
+9. definition create/replace/delete racing source writes binds an exact complete
+   generation or retries without partial visibility;
+10. crash/restart at every publication boundary replays exactly and GC reclaims
+    unattached packs;
+11. catalog paging and restart do not create one task per definition; and
+12. physical work counters are independent of equivalent logical-definition
+    count.
+
+## 15. Scale qualification gates
+
+Qualification uses fresh volumes and the same exact candidate artifact on the
+8-core/32-GiB SSD and 16-core/64-GiB rotational hosts. All experiment files and
+Keldra data remain under `~/keldra_experiments`.
+
+### 15.1 Catalog-250K
+
+Create 250,000 live logical definitions, restart, point-read and page-list them,
+then mutate objects matching zero, one, and a bounded set of recipes. Record
+creation rate, restart time, RSS, task count, catalog lookup/list latency,
+mutation work, and query correctness.
+
+### 15.2 Equivalent D1 through D640
+
+Run D1, D4, D16, D64, D256, and D640 identical definitions over one hot source
+stream. Physical component items/bytes, payload parsing, Store/reference
+mutations, source work, and visibility lag must remain close to D1. Logical
+catalog/binding bytes may grow linearly.
+
+### 15.3 Heterogeneous recipes
+
+Vary source prefixes, predicates, field subsets, types, analyzers, dates,
+facets, aggregates, ordering, text, and vectors. Demonstrate that physical work
+tracks distinct matched changed recipes, not definitions, and verify every
+public query against an independent expected result.
+
+### 15.4 Projection-preserving update
+
+Continuously mutate large unindexed properties while indexed values remain
+constant, then change one indexed field and one membership predicate. Prove
+zero physical field work in the first phase and exact component-local work in
+the later phases.
+
+### 15.5 Sustained keep-up
+
+Offer a fixed realistic write rate for at least 30 minutes. Source-to-visible
+lag must reach a stationary bounded distribution during ingestion. A final
+drain is not evidence of keeping pace.
+
+### 15.6 Churn and recovery
+
+Create, replace, and delete definitions while ingesting; crash during routing
+swap, buffer flush, generation publication, binding publication, merge, and GC.
+Prove exact results, bounded replay, and eventual orphan reclamation.
+
+Each result records source commit, binary/image digest, host/topology, corpus
+hash, definitions and distinct recipes, offered/accepted rate, latency
+distributions, visibility lag, CPU profile, async waits, Store-lock ownership,
+RocksDB and artifact bytes, RSS, task/file counts, correctness, and end-to-end
+duration.
+
+## 16. Success criteria
+
+The architecture is complete only when:
+
+- 250,000 catalog definitions are operational without 250,000 runtime tasks or
+  physical copies;
+- equivalent D640 remains bounded near D1 physical work;
+- projection-preserving updates avoid all unchanged component writes;
+- heterogeneous work scales with distinct changed recipes;
+- sustained ingestion reaches a stationary visibility lag on both hosts;
+- crash/restart and churn preserve exact query/publication semantics; and
+- no resource bound, authorization check, placement fence, durability, or GC
+  guarantee is weakened to obtain the result.
+
+## 17. Non-goals
+
+This RFC does not:
+
+- make 250,000 genuinely distinct changed recipes free;
+- share physical bytes across tenant/bucket authorization authorities;
+- make derived indexes an object-data authority;
+- introduce synchronous index construction into ordinary object commits;
+- adopt Lucene as a dependency or use its file format;
+- create one Elasticsearch-style shard per logical definition;
+- weaken exact-version result reads, query authorization, or freshness
+  semantics; or
+- preserve legacy derived-index physical formats.
