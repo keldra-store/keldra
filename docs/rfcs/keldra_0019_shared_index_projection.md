@@ -229,6 +229,67 @@ The change succeeds only if final results are exact and it materially reduces
 normalized projection work and freshness lag at multi-definition scale without
 regressing D1 ingestion/query behavior beyond normal run variance.
 
+### 10.1 Qualification result
+
+The final candidate was `fd87484511af25c005e4c802adfcfd06d74d7d95`.
+The x86-64 GNU/Linux server SHA-256 was
+`2700cf86a09f2b2c4d4d00d5f1a9e0f6f8a88758e520d81f3130363e90a5920d`.
+All cells used 72 KiB source objects, four saturated mutation workers,
+32-operation batches and 20 concurrent queries per second.
+
+The clean 8-core/32-GiB SSD result was:
+
+| Definitions | Released ops/s | Candidate ops/s | Mutation p99 | Query p99 | Visibility p99 | Drain | Result |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 390.9 | 1,280.1 | 168 ms | 199 ms | 9.22 s | 24.66 s | pass |
+| 4 | 347.5 | 1,227.5 | 188 ms | 248 ms | 12.80 s | 30.49 s | pass |
+| 16 | timed out | 823.5 | 416 ms | 1,896 ms | 27.36 s | 57.18 s | pass |
+| 64 | timed out | 683.0 | 456 ms | 1,852 ms | 66.22 s | 253.92 s | freshness fail |
+
+The released D16 and D64 cells accepted 18,249 and 13,926 mutations before
+failing the 1,200-second drain bound. The candidate accepted 51,249 (+181%) and
+42,603 (+206%) and then drained both workloads. D64 is the measured limit of
+this change: final correctness and the two-second query objective pass, but the
+30-second publication-visibility objective does not.
+
+Direct mapper evidence separates sharing from general admission improvements:
+
+| Definitions | Projection requests | Payload parses | Prepared hits | Parse share | Prepared-hit share | Bypasses |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 65,536 | 65,533 | 0 | 100.0% | 0.0% | 0 |
+| 4 | 294,912 | 74,694 | 220,214 | 25.3% | 74.7% | 0 |
+| 16 | 819,200 | 51,569 | 767,630 | 6.3% | 93.7% | 0 |
+| 64 | 2,736,128 | 42,923 | 2,693,204 | 1.6% | 98.4% | 0 |
+
+The released SSD D16/D64 cells wrote 47.1/71.4 GiB while repeatedly failing
+decoded source-page admission. The candidate wrote 4.28/8.69 GiB despite
+accepting roughly three times as many mutations. No candidate cell emitted the
+former `index source frame leaves no bounded projection workspace` error, a
+server ERROR, a mutation/query error or a correctness failure.
+
+The co-tenant 16-core/64-GiB spinning-disk result is operational rather than a
+clean causal comparison:
+
+| Definitions | Released ops/s | Candidate ops/s | Query p99 | Visibility p99 | Drain | Result |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 108.0 | 261.5 | 251 ms | 38.24 s | 32.94 s | freshness fail |
+| 4 | 98.2 | 155.4 | 295 ms | 73.92 s | 76.75 s | freshness fail |
+| 16 | timed out | 42.6 | 502 ms | 104.27 s | 277.74 s | freshness fail |
+| 64 | timed out | 43.8 | 700 ms | 251.53 s | 667.12 s | freshness fail |
+
+Even there, every candidate cell makes bounded progress and remains
+correct/query-responsive. The remaining failure is freshness on rotational
+storage, not unbounded projection duplication.
+
+Evidence archive SHA-256 values are:
+
+- SSD released: `d40a95765a13408d244d25b01bf66769bc714743d4842fe3547c6497fc231072`;
+- SSD candidate D1/D4: `213e6816f2b5b95be1f4e386d9bc56959fb0932885bb9d18584c6238bd14f2ce`;
+- SSD candidate D16/D64: `377ba2b41499ff882f2be377132f4c5082e655908e9a2d9963d7e62125cec570`;
+- HDD released: `3664f4215912cd771ae7b25eb3d9346f08f63efd976c8d92f0f70cd26145b0d7`;
+- HDD candidate D1/D4: `73ea362dec765d0d177cc43a01ef7db4fd44b776b0e67d017527992c050f3449`;
+- HDD candidate D16/D64: `03c73acfeb4b735a4a62a59751294e74d16dafaf54eef7017af7f5b16b048027`.
+
 ## 11. Non-goals
 
 This RFC does not:
