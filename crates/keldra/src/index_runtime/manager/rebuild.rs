@@ -813,21 +813,33 @@ async fn project_snapshot_batch(
     let admitted_bytes = batch.resident_bytes;
     let effective_lanes = batch.effective_lanes();
     let lane_limit = batch.lane_limit()?;
-    let payload_fetches = batch
-        .sources
-        .iter()
-        .filter(|source| source.needs_payload)
-        .count() as u64;
-    let payload_bytes = batch
-        .sources
-        .iter()
-        .filter_map(|source| match &source.source {
-            IndexSourceMutation::Upsert(object) if source.needs_payload => {
-                Some(object.content_length)
-            }
-            _ => None,
+    // Shared Typed JSON fetches happen only on mapper misses and are emitted at
+    // that exact boundary. Other kinds still fetch every prepared payload in
+    // this wave, so their existing aggregate remains exact.
+    let shared_mapper = kind == IndexKind::TypedJson;
+    let payload_fetches = (!shared_mapper)
+        .then(|| {
+            batch
+                .sources
+                .iter()
+                .filter(|source| source.needs_payload)
+                .count() as u64
         })
-        .fold(0_u64, u64::saturating_add);
+        .unwrap_or(0);
+    let payload_bytes = (!shared_mapper)
+        .then(|| {
+            batch
+                .sources
+                .iter()
+                .filter_map(|source| match &source.source {
+                    IndexSourceMutation::Upsert(object) if source.needs_payload => {
+                        Some(object.content_length)
+                    }
+                    _ => None,
+                })
+                .fold(0_u64, u64::saturating_add)
+        })
+        .unwrap_or(0);
     let started = Instant::now();
     let span = tracing::debug_span!(
         "keldra.index.projection_wave",
@@ -839,6 +851,7 @@ async fn project_snapshot_batch(
         projection.admitted_bytes = admitted_bytes,
         projection.payload_fetches = payload_fetches,
         projection.payload_bytes = payload_bytes,
+        projection.shared_mapper = shared_mapper,
         projection.accepted = tracing::field::Empty,
         projection.skipped = tracing::field::Empty,
         projection.rayon_queue_seconds = tracing::field::Empty,
@@ -1131,6 +1144,66 @@ async fn project_snapshot_batch_inner(
     candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<ProjectionWaveTotals, Status> {
+    if schema.kind == IndexKind::TypedJson {
+        let source_count = sources.len();
+        let lanes = partition_projection_lanes(sources, effective_lanes);
+        let mut senders = Vec::with_capacity(lanes.len());
+        let mut receivers = Vec::with_capacity(lanes.len());
+        for _ in 0..lanes.len() {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            senders.push(sender);
+            receivers.push(receiver);
+        }
+        let projection_task = tokio::spawn(run_shared_projection_lanes(
+            definition.clone(),
+            lanes,
+            senders,
+            lane_limit,
+            dependencies.projection_mapper.clone(),
+        ));
+        let mut totals = ProjectionWaveTotals::default();
+        let mut failure = None;
+        for position in 0..source_count {
+            let Some(projected) = receive_ordered_lane_item(&mut receivers, position).await else {
+                failure = Some(Status::internal("shared projection lane omitted a source"));
+                break;
+            };
+            let (mutation, diagnostics) = match projected {
+                Ok(value) => value,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            totals.accepted = totals.accepted.saturating_add(diagnostics.accepted_objects);
+            totals.skipped = totals.skipped.saturating_add(diagnostics.skipped_objects);
+            candidate.diagnostics.add(diagnostics);
+            if let MergeMutation::Upsert(source) = mutation {
+                if let Err(error) = push_or_flush(
+                    definition,
+                    runtime_kind(definition.schema.kind),
+                    builder,
+                    source,
+                    candidate,
+                    dependencies,
+                    true,
+                )
+                .await
+                {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        drop(receivers);
+        projection_task.await.map_err(|error| {
+            Status::internal(format!("shared projection batch task failed: {error}"))
+        })??;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        return Ok(totals);
+    }
     let fetched = fetch_projection_sources(sources, effective_lanes, dependencies).await?;
     let source_count = fetched.len();
     let lanes = partition_projection_lanes(fetched, effective_lanes);
@@ -1215,6 +1288,37 @@ pub(super) async fn receive_ordered_lane_item<T>(
     }
     let lane = position % lane_count;
     receivers[lane].recv().await
+}
+
+pub(super) async fn run_shared_projection_lanes(
+    definition: CatalogDefinition,
+    lanes: Vec<Vec<PreparedProjection>>,
+    senders: Vec<tokio::sync::mpsc::Sender<Result<(MergeMutation, IndexBuildDiagnostics), Status>>>,
+    lane_limit: usize,
+    mapper: SharedProjectionMapper,
+) -> Result<(), Status> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for (lane, sender) in lanes.into_iter().zip(senders) {
+        let mapper = mapper.clone();
+        let definition = definition.clone();
+        tasks.spawn(async move {
+            for prepared in lane {
+                let projected = mapper
+                    .project(&definition, prepared.source, lane_limit)
+                    .await;
+                let failed = projected.is_err();
+                if sender.send(projected).await.is_err() || failed {
+                    break;
+                }
+            }
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.map_err(|error| {
+            Status::internal(format!("shared projection lane task failed: {error}"))
+        })?;
+    }
+    Ok(())
 }
 
 pub(super) async fn fetch_projection_sources(

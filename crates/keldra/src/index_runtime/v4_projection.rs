@@ -24,14 +24,20 @@ use crate::index_service::path_matches_prefix;
 
 use super::date::parse_millis;
 use super::json_projection::{
-    ProjectedJson, ProjectionSelection, SelectedScalarField, SelectedScalarFields, project_json,
-    projection_floor_bytes,
+    ProjectedJson, ProjectedScalarPointers, ProjectionSelection, SelectedScalarField,
+    SelectedScalarFields, project_json, projection_floor_bytes,
 };
 use super::source::{IndexBuildDiagnostics, IndexBuildObject, IndexSourceMutation};
 
 const PROJECTION_FIXED_BYTES: usize = 256;
 const RECORD_PROJECTION_EXPANSION: u64 = 16;
 const TEXT_VALUE_POSITION_GAP: u32 = 1;
+
+mod shared;
+
+pub(crate) use shared::{
+    project_typed_json_from_shared_scalars, projected_mutation_resident_bytes,
+};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct GitSourceRecord {
@@ -953,7 +959,7 @@ fn object_identity(object: &IndexBuildObject) -> ObjectIdentity {
     object.identity()
 }
 
-fn source_matches_schema(schema: &Schema, object: &IndexBuildObject) -> bool {
+pub(crate) fn source_matches_schema(schema: &Schema, object: &IndexBuildObject) -> bool {
     path_matches_prefix(&object.path, &schema.path_prefix)
         && !object.path.split('/').any(|segment| segment == "_keldra")
         && schema
@@ -1193,6 +1199,8 @@ fn bounded_mutation(
     diagnostics: IndexBuildDiagnostics,
     limit: usize,
 ) -> Result<(MergeMutation, IndexBuildDiagnostics), IndexError> {
+    // Preserve the released projection admission contract. Cache accounting
+    // above charges actual retained capacity separately.
     let resident = match &mutation {
         MergeMutation::Upsert(source) => source.resident_bytes()?,
         MergeMutation::Delete(identity) => {

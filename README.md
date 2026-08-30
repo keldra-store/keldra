@@ -570,7 +570,13 @@ executable in
 
 Indices are bucket-local definitions scoped by an optional path prefix and
 content type. Each definition's HRW-selected writer consumes every node's
-ordered source journal, writes bounded immutable native segments, merges
+ordered source journal. On each node, Typed JSON writers share one bounded
+source-projection mapper: the exact payload is streamed once into a union of
+definition-neutral scalar facts, and identical prepared projections are reused
+before each definition-local writer assembles its own native segment. Writers
+still own their Field IDs, document IDs, live masks and manifests, so the mapper
+is a disposable acceleration layer rather than index authority. Keldra writes
+bounded immutable native segments, merges
 deterministic size tiers, and publishes complete generations through the
 ordinary object store. Seekable postings and numeric points intersect selective
 predicates before typed doc values are read; an optional definition-time
@@ -611,9 +617,12 @@ worker pool and the corresponding kind's construction-memory budget.
 `KELDRA_INDEX_MAX_SEGMENTS_PER_TIER` and
 `KELDRA_INDEX_MAX_UNMERGED_BYTES_PER_TIER` bound merge debt, with per-kind
 overrides following the same naming pattern. `KELDRA_INDEX_QUERY_MEMORY_BYTES`
-is the query fair share. `KELDRA_INDEX_WORKING_MEMORY_BYTES` optionally sets the
-hard aggregate query/build/compaction ceiling; without it, Keldra uses the
-checked sum of the query and eight per-kind shares (2.5 GiB with defaults).
+is the query fair share. `KELDRA_INDEX_SHARED_PROJECTION_MEMORY_BYTES` bounds
+the process-local mapper's cache and active union workspace (256 MiB by
+default). `KELDRA_INDEX_WORKING_MEMORY_BYTES` optionally sets the hard aggregate
+query/build/compaction/projection ceiling; without it, Keldra uses the checked
+sum of the query, shared projection, and eight per-kind shares (2.75 GiB with
+defaults).
 Queries and builders can borrow idle bytes and derive their workspace from the
 actual grant, while queued mandatory work retains FIFO priority.
 

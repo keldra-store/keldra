@@ -394,8 +394,16 @@ struct Arguments {
     )]
     index_query_memory_bytes: u64,
 
-    /// Hard aggregate heap ceiling shared by index queries, builders and compaction.
-    /// Absent uses the checked sum of the query and per-kind fair shares.
+    /// Accounted cache and mapping workspace shared by index definitions.
+    #[arg(
+        long,
+        env = "KELDRA_INDEX_SHARED_PROJECTION_MEMORY_BYTES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_SHARED_PROJECTION_MEMORY_BYTES
+    )]
+    index_shared_projection_memory_bytes: u64,
+
+    /// Hard aggregate heap ceiling shared by queries, projection, builders and compaction.
+    /// Absent uses the checked sum of every fair share.
     #[arg(long, env = "KELDRA_INDEX_WORKING_MEMORY_BYTES")]
     index_working_memory_bytes: Option<u64>,
 
@@ -634,6 +642,9 @@ impl Arguments {
             config.with_query_work_quantum_bytes(self.index_query_work_quantum_bytes)
         })
         .and_then(|config| config.with_query_memory_bytes(self.index_query_memory_bytes))
+        .and_then(|config| {
+            config.with_shared_projection_memory_bytes(self.index_shared_projection_memory_bytes)
+        })
         .and_then(|config| {
             config.with_segment_flush_boundaries(
                 self.index_segment_flush_bytes,
@@ -1047,6 +1058,8 @@ mod tests {
             "1048576",
             "--index-query-memory-bytes",
             "268435456",
+            "--index-shared-projection-memory-bytes",
+            "134217728",
             "--index-working-memory-bytes",
             "1073741824",
             "--index-max-segments-per-tier",
@@ -1089,6 +1102,7 @@ mod tests {
         assert_eq!(config.query_max_concurrency(), 17);
         assert_eq!(config.query_work_quantum_bytes(), 1_048_576);
         assert_eq!(config.query_memory_bytes(), 268_435_456);
+        assert_eq!(config.shared_projection_memory_bytes(), 134_217_728);
         assert_eq!(config.working_memory_bytes().unwrap(), 1_073_741_824);
         assert_eq!(config.max_segments_per_tier(IndexKind::Path), 8);
         assert_eq!(

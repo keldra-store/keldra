@@ -15,11 +15,12 @@ use tokio::sync::Notify;
 
 use crate::index_config::IndexRuntimeConfig;
 
-const ACCOUNT_COUNT: usize = 9;
+const ACCOUNT_COUNT: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkingMemoryAccount {
     Query,
+    SharedProjection,
     Builder(IndexKind),
 }
 
@@ -27,13 +28,15 @@ impl WorkingMemoryAccount {
     const fn slot(self) -> usize {
         match self {
             Self::Query => 0,
-            Self::Builder(kind) => kind as u8 as usize,
+            Self::SharedProjection => 1,
+            Self::Builder(kind) => kind as u8 as usize + 1,
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
             Self::Query => "query",
+            Self::SharedProjection => "shared_projection",
             Self::Builder(IndexKind::Path) => "path",
             Self::Builder(IndexKind::MetadataFilter) => "metadata_filter",
             Self::Builder(IndexKind::TypedJson) => "typed_json",
@@ -79,6 +82,8 @@ impl IndexWorkingMemory {
     pub(crate) fn from_config(config: IndexRuntimeConfig) -> Result<Self, WorkingMemoryError> {
         let mut shares = [0; ACCOUNT_COUNT];
         shares[WorkingMemoryAccount::Query.slot()] = config.query_memory_bytes();
+        shares[WorkingMemoryAccount::SharedProjection.slot()] =
+            config.shared_projection_memory_bytes();
         for kind in all_kinds() {
             shares[WorkingMemoryAccount::Builder(kind).slot()] = config.builder_memory_bytes(kind);
         }
@@ -172,7 +177,7 @@ impl IndexWorkingMemory {
                         .iter()
                         .take(index)
                         .any(|waiter| waiter.account == WorkingMemoryAccount::Query),
-                    WorkingMemoryAccount::Builder(_) => {
+                    WorkingMemoryAccount::SharedProjection | WorkingMemoryAccount::Builder(_) => {
                         index == 0
                             && !state
                                 .waiters
@@ -183,10 +188,13 @@ impl IndexWorkingMemory {
                 let free = self.inner.hard_limit.saturating_sub(state.used);
                 let available = match account {
                     WorkingMemoryAccount::Query => free,
-                    WorkingMemoryAccount::Builder(_) => free.saturating_sub(
-                        self.inner.shares[WorkingMemoryAccount::Query.slot()]
-                            .saturating_sub(state.account_used[WorkingMemoryAccount::Query.slot()]),
-                    ),
+                    WorkingMemoryAccount::SharedProjection | WorkingMemoryAccount::Builder(_) => {
+                        free.saturating_sub(
+                            self.inner.shares[WorkingMemoryAccount::Query.slot()].saturating_sub(
+                                state.account_used[WorkingMemoryAccount::Query.slot()],
+                            ),
+                        )
+                    }
                 };
                 if eligible && available >= minimum {
                     // Existing mandatory waiters get priority over optional
@@ -431,6 +439,24 @@ mod tests {
             .unwrap();
         assert_eq!(permit.bytes(), 8);
         assert_eq!(memory.available(), 4);
+    }
+
+    #[tokio::test]
+    async fn permanent_projection_residency_remains_in_the_hard_parent() {
+        let memory = pool(40, 10, 10);
+        let projection = memory
+            .acquire_up_to(WorkingMemoryAccount::SharedProjection, 10, 10)
+            .await
+            .unwrap();
+        let builder = memory
+            .acquire_up_to(WorkingMemoryAccount::Builder(IndexKind::TypedJson), 10, 20)
+            .await
+            .unwrap();
+
+        assert_eq!(projection.bytes(), 10);
+        assert_eq!(builder.bytes(), 20);
+        assert_eq!(memory.used(), 30);
+        assert_eq!(memory.available(), 10);
     }
 
     #[tokio::test]

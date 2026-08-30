@@ -40,6 +40,7 @@ use super::cpu::{IndexCpuPool, IndexCpuPoolError};
 use super::directory::ManifestArtifactDirectory;
 use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage};
 use super::placement::{IndexIdentity, IndexPlacement};
+use super::projection_mapper::SharedProjectionMapper;
 use super::publication::DerivedArtifactAdmission;
 use super::publisher::{CommittedIndexView, IndexCommitPublisher};
 use super::retention::{IndexCommitRetention, IndexRetentionTask};
@@ -155,6 +156,7 @@ pub(crate) struct IndexBuilderDependencies {
     pub(crate) cache: IndexCache,
     pub(crate) budgets: IndexMemoryBudgets,
     pub(crate) cpu: IndexCpuPool,
+    pub(crate) projection_mapper: SharedProjectionMapper,
     pub(crate) config: IndexRuntimeConfig,
     pub(crate) derived_progress: DerivedProgressReporter,
     pub(crate) maintenance_work_slots: IndexMaintenanceWorkSlots,
@@ -187,11 +189,12 @@ async fn run_manager(
             Ok(page) => {
                 for change in page {
                     abort_replaced_worker(&change, &scheduler, &mut running, &mut inflight);
-                    if let Err(error) = scheduler.apply_change(
+                    if let Err(error) = apply_catalog_change(
+                        &mut scheduler,
                         change,
                         local_node,
                         &decisions,
-                        &dependencies.retention,
+                        &dependencies,
                     ) {
                         tracing::debug!(%error, "bounded index builder admission deferred to assignment rediscovery");
                     }
@@ -242,11 +245,12 @@ async fn run_manager(
                     if let Ok(Some(change)) = catalog.take(identity, scheduler.can_admit(identity))
                     {
                         abort_replaced_worker(&change, &scheduler, &mut running, &mut inflight);
-                        if let Err(error) = scheduler.apply_change(
+                        if let Err(error) = apply_catalog_change(
+                            &mut scheduler,
                             change,
                             local_node,
                             &decisions,
-                            &dependencies.retention,
+                            &dependencies,
                         ) {
                             tracing::debug!(%error, "bounded index builder admission deferred to assignment rediscovery");
                         }

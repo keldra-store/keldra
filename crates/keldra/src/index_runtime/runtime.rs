@@ -36,6 +36,7 @@ use super::manager::{
     IndexBuilderDependencies, IndexBuilderManagerTask, IndexMaintenanceWorkSlots,
     IndexPublicationSlots,
 };
+use super::projection_mapper::SharedProjectionMapper;
 use super::publication::{IndexArtifactCoordinator, IndexArtifactRouter};
 use super::publisher::IndexCommitPublisher;
 use super::query_budget::IndexQueryMemoryBudget;
@@ -143,6 +144,14 @@ pub(crate) async fn start(
     );
     let working_memory = IndexWorkingMemory::from_config(config)
         .context("validate aggregate index working-memory budget")?;
+    let projection_mapper = SharedProjectionMapper::new(
+        reader.clone(),
+        cpu.clone(),
+        working_memory.clone(),
+        config.shared_projection_memory_bytes(),
+    )
+    .await
+    .context("reserve shared index projection memory")?;
     let query_budget = IndexQueryMemoryBudget::from_shared(working_memory.clone());
     let local_queries: Arc<dyn LocalIndexQueryExecutor> =
         Arc::new(LocalRevisionQueryExecutor::new(
@@ -202,6 +211,7 @@ pub(crate) async fn start(
             cache: cache.clone(),
             budgets,
             cpu,
+            projection_mapper,
             config,
             derived_progress,
             maintenance_work_slots: IndexMaintenanceWorkSlots::default(),

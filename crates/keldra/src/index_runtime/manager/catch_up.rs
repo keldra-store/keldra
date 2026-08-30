@@ -13,6 +13,7 @@ use crate::index_runtime::events::{
 use super::rebuild::{
     FetchedProjection, PreparedProjection, ProjectionBatch, fetch_projection_sources,
     partition_projection_lanes, receive_ordered_lane_item, run_projection_lanes,
+    run_shared_projection_lanes,
 };
 use super::*;
 use alias_paths::{ExactSourcePath, atomic_source_paths, ordinary_journal_source_paths};
@@ -1060,6 +1061,60 @@ async fn project_catch_up_batch(
 ) -> Result<(), Status> {
     let effective_lanes = batch.effective_lanes();
     let lane_limit = batch.lane_limit()?;
+    if kind == IndexKind::TypedJson {
+        let source_count = batch.sources.len();
+        let lanes = partition_projection_lanes(batch.sources, effective_lanes);
+        let mut senders = Vec::with_capacity(lanes.len());
+        let mut receivers = Vec::with_capacity(lanes.len());
+        for _ in 0..lanes.len() {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            senders.push(sender);
+            receivers.push(receiver);
+        }
+        let projection_task = tokio::spawn(run_shared_projection_lanes(
+            definition.clone(),
+            lanes,
+            senders,
+            lane_limit,
+            dependencies.projection_mapper.clone(),
+        ));
+        let mut failure = None;
+        let mut mutations = Vec::with_capacity(source_count);
+        for position in 0..source_count {
+            let Some(projected) = receive_ordered_lane_item(&mut receivers, position).await else {
+                failure = Some(Status::internal("shared projection lane omitted a source"));
+                break;
+            };
+            match projected {
+                Ok((mutation, diagnostics)) => {
+                    candidate.diagnostics.add(diagnostics);
+                    mutations.push(mutation);
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        drop(receivers);
+        projection_task.await.map_err(|error| {
+            Status::internal(format!("shared projection batch task failed: {error}"))
+        })??;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        return apply_incremental_mutations(
+            definition,
+            kind,
+            plan,
+            builder,
+            mutations,
+            candidate,
+            dependencies,
+            soft_flush_allowed,
+        )
+        .await;
+    }
     let fetched = fetch_projection_sources(batch.sources, effective_lanes, dependencies).await?;
     let source_count = fetched.len();
     let lanes = partition_projection_lanes(fetched, effective_lanes);

@@ -39,6 +39,7 @@ pub struct IndexRuntimeConfig {
     query_max_concurrency: NonZeroU32,
     query_work_quantum_bytes: NonZeroU64,
     query_memory_bytes: NonZeroU64,
+    shared_projection_memory_bytes: NonZeroU64,
     working_memory_bytes: Option<NonZeroU64>,
     max_retained_commit_revisions: NonZeroU32,
     max_commit_revision_age_hours: NonZeroU64,
@@ -63,6 +64,7 @@ impl IndexRuntimeConfig {
     pub const DEFAULT_QUERY_MAX_CONCURRENCY: u32 = 64;
     pub const DEFAULT_QUERY_WORK_QUANTUM_BYTES: u64 = 4 * 1024 * 1024;
     pub const DEFAULT_QUERY_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+    pub const DEFAULT_SHARED_PROJECTION_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
     pub const DEFAULT_MAX_SEGMENTS_PER_TIER: u32 = 64;
     pub const DEFAULT_MAX_UNMERGED_BYTES_PER_TIER: u64 = 1024 * 1024 * 1024;
     pub const DEFAULT_MAX_RETAINED_COMMIT_REVISIONS: u32 = 3;
@@ -149,6 +151,10 @@ impl IndexRuntimeConfig {
                 .expect("the default query work quantum is positive"),
             query_memory_bytes: NonZeroU64::new(Self::DEFAULT_QUERY_MEMORY_BYTES)
                 .expect("the default query memory budget is positive"),
+            shared_projection_memory_bytes: NonZeroU64::new(
+                Self::DEFAULT_SHARED_PROJECTION_MEMORY_BYTES,
+            )
+            .expect("the default shared projection memory budget is positive"),
             working_memory_bytes: None,
             max_retained_commit_revisions,
             max_commit_revision_age_hours,
@@ -331,6 +337,21 @@ impl IndexRuntimeConfig {
         self.query_memory_bytes.get()
     }
 
+    pub fn with_shared_projection_memory_bytes(
+        mut self,
+        bytes: u64,
+    ) -> Result<Self, IndexRuntimeConfigError> {
+        self.shared_projection_memory_bytes = NonZeroU64::new(bytes)
+            .ok_or(IndexRuntimeConfigError::ZeroSharedProjectionMemoryBytes)?;
+        Ok(self)
+    }
+
+    /// Accounted process-local cache and mapping workspace shared by all
+    /// assigned index definitions.
+    pub fn shared_projection_memory_bytes(self) -> u64 {
+        self.shared_projection_memory_bytes.get()
+    }
+
     /// Override the hard aggregate heap ceiling shared by index queries,
     /// builders and compaction. When absent, the checked sum of the query and
     /// per-kind fair shares preserves the former theoretical process maximum.
@@ -344,13 +365,23 @@ impl IndexRuntimeConfig {
     }
 
     pub fn working_memory_bytes(self) -> Result<u64, IndexRuntimeConfigError> {
-        let required = self.query_memory_bytes().max(
-            KINDS
-                .iter()
-                .map(|kind| self.builder_memory_bytes(*kind))
-                .max()
-                .unwrap_or(0),
-        );
+        // Shared projection is a permanent accounted resident. Preserve the
+        // query reservation and enough room for one complete builder share so
+        // an explicit parent cannot validate and then deadlock at startup or
+        // make all construction inadmissible.
+        let required = self
+            .query_memory_bytes()
+            .checked_add(self.shared_projection_memory_bytes())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    KINDS
+                        .iter()
+                        .map(|kind| self.builder_memory_bytes(*kind))
+                        .max()
+                        .unwrap_or(0),
+                )
+            })
+            .ok_or(IndexRuntimeConfigError::WorkingMemoryBytesOverflow)?;
         if let Some(configured) = self.working_memory_bytes {
             if configured.get() < required {
                 return Err(
@@ -362,13 +393,16 @@ impl IndexRuntimeConfig {
             }
             return Ok(configured.get());
         }
-        KINDS
-            .iter()
-            .try_fold(self.query_memory_bytes(), |total, kind| {
+        KINDS.iter().try_fold(
+            self.query_memory_bytes()
+                .checked_add(self.shared_projection_memory_bytes())
+                .ok_or(IndexRuntimeConfigError::WorkingMemoryBytesOverflow)?,
+            |total, kind| {
                 total
                     .checked_add(self.builder_memory_bytes(*kind))
                     .ok_or(IndexRuntimeConfigError::WorkingMemoryBytesOverflow)
-            })
+            },
+        )
     }
 
     /// Maximum source-complete immutable segments retained in one deterministic
@@ -455,6 +489,8 @@ pub enum IndexRuntimeConfigError {
     ZeroQueryWorkQuantumBytes,
     #[error("global index query memory bytes must be greater than zero")]
     ZeroQueryMemoryBytes,
+    #[error("shared index projection memory bytes must be greater than zero")]
+    ZeroSharedProjectionMemoryBytes,
     #[error("aggregate index working memory bytes must be greater than zero")]
     ZeroWorkingMemoryBytes,
     #[error("aggregate index working memory {configured} cannot admit mandatory request {minimum}")]
@@ -503,9 +539,10 @@ mod tests {
         assert_eq!(config.query_max_concurrency(), 64);
         assert_eq!(config.query_work_quantum_bytes(), 4 * 1024 * 1024);
         assert_eq!(config.query_memory_bytes(), 512 * 1024 * 1024);
+        assert_eq!(config.shared_projection_memory_bytes(), 256 * 1024 * 1024);
         assert_eq!(
             config.working_memory_bytes().unwrap(),
-            512 * 1024 * 1024 + 8 * 256 * 1024 * 1024
+            512 * 1024 * 1024 + 256 * 1024 * 1024 + 8 * 256 * 1024 * 1024
         );
         for kind in KINDS {
             assert_eq!(config.builder_memory_bytes(kind), 256 * 1024 * 1024);
@@ -670,13 +707,17 @@ mod tests {
             Err(
                 IndexRuntimeConfigError::WorkingMemoryBelowMandatoryMinimum {
                     configured: 256 * 1024 * 1024,
-                    minimum: 512 * 1024 * 1024,
+                    minimum: 1024 * 1024 * 1024,
                 }
             )
         );
         assert_eq!(
             IndexRuntimeConfig::default().with_working_memory_bytes(0),
             Err(IndexRuntimeConfigError::ZeroWorkingMemoryBytes)
+        );
+        assert_eq!(
+            IndexRuntimeConfig::default().with_shared_projection_memory_bytes(0),
+            Err(IndexRuntimeConfigError::ZeroSharedProjectionMemoryBytes)
         );
     }
 

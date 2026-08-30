@@ -56,6 +56,106 @@ pub(crate) enum ProjectedJson {
     },
 }
 
+/// Definition-neutral scalar facts selected once from one exact JSON object.
+///
+/// Keys are canonical JSON pointers rather than definition-local field names.
+/// An index assembler can therefore copy the same selected value into every
+/// compatible schema without reading or parsing the payload again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectedScalarPointers {
+    fields: BTreeMap<String, SelectedScalarField>,
+}
+
+impl ProjectedScalarPointers {
+    pub(crate) fn get(&self, pointer: &str) -> Option<&SelectedScalarField> {
+        self.fields.get(pointer)
+    }
+
+    pub(crate) fn resident_bytes(&self) -> Result<usize, IndexError> {
+        self.fields
+            .iter()
+            .try_fold(std::mem::size_of::<Self>(), |bytes, (pointer, selected)| {
+                let values = selected
+                    .values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<ScalarValue>())
+                    .ok_or_else(|| {
+                        IndexError::InvalidDefinition(
+                            "shared scalar projection size exceeds this platform".into(),
+                        )
+                    })?;
+                let strings = selected.values.iter().try_fold(0usize, |total, value| {
+                    let dynamic = match value {
+                        ScalarValue::String(value) => value.capacity(),
+                        _ => 0,
+                    };
+                    total.checked_add(dynamic).ok_or_else(|| {
+                        IndexError::InvalidDefinition(
+                            "shared scalar projection size exceeds this platform".into(),
+                        )
+                    })
+                })?;
+                bytes
+                    .checked_add(std::mem::size_of::<(String, SelectedScalarField)>())
+                    .and_then(|total| total.checked_add(3 * std::mem::size_of::<usize>()))
+                    .and_then(|total| total.checked_add(pointer.capacity()))
+                    .and_then(|total| total.checked_add(values))
+                    .and_then(|total| total.checked_add(strings))
+                    .ok_or_else(|| {
+                        IndexError::InvalidDefinition(
+                            "shared scalar projection size exceeds this platform".into(),
+                        )
+                    })
+            })
+    }
+}
+
+/// Select one union of JSON pointers in a single streaming parser pass.
+pub(crate) fn project_scalar_pointers(
+    source: &mut dyn Read,
+    pointers: &[String],
+    max_selected_bytes: usize,
+) -> Result<Option<ProjectedScalarPointers>, IndexError> {
+    let mut unique = BTreeSet::new();
+    if pointers.is_empty()
+        || pointers
+            .iter()
+            .any(|pointer| !unique.insert(pointer.as_str()))
+    {
+        return Err(IndexError::InvalidDefinition(
+            "shared scalar projection pointers must be non-empty and unique".into(),
+        ));
+    }
+    let fields = pointers
+        .iter()
+        .enumerate()
+        .map(|(ordinal, pointer)| (format!("shared_{ordinal}"), pointer.clone()))
+        .collect::<Vec<_>>();
+    let names = fields
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let Some(ProjectedJson::Scalars(selected)) = project_json(
+        source,
+        &ProjectionSelection::Scalars(fields),
+        max_selected_bytes,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mapped = pointers
+        .iter()
+        .zip(names)
+        .filter_map(|(pointer, name)| {
+            selected
+                .get(&name)
+                .cloned()
+                .map(|value| (pointer.clone(), value))
+        })
+        .collect();
+    Ok(Some(ProjectedScalarPointers { fields: mapped }))
+}
+
 /// Returns the fixed bytes a projection needs before it can retain source
 /// values. Calling this before parsing prevents a definition with oversized
 /// selected names or vector dimensions from causing an allocation first.
@@ -1325,6 +1425,28 @@ mod tests {
                 ),
             ])))
         );
+    }
+
+    #[test]
+    fn shared_pointer_projection_does_not_retain_a_large_unselected_body() {
+        let mut json = br#"{"body":""#.to_vec();
+        json.extend(std::iter::repeat_n(b'x', 72 * 1024));
+        json.extend_from_slice(br#"","status":"open","count":7}"#);
+        let pointers = vec!["/count".into(), "/status".into()];
+        let mut input = Cursor::new(json);
+        let projected = project_scalar_pointers(&mut input, &pointers, 4 * 1024)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            projected.get("/status").unwrap().values,
+            [ScalarValue::String("open".into())]
+        );
+        assert_eq!(
+            projected.get("/count").unwrap().values,
+            [ScalarValue::Unsigned(7)]
+        );
+        assert!(projected.resident_bytes().unwrap() < 4 * 1024);
     }
 
     #[test]

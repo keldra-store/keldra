@@ -28,9 +28,9 @@ impl IndexMemoryBudgets {
     #[cfg(test)]
     pub(crate) fn new(bytes_per_kind: u64) -> Result<Self, IndexBudgetError> {
         let aggregate = bytes_per_kind
-            .checked_mul(9)
+            .checked_mul(10)
             .ok_or(IndexBudgetError::LimitExceedsPlatform(bytes_per_kind))?;
-        let memory = IndexWorkingMemory::new(aggregate, [bytes_per_kind; 9])?;
+        let memory = IndexWorkingMemory::new(aggregate, [bytes_per_kind; 10])?;
         Self::from_limits(memory, |_| bytes_per_kind)
     }
 

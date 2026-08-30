@@ -2,6 +2,23 @@
 
 use super::*;
 
+pub(super) fn apply_catalog_change(
+    scheduler: &mut BuilderScheduler,
+    change: CatalogChange,
+    local_node: NodeId,
+    decisions: &DecisionRaft,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<(), Status> {
+    let identity = change.identity();
+    let applied = scheduler.apply_change(change, local_node, decisions, &dependencies.retention);
+    let registered = if let Some(entry) = scheduler.entries.get(&identity) {
+        dependencies.projection_mapper.upsert(&entry.definition)
+    } else {
+        dependencies.projection_mapper.remove(identity)
+    };
+    applied.and(registered)
+}
+
 pub(super) fn source_wire_limit(limit: u64) -> u64 {
     let fixed = FIXED_INDEX_SEAL_WORKSPACE_BYTES as u64;
     let remaining = limit.saturating_sub(fixed);
