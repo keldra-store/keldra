@@ -307,6 +307,76 @@ than rewritten. Publication atomically installs the complete generation and
 then makes eligible logical bindings visible. No query can combine component
 roots from different source barriers.
 
+### 8.1 Format-v5 stable document keys
+
+Format v4 cannot be extended into the projection-preserving design by adding a
+comparison cache alone. Its postings use segment-local `DocId` values and its
+identity rows embed the source/result object version. Reusing those postings
+after a source-version change would either return the old version or cause the
+exact-current candidate gate to reject the result. Format v5 therefore makes a
+stable document key the join key shared by every independently reusable
+component.
+
+The key is derived from the source-scope identity, canonical source path, and
+deterministic expanded-record identity. The current expansion contract uses the
+record ordinal; a change which shifts ordinals is consequently a material
+delete/insert for those records. Hash collisions are never accepted as
+equality: every head entry retains and validates the complete source path and
+record identity.
+
+```text
+StableDocumentKey = H(
+    format/domain,
+    source_scope_id,
+    source_path,
+    source_record_identity
+)
+```
+
+Format-v5 immutable streams are separated by authority:
+
+```text
+document-head delta:
+    stable key -> source path, record identity, current source version,
+                  current result identity, live/deleted state
+
+membership delta for recipe R:
+    stable key -> present/absent
+
+field delta for recipe R:
+    stable key -> exact canonical field state or tombstone
+
+order delta for order recipe R:
+    stable key -> canonical order tuple or tombstone
+```
+
+The newest entry at or below the pinned generation wins independently in each
+stream. A query obtains stable keys from postings/points/order, resolves the
+pinned membership and live head, then obtains the exact current result identity
+from that head. No query reads a field component from a generation newer than
+its pinned complete barrier.
+
+### 8.2 Exact projected-state comparison
+
+Projected-document state stores the complete canonical bytes for each recipe,
+not only a digest. A digest is kept as a bounded negative-comparison
+accelerator. Equality is authorized only after byte-for-byte comparison of the
+canonical recipe state and exact membership state.
+
+For one source mutation the writer constructs a sorted recipe-state vector and
+merge-compares it with the previous vector. It emits:
+
+- one document-head delta whenever the exact source/result version changes;
+- no membership or field delta when all canonical indexed state is equal;
+- a delta only for each added, removed, or byte-different recipe; and
+- tombstones for records or recipe values removed by the mutation.
+
+The head delta and every changed recipe delta are installed by one projection
+generation. A crash may leave unattached immutable packs, but cannot publish a
+head whose required changed recipe roots are absent. Recipe compaction folds
+newest-by-stable-key state and may rewrite physical keys without changing the
+generation barrier or logical result.
+
 Segments are immutable. Updates and deletes append deltas/tombstones; automatic
 tiered merges combine small segments, fold document-state chains, and reclaim
 obsolete entries. Merge concurrency and I/O are globally bounded and

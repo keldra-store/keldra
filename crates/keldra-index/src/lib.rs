@@ -9,6 +9,7 @@ pub mod compaction;
 mod error;
 mod io;
 pub mod v4;
+pub mod v5;
 
 pub use compaction::{
     FIXED_INDEX_SEAL_WORKSPACE_BYTES, MIN_INDEX_KIND_MEMORY_BYTES, SegmentMemoryPlan,
