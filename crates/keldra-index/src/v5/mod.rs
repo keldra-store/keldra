@@ -45,8 +45,9 @@ pub use buffer::{
 pub use codec::{
     COMPONENT_DIRECTORY_FANOUT, ComponentDirectory, EncodedComponentDirectoryPage,
     EncodedProjectionGeneration, MAX_LOGICAL_BINDING_FIELDS, MAX_PROJECTION_SOURCES,
-    build_component_directory, decode_component_directory, decode_logical_projection_binding,
-    decode_projected_document_state, decode_projection_current, decode_projection_generation,
+    ProjectionGenerationHeader, build_component_directory, decode_component_directory,
+    decode_logical_projection_binding, decode_projected_document_state, decode_projection_current,
+    decode_projection_generation, decode_projection_generation_header,
     encode_logical_projection_binding, encode_projected_document_state, encode_projection_current,
-    encode_projection_generation,
+    encode_projection_generation, resolve_component_root,
 };

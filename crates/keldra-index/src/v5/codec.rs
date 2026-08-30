@@ -44,6 +44,16 @@ pub struct EncodedProjectionGeneration {
     pub component_directory: ComponentDirectory,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionGenerationHeader {
+    pub family_id: [u8; 32],
+    pub revision: u64,
+    pub barrier: ProjectionBarrier,
+    pub component_directory_root_hash: [u8; 32],
+    pub component_root_count: u64,
+    pub previous_generation_hash: Option<[u8; 32]>,
+}
+
 pub fn encode_projection_current(current: ProjectionCurrent) -> Result<Vec<u8>, IndexError> {
     if current.family_id == [0; 32]
         || current.generation_hash == [0; 32]
@@ -118,6 +128,26 @@ pub fn decode_projection_generation(
     bytes: &[u8],
     component_directory: &ComponentDirectory,
 ) -> Result<ProjectionGeneration, IndexError> {
+    let header = decode_projection_generation_header(bytes)?;
+    if header.component_directory_root_hash != component_directory.root_hash
+        || header.component_root_count != component_directory.root_count
+    {
+        return Err(IndexError::Integrity);
+    }
+    let generation = ProjectionGeneration {
+        family_id: header.family_id,
+        revision: header.revision,
+        barrier: header.barrier,
+        roots: decode_component_directory(component_directory)?,
+        previous_generation_hash: header.previous_generation_hash,
+    };
+    generation.validate()?;
+    Ok(generation)
+}
+
+pub fn decode_projection_generation_header(
+    bytes: &[u8],
+) -> Result<ProjectionGenerationHeader, IndexError> {
     let payload = verify_integrity(bytes)?;
     let mut input = Decoder::new(payload);
     input.expect(GENERATION_MAGIC)?;
@@ -143,20 +173,72 @@ pub fn decode_projection_generation(
     let directory_count = input.u64()?;
     let previous_generation_hash = input.optional_hash()?;
     input.finish()?;
-    if directory_hash != component_directory.root_hash
-        || directory_count != component_directory.root_count
-    {
-        return Err(IndexError::Integrity);
+    if family_id == [0; 32] || directory_hash == [0; 32] || directory_count == 0 {
+        return Err(IndexError::InvalidFormat(
+            "projection generation header contains a zero identity",
+        ));
     }
-    let generation = ProjectionGeneration {
+    Ok(ProjectionGenerationHeader {
         family_id,
         revision,
         barrier: ProjectionBarrier::new(source_offsets, atomic_through)?,
-        roots: decode_component_directory(component_directory)?,
+        component_directory_root_hash: directory_hash,
+        component_root_count: directory_count,
         previous_generation_hash,
-    };
-    generation.validate()?;
-    Ok(generation)
+    })
+}
+
+pub fn resolve_component_root(
+    root_hash: [u8; 32],
+    root_count: u64,
+    component: ComponentIdentity,
+    mut load_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+) -> Result<Option<ComponentRoot>, IndexError> {
+    if root_hash == [0; 32] || root_count == 0 {
+        return Err(IndexError::InvalidDefinition(
+            "component directory lookup root is invalid".into(),
+        ));
+    }
+    resolve_component_subtree(root_hash, root_count, component, &mut load_page)
+}
+
+fn resolve_component_subtree(
+    hash: [u8; 32],
+    root_count: u64,
+    component: ComponentIdentity,
+    load_page: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+) -> Result<Option<ComponentRoot>, IndexError> {
+    let bytes = load_page(hash)?;
+    if hash != *blake3::hash(&bytes).as_bytes() {
+        return Err(IndexError::Integrity);
+    }
+    match decode_directory_page(&bytes)? {
+        DirectoryPage::Leaf(roots) => {
+            if roots.len() as u64 != root_count {
+                return Err(IndexError::Integrity);
+            }
+            Ok(roots
+                .binary_search_by_key(&component, |root| root.component)
+                .ok()
+                .map(|index| roots[index].clone()))
+        }
+        DirectoryPage::Branch(children) => {
+            if children
+                .iter()
+                .try_fold(0_u64, |total, child| total.checked_add(child.root_count))
+                != Some(root_count)
+            {
+                return Err(IndexError::Integrity);
+            }
+            let Some(child) = children
+                .iter()
+                .find(|child| child.minimum <= component && component <= child.maximum)
+            else {
+                return Ok(None);
+            };
+            resolve_component_subtree(child.hash, child.root_count, component, load_page)
+        }
+    }
 }
 
 pub fn encode_logical_projection_binding(
@@ -841,6 +923,19 @@ mod tests {
                 .all(|page| page.bytes.len() < 32 * 1024)
         );
         assert_eq!(decode_component_directory(&directory).unwrap(), roots);
+        let pages = directory
+            .pages
+            .iter()
+            .map(|page| (page.hash, page.bytes.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let target = roots[63_777].component;
+        assert_eq!(
+            resolve_component_root(directory.root_hash, directory.root_count, target, |hash| {
+                pages.get(&hash).cloned().ok_or(IndexError::Integrity)
+            },)
+            .unwrap(),
+            Some(roots[63_777].clone())
+        );
     }
 
     #[test]
@@ -864,6 +959,17 @@ mod tests {
         assert_eq!(
             decode_projection_generation(&encoded.bytes, &encoded.component_directory).unwrap(),
             generation
+        );
+        let header = decode_projection_generation_header(&encoded.bytes).unwrap();
+        assert_eq!(header.family_id, generation.family_id);
+        assert_eq!(header.revision, generation.revision);
+        assert_eq!(
+            header.component_directory_root_hash,
+            encoded.component_directory.root_hash
+        );
+        assert_eq!(
+            header.component_root_count,
+            encoded.component_directory.root_count
         );
 
         let mut wrong_directory = encoded.component_directory.clone();
