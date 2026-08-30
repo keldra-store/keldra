@@ -73,13 +73,13 @@ fn seal_pack(
     let deltas = staged
         .into_iter()
         .map(|(delta, offset)| PackedComponentDelta {
-            component: delta.root.component,
+            component: delta.component,
             pack_hash: hash,
             offset,
-            encoded_bytes: delta.root.encoded_bytes,
-            logical_bytes: delta.root.logical_bytes,
+            encoded_bytes: delta.encoded_bytes,
+            logical_bytes: delta.logical_bytes,
             records: delta.records,
-            segment_hash: delta.root.artifact_hash,
+            segment_hash: delta.hash,
         })
         .collect();
     Ok(SealedProjectionDeltaPack {
@@ -91,9 +91,9 @@ fn seal_pack(
 
 fn validate_delta(delta: &SealedComponentDelta) -> Result<(), IndexError> {
     let decoded = decode_component_delta_segment(&delta.bytes)?;
-    if decoded.component != delta.root.component
-        || delta.root.artifact_hash != *blake3::hash(&delta.bytes).as_bytes()
-        || delta.root.encoded_bytes != delta.bytes.len() as u64
+    if decoded.component != delta.component
+        || delta.hash != *blake3::hash(&delta.bytes).as_bytes()
+        || delta.encoded_bytes != delta.bytes.len() as u64
         || delta.records != decoded.records.len() as u64
     {
         return Err(IndexError::Integrity);

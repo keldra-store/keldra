@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::IndexError;
 
 use super::{
-    CanonicalRecipeState, ComponentIdentity, ComponentRoot, DocumentHead, ProjectedDocumentDelta,
+    CanonicalRecipeState, ComponentIdentity, DocumentHead, ProjectedDocumentDelta,
     ProjectedDocumentState, RecipeIdentity, StableDocumentKey, encode_projected_document_state,
 };
 
@@ -26,7 +26,10 @@ pub struct DecodedComponentDelta {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedComponentDelta {
-    pub root: ComponentRoot,
+    pub component: ComponentIdentity,
+    pub hash: [u8; 32],
+    pub encoded_bytes: u64,
+    pub logical_bytes: u64,
     pub bytes: Vec<u8>,
     pub records: u64,
 }
@@ -244,7 +247,10 @@ pub(super) fn seal_component(
     let encoded_bytes = bytes.len() as u64;
     let records = decode_component_delta(&bytes)?.len() as u64;
     Ok(SealedComponentDelta {
-        root: ComponentRoot::new(component, artifact_hash, encoded_bytes, logical_bytes)?,
+        component,
+        hash: artifact_hash,
+        encoded_bytes,
+        logical_bytes,
         bytes,
         records,
     })
@@ -459,11 +465,11 @@ mod tests {
         buffer.apply_state(&new, Some(&old)).unwrap();
         let sealed = buffer.seal().unwrap();
         assert_eq!(sealed.len(), 2);
-        assert_eq!(sealed[0].root.component, ComponentIdentity::DocumentHead);
-        assert_eq!(sealed[1].root.component, ComponentIdentity::ProjectedState);
+        assert_eq!(sealed[0].component, ComponentIdentity::DocumentHead);
+        assert_eq!(sealed[1].component, ComponentIdentity::ProjectedState);
         for segment in sealed {
             let decoded = decode_component_delta_segment(&segment.bytes).unwrap();
-            assert_eq!(decoded.component, segment.root.component);
+            assert_eq!(decoded.component, segment.component);
             assert_eq!(decoded.records.len(), 1);
         }
     }
@@ -479,22 +485,22 @@ mod tests {
         assert!(
             sealed
                 .iter()
-                .any(|segment| segment.root.component == ComponentIdentity::DocumentHead)
+                .any(|segment| segment.component == ComponentIdentity::DocumentHead)
         );
         assert!(
             sealed
                 .iter()
-                .any(|segment| segment.root.component == ComponentIdentity::Field(recipe(2)))
+                .any(|segment| segment.component == ComponentIdentity::Field(recipe(2)))
         );
         assert!(
             sealed
                 .iter()
-                .any(|segment| segment.root.component == ComponentIdentity::ProjectedState)
+                .any(|segment| segment.component == ComponentIdentity::ProjectedState)
         );
         assert!(
             !sealed
                 .iter()
-                .any(|segment| segment.root.component == ComponentIdentity::Field(recipe(3)))
+                .any(|segment| segment.component == ComponentIdentity::Field(recipe(3)))
         );
         for segment in sealed {
             assert_eq!(decode_component_delta(&segment.bytes).unwrap().len(), 1);

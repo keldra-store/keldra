@@ -67,14 +67,7 @@ pub struct ComponentStreamDirectory {
 impl ComponentStreamDirectory {
     pub fn component_root(&self) -> Result<ComponentRoot, IndexError> {
         decode_component_stream(self)?;
-        ComponentRoot::new(
-            self.component,
-            self.root_hash,
-            self.encoded_bytes
-                .checked_add(self.directory_bytes)
-                .ok_or(IndexError::OffsetOverflow)?,
-            self.logical_bytes,
-        )
+        self.root().component_root()
     }
 
     pub fn root(&self) -> ComponentStreamRoot {
@@ -99,6 +92,37 @@ pub struct ComponentStreamRoot {
     pub encoded_bytes: u64,
     pub logical_bytes: u64,
     pub directory_bytes: u64,
+}
+
+impl ComponentStreamRoot {
+    pub fn from_component_root(root: &ComponentRoot) -> Result<Self, IndexError> {
+        root.validate()?;
+        Ok(Self {
+            component: root.component,
+            root_hash: root.stream_root_hash,
+            segment_count: root.segment_count,
+            encoded_bytes: root
+                .encoded_bytes
+                .checked_sub(root.directory_bytes)
+                .ok_or(IndexError::OffsetOverflow)?,
+            logical_bytes: root.logical_bytes,
+            directory_bytes: root.directory_bytes,
+        })
+    }
+
+    pub fn component_root(self) -> Result<ComponentRoot, IndexError> {
+        validate_root(self)?;
+        ComponentRoot::new(
+            self.component,
+            self.root_hash,
+            self.segment_count,
+            self.encoded_bytes
+                .checked_add(self.directory_bytes)
+                .ok_or(IndexError::OffsetOverflow)?,
+            self.logical_bytes,
+            self.directory_bytes,
+        )
+    }
 }
 
 /// A path-copy append result. Only these pages need publication before the new
@@ -359,12 +383,10 @@ pub fn compact_component_stream(
         .expect("one compacted segment produces one pack");
     let compacted = append_component_delta(None, &pack.deltas[0])?;
     let segment = SealedComponentDelta {
-        root: ComponentRoot::new(
-            pack.deltas[0].component,
-            pack.deltas[0].segment_hash,
-            pack.deltas[0].encoded_bytes,
-            pack.deltas[0].logical_bytes,
-        )?,
+        component: pack.deltas[0].component,
+        hash: pack.deltas[0].segment_hash,
+        encoded_bytes: pack.deltas[0].encoded_bytes,
+        logical_bytes: pack.deltas[0].logical_bytes,
         bytes: pack.bytes,
         records: pack.deltas[0].records,
     };
@@ -991,10 +1013,13 @@ mod tests {
             .iter()
             .map(|page| (page.hash, page.bytes.clone()))
             .collect::<BTreeMap<_, _>>();
+        let persisted_root = previous.component_root().unwrap();
+        let reopened_root = ComponentStreamRoot::from_component_root(&persisted_root).unwrap();
+        assert_eq!(reopened_root, previous.root());
         let (delta, _) = packed(sealed(component, &[(1, Some(b"next"))]));
 
         let appended = append_component_stream(
-            Some(previous.root()),
+            Some(reopened_root),
             |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
             &delta,
         )

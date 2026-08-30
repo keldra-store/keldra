@@ -384,9 +384,11 @@ fn encode_directory_page(
             put_u32(&mut out, roots.len() as u32);
             for root in roots {
                 put_component(&mut out, root.component);
-                out.extend_from_slice(&root.artifact_hash);
+                out.extend_from_slice(&root.stream_root_hash);
+                put_u64(&mut out, root.segment_count);
                 put_u64(&mut out, root.encoded_bytes);
                 put_u64(&mut out, root.logical_bytes);
+                put_u64(&mut out, root.directory_bytes);
             }
         }
         DirectoryPage::Branch(children) => {
@@ -433,6 +435,8 @@ fn decode_directory_page(bytes: &[u8]) -> Result<DirectoryPage, IndexError> {
                     input.array_32()?,
                     input.u64()?,
                     input.u64()?,
+                    input.u64()?,
+                    input.u64()?,
                 )?);
             }
             validate_roots(&roots)?;
@@ -475,9 +479,11 @@ fn validate_roots(roots: &[ComponentRoot]) -> Result<(), IndexError> {
     for root in roots {
         ComponentRoot::new(
             root.component,
-            root.artifact_hash,
+            root.stream_root_hash,
+            root.segment_count,
             root.encoded_bytes,
             root.logical_bytes,
+            root.directory_bytes,
         )?;
     }
     Ok(())
@@ -724,11 +730,20 @@ mod tests {
             [9; 32],
             ProjectionBarrier::new(vec![(1, 7), (2, 11)], Some(5)).unwrap(),
             vec![
-                ComponentRoot::new(ComponentIdentity::DocumentHead, [1; 32], 10, 9).unwrap(),
-                ComponentRoot::new(ComponentIdentity::ProjectedState, [4; 32], 10, 9).unwrap(),
-                ComponentRoot::new(ComponentIdentity::Membership(recipe(2)), [2; 32], 10, 9)
+                ComponentRoot::new(ComponentIdentity::DocumentHead, [1; 32], 1, 10, 9, 1).unwrap(),
+                ComponentRoot::new(ComponentIdentity::ProjectedState, [4; 32], 1, 10, 9, 1)
                     .unwrap(),
-                ComponentRoot::new(ComponentIdentity::Field(recipe(3)), [3; 32], 10, 9).unwrap(),
+                ComponentRoot::new(
+                    ComponentIdentity::Membership(recipe(2)),
+                    [2; 32],
+                    1,
+                    10,
+                    9,
+                    1,
+                )
+                .unwrap(),
+                ComponentRoot::new(ComponentIdentity::Field(recipe(3)), [3; 32], 1, 10, 9, 1)
+                    .unwrap(),
             ],
         )
         .unwrap()
@@ -764,8 +779,10 @@ mod tests {
                 ComponentRoot::new(
                     ComponentIdentity::Field(recipe),
                     *blake3::hash(&identity).as_bytes(),
+                    1,
                     64,
                     48,
+                    16,
                 )
                 .unwrap()
             })
@@ -784,8 +801,8 @@ mod tests {
     #[test]
     fn directory_rejects_missing_or_corrupt_pages() {
         let roots = [
-            ComponentRoot::new(ComponentIdentity::DocumentHead, [1; 32], 10, 10).unwrap(),
-            ComponentRoot::new(ComponentIdentity::Field(recipe(2)), [2; 32], 10, 10).unwrap(),
+            ComponentRoot::new(ComponentIdentity::DocumentHead, [1; 32], 1, 10, 10, 1).unwrap(),
+            ComponentRoot::new(ComponentIdentity::Field(recipe(2)), [2; 32], 1, 10, 10, 1).unwrap(),
         ];
         let mut directory = build_component_directory(&roots).unwrap();
         directory.pages[0].bytes[4] ^= 1;
@@ -815,8 +832,8 @@ mod tests {
     #[test]
     fn generation_record_size_does_not_grow_with_component_count() {
         let mut roots = vec![
-            ComponentRoot::new(ComponentIdentity::DocumentHead, [8; 32], 64, 48).unwrap(),
-            ComponentRoot::new(ComponentIdentity::ProjectedState, [9; 32], 64, 48).unwrap(),
+            ComponentRoot::new(ComponentIdentity::DocumentHead, [8; 32], 1, 64, 48, 16).unwrap(),
+            ComponentRoot::new(ComponentIdentity::ProjectedState, [9; 32], 1, 64, 48, 16).unwrap(),
         ];
         roots.extend((1_u32..=70_000).map(|ordinal| {
             let mut identity = [0_u8; 32];
@@ -824,8 +841,10 @@ mod tests {
             ComponentRoot::new(
                 ComponentIdentity::Field(RecipeIdentity::new(identity).unwrap()),
                 *blake3::hash(&identity).as_bytes(),
+                1,
                 64,
                 48,
+                16,
             )
             .unwrap()
         }));

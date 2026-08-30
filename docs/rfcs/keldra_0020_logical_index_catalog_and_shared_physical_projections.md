@@ -726,6 +726,9 @@ Implemented groundwork on `feat/shared-index-projection`:
   regression keeps directory pages below 32 KiB; and
 - component-stream append is a persistent path-copy operation rather than a
   whole-directory rebuild. The generation retains only a small root identity;
+  that identity includes the stream root hash, segment count, delta bytes,
+  logical bytes, and directory bytes, so it can be reopened exactly without
+  loading or guessing the full directory;
   immutable directory pages are loaded by hash and one append publishes only
   the rightmost leaf plus its `O(log_256 segments)` parent path. A 65,536 to
   65,537 segment boundary regression rewrites exactly three pages while

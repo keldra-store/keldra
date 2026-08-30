@@ -19,30 +19,41 @@ pub enum ComponentIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentRoot {
     pub component: ComponentIdentity,
-    pub artifact_hash: [u8; 32],
+    pub stream_root_hash: [u8; 32],
+    pub segment_count: u64,
     pub encoded_bytes: u64,
     pub logical_bytes: u64,
+    pub directory_bytes: u64,
 }
 
 impl ComponentRoot {
     pub fn new(
         component: ComponentIdentity,
-        artifact_hash: [u8; 32],
+        stream_root_hash: [u8; 32],
+        segment_count: u64,
         encoded_bytes: u64,
         logical_bytes: u64,
+        directory_bytes: u64,
     ) -> Result<Self, IndexError> {
         let root = Self {
             component,
-            artifact_hash,
+            stream_root_hash,
+            segment_count,
             encoded_bytes,
             logical_bytes,
+            directory_bytes,
         };
         root.validate()?;
         Ok(root)
     }
 
-    fn validate(&self) -> Result<(), IndexError> {
-        if self.artifact_hash == [0; 32] || self.encoded_bytes == 0 || self.logical_bytes == 0 {
+    pub(super) fn validate(&self) -> Result<(), IndexError> {
+        if self.stream_root_hash == [0; 32]
+            || self.segment_count == 0
+            || self.encoded_bytes <= self.directory_bytes
+            || self.logical_bytes == 0
+            || self.directory_bytes == 0
+        {
             return Err(IndexError::InvalidDefinition(
                 "projection component root is invalid".into(),
             ));
@@ -273,7 +284,7 @@ mod tests {
     }
 
     fn root(component: ComponentIdentity, byte: u8) -> ComponentRoot {
-        ComponentRoot::new(component, [byte; 32], 100, 80).unwrap()
+        ComponentRoot::new(component, [byte; 32], 1, 100, 80, 20).unwrap()
     }
 
     fn initial() -> ProjectionGeneration {
