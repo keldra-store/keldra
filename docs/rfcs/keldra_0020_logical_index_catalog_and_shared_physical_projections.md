@@ -389,6 +389,9 @@ field delta for recipe R:
 
 order delta for order recipe R:
     stable key -> canonical order tuple or tombstone
+
+source-record-set delta:
+    source scope + path -> exact sorted stable keys currently expanded
 ```
 
 The newest entry at or below the pinned generation wins independently in each
@@ -802,6 +805,15 @@ and document head—no membership or query field—and that changing one indexed
 field adds only that field recipe. Durable generation publication and
 production query resolution still have to consume these records before
 Milestone C is complete.
+
+The writer also maintains one source-record-set component. It lets overwrite,
+delete, and expansion shrink load exactly the prior stable keys for that source
+without scanning the family. A complete source update is admitted
+transactionally: all current records, removed-record tombstones, and the
+record-set replacement enter the shared buffer or none do. The current
+implementation reserves twice the buffer bound while cloning the affected
+buffer for rollback; this is an explicit temporary peak bound, not unaccounted
+memory or a per-definition reservation.
 
 ### 18.4 Milestone D: lifecycle and scale completion
 

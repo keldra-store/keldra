@@ -768,6 +768,7 @@ fn put_component(out: &mut Vec<u8>, component: ComponentIdentity) {
     match component {
         ComponentIdentity::DocumentHead => out.push(1),
         ComponentIdentity::ProjectedState => out.push(5),
+        ComponentIdentity::SourceRecords => out.push(6),
         ComponentIdentity::Membership(recipe) => {
             out.push(2);
             out.extend_from_slice(&recipe.bytes());
@@ -852,6 +853,7 @@ impl<'a> Decoder<'a> {
         match self.byte()? {
             1 => Ok(ComponentIdentity::DocumentHead),
             5 => Ok(ComponentIdentity::ProjectedState),
+            6 => Ok(ComponentIdentity::SourceRecords),
             2 => Ok(ComponentIdentity::Membership(RecipeIdentity::new(
                 self.array_32()?,
             )?)),

@@ -10,6 +10,10 @@ use super::RecipeIdentity;
 pub enum ComponentIdentity {
     DocumentHead,
     ProjectedState,
+    /// Exact stable-key set produced by one source object. This makes delete
+    /// and record-expansion shrink proportional to that source rather than a
+    /// scan of the complete projected-state stream.
+    SourceRecords,
     Membership(RecipeIdentity),
     Field(RecipeIdentity),
     Order(RecipeIdentity),
