@@ -85,10 +85,6 @@ impl AssignedBucketInventory {
         self.buckets.len()
     }
 
-    pub(super) const fn fence(&self) -> PlacementLogId {
-        self.fence
-    }
-
     pub(super) fn definitions(
         &self,
         tenant_id: u64,

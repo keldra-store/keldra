@@ -23,6 +23,7 @@ use crate::index_runtime::publisher::IndexCommitPublisher;
 use super::{
     DerivedBarrierEvidence, DerivedCheckpointPublisher, DerivedDefinitionIdentity,
     SparseDerivedInventory, SparseDerivedTracker, assigned::AssignedBucketInventory,
+    assignment_changes::AssignmentChangeCollector,
 };
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -216,17 +217,8 @@ impl DerivedConsumerRuntimeTask {
         resolver: DerivedEvidenceResolver,
     ) -> (DerivedProgressReporter, Self) {
         let (reporter, receiver) = DerivedProgressReporter::channel(kind);
-        let assignment_changes = store.subscribe_definition_assignment_changes();
         let task = tokio::spawn(run(
-            kind,
-            local_node,
-            decisions,
-            store,
-            journal,
-            publisher,
-            resolver,
-            receiver,
-            assignment_changes,
+            kind, local_node, decisions, store, journal, publisher, resolver, receiver,
         ));
         (reporter, Self { task })
     }
@@ -242,6 +234,7 @@ struct RuntimeState {
     tracker: SparseDerivedTracker,
     demux: IndexBarrier,
     assignments: AssignedBucketInventory,
+    assignment_changes: AssignmentChangeCollector,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -254,19 +247,10 @@ async fn run(
     publisher: DerivedCheckpointPublisher,
     resolver: DerivedEvidenceResolver,
     mut progress: tokio::sync::mpsc::Receiver<ProgressMessage>,
-    mut assignment_changes: tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
 ) {
     loop {
-        assignment_changes = assignment_changes.resubscribe();
         let initialized = initialize(
-            kind,
-            local_node,
-            &decisions,
-            &store,
-            &journal,
-            &publisher,
-            &resolver,
-            &mut assignment_changes,
+            kind, local_node, &decisions, &store, &journal, &publisher, &resolver,
         )
         .await;
         let mut state = match initialized {
@@ -285,23 +269,6 @@ async fn run(
                     Some(message) => apply_progress(&publisher, &mut state.tracker, message).await,
                     None => return,
                 },
-                received = assignment_changes.recv() => match received {
-                    Ok(mutations) => apply_assignment_changes(
-                        &mut state,
-                        mutations,
-                    ),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(consumer.kind = ?kind, skipped, "derived assignment notifications lagged; reconciling exact durable inventory");
-                        reconcile_assignment_snapshot(
-                            kind,
-                            &store,
-                            &mut assignment_changes,
-                            &mut state.assignments,
-                            &mut state.tracker,
-                        ).await
-                    },
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                },
                 _ = interval.tick() => advance_once(
                     kind,
                     &decisions,
@@ -309,7 +276,6 @@ async fn run(
                     &journal,
                     &publisher,
                     &resolver,
-                    &mut assignment_changes,
                     &mut state,
                 ).await,
             };
@@ -329,7 +295,6 @@ async fn initialize(
     journal: &IndexEventJournal,
     publisher: &DerivedCheckpointPublisher,
     resolver: &DerivedEvidenceResolver,
-    assignment_changes: &mut tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
 ) -> Result<RuntimeState, Status> {
     let target = journal.capture_barrier().await.map_err(event_status)?;
     wait_for_assignment_delivery(kind, decisions, store, &target).await?;
@@ -345,8 +310,8 @@ async fn initialize(
             .map(|(status, checkpoint)| (*status, checkpoint.clone())),
     )
     .map_err(tracker_status)?;
-    let (mut assignments, exact_changes) = assignment_snapshot(kind, store, target.fence).await?;
-    *assignment_changes = exact_changes;
+    let (mut assignments, assignment_changes) =
+        AssignmentChangeCollector::start(kind, store.clone(), target.fence).await?;
     scan_inventory(
         kind,
         journal,
@@ -362,19 +327,13 @@ async fn initialize(
     // this returns. Drain them before this disposable inventory is trusted.
     wait_for_assignment_delivery(kind, decisions, store, &target).await?;
     let mut tracker = inventory.finish();
-    synchronize_assignment_changes(
-        kind,
-        store,
-        assignment_changes,
-        &mut assignments,
-        &mut tracker,
-    )
-    .await?;
+    synchronize_assignment_changes(&assignment_changes, &mut assignments, &mut tracker)?;
     publisher.publish_tracker(&mut tracker).await?;
     Ok(RuntimeState {
         tracker,
         demux: target,
         assignments,
+        assignment_changes,
     })
 }
 
@@ -499,13 +458,6 @@ async fn apply_progress(
     publisher.publish_tracker(tracker).await
 }
 
-fn apply_assignment_changes(
-    state: &mut RuntimeState,
-    mutations: Vec<DefinitionAssignmentMutation>,
-) -> Result<(), Status> {
-    apply_assignment_mutations(&mut state.assignments, &mut state.tracker, mutations)
-}
-
 async fn advance_once(
     kind: DerivedConsumerKind,
     decisions: &DecisionRaft,
@@ -513,23 +465,19 @@ async fn advance_once(
     journal: &IndexEventJournal,
     publisher: &DerivedCheckpointPublisher,
     resolver: &DerivedEvidenceResolver,
-    assignment_changes: &mut tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
     state: &mut RuntimeState,
 ) -> Result<(), Status> {
+    synchronize_assignment_changes(
+        &state.assignment_changes,
+        &mut state.assignments,
+        &mut state.tracker,
+    )?;
     let target = journal.capture_barrier().await.map_err(event_status)?;
     require_compatible(&state.demux, &target)?;
     if state.demux == target {
         return Ok(());
     }
     wait_for_assignment_delivery(kind, decisions, store, &target).await?;
-    synchronize_assignment_changes(
-        kind,
-        store,
-        assignment_changes,
-        &mut state.assignments,
-        &mut state.tracker,
-    )
-    .await?;
     // Routed effects are bounded by the target captured above. Move the
     // disposable tracker's settled view to that same target before asking it
     // to validate those effects; validating first compares new offsets with
@@ -809,69 +757,18 @@ fn change_buckets(kind: DerivedConsumerKind, change: &LocalChange) -> Vec<(u64, 
     }
 }
 
-async fn synchronize_assignment_changes(
-    kind: DerivedConsumerKind,
-    store: &Store,
-    receiver: &mut tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
+fn synchronize_assignment_changes(
+    collector: &AssignmentChangeCollector,
     assignments: &mut AssignedBucketInventory,
     tracker: &mut SparseDerivedTracker,
 ) -> Result<(), Status> {
-    loop {
-        match receiver.try_recv() {
-            Ok(mutations) => apply_assignment_mutations(assignments, tracker, mutations)?,
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return Ok(()),
-            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                return Err(Status::unavailable(
-                    "derived assignment notifications closed",
-                ));
-            }
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
-                tracing::warn!(consumer.kind = ?kind, skipped, "derived assignment notification drain lagged; reconciling exact durable inventory");
-                reconcile_assignment_snapshot(kind, store, receiver, assignments, tracker).await?;
-            }
+    let changes = collector.drain()?;
+    if let Some(replacement) = changes.replacement {
+        for removed in assignments.replace_with(replacement) {
+            tracker.remove_identity(removed).map_err(tracker_status)?;
         }
     }
-}
-
-async fn reconcile_assignment_snapshot(
-    kind: DerivedConsumerKind,
-    store: &Store,
-    receiver: &mut tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
-    assignments: &mut AssignedBucketInventory,
-    tracker: &mut SparseDerivedTracker,
-) -> Result<(), Status> {
-    let (replacement, exact_changes) =
-        assignment_snapshot(kind, store, assignments.fence()).await?;
-    for removed in assignments.replace_with(replacement) {
-        tracker.remove_identity(removed).map_err(tracker_status)?;
-    }
-    *receiver = exact_changes;
-    Ok(())
-}
-
-async fn assignment_snapshot(
-    kind: DerivedConsumerKind,
-    store: &Store,
-    fence: PlacementLogId,
-) -> Result<
-    (
-        AssignedBucketInventory,
-        tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
-    ),
-    Status,
-> {
-    let store = store.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut inventory = AssignedBucketInventory::new(definition_kind(kind), fence);
-        let receiver =
-            store.visit_definition_assignment_snapshot(definition_kind(kind), |assignment| {
-                inventory.insert_scanned(assignment);
-            })?;
-        Ok::<_, keldra_store::DefinitionStateError>((inventory, receiver))
-    })
-    .await
-    .map_err(join_status)?
-    .map_err(internal_status)
+    apply_assignment_mutations(assignments, tracker, changes.mutations)
 }
 
 fn apply_assignment_mutations(

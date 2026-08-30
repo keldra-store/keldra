@@ -495,3 +495,20 @@ receiver created under the same assignment lock; lag now replaces only the
 disposable assignment inventory and preserves completed source/projection
 progress. Catalog-250K must be rerun against that exact candidate before a pass
 is claimed.
+
+That first replacement was necessary but not sufficient. Candidate
+`737c62e65f1f` reached 77,291 definitions at about 859 definitions/s on SSD,
+but performed hundreds of full durable reconciliations in its first two
+minutes. The HDD cell reached 1,908 definitions at about 21 definitions/s and
+its skipped notification batches grew 4, 58, then 126. Both diagnostics were
+stopped and preserved. Keeping projection progress removed the old restart
+loop, but tying assignment receipt to long derived-consumer turns still made
+catalog recovery work proportional to repeated catalog snapshots.
+
+The second replacement gives assignment intake its own lightweight task. It
+continuously drains the Store receiver and coalesces the newest committed
+mutation per exact definition identity in a map bounded by catalog cardinality.
+The derived runtime drains that map at its normal boundaries; only genuine lag
+inside the collector invokes the exact durable snapshot. This candidate must
+show zero collector-lag replacements during Catalog-250K before the control
+plane is considered scalable.

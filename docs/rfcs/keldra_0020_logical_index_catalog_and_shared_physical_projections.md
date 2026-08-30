@@ -161,8 +161,13 @@ reconcile from an exact bounded-memory view of the durable catalog. It must not
 discard a partially or completely reconstructed projection inventory and
 restart from page one. The assignment scan and replacement receiver share the
 Store's assignment mutation fence, so no change can fall between the exact
-inventory and its catch-up stream. A later catalog-page format may reduce the
-duration of that fence, but cannot weaken this boundary.
+inventory and its catch-up stream. A dedicated lightweight collector drains
+that receiver independently of source/index work and coalesces only the newest
+committed mutation per definition. The pending map is bounded by catalog
+cardinality. Full durable replacement is reserved for startup and genuine
+collector lag; a long indexing turn cannot repeatedly trigger an `O(catalog)`
+rescan. A later catalog-page format may reduce the duration of the snapshot
+fence, but cannot weaken this boundary.
 
 ## 5. Canonical physical identities
 
