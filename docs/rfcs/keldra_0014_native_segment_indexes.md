@@ -1712,7 +1712,11 @@ bounded loan is not revoked; it is returned at the existing query, build-turn,
 or compaction boundary. Catch-up, rebuild, and segment compaction derive their
 actual workspace from the granted bytes. Locator-root compaction is globally
 charged but requests only its fixed fair-share workspace because a larger
-grant cannot accelerate that path.
+grant cannot accelerate that path. Segment compaction likewise requests only
+its per-kind fair share: the configured default lanes fit that share, and a
+non-preemptible merge must not borrow otherwise idle aggregate memory which a
+new source-writer turn may need. Optional borrowing remains available to
+bounded build turns whose own turn boundary returns the loan.
 
 Long-lived projection and merge lanes are async orchestration tasks outside the
 Rayon pool. They acquire work and memory, submit one finite leaf CPU chunk, await

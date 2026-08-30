@@ -136,6 +136,23 @@ async fn maintenance_waits_for_its_lane_before_leasing_working_memory() {
 }
 
 #[tokio::test]
+async fn compaction_keeps_an_incremental_kind_turn_admissible() {
+    let share = MIN_INDEX_KIND_MEMORY_BYTES as u64;
+    let budgets = IndexMemoryBudgets::new(share).unwrap();
+    let budget = budgets.for_kind(IndexKind::TypedJson);
+    let slots = IndexMaintenanceWorkSlots::new(1);
+
+    let (_slot, compaction) = acquire_compaction_memory(&slots, budget).await.unwrap();
+    assert_eq!(compaction.bytes(), share);
+
+    let incremental = tokio::time::timeout(Duration::from_secs(1), budget.acquire(share))
+        .await
+        .expect("a non-preemptible compaction must not lease the next writer turn")
+        .unwrap();
+    assert_eq!(incremental.bytes(), share);
+}
+
+#[tokio::test]
 async fn owned_background_task_is_aborted_when_dropped() {
     let (started, started_rx) = tokio::sync::oneshot::channel();
     let (dropped, dropped_rx) = tokio::sync::oneshot::channel();

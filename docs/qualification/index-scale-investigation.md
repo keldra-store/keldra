@@ -572,3 +572,59 @@ This is a control-plane and recovery result. It proves that a large logical
 catalog is cheap resident metadata; it does not claim that 250,000 distinct
 recipes can all maintain changed physical fields for free. The rotational-host
 Catalog-250K cell and the distinct-recipe/HOT gates remain in progress.
+
+## Mixed field-subset bridge evidence and maintenance-admission defect
+
+Server and harness commit `ed9041b68fd8` changed the production Typed JSON
+bridge from complete-schema sharing to membership-family sharing. The bounded
+qualification alternated two genuinely different logical field subsets: one
+requested `record_id`, `class`, and `generation`; the other requested the same
+physical `record_id` and `class` recipes under `document_id` and `category`
+while omitting `generation`. Logical queries remained restricted to their own
+declared fields.
+
+On the 8-core SSD host, a fresh-volume 100 operations/s sweep produced:
+
+| Definitions | Accepted | Accepted/s | Mutation p99 | Query p99 | Visibility p99 | Drain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 11,979 | 99.93 | 97.54 ms | 143.36 ms | 3.03 s | 16.53 s |
+| 256 | 11,979 | 99.94 | 82.88 ms | 141.82 ms | 3.01 s | 21.89 s |
+| 640 | 11,979 | 99.97 | 72.26 ms | 127.10 ms | 4.20 s | 20.53 s |
+
+Every cell completed 7,680 concurrent queries with zero mutation, query,
+timeout, scheduling, or correctness error and exact final results for every
+logical definition. After one zero-work transitional physical identity while
+the recipe union changed, the server ran one steady family builder. The
+definition-count sweep archive SHA-256 is
+`343bd96d72f8926ecbada92b2abbd5fe34802af5e542ed21a6d58af5c40a3169`.
+This proves that 640 mixed logical subsets do not create 640 physical writers;
+it is not a 30-minute keep-up result.
+
+The corresponding ten-minute D640 SSD cell accepted all 59,994 operations at
+99.99 operations/s and completed 38,400 concurrent queries with zero errors,
+timeouts, drops, or correctness failures. Mutation p99 was 127.81 ms and query
+p99 was 892.93 ms. It nevertheless failed the publication-visibility gate:
+95 of 96 samples remained in the ordinary 2--4 second range, but one sample
+waited 95.29 seconds; exact drain was 149.75 seconds. The failure archive
+SHA-256 is
+`2b2e61b01ea24def8ef819526e6975a99259cc390738e8eb7827dd6e0ce72bfe`.
+
+The server trace attributes that outlier to working-memory admission rather
+than definition fan-out. Default index working memory was 2.75 GiB. Queries
+reserved 512 MiB and the shared projection held 256 MiB, leaving 2 GiB of
+background capacity. A four-lane Typed JSON compaction of four segments, 429
+documents, and only 55,558 encoded input bytes admitted 256 MiB of actual
+workspace but leased the complete 2 GiB remainder. Because that loan is
+non-preemptible, a new source-writer turn could not obtain its mandatory
+256 MiB. Its catch-up span emitted 30- and 60-second zero-progress heartbeats
+and resumed only after 84.03 seconds when the merge released the oversized
+lease.
+
+The correction makes segment and locator compaction request exactly their
+per-kind fair share. The default four lanes already fit that 256 MiB share, so
+the observed merge loses no admitted lane while a later writer remains
+admissible. A focused asynchronous regression holds the exact production
+compaction permit and proves a second Typed JSON writer obtains its complete
+mandatory turn without waiting for compaction to finish. A sustained exact-
+candidate rerun on SSD and rotational storage is required before this defect is
+closed; the failed cell remains part of the record.

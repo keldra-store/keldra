@@ -72,6 +72,11 @@ use debt::{DebtLimits, DebtSelection};
 mod invalidation;
 #[path = "manager/locator_debt.rs"]
 mod locator_debt;
+#[path = "manager/maintenance.rs"]
+mod maintenance;
+use maintenance::compact_one_if_needed;
+#[cfg(test)]
+use maintenance::{acquire_compaction_memory, acquire_maintenance_memory};
 #[path = "manager/observability.rs"]
 mod observability;
 #[path = "manager/publication.rs"]
@@ -1618,107 +1623,6 @@ async fn enqueue_candidate_publication(
     work.must_publish = false;
     work.checkpoint_started = None;
     Ok(())
-}
-
-async fn compact_one_if_needed(
-    job: &BuilderJob,
-    candidate: &mut CandidateCommit,
-    limits: DebtLimits,
-    dependencies: &IndexBuilderDependencies,
-) -> Result<bool, Status> {
-    invalidation::materialize_pending_live_masks(&job.definition, candidate, dependencies).await?;
-    emit_compaction_debt(
-        job.kind,
-        &candidate.segments,
-        limits.maximum_segments,
-        limits.maximum_bytes,
-        "observed",
-    );
-    let Some(selection) = debt::select_before_locator_limit(
-        &candidate.segments,
-        candidate.locator_roots.len(),
-        limits,
-    ) else {
-        let Some(locator_selection) = debt::select_locator_roots(&candidate.locator_roots, limits)
-        else {
-            return Ok(false);
-        };
-        tracing::info!(
-            index.kind = ?job.kind,
-            compaction.trigger = "locator_debt",
-            compaction.input_roots = locator_selection.input_roots,
-            gauge.keldra_index_locator_roots = candidate.locator_roots.len() as u64,
-            monotonic_counter.keldra_index_locator_compaction_admission_stops_total = 1_u64,
-            "index source work yielded to bounded locator compaction debt"
-        );
-        let budget = dependencies.budgets.for_kind(job.kind);
-        let (_publication_slot, _permit) = acquire_maintenance_memory(
-            &dependencies.maintenance_work_slots,
-            budget,
-            budget.limit(),
-            budget.limit(),
-        )
-        .await?;
-        locator_debt::compact_oldest_prefix(
-            &job.definition,
-            job.kind,
-            locator_selection,
-            compaction_admission(),
-            candidate,
-            dependencies,
-        )
-        .await?;
-        return Ok(true);
-    };
-    tracing::info!(
-        index.kind = ?job.kind,
-        compaction.trigger = "debt",
-        monotonic_counter.keldra_index_compaction_admission_stops_total = 1_u64,
-        "index source work yielded to bounded compaction debt"
-    );
-    let budget = dependencies.budgets.for_kind(job.kind);
-    let (_publication_slot, permit) = acquire_maintenance_memory(
-        &dependencies.maintenance_work_slots,
-        budget,
-        budget.limit(),
-        budget.working_memory_limit(),
-    )
-    .await?;
-    compact_tier(
-        &job.definition,
-        job.kind,
-        selection,
-        permit.bytes(),
-        compaction_admission(),
-        candidate,
-        dependencies,
-    )
-    .await?;
-    emit_compaction_debt(
-        job.kind,
-        &candidate.segments,
-        limits.maximum_segments,
-        limits.maximum_bytes,
-        "repaid",
-    );
-    Ok(true)
-}
-
-async fn acquire_maintenance_memory(
-    slots: &IndexMaintenanceWorkSlots,
-    budget: &super::budget::IndexMemoryBudget,
-    minimum: u64,
-    preferred: u64,
-) -> Result<(tokio::sync::OwnedSemaphorePermit, IndexMemoryPermit), Status> {
-    // Queue for the scarce maintenance lane before leasing construction
-    // memory. Waiting maintenance must not pin bytes that incremental builders
-    // can use while it is not runnable.
-    let slot = slots.acquire().await?;
-    let permit = budget
-        .acquire_up_to(minimum, preferred)
-        .await
-        .map_err(budget_status)?;
-    Ok((slot, permit))
 }
 
 fn is_local_builder(

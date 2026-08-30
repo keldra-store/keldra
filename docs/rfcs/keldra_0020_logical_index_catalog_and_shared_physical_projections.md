@@ -527,6 +527,15 @@ Fair scheduling rotates source windows and backfills by source partition and
 oldest wall-clock lag. A hot family cannot monopolize the writer, and a large
 catalog cannot dilute service for the bounded set of dirty families.
 
+Compaction is a non-preemptible maintenance turn. It may use the complete
+per-kind construction fair share, including every configured merge lane, but
+must not lease the idle aggregate working-memory parent merely because no
+writer happened to be queued at admission time. The unborrowed capacity keeps
+a later source-writer turn admissible while maintenance is running. This is a
+latency and liveness invariant, not an unaccounted memory reserve: compaction
+still charges its complete admitted workspace and the hard node ceiling remains
+unchanged.
+
 ## 13. Telemetry
 
 Required counters and histograms are labelled by physical family/recipe class,
