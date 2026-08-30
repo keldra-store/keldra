@@ -1207,14 +1207,10 @@ async fn advance_catch_up(
                 let publication_started =
                     BufferAge::earliest(active.started, work.checkpoint_started);
                 let remaining = publication_started.and_then(|started| {
-                    started.remaining(
-                        &active.builder.runnable,
-                        dependencies.config.segment_flush_max_age(),
-                    )
+                    started.wall_remaining(dependencies.config.segment_flush_max_age())
                 });
                 if let Some(remaining) = remaining {
                     tokio::time::sleep(remaining).await;
-                    active.builder.runnable.add(remaining);
                 }
             }
             if work.publishing.is_some() {
@@ -1431,10 +1427,7 @@ async fn advance_catch_up(
             page_work.source_payload_bytes,
         )? == SourceWorkBoundary::SealAndYield;
         let age_boundary = active.started.is_some_and(|started| {
-            started.reached(
-                &active.builder.runnable,
-                dependencies.config.segment_flush_max_age(),
-            )
+            started.wall_reached(dependencies.config.segment_flush_max_age())
         });
         let operation_boundary =
             active.operations >= dependencies.config.segment_flush_max_operations(job.kind);
@@ -1649,10 +1642,7 @@ async fn push_or_flush(
 ) -> Result<(), Status> {
     let age_boundary = soft_flush_allowed
         && builder.started.is_some_and(|started| {
-            started.reached(
-                &builder.runnable,
-                dependencies.config.segment_flush_max_age(),
-            )
+            started.wall_reached(dependencies.config.segment_flush_max_age())
         });
     if soft_flush_allowed
         && (builder.writer.source_count() as u64 >= builder.maximum_operations || age_boundary)
@@ -1740,12 +1730,10 @@ async fn freeze_builder(
     if builder.is_empty() {
         return Ok(());
     }
-    let flush_reason = if builder.started.is_some_and(|started| {
-        started.reached(
-            &builder.runnable,
-            dependencies.config.segment_flush_max_age(),
-        )
-    }) {
+    let flush_reason = if builder
+        .started
+        .is_some_and(|started| started.wall_reached(dependencies.config.segment_flush_max_age()))
+    {
         "maximum_age"
     } else if builder.writer.source_count() as u64 >= builder.maximum_operations {
         "maximum_operations"

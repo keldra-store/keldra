@@ -559,6 +559,22 @@ This milestone is intended to prove that D640 equivalent definitions remain
 close to D1 physical work. It deliberately does not claim component sharing
 between different schemas or projection-preserving updates.
 
+Qualification of server commit `f3dc43afa795` with harness commit
+`f1aa37322283` established that intended bound. On the SSD host, saturated
+accepted throughput remained 1,000.13 operations/s at D1 and 973.84 at D640.
+On rotational storage it remained 90.49 operations/s at D1 and 114.71 at D640.
+Both D640 runs completed with zero mutation/query/correctness errors. The source
+projection summaries recorded one projection request and parse per source
+mutation rather than per logical definition.
+
+The first sustained keep-up gate also passed on rotational storage at D640: a
+fixed 40 operations/s for 30 minutes accepted 71,973 of 71,973 offered
+operations, publication visibility p99 was 26.69 seconds, concurrent-query p99
+was 401.92 milliseconds, and the final exact drain took 80.36 seconds. This is
+a bounded in-load visibility result, not a saturation result inferred from an
+eventual drain. The corresponding SSD fixed-rate result is recorded separately
+when complete.
+
 ### 18.2 Milestone B: recipe catalog and component generations
 
 Replace complete-schema physical ownership with canonical membership and field
@@ -566,6 +582,22 @@ recipe records. A projection-family generation references independently reusable
 membership, field, document-head, and liveness components. Logical bindings map
 public field IDs and names to those physical recipes. Qualification must include
 different public names, field subsets, and incompatible-recipe isolation.
+
+Implemented groundwork on `feat/shared-index-projection`:
+
+- tenant/bucket-scoped membership and field recipe identities cover selectors,
+  value semantics, capabilities, formats, and component codec versions;
+- runtime catalog plans reference-count those recipes transactionally and emit
+  bounded aggregate telemetry; and
+- native field IDs are canonicalized by recipe identity while public names are
+  excluded from the segment schema fingerprint. Complete schemas which differ
+  only by field declaration order or public aliases now share the same actual
+  projection, segments, and query reader; query compilation and response labels
+  still use the authorized logical names.
+
+This does not yet satisfy Milestone B for field subsets. Independent component
+generation ownership and bindings remain required before different complete
+schema sets may share only their compatible fields.
 
 ### 18.3 Milestone C: projected-document state
 

@@ -39,11 +39,6 @@ impl BuilderRunnableClock {
         )
     }
 
-    pub(super) fn add(&self, elapsed: Duration) {
-        let mut state = self.lock();
-        state.elapsed = state.elapsed.saturating_add(elapsed);
-    }
-
     pub(super) fn measure<T>(&self, work: impl FnOnce() -> T) -> T {
         let _guard = self.enter();
         work()
@@ -91,7 +86,7 @@ impl Drop for RunnableGuard {
 impl BufferAge {
     pub(super) fn earliest(left: Option<Self>, right: Option<Self>) -> Option<Self> {
         match (left, right) {
-            (Some(left), Some(right)) => Some(if left.runnable_started <= right.runnable_started {
+            (Some(left), Some(right)) => Some(if left.wall_started <= right.wall_started {
                 left
             } else {
                 right
@@ -109,17 +104,13 @@ impl BufferAge {
         self.wall_started.elapsed()
     }
 
-    pub(super) fn reached(self, clock: &BuilderRunnableClock, maximum: Duration) -> bool {
-        self.elapsed(clock) >= maximum
+    pub(super) fn wall_reached(self, maximum: Duration) -> bool {
+        self.wall_elapsed() >= maximum
     }
 
-    pub(super) fn remaining(
-        self,
-        clock: &BuilderRunnableClock,
-        maximum: Duration,
-    ) -> Option<Duration> {
+    pub(super) fn wall_remaining(self, maximum: Duration) -> Option<Duration> {
         maximum
-            .checked_sub(self.elapsed(clock))
+            .checked_sub(self.wall_elapsed())
             .filter(|age| !age.is_zero())
     }
 }
@@ -137,27 +128,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scheduler_or_resource_wait_does_not_manufacture_an_age_flush() {
+    fn scheduler_or_resource_wait_counts_toward_the_publication_age() {
         let clock = BuilderRunnableClock::default();
         let age = BufferAge {
             wall_started: Instant::now().checked_sub(Duration::from_secs(30)).unwrap(),
             runnable_started: clock.elapsed(),
         };
 
-        // Wall time is deliberately irrelevant while the definition is not
-        // runnable. Advancing no runnable time cannot cross the age boundary.
-        assert!(!age.reached(&clock, Duration::from_secs(1)));
+        assert!(age.wall_reached(Duration::from_secs(1)));
         assert_eq!(age.elapsed(&clock), Duration::ZERO);
         assert!(age.wall_elapsed() >= Duration::from_secs(30));
     }
 
     #[test]
-    fn one_second_of_runnable_work_triggers_the_age_flush_boundary() {
+    fn wall_deadline_does_not_require_runnable_progress() {
         let clock = BuilderRunnableClock::default();
-        let age = clock.stamp();
-        clock.add(Duration::from_millis(999));
-        assert!(!age.reached(&clock, Duration::from_secs(1)));
-        clock.add(Duration::from_millis(1));
-        assert!(age.reached(&clock, Duration::from_secs(1)));
+        let age = BufferAge {
+            wall_started: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            runnable_started: clock.elapsed(),
+        };
+        assert!(age.wall_reached(Duration::from_secs(1)));
+        assert_eq!(age.wall_remaining(Duration::from_secs(1)), None);
+        assert_eq!(age.elapsed(&clock), Duration::ZERO);
     }
 }

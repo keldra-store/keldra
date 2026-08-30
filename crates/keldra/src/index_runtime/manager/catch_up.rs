@@ -323,7 +323,7 @@ pub(super) async fn process_journal_page(
             .checked_add(processed_journal_encoded_bytes(&page.changes[start..end])?)
             .ok_or_else(|| Status::resource_exhausted("processed journal bytes overflow"))?;
         if locator_publication_required(candidate, builder)
-            || deadline.is_some_and(|age| age.reached(&builder.runnable, maximum_age))
+            || deadline.is_some_and(|age| age.wall_reached(maximum_age))
         {
             break;
         }

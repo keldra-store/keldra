@@ -57,6 +57,7 @@ struct Report {
     configuration: config::PublicConfig,
     corpus_sha256: String,
     index_definition_ids: Vec<u64>,
+    logical_schema_variants: usize,
     observed_source_node_ids: Vec<u64>,
     assignment_observability: &'static str,
     responsiveness_definition: &'static str,
@@ -258,13 +259,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     let corpus_sha256 =
         data::corpus_digest(config.seed, config.stable_records, config.mutable_records);
     let setup_channels = connect_all(&config.endpoints).await?;
-    let token = exchange_client_credentials(
-        setup_channels[0].clone(),
-        config.client_id.clone(),
-        config.client_secret.clone(),
-    )
-    .await?
-    .access_token;
+    let token = fresh_token(&config, &setup_channels[0]).await?;
     setup(&config, &setup_channels[0], &token).await?;
 
     let definitions = create_definitions(&config, &setup_channels[0], &token).await?;
@@ -279,6 +274,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
             .collect::<BTreeSet<_>>(),
     );
     wait_all_ready(&config, &names, &expected, &token).await?;
+    let phase_token = fresh_token(&config, &setup_channels[0]).await?;
 
     // Query and mutation transports are separately established so client-side
     // HTTP/2 flow control cannot manufacture server contention evidence.
@@ -295,7 +291,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         &names,
         &expected,
         &query_channels,
-        &token,
+        &phase_token,
         config.baseline,
         counters.clone(),
     )
@@ -305,7 +301,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         config.clone(),
         mutation_channels,
         visibility_channels,
-        token.clone(),
+        phase_token.clone(),
         counters.clone(),
     ));
     let concurrent = run_query_phase(
@@ -313,7 +309,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         &names,
         &expected,
         &query_channels,
-        &token,
+        &phase_token,
         config.concurrent,
         counters.clone(),
     )
@@ -325,10 +321,17 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         .context("mutation drain exceeded timeout")???;
     let final_canary = mutations.1;
     let mutation_report = mutations.0;
+    let verification_token = fresh_token(&config, &setup_channels[0]).await?;
     let (final_visible, mut observed) = if let Some(canary) = final_canary {
         tokio::time::timeout(
             config.drain_timeout,
-            wait_canary_on_all(&config, &names, &query_channels, &token, canary),
+            wait_canary_on_all(
+                &config,
+                &names,
+                &query_channels,
+                &verification_token,
+                canary,
+            ),
         )
         .await
         .context("final canary verification exceeded drain timeout")??
@@ -337,7 +340,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     };
     let (final_state_verified, advisory_zero_lag, final_sources) = tokio::time::timeout(
         config.drain_timeout,
-        verify_final_mutable_state(&config, &names, &query_channels, &token),
+        verify_final_mutable_state(&config, &names, &query_channels, &verification_token),
     )
     .await
     .context("final mutable verification exceeded drain timeout")??;
@@ -349,7 +352,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         &names,
         &expected,
         &query_channels,
-        &token,
+        &verification_token,
         config.post,
         counters.clone(),
     )
@@ -415,6 +418,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         configuration: config.public(),
         corpus_sha256,
         index_definition_ids: definitions,
+        logical_schema_variants: config.definition_count.min(2),
         observed_source_node_ids: observed.into_iter().collect(),
         assignment_observability: "public APIs expose source node IDs and placement epochs, but not builder-to-node assignments; definition_count is cluster-wide work and is not labeled per-node concurrency",
         responsiveness_definition: "every offered open-loop schedule completes within request_timeout with no scheduler drop, request error, timeout, or oracle mismatch; visibility probes use request_timeout per query and a separate observation timeout; optional concurrent-query and publication-visibility p99 gates are applied when configured",
@@ -512,13 +516,22 @@ async fn create_definitions(config: &Config, channel: &Channel, token: &str) -> 
     let mut ids = Vec::with_capacity(config.definition_count);
     for position in 0..config.definition_count {
         let name = data::index_name(position);
-        let request: CreateIndexRequest = TypedJsonIndexBuilder::new(&config.bucket, &name)
+        let builder = TypedJsonIndexBuilder::new(&config.bucket, &name)
             .path_prefix("contention/")
-            .content_type(CONTENT_TYPE)
-            .field(UnsignedIntegerField::single("record_id", "/record_id").exact())
-            .field(KeywordField::single("class", "/class").exact())
-            .field(UnsignedIntegerField::single("generation", "/generation").exact())
-            .finish(format!("contention-create-{position}"))?;
+            .content_type(CONTENT_TYPE);
+        let request: CreateIndexRequest = if alternate_schema(position) {
+            builder
+                .field(UnsignedIntegerField::single("revision", "/generation").exact())
+                .field(KeywordField::single("category", "/class").exact())
+                .field(UnsignedIntegerField::single("document_id", "/record_id").exact())
+                .finish(format!("contention-create-{position}"))?
+        } else {
+            builder
+                .field(UnsignedIntegerField::single("record_id", "/record_id").exact())
+                .field(KeywordField::single("class", "/class").exact())
+                .field(UnsignedIntegerField::single("generation", "/generation").exact())
+                .finish(format!("contention-create-{position}"))?
+        };
         let definition = client
             .create_index(request)
             .await
@@ -1368,7 +1381,7 @@ async fn class_query(
         client,
         bucket,
         index_name,
-        "class",
+        query_field(index_name, "class", "category"),
         serde_json::to_vec(class)?,
         limit,
     )
@@ -1386,7 +1399,7 @@ async fn marker_query(
         client,
         bucket,
         index_name,
-        "record_id",
+        query_field(index_name, "record_id", "document_id"),
         marker_id.to_string().into_bytes(),
         1,
     )
@@ -1474,6 +1487,31 @@ async fn connect_all(endpoints: &[String]) -> Result<Vec<Channel>> {
     Ok(channels)
 }
 
+async fn fresh_token(config: &Config, channel: &Channel) -> Result<String> {
+    Ok(exchange_client_credentials(
+        channel.clone(),
+        config.client_id.clone(),
+        config.client_secret.clone(),
+    )
+    .await?
+    .access_token)
+}
+
+fn alternate_schema(position: usize) -> bool {
+    position % 2 == 1
+}
+
+fn query_field<'a>(index_name: &str, regular: &'a str, alternate: &'a str) -> &'a str {
+    let position = index_name
+        .rsplit_once('-')
+        .and_then(|(_, suffix)| suffix.parse::<usize>().ok());
+    if position.is_some_and(alternate_schema) {
+        alternate
+    } else {
+        regular
+    }
+}
+
 fn unix_millis() -> Result<u128> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
 }
@@ -1486,6 +1524,15 @@ mod tests {
     fn marker_ids_do_not_overlap_small_corpus_ids() {
         assert_eq!((1u64 << 63) | 7, 9_223_372_036_854_775_815);
         assert!(data::marker_path(7).contains("0000000000000007"));
+    }
+
+    #[test]
+    fn queries_use_each_logical_schema_alias() {
+        assert_eq!(query_field("contention-000", "class", "category"), "class");
+        assert_eq!(
+            query_field("contention-001", "class", "category"),
+            "category"
+        );
     }
 
     #[test]

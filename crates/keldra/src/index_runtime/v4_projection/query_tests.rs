@@ -2,15 +2,19 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
+use keldra_api::v1::index_field::FieldType as ApiFieldType;
 use keldra_api::v1::index_specification::Specification;
-use keldra_api::v1::{GitSourceIndexSpec, IndexSpecification, TensorIndexSpec};
+use keldra_api::v1::{
+    GitSourceIndexSpec, IndexField, IndexFieldCapability, IndexFieldCardinality,
+    IndexSpecification, KeywordIndexField, TensorIndexSpec, TypedJsonIndexSpec,
+};
 use keldra_index::v4::build::{
     BuildLimits, ExactMemorySink, NativeSegmentWriter, PublishedObject, SourcePush,
 };
 use keldra_index::v4::{
     ArtifactDirectoryRead, ArtifactPackReference, CandidateGate, CandidateGateEvidence,
     CandidateReference, NativeQuery, NativeQueryExecutor, NativeQueryLimits, NativeQueryRequest,
-    Schema, SegmentIdentity,
+    Predicate, PredicateId, ScalarValue, Schema, SegmentIdentity,
 };
 use keldra_index::{FIXED_INDEX_SEAL_WORKSPACE_BYTES, IndexError, IndexFileRead};
 
@@ -110,14 +114,23 @@ fn project(schema: &Schema, body: &[u8]) -> ProjectedSource {
 }
 
 async fn execute(schema: Schema, source: ProjectedSource, query: NativeQuery) -> Vec<String> {
-    let identity = SegmentIdentity::new(71, 1, schema.fingerprint().unwrap(), 91).unwrap();
+    execute_with_query_schema(schema.clone(), schema, source, query).await
+}
+
+async fn execute_with_query_schema(
+    build_schema: Schema,
+    query_schema: Schema,
+    source: ProjectedSource,
+    query: NativeQuery,
+) -> Vec<String> {
+    let identity = SegmentIdentity::new(71, 1, build_schema.fingerprint().unwrap(), 91).unwrap();
     let limits = BuildLimits::with_resident_limits(
         TEST_MEMORY_BYTES,
         TEST_MEMORY_BYTES - FIXED_INDEX_SEAL_WORKSPACE_BYTES,
         FIXED_INDEX_SEAL_WORKSPACE_BYTES,
     )
     .unwrap();
-    let mut writer = NativeSegmentWriter::new(identity, schema.clone(), limits).unwrap();
+    let mut writer = NativeSegmentWriter::new(identity, build_schema, limits).unwrap();
     assert_eq!(writer.push_source(source).unwrap(), SourcePush::Accepted);
     let mut sink = ExactMemorySink::new();
     let segment = writer.seal(&mut sink).await.unwrap().descriptor;
@@ -125,7 +138,7 @@ async fn execute(schema: Schema, source: ProjectedSource, query: NativeQuery) ->
     let page = NativeQueryExecutor::new(&directory, &AllowAll, NativeQueryLimits::default())
         .unwrap()
         .execute(&NativeQueryRequest {
-            schema,
+            schema: query_schema,
             segments: vec![segment],
             query,
             after: None,
@@ -137,6 +150,60 @@ async fn execute(schema: Schema, source: ProjectedSource, query: NativeQuery) ->
         .await
         .unwrap();
     page.hits.into_iter().map(|hit| hit.result.path).collect()
+}
+
+fn keyword_field(name: &str, pointer: &str) -> IndexField {
+    IndexField {
+        name: name.into(),
+        json_pointer: pointer.into(),
+        cardinality: IndexFieldCardinality::Single as i32,
+        capabilities: vec![IndexFieldCapability::Exact as i32],
+        field_type: Some(ApiFieldType::Keyword(KeywordIndexField {})),
+    }
+}
+
+#[tokio::test]
+async fn renamed_and_reordered_logical_fields_query_one_shared_segment() {
+    let first = schema(Specification::TypedJson(TypedJsonIndexSpec {
+        fields: vec![
+            keyword_field("state", "/state"),
+            keyword_field("ecosystem", "/ecosystem"),
+        ],
+        physical_order: Vec::new(),
+    }));
+    let second = schema(Specification::TypedJson(TypedJsonIndexSpec {
+        fields: vec![
+            keyword_field("package_ecosystem", "/ecosystem"),
+            keyword_field("advisory_state", "/state"),
+        ],
+        physical_order: Vec::new(),
+    }));
+    assert_eq!(first.fingerprint().unwrap(), second.fingerprint().unwrap());
+    let state = second
+        .fields
+        .iter()
+        .find(|field| field.name == "advisory_state")
+        .unwrap()
+        .id;
+    let source = project(&first, br#"{"state":"active","ecosystem":"cargo"}"#);
+
+    assert_eq!(
+        execute_with_query_schema(
+            first,
+            second,
+            source,
+            NativeQuery::Filter {
+                predicate: Some(Predicate::Equal {
+                    id: PredicateId::new(0),
+                    field_id: state,
+                    value: ScalarValue::String("active".into()),
+                }),
+                order: Vec::new(),
+            },
+        )
+        .await,
+        ["records/source.json"]
+    );
 }
 
 #[tokio::test]

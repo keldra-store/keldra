@@ -742,7 +742,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                 let mut physical_definition = loaded.api.clone();
                 physical_definition.index_id = physical.index_id;
                 physical_definition.version = physical.definition_version;
-                let executed = self
+                let mut executed = self
                     .dependencies
                     .queries
                     .execute(ExecuteIndexQuery {
@@ -759,6 +759,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                     })
                     .await?;
                 validate_execution(&executed, resume.as_ref(), limit)?;
+                bind_logical_freshness(&mut executed, &loaded.api);
                 let authorization_revision = executed.freshness.authorization_revision;
                 let next_page_token = match executed.next_position {
                     Some(last_position) => self.dependencies.page_tokens.encode(
@@ -1173,6 +1174,14 @@ fn validate_query_kind(definition: &IndexDefinition, query: &IndexQuery) -> Resu
             "query type does not match the index definition",
         ))
     }
+}
+
+fn bind_logical_freshness(
+    execution: &mut super::boundary::ExecutedIndexQuery,
+    definition: &IndexDefinition,
+) {
+    execution.freshness.index_id = definition.index_id;
+    execution.freshness.definition_version = definition.version;
 }
 
 fn validate_execution(
@@ -1590,6 +1599,31 @@ mod tests {
         };
 
         assert!(validate_execution(&execution, None, 100).is_ok());
+    }
+
+    #[test]
+    fn public_freshness_uses_the_logical_definition_identity() {
+        let mut execution = super::super::boundary::ExecutedIndexQuery {
+            hits: Vec::new(),
+            facet_results: Vec::new(),
+            aggregate_results: Vec::new(),
+            freshness: IndexFreshness {
+                index_id: 91,
+                definition_version: 92,
+                ..Default::default()
+            },
+            next_position: None,
+        };
+        let definition = IndexDefinition {
+            index_id: 7,
+            version: 8,
+            ..Default::default()
+        };
+
+        bind_logical_freshness(&mut execution, &definition);
+
+        assert_eq!(execution.freshness.index_id, 7);
+        assert_eq!(execution.freshness.definition_version, 8);
     }
 
     #[test]

@@ -434,3 +434,29 @@ storage with fresh volumes:
 The primary success metric is physical work per accepted source mutation per
 distinct matched recipe. Logical definition count is a control-plane dimension,
 not permission to repeat equivalent physical indexing work.
+
+## First replacement-architecture evidence
+
+Server commit `f3dc43afa795` and bounded harness commit `f1aa37322283` were run
+from fresh volumes with the same x86-64 candidate on the 8-core SSD and 16-core
+rotational hosts.
+
+Equivalent-definition saturation no longer exhibits definition-linear work:
+
+| Host | D1 accepted ops/s | D640 accepted ops/s | D640 query p99 | D640 result |
+| --- | ---: | ---: | ---: | --- |
+| SSD | 1,000.13 | 973.84 | 351.74 ms | exact, zero errors |
+| rotational | 90.49 | 114.71 | 350.98 ms | exact, zero errors |
+
+The visibility gate failed in these saturation cells because the open-loop
+offered rate exceeded the physical writer's sustained service rate. That is not
+a definition-count scaling regression: periodic projection summaries showed
+one physical request/parse stream at D640, comparable with D1.
+
+The rotational D640 fixed-rate run then held 40 operations/s for 30 minutes. It
+accepted all 71,973 operations with no mutation, query, timeout, scheduling, or
+oracle error. In-load publication visibility was p50 5.43 seconds, p95 21.14
+seconds, and p99 26.69 seconds; concurrent-query p99 was 401.92 milliseconds;
+the exact final drain was 80.36 seconds. This passes the sustained keep-up gate
+on the slower host. The SSD fixed-rate run and heterogeneous/HOT/churn gates
+remain separate evidence requirements.

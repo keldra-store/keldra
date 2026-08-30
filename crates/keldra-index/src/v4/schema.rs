@@ -469,6 +469,43 @@ pub(crate) struct SegmentSchemaShape {
 }
 
 impl Schema {
+    /// Assign definition-neutral dense field IDs from physical recipe identity.
+    ///
+    /// Public field names remain on the returned schema so query compilation
+    /// and result labelling retain the logical contract. They do not influence
+    /// physical ordering or the segment fingerprint. Definitions which differ
+    /// only by field declaration order or public aliases can therefore read the
+    /// same immutable components without a query-time name registry.
+    pub fn canonicalize_physical_fields(mut self) -> Result<Self, IndexError> {
+        let recipes = self.recipe_fingerprints()?.fields;
+        let mut fields = self
+            .fields
+            .into_iter()
+            .enumerate()
+            .zip(recipes)
+            .map(|((ordinal, field), recipe)| (recipe, ordinal, field))
+            .collect::<Vec<_>>();
+        fields.sort_by_key(|(recipe, ordinal, _)| (*recipe, *ordinal));
+
+        let mut old_to_new = vec![FieldId::new(0); fields.len()];
+        let mut canonical = Vec::with_capacity(fields.len());
+        for (new_ordinal, (_, old_ordinal, mut field)) in fields.into_iter().enumerate() {
+            let field_id =
+                FieldId::new(u32::try_from(new_ordinal).map_err(|_| IndexError::OffsetOverflow)?);
+            old_to_new[old_ordinal] = field_id;
+            field.id = field_id;
+            canonical.push(field);
+        }
+        for order in &mut self.physical_order {
+            order.field_id = *old_to_new
+                .get(order.field_id.get() as usize)
+                .ok_or_else(|| IndexError::InvalidDefinition("unknown order field".into()))?;
+        }
+        self.fields = canonical;
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn recipe_fingerprints(&self) -> Result<RecipeFingerprints, IndexError> {
         self.validate()?;
 
@@ -803,7 +840,6 @@ impl Schema {
         out.usize_u32(self.fields.len())?;
         for field in &self.fields {
             out.u32(field.id.get());
-            out.string(&field.name)?;
             out.string(&field.source_selector)?;
             out.u8(field.field_type as u8);
             out.u8(field.cardinality as u8);
@@ -1162,7 +1198,7 @@ mod tests {
 
         let mut renamed = first.clone();
         renamed.fields[0].name = "publicly-renamed".into();
-        assert_ne!(first.fingerprint().unwrap(), renamed.fingerprint().unwrap());
+        assert_eq!(first.fingerprint().unwrap(), renamed.fingerprint().unwrap());
         assert_eq!(first_recipes, renamed.recipe_fingerprints().unwrap());
 
         let mut rescope = first.clone();
@@ -1176,6 +1212,42 @@ mod tests {
         let reselect = reselect.recipe_fingerprints().unwrap();
         assert_eq!(first_recipes.membership, reselect.membership);
         assert_ne!(first_recipes.fields, reselect.fields);
+    }
+
+    #[test]
+    fn canonical_field_ids_ignore_public_names_and_declaration_order() {
+        let mut source = recipe_schema();
+        let mut second = source.fields[0].clone();
+        second.id = FieldId::new(1);
+        second.name = "severity".into();
+        second.source_selector = "/severity".into();
+        source.fields.push(second);
+        let first = source.clone().canonicalize_physical_fields().unwrap();
+        let mut reordered = source;
+        reordered.fields.swap(0, 1);
+        for (ordinal, field) in reordered.fields.iter_mut().enumerate() {
+            field.id = FieldId::new(u32::try_from(ordinal).unwrap());
+        }
+        for order in &mut reordered.physical_order {
+            order.field_id = FieldId::new(1 - order.field_id.get());
+        }
+        reordered.fields[0].name = "second-public-alias".into();
+        reordered.fields[1].name = "first-public-alias".into();
+        let reordered = reordered.canonicalize_physical_fields().unwrap();
+
+        assert_eq!(
+            first.fingerprint().unwrap(),
+            reordered.fingerprint().unwrap()
+        );
+        assert_eq!(
+            first.fields[0].source_selector,
+            reordered.fields[0].source_selector
+        );
+        assert_eq!(
+            first.fields[1].source_selector,
+            reordered.fields[1].source_selector
+        );
+        assert_ne!(first.fields[0].name, reordered.fields[0].name);
     }
 
     #[test]

@@ -55,8 +55,7 @@ pub(crate) fn compile_schema(
         semantics,
         physical_order,
     };
-    schema.validate()?;
-    Ok(schema)
+    schema.canonicalize_physical_fields()
 }
 
 type SchemaParts = (IndexKind, Vec<FieldSchema>, IndexSemantics, Vec<OrderField>);
@@ -712,12 +711,22 @@ mod tests {
             .find(|(name, _, _)| *name == "typed")
             .unwrap();
         let schema = compile_schema("", None, &specification).unwrap();
-        assert_eq!(schema.fields[0].cardinality, Cardinality::Single);
-        assert_eq!(schema.fields[1].cardinality, Cardinality::Multi);
+        let modified = schema
+            .fields
+            .iter()
+            .find(|field| field.name == "modified")
+            .unwrap();
+        let ecosystems = schema
+            .fields
+            .iter()
+            .find(|field| field.name == "ecosystems")
+            .unwrap();
+        assert_eq!(modified.cardinality, Cardinality::Single);
+        assert_eq!(ecosystems.cardinality, Cardinality::Multi);
         assert_eq!(
             schema.physical_order,
             vec![OrderField {
-                field_id: FieldId::new(0),
+                field_id: modified.id,
                 direction: OrderDirection::Descending,
             }]
         );
@@ -746,6 +755,62 @@ mod tests {
                 .unwrap()
                 .fingerprint()
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn typed_public_aliases_and_declaration_order_share_physical_schema() {
+        let (_, first_specification, _) = all_kinds()
+            .into_iter()
+            .find(|(name, _, _)| *name == "typed")
+            .unwrap();
+        let mut second_specification = first_specification.clone();
+        let Some(Spec::TypedJson(second)) = second_specification.specification.as_mut() else {
+            unreachable!();
+        };
+        second.fields.swap(0, 1);
+        let modified = second
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "modified")
+            .unwrap();
+        modified.name = "last_changed".into();
+        second.physical_order[0].field = "last_changed".into();
+        second
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "ecosystems")
+            .unwrap()
+            .name = "package_ecosystems".into();
+
+        let first =
+            compile_schema("scope/", Some("application/json"), &first_specification).unwrap();
+        let second =
+            compile_schema("scope/", Some("application/json"), &second_specification).unwrap();
+        assert_eq!(first.fingerprint().unwrap(), second.fingerprint().unwrap());
+        assert_eq!(
+            first
+                .fields
+                .iter()
+                .map(|field| (&field.source_selector, field.id))
+                .collect::<Vec<_>>(),
+            second
+                .fields
+                .iter()
+                .map(|field| (&field.source_selector, field.id))
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            first
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            second
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -891,7 +956,11 @@ mod tests {
             .find(|(name, _, _)| *name == "typed")
             .unwrap();
         let schema = compile_schema("", None, &specification).unwrap();
-        let modified = &schema.fields[0];
+        let modified = schema
+            .fields
+            .iter()
+            .find(|field| field.name == "modified")
+            .unwrap();
         assert_eq!(modified.field_type, FieldType::SignedInteger);
         assert_eq!(
             modified.capabilities,
@@ -901,7 +970,11 @@ mod tests {
         assert!(modified.components.contains(FieldComponents::DOC_VALUES));
         assert!(!modified.components.contains(FieldComponents::TERMS));
 
-        let ecosystems = &schema.fields[1];
+        let ecosystems = schema
+            .fields
+            .iter()
+            .find(|field| field.name == "ecosystems")
+            .unwrap();
         assert_eq!(ecosystems.field_type, FieldType::Keyword);
         assert_eq!(
             ecosystems.capabilities,
