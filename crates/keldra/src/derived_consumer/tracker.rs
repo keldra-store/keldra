@@ -172,11 +172,17 @@ impl SourceProgress {
                 settled_next,
             });
         }
-        // Publication reports race this tracker's 100 ms settled-status poll.
-        // A valid same-source/fence proof may therefore be ahead of the
-        // captured settled tail. It proves every currently settled offset but
-        // must never advance the retention checkpoint beyond that tail.
-        let proof_next = proof_next.min(settled_next).max(self.baseline_next);
+        // Publication can race ahead of this tracker's captured demultiplexing
+        // barrier. Do not reject and rebuild, but do not trust the future proof
+        // for retention either. The normal scan will apply it once the source
+        // barrier catches up.
+        let proof_ahead = proof_next > settled_next;
+        let proof_next = if proof_ahead {
+            self.baseline_next
+        } else {
+            proof_next.max(self.baseline_next)
+        };
+        let proof_atomic_through = (!proof_ahead).then_some(proof_atomic_through).flatten();
         let previous = self.pending.remove(&identity);
         if let Some(previous) = previous {
             self.remove_minimum(previous.retention_next())?;
@@ -216,7 +222,9 @@ impl SourceProgress {
             .settled_through
             .checked_add(1)
             .ok_or(SparseTrackerError::OffsetOverflow)?;
-        let proof_next = proof_next.min(settled_next);
+        if proof_next > settled_next {
+            return Ok(());
+        }
         let Some(previous) = self.pending.remove(&identity) else {
             return Ok(());
         };

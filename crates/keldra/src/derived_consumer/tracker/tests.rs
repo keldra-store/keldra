@@ -227,7 +227,7 @@ fn published_proof_releases_only_the_effects_it_covers() {
 }
 
 #[test]
-fn publication_ahead_of_the_status_poll_is_clamped_without_rebuilding_inventory() {
+fn publication_ahead_of_the_demux_barrier_is_deferred_without_rebuilding_inventory() {
     let status = source(1, 5);
     let assignment = assignment(DefinitionKind::Index, 1);
     let mut inventory = SparseDerivedInventory::begin(
@@ -246,10 +246,47 @@ fn publication_ahead_of_the_status_poll_is_clamped_without_rebuilding_inventory(
         .observe_proof(&assignment, &barrier(&[(status, 100)]))
         .unwrap();
 
-    assert_eq!(tracker.affected_len(status.source_id), 0);
+    assert_eq!(tracker.affected_len(status.source_id), 1);
     let checkpoint = tracker.checkpoints().unwrap();
     assert_eq!(checkpoint.len(), 1);
-    assert_eq!(checkpoint[0].next_offset, 6);
+    assert_eq!(checkpoint[0].next_offset, 1);
+
+    let caught_up = source(1, 99);
+    tracker.update_source_status(caught_up).unwrap();
+    tracker
+        .observe_proof(&assignment, &barrier(&[(caught_up, 100)]))
+        .unwrap();
+    assert_eq!(tracker.affected_len(status.source_id), 0);
+    assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 100);
+}
+
+#[test]
+fn inventory_scan_defers_a_publication_ahead_of_its_demux_barrier() {
+    let status = source(1, 5);
+    let assignment = assignment(DefinitionKind::Index, 1);
+    let future = barrier(&[(status, 100)]);
+    let mut inventory = SparseDerivedInventory::begin(
+        DerivedConsumerKind::Index,
+        NodeId(3),
+        fence(),
+        [(status, None)],
+    )
+    .unwrap();
+    inventory
+        .record_affected(&assignment, status.source_id, 5, None, None, Some(&future))
+        .unwrap();
+
+    let mut tracker = inventory.finish();
+    assert_eq!(tracker.affected_len(status.source_id), 1);
+    assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 1);
+
+    let caught_up = source(1, 99);
+    tracker.update_source_status(caught_up).unwrap();
+    tracker
+        .observe_proof(&assignment, &barrier(&[(caught_up, 100)]))
+        .unwrap();
+    assert_eq!(tracker.affected_len(status.source_id), 0);
+    assert_eq!(tracker.checkpoints().unwrap()[0].next_offset, 100);
 }
 
 #[test]
