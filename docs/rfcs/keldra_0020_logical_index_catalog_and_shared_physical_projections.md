@@ -338,6 +338,16 @@ than rewritten. Publication atomically installs the complete generation and
 then makes eligible logical bindings visible. No query can combine component
 roots from different source barriers.
 
+Format-v5 immutable values use the canonical internal namespace
+`_keldra/index-projections/v5/<full-family-hash>/...`, with separate hashed
+classes for integrated delta packs, stream-directory pages,
+component-directory pages, and generation records. One small `current` object
+per physical family is the only mutable publication object. It contains the
+full family ID, exact generation content hash, and revision and is replaced by
+version CAS only after every immutable dependency is durable. Logical bindings
+name the family and their ready revision, so advancing `current` never rewrites
+one binding per logical definition.
+
 ### 8.1 Format-v5 stable document keys
 
 Format v4 cannot be extended into the projection-preserving design by adding a

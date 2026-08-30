@@ -4,8 +4,9 @@ use crate::IndexError;
 
 use super::{
     ComponentStreamRoot, EncodedComponentStreamPage, EncodedProjectionGeneration,
-    ProjectionBarrier, ProjectionGeneration, SealedComponentDelta, SealedProjectionDeltaPack,
-    append_component_stream, encode_projection_generation, pack_component_deltas,
+    ProjectionBarrier, ProjectionCurrent, ProjectionGeneration, SealedComponentDelta,
+    SealedProjectionDeltaPack, append_component_stream, encode_projection_current,
+    encode_projection_generation, pack_component_deltas,
 };
 
 /// Complete immutable payload which must be durable before its generation is
@@ -15,6 +16,9 @@ pub struct PreparedProjectionGeneration {
     pub packs: Vec<SealedProjectionDeltaPack>,
     pub stream_pages: Vec<EncodedComponentStreamPage>,
     pub generation: EncodedProjectionGeneration,
+    /// Mutable value installed by exact-version CAS only after every immutable
+    /// artifact and the generation record are durable.
+    pub current: Vec<u8>,
 }
 
 impl PreparedProjectionGeneration {
@@ -30,7 +34,7 @@ impl PreparedProjectionGeneration {
                     .iter()
                     .map(|page| page.bytes.len()),
             )
-            .chain(std::iter::once(self.generation.bytes.len()))
+            .chain([self.generation.bytes.len(), self.current.len()])
             .try_fold(0_usize, |total, bytes| {
                 total.checked_add(bytes).ok_or(IndexError::OffsetOverflow)
             })
@@ -87,11 +91,16 @@ pub fn prepare_projection_generation(
         }
         None => ProjectionGeneration::initial(family_id, barrier, replacements)?,
     };
-    let generation = encode_projection_generation(&generation)?;
+    let encoded_generation = encode_projection_generation(&generation)?;
+    let current = encode_projection_current(ProjectionCurrent::new(
+        encoded_generation.hash,
+        &generation,
+    )?)?;
     let prepared = PreparedProjectionGeneration {
         packs,
         stream_pages,
-        generation,
+        generation: encoded_generation,
+        current,
     };
     prepared.payload_bytes()?;
     Ok(prepared)
@@ -177,6 +186,9 @@ mod tests {
         assert_eq!(generation.revision, 1);
         assert!(generation.root(ComponentIdentity::DocumentHead).is_some());
         assert!(generation.root(ComponentIdentity::ProjectedState).is_some());
+        let current = crate::v5::decode_projection_current(&prepared.current).unwrap();
+        current.validate_against(&generation).unwrap();
+        assert_eq!(current.generation_hash, prepared.generation.hash);
     }
 
     #[test]

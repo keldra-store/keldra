@@ -4,17 +4,19 @@ use crate::IndexError;
 
 use super::{
     CanonicalRecipeState, ComponentIdentity, ComponentRoot, DocumentHead, LogicalFieldBinding,
-    LogicalProjectionBinding, ProjectedDocumentState, ProjectionBarrier, ProjectionGeneration,
-    RecipeIdentity, StableDocumentKey,
+    LogicalProjectionBinding, ProjectedDocumentState, ProjectionBarrier, ProjectionCurrent,
+    ProjectionGeneration, RecipeIdentity, StableDocumentKey,
 };
 
 const STATE_MAGIC: &[u8; 8] = b"K5STATE1";
 const DIRECTORY_MAGIC: &[u8; 8] = b"K5CDIR01";
 const GENERATION_MAGIC: &[u8; 8] = b"K5GEN001";
+const CURRENT_MAGIC: &[u8; 8] = b"K5CUR001";
 const BINDING_MAGIC: &[u8; 8] = b"K5BIND01";
 const STATE_FORMAT: u16 = 1;
 const DIRECTORY_FORMAT: u16 = 1;
 const GENERATION_FORMAT: u16 = 1;
+const CURRENT_FORMAT: u16 = 1;
 const BINDING_FORMAT: u16 = 1;
 pub const COMPONENT_DIRECTORY_FANOUT: usize = 256;
 pub const MAX_PROJECTION_SOURCES: usize = 4_096;
@@ -40,6 +42,44 @@ pub struct EncodedProjectionGeneration {
     pub hash: [u8; 32],
     pub bytes: Vec<u8>,
     pub component_directory: ComponentDirectory,
+}
+
+pub fn encode_projection_current(current: ProjectionCurrent) -> Result<Vec<u8>, IndexError> {
+    if current.family_id == [0; 32]
+        || current.generation_hash == [0; 32]
+        || current.generation_revision == 0
+    {
+        return Err(IndexError::InvalidDefinition(
+            "projection current is invalid".into(),
+        ));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(CURRENT_MAGIC);
+    put_u16(&mut out, CURRENT_FORMAT);
+    out.extend_from_slice(&current.family_id);
+    out.extend_from_slice(&current.generation_hash);
+    put_u64(&mut out, current.generation_revision);
+    append_integrity(&mut out);
+    Ok(out)
+}
+
+pub fn decode_projection_current(bytes: &[u8]) -> Result<ProjectionCurrent, IndexError> {
+    let payload = verify_integrity(bytes)?;
+    let mut input = Decoder::new(payload);
+    input.expect(CURRENT_MAGIC)?;
+    if input.u16()? != CURRENT_FORMAT {
+        return Err(IndexError::InvalidFormat(
+            "projection current format is unsupported",
+        ));
+    }
+    let current = ProjectionCurrent {
+        family_id: input.array_32()?,
+        generation_hash: input.array_32()?,
+        generation_revision: input.u64()?,
+    };
+    input.finish()?;
+    encode_projection_current(current)?;
+    Ok(current)
 }
 
 pub fn encode_projection_generation(
@@ -828,6 +868,33 @@ mod tests {
         wrong_directory.root_count += 1;
         assert_eq!(
             decode_projection_generation(&encoded.bytes, &wrong_directory),
+            Err(IndexError::Integrity)
+        );
+    }
+
+    #[test]
+    fn current_pointer_round_trips_and_binds_one_exact_generation() {
+        let generation = generation();
+        let encoded_generation = encode_projection_generation(&generation).unwrap();
+        let current = ProjectionCurrent::new(encoded_generation.hash, &generation).unwrap();
+        let bytes = encode_projection_current(current).unwrap();
+        let decoded = decode_projection_current(&bytes).unwrap();
+        assert_eq!(decoded, current);
+        decoded.validate_against(&generation).unwrap();
+
+        let advanced = generation
+            .advance(
+                encoded_generation.hash,
+                ProjectionBarrier::new(vec![(1, 8), (2, 11)], Some(5)).unwrap(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(decoded.validate_against(&advanced).is_err());
+
+        let mut corrupt = bytes;
+        corrupt[20] ^= 1;
+        assert_eq!(
+            decode_projection_current(&corrupt),
             Err(IndexError::Integrity)
         );
     }

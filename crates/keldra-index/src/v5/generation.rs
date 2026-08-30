@@ -130,6 +130,47 @@ pub struct ProjectionGeneration {
     pub previous_generation_hash: Option<[u8; 32]>,
 }
 
+/// Small mutable family pointer. Its exact generation record and immutable
+/// directories remain content-addressed; only this value is replaced by CAS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectionCurrent {
+    pub family_id: [u8; 32],
+    pub generation_hash: [u8; 32],
+    pub generation_revision: u64,
+}
+
+impl ProjectionCurrent {
+    pub fn new(
+        generation_hash: [u8; 32],
+        generation: &ProjectionGeneration,
+    ) -> Result<Self, IndexError> {
+        generation.validate()?;
+        if generation_hash == [0; 32] {
+            return Err(IndexError::InvalidDefinition(
+                "projection current generation hash is zero".into(),
+            ));
+        }
+        Ok(Self {
+            family_id: generation.family_id,
+            generation_hash,
+            generation_revision: generation.revision,
+        })
+    }
+
+    pub fn validate_against(&self, generation: &ProjectionGeneration) -> Result<(), IndexError> {
+        generation.validate()?;
+        if self.family_id != generation.family_id
+            || self.generation_hash == [0; 32]
+            || self.generation_revision != generation.revision
+        {
+            return Err(IndexError::InvalidDefinition(
+                "projection current does not name its exact generation".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ProjectionGeneration {
     pub fn initial(
         family_id: [u8; 32],

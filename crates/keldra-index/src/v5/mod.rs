@@ -8,6 +8,7 @@ mod buffer;
 mod codec;
 mod generation;
 mod pack;
+mod paths;
 mod projected_state;
 mod projector;
 mod publication;
@@ -15,9 +16,14 @@ mod stream;
 
 pub use generation::{
     ComponentIdentity, ComponentRoot, LogicalFieldBinding, LogicalProjectionBinding,
-    ProjectionBarrier, ProjectionGeneration,
+    ProjectionBarrier, ProjectionCurrent, ProjectionGeneration,
 };
 pub use pack::{PackedComponentDelta, SealedProjectionDeltaPack, pack_component_deltas};
+pub use paths::{
+    ProjectionArtifactKind, ProjectionArtifactPath, parse_projection_artifact_path,
+    projection_component_page_path, projection_current_path, projection_generation_path,
+    projection_pack_path, projection_stream_page_path,
+};
 pub use projected_state::{
     CanonicalRecipeState, DocumentHead, ProjectedDocumentDelta, ProjectedDocumentState,
     RecipeDelta, RecipeIdentity, StableDocumentKey,
@@ -40,7 +46,7 @@ pub use codec::{
     COMPONENT_DIRECTORY_FANOUT, ComponentDirectory, EncodedComponentDirectoryPage,
     EncodedProjectionGeneration, MAX_LOGICAL_BINDING_FIELDS, MAX_PROJECTION_SOURCES,
     build_component_directory, decode_component_directory, decode_logical_projection_binding,
-    decode_projected_document_state, decode_projection_generation,
-    encode_logical_projection_binding, encode_projected_document_state,
+    decode_projected_document_state, decode_projection_current, decode_projection_generation,
+    encode_logical_projection_binding, encode_projected_document_state, encode_projection_current,
     encode_projection_generation,
 };
