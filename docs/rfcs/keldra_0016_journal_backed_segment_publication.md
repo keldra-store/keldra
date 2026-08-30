@@ -681,6 +681,12 @@ disaster recovery, not normal cache recovery, and must be observable as such.
 
 ## 17. Initial build and explicit rebuild
 
+KELDRA-0020 changes “per definition” below to “per missing physical projection
+family or recipe.” Equivalent logical definitions bind the same ready build;
+they do not create additional roots. A definition which introduces a genuinely
+new recipe references one bounded physical backfill, and becomes ready only
+when its complete binding reaches one compatible source barrier.
+
 An initial build and an explicit rebuild use the same 16 MiB segment production
 path. They differ from steady-state catch-up because no partial baseline may be
 served as a complete index.
@@ -730,7 +736,8 @@ that consequence.
 11. Loss of every local materialization cannot lose acknowledged index state.
 12. Irreparable loss of a committed segment is reported as durable-data loss;
     it is not silently treated as an ordinary cache miss.
-13. At most one non-serving initial/rebuild root exists per definition.
+13. At most one non-serving initial/rebuild root exists per missing physical
+    projection family or recipe; logical aliases do not create more roots.
 14. Unpublished segments and manifests never become searchable merely because
     they exist.
 

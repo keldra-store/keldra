@@ -904,6 +904,17 @@ unvalidated value. These limits are format constants, not startup settings.
 
 ### 9.4 Schema fingerprint
 
+KELDRA-0020 supersedes the definition-local identity described below. In the
+shared-projection format, fields are ordered and assigned dense physical IDs by
+canonical field-recipe identity; public names and declaration order belong to
+the logical binding and are not physical fingerprint inputs. Path/content-type
+membership, source selectors, value semantics, capabilities, physical order,
+and component codec versions remain fingerprint inputs. This preserves the
+fail-closed format-v4 validation contract while allowing differently named
+logical definitions to read the same compatible physical segment.
+
+The following list records the original definition-owned format-v4 contract.
+
 The schema fingerprint is BLAKE3 with domain separator
 `keldra.index.schema.v4`. Its input is one explicit length-prefixed canonical
 binary encoding in this order:
@@ -1024,6 +1035,17 @@ age and exact-version deletion rules. It never deletes the ordinary definition
 tombstone and never touches another index in the bucket.
 
 ## 10. Schema and field identity
+
+KELDRA-0020 replaces the definition-local ownership in this section. Public
+field names and IDs remain definition-local query bindings. Physical FieldIds
+are dense IDs assigned from canonical field-recipe order within the exact
+physical schema, and the physical projection identity—not a logical index
+ID—owns segments and generations. Two logical definitions may therefore bind
+different public names to one physical field recipe. Component-level sharing
+between field subsets requires the projection-generation format described by
+KELDRA-0020 and is not implied merely by matching one FieldId.
+
+The paragraphs below describe the superseded definition-owned identity model.
 
 Each definition version has one canonical field catalogue. A field receives a
 dense definition-local `u32 FieldId` from canonical specification order. There
