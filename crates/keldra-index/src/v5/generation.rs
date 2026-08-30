@@ -235,7 +235,10 @@ pub struct LogicalFieldBinding {
 pub struct LogicalProjectionBinding {
     pub logical_index_id: u64,
     pub logical_definition_version: u64,
-    pub generation_revision: u64,
+    pub family_id: [u8; 32],
+    /// First family generation containing every recipe named by this binding.
+    /// Later generations remain valid without rewriting logical catalog state.
+    pub ready_from_revision: u64,
     pub membership: RecipeIdentity,
     pub fields: Vec<LogicalFieldBinding>,
 }
@@ -245,7 +248,9 @@ impl LogicalProjectionBinding {
         generation.validate()?;
         if self.logical_index_id == 0
             || self.logical_definition_version == 0
-            || self.generation_revision != generation.revision
+            || self.family_id != generation.family_id
+            || self.ready_from_revision == 0
+            || self.ready_from_revision > generation.revision
             || generation
                 .root(ComponentIdentity::Membership(self.membership))
                 .is_none()
@@ -333,7 +338,8 @@ mod tests {
         let first = LogicalProjectionBinding {
             logical_index_id: 10,
             logical_definition_version: 1,
-            generation_revision: 1,
+            family_id: generation.family_id,
+            ready_from_revision: 1,
             membership: recipe(3),
             fields: vec![LogicalFieldBinding {
                 public_field_id: 0,
@@ -344,7 +350,8 @@ mod tests {
         let second = LogicalProjectionBinding {
             logical_index_id: 11,
             logical_definition_version: 7,
-            generation_revision: 1,
+            family_id: generation.family_id,
+            ready_from_revision: 1,
             membership: recipe(3),
             fields: vec![
                 LogicalFieldBinding {

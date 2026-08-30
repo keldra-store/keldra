@@ -108,8 +108,10 @@ It is used to decide which physical recipes actually changed.
 complete source barrier to document-state, membership, and field component
 segments.
 
-**Logical binding** maps one exact logical-definition version to one projection
-family generation, membership recipe, field recipes, and public field IDs.
+**Logical binding** maps one exact logical-definition version to a projection
+family, the first generation where all its recipes were ready, its membership
+and field recipes, and public field IDs. It follows later complete generations
+of that family without a catalog rewrite.
 
 ## 4. Durable logical catalog
 
@@ -147,9 +149,10 @@ Catalog cardinality must not create an equal number of:
 - filesystem query-cache files.
 
 Creating a definition whose complete physical semantics already exist adds a
-logical binding and references the ready physical generation. It performs no
-source rebuild. Creating a genuinely new recipe schedules only the new physical
-recipe's bounded backfill.
+logical binding with the existing ready revision. It performs no source rebuild.
+Creating a genuinely new recipe schedules only the new physical recipe's
+bounded backfill and publishes the binding after the first complete generation
+containing that recipe.
 
 Catalog changes compile a new immutable routing snapshot. A source mutation
 never scans all logical definitions and never takes a process-wide mutable
@@ -417,7 +420,8 @@ A query follows this exact sequence:
 
 1. authorize and load the requested logical definition;
 2. resolve its exact logical binding;
-3. pin the referenced projection generation;
+3. load and pin the family's current generation, requiring it to be at or
+   beyond the binding's ready revision;
 4. compile public field IDs through the binding to physical recipes;
 5. execute predicates, ordering, facets, aggregates, text, and vectors against
    those component roots;
@@ -474,8 +478,9 @@ Crash points are recovered as follows:
 - a complete generation uploaded before current publication is unattached and
   reclaimed unless retry attaches the exact content identity;
 - a published physical generation without a new logical binding remains valid
-  physical state and can be bound on retry;
-- a logical binding never names a partially published generation;
+  physical state and can satisfy that binding on retry;
+- a logical binding never becomes ready before a complete published generation
+  contains every recipe it names;
 - restart rebuilds immutable routing pages from the durable catalog in bounded
   pages and resumes source partitions from physical barriers.
 

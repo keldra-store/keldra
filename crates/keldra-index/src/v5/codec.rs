@@ -134,7 +134,8 @@ pub fn encode_logical_projection_binding(
     put_u16(&mut out, BINDING_FORMAT);
     put_u64(&mut out, binding.logical_index_id);
     put_u64(&mut out, binding.logical_definition_version);
-    put_u64(&mut out, binding.generation_revision);
+    out.extend_from_slice(&binding.family_id);
+    put_u64(&mut out, binding.ready_from_revision);
     out.extend_from_slice(&binding.membership.bytes());
     put_u32(&mut out, binding.fields.len() as u32);
     for field in &binding.fields {
@@ -160,7 +161,8 @@ pub fn decode_logical_projection_binding(
     }
     let logical_index_id = input.u64()?;
     let logical_definition_version = input.u64()?;
-    let generation_revision = input.u64()?;
+    let family_id = input.array_32()?;
+    let ready_from_revision = input.u64()?;
     let membership = RecipeIdentity::new(input.array_32()?)?;
     let field_count = input.u32()? as usize;
     if field_count > MAX_LOGICAL_BINDING_FIELDS {
@@ -180,7 +182,8 @@ pub fn decode_logical_projection_binding(
     let binding = LogicalProjectionBinding {
         logical_index_id,
         logical_definition_version,
-        generation_revision,
+        family_id,
+        ready_from_revision,
         membership,
         fields,
     };
@@ -860,12 +863,13 @@ mod tests {
     }
 
     #[test]
-    fn logical_binding_round_trips_and_remains_generation_exact() {
+    fn logical_binding_round_trips_and_follows_only_ready_family_generations() {
         let generation = generation();
         let binding = LogicalProjectionBinding {
             logical_index_id: 44,
             logical_definition_version: 8,
-            generation_revision: generation.revision,
+            family_id: generation.family_id,
+            ready_from_revision: generation.revision,
             membership: recipe(2),
             fields: vec![LogicalFieldBinding {
                 public_field_id: 7,
@@ -886,6 +890,17 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        assert!(decode_logical_projection_binding(&bytes, &advanced).is_err());
+        assert_eq!(
+            decode_logical_projection_binding(&bytes, &advanced).unwrap(),
+            binding
+        );
+
+        let mut wrong_family = advanced.clone();
+        wrong_family.family_id = [42; 32];
+        assert!(decode_logical_projection_binding(&bytes, &wrong_family).is_err());
+
+        let mut not_ready = binding;
+        not_ready.ready_from_revision = advanced.revision + 1;
+        assert!(encode_logical_projection_binding(&not_ready, &advanced).is_err());
     }
 }
