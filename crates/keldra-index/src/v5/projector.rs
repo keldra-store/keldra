@@ -4,6 +4,78 @@ use crate::v4::{FieldId, ScalarValue, Schema};
 
 use super::{CanonicalRecipeState, DocumentHead, ProjectedDocumentState, RecipeIdentity};
 
+/// Merge independently compiled logical schemas over the same exact source
+/// into one canonical physical family projection.
+///
+/// Public aliases and field subsets disappear at this boundary. Repeated
+/// recipes must produce byte-identical canonical state; otherwise sharing
+/// fails closed rather than selecting one definition's interpretation.
+pub fn merge_projected_document_states(
+    projected: Vec<Vec<ProjectedDocumentState>>,
+) -> Result<Vec<ProjectedDocumentState>, IndexError> {
+    let mut projected = projected.into_iter();
+    let Some(mut merged) = projected.next() else {
+        return Ok(Vec::new());
+    };
+    for states in projected {
+        if states.len() != merged.len() {
+            return Err(IndexError::InvalidDefinition(
+                "logical schemas expanded one source into different record sets".into(),
+            ));
+        }
+        for (target, incoming) in merged.iter_mut().zip(states) {
+            target.validate()?;
+            incoming.validate()?;
+            if target.source_scope != incoming.source_scope || target.head != incoming.head {
+                return Err(IndexError::InvalidDefinition(
+                    "logical schemas do not share one exact document universe".into(),
+                ));
+            }
+            merge_recipe_states(&mut target.memberships, incoming.memberships)?;
+            merge_recipe_states(&mut target.fields, incoming.fields)?;
+            target.validate()?;
+        }
+    }
+    Ok(merged)
+}
+
+fn merge_recipe_states(
+    target: &mut Vec<CanonicalRecipeState>,
+    incoming: Vec<CanonicalRecipeState>,
+) -> Result<(), IndexError> {
+    let mut merged = Vec::with_capacity(target.len().saturating_add(incoming.len()));
+    let (mut left, mut right) = (0, 0);
+    while left < target.len() || right < incoming.len() {
+        match (target.get(left), incoming.get(right)) {
+            (Some(existing), Some(candidate)) if existing.recipe == candidate.recipe => {
+                if existing != candidate {
+                    return Err(IndexError::InvalidDefinition(
+                        "one physical recipe produced conflicting canonical state".into(),
+                    ));
+                }
+                merged.push(existing.clone());
+                left += 1;
+                right += 1;
+            }
+            (Some(existing), Some(candidate)) if existing.recipe < candidate.recipe => {
+                merged.push(existing.clone());
+                left += 1;
+            }
+            (_, Some(candidate)) => {
+                merged.push(candidate.clone());
+                right += 1;
+            }
+            (Some(existing), None) => {
+                merged.push(existing.clone());
+                left += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    *target = merged;
+    Ok(())
+}
+
 const CANONICAL_FIELD_STATE_VERSION: u16 = 1;
 
 /// Convert the deterministic native projection into exact recipe-local state.
@@ -299,5 +371,49 @@ mod tests {
         let delta = new[0].delta_from(Some(&old[0])).unwrap();
         assert_eq!(delta.fields.len(), 1);
         assert_eq!(delta.fields[0].recipe, old[0].fields[0].recipe);
+    }
+
+    #[test]
+    fn aliases_and_subsets_merge_to_one_canonical_recipe_union() {
+        let first = family_state(&[(2, b"first")]);
+        let alias = family_state(&[(2, b"first")]);
+        let second = family_state(&[(3, b"second")]);
+        let merged =
+            merge_projected_document_states(vec![vec![first], vec![alias], vec![second]]).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].memberships.len(), 1);
+        assert_eq!(merged[0].fields.len(), 2);
+    }
+
+    #[test]
+    fn family_merge_rejects_conflicting_expansion_or_recipe_bytes() {
+        let first = family_state(&[(2, b"first")]);
+        let conflicting = family_state(&[(2, b"conflict")]);
+        assert!(merge_projected_document_states(vec![vec![first], vec![conflicting]]).is_err());
+
+        let first = family_state(&[(2, b"first")]);
+        assert!(merge_projected_document_states(vec![vec![first], Vec::new()]).is_err());
+    }
+
+    fn family_state(fields: &[(u8, &[u8])]) -> ProjectedDocumentState {
+        let scope = [1; 32];
+        ProjectedDocumentState::new(
+            scope,
+            DocumentHead::new(scope, "objects/a".into(), 0, 7, None, true).unwrap(),
+            vec![
+                CanonicalRecipeState::new(RecipeIdentity::new([1; 32]).unwrap(), vec![1]).unwrap(),
+            ],
+            fields
+                .iter()
+                .map(|(identity, value)| {
+                    CanonicalRecipeState::new(
+                        RecipeIdentity::new([*identity; 32]).unwrap(),
+                        value.to_vec(),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap()
     }
 }

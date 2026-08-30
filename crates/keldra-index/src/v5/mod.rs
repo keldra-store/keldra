@@ -28,7 +28,7 @@ pub use projected_state::{
     CanonicalRecipeState, DocumentHead, ProjectedDocumentDelta, ProjectedDocumentState,
     RecipeDelta, RecipeIdentity, StableDocumentKey,
 };
-pub use projector::projected_document_states;
+pub use projector::{merge_projected_document_states, projected_document_states};
 pub use publication::{PreparedProjectionGeneration, prepare_projection_generation};
 pub use stream::{
     COMPONENT_STREAM_DIRECTORY_FANOUT, ComponentSegmentDescriptor, ComponentStreamAppend,
