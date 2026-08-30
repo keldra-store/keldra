@@ -9,6 +9,7 @@ mod codec;
 mod generation;
 mod projected_state;
 mod projector;
+mod stream;
 
 pub use generation::{
     ComponentIdentity, ComponentRoot, LogicalFieldBinding, LogicalProjectionBinding,
@@ -19,6 +20,11 @@ pub use projected_state::{
     RecipeDelta, RecipeIdentity, StableDocumentKey,
 };
 pub use projector::projected_document_states;
+pub use stream::{
+    COMPONENT_STREAM_DIRECTORY_FANOUT, ComponentSegmentDescriptor, ComponentStreamDirectory,
+    EncodedComponentStreamPage, append_component_delta, build_component_stream,
+    compact_component_stream, decode_component_stream, resolve_component_record,
+};
 
 pub const INDEX_FORMAT_VERSION: u16 = 5;
 pub use buffer::{

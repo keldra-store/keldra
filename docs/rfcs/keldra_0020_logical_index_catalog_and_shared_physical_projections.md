@@ -716,7 +716,14 @@ Implemented groundwork on `feat/shared-index-projection`:
   bounded codecs; and
 - component roots are represented by a canonical bounded-fanout Merkle
   directory rather than an unbounded manifest or one file per component. A
-  70,000-component regression keeps every encoded directory page below 32 KiB.
+  70,000-component regression keeps every encoded directory page below 32 KiB;
+  and
+- each component root can now name an ordered immutable delta stream through a
+  second bounded-fanout content-addressed directory. Readers verify every
+  segment identity and resolve newest-by-stable-key values; compaction folds
+  the stream into one exact self-contained segment while retaining tombstones
+  required by concurrently pinned older generations. A 70,000-segment
+  regression keeps directory pages below 32 KiB.
 
 This does not yet satisfy Milestone B for field subsets. Independent component
 generation ownership and bindings remain required before different complete

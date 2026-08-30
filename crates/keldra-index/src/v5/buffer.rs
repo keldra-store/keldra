@@ -207,7 +207,7 @@ fn encode_document_head(head: &DocumentHead) -> Result<Vec<u8>, IndexError> {
     Ok(bytes)
 }
 
-fn seal_component(
+pub(super) fn seal_component(
     component: ComponentIdentity,
     records: BTreeMap<StableDocumentKey, Option<Vec<u8>>>,
 ) -> Result<SealedComponentDelta, IndexError> {
