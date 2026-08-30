@@ -288,6 +288,25 @@ mod tests {
     }
 
     #[test]
+    fn empty_initial_projection_publishes_only_the_complete_generation() {
+        let prepared =
+            prepare_projection_generation([12; 32], None, barrier(2), Vec::new(), |_| {
+                Err(IndexError::Integrity)
+            })
+            .unwrap();
+        assert!(prepared.packs.is_empty());
+        assert!(prepared.stream_pages.is_empty());
+        assert_eq!(prepared.generation.component_directory.root_count, 0);
+        assert!(prepared.generation.component_directory.pages.is_empty());
+        let generation = decode_projection_generation(
+            &prepared.generation.bytes,
+            &prepared.generation.component_directory,
+        )
+        .unwrap();
+        assert!(generation.roots.is_empty());
+    }
+
+    #[test]
     fn packed_delta_hashes_cover_exact_component_bytes() {
         let prepared = prepare_projection_generation(
             [10; 32],

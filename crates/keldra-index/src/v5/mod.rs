@@ -49,6 +49,7 @@ pub use codec::{
     ProjectionGenerationHeader, build_component_directory, component_directory_child_hashes,
     decode_component_directory, decode_logical_projection_binding, decode_projected_document_state,
     decode_projection_current, decode_projection_generation, decode_projection_generation_header,
-    encode_logical_projection_binding, encode_projected_document_state, encode_projection_current,
-    encode_projection_generation, resolve_component_root,
+    empty_component_directory_hash, encode_logical_projection_binding,
+    encode_projected_document_state, encode_projection_current, encode_projection_generation,
+    resolve_component_root,
 };

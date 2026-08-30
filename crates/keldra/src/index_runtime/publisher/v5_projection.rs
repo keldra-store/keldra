@@ -10,10 +10,10 @@ use keldra_index::v5::{
     ProjectionGeneration, SealedComponentDelta, StableDocumentKey,
     component_directory_child_hashes, component_stream_child_hashes, decode_component_stream,
     decode_projected_document_state, decode_projection_current, decode_projection_generation,
-    decode_projection_generation_header, decode_source_records, lookup_component_record_in_pack,
-    prepare_projection_generation, projection_component_page_path, projection_current_path,
-    projection_generation_path, projection_pack_path, projection_routing_id,
-    projection_stream_page_path,
+    decode_projection_generation_header, decode_source_records, empty_component_directory_hash,
+    lookup_component_record_in_pack, prepare_projection_generation, projection_component_page_path,
+    projection_current_path, projection_generation_path, projection_pack_path,
+    projection_routing_id, projection_stream_page_path,
 };
 use keldra_store::{BlobRef, ObjectKey, VersionId};
 use tonic::Status;
@@ -35,6 +35,13 @@ pub(crate) struct PublishedProjectionGeneration {
     pub(crate) generation_hash: [u8; 32],
     pub(crate) artifacts: Vec<ProjectionArtifactReference>,
     pub(crate) current_version: VersionId,
+}
+
+pub(crate) struct PublishedProjectionArtifacts {
+    pub(crate) family_id: [u8; 32],
+    pub(crate) generation_hash: [u8; 32],
+    pub(crate) artifacts: Vec<ProjectionArtifactReference>,
+    current: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -376,9 +383,47 @@ impl IndexCommitPublisher {
         prepared: PreparedProjectionGeneration,
         admission: DerivedArtifactAdmission,
     ) -> Result<PublishedProjectionGeneration, Status> {
+        let published = self
+            .publish_projection_artifacts(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                family_id,
+                prepared,
+                admission,
+            )
+            .await?;
+        self.install_projection_current(
+            storage_tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            expected_current,
+            published,
+            admission,
+        )
+        .await
+    }
+
+    /// Publish a complete immutable generation without making it visible.
+    /// Rebuilds use this after each bounded frame, retaining only the newest
+    /// returned installation token. A failed or superseded attempt leaves
+    /// content-addressed artifacts for the ordinary orphan collector.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn publish_projection_artifacts(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        family_id: [u8; 32],
+        prepared: PreparedProjectionGeneration,
+        admission: DerivedArtifactAdmission,
+    ) -> Result<PublishedProjectionArtifacts, Status> {
         let routing_id = projection_routing_id(family_id);
         let generation_hash = prepared.generation.hash;
-        let artifacts = collect_artifacts(family_id, prepared)?;
+        let (artifacts, current) = collect_artifacts(family_id, prepared)?;
         let mut staged = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
             let blob = stage_index_bytes_with_retry(&self.store, &artifact.bytes, admission)
@@ -390,16 +435,6 @@ impl IndexCommitPublisher {
                 ));
             }
             staged.push((artifact.path, blob));
-        }
-
-        let current_path = projection_current_path(family_id);
-        let current = staged
-            .pop()
-            .ok_or_else(|| Status::internal("prepared projection has no current pointer"))?;
-        if current.0 != current_path {
-            return Err(Status::internal(
-                "prepared projection current pointer was not ordered last",
-            ));
         }
 
         let requests = staged
@@ -437,22 +472,45 @@ impl IndexCommitPublisher {
             });
         }
 
+        Ok(PublishedProjectionArtifacts {
+            family_id,
+            generation_hash,
+            artifacts: references,
+            current,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn install_projection_current(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        expected_current: Option<VersionId>,
+        published: PublishedProjectionArtifacts,
+        admission: DerivedArtifactAdmission,
+    ) -> Result<PublishedProjectionGeneration, Status> {
+        let current_path = projection_current_path(published.family_id);
+        let current_blob = stage_index_bytes_with_retry(&self.store, &published.current, admission)
+            .await
+            .map_err(index_status)?;
         let current_request = projection_request(
             storage_tenant,
             bucket,
             tenant_id,
             bucket_id,
-            routing_id,
-            &current.0,
-            current.1,
+            projection_routing_id(published.family_id),
+            &current_path,
+            current_blob,
             expected_current,
             admission,
         );
         let current_outcome = self.artifacts.publish(current_request).await?;
         Ok(PublishedProjectionGeneration {
-            family_id,
-            generation_hash,
-            artifacts: references,
+            family_id: published.family_id,
+            generation_hash: published.generation_hash,
+            artifacts: published.artifacts,
             current_version: current_outcome.version,
         })
     }
@@ -468,6 +526,9 @@ impl IndexCommitPublisher {
         root_hash: [u8; 32],
         root_count: u64,
     ) -> Result<Vec<EncodedComponentDirectoryPage>, Status> {
+        if root_count == 0 && root_hash == empty_component_directory_hash() {
+            return Ok(Vec::new());
+        }
         let maximum_pages = usize::try_from(root_count)
             .map_err(|_| Status::resource_exhausted("projection root count is unbounded"))?
             .saturating_mul(2)
@@ -650,7 +711,7 @@ impl IndexCommitPublisher {
 fn collect_artifacts(
     family_id: [u8; 32],
     prepared: PreparedProjectionGeneration,
-) -> Result<Vec<ArtifactBytes>, Status> {
+) -> Result<(Vec<ArtifactBytes>, Vec<u8>), Status> {
     let mut artifacts = BTreeMap::<String, ArtifactBytes>::new();
     for pack in prepared.packs {
         insert_artifact(
@@ -682,14 +743,7 @@ fn collect_artifacts(
         prepared.generation.hash,
         prepared.generation.bytes,
     )?;
-    let current_hash = *blake3::hash(&prepared.current).as_bytes();
-    let mut ordered = artifacts.into_values().collect::<Vec<_>>();
-    ordered.push(ArtifactBytes {
-        path: projection_current_path(family_id),
-        hash: current_hash,
-        bytes: prepared.current,
-    });
-    Ok(ordered)
+    Ok((artifacts.into_values().collect(), prepared.current))
 }
 
 fn insert_artifact(
@@ -769,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_generation_flattens_to_deduplicated_immutable_paths_then_current() {
+    fn prepared_generation_separates_deduplicated_immutable_paths_from_current() {
         let family = [9; 32];
         let stream_bytes = b"stream-page".to_vec();
         let component_bytes = b"component-page".to_vec();
@@ -800,11 +854,13 @@ mod tests {
             },
             current: b"current".to_vec(),
         };
-        let artifacts = collect_artifacts(family, prepared).unwrap();
-        assert_eq!(artifacts.len(), 4);
-        assert_eq!(
-            artifacts.last().unwrap().path,
-            projection_current_path(family)
+        let (artifacts, current) = collect_artifacts(family, prepared).unwrap();
+        assert_eq!(artifacts.len(), 3);
+        assert_eq!(current, b"current");
+        assert!(
+            artifacts
+                .iter()
+                .all(|artifact| artifact.path != projection_current_path(family))
         );
         assert_eq!(
             artifacts

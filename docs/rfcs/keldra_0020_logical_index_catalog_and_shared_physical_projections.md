@@ -782,6 +782,12 @@ Implemented groundwork on `feat/shared-index-projection`:
   delta packs, newly path-copied stream pages, component-directory pages, and
   exact next generation. Runtime publication must make those immutable values
   durable first and atomically install only the generation record last; and
+- an empty captured family is represented by a canonical empty component
+  directory and a complete source barrier, rather than fabricated records or
+  the absence of a checkpoint. Rebuild publication is split into an immutable
+  generation stage and a final exact-version `current` installation: bounded
+  rebuild frames can therefore become durable without exposing a partial
+  snapshot, and only the final complete frame becomes query-visible; and
 - the production artifact boundary now admits those canonical format-v5 paths,
   verifies every immutable path against its exact payload hash, stages and
   publishes the complete immutable dependency set through ordinary integrated

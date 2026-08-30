@@ -106,7 +106,7 @@ impl ProjectionBarrier {
         Ok(())
     }
 
-    fn covers(&self, previous: &Self) -> bool {
+    pub fn covers(&self, previous: &Self) -> bool {
         let current = self
             .source_offsets
             .iter()
@@ -251,14 +251,14 @@ impl ProjectionGeneration {
         if self.family_id == [0; 32]
             || self.revision == 0
             || self.previous_generation_hash == Some([0; 32])
-            || self.roots.is_empty()
             || self
                 .roots
                 .windows(2)
                 .any(|pair| pair[0].component >= pair[1].component)
             || self.roots.iter().any(|root| root.validate().is_err())
-            || self.root(ComponentIdentity::DocumentHead).is_none()
-            || self.root(ComponentIdentity::ProjectedState).is_none()
+            || (!self.roots.is_empty()
+                && (self.root(ComponentIdentity::DocumentHead).is_none()
+                    || self.root(ComponentIdentity::ProjectedState).is_none()))
         {
             return Err(IndexError::InvalidDefinition(
                 "projection generation is incomplete or non-canonical".into(),
@@ -427,5 +427,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn empty_family_has_a_complete_barrier_without_fabricated_components() {
+        let barrier = ProjectionBarrier::new(vec![(1, 8)], None).unwrap();
+        let empty = ProjectionGeneration::initial([7; 32], barrier.clone(), Vec::new()).unwrap();
+        assert!(empty.roots.is_empty());
+        assert!(barrier.covers(&empty.barrier));
+
+        let advanced = empty
+            .advance(
+                [9; 32],
+                ProjectionBarrier::new(vec![(1, 9)], None).unwrap(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(advanced.roots.is_empty());
     }
 }

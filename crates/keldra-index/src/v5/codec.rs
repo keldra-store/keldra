@@ -11,6 +11,7 @@ use super::{
 const STATE_MAGIC: &[u8; 8] = b"K5STATE1";
 const DIRECTORY_MAGIC: &[u8; 8] = b"K5CDIR01";
 const GENERATION_MAGIC: &[u8; 8] = b"K5GEN001";
+const EMPTY_COMPONENT_DIRECTORY_DOMAIN: &[u8] = b"keldra.index.v5.empty-component-directory/v1";
 const CURRENT_MAGIC: &[u8; 8] = b"K5CUR001";
 const BINDING_MAGIC: &[u8; 8] = b"K5BIND01";
 const STATE_FORMAT: u16 = 1;
@@ -173,7 +174,10 @@ pub fn decode_projection_generation_header(
     let directory_count = input.u64()?;
     let previous_generation_hash = input.optional_hash()?;
     input.finish()?;
-    if family_id == [0; 32] || directory_hash == [0; 32] || directory_count == 0 {
+    if family_id == [0; 32]
+        || directory_hash == [0; 32]
+        || (directory_count == 0 && directory_hash != empty_component_directory_hash())
+    {
         return Err(IndexError::InvalidFormat(
             "projection generation header contains a zero identity",
         ));
@@ -194,12 +198,19 @@ pub fn resolve_component_root(
     component: ComponentIdentity,
     mut load_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
 ) -> Result<Option<ComponentRoot>, IndexError> {
+    if root_count == 0 && root_hash == empty_component_directory_hash() {
+        return Ok(None);
+    }
     if root_hash == [0; 32] || root_count == 0 {
         return Err(IndexError::InvalidDefinition(
             "component directory lookup root is invalid".into(),
         ));
     }
     resolve_component_subtree(root_hash, root_count, component, &mut load_page)
+}
+
+pub fn empty_component_directory_hash() -> [u8; 32] {
+    *blake3::hash(EMPTY_COMPONENT_DIRECTORY_DOMAIN).as_bytes()
 }
 
 /// Child page hashes named by one verified component-directory page.
@@ -409,6 +420,13 @@ pub fn decode_projected_document_state(bytes: &[u8]) -> Result<ProjectedDocument
 pub fn build_component_directory(
     roots: &[ComponentRoot],
 ) -> Result<ComponentDirectory, IndexError> {
+    if roots.is_empty() {
+        return Ok(ComponentDirectory {
+            root_hash: empty_component_directory_hash(),
+            root_count: 0,
+            pages: Vec::new(),
+        });
+    }
     validate_roots(roots)?;
     let mut pages = Vec::new();
     let mut level = Vec::new();
@@ -456,6 +474,15 @@ pub fn build_component_directory(
 pub fn decode_component_directory(
     directory: &ComponentDirectory,
 ) -> Result<Vec<ComponentRoot>, IndexError> {
+    if directory.root_count == 0 {
+        return if directory.root_hash == empty_component_directory_hash()
+            && directory.pages.is_empty()
+        {
+            Ok(Vec::new())
+        } else {
+            Err(IndexError::Integrity)
+        };
+    }
     if directory.root_hash == [0; 32] || directory.root_count == 0 {
         return Err(IndexError::InvalidFormat(
             "component directory root is invalid",
@@ -599,8 +626,7 @@ fn decode_directory_page(bytes: &[u8]) -> Result<DirectoryPage, IndexError> {
 }
 
 fn validate_roots(roots: &[ComponentRoot]) -> Result<(), IndexError> {
-    if roots.is_empty()
-        || roots.len() > u32::MAX as usize
+    if roots.len() > u32::MAX as usize
         || roots
             .windows(2)
             .any(|pair| pair[0].component >= pair[1].component)
