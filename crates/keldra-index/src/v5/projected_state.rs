@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::IndexError;
-use crate::v4::{INDEX_COMPONENT_BYTES, INDEX_ROUTING_KEY_BYTES, ObjectIdentity};
+use crate::v4::{INDEX_ROUTING_KEY_BYTES, ObjectIdentity};
 
 const STABLE_DOCUMENT_KEY_DOMAIN: &[u8] = b"keldra.index.stable-document-key/v1";
 
@@ -125,12 +125,6 @@ pub struct CanonicalRecipeState {
 
 impl CanonicalRecipeState {
     pub fn new(recipe: RecipeIdentity, value: Vec<u8>) -> Result<Self, IndexError> {
-        if value.len() > INDEX_COMPONENT_BYTES {
-            return Err(IndexError::ResourceLimit {
-                needed: value.len(),
-                limit: INDEX_COMPONENT_BYTES,
-            });
-        }
         Ok(Self {
             recipe,
             digest: *blake3::hash(&value).as_bytes(),
@@ -139,9 +133,7 @@ impl CanonicalRecipeState {
     }
 
     fn validate(&self) -> Result<(), IndexError> {
-        if self.value.len() > INDEX_COMPONENT_BYTES
-            || self.digest != *blake3::hash(&self.value).as_bytes()
-        {
+        if self.digest != *blake3::hash(&self.value).as_bytes() {
             return Err(IndexError::InvalidDefinition(
                 "canonical projected recipe state is invalid".into(),
             ));
