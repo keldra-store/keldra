@@ -27,9 +27,9 @@ enum Phase {
 struct Args {
     #[arg(long)]
     endpoint: String,
-    #[arg(long)]
+    #[arg(long, env = "KELDRA_CLIENT_ID")]
     client_id: String,
-    #[arg(long)]
+    #[arg(long, env = "KELDRA_CLIENT_SECRET", hide_env_values = true)]
     client_secret: String,
     #[arg(long)]
     bucket: String,
