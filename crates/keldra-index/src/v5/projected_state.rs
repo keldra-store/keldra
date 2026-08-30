@@ -32,6 +32,14 @@ impl RecipeIdentity {
 pub struct StableDocumentKey([u8; 32]);
 
 impl StableDocumentKey {
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, IndexError> {
+        if bytes == [0; 32] {
+            return Err(IndexError::InvalidDefinition(
+                "stable document key must be non-zero".into(),
+            ));
+        }
+        Ok(Self(bytes))
+    }
     pub fn derive(
         source_scope: [u8; 32],
         source_path: &str,

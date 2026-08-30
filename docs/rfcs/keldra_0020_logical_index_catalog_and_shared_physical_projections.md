@@ -155,6 +155,14 @@ Catalog changes compile a new immutable routing snapshot. A source mutation
 never scans all logical definitions and never takes a process-wide mutable
 catalog lock.
 
+Process-local assignment notifications are wakeups, not a change journal. A
+receiver which falls behind must retain already completed physical progress and
+resume a paged reconciliation from the durable catalog. It must not discard a
+partially or completely reconstructed projection inventory and restart from
+page one. Catalog reconciliation uses a monotonic durable catalog generation
+and an exact snapshot/catch-up boundary so creation churn cannot repeatedly
+invalidate `O(catalog cardinality)` work.
+
 ## 5. Canonical physical identities
 
 Recipe sharing is allowed only when every result-affecting semantic input is
@@ -301,6 +309,14 @@ ProjectionGeneration {
     encoded/logical byte accounting
 }
 ```
+
+The component lists in that illustration are logical lists, not one unbounded
+manifest array. They are encoded as a content-addressed bounded-fanout Merkle
+directory. Leaf pages contain canonical sorted component roots; branch pages
+contain canonical key ranges and child hashes. The generation record contains
+only the directory root, root count, barrier, and predecessor. This keeps
+generation publication and point lookup bounded without creating one
+filesystem inode per component.
 
 An unchanged component root is referenced from the previous generation rather
 than rewritten. Publication atomically installs the complete generation and
