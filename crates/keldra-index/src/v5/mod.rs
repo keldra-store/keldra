@@ -23,8 +23,9 @@ pub use projected_state::{
 };
 pub use projector::projected_document_states;
 pub use stream::{
-    COMPONENT_STREAM_DIRECTORY_FANOUT, ComponentSegmentDescriptor, ComponentStreamDirectory,
-    EncodedComponentStreamPage, append_component_delta, build_component_stream,
+    COMPONENT_STREAM_DIRECTORY_FANOUT, ComponentSegmentDescriptor, ComponentStreamAppend,
+    ComponentStreamDirectory, ComponentStreamRoot, EncodedComponentStreamPage,
+    append_component_delta, append_component_stream, build_component_stream,
     compact_component_stream, decode_component_stream, resolve_component_record,
 };
 

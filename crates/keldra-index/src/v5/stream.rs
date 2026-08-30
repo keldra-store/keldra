@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::IndexError;
 
@@ -60,26 +60,53 @@ pub struct ComponentStreamDirectory {
     pub segment_count: u64,
     pub encoded_bytes: u64,
     pub logical_bytes: u64,
+    pub directory_bytes: u64,
     pub pages: Vec<EncodedComponentStreamPage>,
 }
 
 impl ComponentStreamDirectory {
     pub fn component_root(&self) -> Result<ComponentRoot, IndexError> {
         decode_component_stream(self)?;
-        let directory_bytes = self.pages.iter().try_fold(0_u64, |total, page| {
-            total
-                .checked_add(page.bytes.len() as u64)
-                .ok_or(IndexError::OffsetOverflow)
-        })?;
         ComponentRoot::new(
             self.component,
             self.root_hash,
             self.encoded_bytes
-                .checked_add(directory_bytes)
+                .checked_add(self.directory_bytes)
                 .ok_or(IndexError::OffsetOverflow)?,
             self.logical_bytes,
         )
     }
+
+    pub fn root(&self) -> ComponentStreamRoot {
+        ComponentStreamRoot {
+            component: self.component,
+            root_hash: self.root_hash,
+            segment_count: self.segment_count,
+            encoded_bytes: self.encoded_bytes,
+            logical_bytes: self.logical_bytes,
+            directory_bytes: self.directory_bytes,
+        }
+    }
+}
+
+/// The small generation-owned identity of a component stream. Immutable pages
+/// are loaded independently by hash; appending never copies the full page set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComponentStreamRoot {
+    pub component: ComponentIdentity,
+    pub root_hash: [u8; 32],
+    pub segment_count: u64,
+    pub encoded_bytes: u64,
+    pub logical_bytes: u64,
+    pub directory_bytes: u64,
+}
+
+/// A path-copy append result. Only these pages need publication before the new
+/// root is installed; every other reachable page is shared with the prior root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentStreamAppend {
+    pub root: ComponentStreamRoot,
+    pub new_pages: Vec<EncodedComponentStreamPage>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +123,7 @@ struct Child {
     segment_count: u64,
     encoded_bytes: u64,
     logical_bytes: u64,
+    directory_bytes: u64,
 }
 
 pub fn build_component_stream(
@@ -107,14 +135,22 @@ pub fn build_component_stream(
     let mut level = Vec::new();
     for chunk in segments.chunks(COMPONENT_STREAM_DIRECTORY_FANOUT) {
         let encoded = encode_page(component, &Page::Leaf(chunk.to_vec()))?;
-        level.push(Child::from_segments(chunk, encoded.hash)?);
+        level.push(Child::from_segments(
+            chunk,
+            encoded.hash,
+            encoded.bytes.len() as u64,
+        )?);
         pages.push(encoded);
     }
     while level.len() > 1 {
         let mut parent = Vec::new();
         for chunk in level.chunks(COMPONENT_STREAM_DIRECTORY_FANOUT) {
             let encoded = encode_page(component, &Page::Branch(chunk.to_vec()))?;
-            parent.push(Child::from_children(chunk, encoded.hash)?);
+            parent.push(Child::from_children(
+                chunk,
+                encoded.hash,
+                encoded.bytes.len() as u64,
+            )?);
             pages.push(encoded);
         }
         level = parent;
@@ -129,7 +165,83 @@ pub fn build_component_stream(
         segment_count: root.segment_count,
         encoded_bytes: root.encoded_bytes,
         logical_bytes: root.logical_bytes,
+        directory_bytes: root.directory_bytes,
         pages,
+    })
+}
+
+/// Append one immutable delta by copying only the rightmost tree path. The
+/// loader is called once per existing level, so the work is O(log_256 N).
+pub fn append_component_stream(
+    previous: Option<ComponentStreamRoot>,
+    mut load_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    delta: &PackedComponentDelta,
+) -> Result<ComponentStreamAppend, IndexError> {
+    let next_sequence = match previous {
+        Some(root) => {
+            validate_root(root)?;
+            if root.component != delta.component {
+                return Err(IndexError::InvalidDefinition(
+                    "component delta was appended to a different stream".into(),
+                ));
+            }
+            root.segment_count
+                .checked_add(1)
+                .ok_or(IndexError::OffsetOverflow)?
+        }
+        None => 1,
+    };
+    if next_sequence > MAX_COMPONENT_STREAM_SEGMENTS as u64 {
+        return Err(IndexError::ResourceLimit {
+            needed: next_sequence as usize,
+            limit: MAX_COMPONENT_STREAM_SEGMENTS,
+        });
+    }
+    let descriptor = descriptor(next_sequence, delta)?;
+    let mut new_pages = Vec::new();
+    let children = match previous {
+        Some(root) => append_subtree(
+            root.component,
+            root.root_hash,
+            &descriptor,
+            &mut load_page,
+            &mut new_pages,
+        )?,
+        None => {
+            let encoded = encode_page(delta.component, &Page::Leaf(vec![descriptor]))?;
+            let child = Child::from_segments(
+                match decode_page(delta.component, &encoded.bytes)? {
+                    Page::Leaf(ref segments) => segments,
+                    Page::Branch(_) => unreachable!(),
+                },
+                encoded.hash,
+                encoded.bytes.len() as u64,
+            )?;
+            new_pages.push(encoded);
+            vec![child]
+        }
+    };
+    let root_child = if children.len() == 1 {
+        children[0].clone()
+    } else {
+        let encoded = encode_page(delta.component, &Page::Branch(children.clone()))?;
+        let child = Child::from_children(&children, encoded.hash, encoded.bytes.len() as u64)?;
+        new_pages.push(encoded);
+        child
+    };
+    if root_child.segment_count != next_sequence {
+        return Err(IndexError::Integrity);
+    }
+    Ok(ComponentStreamAppend {
+        root: ComponentStreamRoot {
+            component: delta.component,
+            root_hash: root_child.hash,
+            segment_count: root_child.segment_count,
+            encoded_bytes: root_child.encoded_bytes,
+            logical_bytes: root_child.logical_bytes,
+            directory_bytes: root_child.directory_bytes,
+        },
+        new_pages,
     })
 }
 
@@ -151,15 +263,7 @@ pub fn append_component_delta(
     let sequence = (segments.len() as u64)
         .checked_add(1)
         .ok_or(IndexError::OffsetOverflow)?;
-    segments.push(ComponentSegmentDescriptor {
-        sequence,
-        pack_hash: delta.pack_hash,
-        pack_offset: delta.offset,
-        segment_hash: delta.segment_hash,
-        encoded_bytes: delta.encoded_bytes,
-        logical_bytes: delta.logical_bytes,
-        records: delta.records,
-    });
+    segments.push(descriptor(sequence, delta)?);
     build_component_stream(delta.component, &segments)
 }
 
@@ -171,6 +275,7 @@ pub fn decode_component_stream(
         || directory.segment_count > MAX_COMPONENT_STREAM_SEGMENTS as u64
         || directory.encoded_bytes == 0
         || directory.logical_bytes == 0
+        || directory.directory_bytes == 0
     {
         return Err(IndexError::InvalidFormat(
             "component stream directory root is invalid",
@@ -186,15 +291,19 @@ pub fn decode_component_stream(
         }
     }
     let mut segments = Vec::new();
+    let mut visited = BTreeSet::new();
     let totals = decode_subtree(
         directory.component,
         directory.root_hash,
         &pages,
+        &mut visited,
         &mut segments,
     )?;
     if totals.segment_count != directory.segment_count
         || totals.encoded_bytes != directory.encoded_bytes
         || totals.logical_bytes != directory.logical_bytes
+        || totals.directory_bytes != directory.directory_bytes
+        || visited.len() != pages.len()
     {
         return Err(IndexError::Integrity);
     }
@@ -262,6 +371,115 @@ pub fn compact_component_stream(
     Ok((compacted, segment))
 }
 
+fn descriptor(
+    sequence: u64,
+    delta: &PackedComponentDelta,
+) -> Result<ComponentSegmentDescriptor, IndexError> {
+    let descriptor = ComponentSegmentDescriptor {
+        sequence,
+        pack_hash: delta.pack_hash,
+        pack_offset: delta.offset,
+        segment_hash: delta.segment_hash,
+        encoded_bytes: delta.encoded_bytes,
+        logical_bytes: delta.logical_bytes,
+        records: delta.records,
+    };
+    descriptor.validate()?;
+    Ok(descriptor)
+}
+
+fn validate_root(root: ComponentStreamRoot) -> Result<(), IndexError> {
+    if root.root_hash == [0; 32]
+        || root.segment_count == 0
+        || root.segment_count > MAX_COMPONENT_STREAM_SEGMENTS as u64
+        || root.encoded_bytes == 0
+        || root.logical_bytes == 0
+        || root.directory_bytes == 0
+    {
+        return Err(IndexError::InvalidDefinition(
+            "component stream root is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn append_subtree(
+    component: ComponentIdentity,
+    hash: [u8; 32],
+    descriptor: &ComponentSegmentDescriptor,
+    load_page: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    new_pages: &mut Vec<EncodedComponentStreamPage>,
+) -> Result<Vec<Child>, IndexError> {
+    let bytes = load_page(hash)?;
+    if hash != *blake3::hash(&bytes).as_bytes() {
+        return Err(IndexError::Integrity);
+    }
+    match decode_page(component, &bytes)? {
+        Page::Leaf(mut segments) => {
+            if segments
+                .last()
+                .and_then(|last| last.sequence.checked_add(1))
+                != Some(descriptor.sequence)
+            {
+                return Err(IndexError::Integrity);
+            }
+            if segments.len() < COMPONENT_STREAM_DIRECTORY_FANOUT {
+                segments.push(descriptor.clone());
+                let encoded = encode_page(component, &Page::Leaf(segments.clone()))?;
+                let child =
+                    Child::from_segments(&segments, encoded.hash, encoded.bytes.len() as u64)?;
+                new_pages.push(encoded);
+                Ok(vec![child])
+            } else {
+                let existing = Child::from_segments(&segments, hash, bytes.len() as u64)?;
+                let encoded = encode_page(component, &Page::Leaf(vec![descriptor.clone()]))?;
+                let appended = Child::from_segments(
+                    std::slice::from_ref(descriptor),
+                    encoded.hash,
+                    encoded.bytes.len() as u64,
+                )?;
+                new_pages.push(encoded);
+                Ok(vec![existing, appended])
+            }
+        }
+        Page::Branch(mut children) => {
+            let previous = children.pop().ok_or(IndexError::Integrity)?;
+            if previous.last_sequence.checked_add(1) != Some(descriptor.sequence) {
+                return Err(IndexError::Integrity);
+            }
+            children.extend(append_subtree(
+                component,
+                previous.hash,
+                descriptor,
+                load_page,
+                new_pages,
+            )?);
+            if children.len() <= COMPONENT_STREAM_DIRECTORY_FANOUT {
+                let encoded = encode_page(component, &Page::Branch(children.clone()))?;
+                let child =
+                    Child::from_children(&children, encoded.hash, encoded.bytes.len() as u64)?;
+                if encoded.hash != hash {
+                    new_pages.push(encoded);
+                }
+                Ok(vec![child])
+            } else {
+                let right = children.split_off(COMPONENT_STREAM_DIRECTORY_FANOUT);
+                let mut result = Vec::with_capacity(2);
+                for half in [children, right] {
+                    let encoded = encode_page(component, &Page::Branch(half.clone()))?;
+                    let child =
+                        Child::from_children(&half, encoded.hash, encoded.bytes.len() as u64)?;
+                    if encoded.hash != hash {
+                        new_pages.push(encoded);
+                    }
+                    result.push(child);
+                }
+                Ok(result)
+            }
+        }
+    }
+}
+
 fn validate_artifact<'a>(
     component: ComponentIdentity,
     descriptor: &ComponentSegmentDescriptor,
@@ -305,6 +523,7 @@ impl Child {
     fn from_segments(
         segments: &[ComponentSegmentDescriptor],
         hash: [u8; 32],
+        page_bytes: u64,
     ) -> Result<Self, IndexError> {
         let first = segments.first().expect("nonempty leaf");
         let last = segments.last().expect("nonempty leaf");
@@ -315,10 +534,15 @@ impl Child {
             segment_count: segments.len() as u64,
             encoded_bytes: sum_segments(segments, |segment| segment.encoded_bytes)?,
             logical_bytes: sum_segments(segments, |segment| segment.logical_bytes)?,
+            directory_bytes: page_bytes,
         })
     }
 
-    fn from_children(children: &[Child], hash: [u8; 32]) -> Result<Self, IndexError> {
+    fn from_children(
+        children: &[Child],
+        hash: [u8; 32],
+        page_bytes: u64,
+    ) -> Result<Self, IndexError> {
         let first = children.first().expect("nonempty branch");
         let last = children.last().expect("nonempty branch");
         Ok(Self {
@@ -328,6 +552,9 @@ impl Child {
             segment_count: sum_children(children, |child| child.segment_count)?,
             encoded_bytes: sum_children(children, |child| child.encoded_bytes)?,
             logical_bytes: sum_children(children, |child| child.logical_bytes)?,
+            directory_bytes: sum_children(children, |child| child.directory_bytes)?
+                .checked_add(page_bytes)
+                .ok_or(IndexError::OffsetOverflow)?,
         })
     }
 }
@@ -390,6 +617,7 @@ fn encode_page(
                 put_u64(&mut bytes, child.segment_count);
                 put_u64(&mut bytes, child.encoded_bytes);
                 put_u64(&mut bytes, child.logical_bytes);
+                put_u64(&mut bytes, child.directory_bytes);
             }
         }
     }
@@ -404,19 +632,23 @@ fn decode_subtree(
     component: ComponentIdentity,
     hash: [u8; 32],
     pages: &BTreeMap<[u8; 32], &[u8]>,
+    visited: &mut BTreeSet<[u8; 32]>,
     segments: &mut Vec<ComponentSegmentDescriptor>,
 ) -> Result<Child, IndexError> {
+    if !visited.insert(hash) {
+        return Err(IndexError::Integrity);
+    }
     let bytes = pages.get(&hash).ok_or(IndexError::Integrity)?;
     match decode_page(component, bytes)? {
         Page::Leaf(page_segments) => {
-            let child = Child::from_segments(&page_segments, hash)?;
+            let child = Child::from_segments(&page_segments, hash, bytes.len() as u64)?;
             segments.extend(page_segments);
             Ok(child)
         }
         Page::Branch(children) => {
             let before = segments.len();
             for expected in &children {
-                let actual = decode_subtree(component, expected.hash, pages, segments)?;
+                let actual = decode_subtree(component, expected.hash, pages, visited, segments)?;
                 if &actual != expected {
                     return Err(IndexError::Integrity);
                 }
@@ -424,7 +656,7 @@ fn decode_subtree(
             if segments.len() == before {
                 return Err(IndexError::Integrity);
             }
-            Child::from_children(&children, hash)
+            Child::from_children(&children, hash, bytes.len() as u64)
         }
     }
 }
@@ -471,6 +703,7 @@ fn decode_page(component: ComponentIdentity, bytes: &[u8]) -> Result<Page, Index
                     segment_count: input.u64()?,
                     encoded_bytes: input.u64()?,
                     logical_bytes: input.u64()?,
+                    directory_bytes: input.u64()?,
                 });
             }
             validate_children(&children)?;
@@ -496,6 +729,7 @@ fn validate_children(children: &[Child]) -> Result<(), IndexError> {
                 || child.segment_count == 0
                 || child.encoded_bytes == 0
                 || child.logical_bytes == 0
+                || child.directory_bytes == 0
         })
         || children
             .windows(2)
@@ -648,6 +882,21 @@ mod tests {
         (pack.deltas[0].clone(), pack.bytes)
     }
 
+    fn reachable_pages(
+        component: ComponentIdentity,
+        hash: [u8; 32],
+        pages: &BTreeMap<[u8; 32], Vec<u8>>,
+        reachable: &mut Vec<EncodedComponentStreamPage>,
+    ) {
+        let bytes = pages.get(&hash).unwrap().clone();
+        if let Page::Branch(children) = decode_page(component, &bytes).unwrap() {
+            for child in children {
+                reachable_pages(component, child.hash, pages, reachable);
+            }
+        }
+        reachable.push(EncodedComponentStreamPage { hash, bytes });
+    }
+
     #[test]
     fn newest_delta_wins_and_tombstones_hide_older_values() {
         let component = ComponentIdentity::Field(RecipeIdentity::new([7; 32]).unwrap());
@@ -720,6 +969,66 @@ mod tests {
                 .all(|page| page.bytes.len() < 32 * 1024)
         );
         assert!(directory.pages.len() < 300);
+    }
+
+    #[test]
+    fn append_path_copies_only_the_logarithmic_right_spine() {
+        let component = ComponentIdentity::DocumentHead;
+        let segments = (1_u64..=65_536)
+            .map(|sequence| ComponentSegmentDescriptor {
+                sequence,
+                pack_hash: *blake3::hash(&sequence.to_le_bytes()).as_bytes(),
+                pack_offset: 0,
+                segment_hash: *blake3::hash(&sequence.to_be_bytes()).as_bytes(),
+                encoded_bytes: 100,
+                logical_bytes: 80,
+                records: 1,
+            })
+            .collect::<Vec<_>>();
+        let previous = build_component_stream(component, &segments).unwrap();
+        let pages = previous
+            .pages
+            .iter()
+            .map(|page| (page.hash, page.bytes.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let (delta, _) = packed(sealed(component, &[(1, Some(b"next"))]));
+
+        let appended = append_component_stream(
+            Some(previous.root()),
+            |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
+            &delta,
+        )
+        .unwrap();
+
+        assert_eq!(appended.root.segment_count, 65_537);
+        assert_eq!(appended.new_pages.len(), 3);
+        assert!(appended.new_pages.len() < previous.pages.len() / 50);
+        let mut page_store = pages;
+        page_store.extend(
+            appended
+                .new_pages
+                .iter()
+                .map(|page| (page.hash, page.bytes.clone())),
+        );
+        let mut all_pages = Vec::new();
+        reachable_pages(
+            component,
+            appended.root.root_hash,
+            &page_store,
+            &mut all_pages,
+        );
+        let complete = ComponentStreamDirectory {
+            component,
+            root_hash: appended.root.root_hash,
+            segment_count: appended.root.segment_count,
+            encoded_bytes: appended.root.encoded_bytes,
+            logical_bytes: appended.root.logical_bytes,
+            directory_bytes: appended.root.directory_bytes,
+            pages: all_pages,
+        };
+        let decoded = decode_component_stream(&complete).unwrap();
+        assert_eq!(decoded.len(), 65_537);
+        assert_eq!(decoded.last().unwrap().pack_hash, delta.pack_hash);
     }
 
     #[test]

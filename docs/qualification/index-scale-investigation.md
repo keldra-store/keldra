@@ -484,6 +484,35 @@ SHA-256 is `d761a73f78ad4b70af3d5c8558c9dd60fac85f8f7f1fe3fca8cfc86a3d314aca`.
 This bounds the current SSD service rate below 180 operations/s for this corpus
 and D640 shape; a lower-rate sweep is required to locate the stationary limit.
 
+The next SSD D640 cell offered 100 operations/s for ten minutes against server
+commit `ecab0a14b49f`. It accepted all 59,994 operations, completed all 12,000
+concurrent queries without a request, timeout, scheduling, or correctness
+error, held concurrent-query p99 to 200.96 milliseconds, and observed every
+one of 114 publication samples. Publication visibility was p50 2.28 seconds,
+p95 3.64 seconds, p99 3.99 seconds, maximum 4.33 seconds; exact final drain was
+33.32 seconds. The harness marked the cell `fail` only because its generic
+workload-validity predicate required a saturated producer queue and at least
+one query per definition during each 30-second baseline/post phase. Neither is
+appropriate to a deliberately paced 100 operations/s keep-up cell; the
+responsiveness and correctness subreports both passed. The evidence archive
+SHA-256 is
+`a41c3992cba38aded531b4f9c84afb6d89c2078c2bc1a63a53138980eeccc579`.
+
+That run also exposed a distinct write-amplification defect rather than a
+service-rate limit. It wrote 71.12 GB while accepting only 5.91 MB of request
+payload and logged 142 `derived proof is beyond the settled source tail`
+warnings, 116 inventory retries, and 26 full disposable-inventory rebuilds.
+An asynchronous valid publication proof could arrive ahead of the derived
+tracker's previous 100 ms settled-source status poll. The tracker incorrectly
+classified that ordering as corrupt evidence and rebuilt. Commit `e8307832`
+instead accepts the same-source/fence proof, releases only effects at or below
+the captured settled tail, and clamps the retention checkpoint to that tail.
+The focused regression proves that a proof at offset 100 observed against a
+settled tail of 5 clears the settled effect but advances the durable checkpoint
+only to 6. A same-shape exact-candidate A/B must show zero such rebuilds and a
+material reduction in bytes written before a higher SSD stationary rate is
+claimed.
+
 The first Catalog-250K attempt also exposed a separate control-plane defect.
 While definitions were being created, the derived consumer repeatedly lost its
 bounded assignment notifications and discarded its entire reconstructed

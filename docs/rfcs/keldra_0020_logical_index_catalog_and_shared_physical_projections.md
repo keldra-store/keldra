@@ -724,6 +724,13 @@ Implemented groundwork on `feat/shared-index-projection`:
   the stream into one exact self-contained segment while retaining tombstones
   required by concurrently pinned older generations. A 70,000-segment
   regression keeps directory pages below 32 KiB; and
+- component-stream append is a persistent path-copy operation rather than a
+  whole-directory rebuild. The generation retains only a small root identity;
+  immutable directory pages are loaded by hash and one append publishes only
+  the rightmost leaf plus its `O(log_256 segments)` parent path. A 65,536 to
+  65,537 segment boundary regression rewrites exactly three pages while
+  preserving an exact complete decode; unreachable proof pages are rejected;
+  and
 - changed deltas are integrated into shared payload packs at the existing
   16 MiB physical bound. Stream descriptors bind pack hash, exact byte range,
   segment hash, record count, and byte accounting, so many tiny recipe changes
