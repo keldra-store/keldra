@@ -4,6 +4,7 @@
 //! reusable membership and field-recipe state. These types are deliberately
 //! storage-neutral; publication and generation fencing remain runtime duties.
 
+mod buffer;
 mod codec;
 mod generation;
 mod projected_state;
@@ -20,6 +21,9 @@ pub use projected_state::{
 pub use projector::projected_document_states;
 
 pub const INDEX_FORMAT_VERSION: u16 = 5;
+pub use buffer::{
+    ComponentDeltaRecord, ProjectionMutationBuffer, SealedComponentDelta, decode_component_delta,
+};
 pub use codec::{
     COMPONENT_DIRECTORY_FANOUT, ComponentDirectory, EncodedComponentDirectoryPage,
     build_component_directory, decode_component_directory, decode_projected_document_state,
