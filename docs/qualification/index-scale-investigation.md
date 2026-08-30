@@ -511,8 +511,21 @@ the normal scan applies it only after the exact source barrier catches up. The
 focused regression proves that a proof at offset 100 observed against a
 settled tail of 5 leaves the effect and checkpoint at 1, then clears the effect
 and advances to 100 only after the settled tail reaches 99. A same-shape
-exact-candidate A/B must show zero such rebuilds and a material reduction in
-bytes written before a higher SSD stationary rate is claimed.
+exact-candidate A/B at server commit `a5f3284cbf45` accepted all 59,994 offered
+mutations at 100 operations/s, completed all 12,800 queries, and passed exact
+final correctness with zero future-proof warnings, inventory retries, or
+rebuild lines. Visibility was p50 2.44 seconds, p95 3.86 seconds, p99 4.26
+seconds, maximum 4.30 seconds; concurrent-query p99 was 200.19 milliseconds.
+The evidence archive SHA-256 is
+`cfa78e3035034e3201c1b7904cf4311ad44b3aaba0214d94af9d37c8c052d817`.
+
+That run does not support attributing the remaining write amplification to the
+false rebuilds. It wrote 92.43 GB and drained in 59.35 seconds, versus 71.12 GB
+and 33.32 seconds in the earlier same-rate cell. The fix is therefore a
+correctness and recovery-stability result, not a storage-efficiency result.
+The remaining amplifier is the ordinary format-v4 component, manifest,
+reference, checkpoint, and compaction work which KELDRA-0020 replaces; a
+higher SSD stationary rate is not claimed from this patch.
 
 The first Catalog-250K attempt also exposed a separate control-plane defect.
 While definitions were being created, the derived consumer repeatedly lost its

@@ -677,6 +677,16 @@ invisible after the full 1,800-second drain allowance. Its archive SHA-256 is
 `d761a73f78ad4b70af3d5c8558c9dd60fac85f8f7f1fe3fca8cfc86a3d314aca`.
 This is an overload bound, not a successful SSD service-rate result.
 
+A later SSD D640 cell at server commit `a5f3284cbf45` established a bounded
+100 operations/s service point: all 59,994 offered mutations and 12,800 queries
+completed, visibility p99 was 4.26 seconds, concurrent-query p99 was 200.19
+milliseconds, and exact correctness passed. The derived-progress race produced
+zero false inventory rebuilds after conservative proof deferral. The cell still
+wrote 92.43 GB and drained in 59.35 seconds, so it proves keep-up and recovery
+stability at that rate, not acceptable physical write efficiency. Its archive
+SHA-256 is
+`cfa78e3035034e3201c1b7904cf4311ad44b3aaba0214d94af9d37c8c052d817`.
+
 Catalog scale was qualified separately at server commit `ecab0a14b49f`. On the
 8-core SSD host, 250,000 definitions were created in 333.24 seconds at 750.21
 definitions/s. A clean restart recovered and listed all 250,000 definitions and
