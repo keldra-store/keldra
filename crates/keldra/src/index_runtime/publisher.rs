@@ -25,6 +25,9 @@ mod merge_rebase;
 mod prepared_publication;
 #[path = "publisher/revalidation.rs"]
 mod revalidation;
+#[path = "publisher/v5_projection.rs"]
+mod v5_projection;
+pub(crate) use v5_projection::{ProjectionArtifactReference, PublishedProjectionGeneration};
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::index_config::IndexRuntimeConfig;
@@ -1502,7 +1505,7 @@ async fn stage_index_bytes(
     .map_err(|error| IndexError::Io(error.to_string()))
 }
 
-async fn stage_index_bytes_with_retry(
+pub(super) async fn stage_index_bytes_with_retry(
     store: &Store,
     bytes: &[u8],
     admission: DerivedArtifactAdmission,

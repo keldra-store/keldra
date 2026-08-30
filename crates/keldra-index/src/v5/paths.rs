@@ -38,6 +38,24 @@ pub fn projection_current_path(family_id: [u8; 32]) -> String {
     format!("{ROOT}/{}/current", encode_hash(family_id))
 }
 
+/// Non-authoritative scheduler key for one exact projection family.
+///
+/// Persistence and validation always use the full family identity embedded in
+/// the canonical path. A collision here can therefore only serialize two
+/// unrelated publication streams behind the same in-process gate.
+pub fn projection_routing_id(family_id: [u8; 32]) -> u64 {
+    let digest = blake3::hash(
+        &[
+            b"keldra-index-projection-routing-v1\0".as_slice(),
+            family_id.as_slice(),
+        ]
+        .concat(),
+    );
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_be_bytes(prefix).max(1)
+}
+
 pub fn parse_projection_artifact_path(path: &str) -> Result<ProjectionArtifactPath, IndexError> {
     let parts = path.split('/').collect::<Vec<_>>();
     let (family, kind, hash) = match parts.as_slice() {
@@ -186,5 +204,18 @@ mod tests {
         ] {
             assert!(parse_projection_artifact_path(&path).is_err(), "{path}");
         }
+    }
+
+    #[test]
+    fn routing_identity_is_stable_nonzero_and_not_the_storage_authority() {
+        assert_eq!(
+            projection_routing_id([7; 32]),
+            projection_routing_id([7; 32])
+        );
+        assert_ne!(projection_routing_id([7; 32]), 0);
+        assert_ne!(
+            projection_routing_id([7; 32]),
+            projection_routing_id([8; 32])
+        );
     }
 }

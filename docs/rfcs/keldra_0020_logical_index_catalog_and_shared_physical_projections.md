@@ -772,7 +772,15 @@ Implemented groundwork on `feat/shared-index-projection`:
 - one storage-neutral publication preparation produces the complete set of
   delta packs, newly path-copied stream pages, component-directory pages, and
   exact next generation. Runtime publication must make those immutable values
-  durable first and atomically install only the generation record last.
+  durable first and atomically install only the generation record last; and
+- the production artifact boundary now admits those canonical format-v5 paths,
+  verifies every immutable path against its exact payload hash, stages and
+  publishes the complete immutable dependency set through ordinary integrated
+  payload storage, and installs the single family `current` object by
+  exact-version CAS. The full 256-bit family identity remains the persistence
+  authority; its derived 64-bit publication key is scheduling-only, so a
+  collision can at most serialize unrelated families. Reclamation remains
+  fail-closed until generation reachability is wired.
 
 This does not yet satisfy Milestone B for field subsets. Independent component
 generation ownership and bindings remain required before different complete

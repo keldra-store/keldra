@@ -22,7 +22,7 @@ pub use pack::{PackedComponentDelta, SealedProjectionDeltaPack, pack_component_d
 pub use paths::{
     ProjectionArtifactKind, ProjectionArtifactPath, parse_projection_artifact_path,
     projection_component_page_path, projection_current_path, projection_generation_path,
-    projection_pack_path, projection_stream_page_path,
+    projection_pack_path, projection_routing_id, projection_stream_page_path,
 };
 pub use projected_state::{
     CanonicalRecipeState, DocumentHead, ProjectedDocumentDelta, ProjectedDocumentState,

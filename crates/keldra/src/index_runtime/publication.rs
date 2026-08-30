@@ -19,6 +19,13 @@ use crate::object_distribution::ObjectDistribution;
 use super::placement::{IndexIdentity, IndexPlacement};
 
 mod cohort;
+mod paths;
+use paths::{ArtifactPathKind, immutable_content_hash_from_path, parse_artifact_path};
+pub(crate) use paths::{
+    artifact_hash_from_path, artifact_path, current_path, index_definition_name,
+    is_index_recovery_path, is_manifest_artifact_path, manifest_hash_from_path, manifest_path,
+    rebuild_path,
+};
 
 const INDEX_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.index-artifact";
 const ACCOUNTING_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.accounting+json";
@@ -182,6 +189,14 @@ impl IndexArtifactDelete {
             ));
         }
         let kind = parse_artifact_path(&self.exact_path, self.index_id)?;
+        if matches!(
+            kind,
+            ArtifactPathKind::ProjectionCurrent | ArtifactPathKind::ProjectionImmutable
+        ) {
+            return Err(Status::failed_precondition(
+                "v5 projection artifact reclamation requires family-generation reachability proof",
+            ));
+        }
         validate_definition_intent(
             kind,
             &self.exact_path,
@@ -210,10 +225,18 @@ impl IndexArtifactPublish {
             ));
         }
         let kind = parse_artifact_path(&self.exact_path, self.index_id)?;
-        if kind == ArtifactPathKind::Immutable
-            && immutable_content_hash_from_path(self.index_id, &self.exact_path)
-                != Some(self.blob.hash)
-        {
+        let expected_content_hash = match kind {
+            ArtifactPathKind::Immutable => {
+                immutable_content_hash_from_path(self.index_id, &self.exact_path)
+            }
+            ArtifactPathKind::ProjectionImmutable => {
+                keldra_index::v5::parse_projection_artifact_path(&self.exact_path)
+                    .ok()
+                    .and_then(|parsed| parsed.content_hash)
+            }
+            _ => None,
+        };
+        if kind.is_immutable() && expected_content_hash != Some(self.blob.hash) {
             return Err(Status::invalid_argument(
                 "immutable index artifact path must equal its content hash",
             ));
@@ -230,6 +253,8 @@ impl IndexArtifactPublish {
                 ArtifactPathKind::Current
                     | ArtifactPathKind::RebuildMutable
                     | ArtifactPathKind::Immutable
+                    | ArtifactPathKind::ProjectionCurrent
+                    | ArtifactPathKind::ProjectionImmutable
             ) || (kind == ArtifactPathKind::AccountingMutable
                 && crate::accounting::current_path(self.index_id)
                     .ok()
@@ -245,6 +270,11 @@ impl IndexArtifactPublish {
             (ArtifactPathKind::Current, Some(VersionId(0))) => Err(Status::invalid_argument(
                 "index current-pointer expected version must be non-zero",
             )),
+            (ArtifactPathKind::ProjectionCurrent, Some(VersionId(0))) => {
+                Err(Status::invalid_argument(
+                    "projection current-pointer expected version must be non-zero",
+                ))
+            }
             (ArtifactPathKind::RebuildMutable, Some(VersionId(0))) => Err(
                 Status::invalid_argument("index rebuild-root expected version must be non-zero"),
             ),
@@ -253,14 +283,17 @@ impl IndexArtifactPublish {
             ),
             (
                 ArtifactPathKind::Current
+                | ArtifactPathKind::ProjectionCurrent
                 | ArtifactPathKind::RebuildMutable
                 | ArtifactPathKind::AccountingMutable,
                 _,
             )
-            | (ArtifactPathKind::Immutable, None) => Ok(kind),
-            (ArtifactPathKind::Immutable, Some(_)) => Err(Status::invalid_argument(
-                "immutable index commit artifacts cannot be replaced",
-            )),
+            | (ArtifactPathKind::Immutable | ArtifactPathKind::ProjectionImmutable, None) => {
+                Ok(kind)
+            }
+            (ArtifactPathKind::Immutable | ArtifactPathKind::ProjectionImmutable, Some(_)) => Err(
+                Status::invalid_argument("immutable index commit artifacts cannot be replaced"),
+            ),
         }?;
         let guard_required = matches!(
             kind,
@@ -286,14 +319,6 @@ impl IndexArtifactPublish {
         }
         Ok(kind)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ArtifactPathKind {
-    Current,
-    RebuildMutable,
-    Immutable,
-    AccountingMutable,
 }
 
 fn artifact_placement_identity(
@@ -648,24 +673,31 @@ impl IndexArtifactCoordinator {
         let mode = match (kind, request.expected_version) {
             (
                 ArtifactPathKind::Current
+                | ArtifactPathKind::ProjectionCurrent
                 | ArtifactPathKind::RebuildMutable
                 | ArtifactPathKind::AccountingMutable,
                 Some(version),
             ) => PutMode::PutIfVersion(version),
             (
                 ArtifactPathKind::Current
+                | ArtifactPathKind::ProjectionCurrent
                 | ArtifactPathKind::RebuildMutable
                 | ArtifactPathKind::Immutable
+                | ArtifactPathKind::ProjectionImmutable
                 | ArtifactPathKind::AccountingMutable,
                 None,
             ) => PutMode::PutIfAbsent,
-            (ArtifactPathKind::Immutable, Some(_)) => unreachable!("validated above"),
+            (ArtifactPathKind::Immutable | ArtifactPathKind::ProjectionImmutable, Some(_)) => {
+                unreachable!("validated above")
+            }
         };
         let content_type = match kind {
             ArtifactPathKind::AccountingMutable => ACCOUNTING_ARTIFACT_CONTENT_TYPE,
             ArtifactPathKind::Current
+            | ArtifactPathKind::ProjectionCurrent
             | ArtifactPathKind::RebuildMutable
-            | ArtifactPathKind::Immutable => INDEX_ARTIFACT_CONTENT_TYPE,
+            | ArtifactPathKind::Immutable
+            | ArtifactPathKind::ProjectionImmutable => INDEX_ARTIFACT_CONTENT_TYPE,
         };
         let derived_progress = request.admission.is_publication_progress();
         let durability = artifact_durability(kind, placement.placement_nodes().len());
@@ -801,8 +833,8 @@ impl IndexArtifactRouter {
         &self,
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
-        request.validate()?;
-        let _current_guard = if request.exact_path == current_path(request.index_id) {
+        let kind = request.validate()?;
+        let _current_guard = if kind.is_current() {
             Some(self.acquire_current_mutation(request.index_id).await?)
         } else {
             None
@@ -817,9 +849,7 @@ impl IndexArtifactRouter {
         guard: Option<&IndexCurrentMutationGuard>,
     ) -> Result<IndexArtifactOutcome, Status> {
         let kind = request.validate()?;
-        if request.exact_path == current_path(request.index_id)
-            && guard.is_none_or(|guard| guard.index_id != request.index_id)
-        {
+        if kind.is_current() && guard.is_none_or(|guard| guard.index_id != request.index_id) {
             return Err(Status::internal(
                 "current-pointer publication has no matching mutation guard",
             ));
@@ -1393,7 +1423,7 @@ fn validate_immutable_batch(requests: &[IndexArtifactPublish]) -> Result<(), Sta
     let first = &requests[0];
     let mut bytes = 0_u64;
     for request in requests {
-        if request.validate()? != ArtifactPathKind::Immutable {
+        if !request.validate()?.is_immutable() {
             return Err(Status::invalid_argument(
                 "grouped index publication accepts immutable artifacts only",
             ));
@@ -1466,45 +1496,19 @@ fn artifact_durability(kind: ArtifactPathKind, active_nodes: usize) -> Durabilit
         // the ordinary object path fail closed unless its exact requirements
         // can be met.
         ArtifactPathKind::Current
+        | ArtifactPathKind::ProjectionCurrent
         | ArtifactPathKind::RebuildMutable
         | ArtifactPathKind::Immutable
+        | ArtifactPathKind::ProjectionImmutable
             if active_nodes == 1 =>
         {
             Durability::Local
         }
         ArtifactPathKind::Current
+        | ArtifactPathKind::ProjectionCurrent
         | ArtifactPathKind::RebuildMutable
-        | ArtifactPathKind::Immutable => Durability::Replicated,
-    }
-}
-
-fn parse_artifact_path(path: &str, expected_index: u64) -> Result<ArtifactPathKind, Status> {
-    if crate::accounting::is_artifact_path(path, expected_index) {
-        return Ok(ArtifactPathKind::AccountingMutable);
-    }
-    let parts = path.split('/').collect::<Vec<_>>();
-    if parts.len() < 5
-        || parts[0] != "_keldra"
-        || parts[1] != "indices"
-        || parts[2] != "v4"
-        || parse_canonical_u64(parts[3]) != Some(expected_index)
-    {
-        return Err(Status::invalid_argument(
-            "index artifact path is outside its reserved index namespace",
-        ));
-    }
-    match parts.as_slice() {
-        [_, _, _, _, "current"] => Ok(ArtifactPathKind::Current),
-        [_, _, _, _, "rebuild"] => Ok(ArtifactPathKind::RebuildMutable),
-        [_, _, _, _, "manifests", digest] if valid_digest(digest) => {
-            Ok(ArtifactPathKind::Immutable)
-        }
-        [_, _, _, _, "artifacts", digest] if valid_digest(digest) => {
-            Ok(ArtifactPathKind::Immutable)
-        }
-        _ => Err(Status::invalid_argument(
-            "index artifact path does not name a v4 current pointer, manifest, or artifact",
-        )),
+        | ArtifactPathKind::Immutable
+        | ArtifactPathKind::ProjectionImmutable => Durability::Replicated,
     }
 }
 
@@ -1533,113 +1537,6 @@ fn validate_definition_intent(
             "definition intent does not match the accounting definition path",
         )),
     }
-}
-
-fn parse_canonical_u64(value: &str) -> Option<u64> {
-    let parsed = value.parse::<u64>().ok()?;
-    (parsed != 0 && parsed.to_string() == value).then_some(parsed)
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-pub(crate) fn index_definition_name(path: &str) -> Option<&str> {
-    let parts = path.split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["_keldra", "indices", "v4", "definitions", name] if valid_definition_name(name) => {
-            Some(name)
-        }
-        _ => None,
-    }
-}
-
-fn valid_definition_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 255
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\0'])
-}
-
-pub(crate) fn manifest_path(index_id: u64, digest: [u8; 32]) -> String {
-    keldra_index::v4::manifest_path(index_id, digest)
-}
-
-pub(crate) fn artifact_path(index_id: u64, digest: [u8; 32]) -> String {
-    keldra_index::v4::artifact_path(index_id, digest)
-}
-
-/// Extract an artifact identity only from one complete canonical v4 path.
-/// Retention uses this instead of textual prefix matching so an adjacent
-/// digest or extra segment cannot widen a deletion scope.
-pub(crate) fn artifact_hash_from_path(index_id: u64, path: &str) -> Option<[u8; 32]> {
-    let parts = path.split('/').collect::<Vec<_>>();
-    let digest = match parts.as_slice() {
-        [
-            "_keldra",
-            "indices",
-            "v4",
-            encoded_index,
-            "artifacts",
-            digest,
-        ] if parse_canonical_u64(encoded_index) == Some(index_id) && valid_digest(digest) => {
-            *digest
-        }
-        _ => return None,
-    };
-    let decoded = hex::decode(digest).ok()?;
-    decoded.try_into().ok()
-}
-
-fn immutable_content_hash_from_path(index_id: u64, path: &str) -> Option<[u8; 32]> {
-    if let Some(hash) = artifact_hash_from_path(index_id, path) {
-        return Some(hash);
-    }
-    let parts = path.split('/').collect::<Vec<_>>();
-    let digest = match parts.as_slice() {
-        [
-            "_keldra",
-            "indices",
-            "v4",
-            encoded_index,
-            "manifests",
-            digest,
-        ] if parse_canonical_u64(encoded_index) == Some(index_id) && valid_digest(digest) => {
-            *digest
-        }
-        _ => return None,
-    };
-    hex::decode(digest).ok()?.try_into().ok()
-}
-
-pub(crate) fn manifest_hash_from_path(index_id: u64, path: &str) -> Option<[u8; 32]> {
-    let hash = immutable_content_hash_from_path(index_id, path)?;
-    is_manifest_artifact_path(index_id, path).then_some(hash)
-}
-
-pub(crate) fn is_manifest_artifact_path(index_id: u64, path: &str) -> bool {
-    let parts = path.split('/').collect::<Vec<_>>();
-    matches!(
-        parts.as_slice(),
-        ["_keldra", "indices", "v4", encoded_index, "manifests", digest]
-            if parse_canonical_u64(encoded_index) == Some(index_id) && valid_digest(digest)
-    )
-}
-
-pub(crate) fn current_path(index_id: u64) -> String {
-    keldra_index::v4::current_path(index_id)
-}
-
-pub(crate) fn rebuild_path(index_id: u64) -> String {
-    format!("_keldra/indices/v4/{index_id}/rebuild")
-}
-
-pub(crate) fn is_index_recovery_path(path: &str, index_id: u64) -> bool {
-    parse_artifact_path(path, index_id).is_ok()
 }
 
 #[cfg(test)]
@@ -1861,6 +1758,41 @@ mod tests {
             matched_manifest.validate().unwrap(),
             ArtifactPathKind::Immutable
         );
+    }
+
+    #[test]
+    fn v5_projection_paths_bind_full_family_routing_hash_and_cas_shape() {
+        let family = [7; 32];
+        let routing = keldra_index::v5::projection_routing_id(family);
+        let mut immutable = artifact_publish(
+            keldra_index::v5::projection_pack_path(family, [3; 32]),
+            None,
+        );
+        immutable.index_id = routing;
+        assert_eq!(
+            immutable.validate().unwrap(),
+            ArtifactPathKind::ProjectionImmutable
+        );
+
+        immutable.index_id = routing.wrapping_add(1).max(1);
+        assert!(immutable.validate().is_err());
+        immutable.index_id = routing;
+        immutable.blob.hash = [4; 32];
+        assert!(immutable.validate().is_err());
+
+        let mut current = artifact_publish(keldra_index::v5::projection_current_path(family), None);
+        current.index_id = routing;
+        assert_eq!(
+            current.validate().unwrap(),
+            ArtifactPathKind::ProjectionCurrent
+        );
+        current.expected_version = Some(VersionId(9));
+        assert_eq!(
+            current.validate().unwrap(),
+            ArtifactPathKind::ProjectionCurrent
+        );
+        current.expected_version = Some(VersionId(0));
+        assert!(current.validate().is_err());
     }
 
     #[test]
