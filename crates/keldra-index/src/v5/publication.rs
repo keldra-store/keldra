@@ -3,10 +3,9 @@ use std::collections::BTreeSet;
 use crate::IndexError;
 
 use super::{
-    ComponentIdentity, ComponentStreamRoot, EncodedComponentStreamPage,
-    EncodedProjectionGeneration, ProjectionBarrier, ProjectionGeneration, SealedComponentDelta,
-    SealedProjectionDeltaPack, append_component_stream, encode_projection_generation,
-    pack_component_deltas,
+    ComponentStreamRoot, EncodedComponentStreamPage, EncodedProjectionGeneration,
+    ProjectionBarrier, ProjectionGeneration, SealedComponentDelta, SealedProjectionDeltaPack,
+    append_component_stream, encode_projection_generation, pack_component_deltas,
 };
 
 /// Complete immutable payload which must be durable before its generation is
@@ -104,8 +103,9 @@ mod tests {
 
     use super::*;
     use crate::v5::{
-        CanonicalRecipeState, DocumentHead, ProjectedDocumentState, ProjectionMutationBuffer,
-        RecipeIdentity, decode_component_delta_segment, decode_projection_generation,
+        CanonicalRecipeState, ComponentIdentity, DocumentHead, ProjectedDocumentState,
+        ProjectionMutationBuffer, RecipeIdentity, decode_component_delta_segment,
+        decode_projection_generation,
     };
 
     fn barrier(next: u64) -> ProjectionBarrier {

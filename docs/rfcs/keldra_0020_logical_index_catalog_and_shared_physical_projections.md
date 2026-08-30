@@ -197,6 +197,12 @@ membership predicate. A field-recipe identity includes:
 Field IDs are logical binding IDs, not physical ownership. Two definitions can
 expose the same physical field recipe under different public names or IDs.
 
+The format-v5 projection-family ID is the full domain-separated digest of the
+tenant ID, bucket ID, and canonical membership/source-scope recipe. It is not a
+truncated logical index ID. Definitions with the same source universe but
+different field subsets therefore share one family, while a tenant, bucket, or
+membership change necessarily selects another family.
+
 Sharing is limited to one tenant/bucket authority. Cross-authority sharing is
 not permitted by this RFC.
 

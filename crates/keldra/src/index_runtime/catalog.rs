@@ -17,6 +17,7 @@ use super::v4_schema::compile_schema;
 
 const MAX_PENDING_CATALOG_CHANGES: usize = 1_024;
 const PHYSICAL_PROJECTION_DOMAIN: &[u8] = b"keldra.index.physical-projection/v1";
+const PROJECTION_FAMILY_DOMAIN: &[u8] = b"keldra.index.projection-family/v1";
 
 /// Stable physical identity for one complete canonical source/schema recipe.
 ///
@@ -34,6 +35,16 @@ pub(crate) struct PhysicalRecipeIdentity {
     pub(crate) tenant_id: u64,
     pub(crate) bucket_id: u64,
     pub(crate) fingerprint: [u8; 32],
+}
+
+/// Exact format-v5 ownership identity for one tenant/bucket source scope.
+/// Field subsets sharing the same membership universe append to this family;
+/// different authorities or membership semantics never share it.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ProjectionFamilyIdentity {
+    pub(crate) tenant_id: u64,
+    pub(crate) bucket_id: u64,
+    pub(crate) family_id: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +116,19 @@ impl CatalogDefinition {
 
     pub(crate) fn membership_recipe_identity(&self) -> PhysicalRecipeIdentity {
         self.scoped_recipe(self.recipe_fingerprints.membership)
+    }
+
+    pub(crate) fn projection_family_identity(&self) -> ProjectionFamilyIdentity {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(PROJECTION_FAMILY_DOMAIN);
+        hasher.update(&self.tenant_id.to_be_bytes());
+        hasher.update(&self.bucket_id.to_be_bytes());
+        hasher.update(&self.recipe_fingerprints.membership);
+        ProjectionFamilyIdentity {
+            tenant_id: self.tenant_id,
+            bucket_id: self.bucket_id,
+            family_id: *hasher.finalize().as_bytes(),
+        }
     }
 
     pub(crate) fn field_recipe_identities(&self) -> Vec<PhysicalRecipeIdentity> {
@@ -612,6 +636,10 @@ mod tests {
         assert_eq!(first.schema_fingerprint, second.schema_fingerprint);
         assert_eq!(first.physical_identity(), second.physical_identity());
         assert_eq!(
+            first.projection_family_identity(),
+            second.projection_family_identity()
+        );
+        assert_eq!(
             first.membership_recipe_identity(),
             second.membership_recipe_identity()
         );
@@ -625,6 +653,10 @@ mod tests {
             first.physical_identity(),
             different_bucket.physical_identity()
         );
+        assert_ne!(
+            first.projection_family_identity(),
+            different_bucket.projection_family_identity()
+        );
 
         let mut different_scope = second.stored.clone();
         different_scope.path_prefix = "other/".into();
@@ -632,6 +664,10 @@ mod tests {
         assert_ne!(
             first.physical_identity(),
             different_scope.physical_identity()
+        );
+        assert_ne!(
+            first.projection_family_identity(),
+            different_scope.projection_family_identity()
         );
     }
 
