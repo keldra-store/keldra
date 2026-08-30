@@ -52,6 +52,7 @@ pub(super) fn remove_running_task(
 pub(super) struct WorkMetadata {
     pub(super) identity: CatalogIdentity,
     pub(super) definition_version: u64,
+    pub(super) schema_fingerprint: [u8; 32],
     pub(super) kind: IndexKind,
     pub(super) held_snapshot: bool,
     pub(super) inspecting: bool,
@@ -62,6 +63,7 @@ impl WorkMetadata {
         Self {
             identity: job.definition.identity(),
             definition_version: job.definition.object_version,
+            schema_fingerprint: job.definition.schema_fingerprint,
             kind: job.kind,
             held_snapshot: job.holds_snapshot(),
             inspecting: matches!(job.phase, BuilderPhase::Inspect),
@@ -128,13 +130,38 @@ pub(super) fn apply_catalog_change(
     dependencies: &IndexBuilderDependencies,
 ) -> Result<(), Status> {
     let identity = change.identity();
+    let projection_upsert = match &change {
+        CatalogChange::Upsert(definition) => Some(definition.clone()),
+        CatalogChange::Delete { .. } | CatalogChange::Remove(_) => None,
+    };
+    let physical = match &change {
+        CatalogChange::Upsert(definition) => Some(definition.physical_identity()),
+        CatalogChange::Delete { .. } | CatalogChange::Remove(_) => {
+            scheduler.logical_entries.get(&identity).copied()
+        }
+    };
     let applied = scheduler.apply_change(change, local_node, decisions, &dependencies.retention);
-    let registered = if let Some(entry) = scheduler.entries.get(&identity) {
-        dependencies.projection_mapper.upsert(&entry.definition)
+    let registered = if let Some(definition) = projection_upsert
+        && scheduler.logical_entries.contains_key(&identity)
+    {
+        dependencies.projection_mapper.upsert(&definition)
     } else {
         dependencies.projection_mapper.remove(identity)
     };
-    applied.and(registered)
+    applied.and(registered)?;
+    if let Some(physical) = physical
+        && let Some(representative) = scheduler.physical_entries.get(&physical).copied()
+        && let Some(entry) = scheduler.entries.get(&representative)
+        && entry.definition.schema.kind == IndexKind::TypedJson
+    {
+        let family = entry.definition.projection_family_identity();
+        let schema = dependencies
+            .projection_mapper
+            .family_schema(family)?
+            .ok_or_else(|| Status::internal("active projection family is not registered"))?;
+        scheduler.refresh_physical_schema(physical, schema)?;
+    }
+    Ok(())
 }
 
 pub(super) fn source_wire_limit(limit: u64) -> u64 {

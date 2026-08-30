@@ -292,7 +292,7 @@ fn queue_definition(scheduler: &mut BuilderScheduler, definition: CatalogDefinit
     scheduler.entries.insert(
         identity,
         ScheduledBuilder {
-            definition,
+            definition: definition.clone(),
             job: Some(job),
             queued: false,
             wake_pending: false,
@@ -300,6 +300,7 @@ fn queue_definition(scheduler: &mut BuilderScheduler, definition: CatalogDefinit
     );
     scheduler.physical_entries.insert(physical, identity);
     scheduler.logical_entries.insert(identity, physical);
+    scheduler.logical_definitions.insert(identity, definition);
     scheduler.enqueue(identity);
 }
 
@@ -325,7 +326,7 @@ fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogD
     scheduler.entries.insert(
         identity,
         ScheduledBuilder {
-            definition,
+            definition: definition.clone(),
             job: Some(job),
             queued: false,
             wake_pending: false,
@@ -333,6 +334,7 @@ fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogD
     );
     scheduler.physical_entries.insert(physical, identity);
     scheduler.logical_entries.insert(identity, physical);
+    scheduler.logical_definitions.insert(identity, definition);
     scheduler.enqueue(identity);
 }
 

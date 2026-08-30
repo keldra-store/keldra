@@ -158,6 +158,7 @@ pub(crate) async fn start(
             reader.clone(),
             cache.clone(),
             publisher.clone(),
+            projection_mapper.clone(),
             cpu.clone(),
             query_budget,
             config.query_max_concurrency(),

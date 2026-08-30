@@ -289,6 +289,7 @@ struct BuilderScheduler {
     entries: BTreeMap<CatalogIdentity, ScheduledBuilder>,
     physical_entries: BTreeMap<PhysicalProjectionIdentity, CatalogIdentity>,
     logical_entries: BTreeMap<CatalogIdentity, PhysicalProjectionIdentity>,
+    logical_definitions: BTreeMap<CatalogIdentity, CatalogDefinition>,
     ready_active: [VecDeque<CatalogIdentity>; INDEX_KIND_COUNT],
     ready_inspect: [VecDeque<CatalogIdentity>; INDEX_KIND_COUNT],
     delayed: BTreeMap<CatalogIdentity, (tokio::time::Instant, u64)>,
@@ -304,6 +305,7 @@ impl Default for BuilderScheduler {
             entries: BTreeMap::new(),
             physical_entries: BTreeMap::new(),
             logical_entries: BTreeMap::new(),
+            logical_definitions: BTreeMap::new(),
             ready_active: std::array::from_fn(|_| VecDeque::new()),
             ready_inspect: std::array::from_fn(|_| VecDeque::new()),
             delayed: BTreeMap::new(),
@@ -336,6 +338,45 @@ impl BuilderScheduler {
         self.physical_entries
             .get(&identity)
             .is_some_and(|representative| self.entries.contains_key(representative))
+    }
+
+    fn refresh_physical_schema(
+        &mut self,
+        physical: PhysicalProjectionIdentity,
+        schema: Schema,
+    ) -> Result<(), Status> {
+        let Some(identity) = self.physical_entries.get(&physical).copied() else {
+            return Ok(());
+        };
+        let mut queued_replacement = None;
+        {
+            let entry = self
+                .entries
+                .get_mut(&identity)
+                .ok_or_else(|| Status::internal("physical builder representative is absent"))?;
+            if entry.definition.schema == schema {
+                return Ok(());
+            }
+            entry.definition.replace_runtime_schema(schema)?;
+            if entry.job.is_some() {
+                let previous = entry.job.take().expect("checked builder job exists");
+                queued_replacement = Some((previous, BuilderJob::new(entry.definition.clone())?));
+                entry.queued = false;
+            }
+            entry.wake_pending = true;
+        }
+        if let Some((previous, replacement)) = queued_replacement {
+            if previous.holds_snapshot() {
+                let slot = kind_slot(previous.kind);
+                self.open_rebuilds[slot] = self.open_rebuilds[slot].saturating_sub(1);
+            }
+            self.entries
+                .get_mut(&identity)
+                .expect("physical builder representative remains")
+                .job = Some(replacement);
+            self.enqueue(identity);
+        }
+        Ok(())
     }
 
     fn can_admit_change(&self, change: &CatalogChange) -> bool {
@@ -399,6 +440,7 @@ impl BuilderScheduler {
         if let Some(representative) = self.physical_entries.get(&physical).copied()
             && representative != identity
         {
+            self.logical_definitions.insert(identity, definition);
             if let Some(previous_physical) = self.logical_entries.insert(identity, physical)
                 && previous_physical != physical
             {
@@ -418,8 +460,11 @@ impl BuilderScheduler {
                 "node-wide active index builder lease limit reached",
             ));
         }
+        self.logical_definitions
+            .insert(identity, definition.clone());
         if let Some(previous_physical) = self.logical_entries.get(&identity).copied()
             && previous_physical != physical
+            && self.physical_entries.get(&previous_physical) == Some(&identity)
         {
             self.physical_entries.remove(&previous_physical);
             if let Err(error) = retention.unschedule(
@@ -475,18 +520,59 @@ impl BuilderScheduler {
         unschedule: bool,
     ) {
         let Some(physical) = self.logical_entries.remove(&identity) else {
+            self.logical_definitions.remove(&identity);
             return;
         };
+        self.logical_definitions.remove(&identity);
         if self.physical_entries.get(&physical) == Some(&identity) {
-            self.physical_entries.remove(&physical);
-            self.evict_builder(identity);
-            self.logical_entries
-                .retain(|_, candidate| *candidate != physical);
-            if unschedule
-                && let Err(error) =
-                    retention.unschedule(identity.tenant_id, identity.bucket_id, physical.index_id)
+            self.remove_builder_entry(identity);
+            if let Some(replacement) =
+                self.logical_entries
+                    .iter()
+                    .find_map(|(candidate, candidate_physical)| {
+                        (*candidate_physical == physical).then_some(*candidate)
+                    })
             {
-                tracing::warn!(index.id = physical.index_id, %error, "physical index retention unschedule failed");
+                let Some(definition) = self.logical_definitions.get(&replacement).cloned() else {
+                    tracing::error!(
+                        index.id = physical.index_id,
+                        "physical family member has no catalog definition"
+                    );
+                    self.logical_entries
+                        .retain(|_, candidate| *candidate != physical);
+                    return;
+                };
+                match BuilderJob::new(definition.clone()) {
+                    Ok(job) => {
+                        self.entries.insert(
+                            replacement,
+                            ScheduledBuilder {
+                                definition,
+                                job: Some(job),
+                                queued: false,
+                                wake_pending: true,
+                            },
+                        );
+                        self.physical_entries.insert(physical, replacement);
+                        self.enqueue(replacement);
+                    }
+                    Err(error) => {
+                        tracing::error!(index.id = physical.index_id, %error, "physical family representative promotion failed");
+                        self.logical_entries
+                            .retain(|_, candidate| *candidate != physical);
+                    }
+                }
+            } else {
+                self.physical_entries.remove(&physical);
+                if unschedule
+                    && let Err(error) = retention.unschedule(
+                        identity.tenant_id,
+                        identity.bucket_id,
+                        physical.index_id,
+                    )
+                {
+                    tracing::warn!(index.id = physical.index_id, %error, "physical index retention unschedule failed");
+                }
             }
         }
     }
@@ -503,6 +589,19 @@ impl BuilderScheduler {
     }
 
     fn evict_builder(&mut self, identity: CatalogIdentity) -> bool {
+        let physical = self.logical_entries.get(&identity).copied();
+        let removed = self.remove_builder_entry(identity);
+        if let Some(physical) = physical {
+            self.physical_entries.remove(&physical);
+            self.logical_entries
+                .retain(|_, candidate| *candidate != physical);
+            self.logical_definitions
+                .retain(|logical, _| self.logical_entries.contains_key(logical));
+        }
+        removed
+    }
+
+    fn remove_builder_entry(&mut self, identity: CatalogIdentity) -> bool {
         self.delayed.remove(&identity);
         for queue in self
             .ready_active
@@ -514,13 +613,6 @@ impl BuilderScheduler {
         let removed = self.entries.remove(&identity);
         if let Some(entry) = removed.as_ref() {
             self.release_queued_snapshot(entry);
-        }
-        if let Some(physical) = self.logical_entries.get(&identity).copied()
-            && self.physical_entries.get(&physical) == Some(&identity)
-        {
-            self.physical_entries.remove(&physical);
-            self.logical_entries
-                .retain(|_, candidate| *candidate != physical);
         }
         removed.is_some()
     }
@@ -633,7 +725,22 @@ impl BuilderScheduler {
         let Some(entry) = self.entries.get_mut(&metadata.identity) else {
             return;
         };
-        if entry.definition.object_version != metadata.definition_version {
+        if entry.definition.object_version != metadata.definition_version
+            || entry.definition.schema_fingerprint != metadata.schema_fingerprint
+        {
+            if entry.job.is_none() {
+                match BuilderJob::new(entry.definition.clone()) {
+                    Ok(job) => {
+                        entry.job = Some(job);
+                        entry.wake_pending = false;
+                        self.enqueue(metadata.identity);
+                    }
+                    Err(error) => {
+                        tracing::error!(index.id = metadata.identity.index_id, %error, "replacement physical schema could not restart its builder");
+                        self.evict_builder(metadata.identity);
+                    }
+                }
+            }
             return;
         }
         if step.job.holds_snapshot() {

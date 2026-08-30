@@ -769,6 +769,23 @@ impl SharedProjectionMapper {
         compile_family_schema(family).map(Some)
     }
 
+    /// Bind one logical definition's public field names onto the family's
+    /// definition-neutral physical field IDs. Every non-requested family field
+    /// keeps an internal collision-free name, so the native query engine can
+    /// open the complete shared segment while the public query sees only its
+    /// own aliases.
+    pub(crate) fn family_query_schema(
+        &self,
+        identity: ProjectionFamilyIdentity,
+        logical: &Schema,
+    ) -> Result<Option<Schema>, Status> {
+        let Some(mut family) = self.family_schema(identity)? else {
+            return Ok(None);
+        };
+        bind_family_query_schema(&mut family, logical)?;
+        Ok(Some(family))
+    }
+
     pub(crate) fn family_plan(
         &self,
         identity: ProjectionFamilyIdentity,
@@ -1324,12 +1341,48 @@ impl SharedProjectionMapper {
     }
 }
 
+fn bind_family_query_schema(family: &mut Schema, logical: &Schema) -> Result<(), Status> {
+    let family_recipes = family.recipe_fingerprints().map_err(index_status)?.fields;
+    let logical_recipes = logical.recipe_fingerprints().map_err(index_status)?.fields;
+    let public_names = logical
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for (ordinal, field) in family.fields.iter_mut().enumerate() {
+        let recipe = family_recipes[ordinal];
+        if let Some(logical_ordinal) = logical_recipes
+            .iter()
+            .position(|candidate| *candidate == recipe)
+        {
+            field.name = logical.fields[logical_ordinal].name.clone();
+            continue;
+        }
+        let mut suffix = 0_u32;
+        loop {
+            let candidate = format!("__keldra_physical_{ordinal}_{suffix}");
+            if !public_names.contains(candidate.as_str()) {
+                field.name = candidate;
+                break;
+            }
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                Status::resource_exhausted("physical field alias suffix overflow")
+            })?;
+        }
+    }
+    family.validate().map_err(index_status)
+}
+
 fn compile_family_schema(family: &RegisteredFamily) -> Result<Schema, Status> {
     let mut schema = family.template.clone();
     schema.fields = family
         .fields
-        .values()
-        .map(|registered| registered.field.clone())
+        .iter()
+        .map(|(recipe, registered)| {
+            let mut field = registered.field.clone();
+            field.name = format!("__keldra_recipe_{}", hex::encode(recipe));
+            field
+        })
         .collect();
     schema.canonicalize_physical_fields().map_err(index_status)
 }
@@ -1632,6 +1685,8 @@ mod tests {
         let identity = first.projection_family_identity();
         assert_eq!(identity, alias.projection_family_identity());
         assert_eq!(identity, additional.projection_family_identity());
+        assert_eq!(first.physical_identity(), alias.physical_identity());
+        assert_eq!(first.physical_identity(), additional.physical_identity());
 
         let mut plans = DefinitionPlans::default();
         for definition in [&first, &alias, &additional] {
@@ -1651,6 +1706,20 @@ mod tests {
                 .collect::<BTreeSet<_>>()
                 .len(),
             2
+        );
+
+        let mut query_schema = schema.clone();
+        bind_family_query_schema(&mut query_schema, &alias.schema).unwrap();
+        let logical_recipe = alias.recipe_fingerprints.fields[0];
+        let query_recipes = query_schema.recipe_fingerprints().unwrap().fields;
+        let logical_ordinal = query_recipes
+            .iter()
+            .position(|candidate| *candidate == logical_recipe)
+            .unwrap();
+        assert_eq!(query_schema.fields[logical_ordinal].name, "renamed");
+        assert_eq!(
+            query_schema.fingerprint().unwrap(),
+            schema.fingerprint().unwrap()
         );
     }
 }

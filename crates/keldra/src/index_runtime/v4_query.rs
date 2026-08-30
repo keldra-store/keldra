@@ -54,7 +54,8 @@ pub(crate) fn compile_query(
                 Vec::new(),
                 Vec::new(),
             ),
-            (Some(Specification::TypedJson(_)), Some(Query::TypedJson(query))) => {
+            (Some(Specification::TypedJson(specification)), Some(Query::TypedJson(query))) => {
+                validate_typed_json_field_contract(specification, query)?;
                 if query.facets.len().saturating_add(query.aggregates.len()) > MAX_COMPUTATIONS {
                     return Err(IndexError::InvalidQuery(
                         "a query supports at most 32 facet and aggregate computations".into(),
@@ -157,6 +158,59 @@ pub(crate) fn compile_query(
         facets,
         aggregates,
     })
+}
+
+fn validate_typed_json_field_contract(
+    specification: &keldra_api::v1::TypedJsonIndexSpec,
+    query: &keldra_api::v1::TypedJsonIndexQuery,
+) -> Result<(), IndexError> {
+    let allowed = specification
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let require = |name: &str| {
+        allowed.contains(name).then_some(()).ok_or_else(|| {
+            IndexError::InvalidQuery(format!(
+                "query names field {name:?} outside its logical index definition"
+            ))
+        })
+    };
+    for order in &query.order {
+        require(&order.field)?;
+    }
+    for facet in &query.facets {
+        require(&facet.field)?;
+    }
+    for aggregate in &query.aggregates {
+        require(&aggregate.field)?;
+    }
+    let mut pending = query.predicate.iter().collect::<Vec<_>>();
+    let mut visited = 0_u32;
+    while let Some(expression) = pending.pop() {
+        visited = visited.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
+        if visited > MAX_PREDICATE_NODES {
+            return Err(IndexError::InvalidQuery(format!(
+                "predicate expression exceeds the maximum node count of {MAX_PREDICATE_NODES}"
+            )));
+        }
+        match expression.expression.as_ref() {
+            Some(Expression::Predicate(predicate)) => require(&predicate.field)?,
+            Some(Expression::Conjunction(conjunction)) => {
+                pending.extend(conjunction.expressions.iter())
+            }
+            Some(Expression::Disjunction(disjunction)) => {
+                pending.extend(disjunction.expressions.iter())
+            }
+            Some(Expression::Negation(negation)) => {
+                if let Some(child) = negation.expression.as_deref() {
+                    pending.push(child);
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
 }
 
 fn compile_facets(
@@ -714,6 +768,25 @@ mod tests {
             panic!("expected negated existence leaf")
         };
         assert_eq!([first.get(), second.get(), third.get()], [0, 1, 2]);
+    }
+
+    #[test]
+    fn typed_query_cannot_address_a_shared_family_field_outside_its_definition() {
+        let (specification, schema) = typed();
+        let query = typed_predicate_query(
+            "__keldra_physical_1_0",
+            IndexPredicateOperator::Exists,
+            Vec::new(),
+        );
+        let error = match compile_query(&schema, &specification, &query) {
+            Ok(_) => panic!("shared family field escaped its logical contract"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("outside its logical index definition")
+        );
     }
 
     #[test]

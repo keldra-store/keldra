@@ -34,10 +34,12 @@ use crate::index_service::{
 use super::cache::{
     IndexCache, IndexCacheError, IndexDiskLease, IndexSegmentFetcher, IndexSegmentId, IndexSlice,
 };
+use super::catalog::CatalogDefinition;
 use super::committed_view::{CommitManifestReference, IndexCommitManifest, ManifestPhysicalOrder};
 use super::cpu::IndexCpuPool;
 use super::directory::{ManifestArtifactDirectory, ManifestArtifactFile};
 use super::events::IndexBarrier;
+use super::projection_mapper::SharedProjectionMapper;
 use super::publisher::{IndexCommitPublisher, SelectedCommittedIndexView};
 use super::query_budget::IndexQueryMemoryBudget;
 use super::query_response::{facet_result_to_api, scalar_json};
@@ -753,6 +755,7 @@ pub(crate) struct LocalRevisionQueryExecutor {
     reader: ClusterObjectReader,
     cache: IndexCache,
     publisher: IndexCommitPublisher,
+    projection_mapper: SharedProjectionMapper,
     opened_views: OpenedCommittedViewRegistry,
     cpu: IndexCpuPool,
     query_budget: IndexQueryMemoryBudget,
@@ -766,6 +769,7 @@ impl LocalRevisionQueryExecutor {
         reader: ClusterObjectReader,
         cache: IndexCache,
         publisher: IndexCommitPublisher,
+        projection_mapper: SharedProjectionMapper,
         cpu: IndexCpuPool,
         query_budget: IndexQueryMemoryBudget,
         max_concurrency: u32,
@@ -777,6 +781,7 @@ impl LocalRevisionQueryExecutor {
             reader,
             cache,
             publisher,
+            projection_mapper,
             opened_views: OpenedCommittedViewRegistry::new(
                 (max_concurrency as usize).saturating_mul(64).max(1_024),
                 disk_budget_bytes,
@@ -1194,13 +1199,27 @@ impl LocalRevisionQueryExecutor {
             .specification
             .as_ref()
             .ok_or_else(|| Status::data_loss("index definition has no specification"))?;
-        let schema = compile_schema(
+        let logical_schema = compile_schema(
             &request.definition.path_prefix,
             (!request.definition.content_type.is_empty())
                 .then_some(request.definition.content_type.as_str()),
             specification,
         )
         .map_err(index_status)?;
+        let schema = if logical_schema.kind == IndexKind::TypedJson {
+            let family = CatalogDefinition::family_identity_for_schema(
+                request.tenant_id,
+                request.bucket_id,
+                &logical_schema,
+            )?;
+            self.projection_mapper
+                .family_query_schema(family, &logical_schema)?
+                .ok_or_else(|| {
+                    Status::unavailable("projection family is not active on its builder")
+                })?
+        } else {
+            logical_schema
+        };
         let compiled =
             compile_query(&schema, specification, &request.query).map_err(index_status)?;
         record_computation_requests(

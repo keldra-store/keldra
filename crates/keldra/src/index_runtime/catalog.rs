@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use keldra_index::IndexKind;
 use keldra_index::v4::{RecipeFingerprints, Schema};
 use tonic::Status;
 
@@ -98,6 +99,17 @@ impl CatalogDefinition {
     }
 
     pub(crate) fn physical_identity(&self) -> PhysicalProjectionIdentity {
+        if self.schema.kind == IndexKind::TypedJson {
+            let family = self.projection_family_identity().family_id;
+            let mut index = [0_u8; 8];
+            let mut version = [0_u8; 8];
+            index.copy_from_slice(&family[..8]);
+            version.copy_from_slice(&family[8..16]);
+            return PhysicalProjectionIdentity {
+                index_id: nonzero_identity(index),
+                definition_version: nonzero_identity(version),
+            };
+        }
         let mut hasher = blake3::Hasher::new();
         hasher.update(PHYSICAL_PROJECTION_DOMAIN);
         hasher.update(&self.tenant_id.to_be_bytes());
@@ -119,16 +131,39 @@ impl CatalogDefinition {
     }
 
     pub(crate) fn projection_family_identity(&self) -> ProjectionFamilyIdentity {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(PROJECTION_FAMILY_DOMAIN);
-        hasher.update(&self.tenant_id.to_be_bytes());
-        hasher.update(&self.bucket_id.to_be_bytes());
-        hasher.update(&self.recipe_fingerprints.membership);
-        ProjectionFamilyIdentity {
-            tenant_id: self.tenant_id,
-            bucket_id: self.bucket_id,
-            family_id: *hasher.finalize().as_bytes(),
+        projection_family_identity(
+            self.tenant_id,
+            self.bucket_id,
+            self.recipe_fingerprints.membership,
+        )
+    }
+
+    pub(crate) fn replace_runtime_schema(&mut self, schema: Schema) -> Result<(), Status> {
+        if schema.kind != self.schema.kind
+            || schema.path_prefix != self.schema.path_prefix
+            || schema.content_type_scope != self.schema.content_type_scope
+        {
+            return Err(Status::data_loss(
+                "projection family schema changed its source universe",
+            ));
         }
+        self.schema_fingerprint = schema.fingerprint().map_err(schema_status)?;
+        self.recipe_fingerprints = schema.recipe_fingerprints().map_err(schema_status)?;
+        self.schema = schema;
+        Ok(())
+    }
+
+    pub(crate) fn family_identity_for_schema(
+        tenant_id: u64,
+        bucket_id: u64,
+        schema: &Schema,
+    ) -> Result<ProjectionFamilyIdentity, Status> {
+        let recipes = schema.recipe_fingerprints().map_err(schema_status)?;
+        Ok(projection_family_identity(
+            tenant_id,
+            bucket_id,
+            recipes.membership,
+        ))
     }
 
     pub(crate) fn field_recipe_identities(&self) -> Vec<PhysicalRecipeIdentity> {
@@ -193,6 +228,23 @@ impl CatalogDefinition {
 fn nonzero_identity(bytes: [u8; 8]) -> u64 {
     let value = u64::from_be_bytes(bytes);
     if value == 0 { 1 } else { value }
+}
+
+fn projection_family_identity(
+    tenant_id: u64,
+    bucket_id: u64,
+    membership: [u8; 32],
+) -> ProjectionFamilyIdentity {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(PROJECTION_FAMILY_DOMAIN);
+    hasher.update(&tenant_id.to_be_bytes());
+    hasher.update(&bucket_id.to_be_bytes());
+    hasher.update(&membership);
+    ProjectionFamilyIdentity {
+        tenant_id,
+        bucket_id,
+        family_id: *hasher.finalize().as_bytes(),
+    }
 }
 
 fn schema_status(error: keldra_index::IndexError) -> Status {

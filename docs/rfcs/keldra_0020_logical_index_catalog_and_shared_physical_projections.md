@@ -827,10 +827,39 @@ changes production work ownership.
 The in-memory catalog and projection pass now satisfy the field-subset grouping
 rule: one payload is parsed against the family's distinct-recipe union and is
 converted into canonical format-v5 projected-document state once. The
-production source-journal writer does not yet call that family pass, and public
-queries do not yet resolve logical bindings through independently reusable
-component generations. Those two cutovers remain before Milestone B is
-complete.
+production source-journal writer does not yet call that format-v5 family pass,
+and public queries do not yet resolve logical bindings through independently
+reusable format-v5 component generations. Those two cutovers remain before
+Milestone B is complete.
+
+The existing native segment assembler and query engine now provide the
+production bridge for this cutover. For Typed JSON, the runtime's compact
+physical routing key is derived from the complete membership-family identity,
+not the complete logical field schema. Every assigned field-subset definition
+is registered in the family's distinct-recipe union. The scheduler maintains
+one representative builder for that family, restarts or discards stale work
+when the union fingerprint changes, and promotes another logical member if the
+representative is removed. The assembler therefore parses and seals one union
+segment stream rather than one stream per logical subset.
+
+At query admission, the authorized logical schema is compiled separately. Its
+field-recipe identities are matched to the union's canonical physical field
+IDs, and only then are its public names bound onto a complete union schema for
+the native query executor. Schema fingerprints intentionally exclude those
+public names, so the manifest remains the same physical generation. Unrequested
+union fields receive collision-free internal names and cannot be addressed by
+the logical query. This bridge keeps the existing postings/points/doc-values
+query path efficient while format-v5 becomes the durable projection authority;
+it is a disposable query-cache assembler, not a second logical index owner.
+
+The bridge is also the first production field-subset scale point: definitions
+with the same tenant, bucket, path/content scope and source semantics but
+different field subsets consume one active-builder lease. Adding a distinct
+recipe changes the union schema once and causes one family rebuild. Adding an
+alias or duplicate recipe changes only reference counts and logical bindings.
+The pending server qualification must prove that this behavior remains bounded
+for mixed subsets at D640 and under catalog churn; until then this is
+code-complete and compile-validated, not a scale claim.
 
 ### 18.3 Milestone C: projected-document state
 
