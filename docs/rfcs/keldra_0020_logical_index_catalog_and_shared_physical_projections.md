@@ -108,6 +108,10 @@ It is used to decide which physical recipes actually changed.
 complete source barrier to document-state, membership, and field component
 segments.
 
+A source barrier binds the source node, the complete source-journal epoch, and
+the first unrepresented offset. A numeric offset from another epoch never
+covers prior history.
+
 **Logical binding** maps one exact logical-definition version to a projection
 family, the first generation where all its recipes were ready, its membership
 and field recipes, and public field IDs. It follows later complete generations
@@ -810,6 +814,15 @@ Implemented groundwork on `feat/shared-index-projection`:
   pages, publishes all new immutable artifacts, and CAS-installs `current` last.
   This is now a complete restart-safe storage seam, but it is not yet the source
   journal or public query cutover.
+
+The runtime now also has a bounded family writer seam. It accepts the compiled
+distinct-recipe plan rather than a logical definition, preserves exact journal
+epochs in format-v5 barriers, loads prior projected state by source locator,
+and applies a complete source unit transactionally. Its rebuild mode stages
+successive immutable frame generations and exposes only the final one; its
+incremental mode serializes a family and installs one complete page directly.
+The source-partition scheduler still has to become the sole caller before this
+changes production work ownership.
 
 The in-memory catalog and projection pass now satisfy the field-subset grouping
 rule: one payload is parsed against the family's distinct-recipe union and is

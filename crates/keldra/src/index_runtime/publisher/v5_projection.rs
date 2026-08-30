@@ -71,15 +71,52 @@ impl IndexCommitPublisher {
         deltas: Vec<SealedComponentDelta>,
         admission: DerivedArtifactAdmission,
     ) -> Result<PublishedProjectionGeneration, Status> {
+        let prepared = self
+            .prepare_projection_advance(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                family_id,
+                previous.map(|loaded| (&loaded.generation, loaded.current.generation_hash)),
+                barrier,
+                deltas,
+            )
+            .await?;
+        self.publish_projection_generation(
+            storage_tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            family_id,
+            previous.map(|loaded| loaded.current_object_version),
+            prepared,
+            admission,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_projection_advance(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        family_id: [u8; 32],
+        previous: Option<(&ProjectionGeneration, [u8; 32])>,
+        barrier: ProjectionBarrier,
+        deltas: Vec<SealedComponentDelta>,
+    ) -> Result<PreparedProjectionGeneration, Status> {
         let mut pages = BTreeMap::new();
-        if let Some(previous) = previous {
-            if previous.current.family_id != family_id {
+        if let Some((previous, _)) = previous {
+            if previous.family_id != family_id {
                 return Err(Status::data_loss(
                     "projection predecessor belongs to another family",
                 ));
             }
             for component in deltas.iter().map(|delta| delta.component) {
-                let Some(root) = previous.generation.root(component) else {
+                let Some(root) = previous.root(component) else {
                     continue;
                 };
                 let directory = self
@@ -108,30 +145,13 @@ impl IndexCommitPublisher {
                 }
             }
         }
-        let prepared = prepare_projection_generation(
-            family_id,
-            previous.map(|loaded| (&loaded.generation, loaded.current.generation_hash)),
-            barrier,
-            deltas,
-            |hash| {
-                pages
-                    .get(&hash)
-                    .cloned()
-                    .ok_or(keldra_index::IndexError::Integrity)
-            },
-        )
-        .map_err(index_status)?;
-        self.publish_projection_generation(
-            storage_tenant,
-            bucket,
-            tenant_id,
-            bucket_id,
-            family_id,
-            previous.map(|loaded| loaded.current_object_version),
-            prepared,
-            admission,
-        )
-        .await
+        prepare_projection_generation(family_id, previous, barrier, deltas, |hash| {
+            pages
+                .get(&hash)
+                .cloned()
+                .ok_or(keldra_index::IndexError::Integrity)
+        })
+        .map_err(index_status)
     }
 
     pub(crate) async fn load_projection_generation(

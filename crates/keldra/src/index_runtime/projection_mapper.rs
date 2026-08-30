@@ -90,9 +90,20 @@ struct DefinitionPlans {
 }
 
 struct RegisteredFamily {
+    storage_tenant: String,
+    bucket: String,
     template: Schema,
     definitions: usize,
     fields: BTreeMap<[u8; 32], RegisteredFamilyField>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProjectionFamilyPlan {
+    pub(crate) identity: ProjectionFamilyIdentity,
+    pub(crate) storage_tenant: String,
+    pub(crate) bucket: String,
+    pub(crate) schema: Schema,
+    pub(crate) schema_fingerprint: [u8; 32],
 }
 
 struct RegisteredFamilyField {
@@ -464,10 +475,19 @@ fn add_family_definition(
         .families
         .entry(identity)
         .or_insert_with(|| RegisteredFamily {
+            storage_tenant: definition.stored.tenant.clone(),
+            bucket: definition.stored.bucket.clone(),
             template,
             definitions: 0,
             fields: BTreeMap::new(),
         });
+    if family.storage_tenant != definition.stored.tenant
+        || family.bucket != definition.stored.bucket
+    {
+        return Err(Status::data_loss(
+            "one projection family resolved to conflicting storage authority",
+        ));
+    }
     family.definitions = family
         .definitions
         .checked_add(1)
@@ -747,6 +767,29 @@ impl SharedProjectionMapper {
             return Ok(None);
         };
         compile_family_schema(family).map(Some)
+    }
+
+    pub(crate) fn family_plan(
+        &self,
+        identity: ProjectionFamilyIdentity,
+    ) -> Result<Option<ProjectionFamilyPlan>, Status> {
+        let plans = self
+            .inner
+            .definitions
+            .lock()
+            .map_err(|_| Status::internal("shared projection definition lock is poisoned"))?;
+        let Some(family) = plans.families.get(&identity) else {
+            return Ok(None);
+        };
+        let schema = compile_family_schema(family)?;
+        let schema_fingerprint = schema.fingerprint().map_err(index_status)?;
+        Ok(Some(ProjectionFamilyPlan {
+            identity,
+            storage_tenant: family.storage_tenant.clone(),
+            bucket: family.bucket.clone(),
+            schema,
+            schema_fingerprint,
+        }))
     }
 
     /// Project one source once through the current distinct-recipe union for a

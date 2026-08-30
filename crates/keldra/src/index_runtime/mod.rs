@@ -18,6 +18,7 @@ pub(crate) mod json_projection;
 pub(crate) mod local_query;
 pub(crate) mod manager;
 pub(crate) mod placement;
+pub(crate) mod projection_family_writer;
 pub(crate) mod projection_mapper;
 pub(crate) mod publication;
 pub(crate) mod publisher;

@@ -118,7 +118,7 @@ mod tests {
     };
 
     fn barrier(next: u64) -> ProjectionBarrier {
-        ProjectionBarrier::new(vec![(1, next)], None).unwrap()
+        ProjectionBarrier::new(vec![(1, [1; 32], next)], None).unwrap()
     }
 
     fn sealed(component: ComponentIdentity, byte: u8) -> SealedComponentDelta {

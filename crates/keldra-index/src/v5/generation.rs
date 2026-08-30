@@ -69,14 +69,15 @@ impl ComponentRoot {
 /// Complete source position represented by one atomic generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionBarrier {
-    /// Sorted unique `(source node, first unrepresented journal offset)` pairs.
-    pub source_offsets: Vec<(u64, u64)>,
+    /// Sorted unique `(source node, source epoch, first unrepresented journal
+    /// offset)` tuples. An offset is never interpreted across journal epochs.
+    pub source_offsets: Vec<(u64, [u8; 32], u64)>,
     pub atomic_through: Option<u64>,
 }
 
 impl ProjectionBarrier {
     pub fn new(
-        source_offsets: Vec<(u64, u64)>,
+        source_offsets: Vec<(u64, [u8; 32], u64)>,
         atomic_through: Option<u64>,
     ) -> Result<Self, IndexError> {
         let barrier = Self {
@@ -92,7 +93,7 @@ impl ProjectionBarrier {
             || self
                 .source_offsets
                 .iter()
-                .any(|(node, offset)| *node == 0 || *offset == 0)
+                .any(|(node, epoch, offset)| *node == 0 || *epoch == [0; 32] || *offset == 0)
             || self
                 .source_offsets
                 .windows(2)
@@ -111,16 +112,19 @@ impl ProjectionBarrier {
             .source_offsets
             .iter()
             .copied()
+            .map(|(node, epoch, offset)| (node, (epoch, offset)))
             .collect::<BTreeMap<_, _>>();
-        previous
-            .source_offsets
-            .iter()
-            .all(|(node, offset)| current.get(node).is_some_and(|current| current >= offset))
-            && match (previous.atomic_through, self.atomic_through) {
-                (None, _) => true,
-                (Some(_), None) => false,
-                (Some(old), Some(new)) => new >= old,
-            }
+        previous.source_offsets.iter().all(|(node, epoch, offset)| {
+            current
+                .get(node)
+                .is_some_and(|(current_epoch, current_offset)| {
+                    current_epoch == epoch && current_offset >= offset
+                })
+        }) && match (previous.atomic_through, self.atomic_through) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(old), Some(new)) => new >= old,
+        }
     }
 }
 
@@ -340,7 +344,7 @@ mod tests {
     fn initial() -> ProjectionGeneration {
         ProjectionGeneration::initial(
             [1; 32],
-            ProjectionBarrier::new(vec![(1, 8)], None).unwrap(),
+            ProjectionBarrier::new(vec![(1, [1; 32], 8)], None).unwrap(),
             vec![
                 root(ComponentIdentity::DocumentHead, 2),
                 root(ComponentIdentity::ProjectedState, 6),
@@ -358,7 +362,7 @@ mod tests {
         let new = old
             .advance(
                 [9; 32],
-                ProjectionBarrier::new(vec![(1, 9)], None).unwrap(),
+                ProjectionBarrier::new(vec![(1, [1; 32], 9)], None).unwrap(),
                 vec![root(ComponentIdentity::Field(recipe(4)), 8)],
             )
             .unwrap();
@@ -422,7 +426,7 @@ mod tests {
         assert!(
             old.advance(
                 [9; 32],
-                ProjectionBarrier::new(vec![(1, 7)], None).unwrap(),
+                ProjectionBarrier::new(vec![(1, [1; 32], 7)], None).unwrap(),
                 Vec::new(),
             )
             .is_err()
@@ -431,7 +435,7 @@ mod tests {
 
     #[test]
     fn empty_family_has_a_complete_barrier_without_fabricated_components() {
-        let barrier = ProjectionBarrier::new(vec![(1, 8)], None).unwrap();
+        let barrier = ProjectionBarrier::new(vec![(1, [1; 32], 8)], None).unwrap();
         let empty = ProjectionGeneration::initial([7; 32], barrier.clone(), Vec::new()).unwrap();
         assert!(empty.roots.is_empty());
         assert!(barrier.covers(&empty.barrier));
@@ -439,7 +443,7 @@ mod tests {
         let advanced = empty
             .advance(
                 [9; 32],
-                ProjectionBarrier::new(vec![(1, 9)], None).unwrap(),
+                ProjectionBarrier::new(vec![(1, [1; 32], 9)], None).unwrap(),
                 Vec::new(),
             )
             .unwrap();

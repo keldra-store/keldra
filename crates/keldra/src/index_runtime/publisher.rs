@@ -28,7 +28,8 @@ mod revalidation;
 #[path = "publisher/v5_projection.rs"]
 mod v5_projection;
 pub(crate) use v5_projection::{
-    LoadedProjectionGeneration, ProjectionArtifactReference, PublishedProjectionGeneration,
+    LoadedProjectionGeneration, ProjectionArtifactReference, PublishedProjectionArtifacts,
+    PublishedProjectionGeneration,
 };
 
 use crate::cluster_object_read::ClusterObjectReader;

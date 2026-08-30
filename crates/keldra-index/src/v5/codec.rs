@@ -109,8 +109,9 @@ pub fn encode_projection_generation(
     out.extend_from_slice(&generation.family_id);
     put_u64(&mut out, generation.revision);
     put_u32(&mut out, generation.barrier.source_offsets.len() as u32);
-    for (node, offset) in &generation.barrier.source_offsets {
+    for (node, epoch, offset) in &generation.barrier.source_offsets {
         put_u64(&mut out, *node);
+        out.extend_from_slice(epoch);
         put_u64(&mut out, *offset);
     }
     put_optional_u64(&mut out, generation.barrier.atomic_through);
@@ -167,7 +168,7 @@ pub fn decode_projection_generation_header(
     }
     let mut source_offsets = Vec::with_capacity(source_count);
     for _ in 0..source_count {
-        source_offsets.push((input.u64()?, input.u64()?));
+        source_offsets.push((input.u64()?, input.array_32()?, input.u64()?));
     }
     let atomic_through = input.optional_u64()?;
     let directory_hash = input.array_32()?;
@@ -889,7 +890,7 @@ mod tests {
     fn generation() -> ProjectionGeneration {
         ProjectionGeneration::initial(
             [9; 32],
-            ProjectionBarrier::new(vec![(1, 7), (2, 11)], Some(5)).unwrap(),
+            ProjectionBarrier::new(vec![(1, [1; 32], 7), (2, [2; 32], 11)], Some(5)).unwrap(),
             vec![
                 ComponentRoot::new(ComponentIdentity::DocumentHead, [1; 32], 1, 10, 9, 1).unwrap(),
                 ComponentRoot::new(ComponentIdentity::ProjectedState, [4; 32], 1, 10, 9, 1)
@@ -1032,7 +1033,7 @@ mod tests {
         let advanced = generation
             .advance(
                 encoded_generation.hash,
-                ProjectionBarrier::new(vec![(1, 8), (2, 11)], Some(5)).unwrap(),
+                ProjectionBarrier::new(vec![(1, [1; 32], 8), (2, [2; 32], 11)], Some(5)).unwrap(),
                 Vec::new(),
             )
             .unwrap();
@@ -1067,7 +1068,7 @@ mod tests {
         }));
         let generation = ProjectionGeneration::initial(
             [9; 32],
-            ProjectionBarrier::new(vec![(1, 7)], None).unwrap(),
+            ProjectionBarrier::new(vec![(1, [1; 32], 7)], None).unwrap(),
             roots,
         )
         .unwrap();
@@ -1100,7 +1101,7 @@ mod tests {
         let advanced = generation
             .advance(
                 [7; 32],
-                ProjectionBarrier::new(vec![(1, 8), (2, 11)], Some(5)).unwrap(),
+                ProjectionBarrier::new(vec![(1, [1; 32], 8), (2, [2; 32], 11)], Some(5)).unwrap(),
                 Vec::new(),
             )
             .unwrap();
