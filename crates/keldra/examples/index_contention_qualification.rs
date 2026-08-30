@@ -521,7 +521,6 @@ async fn create_definitions(config: &Config, channel: &Channel, token: &str) -> 
             .content_type(CONTENT_TYPE);
         let request: CreateIndexRequest = if alternate_schema(position) {
             builder
-                .field(UnsignedIntegerField::single("revision", "/generation").exact())
                 .field(KeywordField::single("category", "/class").exact())
                 .field(UnsignedIntegerField::single("document_id", "/record_id").exact())
                 .finish(format!("contention-create-{position}"))?
@@ -1529,6 +1528,16 @@ mod tests {
     #[test]
     fn queries_use_each_logical_schema_alias() {
         assert_eq!(query_field("contention-000", "class", "category"), "class");
+        assert_eq!(
+            query_field("contention-001", "class", "category"),
+            "category"
+        );
+    }
+
+    #[test]
+    fn alternate_schema_is_a_real_field_subset() {
+        assert!(!alternate_schema(0));
+        assert!(alternate_schema(1));
         assert_eq!(
             query_field("contention-001", "class", "category"),
             "category"
