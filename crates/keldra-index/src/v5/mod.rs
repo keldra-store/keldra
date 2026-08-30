@@ -34,7 +34,8 @@ pub use stream::{
     COMPONENT_STREAM_DIRECTORY_FANOUT, ComponentSegmentDescriptor, ComponentStreamAppend,
     ComponentStreamDirectory, ComponentStreamRoot, EncodedComponentStreamPage,
     append_component_delta, append_component_stream, build_component_stream,
-    compact_component_stream, decode_component_stream, resolve_component_record,
+    compact_component_stream, component_stream_child_hashes, decode_component_stream,
+    resolve_component_record,
 };
 
 pub const INDEX_FORMAT_VERSION: u16 = 5;
@@ -45,9 +46,9 @@ pub use buffer::{
 pub use codec::{
     COMPONENT_DIRECTORY_FANOUT, ComponentDirectory, EncodedComponentDirectoryPage,
     EncodedProjectionGeneration, MAX_LOGICAL_BINDING_FIELDS, MAX_PROJECTION_SOURCES,
-    ProjectionGenerationHeader, build_component_directory, decode_component_directory,
-    decode_logical_projection_binding, decode_projected_document_state, decode_projection_current,
-    decode_projection_generation, decode_projection_generation_header,
+    ProjectionGenerationHeader, build_component_directory, component_directory_child_hashes,
+    decode_component_directory, decode_logical_projection_binding, decode_projected_document_state,
+    decode_projection_current, decode_projection_generation, decode_projection_generation_header,
     encode_logical_projection_binding, encode_projected_document_state, encode_projection_current,
     encode_projection_generation, resolve_component_root,
 };

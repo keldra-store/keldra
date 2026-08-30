@@ -27,7 +27,9 @@ mod prepared_publication;
 mod revalidation;
 #[path = "publisher/v5_projection.rs"]
 mod v5_projection;
-pub(crate) use v5_projection::{ProjectionArtifactReference, PublishedProjectionGeneration};
+pub(crate) use v5_projection::{
+    LoadedProjectionGeneration, ProjectionArtifactReference, PublishedProjectionGeneration,
+};
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::index_config::IndexRuntimeConfig;

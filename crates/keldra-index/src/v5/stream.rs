@@ -335,6 +335,17 @@ pub fn decode_component_stream(
     Ok(segments)
 }
 
+/// Child hashes named by one verified stream-directory page.
+pub fn component_stream_child_hashes(
+    component: ComponentIdentity,
+    bytes: &[u8],
+) -> Result<Vec<[u8; 32]>, IndexError> {
+    Ok(match decode_page(component, bytes)? {
+        Page::Leaf(_) => Vec::new(),
+        Page::Branch(children) => children.into_iter().map(|child| child.hash).collect(),
+    })
+}
+
 /// Resolve the newest value for one stable document key. `None` means either
 /// the key never existed or the newest record is a tombstone.
 pub fn resolve_component_record(
@@ -993,6 +1004,18 @@ mod tests {
                 .all(|page| page.bytes.len() < 32 * 1024)
         );
         assert!(directory.pages.len() < 300);
+        let pages = directory
+            .pages
+            .iter()
+            .map(|page| (page.hash, page.bytes.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let root_children = component_stream_child_hashes(
+            directory.component,
+            pages.get(&directory.root_hash).expect("root page"),
+        )
+        .unwrap();
+        assert!(!root_children.is_empty());
+        assert!(root_children.iter().all(|hash| pages.contains_key(hash)));
     }
 
     #[test]

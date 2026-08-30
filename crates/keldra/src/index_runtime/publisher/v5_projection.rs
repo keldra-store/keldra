@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
+use std::collections::{BTreeSet, VecDeque};
+use std::io::Read;
 
 use keldra_index::v5::{
-    PreparedProjectionGeneration, projection_component_page_path, projection_current_path,
-    projection_generation_path, projection_pack_path, projection_routing_id,
-    projection_stream_page_path,
+    ComponentDirectory, EncodedComponentDirectoryPage, PreparedProjectionGeneration,
+    ProjectionCurrent, ProjectionGeneration, component_directory_child_hashes,
+    decode_projection_current, decode_projection_generation, decode_projection_generation_header,
+    projection_component_page_path, projection_current_path, projection_generation_path,
+    projection_pack_path, projection_routing_id, projection_stream_page_path,
 };
-use keldra_store::{BlobRef, VersionId};
+use keldra_store::{BlobRef, ObjectKey, VersionId};
 use tonic::Status;
 
 use super::{IndexCommitPublisher, publish_command, stage_index_bytes_with_retry};
@@ -27,6 +31,13 @@ pub(crate) struct PublishedProjectionGeneration {
     pub(crate) current_version: VersionId,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LoadedProjectionGeneration {
+    pub(crate) current: ProjectionCurrent,
+    pub(crate) current_object_version: VersionId,
+    pub(crate) generation: ProjectionGeneration,
+}
+
 struct ArtifactBytes {
     path: String,
     hash: [u8; 32],
@@ -34,6 +45,83 @@ struct ArtifactBytes {
 }
 
 impl IndexCommitPublisher {
+    pub(crate) async fn load_projection_generation(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        family_id: [u8; 32],
+    ) -> Result<Option<LoadedProjectionGeneration>, Status> {
+        let current_path = projection_current_path(family_id);
+        let Some((current_bytes, current_object_version)) = self
+            .read_projection_object(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                &current_path,
+                None,
+                1024,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let current = decode_projection_current(&current_bytes).map_err(index_status)?;
+        if current.family_id != family_id {
+            return Err(Status::data_loss(
+                "projection current pointer belongs to another family",
+            ));
+        }
+        let generation_path = projection_generation_path(family_id, current.generation_hash);
+        let (generation_bytes, _) = self
+            .read_projection_object(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                &generation_path,
+                Some(current.generation_hash),
+                256 * 1024,
+            )
+            .await?
+            .ok_or_else(|| Status::data_loss("projection generation object is absent"))?;
+        let header =
+            decode_projection_generation_header(&generation_bytes).map_err(index_status)?;
+        if header.family_id != family_id || header.revision != current.generation_revision {
+            return Err(Status::data_loss(
+                "projection generation header does not match current",
+            ));
+        }
+        let pages = self
+            .load_component_directory(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                family_id,
+                header.component_directory_root_hash,
+                header.component_root_count,
+            )
+            .await?;
+        let directory = ComponentDirectory {
+            root_hash: header.component_directory_root_hash,
+            root_count: header.component_root_count,
+            pages,
+        };
+        let generation =
+            decode_projection_generation(&generation_bytes, &directory).map_err(index_status)?;
+        current
+            .validate_against(&generation)
+            .map_err(index_status)?;
+        Ok(Some(LoadedProjectionGeneration {
+            current,
+            current_object_version,
+            generation,
+        }))
+    }
+
     /// Durably publishes one prepared v5 generation, making it visible only by
     /// the final exact-version current-pointer mutation.
     #[allow(clippy::too_many_arguments)]
@@ -127,6 +215,114 @@ impl IndexCommitPublisher {
             artifacts: references,
             current_version: current_outcome.version,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn load_component_directory(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        family_id: [u8; 32],
+        root_hash: [u8; 32],
+        root_count: u64,
+    ) -> Result<Vec<EncodedComponentDirectoryPage>, Status> {
+        let maximum_pages = usize::try_from(root_count)
+            .map_err(|_| Status::resource_exhausted("projection root count is unbounded"))?
+            .saturating_mul(2)
+            .max(1);
+        let mut pending = VecDeque::from([root_hash]);
+        let mut visited = BTreeSet::new();
+        let mut pages = Vec::new();
+        let mut resident = 0_usize;
+        while let Some(hash) = pending.pop_front() {
+            if !visited.insert(hash) {
+                return Err(Status::data_loss(
+                    "projection component directory contains a cycle or duplicate page",
+                ));
+            }
+            if visited.len() > maximum_pages {
+                return Err(Status::resource_exhausted(
+                    "projection component directory exceeds its root-count bound",
+                ));
+            }
+            let path = projection_component_page_path(family_id, hash);
+            let (bytes, _) = self
+                .read_projection_object(
+                    storage_tenant,
+                    bucket,
+                    tenant_id,
+                    bucket_id,
+                    &path,
+                    Some(hash),
+                    32 * 1024,
+                )
+                .await?
+                .ok_or_else(|| Status::data_loss("projection component page is absent"))?;
+            resident = resident
+                .checked_add(bytes.len())
+                .ok_or_else(|| Status::resource_exhausted("projection directory bytes overflow"))?;
+            if resident > 64 * 1024 * 1024 {
+                return Err(Status::resource_exhausted(
+                    "projection component directory exceeds its runtime read bound",
+                ));
+            }
+            pending.extend(component_directory_child_hashes(&bytes).map_err(index_status)?);
+            pages.push(EncodedComponentDirectoryPage { hash, bytes });
+        }
+        Ok(pages)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_projection_object(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        path: &str,
+        expected_hash: Option<[u8; 32]>,
+        maximum_bytes: usize,
+    ) -> Result<Option<(Vec<u8>, VersionId)>, Status> {
+        let key = ObjectKey::new(storage_tenant, bucket, path)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let Some(mut opened) = self
+            .reader
+            .open_stable(&key, tenant_id, bucket_id, None)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if opened.version.deleted {
+            return Err(Status::data_loss("projection artifact is deleted"));
+        }
+        let blob = opened
+            .version
+            .blob
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("projection artifact has no payload identity"))?;
+        if expected_hash.is_some_and(|hash| blob.hash != hash) {
+            return Err(Status::data_loss(
+                "projection artifact path and payload hash differ",
+            ));
+        }
+        let mut payload = opened
+            .payload
+            .take()
+            .ok_or_else(|| Status::data_loss("projection artifact has no payload"))?;
+        let mut bytes = Vec::new();
+        payload
+            .by_ref()
+            .take(maximum_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| Status::internal(format!("read projection artifact: {error}")))?;
+        if bytes.len() > maximum_bytes || bytes.len() as u64 != blob.length {
+            return Err(Status::data_loss(
+                "projection artifact violates its exact byte bound",
+            ));
+        }
+        Ok(Some((bytes, opened.version.id)))
     }
 }
 

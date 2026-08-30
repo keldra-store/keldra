@@ -202,6 +202,14 @@ pub fn resolve_component_root(
     resolve_component_subtree(root_hash, root_count, component, &mut load_page)
 }
 
+/// Child page hashes named by one verified component-directory page.
+pub fn component_directory_child_hashes(bytes: &[u8]) -> Result<Vec<[u8; 32]>, IndexError> {
+    Ok(match decode_directory_page(bytes)? {
+        DirectoryPage::Leaf(_) => Vec::new(),
+        DirectoryPage::Branch(children) => children.into_iter().map(|child| child.hash).collect(),
+    })
+}
+
 fn resolve_component_subtree(
     hash: [u8; 32],
     root_count: u64,
@@ -928,6 +936,11 @@ mod tests {
             .iter()
             .map(|page| (page.hash, page.bytes.clone()))
             .collect::<BTreeMap<_, _>>();
+        let root_children =
+            component_directory_child_hashes(pages.get(&directory.root_hash).expect("root page"))
+                .unwrap();
+        assert!(!root_children.is_empty());
+        assert!(root_children.iter().all(|hash| pages.contains_key(hash)));
         let target = roots[63_777].component;
         assert_eq!(
             resolve_component_root(directory.root_hash, directory.root_count, target, |hash| {
