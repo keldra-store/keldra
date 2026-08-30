@@ -10,7 +10,9 @@ work_root="${experiment_root}/work"
 definitions="${KELDRA_CATALOG_DEFINITIONS:-250000}"
 concurrency="${KELDRA_CATALOG_CONCURRENCY:-64}"
 port="${KELDRA_CATALOG_PORT:-50051}"
-server_rust_log="${KELDRA_CATALOG_RUST_LOG:-info,keldra::index_runtime::cpu=warn}"
+# Per-request INFO emits several lines per definition and would both distort a
+# rotational-disk catalogue run and create multi-gigabyte evidence logs.
+server_rust_log="${KELDRA_CATALOG_RUST_LOG:-warn}"
 server_source_commit="$(tr -d '\r\n' <"${kit_root}/SOURCE_COMMIT")"
 catalog_harness_commit="$(tr -d '\r\n' <"${kit_root}/CATALOG_HARNESS_COMMIT")"
 

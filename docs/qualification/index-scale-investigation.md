@@ -460,3 +460,15 @@ seconds, and p99 26.69 seconds; concurrent-query p99 was 401.92 milliseconds;
 the exact final drain was 80.36 seconds. This passes the sustained keep-up gate
 on the slower host. The SSD fixed-rate run and heterogeneous/HOT/churn gates
 remain separate evidence requirements.
+
+Server commit `1ce4fa290d23` then repeated that gate with 640 logical
+definitions alternating between two declaration orders and two public field
+name sets over the same physical recipes. It again accepted all 71,973 offered
+operations at 40 operations/s and completed all 36,000 concurrent queries with
+zero mutation, request, timeout, scheduling, or correctness error. Visibility
+improved to p50 3.50 seconds, p95 5.81 seconds, p99 10.32 seconds, maximum
+11.57 seconds; concurrent-query p99 was 346.62 milliseconds. Exact final drain
+was 107.42 seconds. This proves alias/order-neutral sharing through the public
+query contract, not merely identical serialized definitions. The archived
+result SHA-256 is
+`03cb408de54a2f1d9bcc848daa56ad93acf34c391eb13147480cf82707e29c3b`.

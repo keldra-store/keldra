@@ -645,6 +645,16 @@ a bounded in-load visibility result, not a saturation result inferred from an
 eventual drain. The corresponding SSD fixed-rate result is recorded separately
 when complete.
 
+Server commit `1ce4fa290d23` subsequently repeated the rotational gate with two
+alternating logical schema variants: reordered fields and different public
+aliases bound the same recipes. All 71,973 offered operations were accepted at
+40 operations/s; all 36,000 concurrent queries completed; there were zero
+mutation, query, timeout, scheduling, or correctness errors. Publication
+visibility was p50 3.50 seconds, p95 5.81 seconds, p99 10.32 seconds, maximum
+11.57 seconds; concurrent-query p99 was 346.62 milliseconds and exact drain was
+107.42 seconds. The evidence archive SHA-256 is
+`03cb408de54a2f1d9bcc848daa56ad93acf34c391eb13147480cf82707e29c3b`.
+
 ### 18.2 Milestone B: recipe catalog and component generations
 
 Replace complete-schema physical ownership with canonical membership and field
