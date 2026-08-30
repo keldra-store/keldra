@@ -7,6 +7,7 @@
 mod buffer;
 mod codec;
 mod generation;
+mod pack;
 mod projected_state;
 mod projector;
 mod stream;
@@ -15,6 +16,7 @@ pub use generation::{
     ComponentIdentity, ComponentRoot, LogicalFieldBinding, LogicalProjectionBinding,
     ProjectionBarrier, ProjectionGeneration,
 };
+pub use pack::{PackedComponentDelta, SealedProjectionDeltaPack, pack_component_deltas};
 pub use projected_state::{
     CanonicalRecipeState, DocumentHead, ProjectedDocumentDelta, ProjectedDocumentState,
     RecipeDelta, RecipeIdentity, StableDocumentKey,

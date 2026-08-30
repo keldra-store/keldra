@@ -723,7 +723,11 @@ Implemented groundwork on `feat/shared-index-projection`:
   segment identity and resolve newest-by-stable-key values; compaction folds
   the stream into one exact self-contained segment while retaining tombstones
   required by concurrently pinned older generations. A 70,000-segment
-  regression keeps directory pages below 32 KiB.
+  regression keeps directory pages below 32 KiB; and
+- changed deltas are integrated into shared payload packs at the existing
+  16 MiB physical bound. Stream descriptors bind pack hash, exact byte range,
+  segment hash, record count, and byte accounting, so many tiny recipe changes
+  do not become one payload object or filesystem inode each.
 
 This does not yet satisfy Milestone B for field subsets. Independent component
 generation ownership and bindings remain required before different complete

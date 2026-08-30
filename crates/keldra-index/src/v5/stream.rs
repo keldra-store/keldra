@@ -4,8 +4,8 @@ use crate::IndexError;
 
 use super::buffer::seal_component;
 use super::{
-    ComponentIdentity, ComponentRoot, RecipeIdentity, SealedComponentDelta, StableDocumentKey,
-    decode_component_delta_segment,
+    ComponentIdentity, ComponentRoot, PackedComponentDelta, RecipeIdentity, SealedComponentDelta,
+    StableDocumentKey, decode_component_delta_segment, pack_component_deltas,
 };
 
 const PAGE_MAGIC: &[u8; 8] = b"K5CSTR01";
@@ -19,7 +19,9 @@ const MAX_COMPONENT_STREAM_SEGMENTS: usize = 1_000_000;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentSegmentDescriptor {
     pub sequence: u64,
-    pub artifact_hash: [u8; 32],
+    pub pack_hash: [u8; 32],
+    pub pack_offset: u64,
+    pub segment_hash: [u8; 32],
     pub encoded_bytes: u64,
     pub logical_bytes: u64,
     pub records: u64,
@@ -28,7 +30,8 @@ pub struct ComponentSegmentDescriptor {
 impl ComponentSegmentDescriptor {
     fn validate(&self) -> Result<(), IndexError> {
         if self.sequence == 0
-            || self.artifact_hash == [0; 32]
+            || self.pack_hash == [0; 32]
+            || self.segment_hash == [0; 32]
             || self.encoded_bytes == 0
             || self.logical_bytes == 0
             || self.records == 0
@@ -132,19 +135,11 @@ pub fn build_component_stream(
 
 pub fn append_component_delta(
     previous: Option<&ComponentStreamDirectory>,
-    delta: &SealedComponentDelta,
+    delta: &PackedComponentDelta,
 ) -> Result<ComponentStreamDirectory, IndexError> {
-    let decoded = decode_component_delta_segment(&delta.bytes)?;
-    if decoded.component != delta.root.component
-        || delta.root.artifact_hash != *blake3::hash(&delta.bytes).as_bytes()
-        || delta.root.encoded_bytes != delta.bytes.len() as u64
-        || delta.records != decoded.records.len() as u64
-    {
-        return Err(IndexError::Integrity);
-    }
     let mut segments = match previous {
         Some(directory) => {
-            if directory.component != delta.root.component {
+            if directory.component != delta.component {
                 return Err(IndexError::InvalidDefinition(
                     "component delta was appended to a different stream".into(),
                 ));
@@ -158,12 +153,14 @@ pub fn append_component_delta(
         .ok_or(IndexError::OffsetOverflow)?;
     segments.push(ComponentSegmentDescriptor {
         sequence,
-        artifact_hash: delta.root.artifact_hash,
-        encoded_bytes: delta.root.encoded_bytes,
-        logical_bytes: delta.root.logical_bytes,
+        pack_hash: delta.pack_hash,
+        pack_offset: delta.offset,
+        segment_hash: delta.segment_hash,
+        encoded_bytes: delta.encoded_bytes,
+        logical_bytes: delta.logical_bytes,
         records: delta.records,
     });
-    build_component_stream(delta.root.component, &segments)
+    build_component_stream(delta.component, &segments)
 }
 
 pub fn decode_component_stream(
@@ -214,10 +211,10 @@ pub fn resolve_component_record(
 ) -> Result<Option<Vec<u8>>, IndexError> {
     let segments = decode_component_stream(directory)?;
     for descriptor in segments.iter().rev() {
-        let bytes = artifacts
-            .get(&descriptor.artifact_hash)
+        let pack = artifacts
+            .get(&descriptor.pack_hash)
             .ok_or(IndexError::Integrity)?;
-        validate_artifact(directory.component, descriptor, bytes)?;
+        let bytes = validate_artifact(directory.component, descriptor, pack)?;
         let decoded = decode_component_delta_segment(bytes)?;
         if let Ok(index) = decoded
             .records
@@ -239,34 +236,55 @@ pub fn compact_component_stream(
     let segments = decode_component_stream(directory)?;
     let mut records = BTreeMap::new();
     for descriptor in &segments {
-        let bytes = artifacts
-            .get(&descriptor.artifact_hash)
+        let pack = artifacts
+            .get(&descriptor.pack_hash)
             .ok_or(IndexError::Integrity)?;
-        validate_artifact(directory.component, descriptor, bytes)?;
+        let bytes = validate_artifact(directory.component, descriptor, pack)?;
         for record in decode_component_delta_segment(bytes)?.records {
             records.insert(record.stable_key, record.replacement);
         }
     }
     let sealed = seal_component(directory.component, records)?;
-    let compacted = append_component_delta(None, &sealed)?;
-    Ok((compacted, sealed))
+    let pack = pack_component_deltas(vec![sealed])?
+        .pop()
+        .expect("one compacted segment produces one pack");
+    let compacted = append_component_delta(None, &pack.deltas[0])?;
+    let segment = SealedComponentDelta {
+        root: ComponentRoot::new(
+            pack.deltas[0].component,
+            pack.deltas[0].segment_hash,
+            pack.deltas[0].encoded_bytes,
+            pack.deltas[0].logical_bytes,
+        )?,
+        bytes: pack.bytes,
+        records: pack.deltas[0].records,
+    };
+    Ok((compacted, segment))
 }
 
-fn validate_artifact(
+fn validate_artifact<'a>(
     component: ComponentIdentity,
     descriptor: &ComponentSegmentDescriptor,
-    bytes: &[u8],
-) -> Result<(), IndexError> {
-    if *blake3::hash(bytes).as_bytes() != descriptor.artifact_hash
-        || bytes.len() as u64 != descriptor.encoded_bytes
-    {
+    pack: &'a [u8],
+) -> Result<&'a [u8], IndexError> {
+    if *blake3::hash(pack).as_bytes() != descriptor.pack_hash {
+        return Err(IndexError::Integrity);
+    }
+    let start = usize::try_from(descriptor.pack_offset).map_err(|_| IndexError::OffsetOverflow)?;
+    let length =
+        usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::OffsetOverflow)?;
+    let end = start
+        .checked_add(length)
+        .ok_or(IndexError::OffsetOverflow)?;
+    let bytes = pack.get(start..end).ok_or(IndexError::Integrity)?;
+    if *blake3::hash(bytes).as_bytes() != descriptor.segment_hash {
         return Err(IndexError::Integrity);
     }
     let decoded = decode_component_delta_segment(bytes)?;
     if decoded.component != component || decoded.records.len() as u64 != descriptor.records {
         return Err(IndexError::Integrity);
     }
-    Ok(())
+    Ok(bytes)
 }
 
 fn validate_segments(segments: &[ComponentSegmentDescriptor]) -> Result<(), IndexError> {
@@ -353,7 +371,9 @@ fn encode_page(
             for segment in segments {
                 segment.validate()?;
                 put_u64(&mut bytes, segment.sequence);
-                bytes.extend_from_slice(&segment.artifact_hash);
+                bytes.extend_from_slice(&segment.pack_hash);
+                put_u64(&mut bytes, segment.pack_offset);
+                bytes.extend_from_slice(&segment.segment_hash);
                 put_u64(&mut bytes, segment.encoded_bytes);
                 put_u64(&mut bytes, segment.logical_bytes);
                 put_u64(&mut bytes, segment.records);
@@ -431,7 +451,9 @@ fn decode_page(component: ComponentIdentity, bytes: &[u8]) -> Result<Page, Index
             for _ in 0..count {
                 segments.push(ComponentSegmentDescriptor {
                     sequence: input.u64()?,
-                    artifact_hash: input.array_32()?,
+                    pack_hash: input.array_32()?,
+                    pack_offset: input.u64()?,
+                    segment_hash: input.array_32()?,
                     encoded_bytes: input.u64()?,
                     logical_bytes: input.u64()?,
                     records: input.u64()?,
@@ -621,16 +643,22 @@ mod tests {
         .unwrap()
     }
 
+    fn packed(delta: SealedComponentDelta) -> (PackedComponentDelta, Vec<u8>) {
+        let pack = pack_component_deltas(vec![delta]).unwrap().remove(0);
+        (pack.deltas[0].clone(), pack.bytes)
+    }
+
     #[test]
     fn newest_delta_wins_and_tombstones_hide_older_values() {
         let component = ComponentIdentity::Field(RecipeIdentity::new([7; 32]).unwrap());
-        let first = sealed(component, &[(1, Some(b"old")), (2, Some(b"kept"))]);
-        let second = sealed(component, &[(1, Some(b"new")), (2, None)]);
+        let (first, first_pack) =
+            packed(sealed(component, &[(1, Some(b"old")), (2, Some(b"kept"))]));
+        let (second, second_pack) = packed(sealed(component, &[(1, Some(b"new")), (2, None)]));
         let one = append_component_delta(None, &first).unwrap();
         let two = append_component_delta(Some(&one), &second).unwrap();
         let artifacts = [
-            (first.root.artifact_hash, first.bytes.clone()),
-            (second.root.artifact_hash, second.bytes.clone()),
+            (first.pack_hash, first_pack),
+            (second.pack_hash, second_pack),
         ]
         .into_iter()
         .collect();
@@ -647,21 +675,21 @@ mod tests {
     #[test]
     fn compaction_preserves_the_exact_newest_view() {
         let component = ComponentIdentity::Membership(RecipeIdentity::new([8; 32]).unwrap());
-        let first = sealed(component, &[(1, Some(b"one")), (2, Some(b"two"))]);
-        let second = sealed(component, &[(1, None), (3, Some(b"three"))]);
+        let (first, first_pack) =
+            packed(sealed(component, &[(1, Some(b"one")), (2, Some(b"two"))]));
+        let (second, second_pack) = packed(sealed(component, &[(1, None), (3, Some(b"three"))]));
         let one = append_component_delta(None, &first).unwrap();
         let two = append_component_delta(Some(&one), &second).unwrap();
         let artifacts = [
-            (first.root.artifact_hash, first.bytes.clone()),
-            (second.root.artifact_hash, second.bytes.clone()),
+            (first.pack_hash, first_pack),
+            (second.pack_hash, second_pack),
         ]
         .into_iter()
         .collect::<BTreeMap<_, _>>();
         let (compacted, segment) = compact_component_stream(&two, &artifacts).unwrap();
         assert_eq!(compacted.segment_count, 1);
-        let compacted_artifacts = [(segment.root.artifact_hash, segment.bytes)]
-            .into_iter()
-            .collect();
+        let compacted_pack_hash = decode_component_stream(&compacted).unwrap()[0].pack_hash;
+        let compacted_artifacts = [(compacted_pack_hash, segment.bytes)].into_iter().collect();
         for stable_key in [key(1), key(2), key(3), key(4)] {
             assert_eq!(
                 resolve_component_record(&two, &artifacts, stable_key).unwrap(),
@@ -675,7 +703,9 @@ mod tests {
         let segments = (1_u64..=70_000)
             .map(|sequence| ComponentSegmentDescriptor {
                 sequence,
-                artifact_hash: *blake3::hash(&sequence.to_le_bytes()).as_bytes(),
+                pack_hash: *blake3::hash(&sequence.to_le_bytes()).as_bytes(),
+                pack_offset: 0,
+                segment_hash: *blake3::hash(&sequence.to_be_bytes()).as_bytes(),
                 encoded_bytes: 100,
                 logical_bytes: 80,
                 records: 1,
@@ -695,13 +725,10 @@ mod tests {
     #[test]
     fn artifact_identity_is_verified_before_reading() {
         let component = ComponentIdentity::ProjectedState;
-        let segment = sealed(component, &[(1, Some(b"state"))]);
+        let (segment, mut corrupted) = packed(sealed(component, &[(1, Some(b"state"))]));
         let directory = append_component_delta(None, &segment).unwrap();
-        let mut corrupted = segment.bytes;
         corrupted[0] ^= 1;
-        let artifacts = [(segment.root.artifact_hash, corrupted)]
-            .into_iter()
-            .collect();
+        let artifacts = [(segment.pack_hash, corrupted)].into_iter().collect();
         assert!(matches!(
             resolve_component_record(&directory, &artifacts, key(1)),
             Err(IndexError::Integrity)
