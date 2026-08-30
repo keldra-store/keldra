@@ -31,17 +31,17 @@ pub use projected_state::{
 pub use projector::{merge_projected_document_states, projected_document_states};
 pub use publication::{PreparedProjectionGeneration, prepare_projection_generation};
 pub use stream::{
-    COMPONENT_STREAM_DIRECTORY_FANOUT, ComponentSegmentDescriptor, ComponentStreamAppend,
-    ComponentStreamDirectory, ComponentStreamRoot, EncodedComponentStreamPage,
-    append_component_delta, append_component_stream, build_component_stream,
-    compact_component_stream, component_stream_child_hashes, decode_component_stream,
-    resolve_component_record,
+    COMPONENT_STREAM_DIRECTORY_FANOUT, ComponentRecordLookup, ComponentSegmentDescriptor,
+    ComponentStreamAppend, ComponentStreamDirectory, ComponentStreamRoot,
+    EncodedComponentStreamPage, append_component_delta, append_component_stream,
+    build_component_stream, compact_component_stream, component_stream_child_hashes,
+    decode_component_stream, lookup_component_record_in_pack, resolve_component_record,
 };
 
 pub const INDEX_FORMAT_VERSION: u16 = 5;
 pub use buffer::{
     ComponentDeltaRecord, DecodedComponentDelta, ProjectionMutationBuffer, SealedComponentDelta,
-    decode_component_delta, decode_component_delta_segment,
+    decode_component_delta, decode_component_delta_segment, decode_source_records,
 };
 pub use codec::{
     COMPONENT_DIRECTORY_FANOUT, ComponentDirectory, EncodedComponentDirectoryPage,

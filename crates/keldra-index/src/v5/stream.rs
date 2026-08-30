@@ -27,6 +27,16 @@ pub struct ComponentSegmentDescriptor {
     pub records: u64,
 }
 
+/// Result of looking up one stable key in one verified component delta. A
+/// tombstone is distinct from a missing key so callers walking newest-to-oldest
+/// streams stop at the first explicit deletion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComponentRecordLookup {
+    Missing,
+    Tombstone,
+    Value(Vec<u8>),
+}
+
 impl ComponentSegmentDescriptor {
     fn validate(&self) -> Result<(), IndexError> {
         if self.sequence == 0
@@ -358,16 +368,36 @@ pub fn resolve_component_record(
         let pack = artifacts
             .get(&descriptor.pack_hash)
             .ok_or(IndexError::Integrity)?;
-        let bytes = validate_artifact(directory.component, descriptor, pack)?;
-        let decoded = decode_component_delta_segment(bytes)?;
-        if let Ok(index) = decoded
-            .records
-            .binary_search_by_key(&stable_key, |record| record.stable_key)
-        {
-            return Ok(decoded.records[index].replacement.clone());
+        match lookup_component_record_in_pack(directory.component, descriptor, pack, stable_key)? {
+            ComponentRecordLookup::Missing => {}
+            ComponentRecordLookup::Tombstone => return Ok(None),
+            ComponentRecordLookup::Value(value) => return Ok(Some(value)),
         }
     }
     Ok(None)
+}
+
+/// Verify one exact pack/segment descriptor and look up a stable key without
+/// retaining or decoding unrelated packs. This is the async runtime seam: the
+/// caller loads packs newest-to-oldest and stops on `Tombstone` or `Value`.
+pub fn lookup_component_record_in_pack(
+    component: ComponentIdentity,
+    descriptor: &ComponentSegmentDescriptor,
+    pack: &[u8],
+    stable_key: StableDocumentKey,
+) -> Result<ComponentRecordLookup, IndexError> {
+    let bytes = validate_artifact(component, descriptor, pack)?;
+    let decoded = decode_component_delta_segment(bytes)?;
+    let Ok(index) = decoded
+        .records
+        .binary_search_by_key(&stable_key, |record| record.stable_key)
+    else {
+        return Ok(ComponentRecordLookup::Missing);
+    };
+    Ok(match decoded.records[index].replacement.clone() {
+        Some(value) => ComponentRecordLookup::Value(value),
+        None => ComponentRecordLookup::Tombstone,
+    })
 }
 
 /// Fold every historical delta into one self-contained segment. Tombstones are
@@ -953,6 +983,16 @@ mod tests {
         assert_eq!(
             resolve_component_record(&two, &artifacts, key(2)).unwrap(),
             None
+        );
+        let newest = decode_component_stream(&two).unwrap().pop().unwrap();
+        let newest_pack = artifacts.get(&newest.pack_hash).unwrap();
+        assert_eq!(
+            lookup_component_record_in_pack(component, &newest, newest_pack, key(2)).unwrap(),
+            ComponentRecordLookup::Tombstone
+        );
+        assert_eq!(
+            lookup_component_record_in_pack(component, &newest, newest_pack, key(3)).unwrap(),
+            ComponentRecordLookup::Missing
         );
     }
 

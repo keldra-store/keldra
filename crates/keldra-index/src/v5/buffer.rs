@@ -305,6 +305,37 @@ fn encode_source_records(
     Ok(bytes)
 }
 
+/// Decode and verify the exact stable-key expansion retained for one source
+/// object. Callers use this locator before loading prior projected states, so a
+/// malformed path or ordinal/key mismatch fails before any component lookup.
+pub fn decode_source_records(
+    source_scope: [u8; 32],
+    expected_path: &str,
+    bytes: &[u8],
+) -> Result<Vec<StableDocumentKey>, IndexError> {
+    let mut input = Decoder::new(bytes);
+    let path_length = input.u32()? as usize;
+    let path = std::str::from_utf8(input.take(path_length)?)
+        .map_err(|_| IndexError::Decode("source-record path is not UTF-8".into()))?;
+    let count = input.u32()? as usize;
+    if path != expected_path || count == 0 || count > input.remaining() / 32 {
+        return Err(IndexError::InvalidFormat(
+            "source-record locator is invalid or unbounded",
+        ));
+    }
+    let mut keys = Vec::with_capacity(count);
+    for ordinal in 0..count {
+        let key = StableDocumentKey::from_bytes(input.array_32()?)?;
+        let ordinal = u32::try_from(ordinal).map_err(|_| IndexError::OffsetOverflow)?;
+        if key != StableDocumentKey::derive(source_scope, expected_path, ordinal)? {
+            return Err(IndexError::Integrity);
+        }
+        keys.push(key);
+    }
+    input.finish()?;
+    Ok(keys)
+}
+
 fn accounted_record_bytes(value: &Option<Vec<u8>>) -> usize {
     ENTRY_ACCOUNTING_BYTES.saturating_add(value.as_ref().map_or(0, Vec::len))
 }
@@ -528,6 +559,9 @@ impl<'a> Decoder<'a> {
     fn u16(&mut self) -> Result<u16, IndexError> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
+    fn u32(&mut self) -> Result<u32, IndexError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
     fn u64(&mut self) -> Result<u64, IndexError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
@@ -684,6 +718,7 @@ mod tests {
             state_record(1, 1, b"removed", b"stable"),
         ];
         let current = vec![state_record(2, 0, b"first", b"stable")];
+        let current_key = current[0].head.stable_key;
         let mut buffer = ProjectionMutationBuffer::new(64 * 1024).unwrap();
         buffer
             .apply_source_states([9; 32], "objects/a", 2, current, previous)
@@ -693,11 +728,16 @@ mod tests {
             .iter()
             .find(|delta| delta.component == ComponentIdentity::SourceRecords)
             .unwrap();
+        let locator_records = decode_component_delta(locator.bytes.as_slice()).unwrap();
+        assert_eq!(locator_records.len(), 1);
         assert_eq!(
-            decode_component_delta(locator.bytes.as_slice())
-                .unwrap()
-                .len(),
-            1
+            decode_source_records(
+                [9; 32],
+                "objects/a",
+                locator_records[0].replacement.as_deref().unwrap(),
+            )
+            .unwrap(),
+            vec![current_key]
         );
         let membership = sealed
             .iter()

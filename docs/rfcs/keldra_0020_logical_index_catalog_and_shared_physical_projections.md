@@ -788,9 +788,16 @@ Implemented groundwork on `feat/shared-index-projection`:
   process restart, verify its referenced generation hash and revision, load the
   bounded component-directory Merkle pages by content hash, and reject missing,
   duplicated, cyclic, oversized, deleted, or identity-mismatched artifacts
-  before exposing the decoded generation. Component streams and their packs
-  remain the next runtime opening boundary; loading the generation alone is not
-  claimed as a query or writer cutover.
+  before exposing the decoded generation;
+- the same reader reopens component-stream directories under their committed
+  page-count and byte bounds, verifies exact pack and segment identities, and
+  resolves stable keys newest-to-oldest while distinguishing an explicit
+  tombstone from a miss. Source-record locators are verified against the exact
+  source path and every derived stable-key ordinal before prior projected state
+  is admitted. Runtime generation advancement reuses the verified predecessor
+  pages, publishes all new immutable artifacts, and CAS-installs `current` last.
+  This is now a complete restart-safe storage seam, but it is not yet the source
+  journal or public query cutover.
 
 This does not yet satisfy Milestone B for field subsets. Independent component
 generation ownership and bindings remain required before different complete
