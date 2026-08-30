@@ -671,6 +671,18 @@ invisible after the full 1,800-second drain allowance. Its archive SHA-256 is
 `d761a73f78ad4b70af3d5c8558c9dd60fac85f8f7f1fe3fca8cfc86a3d314aca`.
 This is an overload bound, not a successful SSD service-rate result.
 
+Catalog scale was qualified separately at server commit `ecab0a14b49f`. On the
+8-core SSD host, 250,000 definitions were created in 333.24 seconds at 750.21
+definitions/s. A clean restart recovered and listed all 250,000 definitions and
+served three exact sampled reads in 203.83 seconds. The independent assignment
+collector performed zero lag-triggered snapshots, its coalescing map peaked at
+1,905 pending definitions, and server residency peaked at 1,551,940 KiB RSS and
+91 threads during creation (568,628 KiB and 58 threads after restart). The
+archive SHA-256 is
+`a725cbb768a8f3e83d154bc67046adc85270a8611771d3d8772b77f4f8e072c6`.
+This proves the sparse logical-catalog requirement on SSD; it is not evidence
+that arbitrary distinct physical recipes have zero maintenance cost.
+
 Server commit `1ce4fa290d23` subsequently repeated the rotational gate with two
 alternating logical schema variants: reordered fields and different public
 aliases bound the same recipes. All 71,973 offered operations were accepted at

@@ -512,3 +512,20 @@ The derived runtime drains that map at its normal boundaries; only genuine lag
 inside the collector invokes the exact durable snapshot. This candidate must
 show zero collector-lag replacements during Catalog-250K before the control
 plane is considered scalable.
+
+Server commit `ecab0a14b49f` passed that Catalog-250K gate on the 8-core SSD
+host. It created 250,000 definitions with concurrency 64 in 333.24 seconds
+(750.21 definitions/s), then restarted the server from the same volume and
+listed all 250,000 definitions plus three exact sampled reads in 203.83 seconds.
+The assignment collector reported zero lag replacements. Its pending map
+peaked at 1,905 entries and repeatedly returned to double digits or zero while
+creation continued. The server peaked at 1,551,940 KiB RSS and 91 threads
+during creation; after restart it peaked at 568,628 KiB and 58 threads. There
+was no definition-proportional task or thread growth. The evidence archive
+SHA-256 is
+`a725cbb768a8f3e83d154bc67046adc85270a8611771d3d8772b77f4f8e072c6`.
+
+This is a control-plane and recovery result. It proves that a large logical
+catalog is cheap resident metadata; it does not claim that 250,000 distinct
+recipes can all maintain changed physical fields for free. The rotational-host
+Catalog-250K cell and the distinct-recipe/HOT gates remain in progress.
