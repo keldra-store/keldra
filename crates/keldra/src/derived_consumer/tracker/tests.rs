@@ -227,6 +227,32 @@ fn published_proof_releases_only_the_effects_it_covers() {
 }
 
 #[test]
+fn publication_ahead_of_the_status_poll_is_clamped_without_rebuilding_inventory() {
+    let status = source(1, 5);
+    let assignment = assignment(DefinitionKind::Index, 1);
+    let mut inventory = SparseDerivedInventory::begin(
+        DerivedConsumerKind::Index,
+        NodeId(3),
+        fence(),
+        [(status, None)],
+    )
+    .unwrap();
+    inventory
+        .record_affected(&assignment, status.source_id, 5, None, None, None)
+        .unwrap();
+    let mut tracker = inventory.finish();
+
+    tracker
+        .observe_proof(&assignment, &barrier(&[(status, 100)]))
+        .unwrap();
+
+    assert_eq!(tracker.affected_len(status.source_id), 0);
+    let checkpoint = tracker.checkpoints().unwrap();
+    assert_eq!(checkpoint.len(), 1);
+    assert_eq!(checkpoint[0].next_offset, 6);
+}
+
+#[test]
 fn unpublished_construction_state_cannot_release_a_routed_effect() {
     let status = source(1, 20);
     let assignment = assignment(DefinitionKind::Index, 1);
