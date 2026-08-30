@@ -740,7 +740,13 @@ Implemented groundwork on `feat/shared-index-projection`:
 - tenant/bucket-scoped membership and field recipe identities cover selectors,
   value semantics, capabilities, formats, and component codec versions;
 - runtime catalog plans reference-count those recipes transactionally and emit
-  bounded aggregate telemetry; and
+  bounded aggregate telemetry. The catalog now also groups definitions by the
+  full projection-family identity and compiles one deterministic schema from
+  the distinct field-recipe union: adding another public alias or equivalent
+  definition increments only reference counts, while adding a genuinely new
+  recipe adds exactly one physical field. A focused three-definition
+  regression proves that two aliases plus one distinct selector produce one
+  family containing two, not three, physical fields; and
 - native field IDs are canonicalized by recipe identity while public names are
   excluded from the segment schema fingerprint. Complete schemas which differ
   only by field declaration order or public aliases now share the same actual
@@ -799,9 +805,13 @@ Implemented groundwork on `feat/shared-index-projection`:
   This is now a complete restart-safe storage seam, but it is not yet the source
   journal or public query cutover.
 
-This does not yet satisfy Milestone B for field subsets. Independent component
-generation ownership and bindings remain required before different complete
-schema sets may share only their compatible fields.
+The in-memory catalog and projection pass now satisfy the field-subset grouping
+rule: one payload is parsed against the family's distinct-recipe union and is
+converted into canonical format-v5 projected-document state once. The
+production source-journal writer does not yet call that family pass, and public
+queries do not yet resolve logical bindings through independently reusable
+component generations. Those two cutovers remain before Milestone B is
+complete.
 
 ### 18.3 Milestone C: projected-document state
 

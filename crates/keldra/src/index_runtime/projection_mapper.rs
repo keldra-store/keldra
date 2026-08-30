@@ -12,13 +12,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use keldra_index::IndexKind;
-use keldra_index::v4::Schema;
 use keldra_index::v4::build::MergeMutation;
+use keldra_index::v4::{FieldId, FieldSchema, Schema};
+use keldra_index::v5::{ProjectedDocumentState, projected_document_states};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
 
-use super::catalog::{CatalogDefinition, CatalogIdentity, PhysicalRecipeIdentity};
+use super::catalog::{
+    CatalogDefinition, CatalogIdentity, PhysicalRecipeIdentity, ProjectionFamilyIdentity,
+};
 use super::cpu::IndexCpuPool;
 use super::json_projection::{ProjectedScalarPointers, project_scalar_pointers};
 use super::source::{IndexBuildDiagnostics, IndexBuildObject, IndexSourceMutation};
@@ -79,9 +82,22 @@ struct ProjectionRoute {
 #[derive(Default)]
 struct DefinitionPlans {
     definitions: BTreeMap<CatalogIdentity, RegisteredDefinition>,
+    logical_families: BTreeMap<CatalogIdentity, ProjectionFamilyIdentity>,
+    families: BTreeMap<ProjectionFamilyIdentity, RegisteredFamily>,
     buckets: BTreeMap<(u64, u64), BucketSelectorPlan>,
     membership_recipes: BTreeMap<PhysicalRecipeIdentity, RegisteredMembership>,
     field_recipes: BTreeMap<PhysicalRecipeIdentity, RegisteredRecipe>,
+}
+
+struct RegisteredFamily {
+    template: Schema,
+    definitions: usize,
+    fields: BTreeMap<[u8; 32], RegisteredFamilyField>,
+}
+
+struct RegisteredFamilyField {
+    field: FieldSchema,
+    references: usize,
 }
 
 struct RegisteredMembership {
@@ -403,6 +419,142 @@ fn selector_reference_increments(
     Ok(increments)
 }
 
+fn add_family_definition(
+    plans: &mut DefinitionPlans,
+    definition: &CatalogDefinition,
+) -> Result<(), Status> {
+    if definition.schema.kind != IndexKind::TypedJson {
+        return Ok(());
+    }
+    let identity = definition.projection_family_identity();
+    let mut template = definition.schema.clone();
+    template.fields.clear();
+    template.physical_order.clear();
+    let recipes = definition
+        .recipe_fingerprints
+        .fields
+        .iter()
+        .copied()
+        .zip(&definition.schema.fields)
+        .collect::<Vec<_>>();
+    if let Some(family) = plans.families.get(&identity) {
+        if family.template != template {
+            return Err(Status::data_loss(
+                "one projection family resolved to conflicting membership semantics",
+            ));
+        }
+        family
+            .definitions
+            .checked_add(1)
+            .ok_or_else(|| Status::resource_exhausted("projection family references overflow"))?;
+        for (recipe, field) in &recipes {
+            if let Some(existing) = family.fields.get(recipe) {
+                if !same_physical_field(&existing.field, field) {
+                    return Err(Status::data_loss(
+                        "one field recipe resolved to conflicting physical semantics",
+                    ));
+                }
+                existing.references.checked_add(1).ok_or_else(|| {
+                    Status::resource_exhausted("projection family field references overflow")
+                })?;
+            }
+        }
+    }
+    let family = plans
+        .families
+        .entry(identity)
+        .or_insert_with(|| RegisteredFamily {
+            template,
+            definitions: 0,
+            fields: BTreeMap::new(),
+        });
+    family.definitions = family
+        .definitions
+        .checked_add(1)
+        .ok_or_else(|| Status::resource_exhausted("projection family references overflow"))?;
+    for (recipe, field) in recipes {
+        match family.fields.get_mut(&recipe) {
+            Some(existing) => {
+                existing.references = existing.references.checked_add(1).ok_or_else(|| {
+                    Status::resource_exhausted("projection family field references overflow")
+                })?;
+            }
+            None => {
+                family.fields.insert(
+                    recipe,
+                    RegisteredFamilyField {
+                        field: field.clone(),
+                        references: 1,
+                    },
+                );
+            }
+        }
+    }
+    if plans
+        .logical_families
+        .insert(definition.identity(), identity)
+        .is_some()
+    {
+        return Err(Status::internal(
+            "projection family logical definition was registered twice",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_family_definition(
+    plans: &mut DefinitionPlans,
+    identity: CatalogIdentity,
+    definition: &RegisteredDefinition,
+) -> Result<(), Status> {
+    let Some(family_identity) = plans.logical_families.remove(&identity) else {
+        return Ok(());
+    };
+    let remove_family = {
+        let family = plans
+            .families
+            .get_mut(&family_identity)
+            .ok_or_else(|| Status::internal("registered projection family is absent"))?;
+        family.definitions = family
+            .definitions
+            .checked_sub(1)
+            .ok_or_else(|| Status::internal("projection family references underflow"))?;
+        let recipes = definition
+            .recipes
+            .iter()
+            .map(|(identity, _)| identity.fingerprint)
+            .collect::<Vec<_>>();
+        for recipe in recipes {
+            let field = family
+                .fields
+                .get_mut(&recipe)
+                .expect("collected family field remains present");
+            field.references = field
+                .references
+                .checked_sub(1)
+                .ok_or_else(|| Status::internal("projection family field references underflow"))?;
+            if field.references == 0 {
+                family.fields.remove(&recipe);
+            }
+        }
+        family.definitions == 0
+    };
+    if remove_family {
+        plans.families.remove(&family_identity);
+    }
+    Ok(())
+}
+
+fn same_physical_field(left: &FieldSchema, right: &FieldSchema) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.id = FieldId::new(0);
+    right.id = FieldId::new(0);
+    left.name.clear();
+    right.name.clear();
+    left == right
+}
+
 fn compile_selector_plan(schema: &Schema) -> CompiledSelectorPlan {
     let selectors = schema
         .fields
@@ -526,6 +678,7 @@ impl SharedProjectionMapper {
             .lock()
             .map_err(|_| Status::internal("shared projection definition lock is poisoned"))?;
         if let Some(previous) = plans.definitions.remove(&definition.identity()) {
+            remove_family_definition(&mut plans, definition.identity(), &previous)?;
             remove_registered_definition(&mut plans, previous)?;
         }
         if definition.schema.kind == IndexKind::TypedJson {
@@ -556,6 +709,10 @@ impl SharedProjectionMapper {
                     .collect(),
             };
             add_registered_definition(&mut plans, &registered)?;
+            if let Err(error) = add_family_definition(&mut plans, definition) {
+                remove_registered_definition(&mut plans, registered)?;
+                return Err(error);
+            }
             plans.definitions.insert(definition.identity(), registered);
         }
         Ok(())
@@ -568,9 +725,105 @@ impl SharedProjectionMapper {
             .lock()
             .map_err(|_| Status::internal("shared projection definition lock is poisoned"))?;
         if let Some(previous) = plans.definitions.remove(&identity) {
+            remove_family_definition(&mut plans, identity, &previous)?;
             remove_registered_definition(&mut plans, previous)?;
         }
         Ok(())
+    }
+
+    /// Compile the current distinct physical recipe union for one family.
+    /// Logical aliases and duplicate definitions consume no fields here; the
+    /// returned schema grows only when a new physical recipe is registered.
+    pub(crate) fn family_schema(
+        &self,
+        identity: ProjectionFamilyIdentity,
+    ) -> Result<Option<Schema>, Status> {
+        let plans = self
+            .inner
+            .definitions
+            .lock()
+            .map_err(|_| Status::internal("shared projection definition lock is poisoned"))?;
+        let Some(family) = plans.families.get(&identity) else {
+            return Ok(None);
+        };
+        compile_family_schema(family).map(Some)
+    }
+
+    /// Project one source once through the current distinct-recipe union for a
+    /// physical family. Logical aliases and equivalent definitions never enter
+    /// this loop. Half of the caller's bound is reserved for the native
+    /// projection and half for canonical persisted state while both coexist.
+    pub(crate) async fn project_family(
+        &self,
+        identity: ProjectionFamilyIdentity,
+        source: IndexSourceMutation,
+        maximum_projection_bytes: usize,
+    ) -> Result<(Vec<ProjectedDocumentState>, IndexBuildDiagnostics), Status> {
+        let schema = self
+            .family_schema(identity)?
+            .ok_or_else(|| Status::failed_precondition("projection family is not registered"))?;
+        let native_limit = maximum_projection_bytes / 2;
+        if native_limit == 0 {
+            return Err(Status::resource_exhausted(
+                "projection family has no admitted native workspace",
+            ));
+        }
+        let payload = match &source {
+            IndexSourceMutation::Upsert(object) if source_matches_schema(&schema, object) => Some(
+                self.inner
+                    .reader
+                    .open_blob_payload(&keldra_store::BlobRef {
+                        hash: object.content_hash,
+                        length: object.content_length,
+                    })
+                    .await?,
+            ),
+            _ => None,
+        };
+        let projected = self
+            .inner
+            .cpu
+            .submit(move || {
+                let mut payload = payload;
+                project_mutation(
+                    &schema,
+                    source,
+                    payload
+                        .as_mut()
+                        .map(|reader| reader as &mut dyn std::io::Read),
+                    native_limit,
+                )
+                .and_then(|(mutation, diagnostics)| {
+                    let states = match mutation {
+                        MergeMutation::Upsert(source) => {
+                            projected_document_states(&schema, &source)?
+                        }
+                        MergeMutation::Delete(_) => Vec::new(),
+                    };
+                    let retained = states.iter().try_fold(0_usize, |total, state| {
+                        total
+                            .checked_add(state.resident_bytes()?)
+                            .ok_or(keldra_index::IndexError::OffsetOverflow)
+                    })?;
+                    if retained > native_limit {
+                        return Err(keldra_index::IndexError::ResourceLimit {
+                            needed: retained,
+                            limit: native_limit,
+                        });
+                    }
+                    Ok((states, diagnostics))
+                })
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .map_err(index_status)?;
+        tracing::debug!(
+            projection.family = %hex::encode(identity.family_id),
+            projection.records = projected.0.len(),
+            monotonic_counter.keldra_index_projection_family_source_passes_total = 1_u64,
+            "source projected once through distinct family recipes"
+        );
+        Ok(projected)
     }
 
     pub(crate) async fn project(
@@ -998,18 +1251,19 @@ impl SharedProjectionMapper {
             .lock()
             .map(|cache| (cache.entries.len() as u64, cache.used_bytes as u64))
             .unwrap_or((0, 0));
-        let (logical_definitions, membership_recipes, field_recipes) = self
+        let (logical_definitions, projection_families, membership_recipes, field_recipes) = self
             .inner
             .definitions
             .lock()
             .map(|plans| {
                 (
                     plans.definitions.len() as u64,
+                    plans.families.len() as u64,
                     plans.membership_recipes.len() as u64,
                     plans.field_recipes.len() as u64,
                 )
             })
-            .unwrap_or((0, 0, 0));
+            .unwrap_or((0, 0, 0, 0));
         tracing::info!(
             projection.requests = requests,
             projection.payload_parses = self.inner.telemetry.payload_parses.load(Ordering::Relaxed),
@@ -1019,11 +1273,22 @@ impl SharedProjectionMapper {
             projection.cache_entries = cache_entries,
             projection.cache_bytes = cache_bytes,
             projection.logical_definitions = logical_definitions,
+            projection.families = projection_families,
             projection.membership_recipes = membership_recipes,
             projection.field_recipes = field_recipes,
             "shared index projection cumulative summary"
         );
     }
+}
+
+fn compile_family_schema(family: &RegisteredFamily) -> Result<Schema, Status> {
+    let mut schema = family.template.clone();
+    schema.fields = family
+        .fields
+        .values()
+        .map(|registered| registered.field.clone())
+        .collect();
+    schema.canonicalize_physical_fields().map_err(index_status)
 }
 
 impl ProjectionCache {
@@ -1097,7 +1362,15 @@ fn index_status(error: keldra_index::IndexError) -> Status {
 
 #[cfg(test)]
 mod tests {
+    use keldra_api::v1::index_field;
+    use keldra_api::v1::index_specification::Specification;
+    use keldra_api::v1::{
+        CreateIndexRequest, IndexField, IndexFieldCapability, IndexFieldCardinality,
+        IndexSpecification, KeywordIndexField, TypedJsonIndexSpec,
+    };
+
     use super::*;
+    use crate::index_service::StoredIndexDefinition;
 
     fn key(ordinal: u64) -> SourceProjectionKey {
         SourceProjectionKey {
@@ -1213,6 +1486,35 @@ mod tests {
         }
     }
 
+    fn family_definition(index_id: u64, name: &str, pointer: &str) -> CatalogDefinition {
+        let field = IndexField {
+            name: name.into(),
+            json_pointer: pointer.into(),
+            cardinality: IndexFieldCardinality::Single as i32,
+            capabilities: vec![IndexFieldCapability::Exact as i32],
+            field_type: Some(index_field::FieldType::Keyword(KeywordIndexField {})),
+        };
+        let stored = StoredIndexDefinition::create(
+            "tenant".into(),
+            CreateIndexRequest {
+                bucket: "bucket".into(),
+                name: format!("family-{index_id}"),
+                path_prefix: "records/".into(),
+                content_type: "application/json".into(),
+                specification: Some(IndexSpecification {
+                    specification: Some(Specification::TypedJson(TypedJsonIndexSpec {
+                        fields: vec![field],
+                        physical_order: Vec::new(),
+                    })),
+                }),
+                command_id: format!("family-{index_id}"),
+            },
+            index_id,
+        )
+        .unwrap();
+        CatalogDefinition::new(1, 2, 1, stored).unwrap()
+    }
+
     #[test]
     fn catalog_updates_compile_direct_scope_and_content_routes() {
         let mut plans = DefinitionPlans::default();
@@ -1277,5 +1579,35 @@ mod tests {
         remove_registered_definition(&mut plans, definition).unwrap();
         assert!(plans.field_recipes.is_empty());
         assert!(plans.buckets.is_empty());
+    }
+
+    #[test]
+    fn family_catalog_grows_with_distinct_recipes_not_logical_aliases() {
+        let first = family_definition(1, "state", "/state");
+        let alias = family_definition(2, "renamed", "/state");
+        let additional = family_definition(3, "priority", "/priority");
+        let identity = first.projection_family_identity();
+        assert_eq!(identity, alias.projection_family_identity());
+        assert_eq!(identity, additional.projection_family_identity());
+
+        let mut plans = DefinitionPlans::default();
+        for definition in [&first, &alias, &additional] {
+            add_family_definition(&mut plans, definition).unwrap();
+        }
+        let family = &plans.families[&identity];
+        assert_eq!(family.definitions, 3);
+        assert_eq!(family.fields.len(), 2);
+        let schema = compile_family_schema(family).unwrap();
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(
+            schema
+                .recipe_fingerprints()
+                .unwrap()
+                .fields
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
     }
 }

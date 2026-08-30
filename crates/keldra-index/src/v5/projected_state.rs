@@ -193,6 +193,35 @@ impl ProjectedDocumentState {
         Ok(())
     }
 
+    /// Concrete retained allocation charged by a runtime while this canonical
+    /// state is held beside the native projection which produced it.
+    pub fn resident_bytes(&self) -> Result<usize, IndexError> {
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(self.head.source_path.capacity())
+            .ok_or(IndexError::OffsetOverflow)?;
+        if let Some(result) = &self.head.result {
+            bytes = bytes
+                .checked_add(result.path.capacity())
+                .ok_or(IndexError::OffsetOverflow)?;
+        }
+        for states in [&self.memberships, &self.fields] {
+            bytes = bytes
+                .checked_add(
+                    states
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<CanonicalRecipeState>())
+                        .ok_or(IndexError::OffsetOverflow)?,
+                )
+                .ok_or(IndexError::OffsetOverflow)?;
+            for state in states {
+                bytes = bytes
+                    .checked_add(state.value.capacity())
+                    .ok_or(IndexError::OffsetOverflow)?;
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Compute the exact independently publishable changes from `previous`.
     ///
     /// Digests are only a fast inequality check. Equal digests still compare
