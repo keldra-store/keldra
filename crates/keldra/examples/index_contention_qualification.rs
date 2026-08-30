@@ -1128,21 +1128,43 @@ async fn wait_canary_on_all(
     canary: Canary,
 ) -> Result<(bool, BTreeSet<u64>)> {
     let mut source_nodes = BTreeSet::new();
-    for (position, name) in names.iter().enumerate() {
-        wait_canary(
-            &channels[position % channels.len()],
-            token,
-            &config.bucket,
-            name,
-            canary,
-            config.visibility_poll,
-            config.request_timeout,
-            config.drain_timeout,
-        )
-        .await?;
-        let mut client = index_client(channels[position % channels.len()].clone(), token)?;
-        let response = marker_query(&mut client, &config.bucket, name, canary.id).await?;
-        if let Some(freshness) = response.freshness {
+    let mut next = names.iter().cloned().enumerate();
+    let mut tasks = JoinSet::new();
+    loop {
+        while tasks.len() < config.query_max_in_flight {
+            let Some((position, name)) = next.next() else {
+                break;
+            };
+            let channel = channels[position % channels.len()].clone();
+            let token = token.to_owned();
+            let bucket = config.bucket.clone();
+            let visibility_poll = config.visibility_poll;
+            let request_timeout = config.request_timeout;
+            let drain_timeout = config.drain_timeout;
+            tasks.spawn(async move {
+                wait_canary(
+                    &channel,
+                    &token,
+                    &bucket,
+                    &name,
+                    canary,
+                    visibility_poll,
+                    request_timeout,
+                    drain_timeout,
+                )
+                .await?;
+                let mut client = index_client(channel, &token)?;
+                Ok::<_, anyhow::Error>(
+                    marker_query(&mut client, &bucket, &name, canary.id)
+                        .await?
+                        .freshness,
+                )
+            });
+        }
+        let Some(completed) = tasks.join_next().await else {
+            break;
+        };
+        if let Some(freshness) = completed.context("final canary task panicked")?? {
             source_nodes.extend(
                 freshness
                     .sources
@@ -1193,73 +1215,115 @@ async fn verify_final_mutable_state(
         };
         authority.insert(path, version);
     }
+    let authority = Arc::new(authority);
     let mut nodes = BTreeSet::new();
     let mut all_observed_tails_available = true;
-    for (position, name) in names.iter().enumerate() {
-        let mut client = index_client(channels[position % channels.len()].clone(), token)?;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            ensure!(
-                !remaining.is_zero(),
-                "index {name} did not converge to authoritative mutable state and zero lag"
-            );
-            let response = tokio::time::timeout(
-                remaining.min(config.request_timeout),
-                class_query(&mut client, &config.bucket, name, "mutable", 1_000),
-            )
-            .await;
-            if let Ok(Ok(response)) = response {
-                let indexed = response
-                    .hits
-                    .iter()
-                    .map(|hit| {
-                        Ok((
-                            hit.address
-                                .as_ref()
-                                .context("mutable query hit omitted address")?
-                                .path
-                                .clone(),
-                            hit.object_version,
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>>>()?;
-                let exact = indexed.len() == response.hits.len() && indexed == authority;
-                if let Some(freshness) = response.freshness {
-                    let source_ids = freshness
-                        .sources
-                        .iter()
-                        .map(|source| source.node_id)
-                        .collect::<BTreeSet<_>>();
-                    let healthy = freshness.initial_build_complete
-                        && !freshness.rebuilding
-                        && freshness.sources.len() == config.endpoints.len()
-                        && source_ids.len() == config.endpoints.len()
-                        && freshness
-                            .sources
-                            .iter()
-                            .all(|source| source.node_id != 0 && source.source_epoch.len() == 32);
-                    let observed_tails_available = freshness
-                        .sources
-                        .iter()
-                        .all(|source| source.observed_tail.is_some());
-                    let no_observed_lag = freshness.sources.iter().all(source_has_no_observed_lag);
-                    if exact && healthy && no_observed_lag {
-                        all_observed_tails_available &= observed_tails_available;
-                        nodes.extend(
-                            freshness
-                                .sources
-                                .into_iter()
-                                .map(|source| source.node_id)
-                                .filter(|id| *id != 0),
-                        );
-                        break;
-                    }
-                }
-            }
-            tokio::time::sleep(config.visibility_poll).await;
+    let mut next = names.iter().cloned().enumerate();
+    let mut tasks = JoinSet::new();
+    loop {
+        while tasks.len() < config.query_max_in_flight {
+            let Some((position, name)) = next.next() else {
+                break;
+            };
+            let channel = channels[position % channels.len()].clone();
+            let token = token.to_owned();
+            let bucket = config.bucket.clone();
+            let visibility_poll = config.visibility_poll;
+            let request_timeout = config.request_timeout;
+            let expected_source_count = config.endpoints.len();
+            let authority = authority.clone();
+            tasks.spawn(async move {
+                verify_one_final_definition(
+                    channel,
+                    token,
+                    bucket,
+                    name,
+                    authority,
+                    deadline,
+                    visibility_poll,
+                    request_timeout,
+                    expected_source_count,
+                )
+                .await
+            });
         }
+        let Some(completed) = tasks.join_next().await else {
+            break;
+        };
+        let (observed_tails_available, source_nodes) =
+            completed.context("final mutable verification task panicked")??;
+        all_observed_tails_available &= observed_tails_available;
+        nodes.extend(source_nodes);
     }
     Ok((true, all_observed_tails_available.then_some(true), nodes))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_one_final_definition(
+    channel: Channel,
+    token: String,
+    bucket: String,
+    name: String,
+    authority: Arc<BTreeMap<String, u64>>,
+    deadline: Instant,
+    visibility_poll: Duration,
+    request_timeout: Duration,
+    expected_source_count: usize,
+) -> Result<(bool, BTreeSet<u64>)> {
+    let mut client = index_client(channel, &token)?;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "index {name} did not converge to authoritative mutable state and zero lag"
+        );
+        let response = tokio::time::timeout(
+            remaining.min(request_timeout),
+            class_query(&mut client, &bucket, &name, "mutable", 1_000),
+        )
+        .await;
+        if let Ok(Ok(response)) = response {
+            let indexed = response
+                .hits
+                .iter()
+                .map(|hit| {
+                    Ok((
+                        hit.address
+                            .as_ref()
+                            .context("mutable query hit omitted address")?
+                            .path
+                            .clone(),
+                        hit.object_version,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let exact = indexed.len() == response.hits.len() && indexed == *authority;
+            if let Some(freshness) = response.freshness {
+                let source_ids = freshness
+                    .sources
+                    .iter()
+                    .map(|source| source.node_id)
+                    .collect::<BTreeSet<_>>();
+                let healthy = freshness.initial_build_complete
+                    && !freshness.rebuilding
+                    && freshness.sources.len() == expected_source_count
+                    && source_ids.len() == expected_source_count
+                    && freshness
+                        .sources
+                        .iter()
+                        .all(|source| source.node_id != 0 && source.source_epoch.len() == 32);
+                let observed_tails_available = freshness
+                    .sources
+                    .iter()
+                    .all(|source| source.observed_tail.is_some());
+                let no_observed_lag = freshness.sources.iter().all(source_has_no_observed_lag);
+                if exact && healthy && no_observed_lag {
+                    return Ok((observed_tails_available, source_ids));
+                }
+            }
+        }
+        tokio::time::sleep(visibility_poll).await;
+    }
 }
 
 fn source_has_no_observed_lag(source: &IndexSourceFreshness) -> bool {
