@@ -64,8 +64,8 @@ pub(super) async fn compact_selected_segments(
     }
 
     let output_identity = SegmentIdentity::new(
-        definition.stored.index_id,
-        definition.object_version,
+        definition.physical_index_id(),
+        definition.physical_definition_version(),
         definition.schema_fingerprint,
         dependencies
             .store
@@ -97,7 +97,7 @@ pub(super) async fn compact_selected_segments(
     let progress = CompactionProgress::default();
     let telemetry = CompactionTelemetry::start(
         IndexTelemetryIdentity {
-            index_id: definition.stored.index_id,
+            index_id: definition.physical_index_id(),
             tenant_id: definition.tenant_id,
             bucket_id: definition.bucket_id,
             kind,
@@ -117,11 +117,12 @@ pub(super) async fn compact_selected_segments(
         definition.stored.bucket.clone(),
         definition.tenant_id,
         definition.bucket_id,
-        definition.stored.index_id,
+        definition.physical_index_id(),
     )
     .map_err(index_status)?;
+    let physical_definition = definition.physical_stored();
     let mut sink = dependencies.publisher.observed_component_sink(
-        &definition.stored,
+        &physical_definition,
         definition.tenant_id,
         definition.bucket_id,
         admission,

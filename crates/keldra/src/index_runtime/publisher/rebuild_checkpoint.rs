@@ -19,6 +19,7 @@ impl IndexCommitPublisher {
     pub(crate) async fn publish_rebuild_root(
         &self,
         definition: &StoredIndexDefinition,
+        definition_object_version: VersionId,
         tenant_id: u64,
         bucket_id: u64,
         root: &DurableRebuildRoot,
@@ -64,7 +65,7 @@ impl IndexCommitPublisher {
                     definition_guard: Some(DefinitionVersionGuard {
                         kind: DefinitionKind::Index,
                         exact_path: definition_path(&definition.name)?,
-                        expected_version: VersionId(root.definition_version),
+                        expected_version: definition_object_version,
                     }),
                     definition_intent: None,
                     admission: DerivedArtifactAdmission::PublicationProgress,

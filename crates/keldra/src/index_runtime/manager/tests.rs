@@ -287,6 +287,7 @@ fn definition(tenant_id: u64, bucket_id: u64, index_id: u64) -> CatalogDefinitio
 
 fn queue_definition(scheduler: &mut BuilderScheduler, definition: CatalogDefinition) {
     let identity = definition.identity();
+    let physical = definition.physical_identity();
     let job = BuilderJob::new(definition.clone()).unwrap();
     scheduler.entries.insert(
         identity,
@@ -297,11 +298,14 @@ fn queue_definition(scheduler: &mut BuilderScheduler, definition: CatalogDefinit
             wake_pending: false,
         },
     );
+    scheduler.physical_entries.insert(physical, identity);
+    scheduler.logical_entries.insert(identity, physical);
     scheduler.enqueue(identity);
 }
 
 fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogDefinition) {
     let identity = definition.identity();
+    let physical = definition.physical_identity();
     let mut job = BuilderJob::new(definition.clone()).unwrap();
     let progress = BuilderProgress::start(job.telemetry_identity(), BuilderProgressPhase::CatchUp);
     job.phase = BuilderPhase::CatchUp(CatchUpWork {
@@ -327,6 +331,8 @@ fn queue_dirty_definition(scheduler: &mut BuilderScheduler, definition: CatalogD
             wake_pending: false,
         },
     );
+    scheduler.physical_entries.insert(physical, identity);
+    scheduler.logical_entries.insert(identity, physical);
     scheduler.enqueue(identity);
 }
 
@@ -548,7 +554,7 @@ fn successful_publish_yields_a_lease_to_a_later_assignment() {
     assert_eq!(scheduler.remaining_capacity(), 0);
     assert!(
         catalog
-            .take(later_identity, scheduler.can_admit(later_identity))
+            .take(later_identity, |_| scheduler.can_admit(later_identity))
             .unwrap()
             .is_none()
     );
@@ -576,7 +582,7 @@ fn successful_publish_yields_a_lease_to_a_later_assignment() {
     );
 
     let admitted = catalog
-        .take(later_identity, scheduler.can_admit(later_identity))
+        .take(later_identity, |_| scheduler.can_admit(later_identity))
         .unwrap()
         .expect("later durable assignment should acquire the yielded lease");
     let CatalogChange::Upsert(later) = admitted else {

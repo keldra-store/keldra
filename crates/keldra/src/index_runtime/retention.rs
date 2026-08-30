@@ -15,6 +15,7 @@ use crate::index_service::{StoredIndexDefinition, definition_path};
 use crate::logical_name_resolution::LogicalNameResolver;
 
 use super::cache::IndexMergeScratchSpace;
+use super::catalog::CatalogDefinition;
 use super::committed_view::{
     CommitManifestReference, IndexCommitManifest, IndexCurrentPointer, LocatorPackOwnership,
     ReleasingManifestReference,
@@ -194,17 +195,16 @@ impl IndexCommitRetention {
     /// only restart-safe evidence that bounded retention work is due.
     pub(crate) fn schedule(
         &self,
-        definition: &StoredIndexDefinition,
-        tenant_id: u64,
-        bucket_id: u64,
+        definition: &CatalogDefinition,
         current: &CommittedIndexView,
     ) -> Result<(), Status> {
-        require_current_identity(definition, current)?;
+        let physical = definition.physical_stored();
+        require_current_identity(&physical, current)?;
         let due = commit_due(
-            definition,
-            tenant_id,
-            bucket_id,
-            current.manifest.definition_version,
+            &physical,
+            definition.tenant_id,
+            definition.bucket_id,
+            definition.object_version,
             current.manifest.revision,
             now_unix_millis()?,
         )?;
@@ -212,10 +212,10 @@ impl IndexCommitRetention {
             .schedule_index_commit_retention(&due)
             .map_err(retention_due_status)?;
         self.orphans.schedule_if_absent(
-            definition,
-            tenant_id,
-            bucket_id,
-            current.manifest.definition_version,
+            &physical,
+            definition.tenant_id,
+            definition.bucket_id,
+            definition.object_version,
         )
     }
 
@@ -461,30 +461,37 @@ impl IndexCommitRetention {
                 "scheduled index definition is no longer live",
             ));
         };
-        if locator.definition_id != due.index_id {
-            return Err(Status::data_loss(
-                "scheduled index locator belongs to another index",
-            ));
-        }
         let Some(object) = load_definition_locator_object(&self.reader, &locator).await? else {
             return Err(Status::unavailable(
                 "scheduled index definition changed during exact read",
             ));
         };
         let definition = StoredIndexDefinition::decode(&object.bytes)?;
-        if definition.index_id != due.index_id
+        if definition.index_id != locator.definition_id
             || definition_path(&definition.name)? != due.definition_path
         {
             return Err(Status::data_loss(
                 "scheduled retention definition identity is inconsistent",
             ));
         }
+        let catalog = CatalogDefinition::new(
+            due.tenant_id,
+            due.bucket_id,
+            locator.object_version.0,
+            definition,
+        )?;
+        if catalog.physical_index_id() != due.index_id {
+            return Err(Status::data_loss(
+                "scheduled retention physical identity is inconsistent",
+            ));
+        }
+        let definition = catalog.physical_stored();
         let current = self
             .publisher
             .load_current(&definition, due.tenant_id, due.bucket_id)
             .await?
             .ok_or_else(|| Status::unavailable("scheduled index has no current committed view"))?;
-        if current.manifest.definition_version != locator.object_version.0 {
+        if current.manifest.definition_version != catalog.physical_definition_version() {
             return Err(Status::unavailable(
                 "index definition publication has not reached its current revision",
             ));
@@ -505,7 +512,14 @@ impl IndexCommitRetention {
                 .map_err(retention_due_status)?;
             return Ok(None);
         }
-        RetentionJob::new(definition, due.tenant_id, due.bucket_id, current).map(Some)
+        RetentionJob::new(
+            definition,
+            due.tenant_id,
+            due.bucket_id,
+            locator.object_version,
+            current,
+        )
+        .map(Some)
     }
 
     async fn finish_due(
@@ -523,6 +537,7 @@ impl IndexCommitRetention {
                         active.job.tenant_id,
                         active.job.bucket_id,
                         &completed,
+                        active.job.definition_object_version,
                     ),
                 )
                 .await?;
@@ -584,7 +599,7 @@ impl IndexCommitRetention {
                 &active.job.definition,
                 active.job.tenant_id,
                 active.job.bucket_id,
-                active.job.current.manifest.definition_version,
+                active.job.definition_object_version.0,
                 active.job.current.manifest.revision,
                 due_at,
             )?;
@@ -704,6 +719,7 @@ impl IndexCommitRetention {
                         job.bucket_id,
                         &job.current,
                         selected,
+                        job.definition_object_version,
                     ),
                 )
                 .await
@@ -1220,6 +1236,7 @@ struct RetentionJob {
     definition: StoredIndexDefinition,
     tenant_id: u64,
     bucket_id: u64,
+    definition_object_version: VersionId,
     current: CommittedIndexView,
     next_due_unix_millis: Option<u64>,
     cleanup_roots: Vec<ReleasingManifestReference>,
@@ -1232,12 +1249,14 @@ impl RetentionJob {
         definition: StoredIndexDefinition,
         tenant_id: u64,
         bucket_id: u64,
+        definition_object_version: VersionId,
         current: CommittedIndexView,
     ) -> Result<Self, Status> {
         Ok(Self {
             definition,
             tenant_id,
             bucket_id,
+            definition_object_version,
             current,
             next_due_unix_millis: None,
             cleanup_roots: Vec::new(),

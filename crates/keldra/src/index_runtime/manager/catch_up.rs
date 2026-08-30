@@ -1248,7 +1248,7 @@ async fn apply_incremental_mutations(
         definition.stored.bucket.clone(),
         definition.tenant_id,
         definition.bucket_id,
-        definition.stored.index_id,
+        definition.physical_index_id(),
     )
     .map_err(index_status)?;
     let roots = candidate.locator_stream_roots()?;
@@ -1393,8 +1393,8 @@ async fn apply_incremental_mutations(
     }
     if !tombstones.is_empty() {
         let identity = SegmentIdentity::new(
-            definition.stored.index_id,
-            definition.object_version,
+            definition.physical_index_id(),
+            definition.physical_definition_version(),
             definition.schema_fingerprint,
             dependencies
                 .store
@@ -1402,8 +1402,9 @@ async fn apply_incremental_mutations(
                 .map_err(|error| Status::internal(format!("allocate locator ID: {error}")))?,
         )
         .map_err(index_status)?;
+        let physical_definition = definition.physical_stored();
         let mut sink = dependencies.publisher.component_sink(
-            &definition.stored,
+            &physical_definition,
             definition.tenant_id,
             definition.bucket_id,
             DerivedArtifactAdmission::PublicationProgress,

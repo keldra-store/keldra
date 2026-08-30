@@ -136,16 +136,18 @@ impl DerivedEvidenceResolver {
                 else {
                     return Ok(None);
                 };
+                let physical_definition = definition.physical_stored();
                 let current = publisher
                     .load_current(
-                        &definition.stored,
+                        &physical_definition,
                         definition.tenant_id,
                         definition.bucket_id,
                     )
                     .await?;
                 let evidence = current
                     .filter(|current| {
-                        current.manifest.definition_version == definition.object_version
+                        current.manifest.definition_version
+                            == definition.physical_definition_version()
                     })
                     .map(|current| {
                         current

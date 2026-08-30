@@ -33,7 +33,7 @@ pub(super) async fn materialize_pending_live_masks(
             invalidations.clear();
             candidate.restore_live_mask_invalidations(invalidations);
             tracing::info!(
-                index.id = definition.stored.index_id,
+                index.id = definition.physical_index_id(),
                 live_mask.rewrites = materialized.rewrites,
                 live_mask.logical_artifacts = materialized.logical_artifacts,
                 live_mask.logical_bytes = materialized.logical_bytes,
@@ -65,15 +65,16 @@ async fn materialize(
         definition.stored.bucket.clone(),
         definition.tenant_id,
         definition.bucket_id,
-        definition.stored.index_id,
+        definition.physical_index_id(),
     )
     .map_err(index_status)?;
     let routing_codec = definition
         .schema
         .codec_version(keldra_index::v4::ComponentKind::ROUTING_NODE)
         .map_err(index_status)?;
+    let physical_definition = definition.physical_stored();
     let mut sink = dependencies.publisher.component_sink(
-        &definition.stored,
+        &physical_definition,
         definition.tenant_id,
         definition.bucket_id,
         DerivedArtifactAdmission::PublicationProgress,

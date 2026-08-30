@@ -5,6 +5,7 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::placement::PlacementKind;
 
 const QUERY_REPLICA_LIMIT: usize = 3;
+const PROJECTION_PARTITION_ID: u64 = 1;
 
 /// Stable identity used for index placement. Mutable names never participate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -28,6 +29,16 @@ impl IndexIdentity {
             bucket_id,
             index_id,
         })
+    }
+
+    /// Placement authority for all physical projections over one source
+    /// bucket. Logical and physical index IDs deliberately do not participate:
+    /// one assigned source-partition writer must see every shareable recipe.
+    pub(crate) fn projection_partition(
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Self, IndexPlacementError> {
+        Self::new(tenant_id, bucket_id, PROJECTION_PARTITION_ID)
     }
 
     fn placement_key(self) -> [u8; 24] {

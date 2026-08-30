@@ -296,6 +296,20 @@ enum ArtifactPathKind {
     AccountingMutable,
 }
 
+fn artifact_placement_identity(
+    tenant_id: u64,
+    bucket_id: u64,
+    index_id: u64,
+    kind: ArtifactPathKind,
+) -> Result<IndexIdentity, Status> {
+    let identity = if kind == ArtifactPathKind::AccountingMutable {
+        IndexIdentity::new(tenant_id, bucket_id, index_id)
+    } else {
+        IndexIdentity::projection_partition(tenant_id, bucket_id)
+    };
+    identity.map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
 /// Destination-side late-bound handler on the mandatory-mTLS listener.
 #[tonic::async_trait]
 pub(crate) trait IndexArtifactPublication: Send + Sync + 'static {
@@ -536,15 +550,19 @@ impl IndexArtifactCoordinator {
         placement: ClusterPlacement,
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
-        request.validate()?;
+        let kind = request.validate()?;
         // The public/peer middleware already admits routed calls. Builders can
         // also publish locally, so explicitly retain the same existing
         // membership-cutover permit across the definition lock and artifact
         // mutation in that case.
         let _permit = self.objects.enter_mutation()?;
         self.require_fence(placement.fence())?;
-        let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let identity = artifact_placement_identity(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            kind,
+        )?;
         self.validate_index_builder(authenticated_builder, &placement, identity)?;
         let guard = request
             .definition_guard
@@ -608,8 +626,12 @@ impl IndexArtifactCoordinator {
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
         let kind = request.validate()?;
-        let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let identity = artifact_placement_identity(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            kind,
+        )?;
         let key = request.key()?;
         let governance = self
             .governance
@@ -794,7 +816,7 @@ impl IndexArtifactRouter {
         request: IndexArtifactPublish,
         guard: Option<&IndexCurrentMutationGuard>,
     ) -> Result<IndexArtifactOutcome, Status> {
-        request.validate()?;
+        let kind = request.validate()?;
         if request.exact_path == current_path(request.index_id)
             && guard.is_none_or(|guard| guard.index_id != request.index_id)
         {
@@ -802,8 +824,12 @@ impl IndexArtifactRouter {
                 "current-pointer publication has no matching mutation guard",
             ));
         }
-        let placement =
-            self.require_local_builder(request.tenant_id, request.bucket_id, request.index_id)?;
+        let placement = self.require_local_builder_for_kind(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            kind,
+        )?;
         let fence = placement.fence();
         let key = match request.definition_guard.as_ref() {
             Some(guard) => guard.key(&request.storage_tenant, &request.bucket)?,
@@ -859,9 +885,13 @@ impl IndexArtifactRouter {
         request: IndexArtifactDelete,
         _guard: Option<&IndexCurrentMutationGuard>,
     ) -> Result<IndexArtifactOutcome, Status> {
-        request.validate()?;
-        let placement =
-            self.require_local_builder(request.tenant_id, request.bucket_id, request.index_id)?;
+        let kind = request.validate()?;
+        let placement = self.require_local_builder_for_kind(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            kind,
+        )?;
         let fence = placement.fence();
         let key = request.key()?;
         let outcome =
@@ -893,10 +923,10 @@ impl IndexArtifactRouter {
         &self,
         tenant_id: u64,
         bucket_id: u64,
-        index_id: u64,
+        _index_id: u64,
     ) -> Result<bool, Status> {
         let placement = self.objects.current_program_placement()?;
-        let identity = IndexIdentity::new(tenant_id, bucket_id, index_id)
+        let identity = IndexIdentity::projection_partition(tenant_id, bucket_id)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let assignment = IndexPlacement::derive(identity, &placement)
             .map_err(|error| Status::unavailable(error.to_string()))?;
@@ -907,11 +937,30 @@ impl IndexArtifactRouter {
         &self,
         tenant_id: u64,
         bucket_id: u64,
-        index_id: u64,
+        _index_id: u64,
     ) -> Result<ClusterPlacement, Status> {
         let placement = self.objects.current_program_placement()?;
-        let identity = IndexIdentity::new(tenant_id, bucket_id, index_id)
+        let identity = IndexIdentity::projection_partition(tenant_id, bucket_id)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let assignment = IndexPlacement::derive(identity, &placement)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        if assignment.builder() != self.local_node {
+            return Err(Status::failed_precondition(
+                "this node is not the current weighted-HRW index builder",
+            ));
+        }
+        Ok(placement)
+    }
+
+    fn require_local_builder_for_kind(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        index_id: u64,
+        kind: ArtifactPathKind,
+    ) -> Result<ClusterPlacement, Status> {
+        let placement = self.objects.current_program_placement()?;
+        let identity = artifact_placement_identity(tenant_id, bucket_id, index_id, kind)?;
         let assignment = IndexPlacement::derive(identity, &placement)
             .map_err(|error| Status::unavailable(error.to_string()))?;
         if assignment.builder() != self.local_node {
@@ -1063,9 +1112,13 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         self.require_fence(placement.fence())?;
         let mut definition_keys = Vec::with_capacity(requests.len());
         for request in &requests {
-            let identity =
-                IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let kind = request.validate()?;
+            let identity = artifact_placement_identity(
+                request.tenant_id,
+                request.bucket_id,
+                request.index_id,
+                kind,
+            )?;
             self.validate_index_builder(authenticated_builder, &placement, identity)?;
             let key = request
                 .definition_guard
@@ -1167,13 +1220,17 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         placement: ClusterPlacement,
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
-        request.validate()?;
+        let kind = request.validate()?;
         let guard = request
             .definition_guard
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("guarded commit has no definition guard"))?;
-        let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let identity = artifact_placement_identity(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            kind,
+        )?;
         self.validate_index_builder(authenticated_builder, &placement, identity)?;
         let definition_key = guard.key(&request.storage_tenant, &request.bucket)?;
         if self.objects.object_coordinator_stable(
@@ -1200,9 +1257,13 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
     ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
         validate_guarded_batch(&requests)?;
         for request in &requests {
-            let identity =
-                IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let kind = request.validate()?;
+            let identity = artifact_placement_identity(
+                request.tenant_id,
+                request.bucket_id,
+                request.index_id,
+                kind,
+            )?;
             self.validate_index_builder(authenticated_builder, &placement, identity)?;
             let guard = request.definition_guard.as_ref().ok_or_else(|| {
                 Status::invalid_argument("guarded commit has no definition guard")
@@ -1231,8 +1292,12 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         request: IndexArtifactDelete,
     ) -> Result<IndexArtifactOutcome, Status> {
         let kind = request.validate()?;
-        let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let identity = artifact_placement_identity(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            kind,
+        )?;
         let key = request.key()?;
         let governance = self
             .governance

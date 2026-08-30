@@ -38,6 +38,13 @@ pub(crate) struct StoredIndexDefinition {
 }
 
 impl StoredIndexDefinition {
+    pub(crate) fn with_index_id(&self, index_id: u64) -> Self {
+        debug_assert_ne!(index_id, 0);
+        let mut physical = self.clone();
+        physical.index_id = index_id;
+        physical
+    }
+
     pub(crate) fn create(
         tenant: String,
         request: CreateIndexRequest,

@@ -93,8 +93,8 @@ impl NativeSegmentBuild {
             .allocate_snowflake_id()
             .map_err(|error| Status::internal(format!("allocate index segment ID: {error}")))?;
         let identity = SegmentIdentity::new(
-            definition.stored.index_id,
-            definition.object_version,
+            definition.physical_index_id(),
+            definition.physical_definition_version(),
             definition.schema_fingerprint,
             segment_id,
         )

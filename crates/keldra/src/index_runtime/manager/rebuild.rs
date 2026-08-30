@@ -42,9 +42,9 @@ pub(super) async fn start_rebuild_work(
         .map_err(|error| Status::internal(format!("allocate rebuild attempt ID: {error}")))?;
     let candidate = CandidateCommit::rebuild();
     let manifest = IndexCommitManifest::new(
-        job.definition.stored.index_id,
+        job.definition.physical_index_id(),
         attempt_id,
-        job.definition.object_version,
+        job.definition.physical_definition_version(),
         job.definition.schema.kind,
         job.definition.schema_fingerprint,
         &through,
@@ -58,8 +58,8 @@ pub(super) async fn start_rebuild_work(
     )
     .map_err(|error| Status::internal(error.to_string()))?;
     let root = DurableRebuildRoot {
-        index_id: job.definition.stored.index_id,
-        definition_version: job.definition.object_version,
+        index_id: job.definition.physical_index_id(),
+        definition_version: job.definition.physical_definition_version(),
         attempt_id,
         baseline: through.clone(),
         last_canonical_path: None,
@@ -71,7 +71,8 @@ pub(super) async fn start_rebuild_work(
     let loaded = dependencies
         .publisher
         .publish_rebuild_root(
-            &job.definition.stored,
+            &job.definition.physical_stored(),
+            VersionId(job.definition.object_version),
             job.definition.tenant_id,
             job.definition.bucket_id,
             &root,
@@ -158,7 +159,7 @@ pub(super) async fn resume_durable_rebuild(
         && serving_completes_rebuild(
             &loaded.root,
             &serving.manifest,
-            job.definition.object_version,
+            job.definition.physical_definition_version(),
         )
     {
         dependencies
@@ -174,7 +175,7 @@ pub(super) async fn resume_durable_rebuild(
     }
     if rebuild_root_requires_replacement(
         &loaded.root,
-        job.definition.object_version,
+        job.definition.physical_definition_version(),
         job.definition.schema.kind,
         job.definition.schema_fingerprint,
     ) {
@@ -287,9 +288,9 @@ pub(super) async fn checkpoint_catch_up_root(
         .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
         .ok_or_else(|| Status::resource_exhausted("rebuild logical bytes overflow"))?;
     let candidate = IndexCommitManifest::new(
-        job.definition.stored.index_id,
+        job.definition.physical_index_id(),
         loaded.root.attempt_id,
-        job.definition.object_version,
+        job.definition.physical_definition_version(),
         job.definition.schema.kind,
         job.definition.schema_fingerprint,
         &work.through,
@@ -313,7 +314,8 @@ pub(super) async fn checkpoint_catch_up_root(
     dependencies
         .publisher
         .publish_rebuild_root(
-            &job.definition.stored,
+            &job.definition.physical_stored(),
+            VersionId(job.definition.object_version),
             job.definition.tenant_id,
             job.definition.bucket_id,
             &checkpoint,
@@ -559,9 +561,9 @@ async fn persist_rebuild_root(
         .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
         .ok_or_else(|| Status::resource_exhausted("rebuild logical bytes overflow"))?;
     let candidate = IndexCommitManifest::new(
-        job.definition.stored.index_id,
+        job.definition.physical_index_id(),
         work.attempt_id,
-        job.definition.object_version,
+        job.definition.physical_definition_version(),
         job.definition.schema.kind,
         job.definition.schema_fingerprint,
         &work.through,
@@ -575,8 +577,8 @@ async fn persist_rebuild_root(
     )
     .map_err(|error| Status::internal(error.to_string()))?;
     let root = DurableRebuildRoot {
-        index_id: job.definition.stored.index_id,
-        definition_version: job.definition.object_version,
+        index_id: job.definition.physical_index_id(),
+        definition_version: job.definition.physical_definition_version(),
         attempt_id: work.attempt_id,
         baseline: work.through.clone(),
         last_canonical_path: work.last_canonical_path.clone(),
@@ -588,7 +590,8 @@ async fn persist_rebuild_root(
     dependencies
         .publisher
         .publish_rebuild_root(
-            &job.definition.stored,
+            &job.definition.physical_stored(),
+            VersionId(job.definition.object_version),
             job.definition.tenant_id,
             job.definition.bucket_id,
             &root,

@@ -172,11 +172,11 @@ impl IndexArtifactCoordinator {
         validate_immutable_batch(&requests)?;
         let first = &requests[0];
         let admission = first.admission;
-        let identity = IndexIdentity::new(first.tenant_id, first.bucket_id, first.index_id)
+        let identity = IndexIdentity::projection_partition(first.tenant_id, first.bucket_id)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         for request in &requests {
             let candidate =
-                IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
+                IndexIdentity::projection_partition(request.tenant_id, request.bucket_id)
                     .map_err(|error| Status::invalid_argument(error.to_string()))?;
             self.validate_index_builder(authenticated_builder, &placement, candidate)?;
         }
@@ -274,7 +274,7 @@ impl IndexArtifactCoordinator {
         let first = &requests[0];
         for request in &requests {
             let identity =
-                IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
+                IndexIdentity::projection_partition(request.tenant_id, request.bucket_id)
                     .map_err(|error| Status::invalid_argument(error.to_string()))?;
             self.validate_index_builder(authenticated_builder, &placement, identity)?;
         }

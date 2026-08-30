@@ -28,6 +28,7 @@ use tonic::{Request, Response, Status};
 use crate::authentication::{AnonymousIndexRequest, Caller, PluginObjectScope};
 use crate::authorization::ObjectPermission;
 use crate::distributed_list::OriginalBearer;
+use crate::index_runtime::catalog::CatalogDefinition;
 use crate::logical_name_resolution::LogicalNameResolver;
 use crate::object_path_access;
 use crate::v05::{ObjectServiceImpl, request_deadline, run_request_until};
@@ -731,6 +732,16 @@ impl IndexServiceRpc for IndexServiceImpl {
                         self.dependencies.authorization.clone(),
                         self.dependencies.live_versions.clone(),
                     ));
+                let physical = CatalogDefinition::new(
+                    tenant_id,
+                    bucket_id,
+                    loaded.api.version,
+                    loaded.stored.clone(),
+                )?
+                .physical_identity();
+                let mut physical_definition = loaded.api.clone();
+                physical_definition.index_id = physical.index_id;
+                physical_definition.version = physical.definition_version;
                 let executed = self
                     .dependencies
                     .queries
@@ -738,7 +749,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                         context: context.clone(),
                         tenant_id,
                         bucket_id,
-                        definition: loaded.api.clone(),
+                        definition: physical_definition,
                         query,
                         limit,
                         candidate_visibility,

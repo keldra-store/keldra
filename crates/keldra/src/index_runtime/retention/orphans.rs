@@ -14,6 +14,7 @@ use tonic::{Code, Status};
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::IndexHeadScanScope;
 use crate::index_runtime::cache::IndexMergeScratchSpace;
+use crate::index_runtime::catalog::CatalogDefinition;
 use crate::index_runtime::coordination::load_definition_locator_object;
 use crate::index_runtime::publication::{
     IndexArtifactDelete, IndexArtifactRouter, artifact_hash_from_path, current_path,
@@ -324,9 +325,7 @@ impl IndexOrphanScrub {
         else {
             return Ok(None);
         };
-        if locator.definition_id != due.index_id
-            || locator.object_version != due.definition_object_version
-        {
+        if locator.object_version != due.definition_object_version {
             self.store
                 .cancel_index_orphan_scrub(due.tenant_id, due.bucket_id, due.index_id)
                 .map_err(orphan_due_status)?;
@@ -338,12 +337,31 @@ impl IndexOrphanScrub {
             ));
         };
         let definition = StoredIndexDefinition::decode(&object.bytes)?;
+        if definition.index_id != locator.definition_id
+            || definition_path(&definition.name)? != due.definition_path
+        {
+            return Err(Status::data_loss(
+                "orphan scrub definition identity is inconsistent",
+            ));
+        }
+        let catalog = CatalogDefinition::new(
+            due.tenant_id,
+            due.bucket_id,
+            locator.object_version.0,
+            definition,
+        )?;
+        if catalog.physical_index_id() != due.index_id {
+            return Err(Status::data_loss(
+                "orphan scrub physical identity is inconsistent",
+            ));
+        }
+        let definition = catalog.physical_stored();
         let current = self
             .publisher
             .load_current(&definition, due.tenant_id, due.bucket_id)
             .await?
             .ok_or_else(|| Status::unavailable("orphan scrub index has no committed view"))?;
-        if current.manifest.definition_version != due.definition_object_version.0 {
+        if current.manifest.definition_version != catalog.physical_definition_version() {
             return Err(Status::aborted(
                 "orphan scrub current view belongs to another definition revision",
             ));

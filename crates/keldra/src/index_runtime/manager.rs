@@ -30,7 +30,9 @@ use tracing::Instrument;
 
 use super::budget::{IndexBudgetError, IndexMemoryBudgets, IndexMemoryPermit};
 use super::cache::IndexCache;
-use super::catalog::{CatalogChange, CatalogDefinition, CatalogIdentity, IndexCatalog};
+use super::catalog::{
+    CatalogChange, CatalogDefinition, CatalogIdentity, IndexCatalog, PhysicalProjectionIdentity,
+};
 use super::committed_view::{
     LocatorPackOwnership, LocatorRoot, MAX_LOCATOR_ROOTS_PER_COMMIT, MAX_SEGMENTS_PER_COMMIT,
 };
@@ -174,15 +176,18 @@ async fn run_manager(
 
     loop {
         let mut available = scheduler.remaining_capacity();
-        match catalog.take_page(BUILDER_CATALOG_PAGE, |identity| {
-            if scheduler.entries.contains_key(&identity) {
+        match catalog.take_page(BUILDER_CATALOG_PAGE, |change| match change {
+            CatalogChange::Delete { .. } | CatalogChange::Remove(_) => true,
+            CatalogChange::Upsert(definition)
+                if scheduler.contains_physical(definition.physical_identity()) =>
+            {
                 true
-            } else if available > 0 {
+            }
+            CatalogChange::Upsert(_) if available > 0 => {
                 available -= 1;
                 true
-            } else {
-                false
             }
+            CatalogChange::Upsert(_) => false,
         }) {
             Ok(page) => {
                 for change in page {
@@ -240,7 +245,7 @@ async fn run_manager(
         tokio::select! {
             received = changes.recv() => match received {
                 Ok(identity) => {
-                    if let Ok(Some(change)) = catalog.take(identity, scheduler.can_admit(identity))
+                    if let Ok(Some(change)) = catalog.take(identity, |change| scheduler.can_admit_change(change))
                     {
                         abort_replaced_worker(&change, &scheduler, &mut running, &mut inflight);
                         if let Err(error) = apply_catalog_change(
@@ -280,67 +285,10 @@ async fn run_manager(
     }
 }
 
-fn abort_replaced_worker(
-    change: &CatalogChange,
-    scheduler: &BuilderScheduler,
-    running: &mut HashMap<CatalogIdentity, (tokio::task::Id, tokio::task::AbortHandle)>,
-    inflight: &mut HashMap<tokio::task::Id, WorkMetadata>,
-) {
-    let identity = change.identity();
-    let replaces = match change {
-        CatalogChange::Upsert(definition) => {
-            scheduler.entries.get(&identity).is_some_and(|entry| {
-                entry.definition.object_version != definition.object_version
-                    || entry.definition.stored != definition.stored
-            })
-        }
-        CatalogChange::Delete { .. } | CatalogChange::Remove(_) => true,
-    };
-    if !replaces {
-        return;
-    }
-    if let Some((task_id, handle)) = running.remove(&identity) {
-        inflight.remove(&task_id);
-        handle.abort();
-    }
-}
-
-fn remove_running_task(
-    running: &mut HashMap<CatalogIdentity, (tokio::task::Id, tokio::task::AbortHandle)>,
-    identity: CatalogIdentity,
-    task_id: tokio::task::Id,
-) {
-    if running
-        .get(&identity)
-        .is_some_and(|(running_id, _)| *running_id == task_id)
-    {
-        running.remove(&identity);
-    }
-}
-
-#[derive(Clone, Copy)]
-struct WorkMetadata {
-    identity: CatalogIdentity,
-    definition_version: u64,
-    kind: IndexKind,
-    held_snapshot: bool,
-    inspecting: bool,
-}
-
-impl WorkMetadata {
-    fn from_job(job: &BuilderJob) -> Self {
-        Self {
-            identity: job.definition.identity(),
-            definition_version: job.definition.object_version,
-            kind: job.kind,
-            held_snapshot: job.holds_snapshot(),
-            inspecting: matches!(job.phase, BuilderPhase::Inspect),
-        }
-    }
-}
-
 struct BuilderScheduler {
     entries: BTreeMap<CatalogIdentity, ScheduledBuilder>,
+    physical_entries: BTreeMap<PhysicalProjectionIdentity, CatalogIdentity>,
+    logical_entries: BTreeMap<CatalogIdentity, PhysicalProjectionIdentity>,
     ready_active: [VecDeque<CatalogIdentity>; INDEX_KIND_COUNT],
     ready_inspect: [VecDeque<CatalogIdentity>; INDEX_KIND_COUNT],
     delayed: BTreeMap<CatalogIdentity, (tokio::time::Instant, u64)>,
@@ -354,6 +302,8 @@ impl Default for BuilderScheduler {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
+            physical_entries: BTreeMap::new(),
+            logical_entries: BTreeMap::new(),
             ready_active: std::array::from_fn(|_| VecDeque::new()),
             ready_inspect: std::array::from_fn(|_| VecDeque::new()),
             delayed: BTreeMap::new(),
@@ -377,8 +327,25 @@ impl BuilderScheduler {
         MAX_ACTIVE_BUILDERS.saturating_sub(self.entries.len())
     }
 
+    #[cfg(test)]
     fn can_admit(&self, identity: CatalogIdentity) -> bool {
-        self.entries.contains_key(&identity) || self.remaining_capacity() > 0
+        self.logical_entries.contains_key(&identity) || self.remaining_capacity() > 0
+    }
+
+    fn contains_physical(&self, identity: PhysicalProjectionIdentity) -> bool {
+        self.physical_entries
+            .get(&identity)
+            .is_some_and(|representative| self.entries.contains_key(representative))
+    }
+
+    fn can_admit_change(&self, change: &CatalogChange) -> bool {
+        match change {
+            CatalogChange::Delete { .. } | CatalogChange::Remove(_) => true,
+            CatalogChange::Upsert(definition) => {
+                self.contains_physical(definition.physical_identity())
+                    || self.remaining_capacity() > 0
+            }
+        }
     }
 
     fn apply_change(
@@ -396,11 +363,11 @@ impl BuilderScheduler {
                 // Definition delivery already committed the durable scoped
                 // cleanup schedule. Stop active construction without erasing
                 // that restart-safe handoff.
-                self.evict_builder(identity);
+                self.remove_logical(identity, retention, false);
                 Ok(())
             }
             CatalogChange::Remove(identity) => {
-                self.remove(identity, retention);
+                self.remove_logical(identity, retention, true);
                 Ok(())
             }
         }
@@ -417,7 +384,7 @@ impl BuilderScheduler {
         if is_local_builder(&definition, local_node, &current_placement(decisions)?)? {
             self.insert(definition, retention)
         } else {
-            self.remove(identity, retention);
+            self.remove_logical(identity, retention, true);
             Ok(())
         }
     }
@@ -428,6 +395,21 @@ impl BuilderScheduler {
         retention: &IndexCommitRetention,
     ) -> Result<(), Status> {
         let identity = definition.identity();
+        let physical = definition.physical_identity();
+        if let Some(representative) = self.physical_entries.get(&physical).copied()
+            && representative != identity
+        {
+            if let Some(previous_physical) = self.logical_entries.insert(identity, physical)
+                && previous_physical != physical
+            {
+                self.remove_physical_member(identity, previous_physical, retention);
+            }
+            if let Some(entry) = self.entries.get_mut(&representative) {
+                entry.wake_pending = true;
+                self.enqueue(representative);
+            }
+            return Ok(());
+        }
         if self.record_same_definition_wake(&definition) {
             return Ok(());
         }
@@ -435,6 +417,18 @@ impl BuilderScheduler {
             return Err(Status::resource_exhausted(
                 "node-wide active index builder lease limit reached",
             ));
+        }
+        if let Some(previous_physical) = self.logical_entries.get(&identity).copied()
+            && previous_physical != physical
+        {
+            self.physical_entries.remove(&previous_physical);
+            if let Err(error) = retention.unschedule(
+                identity.tenant_id,
+                identity.bucket_id,
+                previous_physical.index_id,
+            ) {
+                tracing::warn!(index.id = previous_physical.index_id, %error, "replaced physical index retention unschedule failed");
+            }
         }
         let job = BuilderJob::new(definition.clone())?;
         if let Some(previous) = self.entries.remove(&identity) {
@@ -450,6 +444,8 @@ impl BuilderScheduler {
                 wake_pending: false,
             },
         );
+        self.physical_entries.insert(physical, identity);
+        self.logical_entries.insert(identity, physical);
         self.enqueue(identity);
         Ok(())
     }
@@ -469,11 +465,40 @@ impl BuilderScheduler {
     }
 
     fn remove(&mut self, identity: CatalogIdentity, retention: &IndexCommitRetention) {
-        self.evict_builder(identity);
-        if let Err(error) =
-            retention.unschedule(identity.tenant_id, identity.bucket_id, identity.index_id)
-        {
-            tracing::warn!(index.id = identity.index_id, %error, "index retention unschedule failed");
+        self.remove_logical(identity, retention, true);
+    }
+
+    fn remove_logical(
+        &mut self,
+        identity: CatalogIdentity,
+        retention: &IndexCommitRetention,
+        unschedule: bool,
+    ) {
+        let Some(physical) = self.logical_entries.remove(&identity) else {
+            return;
+        };
+        if self.physical_entries.get(&physical) == Some(&identity) {
+            self.physical_entries.remove(&physical);
+            self.evict_builder(identity);
+            self.logical_entries
+                .retain(|_, candidate| *candidate != physical);
+            if unschedule
+                && let Err(error) =
+                    retention.unschedule(identity.tenant_id, identity.bucket_id, physical.index_id)
+            {
+                tracing::warn!(index.id = physical.index_id, %error, "physical index retention unschedule failed");
+            }
+        }
+    }
+
+    fn remove_physical_member(
+        &mut self,
+        identity: CatalogIdentity,
+        physical: PhysicalProjectionIdentity,
+        retention: &IndexCommitRetention,
+    ) {
+        if self.physical_entries.get(&physical) == Some(&identity) {
+            self.remove_logical(identity, retention, true);
         }
     }
 
@@ -489,6 +514,13 @@ impl BuilderScheduler {
         let removed = self.entries.remove(&identity);
         if let Some(entry) = removed.as_ref() {
             self.release_queued_snapshot(entry);
+        }
+        if let Some(physical) = self.logical_entries.get(&identity).copied()
+            && self.physical_entries.get(&physical) == Some(&identity)
+        {
+            self.physical_entries.remove(&physical);
+            self.logical_entries
+                .retain(|_, candidate| *candidate != physical);
         }
         removed.is_some()
     }
@@ -571,12 +603,7 @@ impl BuilderScheduler {
         retention: &IndexCommitRetention,
     ) {
         self.complete_with(metadata, step, |definition, identity, current| {
-            match retention.schedule(
-                definition,
-                identity.tenant_id,
-                identity.bucket_id,
-                current,
-            ) {
+            match retention.schedule(definition, current) {
                 Ok(()) => true,
                 Err(error) => {
                     tracing::warn!(index.id = identity.index_id, %error, "index retention lease admission will retry");
@@ -591,7 +618,7 @@ impl BuilderScheduler {
         metadata: WorkMetadata,
         step: BuilderStep,
         mut schedule_retention: impl FnMut(
-            &StoredIndexDefinition,
+            &CatalogDefinition,
             CatalogIdentity,
             &CommittedIndexView,
         ) -> bool,
@@ -613,7 +640,7 @@ impl BuilderScheduler {
             self.open_rebuilds[slot] = self.open_rebuilds[slot].saturating_add(1);
         }
         let retention_admitted = step.retention_current.as_ref().is_none_or(|current| {
-            schedule_retention(&entry.definition.stored, metadata.identity, current)
+            schedule_retention(&entry.definition, metadata.identity, current)
         });
         entry.job = Some(step.job);
         if !retention_admitted {
@@ -676,61 +703,6 @@ impl BuilderScheduler {
             self.open_rebuilds[slot] = self.open_rebuilds[slot].saturating_sub(1);
         }
     }
-}
-
-fn builder_lease_is_current(
-    definition: &CatalogDefinition,
-    local_node: NodeId,
-    decisions: &DecisionRaft,
-    store: &Store,
-) -> Result<bool, Status> {
-    let assignment = store
-        .definition_assignment(
-            DefinitionKind::Index,
-            definition.tenant_id,
-            definition.bucket_id,
-            definition.stored.index_id,
-        )
-        .map_err(|error| Status::internal(format!("read active index assignment: {error}")))?;
-    let Some(assignment) = assignment else {
-        return Ok(false);
-    };
-    let placement = current_placement(decisions)?;
-    let identity = IndexIdentity::new(
-        definition.tenant_id,
-        definition.bucket_id,
-        definition.stored.index_id,
-    )
-    .map_err(|error| Status::data_loss(error.to_string()))?;
-    let owners = IndexPlacement::derive(identity, &placement)
-        .map_err(|error| Status::unavailable(error.to_string()))?;
-    Ok(assignment.kind == DefinitionKind::Index
-        && assignment.object_version == VersionId(definition.object_version)
-        && assignment.definition_path == definition_path(&definition.stored.name)?
-        && assignment.observed_fence == placement.fence()
-        && assignment.rank == 0
-        && owners.builder() == local_node)
-}
-
-fn take_ready(
-    queue: &mut VecDeque<CatalogIdentity>,
-    entries: &mut BTreeMap<CatalogIdentity, ScheduledBuilder>,
-    active: bool,
-) -> Option<CatalogIdentity> {
-    while let Some(identity) = queue.pop_front() {
-        let Some(entry) = entries.get(&identity) else {
-            continue;
-        };
-        if entry.queued
-            && entry
-                .job
-                .as_ref()
-                .is_some_and(|job| job.is_active() == active)
-        {
-            return Some(identity);
-        }
-    }
-    None
 }
 
 struct BuilderJob {
@@ -861,10 +833,11 @@ async fn inspect_builder(
 ) -> Result<(BuilderPhase, BuilderDisposition, Option<CommittedIndexView>), Status> {
     let telemetry_identity = job.telemetry_identity();
     let definition = &job.definition;
+    let physical_definition = definition.physical_stored();
     let current = dependencies
         .publisher
         .load_current(
-            &definition.stored,
+            &physical_definition,
             definition.tenant_id,
             definition.bucket_id,
         )
@@ -879,7 +852,7 @@ async fn inspect_builder(
     }
     emit_publication_age(job.kind, current.as_ref());
     if let Some(current) = current.as_ref()
-        && current.manifest.definition_version == definition.object_version
+        && current.manifest.definition_version == definition.physical_definition_version()
         && current.manifest.kind == definition.schema.kind
     {
         let published = current.manifest.barrier().map_err(commit_view_status)?;
@@ -1653,12 +1626,8 @@ fn is_local_builder(
     local_node: NodeId,
     placement: &ClusterPlacement,
 ) -> Result<bool, Status> {
-    let identity = IndexIdentity::new(
-        definition.tenant_id,
-        definition.bucket_id,
-        definition.stored.index_id,
-    )
-    .map_err(|error| Status::data_loss(error.to_string()))?;
+    let identity = IndexIdentity::projection_partition(definition.tenant_id, definition.bucket_id)
+        .map_err(|error| Status::data_loss(error.to_string()))?;
     Ok(IndexPlacement::derive(identity, placement)
         .map_err(|error| Status::unavailable(error.to_string()))?
         .builder()
@@ -1808,8 +1777,9 @@ async fn freeze_builder(
         .plan
         .seal_workspace_bytes(full.writer.buffered_source_bytes())
         .map_err(index_status)?;
+    let physical_definition = definition.physical_stored();
     let mut sink = dependencies.publisher.component_sink(
-        &definition.stored,
+        &physical_definition,
         definition.tenant_id,
         definition.bucket_id,
         DerivedArtifactAdmission::PublicationProgress,

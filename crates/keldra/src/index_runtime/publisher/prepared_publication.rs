@@ -377,7 +377,7 @@ impl PreparedCurrentPointerPublication {
         definition: &StoredIndexDefinition,
         tenant_id: u64,
         bucket_id: u64,
-        definition_version: u64,
+        definition_object_version: u64,
         pointer: IndexCurrentPointer,
         manifest: IndexCommitManifest,
         blob: BlobRef,
@@ -398,7 +398,7 @@ impl PreparedCurrentPointerPublication {
             definition_guard: Some(DefinitionVersionGuard {
                 kind: DefinitionKind::Index,
                 exact_path: definition_path(&definition.name)?,
-                expected_version: VersionId(definition_version),
+                expected_version: VersionId(definition_object_version),
             }),
             definition_intent: None,
             admission,

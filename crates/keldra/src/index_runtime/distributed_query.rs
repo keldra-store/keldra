@@ -94,12 +94,8 @@ impl DistributedIndexQueryExecutor {
 impl IndexQueryExecutor for DistributedIndexQueryExecutor {
     async fn execute(&self, request: ExecuteIndexQuery) -> Result<ExecutedIndexQuery, Status> {
         let placement = self.placement()?;
-        let identity = IndexIdentity::new(
-            request.tenant_id,
-            request.bucket_id,
-            request.definition.index_id,
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let identity = IndexIdentity::projection_partition(request.tenant_id, request.bucket_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let assignment = IndexPlacement::derive(identity, &placement)
             .map_err(|error| Status::unavailable(error.to_string()))?;
         let replicas = assignment.query_replicas();

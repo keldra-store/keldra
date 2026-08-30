@@ -47,8 +47,8 @@ pub(super) async fn compact_oldest_prefix(
         ));
     }
     let identity = SegmentIdentity::new(
-        definition.stored.index_id,
-        definition.object_version,
+        definition.physical_index_id(),
+        definition.physical_definition_version(),
         definition.schema_fingerprint,
         dependencies
             .store
@@ -70,12 +70,13 @@ pub(super) async fn compact_oldest_prefix(
         definition.stored.bucket.clone(),
         definition.tenant_id,
         definition.bucket_id,
-        definition.stored.index_id,
+        definition.physical_index_id(),
     )
     .map_err(index_status)?;
     let started = Instant::now();
+    let physical_definition = definition.physical_stored();
     let mut sink = dependencies.publisher.component_sink(
-        &definition.stored,
+        &physical_definition,
         definition.tenant_id,
         definition.bucket_id,
         admission,
@@ -83,7 +84,7 @@ pub(super) async fn compact_oldest_prefix(
     );
     let span = tracing::info_span!(
         "keldra.index.locator_compaction",
-        index.id = definition.stored.index_id,
+        index.id = definition.physical_index_id(),
         tenant.id = definition.tenant_id,
         bucket.id = definition.bucket_id,
         index.kind = ?kind,

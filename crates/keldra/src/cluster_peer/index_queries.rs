@@ -764,9 +764,9 @@ fn require_query_replica(
     placement: &ClusterPlacement,
     tenant_id: u64,
     bucket_id: u64,
-    index_id: u64,
+    _index_id: u64,
 ) -> Result<(), Status> {
-    let identity = IndexIdentity::new(tenant_id, bucket_id, index_id)
+    let identity = IndexIdentity::projection_partition(tenant_id, bucket_id)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let indices = IndexPlacement::derive(identity, placement)
         .map_err(|error| Status::unavailable(error.to_string()))?;

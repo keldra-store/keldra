@@ -42,7 +42,7 @@ pub(crate) struct SharedProjectionMapper {
 struct MapperInner {
     reader: ClusterObjectReader,
     cpu: IndexCpuPool,
-    definitions: Mutex<BTreeMap<CatalogIdentity, RegisteredDefinition>>,
+    definitions: Mutex<DefinitionPlans>,
     cache: Mutex<ProjectionCache>,
     stripes: [tokio::sync::Mutex<()>; MAPPER_STRIPES],
     cache_limit: usize,
@@ -64,10 +64,41 @@ struct MapperTelemetry {
 struct RegisteredDefinition {
     tenant_id: u64,
     bucket_id: u64,
-    schema: Schema,
+    route: ProjectionRoute,
+    selectors: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectionRoute {
+    path_prefix: String,
+    content_type: Option<String>,
+}
+
+#[derive(Default)]
+struct DefinitionPlans {
+    definitions: BTreeMap<CatalogIdentity, RegisteredDefinition>,
+    buckets: BTreeMap<(u64, u64), BucketSelectorPlan>,
+}
+
+#[derive(Default)]
+struct BucketSelectorPlan {
+    routes: BTreeMap<ProjectionRoute, RouteSelectorPlan>,
+}
+
+#[derive(Default)]
+struct RouteSelectorPlan {
+    selector_references: BTreeMap<String, usize>,
+    compiled: Option<CompiledSelectorPlan>,
+}
+
+#[derive(Clone)]
+struct CompiledSelectorPlan {
+    pointers: Arc<Vec<String>>,
+    workspace_bytes: usize,
+    plan_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct SourceProjectionKey {
     tenant_id: u64,
     bucket_id: u64,
@@ -82,6 +113,7 @@ struct SourceProjectionKey {
 
 struct ProjectionCache {
     entries: HashMap<SourceProjectionKey, CachedProjection>,
+    recency: BTreeSet<(u64, SourceProjectionKey)>,
     used_bytes: usize,
     clock: u64,
 }
@@ -101,8 +133,147 @@ struct CachedOutput {
 
 struct ProjectionPlan {
     key: SourceProjectionKey,
-    pointers: Vec<String>,
+    pointers: Arc<Vec<String>>,
     workspace_bytes: usize,
+}
+
+fn add_registered_definition(
+    plans: &mut DefinitionPlans,
+    definition: &RegisteredDefinition,
+) -> Result<(), Status> {
+    let bucket = plans
+        .buckets
+        .entry((definition.tenant_id, definition.bucket_id))
+        .or_default();
+    for selector in &definition.selectors {
+        let route = bucket.routes.entry(definition.route.clone()).or_default();
+        let references = route
+            .selector_references
+            .entry(selector.clone())
+            .or_default();
+        *references = references
+            .checked_add(1)
+            .ok_or_else(|| Status::resource_exhausted("selector reference count overflow"))?;
+    }
+    let route = bucket
+        .routes
+        .get_mut(&definition.route)
+        .expect("inserted projection route remains present");
+    route.compiled = Some(compile_selector_references(&route.selector_references));
+    Ok(())
+}
+
+fn remove_registered_definition(
+    plans: &mut DefinitionPlans,
+    definition: RegisteredDefinition,
+) -> Result<(), Status> {
+    let key = (definition.tenant_id, definition.bucket_id);
+    let Some(bucket) = plans.buckets.get_mut(&key) else {
+        return Err(Status::internal(
+            "registered projection definition has no compiled bucket plan",
+        ));
+    };
+    let route = bucket.routes.get_mut(&definition.route).ok_or_else(|| {
+        Status::internal("registered projection definition has no compiled route")
+    })?;
+    for selector in &definition.selectors {
+        let remove = {
+            let references = route.selector_references.get_mut(selector).ok_or_else(|| {
+                Status::internal("registered projection selector reference is absent")
+            })?;
+            *references = references.checked_sub(1).ok_or_else(|| {
+                Status::internal("registered projection selector reference underflow")
+            })?;
+            *references == 0
+        };
+        if remove {
+            route.selector_references.remove(selector);
+        }
+    }
+    if route.selector_references.is_empty() {
+        bucket.routes.remove(&definition.route);
+    } else {
+        route.compiled = Some(compile_selector_references(&route.selector_references));
+    }
+    if bucket.routes.is_empty() {
+        plans.buckets.remove(&key);
+    }
+    Ok(())
+}
+
+fn compile_selector_plan(schema: &Schema) -> CompiledSelectorPlan {
+    let selectors = schema
+        .fields
+        .iter()
+        .map(|field| field.source_selector.clone())
+        .collect::<BTreeSet<_>>();
+    compile_selectors(selectors.into_iter())
+}
+
+fn compile_selector_references(selectors: &BTreeMap<String, usize>) -> CompiledSelectorPlan {
+    compile_selectors(selectors.keys().cloned())
+}
+
+fn matching_selector_plans(
+    bucket: &BucketSelectorPlan,
+    object: &IndexBuildObject,
+) -> Vec<CompiledSelectorPlan> {
+    let mut prefixes = BTreeSet::from([String::new(), object.path.clone()]);
+    for (offset, byte) in object.path.bytes().enumerate() {
+        if byte == b'/' {
+            prefixes.insert(object.path[..offset].to_owned());
+            prefixes.insert(object.path[..=offset].to_owned());
+        }
+    }
+    let mut routes = BTreeSet::new();
+    for path_prefix in prefixes {
+        routes.insert(ProjectionRoute {
+            path_prefix: path_prefix.clone(),
+            content_type: None,
+        });
+        if let Some(content_type) = object.content_type.as_ref() {
+            routes.insert(ProjectionRoute {
+                path_prefix,
+                content_type: Some(content_type.clone()),
+            });
+        }
+    }
+    routes
+        .into_iter()
+        .filter_map(|route| bucket.routes.get(&route)?.compiled.clone())
+        .collect()
+}
+
+fn merge_selector_plans(plans: Vec<CompiledSelectorPlan>) -> Option<CompiledSelectorPlan> {
+    if plans.len() == 1 {
+        return plans.into_iter().next();
+    }
+    let mut pointers = BTreeSet::new();
+    for plan in plans {
+        pointers.extend(plan.pointers.iter().cloned());
+    }
+    (!pointers.is_empty()).then(|| compile_selectors(pointers.into_iter()))
+}
+
+fn compile_selectors(selectors: impl Iterator<Item = String>) -> CompiledSelectorPlan {
+    let pointers = selectors.collect::<Vec<_>>();
+    let workspace_bytes = pointers.iter().fold(0usize, |bytes, pointer| {
+        bytes.saturating_add(
+            PLAN_POINTER_FIXED_BYTES
+                .saturating_add(pointer.len())
+                .saturating_mul(2),
+        )
+    });
+    let mut plan = blake3::Hasher::new();
+    for pointer in &pointers {
+        plan.update(&(pointer.len() as u64).to_be_bytes());
+        plan.update(pointer.as_bytes());
+    }
+    CompiledSelectorPlan {
+        pointers: Arc::new(pointers),
+        workspace_bytes,
+        plan_hash: *plan.finalize().as_bytes(),
+    }
 }
 
 impl SharedProjectionMapper {
@@ -130,9 +301,10 @@ impl SharedProjectionMapper {
             inner: Arc::new(MapperInner {
                 reader,
                 cpu,
-                definitions: Mutex::new(BTreeMap::new()),
+                definitions: Mutex::new(DefinitionPlans::default()),
                 cache: Mutex::new(ProjectionCache {
                     entries: HashMap::new(),
+                    recency: BTreeSet::new(),
                     used_bytes: 0,
                     clock: 0,
                 }),
@@ -146,32 +318,44 @@ impl SharedProjectionMapper {
     }
 
     pub(crate) fn upsert(&self, definition: &CatalogDefinition) -> Result<(), Status> {
-        let mut definitions = self
+        let mut plans = self
             .inner
             .definitions
             .lock()
             .map_err(|_| Status::internal("shared projection definition lock is poisoned"))?;
+        if let Some(previous) = plans.definitions.remove(&definition.identity()) {
+            remove_registered_definition(&mut plans, previous)?;
+        }
         if definition.schema.kind == IndexKind::TypedJson {
-            definitions.insert(
-                definition.identity(),
-                RegisteredDefinition {
-                    tenant_id: definition.tenant_id,
-                    bucket_id: definition.bucket_id,
-                    schema: definition.schema.clone(),
+            let registered = RegisteredDefinition {
+                tenant_id: definition.tenant_id,
+                bucket_id: definition.bucket_id,
+                route: ProjectionRoute {
+                    path_prefix: definition.schema.path_prefix.clone(),
+                    content_type: definition.schema.content_type_scope.clone(),
                 },
-            );
-        } else {
-            definitions.remove(&definition.identity());
+                selectors: definition
+                    .schema
+                    .fields
+                    .iter()
+                    .map(|field| field.source_selector.clone())
+                    .collect(),
+            };
+            add_registered_definition(&mut plans, &registered)?;
+            plans.definitions.insert(definition.identity(), registered);
         }
         Ok(())
     }
 
     pub(crate) fn remove(&self, identity: CatalogIdentity) -> Result<(), Status> {
-        self.inner
+        let mut plans = self
+            .inner
             .definitions
             .lock()
-            .map_err(|_| Status::internal("shared projection definition lock is poisoned"))?
-            .remove(&identity);
+            .map_err(|_| Status::internal("shared projection definition lock is poisoned"))?;
+        if let Some(previous) = plans.definitions.remove(&identity) {
+            remove_registered_definition(&mut plans, previous)?;
+        }
         Ok(())
     }
 
@@ -349,66 +533,30 @@ impl SharedProjectionMapper {
         definition: &CatalogDefinition,
         object: &IndexBuildObject,
     ) -> Result<ProjectionPlan, Status> {
-        let definitions = self
+        let matching_plans = self
             .inner
             .definitions
             .lock()
-            .map_err(|_| Status::internal("shared projection definition lock is poisoned"))?;
-        let mut pointers = BTreeSet::new();
+            .map_err(|_| Status::internal("shared projection definition lock is poisoned"))?
+            .buckets
+            .get(&(definition.tenant_id, definition.bucket_id))
+            .map(|bucket| matching_selector_plans(bucket, object))
+            .unwrap_or_default();
         let mut workspace_bytes = CACHE_ENTRY_FIXED_BYTES
             .checked_add(object.path.capacity())
             .and_then(|bytes| {
                 bytes.checked_add(object.content_type.as_ref().map_or(0, String::capacity))
             })
             .ok_or_else(|| Status::resource_exhausted("shared projection plan size overflow"))?;
-        for pointer in definitions
-            .values()
-            .filter(|registered| {
-                registered.tenant_id == definition.tenant_id
-                    && registered.bucket_id == definition.bucket_id
-                    && source_matches_schema(&registered.schema, object)
-            })
-            .flat_map(|registered| {
-                registered
-                    .schema
-                    .fields
-                    .iter()
-                    .map(|field| &field.source_selector)
-            })
-            .chain(
-                definition
-                    .schema
-                    .fields
-                    .iter()
-                    .map(|field| &field.source_selector),
-            )
-        {
-            if pointers.contains(pointer) {
-                continue;
-            }
-            let pointer_workspace = PLAN_POINTER_FIXED_BYTES
-                .checked_add(pointer.len())
-                .and_then(|bytes| bytes.checked_mul(2))
-                .ok_or_else(|| {
-                    Status::resource_exhausted("shared projection plan size overflow")
-                })?;
-            workspace_bytes = workspace_bytes
-                .checked_add(pointer_workspace)
-                .ok_or_else(|| {
-                    Status::resource_exhausted("shared projection plan size overflow")
-                })?;
-            if workspace_bytes >= self.inner.mapping_limit {
-                return Err(Status::resource_exhausted(
-                    "shared projection selector union exceeds its mapping workspace",
-                ));
-            }
-            pointers.insert(pointer.clone());
-        }
-        let pointers = pointers.into_iter().collect::<Vec<_>>();
-        let mut plan = blake3::Hasher::new();
-        for pointer in &pointers {
-            plan.update(&(pointer.len() as u64).to_be_bytes());
-            plan.update(pointer.as_bytes());
+        let compiled = merge_selector_plans(matching_plans)
+            .unwrap_or_else(|| compile_selector_plan(&definition.schema));
+        workspace_bytes = workspace_bytes
+            .checked_add(compiled.workspace_bytes)
+            .ok_or_else(|| Status::resource_exhausted("shared projection plan size overflow"))?;
+        if workspace_bytes >= self.inner.mapping_limit {
+            return Err(Status::resource_exhausted(
+                "shared projection selector union exceeds its mapping workspace",
+            ));
         }
         Ok(ProjectionPlan {
             key: SourceProjectionKey {
@@ -420,9 +568,9 @@ impl SharedProjectionMapper {
                 content_type: object.content_type.clone(),
                 content_hash: object.content_hash,
                 content_length: object.content_length,
-                plan_hash: *plan.finalize().as_bytes(),
+                plan_hash: compiled.plan_hash,
             },
-            pointers,
+            pointers: compiled.pointers,
             workspace_bytes,
         })
     }
@@ -486,10 +634,10 @@ impl SharedProjectionMapper {
     ) -> Result<Option<(MergeMutation, IndexBuildDiagnostics)>, Status> {
         let mut cache = self.cache()?;
         let tick = cache.tick();
-        let Some(entry) = cache.entries.get_mut(key) else {
+        if !cache.touch(key, tick) {
             return Ok(None);
-        };
-        entry.last_used = tick;
+        }
+        let entry = cache.entries.get(key).expect("touched cache entry exists");
         let Some(output) = entry.outputs.get(&schema) else {
             return Ok(None);
         };
@@ -514,10 +662,10 @@ impl SharedProjectionMapper {
     ) -> Result<Option<Option<Arc<ProjectedScalarPointers>>>, Status> {
         let mut cache = self.cache()?;
         let tick = cache.tick();
-        let Some(entry) = cache.entries.get_mut(key) else {
+        if !cache.touch(key, tick) {
             return Ok(None);
-        };
-        entry.last_used = tick;
+        }
+        let entry = cache.entries.get(key).expect("touched cache entry exists");
         tracing::debug!(
             projection.cache = "selected_hit",
             monotonic_counter.keldra_index_shared_projection_selected_hits_total = 1_u64,
@@ -556,7 +704,7 @@ impl SharedProjectionMapper {
         }
         cache.used_bytes = cache.used_bytes.saturating_add(resident);
         cache.entries.insert(
-            key,
+            key.clone(),
             CachedProjection {
                 selected,
                 outputs: HashMap::new(),
@@ -564,6 +712,7 @@ impl SharedProjectionMapper {
                 last_used: tick,
             },
         );
+        cache.recency.insert((tick, key));
         cache.evict_to(self.inner.cache_limit);
         Ok(())
     }
@@ -589,10 +738,12 @@ impl SharedProjectionMapper {
         if !cache.make_room(self.inner.cache_limit, resident, Some(&key)) {
             return Ok(());
         }
+        if !cache.touch(&key, tick) {
+            return Ok(());
+        }
         let Some(entry) = cache.entries.get_mut(&key) else {
             return Ok(());
         };
-        entry.last_used = tick;
         if entry.outputs.contains_key(&schema) {
             return Ok(());
         }
@@ -652,17 +803,23 @@ impl ProjectionCache {
         self.clock
     }
 
+    fn touch(&mut self, key: &SourceProjectionKey, tick: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return false;
+        };
+        self.recency.remove(&(entry.last_used, key.clone()));
+        entry.last_used = tick;
+        self.recency.insert((tick, key.clone()));
+        true
+    }
+
     fn evict_to(&mut self, limit: usize) {
         while self.used_bytes > limit {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
-            else {
+            let Some((tick, oldest)) = self.recency.iter().next().cloned() else {
                 self.used_bytes = 0;
                 return;
             };
+            self.recency.remove(&(tick, oldest.clone()));
             if let Some(removed) = self.entries.remove(&oldest) {
                 self.used_bytes = self.used_bytes.saturating_sub(removed.resident_bytes);
             }
@@ -676,15 +833,15 @@ impl ProjectionCache {
         preserve: Option<&SourceProjectionKey>,
     ) -> bool {
         while self.used_bytes.saturating_add(additional) > limit {
-            let Some(oldest) = self
-                .entries
+            let Some((tick, oldest)) = self
+                .recency
                 .iter()
-                .filter(|(key, _)| preserve != Some(*key))
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
+                .find(|(_, key)| preserve != Some(key))
+                .cloned()
             else {
                 return false;
             };
+            self.recency.remove(&(tick, oldest.clone()));
             if let Some(removed) = self.entries.remove(&oldest) {
                 self.used_bytes = self.used_bytes.saturating_sub(removed.resident_bytes);
             }
@@ -747,6 +904,11 @@ mod tests {
                 (oldest.clone(), entry(30, 2)),
                 (newest.clone(), entry(30, 3)),
             ]),
+            recency: BTreeSet::from([
+                (1, retained.clone()),
+                (2, oldest.clone()),
+                (3, newest.clone()),
+            ]),
             used_bytes: 90,
             clock: 3,
         };
@@ -768,5 +930,73 @@ mod tests {
 
         assert_ne!(original, changed_bytes);
         assert_ne!(original, changed_plan);
+    }
+
+    fn registered(
+        path_prefix: &str,
+        content_type: Option<&str>,
+        selectors: &[&str],
+    ) -> RegisteredDefinition {
+        RegisteredDefinition {
+            tenant_id: 1,
+            bucket_id: 2,
+            route: ProjectionRoute {
+                path_prefix: path_prefix.into(),
+                content_type: content_type.map(str::to_owned),
+            },
+            selectors: selectors.iter().map(|value| (*value).to_owned()).collect(),
+        }
+    }
+
+    fn object(path: &str, content_type: Option<&str>) -> IndexBuildObject {
+        IndexBuildObject {
+            path: path.into(),
+            version: 1,
+            committed_at_unix_millis: 2,
+            content_type: content_type.map(str::to_owned),
+            content_hash: [3; 32],
+            content_length: 4,
+        }
+    }
+
+    #[test]
+    fn catalog_updates_compile_direct_scope_and_content_routes() {
+        let mut plans = DefinitionPlans::default();
+        let global = registered("", None, &["/id"]);
+        let records = registered("records/", Some("application/json"), &["/class"]);
+        let wrong_scope = registered("other/", None, &["/never"]);
+        let wrong_type = registered("records/", Some("text/plain"), &["/also_never"]);
+        for definition in [&global, &records, &wrong_scope, &wrong_type] {
+            add_registered_definition(&mut plans, definition).unwrap();
+        }
+
+        let bucket = &plans.buckets[&(1, 2)];
+        let merged = merge_selector_plans(matching_selector_plans(
+            bucket,
+            &object("records/a.json", Some("application/json")),
+        ))
+        .unwrap();
+
+        assert_eq!(merged.pointers.as_ref(), &["/class", "/id"]);
+    }
+
+    #[test]
+    fn equivalent_definitions_reference_one_compiled_selector() {
+        let mut plans = DefinitionPlans::default();
+        let first = registered("records/", None, &["/id"]);
+        let second = registered("records/", None, &["/id"]);
+        add_registered_definition(&mut plans, &first).unwrap();
+        add_registered_definition(&mut plans, &second).unwrap();
+        let route = &plans.buckets[&(1, 2)].routes[&first.route];
+        assert_eq!(route.selector_references["/id"], 2);
+        assert_eq!(route.compiled.as_ref().unwrap().pointers.len(), 1);
+
+        remove_registered_definition(&mut plans, first).unwrap();
+        assert_eq!(
+            plans.buckets[&(1, 2)].routes[&second.route].selector_references["/id"],
+            1
+        );
+        remove_registered_definition(&mut plans, second).unwrap();
+        assert!(!plans.buckets.contains_key(&(1, 2)));
     }
 }

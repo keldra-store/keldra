@@ -179,7 +179,7 @@ pub(super) async fn publish_candidate(
         .sum::<u64>();
     let span = tracing::debug_span!(
         "keldra.index.publication",
-        index.id = definition.stored.index_id,
+        index.id = definition.physical_index_id(),
         tenant.id = definition.tenant_id,
         bucket.id = definition.bucket_id,
         index.kind = ?kind,
@@ -202,12 +202,14 @@ pub(super) async fn publish_candidate(
             .validate_publication_barrier(&barrier)
             .await
             .map_err(event_status)?;
+        let physical_definition = definition.physical_stored();
         dependencies
             .publisher
             .publish_manifest(
-                &definition.stored,
+                &physical_definition,
                 definition.tenant_id,
                 definition.bucket_id,
+                definition.physical_definition_version(),
                 definition.object_version,
                 definition.schema.kind,
                 definition.schema_fingerprint,
@@ -295,7 +297,7 @@ pub(super) fn publication_cas_class(
     let Some(current) = current else {
         return Ok(super::super::publisher::IndexPointerCasClass::Rebuild);
     };
-    if current.manifest.definition_version != definition.object_version {
+    if current.manifest.definition_version != definition.physical_definition_version() {
         return Ok(super::super::publisher::IndexPointerCasClass::Rebuild);
     }
     let current_barrier = current.manifest.barrier().map_err(commit_view_status)?;

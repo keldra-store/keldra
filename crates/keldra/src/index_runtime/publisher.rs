@@ -228,7 +228,8 @@ impl IndexCommitPublisher {
         definition: &StoredIndexDefinition,
         tenant_id: u64,
         bucket_id: u64,
-        definition_version: u64,
+        physical_definition_version: u64,
+        definition_object_version: u64,
         kind: IndexKind,
         schema_fingerprint: [u8; 32],
         mut barrier: IndexBarrier,
@@ -287,7 +288,7 @@ impl IndexCommitPublisher {
             let manifest = IndexCommitManifest::new(
                 definition.index_id,
                 revision,
-                definition_version,
+                physical_definition_version,
                 kind,
                 schema_fingerprint,
                 &barrier,
@@ -476,7 +477,7 @@ impl IndexCommitPublisher {
                     definition,
                     tenant_id,
                     bucket_id,
-                    definition_version,
+                    definition_object_version,
                     pointer,
                     manifest,
                     blob,
@@ -550,6 +551,7 @@ impl IndexCommitPublisher {
         bucket_id: u64,
         current: &CommittedIndexView,
         retained: Vec<CommitManifestReference>,
+        definition_object_version: VersionId,
     ) -> Result<CommittedIndexView, Status> {
         validate_manifest_reference(
             &current.pointer.current,
@@ -621,7 +623,7 @@ impl IndexCommitPublisher {
                 definition_guard: Some(DefinitionVersionGuard {
                     kind: DefinitionKind::Index,
                     exact_path: definition_path(&definition.name)?,
-                    expected_version: VersionId(current.manifest.definition_version),
+                    expected_version: definition_object_version,
                 }),
                 definition_intent: None,
                 admission: DerivedArtifactAdmission::Bounded,
@@ -652,6 +654,7 @@ impl IndexCommitPublisher {
         tenant_id: u64,
         bucket_id: u64,
         completed: &[ReleasingManifestReference],
+        definition_object_version: VersionId,
     ) -> Result<CommittedIndexView, Status> {
         let current_guard = self
             .artifacts
@@ -709,7 +712,7 @@ impl IndexCommitPublisher {
                     definition_guard: Some(DefinitionVersionGuard {
                         kind: DefinitionKind::Index,
                         exact_path: definition_path(&definition.name)?,
-                        expected_version: VersionId(current.manifest.definition_version),
+                        expected_version: definition_object_version,
                     }),
                     definition_intent: None,
                     admission: DerivedArtifactAdmission::Bounded,

@@ -2,6 +2,124 @@
 
 use super::*;
 
+pub(super) fn abort_replaced_worker(
+    change: &CatalogChange,
+    scheduler: &BuilderScheduler,
+    running: &mut HashMap<CatalogIdentity, (tokio::task::Id, tokio::task::AbortHandle)>,
+    inflight: &mut HashMap<tokio::task::Id, WorkMetadata>,
+) {
+    let logical_identity = change.identity();
+    let running_identity = scheduler
+        .logical_entries
+        .get(&logical_identity)
+        .and_then(|physical| scheduler.physical_entries.get(physical))
+        .copied();
+    let replaces = match change {
+        CatalogChange::Upsert(definition) => running_identity.is_some_and(|identity| {
+            identity == logical_identity
+                && scheduler.entries.get(&identity).is_some_and(|entry| {
+                    entry.definition.object_version != definition.object_version
+                        || entry.definition.stored != definition.stored
+                })
+        }),
+        CatalogChange::Delete { .. } | CatalogChange::Remove(_) => {
+            running_identity == Some(logical_identity)
+        }
+    };
+    if !replaces {
+        return;
+    }
+    if let Some((task_id, handle)) = running.remove(&logical_identity) {
+        inflight.remove(&task_id);
+        handle.abort();
+    }
+}
+
+pub(super) fn remove_running_task(
+    running: &mut HashMap<CatalogIdentity, (tokio::task::Id, tokio::task::AbortHandle)>,
+    identity: CatalogIdentity,
+    task_id: tokio::task::Id,
+) {
+    if running
+        .get(&identity)
+        .is_some_and(|(running_id, _)| *running_id == task_id)
+    {
+        running.remove(&identity);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct WorkMetadata {
+    pub(super) identity: CatalogIdentity,
+    pub(super) definition_version: u64,
+    pub(super) kind: IndexKind,
+    pub(super) held_snapshot: bool,
+    pub(super) inspecting: bool,
+}
+
+impl WorkMetadata {
+    pub(super) fn from_job(job: &BuilderJob) -> Self {
+        Self {
+            identity: job.definition.identity(),
+            definition_version: job.definition.object_version,
+            kind: job.kind,
+            held_snapshot: job.holds_snapshot(),
+            inspecting: matches!(job.phase, BuilderPhase::Inspect),
+        }
+    }
+}
+
+pub(super) fn builder_lease_is_current(
+    definition: &CatalogDefinition,
+    local_node: NodeId,
+    decisions: &DecisionRaft,
+    store: &Store,
+) -> Result<bool, Status> {
+    let assignment = store
+        .definition_assignment(
+            DefinitionKind::Index,
+            definition.tenant_id,
+            definition.bucket_id,
+            definition.stored.index_id,
+        )
+        .map_err(|error| Status::internal(format!("read active index assignment: {error}")))?;
+    let Some(assignment) = assignment else {
+        return Ok(false);
+    };
+    let placement = current_placement(decisions)?;
+    let identity = IndexIdentity::projection_partition(definition.tenant_id, definition.bucket_id)
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+    let owners = IndexPlacement::derive(identity, &placement)
+        .map_err(|error| Status::unavailable(error.to_string()))?;
+    Ok(assignment.kind == DefinitionKind::Index
+        && assignment.object_version == VersionId(definition.object_version)
+        && assignment.definition_path == definition_path(&definition.stored.name)?
+        && assignment.observed_fence == placement.fence()
+        && assignment.rank == 0
+        && owners.builder() == local_node)
+}
+
+pub(super) fn take_ready(
+    queue: &mut VecDeque<CatalogIdentity>,
+    entries: &mut BTreeMap<CatalogIdentity, ScheduledBuilder>,
+    active: bool,
+) -> Option<CatalogIdentity> {
+    while let Some(identity) = queue.pop_front() {
+        let Some(entry) = entries.get(&identity) else {
+            continue;
+        };
+        if entry.queued
+            && entry
+                .job
+                .as_ref()
+                .is_some_and(|job| job.is_active() == active)
+        {
+            return Some(identity);
+        }
+    }
+    None
+}
+
 pub(super) fn apply_catalog_change(
     scheduler: &mut BuilderScheduler,
     change: CatalogChange,

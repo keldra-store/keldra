@@ -16,6 +16,18 @@ use crate::index_service::{StoredIndexDefinition, definition_path};
 use super::v4_schema::compile_schema;
 
 const MAX_PENDING_CATALOG_CHANGES: usize = 1_024;
+const PHYSICAL_PROJECTION_DOMAIN: &[u8] = b"keldra.index.physical-projection/v1";
+
+/// Stable physical identity for one complete canonical source/schema recipe.
+///
+/// The full schema fingerprint remains stored and validated by every segment
+/// and manifest. These compact values are routing/path keys only: a truncated
+/// collision fails closed on that full fingerprint instead of sharing bytes.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PhysicalProjectionIdentity {
+    pub(crate) index_id: u64,
+    pub(crate) definition_version: u64,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct CatalogDefinition {
@@ -64,6 +76,35 @@ impl CatalogDefinition {
         }
     }
 
+    pub(crate) fn physical_identity(&self) -> PhysicalProjectionIdentity {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(PHYSICAL_PROJECTION_DOMAIN);
+        hasher.update(&self.tenant_id.to_be_bytes());
+        hasher.update(&self.bucket_id.to_be_bytes());
+        hasher.update(&self.schema_fingerprint);
+        let digest = hasher.finalize();
+        let mut index = [0_u8; 8];
+        let mut version = [0_u8; 8];
+        index.copy_from_slice(&digest.as_bytes()[..8]);
+        version.copy_from_slice(&digest.as_bytes()[8..16]);
+        PhysicalProjectionIdentity {
+            index_id: nonzero_identity(index),
+            definition_version: nonzero_identity(version),
+        }
+    }
+
+    pub(crate) fn physical_stored(&self) -> StoredIndexDefinition {
+        self.stored.with_index_id(self.physical_identity().index_id)
+    }
+
+    pub(crate) fn physical_index_id(&self) -> u64 {
+        self.physical_identity().index_id
+    }
+
+    pub(crate) fn physical_definition_version(&self) -> u64 {
+        self.physical_identity().definition_version
+    }
+
     pub(crate) fn validate(&self) -> Result<(), Status> {
         if self.tenant_id == 0 || self.bucket_id == 0 || self.object_version == 0 {
             return Err(Status::data_loss(
@@ -90,6 +131,11 @@ impl CatalogDefinition {
         }
         Ok(())
     }
+}
+
+fn nonzero_identity(bytes: [u8; 8]) -> u64 {
+    let value = u64::from_be_bytes(bytes);
+    if value == 0 { 1 } else { value }
 }
 
 fn schema_status(error: keldra_index::IndexError) -> Status {
@@ -259,17 +305,15 @@ impl IndexCatalog {
     pub(crate) fn take(
         &self,
         identity: CatalogIdentity,
-        admit_upsert: bool,
+        mut admit_upsert: impl FnMut(&CatalogChange) -> bool,
     ) -> Result<Option<CatalogChange>, Status> {
         let mut state = self
             .inner
             .lock()
             .map_err(|_| Status::internal("assigned index handoff lock is poisoned"))?;
-        if state
-            .pending
-            .get(&identity)
-            .is_some_and(|change| matches!(change, CatalogChange::Upsert(_)) && !admit_upsert)
-        {
+        if state.pending.get(&identity).is_some_and(|change| {
+            matches!(change, CatalogChange::Upsert(_)) && !admit_upsert(change)
+        }) {
             return Ok(None);
         }
         let removed = state.pending.remove(&identity);
@@ -283,7 +327,7 @@ impl IndexCatalog {
     pub(crate) fn take_page(
         &self,
         limit: usize,
-        mut admit_upsert: impl FnMut(CatalogIdentity) -> bool,
+        mut admit_upsert: impl FnMut(&CatalogChange) -> bool,
     ) -> Result<Vec<CatalogChange>, Status> {
         if limit == 0 {
             return Err(Status::invalid_argument(
@@ -299,7 +343,7 @@ impl IndexCatalog {
             .iter()
             .filter_map(|(identity, change)| match change {
                 CatalogChange::Delete { .. } | CatalogChange::Remove(_) => Some(*identity),
-                CatalogChange::Upsert(_) if admit_upsert(*identity) => Some(*identity),
+                CatalogChange::Upsert(_) if admit_upsert(change) => Some(*identity),
                 CatalogChange::Upsert(_) => None,
             })
             .take(limit)
@@ -385,7 +429,10 @@ mod tests {
         catalog.upsert(first).unwrap();
         catalog.upsert(replacement.clone()).unwrap();
         assert_eq!(catalog.pending_len().unwrap(), 1);
-        let change = catalog.take(replacement.identity(), true).unwrap().unwrap();
+        let change = catalog
+            .take(replacement.identity(), |_| true)
+            .unwrap()
+            .unwrap();
         assert!(matches!(change, CatalogChange::Upsert(value) if value.object_version == 2));
         assert_eq!(catalog.pending_len().unwrap(), 0);
     }
@@ -404,7 +451,7 @@ mod tests {
             .remove(first.tenant_id, first.bucket_id, first.stored.index_id)
             .unwrap();
         assert!(matches!(
-            catalog.take(first.identity(), true).unwrap(),
+            catalog.take(first.identity(), |_| true).unwrap(),
             Some(CatalogChange::Remove(_))
         ));
     }
@@ -423,7 +470,7 @@ mod tests {
             .unwrap();
         catalog.remove(1, 2, 9).unwrap();
         assert!(matches!(
-            catalog.take(identity, true).unwrap(),
+            catalog.take(identity, |_| true).unwrap(),
             Some(CatalogChange::Delete {
                 object_version: 2,
                 ..
@@ -445,7 +492,7 @@ mod tests {
             .unwrap();
         catalog.upsert(stale).unwrap();
         assert!(matches!(
-            catalog.take(identity, true).unwrap(),
+            catalog.take(identity, |_| true).unwrap(),
             Some(CatalogChange::Delete {
                 object_version: 3,
                 ..
@@ -462,7 +509,7 @@ mod tests {
         recreated.object_version = 4;
         catalog.upsert(recreated).unwrap();
         assert!(matches!(
-            catalog.take(identity, true).unwrap(),
+            catalog.take(identity, |_| true).unwrap(),
             Some(CatalogChange::Upsert(CatalogDefinition {
                 object_version: 4,
                 ..
@@ -492,13 +539,13 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
 
-        assert!(catalog.take(first.identity(), true).unwrap().is_some());
+        assert!(catalog.take(first.identity(), |_| true).unwrap().is_some());
         tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
             .await
             .expect("affected wake did not resume after catalog capacity was released")
             .unwrap()
             .unwrap();
-        assert!(catalog.take(second_identity, true).unwrap().is_some());
+        assert!(catalog.take(second_identity, |_| true).unwrap().is_some());
     }
 
     #[test]
@@ -522,6 +569,52 @@ mod tests {
 
         assert_ne!(original.schema_fingerprint, updated.schema_fingerprint);
         assert_eq!(updated.schema.path_prefix, "tenant/42/");
+    }
+
+    #[test]
+    fn equivalent_logical_definitions_share_one_physical_projection_identity() {
+        let first = definition(1, 2, 9);
+        let second = definition(1, 2, 10);
+        assert_ne!(first.identity(), second.identity());
+        assert_eq!(first.schema_fingerprint, second.schema_fingerprint);
+        assert_eq!(first.physical_identity(), second.physical_identity());
+
+        let different_bucket = definition(1, 3, 11);
+        assert_ne!(
+            first.physical_identity(),
+            different_bucket.physical_identity()
+        );
+
+        let mut different_scope = second.stored.clone();
+        different_scope.path_prefix = "other/".into();
+        let different_scope = CatalogDefinition::new(1, 2, 2, different_scope).unwrap();
+        assert_ne!(
+            first.physical_identity(),
+            different_scope.physical_identity()
+        );
+    }
+
+    #[test]
+    fn catalog_scale_collapses_two_hundred_fifty_thousand_equivalent_definitions() {
+        let base = definition(1, 2, 1);
+        let logical = (1..=250_000_u64)
+            .map(|index_id| {
+                (
+                    CatalogIdentity {
+                        tenant_id: 1,
+                        bucket_id: 2,
+                        index_id,
+                    },
+                    base.physical_identity(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let physical = logical
+            .values()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(logical.len(), 250_000);
+        assert_eq!(physical.len(), 1);
     }
 
     #[test]
