@@ -157,11 +157,12 @@ catalog lock.
 
 Process-local assignment notifications are wakeups, not a change journal. A
 receiver which falls behind must retain already completed physical progress and
-resume a paged reconciliation from the durable catalog. It must not discard a
-partially or completely reconstructed projection inventory and restart from
-page one. Catalog reconciliation uses a monotonic durable catalog generation
-and an exact snapshot/catch-up boundary so creation churn cannot repeatedly
-invalidate `O(catalog cardinality)` work.
+reconcile from an exact bounded-memory view of the durable catalog. It must not
+discard a partially or completely reconstructed projection inventory and
+restart from page one. The assignment scan and replacement receiver share the
+Store's assignment mutation fence, so no change can fall between the exact
+inventory and its catch-up stream. A later catalog-page format may reduce the
+duration of that fence, but cannot weaken this boundary.
 
 ## 5. Canonical physical identities
 
@@ -658,8 +659,12 @@ fixed 40 operations/s for 30 minutes accepted 71,973 of 71,973 offered
 operations, publication visibility p99 was 26.69 seconds, concurrent-query p99
 was 401.92 milliseconds, and the final exact drain took 80.36 seconds. This is
 a bounded in-load visibility result, not a saturation result inferred from an
-eventual drain. The corresponding SSD fixed-rate result is recorded separately
-when complete.
+eventual drain. A corresponding 180 operations/s SSD cell accepted all 323,994
+offered mutations and completed all 37,200 scheduled queries without an
+in-load error, but failed the keep-up gate: the target generation remained
+invisible after the full 1,800-second drain allowance. Its archive SHA-256 is
+`d761a73f78ad4b70af3d5c8558c9dd60fac85f8f7f1fe3fca8cfc86a3d314aca`.
+This is an overload bound, not a successful SSD service-rate result.
 
 Server commit `1ce4fa290d23` subsequently repeated the rotational gate with two
 alternating logical schema variants: reordered fields and different public
@@ -689,7 +694,12 @@ Implemented groundwork on `feat/shared-index-projection`:
   excluded from the segment schema fingerprint. Complete schemas which differ
   only by field declaration order or public aliases now share the same actual
   projection, segments, and query reader; query compilation and response labels
-  still use the authorized logical names.
+  still use the authorized logical names;
+- format-v5 projected-state and generation records use integrity-checked,
+  bounded codecs; and
+- component roots are represented by a canonical bounded-fanout Merkle
+  directory rather than an unbounded manifest or one file per component. A
+  70,000-component regression keeps every encoded directory page below 32 KiB.
 
 This does not yet satisfy Milestone B for field subsets. Independent component
 generation ownership and bindings remain required before different complete
@@ -701,6 +711,15 @@ Persist the disposable exact projected state and stable document indirection
 described in section 7. The writer compares canonical prior/current state and
 emits no component mutation for an unindexed change, or only the changed recipe
 subset for a material change. This is the Keldra HOT-equivalent milestone.
+
+The native format-v5 writer core is implemented. One byte-accounted
+source-partition buffer admits a complete mutation across every dirty physical
+recipe or leaves the buffer unchanged, coalesces repeated stable-document-key
+updates, and seals canonical integrity-checked delta segments. Focused tests
+prove that an unindexed update writes only the document head and that changing
+one indexed field writes only that field recipe plus the head. Durable
+generation publication and production query resolution still have to consume
+these records before Milestone C is complete.
 
 ### 18.4 Milestone D: lifecycle and scale completion
 

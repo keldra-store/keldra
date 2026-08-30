@@ -94,11 +94,29 @@ async fn main() -> Result<()> {
 
 async fn create_definitions(args: Arc<Args>) -> Result<()> {
     let next = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let progress_args = args.clone();
+    let progress_completed = completed.clone();
+    let progress_started = Instant::now();
+    let progress = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let count = progress_completed.load(Ordering::Relaxed);
+            eprintln!(
+                "catalog progress: {count}/{} definitions ({:.2}/s)",
+                progress_args.definitions,
+                count as f64 / progress_started.elapsed().as_secs_f64()
+            );
+        }
+    });
     let workers = args.concurrency.min(args.definitions);
     let mut tasks = JoinSet::new();
     for _ in 0..workers {
         let args = args.clone();
         let next = next.clone();
+        let completed = completed.clone();
         tasks.spawn(async move {
             let channel = connect_channel(&args.endpoint)
                 .await
@@ -141,12 +159,15 @@ async fn create_definitions(args: Arc<Args>) -> Result<()> {
                     "created definition identity changed"
                 );
                 ensure!(definition.index_id != 0, "created definition has zero ID");
+                completed.fetch_add(1, Ordering::Relaxed);
             }
         });
     }
     while let Some(result) = tasks.join_next().await {
         result.context("catalog creation worker panicked")??;
     }
+    progress.abort();
+    let _ = progress.await;
     Ok(())
 }
 

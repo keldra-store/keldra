@@ -6,9 +6,8 @@ use std::time::Duration;
 
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
-    DefinitionAssignment, DefinitionAssignmentCursor, DefinitionAssignmentMutation,
-    DefinitionConsumerKind, DefinitionKind, DerivedConsumerKind, LocalChange,
-    MAX_DEFINITION_STATE_SCAN_RECORDS, PlacementLogId, SourceId, Store, WatchJournalStatus,
+    DefinitionAssignment, DefinitionAssignmentMutation, DefinitionConsumerKind, DefinitionKind,
+    DerivedConsumerKind, LocalChange, PlacementLogId, SourceId, Store, WatchJournalStatus,
 };
 use tonic::Status;
 
@@ -291,11 +290,16 @@ async fn run(
                         &mut state,
                         mutations,
                     ),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => Err(
-                        Status::unavailable(format!(
-                            "derived assignment notifications lagged by {skipped} batches",
-                        )),
-                    ),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(consumer.kind = ?kind, skipped, "derived assignment notifications lagged; reconciling exact durable inventory");
+                        reconcile_assignment_snapshot(
+                            kind,
+                            &store,
+                            &mut assignment_changes,
+                            &mut state.assignments,
+                            &mut state.tracker,
+                        ).await
+                    },
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
                 _ = interval.tick() => advance_once(
@@ -341,10 +345,10 @@ async fn initialize(
             .map(|(status, checkpoint)| (*status, checkpoint.clone())),
     )
     .map_err(tracker_status)?;
-    let mut assignments = AssignedBucketInventory::new(definition_kind(kind), target.fence);
+    let (mut assignments, exact_changes) = assignment_snapshot(kind, store, target.fence).await?;
+    *assignment_changes = exact_changes;
     scan_inventory(
         kind,
-        store,
         journal,
         resolver,
         &from,
@@ -358,7 +362,14 @@ async fn initialize(
     // this returns. Drain them before this disposable inventory is trusted.
     wait_for_assignment_delivery(kind, decisions, store, &target).await?;
     let mut tracker = inventory.finish();
-    drain_assignment_changes(&mut assignments, &mut tracker, assignment_changes)?;
+    synchronize_assignment_changes(
+        kind,
+        store,
+        assignment_changes,
+        &mut assignments,
+        &mut tracker,
+    )
+    .await?;
     publisher.publish_tracker(&mut tracker).await?;
     Ok(RuntimeState {
         tracker,
@@ -441,40 +452,19 @@ fn baseline_barrier(
 
 async fn scan_inventory(
     kind: DerivedConsumerKind,
-    store: &Store,
     journal: &IndexEventJournal,
     resolver: &DerivedEvidenceResolver,
     from: &IndexBarrier,
     target: &IndexBarrier,
     inventory: &mut SparseDerivedInventory,
-    assignments: &mut AssignedBucketInventory,
+    assignments: &AssignedBucketInventory,
 ) -> Result<(), Status> {
-    let mut cursor: Option<DefinitionAssignmentCursor> = None;
-    let mut bucket = None;
-    let mut effects = BTreeMap::new();
-    loop {
-        let page = scan_assignments(store, kind, cursor.as_ref()).await?;
-        for assignment in page.assignments {
-            if assignment.rank != 0 || assignment.observed_fence != target.fence {
-                continue;
-            }
-            assignments.insert_scanned(assignment.clone());
-            let current_bucket = (assignment.tenant_id, assignment.bucket_id);
-            if bucket != Some(current_bucket) {
-                effects = routed_effects(
-                    kind,
-                    journal,
-                    current_bucket.0,
-                    current_bucket.1,
-                    from,
-                    target,
-                )
-                .await?;
-                bucket = Some(current_bucket);
-            }
-            if effects.is_empty() {
-                continue;
-            }
+    for ((tenant_id, bucket_id), definitions) in assignments.buckets() {
+        let effects = routed_effects(kind, journal, tenant_id, bucket_id, from, target).await?;
+        if effects.is_empty() {
+            continue;
+        }
+        for assignment in definitions.values() {
             let evidence = resolver.affected(&assignment, &effects).await?;
             for (&source, effect) in &effects {
                 inventory
@@ -493,12 +483,9 @@ async fn scan_inventory(
                     .map_err(tracker_status)?;
             }
         }
-        cursor = page.next_cursor;
-        if cursor.is_none() {
-            return Ok(());
-        }
         tokio::task::yield_now().await;
     }
+    Ok(())
 }
 
 async fn apply_progress(
@@ -535,11 +522,14 @@ async fn advance_once(
         return Ok(());
     }
     wait_for_assignment_delivery(kind, decisions, store, &target).await?;
-    drain_assignment_changes(
+    synchronize_assignment_changes(
+        kind,
+        store,
+        assignment_changes,
         &mut state.assignments,
         &mut state.tracker,
-        assignment_changes,
-    )?;
+    )
+    .await?;
     // Routed effects are bounded by the target captured above. Move the
     // disposable tracker's settled view to that same target before asking it
     // to validate those effects; validating first compares new offsets with
@@ -819,10 +809,12 @@ fn change_buckets(kind: DerivedConsumerKind, change: &LocalChange) -> Vec<(u64, 
     }
 }
 
-fn drain_assignment_changes(
+async fn synchronize_assignment_changes(
+    kind: DerivedConsumerKind,
+    store: &Store,
+    receiver: &mut tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
     assignments: &mut AssignedBucketInventory,
     tracker: &mut SparseDerivedTracker,
-    receiver: &mut tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
 ) -> Result<(), Status> {
     loop {
         match receiver.try_recv() {
@@ -834,12 +826,52 @@ fn drain_assignment_changes(
                 ));
             }
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
-                return Err(Status::unavailable(format!(
-                    "derived assignment notifications lagged by {skipped} batches",
-                )));
+                tracing::warn!(consumer.kind = ?kind, skipped, "derived assignment notification drain lagged; reconciling exact durable inventory");
+                reconcile_assignment_snapshot(kind, store, receiver, assignments, tracker).await?;
             }
         }
     }
+}
+
+async fn reconcile_assignment_snapshot(
+    kind: DerivedConsumerKind,
+    store: &Store,
+    receiver: &mut tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
+    assignments: &mut AssignedBucketInventory,
+    tracker: &mut SparseDerivedTracker,
+) -> Result<(), Status> {
+    let (replacement, exact_changes) =
+        assignment_snapshot(kind, store, assignments.fence()).await?;
+    for removed in assignments.replace_with(replacement) {
+        tracker.remove_identity(removed).map_err(tracker_status)?;
+    }
+    *receiver = exact_changes;
+    Ok(())
+}
+
+async fn assignment_snapshot(
+    kind: DerivedConsumerKind,
+    store: &Store,
+    fence: PlacementLogId,
+) -> Result<
+    (
+        AssignedBucketInventory,
+        tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
+    ),
+    Status,
+> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut inventory = AssignedBucketInventory::new(definition_kind(kind), fence);
+        let receiver =
+            store.visit_definition_assignment_snapshot(definition_kind(kind), |assignment| {
+                inventory.insert_scanned(assignment);
+            })?;
+        Ok::<_, keldra_store::DefinitionStateError>((inventory, receiver))
+    })
+    .await
+    .map_err(join_status)?
+    .map_err(internal_status)
 }
 
 fn apply_assignment_mutations(
@@ -898,25 +930,6 @@ async fn assignment_delivery_next(
     Ok(checkpoint
         .filter(|checkpoint| checkpoint.source_id == source && checkpoint.observed_fence == fence)
         .map_or(0, |checkpoint| checkpoint.next_offset))
-}
-
-async fn scan_assignments(
-    store: &Store,
-    kind: DerivedConsumerKind,
-    cursor: Option<&DefinitionAssignmentCursor>,
-) -> Result<keldra_store::DefinitionAssignmentPage, Status> {
-    let store = store.clone();
-    let cursor = cursor.cloned();
-    tokio::task::spawn_blocking(move || {
-        store.scan_definition_assignments_by_kind(
-            definition_kind(kind),
-            cursor.as_ref(),
-            MAX_DEFINITION_STATE_SCAN_RECORDS,
-        )
-    })
-    .await
-    .map_err(join_status)?
-    .map_err(internal_status)
 }
 
 fn require_compatible(from: &IndexBarrier, target: &IndexBarrier) -> Result<(), Status> {

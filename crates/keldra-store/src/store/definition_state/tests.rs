@@ -765,3 +765,46 @@ async fn direct_assignment_transfer_is_idempotent_stale_safe_and_notifies_change
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn exact_assignment_snapshot_receiver_starts_after_the_visited_state() {
+    let (_temporary, store) = store().await;
+    let first = DefinitionAssignment {
+        kind: DefinitionKind::Index,
+        tenant_id: 7,
+        bucket_id: 9,
+        definition_id: 11,
+        definition_path: "indexes/a".into(),
+        object_version: VersionId(21),
+        observed_fence: fence(30),
+        rank: 0,
+    };
+    store
+        .apply_definition_assignment_mutations(&[DefinitionAssignmentMutation::Upsert(
+            first.clone(),
+        )])
+        .unwrap();
+
+    let mut visited = Vec::new();
+    let mut changes = store
+        .visit_definition_assignment_snapshot(DefinitionKind::Index, |assignment| {
+            visited.push(assignment);
+        })
+        .unwrap();
+    assert_eq!(visited, [first.clone()]);
+    assert!(matches!(
+        changes.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    let second = DefinitionAssignment {
+        definition_id: 12,
+        definition_path: "indexes/b".into(),
+        ..first
+    };
+    let mutation = DefinitionAssignmentMutation::Upsert(second);
+    store
+        .apply_definition_assignment_mutations(std::slice::from_ref(&mutation))
+        .unwrap();
+    assert_eq!(changes.recv().await.unwrap(), [mutation]);
+}

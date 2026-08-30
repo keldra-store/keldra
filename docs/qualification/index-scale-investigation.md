@@ -472,3 +472,26 @@ was 107.42 seconds. This proves alias/order-neutral sharing through the public
 query contract, not merely identical serialized definitions. The archived
 result SHA-256 is
 `03cb408de54a2f1d9bcc848daa56ad93acf34c391eb13147480cf82707e29c3b`.
+
+The corresponding SSD D640 run deliberately offered a much higher fixed rate:
+180 operations/s for 30 minutes. It accepted all 323,994 operations and
+completed all 37,200 scheduled queries with zero mutation, query, timeout, or
+correctness errors during the offered-load phase. It did **not** pass keep-up:
+after another 1,800 seconds the final canary still could not observe the target
+generation and its query hit the 30-second request deadline. The terminal
+report is therefore a failure, not an eventual-drain success. Its archive
+SHA-256 is `d761a73f78ad4b70af3d5c8558c9dd60fac85f8f7f1fe3fca8cfc86a3d314aca`.
+This bounds the current SSD service rate below 180 operations/s for this corpus
+and D640 shape; a lower-rate sweep is required to locate the stationary limit.
+
+The first Catalog-250K attempt also exposed a separate control-plane defect.
+While definitions were being created, the derived consumer repeatedly lost its
+bounded assignment notifications and discarded its entire reconstructed
+inventory. The skipped batches grew 5, 57, 131, 357, 824, 1,854, then 3,305 as
+each page-one restart took longer. That is direct superlinear recovery work,
+not a host-capacity result. The diagnostic was stopped with its logs preserved.
+The replacement uses an exact Store assignment snapshot plus a notification
+receiver created under the same assignment lock; lag now replaces only the
+disposable assignment inventory and preserves completed source/projection
+progress. Catalog-250K must be rerun against that exact candidate before a pass
+is claimed.
