@@ -3,15 +3,22 @@ use std::collections::BTreeMap;
 use crate::IndexError;
 
 use super::{
-    CanonicalRecipeState, ComponentIdentity, ComponentRoot, DocumentHead, ProjectedDocumentState,
+    CanonicalRecipeState, ComponentIdentity, ComponentRoot, DocumentHead, LogicalFieldBinding,
+    LogicalProjectionBinding, ProjectedDocumentState, ProjectionBarrier, ProjectionGeneration,
     RecipeIdentity, StableDocumentKey,
 };
 
 const STATE_MAGIC: &[u8; 8] = b"K5STATE1";
 const DIRECTORY_MAGIC: &[u8; 8] = b"K5CDIR01";
+const GENERATION_MAGIC: &[u8; 8] = b"K5GEN001";
+const BINDING_MAGIC: &[u8; 8] = b"K5BIND01";
 const STATE_FORMAT: u16 = 1;
 const DIRECTORY_FORMAT: u16 = 1;
+const GENERATION_FORMAT: u16 = 1;
+const BINDING_FORMAT: u16 = 1;
 pub const COMPONENT_DIRECTORY_FANOUT: usize = 256;
+pub const MAX_PROJECTION_SOURCES: usize = 4_096;
+pub const MAX_LOGICAL_BINDING_FIELDS: usize = 65_536;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedComponentDirectoryPage {
@@ -24,6 +31,161 @@ pub struct ComponentDirectory {
     pub root_hash: [u8; 32],
     pub root_count: u64,
     pub pages: Vec<EncodedComponentDirectoryPage>,
+}
+
+/// One content-addressed generation record and the independently publishable
+/// bounded directory pages it names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedProjectionGeneration {
+    pub hash: [u8; 32],
+    pub bytes: Vec<u8>,
+    pub component_directory: ComponentDirectory,
+}
+
+pub fn encode_projection_generation(
+    generation: &ProjectionGeneration,
+) -> Result<EncodedProjectionGeneration, IndexError> {
+    generation.validate()?;
+    if generation.barrier.source_offsets.len() > MAX_PROJECTION_SOURCES {
+        return Err(IndexError::InvalidDefinition(
+            "projection generation source barrier is unbounded".into(),
+        ));
+    }
+    let component_directory = build_component_directory(&generation.roots)?;
+    let mut out = Vec::new();
+    out.extend_from_slice(GENERATION_MAGIC);
+    put_u16(&mut out, GENERATION_FORMAT);
+    out.extend_from_slice(&generation.family_id);
+    put_u64(&mut out, generation.revision);
+    put_u32(&mut out, generation.barrier.source_offsets.len() as u32);
+    for (node, offset) in &generation.barrier.source_offsets {
+        put_u64(&mut out, *node);
+        put_u64(&mut out, *offset);
+    }
+    put_optional_u64(&mut out, generation.barrier.atomic_through);
+    out.extend_from_slice(&component_directory.root_hash);
+    put_u64(&mut out, component_directory.root_count);
+    put_optional_hash(&mut out, generation.previous_generation_hash);
+    append_integrity(&mut out);
+    Ok(EncodedProjectionGeneration {
+        hash: *blake3::hash(&out).as_bytes(),
+        bytes: out,
+        component_directory,
+    })
+}
+
+pub fn decode_projection_generation(
+    bytes: &[u8],
+    component_directory: &ComponentDirectory,
+) -> Result<ProjectionGeneration, IndexError> {
+    let payload = verify_integrity(bytes)?;
+    let mut input = Decoder::new(payload);
+    input.expect(GENERATION_MAGIC)?;
+    if input.u16()? != GENERATION_FORMAT {
+        return Err(IndexError::InvalidFormat(
+            "projection generation format is unsupported",
+        ));
+    }
+    let family_id = input.array_32()?;
+    let revision = input.u64()?;
+    let source_count = input.u32()? as usize;
+    if source_count == 0 || source_count > MAX_PROJECTION_SOURCES {
+        return Err(IndexError::InvalidFormat(
+            "projection generation source barrier is unbounded",
+        ));
+    }
+    let mut source_offsets = Vec::with_capacity(source_count);
+    for _ in 0..source_count {
+        source_offsets.push((input.u64()?, input.u64()?));
+    }
+    let atomic_through = input.optional_u64()?;
+    let directory_hash = input.array_32()?;
+    let directory_count = input.u64()?;
+    let previous_generation_hash = input.optional_hash()?;
+    input.finish()?;
+    if directory_hash != component_directory.root_hash
+        || directory_count != component_directory.root_count
+    {
+        return Err(IndexError::Integrity);
+    }
+    let generation = ProjectionGeneration {
+        family_id,
+        revision,
+        barrier: ProjectionBarrier::new(source_offsets, atomic_through)?,
+        roots: decode_component_directory(component_directory)?,
+        previous_generation_hash,
+    };
+    generation.validate()?;
+    Ok(generation)
+}
+
+pub fn encode_logical_projection_binding(
+    binding: &LogicalProjectionBinding,
+    generation: &ProjectionGeneration,
+) -> Result<Vec<u8>, IndexError> {
+    binding.validate_against(generation)?;
+    if binding.fields.len() > MAX_LOGICAL_BINDING_FIELDS {
+        return Err(IndexError::InvalidDefinition(
+            "logical projection binding has too many fields".into(),
+        ));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(BINDING_MAGIC);
+    put_u16(&mut out, BINDING_FORMAT);
+    put_u64(&mut out, binding.logical_index_id);
+    put_u64(&mut out, binding.logical_definition_version);
+    put_u64(&mut out, binding.generation_revision);
+    out.extend_from_slice(&binding.membership.bytes());
+    put_u32(&mut out, binding.fields.len() as u32);
+    for field in &binding.fields {
+        put_u32(&mut out, field.public_field_id);
+        put_bytes(&mut out, field.public_name.as_bytes())?;
+        out.extend_from_slice(&field.recipe.bytes());
+    }
+    append_integrity(&mut out);
+    Ok(out)
+}
+
+pub fn decode_logical_projection_binding(
+    bytes: &[u8],
+    generation: &ProjectionGeneration,
+) -> Result<LogicalProjectionBinding, IndexError> {
+    let payload = verify_integrity(bytes)?;
+    let mut input = Decoder::new(payload);
+    input.expect(BINDING_MAGIC)?;
+    if input.u16()? != BINDING_FORMAT {
+        return Err(IndexError::InvalidFormat(
+            "logical projection binding format is unsupported",
+        ));
+    }
+    let logical_index_id = input.u64()?;
+    let logical_definition_version = input.u64()?;
+    let generation_revision = input.u64()?;
+    let membership = RecipeIdentity::new(input.array_32()?)?;
+    let field_count = input.u32()? as usize;
+    if field_count > MAX_LOGICAL_BINDING_FIELDS {
+        return Err(IndexError::InvalidFormat(
+            "logical projection binding has too many fields",
+        ));
+    }
+    let mut fields = Vec::with_capacity(field_count);
+    for _ in 0..field_count {
+        fields.push(LogicalFieldBinding {
+            public_field_id: input.u32()?,
+            public_name: input.string()?,
+            recipe: RecipeIdentity::new(input.array_32()?)?,
+        });
+    }
+    input.finish()?;
+    let binding = LogicalProjectionBinding {
+        logical_index_id,
+        logical_definition_version,
+        generation_revision,
+        membership,
+        fields,
+    };
+    binding.validate_against(generation)?;
+    Ok(binding)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -416,6 +578,24 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
+fn put_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            put_u64(out, value);
+        }
+        None => out.push(0),
+    }
+}
+fn put_optional_hash(out: &mut Vec<u8>, value: Option<[u8; 32]>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value);
+        }
+        None => out.push(0),
+    }
+}
 
 struct Decoder<'a> {
     bytes: &'a [u8],
@@ -470,6 +650,20 @@ impl<'a> Decoder<'a> {
     fn array_32(&mut self) -> Result<[u8; 32], IndexError> {
         Ok(self.take(32)?.try_into().unwrap())
     }
+    fn optional_u64(&mut self) -> Result<Option<u64>, IndexError> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.u64()?)),
+            _ => Err(IndexError::Decode("optional u64 is invalid".into())),
+        }
+    }
+    fn optional_hash(&mut self) -> Result<Option<[u8; 32]>, IndexError> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.array_32()?)),
+            _ => Err(IndexError::Decode("optional hash is invalid".into())),
+        }
+    }
     fn string(&mut self) -> Result<String, IndexError> {
         let length = self.u32()? as usize;
         String::from_utf8(self.take(length)?.to_vec())
@@ -521,6 +715,20 @@ mod tests {
 
     fn recipe(byte: u8) -> RecipeIdentity {
         RecipeIdentity::new([byte; 32]).unwrap()
+    }
+
+    fn generation() -> ProjectionGeneration {
+        ProjectionGeneration::initial(
+            [9; 32],
+            ProjectionBarrier::new(vec![(1, 7), (2, 11)], Some(5)).unwrap(),
+            vec![
+                ComponentRoot::new(ComponentIdentity::DocumentHead, [1; 32], 10, 9).unwrap(),
+                ComponentRoot::new(ComponentIdentity::Membership(recipe(2)), [2; 32], 10, 9)
+                    .unwrap(),
+                ComponentRoot::new(ComponentIdentity::Field(recipe(3)), [3; 32], 10, 9).unwrap(),
+            ],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -582,5 +790,78 @@ mod tests {
             decode_component_directory(&directory),
             Err(IndexError::Integrity)
         );
+    }
+
+    #[test]
+    fn generation_record_round_trips_through_its_exact_directory() {
+        let generation = generation();
+        let encoded = encode_projection_generation(&generation).unwrap();
+        assert_eq!(
+            decode_projection_generation(&encoded.bytes, &encoded.component_directory).unwrap(),
+            generation
+        );
+
+        let mut wrong_directory = encoded.component_directory.clone();
+        wrong_directory.root_count += 1;
+        assert_eq!(
+            decode_projection_generation(&encoded.bytes, &wrong_directory),
+            Err(IndexError::Integrity)
+        );
+    }
+
+    #[test]
+    fn generation_record_size_does_not_grow_with_component_count() {
+        let mut roots =
+            vec![ComponentRoot::new(ComponentIdentity::DocumentHead, [8; 32], 64, 48).unwrap()];
+        roots.extend((1_u32..=70_000).map(|ordinal| {
+            let mut identity = [0_u8; 32];
+            identity[..4].copy_from_slice(&ordinal.to_be_bytes());
+            ComponentRoot::new(
+                ComponentIdentity::Field(RecipeIdentity::new(identity).unwrap()),
+                *blake3::hash(&identity).as_bytes(),
+                64,
+                48,
+            )
+            .unwrap()
+        }));
+        let generation = ProjectionGeneration::initial(
+            [9; 32],
+            ProjectionBarrier::new(vec![(1, 7)], None).unwrap(),
+            roots,
+        )
+        .unwrap();
+        let encoded = encode_projection_generation(&generation).unwrap();
+        assert!(encoded.bytes.len() < 256);
+        assert_eq!(encoded.component_directory.root_count, 70_001);
+    }
+
+    #[test]
+    fn logical_binding_round_trips_and_remains_generation_exact() {
+        let generation = generation();
+        let binding = LogicalProjectionBinding {
+            logical_index_id: 44,
+            logical_definition_version: 8,
+            generation_revision: generation.revision,
+            membership: recipe(2),
+            fields: vec![LogicalFieldBinding {
+                public_field_id: 7,
+                public_name: "renamed".into(),
+                recipe: recipe(3),
+            }],
+        };
+        let bytes = encode_logical_projection_binding(&binding, &generation).unwrap();
+        assert_eq!(
+            decode_logical_projection_binding(&bytes, &generation).unwrap(),
+            binding
+        );
+
+        let advanced = generation
+            .advance(
+                [7; 32],
+                ProjectionBarrier::new(vec![(1, 8), (2, 11)], Some(5)).unwrap(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(decode_logical_projection_binding(&bytes, &advanced).is_err());
     }
 }
