@@ -516,6 +516,7 @@ fn put_recipe_states(out: &mut Vec<u8>, states: &[CanonicalRecipeState]) -> Resu
 fn put_component(out: &mut Vec<u8>, component: ComponentIdentity) {
     match component {
         ComponentIdentity::DocumentHead => out.push(1),
+        ComponentIdentity::ProjectedState => out.push(5),
         ComponentIdentity::Membership(recipe) => {
             out.push(2);
             out.extend_from_slice(&recipe.bytes());
@@ -688,6 +689,7 @@ impl<'a> Decoder<'a> {
     fn component(&mut self) -> Result<ComponentIdentity, IndexError> {
         match self.byte()? {
             1 => Ok(ComponentIdentity::DocumentHead),
+            5 => Ok(ComponentIdentity::ProjectedState),
             2 => Ok(ComponentIdentity::Membership(RecipeIdentity::new(
                 self.array_32()?,
             )?)),
@@ -723,6 +725,7 @@ mod tests {
             ProjectionBarrier::new(vec![(1, 7), (2, 11)], Some(5)).unwrap(),
             vec![
                 ComponentRoot::new(ComponentIdentity::DocumentHead, [1; 32], 10, 9).unwrap(),
+                ComponentRoot::new(ComponentIdentity::ProjectedState, [4; 32], 10, 9).unwrap(),
                 ComponentRoot::new(ComponentIdentity::Membership(recipe(2)), [2; 32], 10, 9)
                     .unwrap(),
                 ComponentRoot::new(ComponentIdentity::Field(recipe(3)), [3; 32], 10, 9).unwrap(),
@@ -811,8 +814,10 @@ mod tests {
 
     #[test]
     fn generation_record_size_does_not_grow_with_component_count() {
-        let mut roots =
-            vec![ComponentRoot::new(ComponentIdentity::DocumentHead, [8; 32], 64, 48).unwrap()];
+        let mut roots = vec![
+            ComponentRoot::new(ComponentIdentity::DocumentHead, [8; 32], 64, 48).unwrap(),
+            ComponentRoot::new(ComponentIdentity::ProjectedState, [9; 32], 64, 48).unwrap(),
+        ];
         roots.extend((1_u32..=70_000).map(|ordinal| {
             let mut identity = [0_u8; 32];
             identity[..4].copy_from_slice(&ordinal.to_be_bytes());
@@ -832,7 +837,7 @@ mod tests {
         .unwrap();
         let encoded = encode_projection_generation(&generation).unwrap();
         assert!(encoded.bytes.len() < 256);
-        assert_eq!(encoded.component_directory.root_count, 70_001);
+        assert_eq!(encoded.component_directory.root_count, 70_002);
     }
 
     #[test]

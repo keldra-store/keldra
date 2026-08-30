@@ -9,6 +9,7 @@ use super::RecipeIdentity;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ComponentIdentity {
     DocumentHead,
+    ProjectedState,
     Membership(RecipeIdentity),
     Field(RecipeIdentity),
     Order(RecipeIdentity),
@@ -201,6 +202,7 @@ impl ProjectionGeneration {
                 .any(|pair| pair[0].component >= pair[1].component)
             || self.roots.iter().any(|root| root.validate().is_err())
             || self.root(ComponentIdentity::DocumentHead).is_none()
+            || self.root(ComponentIdentity::ProjectedState).is_none()
         {
             return Err(IndexError::InvalidDefinition(
                 "projection generation is incomplete or non-canonical".into(),
@@ -280,6 +282,7 @@ mod tests {
             ProjectionBarrier::new(vec![(1, 8)], None).unwrap(),
             vec![
                 root(ComponentIdentity::DocumentHead, 2),
+                root(ComponentIdentity::ProjectedState, 6),
                 root(ComponentIdentity::Membership(recipe(3)), 3),
                 root(ComponentIdentity::Field(recipe(4)), 4),
                 root(ComponentIdentity::Field(recipe(5)), 5),

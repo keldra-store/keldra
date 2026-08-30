@@ -721,10 +721,11 @@ The native format-v5 writer core is implemented. One byte-accounted
 source-partition buffer admits a complete mutation across every dirty physical
 recipe or leaves the buffer unchanged, coalesces repeated stable-document-key
 updates, and seals canonical integrity-checked delta segments. Focused tests
-prove that an unindexed update writes only the document head and that changing
-one indexed field writes only that field recipe plus the head. Durable
-generation publication and production query resolution still have to consume
-these records before Milestone C is complete.
+prove that an unindexed update writes only the disposable exact projected state
+and document head—no membership or query field—and that changing one indexed
+field adds only that field recipe. Durable generation publication and
+production query resolution still have to consume these records before
+Milestone C is complete.
 
 ### 18.4 Milestone D: lifecycle and scale completion
 

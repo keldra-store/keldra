@@ -22,7 +22,8 @@ pub use projector::projected_document_states;
 
 pub const INDEX_FORMAT_VERSION: u16 = 5;
 pub use buffer::{
-    ComponentDeltaRecord, ProjectionMutationBuffer, SealedComponentDelta, decode_component_delta,
+    ComponentDeltaRecord, DecodedComponentDelta, ProjectionMutationBuffer, SealedComponentDelta,
+    decode_component_delta, decode_component_delta_segment,
 };
 pub use codec::{
     COMPONENT_DIRECTORY_FANOUT, ComponentDirectory, EncodedComponentDirectoryPage,

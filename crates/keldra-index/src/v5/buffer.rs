@@ -4,7 +4,7 @@ use crate::IndexError;
 
 use super::{
     CanonicalRecipeState, ComponentIdentity, ComponentRoot, DocumentHead, ProjectedDocumentDelta,
-    RecipeIdentity, StableDocumentKey,
+    ProjectedDocumentState, RecipeIdentity, StableDocumentKey, encode_projected_document_state,
 };
 
 const SEGMENT_MAGIC: &[u8; 8] = b"K5DELTA1";
@@ -16,6 +16,12 @@ const COMPONENT_ACCOUNTING_BYTES: usize = 192;
 pub struct ComponentDeltaRecord {
     pub stable_key: StableDocumentKey,
     pub replacement: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedComponentDelta {
+    pub component: ComponentIdentity,
+    pub records: Vec<ComponentDeltaRecord>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,14 +66,32 @@ impl ProjectionMutationBuffer {
         self.components.is_empty()
     }
 
-    /// Coalesces an exact document delta into its independently replaceable
-    /// physical components. Failure leaves the complete buffer unchanged.
-    pub fn apply(
+    /// Compares and coalesces one exact projected state into independently
+    /// replaceable physical components. The complete state record is retained
+    /// for the next HOT-equivalent comparison; unchanged query components are
+    /// not rewritten. Failure leaves the complete buffer unchanged.
+    pub fn apply_state(
+        &mut self,
+        state: &ProjectedDocumentState,
+        previous: Option<&ProjectedDocumentState>,
+    ) -> Result<(), IndexError> {
+        state.validate()?;
+        let stable_key = state.head.stable_key;
+        let delta = state.delta_from(previous)?;
+        let incoming = vec![(
+            ComponentIdentity::ProjectedState,
+            stable_key,
+            Some(encode_projected_document_state(state)?),
+        )];
+        self.apply_delta(stable_key, delta, incoming)
+    }
+
+    fn apply_delta(
         &mut self,
         stable_key: StableDocumentKey,
         delta: ProjectedDocumentDelta,
+        mut incoming: Vec<(ComponentIdentity, StableDocumentKey, Option<Vec<u8>>)>,
     ) -> Result<(), IndexError> {
-        let mut incoming = Vec::new();
         if let Some(head) = delta.head {
             if head.stable_key != stable_key {
                 return Err(IndexError::InvalidDefinition(
@@ -227,6 +251,10 @@ fn seal_component(
 }
 
 pub fn decode_component_delta(bytes: &[u8]) -> Result<Vec<ComponentDeltaRecord>, IndexError> {
+    Ok(decode_component_delta_segment(bytes)?.records)
+}
+
+pub fn decode_component_delta_segment(bytes: &[u8]) -> Result<DecodedComponentDelta, IndexError> {
     let split = bytes
         .len()
         .checked_sub(32)
@@ -245,8 +273,13 @@ pub fn decode_component_delta(bytes: &[u8]) -> Result<Vec<ComponentDeltaRecord>,
             "projection delta segment format is unsupported",
         ));
     }
-    let _component = input.component()?;
+    let component = input.component()?;
     let count = usize::try_from(input.u64()?).map_err(|_| IndexError::OffsetOverflow)?;
+    if count == 0 || count > input.remaining() / 33 {
+        return Err(IndexError::InvalidFormat(
+            "projection delta record count is unbounded",
+        ));
+    }
     let mut output = Vec::with_capacity(count);
     for _ in 0..count {
         let stable_key = StableDocumentKey::from_bytes(input.array_32()?)?;
@@ -271,12 +304,16 @@ pub fn decode_component_delta(bytes: &[u8]) -> Result<Vec<ComponentDeltaRecord>,
         });
     }
     input.finish()?;
-    Ok(output)
+    Ok(DecodedComponentDelta {
+        component,
+        records: output,
+    })
 }
 
 fn put_component(out: &mut Vec<u8>, component: ComponentIdentity) {
     match component {
         ComponentIdentity::DocumentHead => out.push(1),
+        ComponentIdentity::ProjectedState => out.push(5),
         ComponentIdentity::Membership(recipe) => {
             out.push(2);
             out.extend_from_slice(&recipe.bytes());
@@ -365,6 +402,7 @@ impl<'a> Decoder<'a> {
     fn component(&mut self) -> Result<ComponentIdentity, IndexError> {
         match self.byte()? {
             1 => Ok(ComponentIdentity::DocumentHead),
+            5 => Ok(ComponentIdentity::ProjectedState),
             2 => Ok(ComponentIdentity::Membership(RecipeIdentity::new(
                 self.array_32()?,
             )?)),
@@ -376,6 +414,9 @@ impl<'a> Decoder<'a> {
             )?)),
             _ => Err(IndexError::Decode("projection component is unknown".into())),
         }
+    }
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
     }
     fn finish(self) -> Result<(), IndexError> {
         if self.offset == self.bytes.len() {
@@ -411,16 +452,20 @@ mod tests {
     }
 
     #[test]
-    fn projection_preserving_update_seals_only_the_head_component() {
+    fn projection_preserving_update_seals_state_and_head_but_no_query_component() {
         let old = state(1, b"stable", b"also stable");
         let new = state(2, b"stable", b"also stable");
         let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
-        buffer
-            .apply(new.head.stable_key, new.delta_from(Some(&old)).unwrap())
-            .unwrap();
+        buffer.apply_state(&new, Some(&old)).unwrap();
         let sealed = buffer.seal().unwrap();
-        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed.len(), 2);
         assert_eq!(sealed[0].root.component, ComponentIdentity::DocumentHead);
+        assert_eq!(sealed[1].root.component, ComponentIdentity::ProjectedState);
+        for segment in sealed {
+            let decoded = decode_component_delta_segment(&segment.bytes).unwrap();
+            assert_eq!(decoded.component, segment.root.component);
+            assert_eq!(decoded.records.len(), 1);
+        }
     }
 
     #[test]
@@ -428,11 +473,9 @@ mod tests {
         let old = state(1, b"old", b"stable");
         let new = state(2, b"new", b"stable");
         let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
-        buffer
-            .apply(new.head.stable_key, new.delta_from(Some(&old)).unwrap())
-            .unwrap();
+        buffer.apply_state(&new, Some(&old)).unwrap();
         let sealed = buffer.seal().unwrap();
-        assert_eq!(sealed.len(), 2);
+        assert_eq!(sealed.len(), 3);
         assert!(
             sealed
                 .iter()
@@ -442,6 +485,11 @@ mod tests {
             sealed
                 .iter()
                 .any(|segment| segment.root.component == ComponentIdentity::Field(recipe(2)))
+        );
+        assert!(
+            sealed
+                .iter()
+                .any(|segment| segment.root.component == ComponentIdentity::ProjectedState)
         );
         assert!(
             !sealed
@@ -456,13 +504,32 @@ mod tests {
     #[test]
     fn failed_admission_does_not_partially_mutate_the_buffer() {
         let state = state(1, &vec![1; 4096], b"small");
-        let delta = state.delta_from(None).unwrap();
         let mut buffer = ProjectionMutationBuffer::new(1024).unwrap();
         assert!(matches!(
-            buffer.apply(state.head.stable_key, delta),
+            buffer.apply_state(&state, None),
             Err(IndexError::ResourceLimit { .. })
         ));
         assert!(buffer.is_empty());
         assert_eq!(buffer.used_bytes(), 0);
+    }
+
+    #[test]
+    fn delta_decoder_rejects_an_impossible_record_count_before_allocation() {
+        let state = state(1, b"a", b"b");
+        let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
+        buffer.apply_state(&state, None).unwrap();
+        let mut bytes = buffer.seal().unwrap().remove(0).bytes;
+        let count_offset = SEGMENT_MAGIC.len() + 2 + 1;
+        bytes[count_offset..count_offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let integrity_offset = bytes.len() - 32;
+        let integrity = *blake3::hash(&bytes[..integrity_offset]).as_bytes();
+        bytes[integrity_offset..].copy_from_slice(&integrity);
+        assert!(matches!(
+            decode_component_delta_segment(&bytes),
+            Err(IndexError::OffsetOverflow)
+                | Err(IndexError::InvalidFormat(
+                    "projection delta record count is unbounded"
+                ))
+        ));
     }
 }
