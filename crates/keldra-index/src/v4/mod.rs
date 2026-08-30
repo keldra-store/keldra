@@ -91,7 +91,7 @@ pub use scan::{
 pub use schema::{
     Analyzer, Cardinality, Collation, ComponentVersion, DateFormat, FieldCapabilities,
     FieldComponents, FieldId, FieldSchema, FieldType, IndexKind, IndexSemantics, OrderDirection,
-    OrderField, Schema, VectorMetric, VectorNormalization,
+    OrderField, RecipeFingerprints, Schema, VectorMetric, VectorNormalization,
 };
 pub use segment_reader::SegmentComponentReader;
 pub use statistics::{

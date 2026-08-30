@@ -18,7 +18,7 @@ use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
 
-use super::catalog::{CatalogDefinition, CatalogIdentity};
+use super::catalog::{CatalogDefinition, CatalogIdentity, PhysicalRecipeIdentity};
 use super::cpu::IndexCpuPool;
 use super::json_projection::{ProjectedScalarPointers, project_scalar_pointers};
 use super::source::{IndexBuildDiagnostics, IndexBuildObject, IndexSourceMutation};
@@ -65,7 +65,9 @@ struct RegisteredDefinition {
     tenant_id: u64,
     bucket_id: u64,
     route: ProjectionRoute,
+    membership: PhysicalRecipeIdentity,
     selectors: Vec<String>,
+    recipes: Vec<(PhysicalRecipeIdentity, String)>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -78,6 +80,18 @@ struct ProjectionRoute {
 struct DefinitionPlans {
     definitions: BTreeMap<CatalogIdentity, RegisteredDefinition>,
     buckets: BTreeMap<(u64, u64), BucketSelectorPlan>,
+    membership_recipes: BTreeMap<PhysicalRecipeIdentity, RegisteredMembership>,
+    field_recipes: BTreeMap<PhysicalRecipeIdentity, RegisteredRecipe>,
+}
+
+struct RegisteredMembership {
+    route: ProjectionRoute,
+    references: usize,
+}
+
+struct RegisteredRecipe {
+    selector: String,
+    references: usize,
 }
 
 #[derive(Default)]
@@ -141,6 +155,95 @@ fn add_registered_definition(
     plans: &mut DefinitionPlans,
     definition: &RegisteredDefinition,
 ) -> Result<(), Status> {
+    let recipe_increments = recipe_reference_increments(definition)?;
+    let selector_increments = selector_reference_increments(definition)?;
+    if plans
+        .membership_recipes
+        .get(&definition.membership)
+        .is_some_and(|recipe| recipe.route != definition.route)
+        || definition.recipes.iter().any(|(identity, selector)| {
+            plans
+                .field_recipes
+                .get(identity)
+                .is_some_and(|recipe| recipe.selector != *selector)
+        })
+    {
+        return Err(Status::data_loss(
+            "physical recipe identity resolved to conflicting canonical semantics",
+        ));
+    }
+    plans
+        .membership_recipes
+        .get(&definition.membership)
+        .map_or(Ok(()), |recipe| {
+            recipe.references.checked_add(1).map(|_| ()).ok_or_else(|| {
+                Status::resource_exhausted("membership recipe reference count overflow")
+            })
+        })?;
+    for (identity, increment) in &recipe_increments {
+        if let Some(recipe) = plans.field_recipes.get(identity) {
+            recipe.references.checked_add(*increment).ok_or_else(|| {
+                Status::resource_exhausted("field recipe reference count overflow")
+            })?;
+        }
+    }
+    let route_references = plans
+        .buckets
+        .get(&(definition.tenant_id, definition.bucket_id))
+        .and_then(|bucket| bucket.routes.get(&definition.route));
+    for (selector, increment) in &selector_increments {
+        if let Some(references) =
+            route_references.and_then(|route| route.selector_references.get(selector))
+        {
+            references
+                .checked_add(*increment)
+                .ok_or_else(|| Status::resource_exhausted("selector reference count overflow"))?;
+        }
+    }
+    match plans.membership_recipes.get_mut(&definition.membership) {
+        Some(recipe) => {
+            if recipe.route != definition.route {
+                return Err(Status::data_loss(
+                    "one physical membership recipe resolved to conflicting routes",
+                ));
+            }
+            recipe.references = recipe.references.checked_add(1).ok_or_else(|| {
+                Status::resource_exhausted("membership recipe reference count overflow")
+            })?;
+        }
+        None => {
+            plans.membership_recipes.insert(
+                definition.membership,
+                RegisteredMembership {
+                    route: definition.route.clone(),
+                    references: 1,
+                },
+            );
+        }
+    }
+    for (identity, selector) in &definition.recipes {
+        match plans.field_recipes.get_mut(identity) {
+            Some(recipe) => {
+                if recipe.selector != *selector {
+                    return Err(Status::data_loss(
+                        "one physical field recipe resolved to conflicting selectors",
+                    ));
+                }
+                recipe.references = recipe.references.checked_add(1).ok_or_else(|| {
+                    Status::resource_exhausted("field recipe reference count overflow")
+                })?;
+            }
+            None => {
+                plans.field_recipes.insert(
+                    *identity,
+                    RegisteredRecipe {
+                        selector: selector.clone(),
+                        references: 1,
+                    },
+                );
+            }
+        }
+    }
     let bucket = plans
         .buckets
         .entry((definition.tenant_id, definition.bucket_id))
@@ -167,7 +270,80 @@ fn remove_registered_definition(
     plans: &mut DefinitionPlans,
     definition: RegisteredDefinition,
 ) -> Result<(), Status> {
+    let recipe_decrements = recipe_reference_increments(&definition)?;
+    let selector_decrements = selector_reference_increments(&definition)?;
     let key = (definition.tenant_id, definition.bucket_id);
+    let route = plans
+        .buckets
+        .get(&key)
+        .and_then(|bucket| bucket.routes.get(&definition.route))
+        .ok_or_else(|| Status::internal("registered projection route is absent"))?;
+    if !plans
+        .membership_recipes
+        .get(&definition.membership)
+        .is_some_and(|recipe| recipe.route == definition.route && recipe.references > 0)
+        || definition.recipes.iter().any(|(identity, selector)| {
+            !plans
+                .field_recipes
+                .get(identity)
+                .is_some_and(|recipe| recipe.selector == *selector && recipe.references > 0)
+        })
+        || recipe_decrements.iter().any(|(identity, decrement)| {
+            !plans
+                .field_recipes
+                .get(identity)
+                .is_some_and(|recipe| recipe.references >= *decrement)
+        })
+        || selector_decrements.iter().any(|(selector, decrement)| {
+            !route
+                .selector_references
+                .get(selector)
+                .is_some_and(|references| *references >= *decrement)
+        })
+    {
+        return Err(Status::internal(
+            "registered physical recipe reference is absent or inconsistent",
+        ));
+    }
+    let remove_membership = {
+        let recipe = plans
+            .membership_recipes
+            .get_mut(&definition.membership)
+            .ok_or_else(|| Status::internal("registered membership recipe is absent"))?;
+        if recipe.route != definition.route {
+            return Err(Status::data_loss(
+                "registered membership recipe route changed",
+            ));
+        }
+        recipe.references = recipe
+            .references
+            .checked_sub(1)
+            .ok_or_else(|| Status::internal("membership recipe reference count underflow"))?;
+        recipe.references == 0
+    };
+    if remove_membership {
+        plans.membership_recipes.remove(&definition.membership);
+    }
+    for (identity, selector) in &definition.recipes {
+        let remove = {
+            let recipe = plans
+                .field_recipes
+                .get_mut(identity)
+                .ok_or_else(|| Status::internal("registered physical field recipe is absent"))?;
+            if recipe.selector != *selector {
+                return Err(Status::data_loss(
+                    "registered physical field recipe selector changed",
+                ));
+            }
+            recipe.references = recipe.references.checked_sub(1).ok_or_else(|| {
+                Status::internal("physical field recipe reference count underflow")
+            })?;
+            recipe.references == 0
+        };
+        if remove {
+            plans.field_recipes.remove(identity);
+        }
+    }
     let Some(bucket) = plans.buckets.get_mut(&key) else {
         return Err(Status::internal(
             "registered projection definition has no compiled bucket plan",
@@ -199,6 +375,32 @@ fn remove_registered_definition(
         plans.buckets.remove(&key);
     }
     Ok(())
+}
+
+fn recipe_reference_increments(
+    definition: &RegisteredDefinition,
+) -> Result<BTreeMap<PhysicalRecipeIdentity, usize>, Status> {
+    let mut increments = BTreeMap::new();
+    for (identity, _) in &definition.recipes {
+        let count = increments.entry(*identity).or_insert(0usize);
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| Status::resource_exhausted("field recipe reference count overflow"))?;
+    }
+    Ok(increments)
+}
+
+fn selector_reference_increments(
+    definition: &RegisteredDefinition,
+) -> Result<BTreeMap<String, usize>, Status> {
+    let mut increments = BTreeMap::new();
+    for selector in &definition.selectors {
+        let count = increments.entry(selector.clone()).or_insert(0usize);
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| Status::resource_exhausted("selector reference count overflow"))?;
+    }
+    Ok(increments)
 }
 
 fn compile_selector_plan(schema: &Schema) -> CompiledSelectorPlan {
@@ -327,6 +529,7 @@ impl SharedProjectionMapper {
             remove_registered_definition(&mut plans, previous)?;
         }
         if definition.schema.kind == IndexKind::TypedJson {
+            let field_recipe_identities = definition.field_recipe_identities();
             let registered = RegisteredDefinition {
                 tenant_id: definition.tenant_id,
                 bucket_id: definition.bucket_id,
@@ -334,11 +537,22 @@ impl SharedProjectionMapper {
                     path_prefix: definition.schema.path_prefix.clone(),
                     content_type: definition.schema.content_type_scope.clone(),
                 },
+                membership: definition.membership_recipe_identity(),
                 selectors: definition
                     .schema
                     .fields
                     .iter()
                     .map(|field| field.source_selector.clone())
+                    .collect(),
+                recipes: field_recipe_identities
+                    .into_iter()
+                    .zip(
+                        definition
+                            .schema
+                            .fields
+                            .iter()
+                            .map(|field| field.source_selector.clone()),
+                    )
                     .collect(),
             };
             add_registered_definition(&mut plans, &registered)?;
@@ -784,6 +998,18 @@ impl SharedProjectionMapper {
             .lock()
             .map(|cache| (cache.entries.len() as u64, cache.used_bytes as u64))
             .unwrap_or((0, 0));
+        let (logical_definitions, membership_recipes, field_recipes) = self
+            .inner
+            .definitions
+            .lock()
+            .map(|plans| {
+                (
+                    plans.definitions.len() as u64,
+                    plans.membership_recipes.len() as u64,
+                    plans.field_recipes.len() as u64,
+                )
+            })
+            .unwrap_or((0, 0, 0));
         tracing::info!(
             projection.requests = requests,
             projection.payload_parses = self.inner.telemetry.payload_parses.load(Ordering::Relaxed),
@@ -792,6 +1018,9 @@ impl SharedProjectionMapper {
             projection.union_bypasses = self.inner.telemetry.union_bypasses.load(Ordering::Relaxed),
             projection.cache_entries = cache_entries,
             projection.cache_bytes = cache_bytes,
+            projection.logical_definitions = logical_definitions,
+            projection.membership_recipes = membership_recipes,
+            projection.field_recipes = field_recipes,
             "shared index projection cumulative summary"
         );
     }
@@ -937,6 +1166,10 @@ mod tests {
         content_type: Option<&str>,
         selectors: &[&str],
     ) -> RegisteredDefinition {
+        let selectors = selectors
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
         RegisteredDefinition {
             tenant_id: 1,
             bucket_id: 2,
@@ -944,7 +1177,28 @@ mod tests {
                 path_prefix: path_prefix.into(),
                 content_type: content_type.map(str::to_owned),
             },
-            selectors: selectors.iter().map(|value| (*value).to_owned()).collect(),
+            membership: PhysicalRecipeIdentity {
+                tenant_id: 1,
+                bucket_id: 2,
+                fingerprint: *blake3::hash(
+                    format!("{path_prefix}\0{}", content_type.unwrap_or_default()).as_bytes(),
+                )
+                .as_bytes(),
+            },
+            recipes: selectors
+                .iter()
+                .map(|selector| {
+                    (
+                        PhysicalRecipeIdentity {
+                            tenant_id: 1,
+                            bucket_id: 2,
+                            fingerprint: *blake3::hash(selector.as_bytes()).as_bytes(),
+                        },
+                        selector.clone(),
+                    )
+                })
+                .collect(),
+            selectors,
         }
     }
 
@@ -990,6 +1244,13 @@ mod tests {
         let route = &plans.buckets[&(1, 2)].routes[&first.route];
         assert_eq!(route.selector_references["/id"], 2);
         assert_eq!(route.compiled.as_ref().unwrap().pointers.len(), 1);
+        assert_eq!(plans.membership_recipes.len(), 1);
+        assert_eq!(
+            plans.membership_recipes.values().next().unwrap().references,
+            2
+        );
+        assert_eq!(plans.field_recipes.len(), 1);
+        assert_eq!(plans.field_recipes.values().next().unwrap().references, 2);
 
         remove_registered_definition(&mut plans, first).unwrap();
         assert_eq!(
@@ -998,5 +1259,23 @@ mod tests {
         );
         remove_registered_definition(&mut plans, second).unwrap();
         assert!(!plans.buckets.contains_key(&(1, 2)));
+        assert!(plans.membership_recipes.is_empty());
+        assert!(plans.field_recipes.is_empty());
+    }
+
+    #[test]
+    fn duplicate_logical_bindings_release_one_shared_recipe_exactly() {
+        let mut plans = DefinitionPlans::default();
+        let definition = registered("records/", None, &["/id", "/id"]);
+        add_registered_definition(&mut plans, &definition).unwrap();
+        assert_eq!(plans.field_recipes.len(), 1);
+        assert_eq!(plans.field_recipes.values().next().unwrap().references, 2);
+        assert_eq!(
+            plans.buckets[&(1, 2)].routes[&definition.route].selector_references["/id"],
+            2
+        );
+        remove_registered_definition(&mut plans, definition).unwrap();
+        assert!(plans.field_recipes.is_empty());
+        assert!(plans.buckets.is_empty());
     }
 }

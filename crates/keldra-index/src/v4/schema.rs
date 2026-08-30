@@ -8,6 +8,8 @@ use super::model::{
 };
 
 const SCHEMA_DOMAIN: &[u8] = b"keldra.index.schema.v4";
+const MEMBERSHIP_RECIPE_DOMAIN: &[u8] = b"keldra.index.membership-recipe/v1";
+const FIELD_RECIPE_DOMAIN: &[u8] = b"keldra.index.field-recipe/v1";
 const STATISTICS_FIXED_PAYLOAD_BYTES: usize = 35;
 const STATISTICS_FIELD_BYTES: usize = 103;
 const STATISTICS_LENGTH_OPTIONS_BYTES: usize = 8;
@@ -447,6 +449,17 @@ pub struct Schema {
     pub component_versions: Vec<ComponentVersion>,
 }
 
+/// Definition-neutral identities used by the logical index catalogue.
+///
+/// Public field IDs and names are intentionally absent from field recipe
+/// fingerprints. They belong to the logical binding; the physical recipe is
+/// selected solely by source and query semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipeFingerprints {
+    pub membership: [u8; 32],
+    pub fields: Vec<[u8; 32]>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SegmentSchemaShape {
     pub field_count: usize,
@@ -456,6 +469,65 @@ pub(crate) struct SegmentSchemaShape {
 }
 
 impl Schema {
+    pub fn recipe_fingerprints(&self) -> Result<RecipeFingerprints, IndexError> {
+        self.validate()?;
+
+        let mut membership = Encoder::default();
+        membership.raw(MEMBERSHIP_RECIPE_DOMAIN);
+        membership.u8(self.kind as u8);
+        membership.string(&self.path_prefix)?;
+        match &self.content_type_scope {
+            Some(value) => {
+                membership.bool(true);
+                membership.string(value)?;
+            }
+            None => membership.bool(false),
+        }
+        encode_semantics(&mut membership, &self.semantics)?;
+
+        let mut fields = Vec::with_capacity(self.fields.len());
+        for field in &self.fields {
+            let mut recipe = Encoder::default();
+            recipe.raw(FIELD_RECIPE_DOMAIN);
+            recipe.u8(self.kind as u8);
+            encode_semantics(&mut recipe, &self.semantics)?;
+            recipe.string(&field.source_selector)?;
+            recipe.u8(field.field_type as u8);
+            recipe.u8(field.cardinality as u8);
+            recipe.bool(field.allow_missing);
+            recipe.bool(field.allow_null);
+            recipe.u8(field.collation as u8);
+            recipe.u16(field.capabilities.bits());
+            match field.analyzer {
+                Some(analyzer) => {
+                    recipe.bool(true);
+                    recipe.u8(analyzer as u8);
+                }
+                None => recipe.bool(false),
+            }
+            match field.date_format.as_ref() {
+                Some(DateFormat::Iso8601) => {
+                    recipe.bool(true);
+                    recipe.bool(false);
+                }
+                Some(DateFormat::Strftime(pattern)) => {
+                    recipe.bool(true);
+                    recipe.bool(true);
+                    recipe.string(pattern)?;
+                }
+                None => recipe.bool(false),
+            }
+            recipe.u16(field.components.bits());
+            encode_field_component_versions(&mut recipe, self, field.components)?;
+            fields.push(*blake3::hash(&recipe.finish()).as_bytes());
+        }
+
+        Ok(RecipeFingerprints {
+            membership: *blake3::hash(&membership.finish()).as_bytes(),
+            fields,
+        })
+    }
+
     pub fn codec_version(&self, kind: ComponentKind) -> Result<u16, IndexError> {
         self.component_versions
             .binary_search_by_key(&kind, |version| version.component_kind)
@@ -816,6 +888,41 @@ fn encode_semantics(out: &mut Encoder, value: &IndexSemantics) -> Result<(), Ind
     Ok(())
 }
 
+fn encode_field_component_versions(
+    out: &mut Encoder,
+    schema: &Schema,
+    components: FieldComponents,
+) -> Result<(), IndexError> {
+    let mut kinds = Vec::with_capacity(7);
+    if components.contains(FieldComponents::TERMS) {
+        kinds.extend([ComponentKind::TERM_DICTIONARY, ComponentKind::POSTINGS]);
+    }
+    if components.contains(FieldComponents::POINTS) {
+        kinds.push(ComponentKind::POINTS);
+    }
+    if components.contains(FieldComponents::DOC_VALUES) {
+        kinds.push(ComponentKind::DOC_VALUES);
+    }
+    if components.contains(FieldComponents::POSITIONS) {
+        kinds.push(ComponentKind::POSITIONS);
+    }
+    if components.contains(FieldComponents::NORMS) {
+        kinds.push(ComponentKind::NORMS);
+        kinds.push(ComponentKind::SCORING_STATISTICS);
+    }
+    if components.contains(FieldComponents::VECTOR) {
+        kinds.push(ComponentKind::VECTORS);
+    }
+    kinds.sort_unstable();
+    kinds.dedup();
+    out.usize_u32(kinds.len())?;
+    for kind in kinds {
+        out.u16(kind.get());
+        out.u16(schema.codec_version(kind)?);
+    }
+    Ok(())
+}
+
 fn encode_vector(
     out: &mut Encoder,
     dimensions: u32,
@@ -1007,6 +1114,32 @@ mod tests {
         }
     }
 
+    fn recipe_schema() -> Schema {
+        let mut value = schema();
+        value.component_versions = [
+            ComponentKind::SEGMENT_ROOT,
+            ComponentKind::ROUTING_NODE,
+            ComponentKind::IDENTITY_TABLE,
+            ComponentKind::LIVE_MASK,
+            ComponentKind::PATH_LOCATOR,
+            ComponentKind::TERM_DICTIONARY,
+            ComponentKind::POSTINGS,
+            ComponentKind::POINTS,
+            ComponentKind::DOC_VALUES,
+            ComponentKind::POSITIONS,
+            ComponentKind::NORMS,
+            ComponentKind::VECTORS,
+            ComponentKind::SCORING_STATISTICS,
+        ]
+        .into_iter()
+        .map(|component_kind| ComponentVersion {
+            component_kind,
+            codec_version: 1,
+        })
+        .collect();
+        value
+    }
+
     #[test]
     fn fingerprint_is_deterministic_and_semantic() {
         let first = schema();
@@ -1020,6 +1153,29 @@ mod tests {
         let mut changed = first.clone();
         changed.fields[0].allow_missing = false;
         assert_ne!(first.fingerprint().unwrap(), changed.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn recipe_fingerprints_separate_logical_names_from_physical_semantics() {
+        let first = recipe_schema();
+        let first_recipes = first.recipe_fingerprints().unwrap();
+
+        let mut renamed = first.clone();
+        renamed.fields[0].name = "publicly-renamed".into();
+        assert_ne!(first.fingerprint().unwrap(), renamed.fingerprint().unwrap());
+        assert_eq!(first_recipes, renamed.recipe_fingerprints().unwrap());
+
+        let mut rescope = first.clone();
+        rescope.path_prefix = "/another-membership".into();
+        let rescope = rescope.recipe_fingerprints().unwrap();
+        assert_ne!(first_recipes.membership, rescope.membership);
+        assert_eq!(first_recipes.fields, rescope.fields);
+
+        let mut reselect = first.clone();
+        reselect.fields[0].source_selector = "/another-value".into();
+        let reselect = reselect.recipe_fingerprints().unwrap();
+        assert_eq!(first_recipes.membership, reselect.membership);
+        assert_ne!(first_recipes.fields, reselect.fields);
     }
 
     #[test]

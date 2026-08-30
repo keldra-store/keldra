@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use keldra_index::v4::Schema;
+use keldra_index::v4::{RecipeFingerprints, Schema};
 use tonic::Status;
 
 use crate::index_service::{StoredIndexDefinition, definition_path};
@@ -29,6 +29,13 @@ pub(crate) struct PhysicalProjectionIdentity {
     pub(crate) definition_version: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PhysicalRecipeIdentity {
+    pub(crate) tenant_id: u64,
+    pub(crate) bucket_id: u64,
+    pub(crate) fingerprint: [u8; 32],
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CatalogDefinition {
     pub(crate) tenant_id: u64,
@@ -39,6 +46,7 @@ pub(crate) struct CatalogDefinition {
     /// definition object. This is process-local and can always be reconstructed.
     pub(crate) schema: Schema,
     pub(crate) schema_fingerprint: [u8; 32],
+    pub(crate) recipe_fingerprints: RecipeFingerprints,
 }
 
 impl CatalogDefinition {
@@ -56,6 +64,7 @@ impl CatalogDefinition {
         )
         .map_err(schema_status)?;
         let schema_fingerprint = schema.fingerprint().map_err(schema_status)?;
+        let recipe_fingerprints = schema.recipe_fingerprints().map_err(schema_status)?;
         let definition = Self {
             tenant_id,
             bucket_id,
@@ -63,6 +72,7 @@ impl CatalogDefinition {
             stored,
             schema,
             schema_fingerprint,
+            recipe_fingerprints,
         };
         definition.validate()?;
         Ok(definition)
@@ -90,6 +100,27 @@ impl CatalogDefinition {
         PhysicalProjectionIdentity {
             index_id: nonzero_identity(index),
             definition_version: nonzero_identity(version),
+        }
+    }
+
+    pub(crate) fn membership_recipe_identity(&self) -> PhysicalRecipeIdentity {
+        self.scoped_recipe(self.recipe_fingerprints.membership)
+    }
+
+    pub(crate) fn field_recipe_identities(&self) -> Vec<PhysicalRecipeIdentity> {
+        self.recipe_fingerprints
+            .fields
+            .iter()
+            .copied()
+            .map(|fingerprint| self.scoped_recipe(fingerprint))
+            .collect()
+    }
+
+    fn scoped_recipe(&self, fingerprint: [u8; 32]) -> PhysicalRecipeIdentity {
+        PhysicalRecipeIdentity {
+            tenant_id: self.tenant_id,
+            bucket_id: self.bucket_id,
+            fingerprint,
         }
     }
 
@@ -124,6 +155,8 @@ impl CatalogDefinition {
         .map_err(schema_status)?;
         if self.schema != expected_schema
             || self.schema_fingerprint != self.schema.fingerprint().map_err(schema_status)?
+            || self.recipe_fingerprints
+                != self.schema.recipe_fingerprints().map_err(schema_status)?
         {
             return Err(Status::data_loss(
                 "assigned index schema does not match its ordinary definition object",
@@ -578,6 +611,14 @@ mod tests {
         assert_ne!(first.identity(), second.identity());
         assert_eq!(first.schema_fingerprint, second.schema_fingerprint);
         assert_eq!(first.physical_identity(), second.physical_identity());
+        assert_eq!(
+            first.membership_recipe_identity(),
+            second.membership_recipe_identity()
+        );
+        assert_eq!(
+            first.field_recipe_identities(),
+            second.field_recipe_identities()
+        );
 
         let different_bucket = definition(1, 3, 11);
         assert_ne!(
@@ -591,6 +632,25 @@ mod tests {
         assert_ne!(
             first.physical_identity(),
             different_scope.physical_identity()
+        );
+    }
+
+    #[test]
+    fn physical_recipe_identity_never_crosses_tenant_or_bucket_authority() {
+        let first = definition(1, 2, 9);
+        let other_tenant = definition(3, 2, 10);
+        let other_bucket = definition(1, 4, 11);
+        assert_ne!(
+            first.membership_recipe_identity(),
+            other_tenant.membership_recipe_identity()
+        );
+        assert_ne!(
+            first.membership_recipe_identity(),
+            other_bucket.membership_recipe_identity()
+        );
+        assert_ne!(
+            first.field_recipe_identities(),
+            other_tenant.field_recipe_identities()
         );
     }
 
