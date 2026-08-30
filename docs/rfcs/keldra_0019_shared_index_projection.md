@@ -4,6 +4,17 @@ Status: Implemented
 
 Audience: Keldra implementors, operators, reviewers, and performance engineers
 
+Post-implementation scale finding: this optimization materially reduced JSON
+fetch/parse duplication, but its current planner reconstructs the selector
+union by scanning all active definitions before every prepared-cache lookup.
+Across `N` equivalent definitions that is `O(N^2)` definition inspection per
+source mutation under one mutex. Its cache eviction also scans the complete
+entry map to remove one oldest entry. These are implementation defects, not
+part of the intended reusable-projection contract. They and the remaining
+definition-local physical publication model are analysed in
+`../qualification/index-scale-investigation.md`; increasing the active
+builder bound is not safe before that redesign.
+
 ## 1. Decision
 
 Every Keldra node runs one bounded projection mapper for the index definitions

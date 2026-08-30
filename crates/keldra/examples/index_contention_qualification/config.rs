@@ -2,6 +2,8 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{env, path::PathBuf, time::Duration};
 
+const MAX_QUALIFICATION_DEFINITIONS: usize = 1_024;
+
 const PREFIX: &str = "KELDRA_INDEX_CONTENTION_";
 
 #[derive(Clone, Debug)]
@@ -93,8 +95,8 @@ impl Config {
         let query_max_in_flight = number("QUERY_MAX_IN_FLIGHT", 64)?;
         ensure!(!endpoints.is_empty(), "at least one endpoint is required");
         ensure!(
-            (1..=64).contains(&definition_count),
-            "definition count must be 1..=64"
+            (1..=MAX_QUALIFICATION_DEFINITIONS).contains(&definition_count),
+            "definition count must be 1..={MAX_QUALIFICATION_DEFINITIONS}"
         );
         ensure!(
             (1..=1_000).contains(&stable_records),

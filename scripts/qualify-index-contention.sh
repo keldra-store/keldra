@@ -139,13 +139,13 @@ if ((${#builder_matrix[@]} == 0)); then
 fi
 seen_builder_values=,
 for builders in "${builder_matrix[@]}"; do
-  if [[ ! "${builders}" =~ ^[1-9][0-9]*$ ]] || ((builders > 64)); then
-    echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique integers from 1 through 64" >&2
+  if [[ ! "${builders}" =~ ^[1-9][0-9]*$ ]] || ((builders > 1024)); then
+    echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique integers from 1 through 1024" >&2
     exit 2
   fi
   case "${seen_builder_values}" in
     *,"${builders}",*)
-      echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique integers from 1 through 64" >&2
+      echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique integers from 1 through 1024" >&2
       exit 2
       ;;
   esac

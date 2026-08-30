@@ -11,7 +11,10 @@ never run as a native macOS server. Each matrix cell
 starts with fresh durable state and creates the requested number of independent,
 simultaneously lagging index definitions; the matrix value is definition count,
 not projection-lane configuration. On one node, `1,4,16,64` is the normative
-node-wide admitted-builder pressure matrix. Three-node placement distributes
+legacy node-wide admitted-builder pressure matrix. The harness accepts values
+through 1,024 so replacement architectures can run the D640 active-fan-out
+gate defined in `index-scale-investigation.md`; raising the harness ceiling does
+not raise the production runtime's 64-builder lease bound. Three-node placement distributes
 definitions using HRW, so its definition count is cluster-wide and is
 supplementary evidence, not a claim that every node ran that many builders.
 
@@ -80,8 +83,9 @@ KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=1000 \
 ```
 
 Omit the variable or set it to `disabled` for the saturated-queue workload.
-Matrix entries may be any unique integer from 1 through 64; `1,4,16,64` remains
-the normative scale matrix.
+Matrix entries may be any unique integer from 1 through 1,024. `1,4,16,64`
+remains the legacy comparison matrix, while D640 is the required tenfold
+active-fan-out gate for the replacement design.
 
 For supplementary three-node Docker evidence, use:
 
