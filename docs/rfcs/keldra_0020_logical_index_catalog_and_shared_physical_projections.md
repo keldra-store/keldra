@@ -737,7 +737,11 @@ Implemented groundwork on `feat/shared-index-projection`:
 - changed deltas are integrated into shared payload packs at the existing
   16 MiB physical bound. Stream descriptors bind pack hash, exact byte range,
   segment hash, record count, and byte accounting, so many tiny recipe changes
-  do not become one payload object or filesystem inode each.
+  do not become one payload object or filesystem inode each; and
+- one storage-neutral publication preparation produces the complete set of
+  delta packs, newly path-copied stream pages, component-directory pages, and
+  exact next generation. Runtime publication must make those immutable values
+  durable first and atomically install only the generation record last.
 
 This does not yet satisfy Milestone B for field subsets. Independent component
 generation ownership and bindings remain required before different complete

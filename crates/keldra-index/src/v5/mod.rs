@@ -10,6 +10,7 @@ mod generation;
 mod pack;
 mod projected_state;
 mod projector;
+mod publication;
 mod stream;
 
 pub use generation::{
@@ -22,6 +23,7 @@ pub use projected_state::{
     RecipeDelta, RecipeIdentity, StableDocumentKey,
 };
 pub use projector::projected_document_states;
+pub use publication::{PreparedProjectionGeneration, prepare_projection_generation};
 pub use stream::{
     COMPONENT_STREAM_DIRECTORY_FANOUT, ComponentSegmentDescriptor, ComponentStreamAppend,
     ComponentStreamDirectory, ComponentStreamRoot, EncodedComponentStreamPage,
