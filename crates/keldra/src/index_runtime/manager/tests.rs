@@ -823,6 +823,18 @@ fn resident_work_plan_charges_every_simultaneous_allocation() {
 }
 
 #[test]
+fn source_page_bound_preserves_projection_workspace_and_retries_to_a_floor() {
+    let total = 256 * 1024 * 1024_u64;
+    let source_bytes = source_wire_limit(total);
+    let plan = work_plan_for_limit(total, source_bytes, total).unwrap();
+
+    assert!(plan.max_source_projection_bytes >= source_bytes as usize);
+    let reduced = reduced_source_wire_limit(source_bytes).unwrap();
+    assert_eq!(reduced, source_bytes / 2);
+    assert_eq!(reduced_source_wire_limit(64 * 1024), None);
+}
+
+#[test]
 fn segment_work_plan_never_exceeds_the_configured_flush_target() {
     let total = keldra_index::MIN_INDEX_KIND_MEMORY_BYTES as u64;
     let plan = work_plan_for_limit(total, 0, 4 * 1024 * 1024).unwrap();

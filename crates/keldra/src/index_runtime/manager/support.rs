@@ -23,10 +23,23 @@ pub(super) fn source_wire_limit(limit: u64) -> u64 {
     let fixed = FIXED_INDEX_SEAL_WORKSPACE_BYTES as u64;
     let remaining = limit.saturating_sub(fixed);
     let builder_reserve = remaining / 2;
+    // A source page is decoded and retained while its payload projections are
+    // prepared. Reserving only the builder half lets a maximum-sized page
+    // consume every remaining byte and leaves no legal projection workspace.
+    // Split the other half between source input and projection; the runtime
+    // also halves this bound and retries the unadvanced page when concrete
+    // decoded residency is more expensive than its wire representation.
+    let projection_reserve = remaining.saturating_sub(builder_reserve) / 2;
     let safe = remaining
         .saturating_sub(builder_reserve)
+        .saturating_sub(projection_reserve)
         .saturating_sub(256);
     MAX_SOURCE_WIRE_BYTES.min(safe.max(64 * 1024))
+}
+
+pub(super) fn reduced_source_wire_limit(current: u64) -> Option<u64> {
+    const MINIMUM_SOURCE_WIRE_BYTES: u64 = 64 * 1024;
+    (current > MINIMUM_SOURCE_WIRE_BYTES).then(|| (current / 2).max(MINIMUM_SOURCE_WIRE_BYTES))
 }
 
 pub(super) fn work_plan_for_limit(

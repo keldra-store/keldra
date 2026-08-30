@@ -1,8 +1,13 @@
 //! Weighted-HRW assignment and bounded format-v4 index commit construction.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
+use crate::cluster_object_read::ClusterObjectReader;
+use crate::cluster_peer::IndexSourceSnapshotHead;
+use crate::cluster_placement::ClusterPlacement;
+use crate::derived_consumer::{
+    DerivedBarrierEvidence, DerivedDefinitionIdentity, DerivedProgressReporter,
+};
+use crate::index_config::IndexRuntimeConfig;
+use crate::index_service::{StoredIndexDefinition, definition_path, path_matches_prefix};
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_index::v4::build::{
     BuildLimits, BuiltSegment, ComponentBatchSink, MergeMutation, NativeSegmentWriter,
@@ -18,17 +23,10 @@ use keldra_index::{
     SegmentMemoryPlan,
 };
 use keldra_store::{DefinitionKind, LocalChange, ObjectKey, Store, VersionId};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tonic::Status;
 use tracing::Instrument;
-
-use crate::cluster_object_read::ClusterObjectReader;
-use crate::cluster_peer::IndexSourceSnapshotHead;
-use crate::cluster_placement::ClusterPlacement;
-use crate::derived_consumer::{
-    DerivedBarrierEvidence, DerivedDefinitionIdentity, DerivedProgressReporter,
-};
-use crate::index_config::IndexRuntimeConfig;
-use crate::index_service::{StoredIndexDefinition, definition_path, path_matches_prefix};
 
 use super::budget::{IndexBudgetError, IndexMemoryBudgets, IndexMemoryPermit};
 use super::cache::IndexCache;
@@ -52,11 +50,10 @@ use super::telemetry::{
 };
 use super::v4_projection::{project_mutation, projection_admission_bytes};
 
-#[path = "manager/catch_up.rs"]
-mod catch_up;
-use catch_up::process_journal_page;
 #[path = "manager/buffer.rs"]
 mod buffer;
+#[path = "manager/catch_up.rs"]
+mod catch_up;
 use buffer::{
     FrozenSegment, FrozenSegmentTask, NativeSegmentBuild, ProjectionExecution,
     SegmentPublicationLane,
@@ -78,6 +75,7 @@ mod observability;
 #[path = "manager/publication.rs"]
 mod publication;
 use publication::{AbortOnDropTask, start_candidate_publication};
+mod source_admission;
 pub(crate) use publication::{IndexMaintenanceWorkSlots, IndexPublicationSlots};
 #[path = "manager/publication_cohort.rs"]
 pub(crate) mod publication_cohort;
@@ -804,6 +802,7 @@ struct ActiveIncrementalBuffer {
     builder: NativeSegmentBuild,
     permit: IndexMemoryPermit,
     quantum: SourceWorkQuantum,
+    maximum_page_bytes: u64,
     started: Option<BufferAge>,
     operations: u64,
 }
@@ -1152,6 +1151,7 @@ async fn advance_catch_up(
                 pending_invalidation_bytes,
                 dependencies.config.segment_flush_bytes(job.kind),
             )?;
+            let maximum_page_bytes = source_wire_limit(granted_bytes);
             ActiveIncrementalBuffer {
                 builder: NativeSegmentBuild::new(
                     job,
@@ -1160,7 +1160,8 @@ async fn advance_catch_up(
                     dependencies,
                 )?,
                 permit,
-                quantum: SourceWorkQuantum::from_budget_limit(granted_bytes),
+                quantum: SourceWorkQuantum::from_wire_limit(maximum_page_bytes),
+                maximum_page_bytes,
                 started: None,
                 operations: 0,
             }
@@ -1187,7 +1188,7 @@ async fn advance_catch_up(
                 )
                 .await?;
             }
-            active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
+            active.quantum = SourceWorkQuantum::from_wire_limit(active.maximum_page_bytes);
             work.active = Some(active);
             return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
         };
@@ -1217,7 +1218,7 @@ async fn advance_catch_up(
                     )
                     .await?;
                 }
-                active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
+                active.quantum = SourceWorkQuantum::from_wire_limit(active.maximum_page_bytes);
                 work.active = Some(active);
                 return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
             }
@@ -1330,7 +1331,17 @@ async fn advance_catch_up(
                     dependencies.config.segment_flush_bytes(job.kind),
                 )?
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return source_admission::retry_smaller_source_page(
+                    job,
+                    work,
+                    active,
+                    page,
+                    error,
+                    dependencies,
+                )
+                .await;
+            }
         };
         let atomic_plan = if page
             .changes
@@ -1391,7 +1402,7 @@ async fn advance_catch_up(
         );
         let page_work = await_with_builder_heartbeats(
             &work.progress,
-            process_journal_page(
+            catch_up::process_journal_page(
                 &job.definition,
                 job.kind,
                 &work.through,
@@ -1476,10 +1487,8 @@ async fn advance_catch_up(
             return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
         }
         if quantum_boundary || operation_boundary {
-            // Size/operation/fairness boundaries detach the active buffer but
-            // do not force a commit. Journal intake continues through the
-            // replacement buffer while the single frozen slot seals. Only its
-            // explicit queue saturation can make the next detach wait.
+            // Fairness boundaries detach without committing; the single
+            // frozen slot seals while journal intake continues.
             if !active.builder.is_empty() {
                 freeze_builder(
                     &job.definition,
@@ -1490,7 +1499,7 @@ async fn advance_catch_up(
                 )
                 .await?;
             }
-            active.quantum = SourceWorkQuantum::from_budget_limit(active.permit.bytes());
+            active.quantum = SourceWorkQuantum::from_wire_limit(active.maximum_page_bytes);
             active.operations = 0;
             work.active = Some(active);
             return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));

@@ -155,6 +155,16 @@ definition's existing projection-lane cap. Results are restored to source order
 before they enter a definition assembler. The mapper therefore changes neither
 journal settlement order nor deterministic segment input order.
 
+Source-page admission reserves independent shares for the mutable builder,
+decoded journal input and projection output. Wire size is only a first estimate
+of decoded residency: if a concrete page still cannot leave a legal projection
+workspace, Keldra drops that unadvanced page, halves the page bound, and retries
+the exact journal position on the next fair turn. The adaptive bound bottoms out
+at 64 KiB; only a page that cannot fit at that minimum retains the existing
+resource-limit failure. A valid large backlog therefore cannot trap a definition
+in fail-closed rediscovery merely because one maximum-sized page decoded larger
+than its wire representation.
+
 The initial implementation shares Typed JSON scalar selection. Other index
 kinds continue through their existing projectors. This is intentional: scalar
 facts have a canonical definition-neutral representation, whereas tokenization,
@@ -204,7 +214,7 @@ Required focused coverage is:
 
 Qualification uses the released 0.15.0 image as baseline and an image built
 from the exact candidate commit. Both run from fresh volumes with identical
-fixed-rate workloads on the same machines:
+saturated bounded-queue workloads on the same machines:
 
 - the 16-core/64-GiB spinning-disk host; and
 - the 8-core/32-GiB SSD host.

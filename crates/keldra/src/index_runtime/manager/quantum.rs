@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn snapshot_uses_its_already_derived_wire_limit() {
         const SNAPSHOT_SHARE_BYTES: u64 = 46_487_252;
-        const DERIVED_WIRE_LIMIT: u64 = 10_660_458;
+        const DERIVED_WIRE_LIMIT: u64 = 5_330_101;
         const OBSERVED_VALID_FRAME_BYTES: u64 = 3_491_999;
 
         assert_eq!(source_wire_limit(SNAPSHOT_SHARE_BYTES), DERIVED_WIRE_LIMIT);
