@@ -60,6 +60,7 @@ credential_file="${cell_work}/state/system-bootstrap-credential.json"
 server_pid=""
 sampler_pid=""
 vmstat_pid=""
+catalog_pid=""
 
 sample_process() {
   local pid="$1" output="$2"
@@ -79,6 +80,10 @@ sample_process() {
 }
 
 stop_server() {
+  if [[ -n "${catalog_pid}" ]]; then
+    kill -TERM "${catalog_pid}" 2>/dev/null || true
+    wait "${catalog_pid}" 2>/dev/null || true
+  fi
   if [[ -n "${sampler_pid}" ]]; then kill "${sampler_pid}" 2>/dev/null || true; wait "${sampler_pid}" 2>/dev/null || true; fi
   if [[ -n "${vmstat_pid}" ]]; then kill "${vmstat_pid}" 2>/dev/null || true; wait "${vmstat_pid}" 2>/dev/null || true; fi
   if [[ -n "${server_pid}" ]]; then
@@ -87,7 +92,7 @@ stop_server() {
     kill -KILL "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
   fi
-  server_pid=""; sampler_pid=""; vmstat_pid=""
+  server_pid=""; sampler_pid=""; vmstat_pid=""; catalog_pid=""
 }
 on_exit() {
   local status=$?
@@ -137,6 +142,20 @@ start_server() {
   return 1
 }
 
+run_catalog_phase() {
+  local phase="$1" output="$2" stdout="$3" stderr="$4"
+  KELDRA_CLIENT_ID="${client_id}" KELDRA_CLIENT_SECRET="${client_secret}" \
+    "${kit_root}/bin/index-catalog-qualification" \
+    --endpoint "http://127.0.0.1:${port}" --bucket "${bucket}" \
+    --definitions "${definitions}" --concurrency "${concurrency}" --phase "${phase}" \
+    --output "${output}" >"${stdout}" 2>"${stderr}" &
+  catalog_pid=$!
+  local status=0
+  wait "${catalog_pid}" || status=$?
+  catalog_pid=""
+  return "${status}"
+}
+
 {
   echo "server_source_commit=${server_source_commit}"
   echo "catalog_harness_commit=${catalog_harness_commit}"
@@ -158,22 +177,14 @@ KELDRA_CLIENT_ID="${client_id}" KELDRA_CLIENT_SECRET="${client_secret}" \
   "${kit_root}/bin/keldra" --endpoint "http://127.0.0.1:${port}" \
   create-bucket "${bucket}" >"${run_dir}/bucket.stdout.log" 2>"${run_dir}/bucket.stderr.log"
 
-KELDRA_CLIENT_ID="${client_id}" KELDRA_CLIENT_SECRET="${client_secret}" \
-  "${kit_root}/bin/index-catalog-qualification" \
-  --endpoint "http://127.0.0.1:${port}" --bucket "${bucket}" \
-  --definitions "${definitions}" --concurrency "${concurrency}" --phase create \
-  --output "${run_dir}/create-report.json" \
-  >"${run_dir}/create.stdout.log" 2>"${run_dir}/create.stderr.log"
+run_catalog_phase create "${run_dir}/create-report.json" \
+  "${run_dir}/create.stdout.log" "${run_dir}/create.stderr.log"
 ps -o pid,%cpu,rss,nlwp,etime -p "${server_pid}" >"${run_dir}/before-restart-process.txt"
 stop_server
 
 start_server restarted false
-KELDRA_CLIENT_ID="${client_id}" KELDRA_CLIENT_SECRET="${client_secret}" \
-  "${kit_root}/bin/index-catalog-qualification" \
-  --endpoint "http://127.0.0.1:${port}" --bucket "${bucket}" \
-  --definitions "${definitions}" --concurrency "${concurrency}" --phase verify \
-  --output "${run_dir}/verify-report.json" \
-  >"${run_dir}/verify.stdout.log" 2>"${run_dir}/verify.stderr.log"
+run_catalog_phase verify "${run_dir}/verify-report.json" \
+  "${run_dir}/verify.stdout.log" "${run_dir}/verify.stderr.log"
 ps -o pid,%cpu,rss,nlwp,etime -p "${server_pid}" >"${run_dir}/after-restart-process.txt"
 stop_server
 
