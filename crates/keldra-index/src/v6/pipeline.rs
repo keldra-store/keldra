@@ -320,6 +320,13 @@ pub struct ChargedPreparedProjectionBatch {
     _permit: IndexingMemoryPermit,
 }
 
+impl ChargedPreparedProjectionBatch {
+    /// Exact retained bytes charged to the prepared-row stage for this batch.
+    pub const fn resident_bytes(&self) -> usize {
+        self.batch.resident_bytes
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedProjectionBatchReservation {
     permit: IndexingMemoryPermit,
@@ -795,6 +802,7 @@ mod tests {
                 .unwrap();
         let bytes = batch.resident_bytes();
         let charged = charged(&memory, batch);
+        assert_eq!(charged.resident_bytes(), bytes);
         assert_eq!(
             memory.stage_used_bytes(IndexingMemoryStage::PreparedRows),
             bytes

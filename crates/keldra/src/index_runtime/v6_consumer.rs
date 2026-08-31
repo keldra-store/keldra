@@ -65,6 +65,9 @@ struct Writer {
     since: Option<Instant>,
     operations: u64,
     source_bytes: u64,
+    pending_prepared_rows: u64,
+    pending_prepared_bytes: u64,
+    pending_projected_rows: u64,
     through_atomic: u64,
 }
 
@@ -328,6 +331,9 @@ async fn open_writer(
         since: None,
         operations: 0,
         source_bytes: 0,
+        pending_prepared_rows: 0,
+        pending_prepared_bytes: 0,
+        pending_projected_rows: 0,
         through_atomic,
     })
 }
@@ -694,12 +700,30 @@ fn apply_rows(
     let batch = reservation
         .finish(source_scope(writer.source), first, next, rows)
         .map_err(index_status)?;
+    let prepared_bytes = u64::try_from(batch.resident_bytes())
+        .map_err(|_| Status::resource_exhausted("v6 prepared-row bytes exceed telemetry"))?;
     match writer
         .accumulator
         .apply_batch(batch, previous)
         .map_err(index_status)?
     {
-        ProjectionBatchAdmission::Applied { .. } => {
+        ProjectionBatchAdmission::Applied {
+            source_rows,
+            coalesced_rows,
+            ..
+        } => {
+            writer.pending_prepared_rows = writer
+                .pending_prepared_rows
+                .saturating_add(u64::try_from(source_rows).map_err(|_| {
+                    Status::resource_exhausted("v6 prepared rows exceed telemetry")
+                })?);
+            writer.pending_prepared_bytes =
+                writer.pending_prepared_bytes.saturating_add(prepared_bytes);
+            writer.pending_projected_rows = writer.pending_projected_rows.saturating_add(
+                u64::try_from(coalesced_rows).map_err(|_| {
+                    Status::resource_exhausted("v6 projected rows exceed telemetry")
+                })?,
+            );
             writer.since.get_or_insert_with(Instant::now);
             Ok(())
         }
@@ -728,6 +752,8 @@ async fn flush(
     if next <= start {
         return Ok(());
     }
+    let projected_bytes = u64::try_from(writer.accumulator.buffered_bytes())
+        .map_err(|_| Status::resource_exhausted("v6 projected bytes exceed telemetry"))?;
     if let Some(current) = &writer.current {
         let runs = current.generation.query_stream_root.run_count;
         if runs >= limits.lsm_runs
@@ -789,25 +815,41 @@ async fn flush(
     let rows = next
         .checked_sub(start)
         .ok_or_else(|| Status::data_loss("v6 cut regressed"))?;
-    writer.current = Some(
-        publisher
-            .publish_atomic_generation(
-                &writer.recipe.storage_tenant,
-                &writer.recipe.bucket,
-                writer.recipe.family.tenant_id,
-                writer.recipe.family.bucket_id,
-                writer.partition,
-                writer.current.as_ref(),
-                prepared,
-                rows,
-                writer.source_bytes,
-            )
-            .await?,
+    let published = publisher
+        .publish_atomic_generation(
+            &writer.recipe.storage_tenant,
+            &writer.recipe.bucket,
+            writer.recipe.family.tenant_id,
+            writer.recipe.family.bucket_id,
+            writer.partition,
+            writer.current.as_ref(),
+            prepared,
+            rows,
+            writer.source_bytes,
+        )
+        .await?;
+    writer.current = Some(published);
+    let telemetry = super::v6_telemetry::global();
+    super::v6_telemetry::V6PipelineTelemetry::add(
+        &telemetry.prepared_rows,
+        writer.pending_prepared_rows,
     );
+    super::v6_telemetry::V6PipelineTelemetry::add(
+        &telemetry.prepared_bytes,
+        writer.pending_prepared_bytes,
+    );
+    super::v6_telemetry::V6PipelineTelemetry::add(
+        &telemetry.projected_rows,
+        writer.pending_projected_rows,
+    );
+    super::v6_telemetry::V6PipelineTelemetry::add(&telemetry.projected_bytes, projected_bytes);
     writer.touched.clear();
     writer.since = None;
     writer.operations = 0;
     writer.source_bytes = 0;
+    writer.pending_prepared_rows = 0;
+    writer.pending_prepared_bytes = 0;
+    writer.pending_projected_rows = 0;
     Ok(())
 }
 

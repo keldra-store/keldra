@@ -37,7 +37,9 @@ pub(super) async fn run(
         config.endpoints.len() == 1,
         "v6 capability preflight requires one endpoint"
     );
-    let channel = connect_channel(&config.endpoints[0]).await?;
+    let channel = connect_channel(&config.endpoints[0])
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let token = fresh_token(config, &channel).await?;
     let mut admin = administration_client(channel.clone(), &token)?;
     admin
