@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::IndexError;
 use crate::typed_json::{
-    AggregateOperation, AggregateRequest, AggregateResult, Cardinality, FacetBucket, FacetRequest,
-    FacetResult, FieldCapabilities, FieldId, FieldSchema, OrderDirection, OrderField, Predicate,
-    RangeBound, ScalarValue, analyze_typed_json_text, encode_scalar_sort_key,
+    AggregateRequest, AggregateResult, Cardinality, FacetBucket, FacetRequest, FacetResult,
+    FieldCapabilities, FieldId, FieldSchema, OrderDirection, OrderField, Predicate, RangeBound,
+    ScalarValue, analyze_typed_json_text, encode_scalar_sort_key,
 };
 
 use super::{
@@ -29,7 +29,7 @@ pub use admission::{
 #[path = "query_executor_values.rs"]
 mod values;
 use values::{
-    leaf_field, resident_scalar_bytes, resource, scalar_number, validate_leaf_capability,
+    leaf_field, reduce_streaming, resident_scalar_bytes, resource, validate_leaf_capability,
     verify_hash,
 };
 
@@ -405,8 +405,18 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
         } else {
             match_all_live_documents(&gates)
         };
+        let key_bytes = request
+            .predicate
+            .as_ref()
+            .map(|_| {
+                keys.len()
+                    .checked_mul(std::mem::size_of::<StableDocumentKey>())
+                    .ok_or(IndexError::OffsetOverflow)
+            })
+            .transpose()?;
         for document in keys {
             let gate = gates.remove(&document).ok_or(IndexError::Integrity)?;
+            let gate_bytes = resident_gate_bytes(&gate)?;
             if gate.live {
                 let candidate = QueryAdmissionCandidate {
                     partition: view.pin.partition,
@@ -422,12 +432,24 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
                 select_handoff_candidate(&mut selected, candidate, block_credits, &mut budget)?;
                 budget.candidates(selected.len())?;
             }
+            budget.release_heap(block_credits, gate_bytes)?;
         }
+        if let Some(bytes) = key_bytes {
+            budget.release_heap(block_credits, bytes)?;
+        }
+        let remaining_gate_bytes = gates.values().try_fold(0usize, |total, gate| {
+            total
+                .checked_add(resident_gate_bytes(gate)?)
+                .ok_or(IndexError::OffsetOverflow)
+        })?;
+        drop(gates);
+        budget.release_heap(block_credits, remaining_gate_bytes)?;
     }
 
     let mut authorized = BTreeMap::new();
     let mut candidates = Vec::new();
     for candidate in selected.into_values() {
+        let selected_bytes = resident_selected_candidate_bytes(&candidate)?;
         let context = QueryAdmissionContext {
             logical_index_id: request.logical.logical_index_id,
             logical_definition_version: request.logical.logical_definition_version,
@@ -459,6 +481,7 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
                 material_source_version: candidate.material_source_version,
             });
         }
+        budget.release_heap(block_credits, selected_bytes)?;
     }
 
     let needed_values = requested_value_recipes(request, &contracts)?;
@@ -772,13 +795,7 @@ async fn load_latest_gates<L: QueryArtifactLoader>(
                     return Err(IndexError::Integrity);
                 }
                 if !gates.contains_key(&gate.document) {
-                    budget.reserve_heap(
-                        credits,
-                        std::mem::size_of::<StableDocumentKey>()
-                            + std::mem::size_of::<QueryDocumentGate>()
-                            + gate.source_path.as_ref().map_or(0, String::len)
-                            + gate.result_path.as_ref().map_or(0, String::len),
-                    )?;
+                    budget.reserve_heap(credits, resident_gate_bytes(&gate)?)?;
                     gates.insert(gate.document, gate);
                 }
             }
@@ -1108,11 +1125,7 @@ fn select_handoff_candidate(
     use std::collections::btree_map::Entry;
     match selected.entry(incoming.document) {
         Entry::Vacant(entry) => {
-            budget.reserve_heap(
-                credits,
-                std::mem::size_of::<StableDocumentKey>()
-                    + std::mem::size_of::<QueryAdmissionCandidate>(),
-            )?;
+            budget.reserve_heap(credits, resident_selected_candidate_bytes(&incoming)?)?;
             entry.insert(incoming);
         }
         Entry::Occupied(mut entry) => {
@@ -1125,6 +1138,7 @@ fn select_handoff_candidate(
                 .cmp(&current.covered_through_source_position)
             {
                 Ordering::Greater => {
+                    replace_selected_candidate_charge(credits, budget, &current, &incoming)?;
                     entry.insert(incoming);
                 }
                 Ordering::Equal
@@ -1137,6 +1151,7 @@ fn select_handoff_candidate(
                     return Err(IndexError::Integrity);
                 }
                 Ordering::Equal if incoming.partition < current.partition => {
+                    replace_selected_candidate_charge(credits, budget, &current, &incoming)?;
                     entry.insert(incoming);
                 }
                 _ => {}
@@ -1144,6 +1159,39 @@ fn select_handoff_candidate(
         }
     }
     Ok(())
+}
+
+fn resident_gate_bytes(gate: &QueryDocumentGate) -> Result<usize, IndexError> {
+    std::mem::size_of::<StableDocumentKey>()
+        .checked_add(std::mem::size_of::<QueryDocumentGate>())
+        .and_then(|bytes| bytes.checked_add(gate.source_path.as_ref().map_or(0, String::len)))
+        .and_then(|bytes| bytes.checked_add(gate.result_path.as_ref().map_or(0, String::len)))
+        .ok_or(IndexError::OffsetOverflow)
+}
+
+fn resident_selected_candidate_bytes(
+    candidate: &QueryAdmissionCandidate,
+) -> Result<usize, IndexError> {
+    std::mem::size_of::<StableDocumentKey>()
+        .checked_add(std::mem::size_of::<QueryAdmissionCandidate>())
+        .and_then(|bytes| bytes.checked_add(candidate.source_path.len()))
+        .and_then(|bytes| bytes.checked_add(candidate.result_path.len()))
+        .ok_or(IndexError::OffsetOverflow)
+}
+
+fn replace_selected_candidate_charge(
+    credits: &mut QueryBlockCredits,
+    budget: &mut Budget,
+    current: &QueryAdmissionCandidate,
+    incoming: &QueryAdmissionCandidate,
+) -> Result<(), IndexError> {
+    let current = resident_selected_candidate_bytes(current)?;
+    let incoming = resident_selected_candidate_bytes(incoming)?;
+    if incoming > current {
+        budget.reserve_heap(credits, incoming - current)
+    } else {
+        budget.release_heap(credits, current - incoming)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1920,66 +1968,6 @@ fn aggregate_candidates(
         });
     }
     Ok(results)
-}
-
-fn reduce_streaming<'a>(
-    operation: AggregateOperation,
-    values: impl Iterator<Item = &'a ScalarValue>,
-) -> Result<(Option<ScalarValue>, u64), IndexError> {
-    let mut count = 0u64;
-    let mut value = None;
-    let mut average_sum = 0.0;
-    for next in values {
-        count = count.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
-        match operation {
-            AggregateOperation::Count => {}
-            AggregateOperation::Minimum => {
-                if value.as_ref().is_none_or(|current| next < current) {
-                    value = Some(next.clone());
-                }
-            }
-            AggregateOperation::Maximum => {
-                if value.as_ref().is_none_or(|current| next > current) {
-                    value = Some(next.clone());
-                }
-            }
-            AggregateOperation::Sum => {
-                value = Some(match value.take() {
-                    None => next.clone(),
-                    Some(current) => sum_pair(current, next)?,
-                });
-            }
-            AggregateOperation::Average => average_sum += scalar_number(next)?,
-        }
-    }
-    let value = match operation {
-        AggregateOperation::Count => Some(ScalarValue::Unsigned(count)),
-        AggregateOperation::Average if count != 0 => {
-            Some(ScalarValue::number(average_sum / count as f64)?)
-        }
-        AggregateOperation::Average => None,
-        _ => value,
-    };
-    Ok((value, count))
-}
-
-fn sum_pair(current: ScalarValue, next: &ScalarValue) -> Result<ScalarValue, IndexError> {
-    match (current, next) {
-        (ScalarValue::Signed(left), ScalarValue::Signed(right)) => left
-            .checked_add(*right)
-            .map(ScalarValue::Signed)
-            .ok_or(IndexError::OffsetOverflow),
-        (ScalarValue::Unsigned(left), ScalarValue::Unsigned(right)) => left
-            .checked_add(*right)
-            .map(ScalarValue::Unsigned)
-            .ok_or(IndexError::OffsetOverflow),
-        (current @ ScalarValue::Number(_), ScalarValue::Number(_)) => {
-            ScalarValue::number(scalar_number(&current)? + scalar_number(next)?)
-        }
-        _ => Err(IndexError::InvalidQuery(
-            "aggregate scalar types differ".into(),
-        )),
-    }
 }
 
 #[cfg(test)]

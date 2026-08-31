@@ -1,5 +1,5 @@
 use super::*;
-use crate::typed_json::FieldType;
+use crate::typed_json::{AggregateOperation, FieldType};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -203,6 +203,43 @@ fn handoff_dedup_selects_furthest_source_position() {
             .unwrap()
             .covered_through_source_position,
         12
+    );
+}
+
+#[test]
+fn handoff_replacement_owns_exactly_one_candidate_charge() {
+    let mut selected = BTreeMap::new();
+    let mut credits = credits(16 * 1024);
+    let mut budget = budget();
+    let mut first = candidate(partition(1), 9);
+    first.source_path = "a".into();
+    first.result_path = "b".into();
+    select_handoff_candidate(&mut selected, first.clone(), &mut credits, &mut budget).unwrap();
+    assert_eq!(
+        budget.heap_bytes,
+        resident_selected_candidate_bytes(&first).unwrap()
+    );
+
+    let mut replacement = candidate(partition(2), 12);
+    replacement.source_path = "objects/a-much-longer-source-path.json".into();
+    replacement.result_path = "results/a-much-longer-result-path.json".into();
+    select_handoff_candidate(
+        &mut selected,
+        replacement.clone(),
+        &mut credits,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        budget.heap_bytes,
+        resident_selected_candidate_bytes(&replacement).unwrap()
+    );
+
+    let ignored = candidate(partition(3), 8);
+    select_handoff_candidate(&mut selected, ignored, &mut credits, &mut budget).unwrap();
+    assert_eq!(
+        budget.heap_bytes,
+        resident_selected_candidate_bytes(&replacement).unwrap()
     );
 }
 

@@ -1,7 +1,67 @@
 use crate::IndexError;
 use crate::typed_json::{
-    FieldCapabilities, FieldId, FieldSchema, FieldType, Predicate, ScalarValue,
+    AggregateOperation, FieldCapabilities, FieldId, FieldSchema, FieldType, Predicate, ScalarValue,
 };
+
+pub(super) fn reduce_streaming<'a>(
+    operation: AggregateOperation,
+    values: impl Iterator<Item = &'a ScalarValue>,
+) -> Result<(Option<ScalarValue>, u64), IndexError> {
+    let mut count = 0u64;
+    let mut value = None;
+    let mut average_sum = 0.0;
+    for next in values {
+        count = count.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
+        match operation {
+            AggregateOperation::Count => {}
+            AggregateOperation::Minimum => {
+                if value.as_ref().is_none_or(|current| next < current) {
+                    value = Some(next.clone());
+                }
+            }
+            AggregateOperation::Maximum => {
+                if value.as_ref().is_none_or(|current| next > current) {
+                    value = Some(next.clone());
+                }
+            }
+            AggregateOperation::Sum => {
+                value = Some(match value.take() {
+                    None => next.clone(),
+                    Some(current) => sum_pair(current, next)?,
+                });
+            }
+            AggregateOperation::Average => average_sum += scalar_number(next)?,
+        }
+    }
+    let value = match operation {
+        AggregateOperation::Count => Some(ScalarValue::Unsigned(count)),
+        AggregateOperation::Average if count != 0 => {
+            Some(ScalarValue::number(average_sum / count as f64)?)
+        }
+        AggregateOperation::Average => None,
+        _ => value,
+    };
+    Ok((value, count))
+}
+
+fn sum_pair(current: ScalarValue, next: &ScalarValue) -> Result<ScalarValue, IndexError> {
+    match (current, next) {
+        (ScalarValue::Signed(left), ScalarValue::Signed(right)) => left
+            .checked_add(*right)
+            .map(ScalarValue::Signed)
+            .ok_or(IndexError::OffsetOverflow),
+        (ScalarValue::Unsigned(left), ScalarValue::Unsigned(right)) => left
+            .checked_add(*right)
+            .map(ScalarValue::Unsigned)
+            .ok_or(IndexError::OffsetOverflow),
+        (current @ ScalarValue::Number(_), ScalarValue::Number(_)) => {
+            ScalarValue::number(scalar_number(&current)? + scalar_number(next)?)
+        }
+        _ => Err(IndexError::InvalidQuery(
+            "aggregate scalar types differ".into(),
+        )),
+    }
+}
 
 pub(super) fn leaf_field(predicate: &Predicate) -> Option<FieldId> {
     match predicate {
