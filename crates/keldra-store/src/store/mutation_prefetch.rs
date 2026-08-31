@@ -14,7 +14,7 @@ type Cached<T> = Result<Option<T>, MutationError>;
 #[derive(Default)]
 pub(super) struct MutationReadCache {
     heads: BTreeMap<Vec<u8>, Cached<Head>>,
-    versions: BTreeMap<Vec<u8>, Cached<Version>>,
+    stored_versions: BTreeMap<Vec<u8>, Cached<StoredVersion>>,
     receipts: BTreeMap<Vec<u8>, Cached<StoredReceipt>>,
     blob_references: BTreeMap<Vec<u8>, Cached<BlobReferenceState>>,
     inline_payloads: BTreeMap<Vec<u8>, Cached<Vec<u8>>>,
@@ -82,7 +82,7 @@ impl MutationReadCache {
             .map(|(key, cached)| {
                 let decoded = cached.and_then(|value| {
                     value
-                        .map(|encoded| StoredVersion::decode(&encoded).map(|stored| stored.version))
+                        .map(|encoded| StoredVersion::decode(&encoded))
                         .transpose()
                 });
                 (key, decoded)
@@ -91,7 +91,7 @@ impl MutationReadCache {
         let elapsed = started.elapsed();
         metrics.version_keys = version_keys.len() as u64;
         metrics.version_seconds = elapsed.as_secs_f64();
-        let versions: BTreeMap<Vec<u8>, Cached<Version>> = version_key_by_head
+        let stored_versions: BTreeMap<Vec<u8>, Cached<StoredVersion>> = version_key_by_head
             .into_iter()
             .map(|(head_key, version_key)| {
                 let cached = versions_by_key.get(&version_key).cloned().ok_or_else(|| {
@@ -138,9 +138,9 @@ impl MutationReadCache {
                 }
             }
         }
-        for cached in versions.values() {
-            if let Ok(Some(version)) = cached
-                && let Some(reference) = version.blob.as_ref()
+        for cached in stored_versions.values() {
+            if let Ok(Some(stored)) = cached
+                && let Some(reference) = stored.version.blob.as_ref()
             {
                 blob_reference_keys.insert(blob_reference_key(reference));
             }
@@ -169,7 +169,7 @@ impl MutationReadCache {
 
         Ok(Self {
             heads,
-            versions,
+            stored_versions,
             receipts,
             blob_references,
             inline_payloads,
@@ -182,8 +182,8 @@ impl MutationReadCache {
         self.heads.get(key).cloned()
     }
 
-    pub(super) fn version(&self, head_key: &[u8]) -> Option<Cached<Version>> {
-        self.versions.get(head_key).cloned()
+    pub(super) fn stored_version(&self, head_key: &[u8]) -> Option<Cached<StoredVersion>> {
+        self.stored_versions.get(head_key).cloned()
     }
 
     pub(super) fn receipt(&self, key: &[u8]) -> Option<Cached<StoredReceipt>> {

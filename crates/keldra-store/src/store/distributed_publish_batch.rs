@@ -174,10 +174,6 @@ impl Store {
         }
 
         let total = operations.len();
-        let reference_effects = match payload_preparation {
-            CoordinatorBatchPayloadPreparation::Distributed => LocalReferenceEffects::Deferred,
-            CoordinatorBatchPayloadPreparation::SingleNode => LocalReferenceEffects::AppliedInline,
-        };
         let mut prepared = Vec::with_capacity(total);
         let mut early = BTreeMap::new();
         let mut bucket_governance = BTreeMap::<Vec<u8>, ObjectMutationGovernance>::new();
@@ -277,6 +273,32 @@ impl Store {
         let source = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let reference_effects = match payload_preparation {
+            CoordinatorBatchPayloadPreparation::Distributed => LocalReferenceEffects::Deferred,
+            CoordinatorBatchPayloadPreparation::SingleNode => {
+                let cursor = self.reference_delta_cursor(source.source_id).map_err(|error| {
+                    MutationError::Storage(format!(
+                        "cannot read local reference cursor before single-node coordination: {error}"
+                    ))
+                })?;
+                if cursor > source.tail {
+                    return Err(MutationError::Storage(format!(
+                        "local reference cursor {cursor} is ahead of source-journal tail {}",
+                        source.tail
+                    )));
+                }
+                if cursor == source.tail {
+                    LocalReferenceEffects::AppliedInline
+                } else {
+                    // A derived or distributed publication may have appended
+                    // reference work that the delivery runtime has not yet
+                    // consumed. Do not advance across that gap or apply this
+                    // group's effects out of order; append them to the same
+                    // authoritative journal for contiguous delivery instead.
+                    LocalReferenceEffects::Deferred
+                }
+            }
+        };
         let mut next_source_position = source.tail.checked_add(1).ok_or_else(|| {
             MutationError::Storage("local invalidation offset is exhausted".into())
         })?;
@@ -337,6 +359,10 @@ impl Store {
                         source_id: source.source_id,
                         source_journal_position: next_source_position,
                         reference_effects,
+                        materialize_inline_payload: matches!(
+                            payload_preparation,
+                            CoordinatorBatchPayloadPreparation::SingleNode
+                        ),
                     }),
                     item.definition_intent,
                 )
@@ -641,6 +667,7 @@ impl Store {
                         source_id: source.source_id,
                         source_journal_position: next_source_position,
                         reference_effects: LocalReferenceEffects::Deferred,
+                        materialize_inline_payload: false,
                     }),
                     None,
                 )

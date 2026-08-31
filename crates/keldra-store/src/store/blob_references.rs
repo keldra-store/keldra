@@ -4,6 +4,7 @@ use crate::blob_gc::{BlobGcBudget, BlobGcCursor, BlobGcPhase, BlobGcTick};
 use crate::key::STORAGE_KEY_FORMAT_VERSION;
 
 use super::journal_capacity::SourceJournalAdmission;
+use super::mutation_prefetch::MutationReadCache;
 use super::payload_artifacts::{ArtifactKind, ArtifactManifest, RocksArtifactReader};
 use super::*;
 
@@ -887,6 +888,53 @@ impl Store {
             },
         };
         Ok((key, state))
+    }
+
+    /// Materializes inline bytes and, when their reference effect must remain
+    /// ordered behind a journal prefix, retains them with a reservation that
+    /// the eventual positive delta publishes without double-counting.
+    pub(super) fn prepare_coordinated_inline_payload(
+        &self,
+        operation: &PreparedOperation,
+        materialize: bool,
+        reserve_for_deferred_delta: bool,
+        pending_inline_payloads: &BTreeSet<Vec<u8>>,
+        pending_blob_references: &PendingBlobReferences,
+        read_cache: &MutationReadCache,
+        now_unix_millis: u64,
+    ) -> Result<
+        (
+            Option<(Vec<u8>, Vec<u8>)>,
+            Option<(Vec<u8>, BlobReferenceState)>,
+        ),
+        MutationError,
+    > {
+        if !materialize {
+            return Ok((None, None));
+        }
+        let PreparedOperation::Put { payload, .. } = operation else {
+            return Ok((None, None));
+        };
+        let inline_payload = match payload.inline_bytes() {
+            Some(bytes) => self.prepare_hashed_inline_payload_value_cached(
+                payload.reference(),
+                bytes,
+                pending_inline_payloads,
+                read_cache.inline_payload(payload.reference()),
+            )?,
+            None => None,
+        };
+        if !reserve_for_deferred_delta {
+            return Ok((inline_payload, None));
+        }
+        let key = blob_reference_key(payload.reference());
+        let reservation = if pending_blob_references.contains_key(&key) {
+            None
+        } else {
+            self.prepare_sealed_artifact_reservation(&key, now_unix_millis)?
+                .map(|state| (key, state))
+        };
+        Ok((inline_payload, reservation))
     }
 
     pub(super) fn prepare_inline_payload_value(

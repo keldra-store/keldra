@@ -7,6 +7,7 @@ pub(super) struct DistributedEvaluationContext {
     pub(super) source_id: SourceId,
     pub(super) source_journal_position: u64,
     pub(super) reference_effects: LocalReferenceEffects,
+    pub(super) materialize_inline_payload: bool,
 }
 
 pub(super) struct EvaluatedOperation {

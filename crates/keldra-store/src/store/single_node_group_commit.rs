@@ -388,6 +388,84 @@ mod tests {
             assert!(matches!(result.as_deref(), Ok([Ok(_)])));
         }
         assert_eq!(physical_commits_since(&store, before), 1);
+        let status = store.local_watch_status().unwrap();
+        assert_eq!(
+            store.reference_delta_cursor(status.source_id).unwrap(),
+            status.tail
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_reference_backlog_does_not_reject_single_node_group() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let governance = governance(&store);
+        let deferred = store
+            .coordinate_distributed_mutation_batch(
+                request("objects/deferred", "deferred", governance.clone()),
+                context(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(deferred.as_slice(), [Ok(_)]));
+        let before = store.local_watch_status().unwrap();
+        let cursor = store.reference_delta_cursor(before.source_id).unwrap();
+        assert!(cursor < before.tail);
+        let before_sequence = store.db.latest_sequence_number();
+
+        let (first, second) = tokio::join!(
+            store.coordinate_single_node_mutation_batch(
+                request(
+                    "objects/first-after-gap",
+                    "first-after-gap",
+                    governance.clone()
+                ),
+                context(1),
+            ),
+            store.coordinate_single_node_mutation_batch(
+                request("objects/second-after-gap", "second-after-gap", governance),
+                context(1),
+            ),
+        );
+
+        assert!(matches!(first.as_deref(), Ok([Ok(_)])), "first={first:?}");
+        assert!(
+            matches!(second.as_deref(), Ok([Ok(_)])),
+            "second={second:?}"
+        );
+        assert_eq!(physical_commits_since(&store, before_sequence), 1);
+        for (path, expected) in [
+            ("objects/first-after-gap", b"first-after-gap".as_slice()),
+            ("objects/second-after-gap", b"second-after-gap".as_slice()),
+        ] {
+            let object = store
+                .get(&ObjectKey::new("tenant", "bucket", path).unwrap())
+                .await
+                .unwrap()
+                .expect("post-gap single-node object must remain readable");
+            assert_eq!(object.bytes, expected);
+            let reference = object
+                .version
+                .blob
+                .expect("put must retain its blob identity");
+            let state = store
+                .blob_reference_state(&reference)
+                .unwrap()
+                .expect("inline payload must retain lifecycle authority");
+            assert_eq!(state.ref_count, 1);
+            assert_eq!(
+                store.complete_copy_state(&reference).await.unwrap(),
+                crate::PayloadArtifactState::Valid
+            );
+        }
+        let after = store.local_watch_status().unwrap();
+        assert!(after.tail > before.tail);
+        assert_eq!(
+            store.reference_delta_cursor(after.source_id).unwrap(),
+            cursor
+        );
     }
 
     #[tokio::test]
@@ -433,7 +511,7 @@ mod tests {
         let first = governance(&store);
         let mut second = first.clone();
         second.policy = BucketPolicy {
-            immutable_prefixes: vec!["immutable/".into()],
+            immutable_prefixes: vec!["immutable".into()],
             ..BucketPolicy::default()
         };
         let before = store.db.latest_sequence_number();
@@ -448,8 +526,11 @@ mod tests {
             ),
         );
 
-        assert!(matches!(first.as_deref(), Ok([Ok(_)])));
-        assert!(matches!(second.as_deref(), Ok([Ok(_)])));
+        assert!(matches!(first.as_deref(), Ok([Ok(_)])), "first={first:?}");
+        assert!(
+            matches!(second.as_deref(), Ok([Ok(_)])),
+            "second={second:?}"
+        );
         assert_eq!(physical_commits_since(&store, before), 2);
     }
 

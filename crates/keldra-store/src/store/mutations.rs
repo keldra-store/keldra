@@ -634,6 +634,7 @@ impl Store {
                     source_id: source.source_id,
                     source_journal_position,
                     reference_effects: LocalReferenceEffects::Deferred,
+                    materialize_inline_payload: false,
                 }),
                 definition_intent,
             )
@@ -1516,23 +1517,40 @@ impl Store {
                 None => self.head_by_storage_key(&encoded_key)?,
             },
         };
+        // Keep the complete durable predecessor record for the rest of this
+        // evaluation. Its retention state drives both reference retirement
+        // and descriptor transition below; re-reading the same key would add
+        // two point gets while the commit fence is held.
+        let current_stored_version = match current.as_ref() {
+            Some(head) if !pending_versions.contains_key(&encoded_key) => Some(
+                match read_cache.stored_version(&encoded_key) {
+                    Some(cached) => cached?,
+                    None => self.stored_version_by_key(&version_key(
+                        operation.identity(),
+                        key,
+                        head.version,
+                    ))?,
+                }
+                .ok_or_else(|| {
+                    MutationError::Storage("head references a missing version".into())
+                })?,
+            ),
+            Some(_) | None => None,
+        };
         let current_version = match current.as_ref() {
-            Some(head) => match pending_versions.get(&encoded_key) {
-                Some(version) => Some(version.clone()),
-                None => Some(
-                    match read_cache.version(&encoded_key) {
-                        Some(cached) => cached?,
-                        None => self.version_metadata_by_identity(
-                            operation.identity(),
-                            key,
-                            head.version,
-                        )?,
-                    }
+            Some(_) => Some(
+                pending_versions
+                    .get(&encoded_key)
+                    .cloned()
+                    .or_else(|| {
+                        current_stored_version
+                            .as_ref()
+                            .map(|stored| stored.version.clone())
+                    })
                     .ok_or_else(|| {
                         MutationError::Storage("head references a missing version".into())
                     })?,
-                ),
-            },
+            ),
             None => None,
         };
         if current_version
@@ -1727,18 +1745,9 @@ impl Store {
             distributed.reference_effects == LocalReferenceEffects::AppliedInline
         });
         let released_predecessor = (versioning == ObjectVersioning::Unversioned)
-            .then_some(current_version.as_ref())
+            .then_some(current_stored_version.as_ref())
             .flatten()
-            .map(|previous| {
-                self.stored_version_by_key(&version_key(operation.identity(), key, previous.id))
-                    .map(|stored| {
-                        stored.filter(|stored| {
-                            stored.retention == StoredVersionRetention::JournalReleased
-                        })
-                    })
-            })
-            .transpose()?
-            .flatten();
+            .filter(|stored| stored.retention == StoredVersionRetention::JournalReleased);
         let mut reference_deltas = Vec::with_capacity(2);
         if let Some(reference) = new_blob.as_ref() {
             reference_deltas.push(ReferenceDelta {
@@ -1824,24 +1833,18 @@ impl Store {
         let heads = self.cf(CF_HEADS)?;
         let encoded_version_key = version_key(operation.identity(), key, id);
         let mut blob_reference_updates = Vec::with_capacity(2);
-        let inline_payload_value = if apply_content_lifecycle {
-            match operation {
-                PreparedOperation::Put { payload, .. } => match payload.inline_bytes() {
-                    Some(bytes) => self.prepare_hashed_inline_payload_value_cached(
-                        payload.reference(),
-                        bytes,
-                        pending_inline_payloads,
-                        read_cache.inline_payload(payload.reference()),
-                    )?,
-                    None => None,
-                },
-                PreparedOperation::Publish { .. }
-                | PreparedOperation::Clone { .. }
-                | PreparedOperation::Delete { .. } => None,
-            }
-        } else {
-            None
-        };
+        let materialize_inline =
+            distributed.is_some_and(|distributed| distributed.materialize_inline_payload);
+        let (inline_payload_value, reservation) = self.prepare_coordinated_inline_payload(
+            operation,
+            apply_content_lifecycle || materialize_inline,
+            materialize_inline && !apply_content_lifecycle,
+            pending_inline_payloads,
+            pending_blob_references,
+            read_cache,
+            now_unix_millis,
+        )?;
+        blob_reference_updates.extend(reservation);
         if apply_content_lifecycle
             && !released_same_as_new
             && let Some(reference) = new_blob.as_ref()
@@ -1916,7 +1919,7 @@ impl Store {
         }
         if let Some(previous) = current_version.as_ref() {
             let previous_key = version_key(operation.identity(), key, previous.id);
-            if let Some(stored) = self.stored_version_by_key(&previous_key)? {
+            if let Some(stored) = current_stored_version.as_ref() {
                 match stored.retention {
                     StoredVersionRetention::JournalPending
                         if versioning == ObjectVersioning::Enabled =>
@@ -1925,7 +1928,7 @@ impl Store {
                             versions,
                             previous_key,
                             serde_json::to_vec(&StoredVersion::new(
-                                stored.version,
+                                stored.version.clone(),
                                 StoredVersionRetention::UserRetained,
                             ))
                             .map_err(storage_error)?,
@@ -1938,7 +1941,7 @@ impl Store {
                             versions,
                             previous_key,
                             serde_json::to_vec(&StoredVersion::new(
-                                stored.version,
+                                stored.version.clone(),
                                 StoredVersionRetention::UserRetained,
                             ))
                             .map_err(storage_error)?,
