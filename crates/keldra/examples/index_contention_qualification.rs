@@ -130,6 +130,9 @@ struct MutationReport {
     accepted_operations_per_second: f64,
     accepted_bytes_per_second: f64,
     request_errors: u64,
+    failure_classes: Vec<MutationFailureClass>,
+    failure_occurrences_omitted: u64,
+    failure_diagnostics_definition: &'static str,
     queue_capacity: usize,
     minimum_sampled_queue_depth_while_producing: usize,
     queue_depth_samples: u64,
@@ -185,6 +188,34 @@ struct VisibilitySampleFailure {
     error: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct MutationFailureClass {
+    source: &'static str,
+    code: i32,
+    code_name: String,
+    message: String,
+    count: u64,
+}
+
+#[derive(Debug)]
+struct MutationRequestFailure {
+    classes: Vec<MutationFailureClass>,
+}
+
+impl MutationRequestFailure {
+    fn one(source: &'static str, code: i32, code_name: String, message: String) -> Self {
+        Self {
+            classes: vec![MutationFailureClass {
+                source,
+                code,
+                code_name,
+                message: bounded_mutation_failure_message(&message),
+                count: 1,
+            }],
+        }
+    }
+}
+
 struct VisibilitySampleOutcome {
     canary: Canary,
     definition_position: usize,
@@ -194,6 +225,8 @@ struct VisibilitySampleOutcome {
 
 const MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS: usize = 16;
 const MAX_VISIBILITY_SAMPLE_ERROR_CHARS: usize = 512;
+const MAX_MUTATION_FAILURE_CLASSES: usize = 8;
+const MAX_MUTATION_FAILURE_MESSAGE_CHARS: usize = 512;
 
 #[derive(Clone, Copy)]
 struct MutationJob {
@@ -860,9 +893,10 @@ async fn run_mutations(
     let mut final_canary: Option<Canary> = None;
     while let Some(event) = result_rx.recv().await {
         match event {
-            Err(_) => {
+            Err(failure) => {
                 report.request_errors += 1;
                 counters.mutation_errors.fetch_add(1, Ordering::Relaxed);
+                record_mutation_failure(&mut report, failure);
             }
             Ok(result) => {
                 report.accepted_batches += 1;
@@ -975,6 +1009,7 @@ async fn run_mutations(
     report.accepted_operations_per_second =
         report.accepted_operations as f64 / report.elapsed_seconds;
     report.accepted_bytes_per_second = report.accepted_bytes as f64 / report.elapsed_seconds;
+    report.failure_diagnostics_definition = "request_errors counts failed BulkWrite requests; failure_classes counts RPC statuses, per-outcome failures, or driver response-validation failures by bounded code and message; at most eight distinct classes are retained and failure_occurrences_omitted counts occurrences from additional classes";
     report.publication_visibility_lag = visibility_latency.report();
     report.visibility_definition = "publication_visibility_lag: receipt acceptance to first ordinary query hit with the exact canary object_version; samples rotate by sample ordinal across definitions, use a separate total observation timeout, and include polling-resolution delay";
     Ok((report, final_canary))
@@ -1063,7 +1098,7 @@ async fn execute_mutation(
     config: &Config,
     client: &mut RawClient,
     job: MutationJob,
-) -> Result<MutationResult> {
+) -> std::result::Result<MutationResult, MutationRequestFailure> {
     let started = Instant::now();
     let mut operations = Vec::with_capacity(config.mutation_batch_size + 1);
     let mut bytes = 0u64;
@@ -1131,32 +1166,78 @@ async fn execute_mutation(
         marker_payload,
         format!("contention-marker-{}", job.sequence),
     ));
-    let response = client
-        .bulk_write(BulkWriteRequest { operations })
-        .await
-        .context("mutation BulkWrite")?
-        .into_inner();
-    ensure!(
-        response.outcomes.len() == config.mutation_batch_size + 1,
-        "mutation outcome count mismatch"
-    );
+    let response = match client.bulk_write(BulkWriteRequest { operations }).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            return Err(MutationRequestFailure::one(
+                "rpc-status",
+                status.code() as i32,
+                format!("{:?}", status.code()),
+                status.message().to_owned(),
+            ));
+        }
+    };
+    if response.outcomes.len() != config.mutation_batch_size + 1 {
+        return Err(driver_mutation_failure(
+            "outcome-count-mismatch",
+            format!(
+                "BulkWrite returned {} outcomes for {} operations",
+                response.outcomes.len(),
+                config.mutation_batch_size + 1
+            ),
+        ));
+    }
     let mut marker_version = None;
+    let mut failures = Vec::new();
     for outcome in response.outcomes {
-        let index = usize::try_from(outcome.index)?;
-        match outcome.outcome.context("missing mutation outcome")? {
+        let index = match usize::try_from(outcome.index) {
+            Ok(index) => index,
+            Err(error) => {
+                return Err(driver_mutation_failure(
+                    "invalid-outcome-index",
+                    format!("BulkWrite outcome index is invalid: {error}"),
+                ));
+            }
+        };
+        let Some(outcome) = outcome.outcome else {
+            return Err(driver_mutation_failure(
+                "missing-outcome",
+                format!("BulkWrite outcome {index} omitted its result"),
+            ));
+        };
+        match outcome {
             BulkOutcomeValue::Receipt(receipt) => {
-                ensure!(!receipt.deleted && receipt.version != 0);
+                if receipt.deleted || receipt.version == 0 {
+                    return Err(driver_mutation_failure(
+                        "invalid-receipt",
+                        format!(
+                            "BulkWrite outcome {index} returned deleted={} version={}",
+                            receipt.deleted, receipt.version
+                        ),
+                    ));
+                }
                 if index == config.mutation_batch_size {
                     marker_version = Some(receipt.version);
                 }
             }
-            BulkOutcomeValue::Failure(failure) => bail!(
-                "mutation failed with code {}: {}",
-                failure.code,
-                failure.message
-            ),
+            BulkOutcomeValue::Failure(failure) => failures.push(MutationFailureClass {
+                source: "outcome",
+                code: failure.code,
+                code_name: format!("{:?}", tonic::Code::from_i32(failure.code)),
+                message: bounded_mutation_failure_message(&failure.message),
+                count: 1,
+            }),
         }
     }
+    if !failures.is_empty() {
+        return Err(MutationRequestFailure { classes: failures });
+    }
+    let Some(marker_version) = marker_version else {
+        return Err(driver_mutation_failure(
+            "missing-marker-receipt",
+            "BulkWrite response omitted the marker receipt".into(),
+        ));
+    };
     let accepted_at = Instant::now();
     Ok(MutationResult {
         operations: (config.mutation_batch_size + 1) as u64,
@@ -1164,7 +1245,7 @@ async fn execute_mutation(
         elapsed: accepted_at.saturating_duration_since(started),
         canary: Some(Canary {
             id: marker_ordinal,
-            version: marker_version.context("marker receipt missing")?,
+            version: marker_version,
             accepted_at,
         }),
     })
@@ -1279,6 +1360,36 @@ fn bounded_error(error: &str) -> String {
         .chars()
         .take(MAX_VISIBILITY_SAMPLE_ERROR_CHARS)
         .collect()
+}
+
+fn bounded_mutation_failure_message(message: &str) -> String {
+    message
+        .chars()
+        .take(MAX_MUTATION_FAILURE_MESSAGE_CHARS)
+        .collect()
+}
+
+fn driver_mutation_failure(code_name: &'static str, message: String) -> MutationRequestFailure {
+    MutationRequestFailure::one("driver-validation", -1, code_name.to_owned(), message)
+}
+
+fn record_mutation_failure(report: &mut MutationReport, failure: MutationRequestFailure) {
+    for class in failure.classes {
+        if let Some(existing) = report.failure_classes.iter_mut().find(|existing| {
+            existing.source == class.source
+                && existing.code == class.code
+                && existing.code_name == class.code_name
+                && existing.message == class.message
+        }) {
+            existing.count = existing.count.saturating_add(class.count);
+        } else if report.failure_classes.len() < MAX_MUTATION_FAILURE_CLASSES {
+            report.failure_classes.push(class);
+        } else {
+            report.failure_occurrences_omitted = report
+                .failure_occurrences_omitted
+                .saturating_add(class.count);
+        }
+    }
 }
 
 async fn verify_final_mutable_state(
@@ -1698,6 +1809,47 @@ mod tests {
         let bounded = bounded_error(&error);
         assert_eq!(bounded.chars().count(), MAX_VISIBILITY_SAMPLE_ERROR_CHARS);
         assert!(error.starts_with(&bounded));
+    }
+
+    #[test]
+    fn mutation_failure_messages_are_bounded_on_character_boundaries() {
+        let message = "é".repeat(MAX_MUTATION_FAILURE_MESSAGE_CHARS + 10);
+        let bounded = bounded_mutation_failure_message(&message);
+        assert_eq!(bounded.chars().count(), MAX_MUTATION_FAILURE_MESSAGE_CHARS);
+        assert!(message.starts_with(&bounded));
+    }
+
+    #[test]
+    fn mutation_failure_classes_are_counted_and_bounded() {
+        let mut report = MutationReport::default();
+        for ordinal in 0..MAX_MUTATION_FAILURE_CLASSES {
+            record_mutation_failure(
+                &mut report,
+                MutationRequestFailure::one(
+                    "outcome",
+                    ordinal as i32,
+                    format!("Code{ordinal}"),
+                    format!("failure-{ordinal}"),
+                ),
+            );
+        }
+        record_mutation_failure(
+            &mut report,
+            MutationRequestFailure::one("outcome", 0, "Code0".into(), "failure-0".into()),
+        );
+        record_mutation_failure(
+            &mut report,
+            MutationRequestFailure::one(
+                "rpc-status",
+                tonic::Code::Unavailable as i32,
+                "Unavailable".into(),
+                "queue closed".into(),
+            ),
+        );
+
+        assert_eq!(report.failure_classes.len(), MAX_MUTATION_FAILURE_CLASSES);
+        assert_eq!(report.failure_classes[0].count, 2);
+        assert_eq!(report.failure_occurrences_omitted, 1);
     }
 
     #[tokio::test]
