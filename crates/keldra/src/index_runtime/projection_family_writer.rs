@@ -386,36 +386,44 @@ impl SharedProjectionFamilyWriter {
         &self,
         plan: &ProjectionFamilyPlan,
         previous: Option<&ProjectionGeneration>,
-        sources: Vec<IndexSourceMutation>,
+        mut sources: Vec<IndexSourceMutation>,
         maximum_workspace_bytes: usize,
     ) -> Result<ProjectedFamilyFrame, Status> {
+        // Only the newest current-object mutation for a path can affect the
+        // projected state at this frame's barrier. Coalescing here also makes
+        // locator/state lookup keys unique for the bounded batch read below.
+        coalesce_latest_sources(&mut sources);
+        let source_paths = sources
+            .iter()
+            .map(|source| source_path(source).to_owned())
+            .collect::<Vec<_>>();
+        let mut prior_states = match previous {
+            Some(previous) => {
+                self.publisher
+                    .load_projection_source_state_sets(
+                        &plan.storage_tenant,
+                        &plan.bucket,
+                        plan.identity.tenant_id,
+                        plan.identity.bucket_id,
+                        previous,
+                        plan.schema
+                            .recipe_fingerprints()
+                            .map_err(index_status)?
+                            .membership,
+                        &source_paths,
+                    )
+                    .await?
+            }
+            None => std::collections::BTreeMap::new(),
+        };
+        require_state_sets_bound(&prior_states, maximum_workspace_bytes / 4)?;
         let mut buffer = family_buffer(maximum_workspace_bytes)?;
         let mut cache_mutations = Vec::new();
         let mut diagnostics = IndexBuildDiagnostics::default();
         for source in sources {
             let (path, version) = source_identity(&source);
-            let prior = match previous {
-                Some(previous) => {
-                    let states = self
-                        .publisher
-                        .load_projection_source_states(
-                            &plan.storage_tenant,
-                            &plan.bucket,
-                            plan.identity.tenant_id,
-                            plan.identity.bucket_id,
-                            previous,
-                            plan.schema
-                                .recipe_fingerprints()
-                                .map_err(index_status)?
-                                .membership,
-                            &path,
-                        )
-                        .await?;
-                    require_state_bound(&states, maximum_workspace_bytes / 4)?;
-                    states
-                }
-                None => Vec::new(),
-            };
+            let prior = prior_states.remove(&path).unwrap_or_default();
+            require_state_bound(&prior, maximum_workspace_bytes / 4)?;
             let (mut current, source_diagnostics) = self
                 .mapper
                 .project_family(plan.identity, source, maximum_workspace_bytes / 2)
@@ -537,6 +545,29 @@ fn source_identity(source: &IndexSourceMutation) -> (String, u64) {
     }
 }
 
+fn source_path(source: &IndexSourceMutation) -> &str {
+    match source {
+        IndexSourceMutation::Upsert(object) => &object.path,
+        IndexSourceMutation::Remove(ObjectIdentity { path, .. }) => path,
+    }
+}
+
+fn source_version(source: &IndexSourceMutation) -> u64 {
+    match source {
+        IndexSourceMutation::Upsert(object) => object.version,
+        IndexSourceMutation::Remove(ObjectIdentity { version, .. }) => *version,
+    }
+}
+
+fn coalesce_latest_sources(sources: &mut Vec<IndexSourceMutation>) {
+    sources.sort_unstable_by(|left, right| {
+        source_path(left)
+            .cmp(source_path(right))
+            .then_with(|| source_version(right).cmp(&source_version(left)))
+    });
+    sources.dedup_by(|later, earlier| source_path(later) == source_path(earlier));
+}
+
 fn mutation_identity(mutation: &keldra_index::v4::build::MergeMutation) -> &ObjectIdentity {
     match mutation {
         keldra_index::v4::build::MergeMutation::Upsert(source) => &source.source_identity,
@@ -556,6 +587,25 @@ fn require_state_bound(
     if resident > maximum_bytes {
         return Err(Status::resource_exhausted(
             "one prior projected source state exceeds its bounded workspace",
+        ));
+    }
+    Ok(())
+}
+
+fn require_state_sets_bound(
+    states: &std::collections::BTreeMap<String, Vec<keldra_index::v5::ProjectedDocumentState>>,
+    maximum_bytes: usize,
+) -> Result<(), Status> {
+    let resident = states.values().try_fold(0_usize, |total, source| {
+        source.iter().try_fold(total, |total, state| {
+            total
+                .checked_add(state.resident_bytes().map_err(index_status)?)
+                .ok_or_else(|| Status::resource_exhausted("prior projected frame bytes overflow"))
+        })
+    })?;
+    if resident > maximum_bytes {
+        return Err(Status::resource_exhausted(
+            "one prior projected frame exceeds its bounded workspace",
         ));
     }
     Ok(())
@@ -641,5 +691,27 @@ mod tests {
             &generation,
             &barrier
         ));
+    }
+
+    #[test]
+    fn one_frame_keeps_only_the_newest_version_of_each_source_path() {
+        let mut sources = vec![
+            IndexSourceMutation::Remove(ObjectIdentity {
+                path: "objects/a".into(),
+                version: 7,
+            }),
+            IndexSourceMutation::Remove(ObjectIdentity {
+                path: "objects/b".into(),
+                version: 4,
+            }),
+            IndexSourceMutation::Remove(ObjectIdentity {
+                path: "objects/a".into(),
+                version: 11,
+            }),
+        ];
+        coalesce_latest_sources(&mut sources);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(source_identity(&sources[0]), ("objects/a".into(), 11));
+        assert_eq!(source_identity(&sources[1]), ("objects/b".into(), 4));
     }
 }

@@ -256,8 +256,13 @@ impl IndexCommitPublisher {
         Ok(records.remove(&stable_key).flatten())
     }
 
+    /// Resolves one bounded frame's predecessor state with two component
+    /// lookups, independent of the number of distinct source paths. Reopening
+    /// the immutable stream once per source turns sustained projection into
+    /// O(frame records * accumulated history); the writer must batch by the
+    /// stable locator and projected-state components instead.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn load_projection_source_states(
+    pub(crate) async fn load_projection_source_state_sets(
         &self,
         storage_tenant: &str,
         bucket: &str,
@@ -265,26 +270,65 @@ impl IndexCommitPublisher {
         bucket_id: u64,
         generation: &ProjectionGeneration,
         source_scope: [u8; 32],
-        source_path: &str,
-    ) -> Result<Vec<keldra_index::v5::ProjectedDocumentState>, Status> {
-        let locator_key =
-            StableDocumentKey::derive(source_scope, source_path, 0).map_err(index_status)?;
-        let Some(locator) = self
-            .load_projection_component_record(
+        source_paths: &[String],
+    ) -> Result<BTreeMap<String, Vec<keldra_index::v5::ProjectedDocumentState>>, Status> {
+        let mut locator_paths = BTreeMap::new();
+        let mut states = source_paths
+            .iter()
+            .cloned()
+            .map(|path| (path, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        if states.len() != source_paths.len() {
+            return Err(Status::invalid_argument(
+                "projection predecessor paths are not unique",
+            ));
+        }
+        for source_path in source_paths {
+            let locator_key =
+                StableDocumentKey::derive(source_scope, source_path, 0).map_err(index_status)?;
+            if locator_paths
+                .insert(locator_key, source_path.clone())
+                .is_some()
+            {
+                return Err(Status::data_loss(
+                    "projection source locator stable-key collision",
+                ));
+            }
+        }
+        let locator_keys = locator_paths.keys().copied().collect::<Vec<_>>();
+        let mut encoded_locators = self
+            .load_projection_component_records(
                 storage_tenant,
                 bucket,
                 tenant_id,
                 bucket_id,
                 generation,
                 ComponentIdentity::SourceRecords,
-                locator_key,
+                &locator_keys,
             )
-            .await?
-        else {
-            return Ok(Vec::new());
-        };
-        let stable_keys =
-            decode_source_records(source_scope, source_path, &locator).map_err(index_status)?;
+            .await?;
+        let mut stable_key_paths = BTreeMap::new();
+        for (locator_key, source_path) in locator_paths {
+            let Some(locator) = encoded_locators.remove(&locator_key).flatten() else {
+                continue;
+            };
+            for stable_key in
+                decode_source_records(source_scope, &source_path, &locator).map_err(index_status)?
+            {
+                if stable_key_paths
+                    .insert(stable_key, source_path.clone())
+                    .is_some()
+                {
+                    return Err(Status::data_loss(
+                        "projection source records share one stable key",
+                    ));
+                }
+            }
+        }
+        if stable_key_paths.is_empty() {
+            return Ok(states);
+        }
+        let stable_keys = stable_key_paths.keys().copied().collect::<Vec<_>>();
         let mut encoded = self
             .load_projection_component_records(
                 storage_tenant,
@@ -296,8 +340,7 @@ impl IndexCommitPublisher {
                 &stable_keys,
             )
             .await?;
-        let mut states = Vec::with_capacity(stable_keys.len());
-        for stable_key in stable_keys {
+        for (stable_key, source_path) in stable_key_paths {
             let bytes = encoded.remove(&stable_key).flatten().ok_or_else(|| {
                 Status::data_loss("projection source locator names absent projected state")
             })?;
@@ -311,7 +354,10 @@ impl IndexCommitPublisher {
                     "projection source locator names inconsistent projected state",
                 ));
             }
-            states.push(state);
+            states
+                .get_mut(&source_path)
+                .ok_or_else(|| Status::data_loss("projection source state escaped its frame"))?
+                .push(state);
         }
         Ok(states)
     }
@@ -327,6 +373,9 @@ impl IndexCommitPublisher {
         component: ComponentIdentity,
         stable_keys: &[StableDocumentKey],
     ) -> Result<BTreeMap<StableDocumentKey, Option<Vec<u8>>>, Status> {
+        if stable_keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         if stable_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(Status::invalid_argument(
                 "projection record lookup keys are not sorted and unique",

@@ -252,6 +252,16 @@ For each source-journal mutation, the writer:
 7. appends those deltas to bounded projection-family buffers; and
 8. advances the physical source barrier only when all routed work is represented.
 
+Predecessor resolution is frame-batched. The writer derives every distinct
+source-locator key in the bounded frame, opens the source-record component once,
+derives the union of stable document keys, and opens the projected-state
+component once. It must never reopen immutable stream directories separately
+for every source record: that makes one turn
+`O(frame records * accumulated history)` and causes indexing throughput to
+decay as versions accumulate even when logical-definition fan-out is constant.
+Multiple versions of one source path in a frame coalesce to its newest current
+version before projection.
+
 The complexity target for a mutation is:
 
 ```text
