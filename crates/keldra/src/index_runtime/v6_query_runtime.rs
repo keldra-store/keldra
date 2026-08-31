@@ -43,7 +43,11 @@ use super::v6_query_compile::compile_v6_query;
 const _: [(); MAX_OBJECT_PATH_BYTES] = [(); keldra_index::v6::MAX_QUERY_DOCUMENT_PATH_BYTES];
 
 const CONTROL_OBJECT_MAX_BYTES: usize = 256 * 1024;
-const MIN_QUERY_MEMORY_BYTES: u64 = 2 * 1024 * 1024;
+// A D1 query retains slightly more than 2 MiB once its authorized candidates
+// and decoded run state overlap. Keep the mandatory grant above that measured
+// floor so fair-share contention cannot admit a query that is guaranteed to
+// fail after doing the artifact work.
+const MIN_QUERY_MEMORY_BYTES: u64 = 4 * 1024 * 1024;
 const PREFERRED_QUERY_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const FRESHNESS_POLL: Duration = Duration::from_millis(25);
 
