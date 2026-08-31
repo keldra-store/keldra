@@ -80,8 +80,10 @@ impl V6LocalIndexQueryExecutor {
 
     async fn execute(&self, request: LocalIndexQueryRequest) -> Result<ExecutedIndexQuery, Status> {
         require_request(&request)?;
+        tracing::debug!("v6 query begins catalog resolution");
         let start_fence = self.placement_fence()?;
         let (logical, recipe, schema, activation) = self.resolve_catalog(&request).await?;
+        tracing::debug!("v6 query resolved its active catalog");
         let compiled = compile_v6_query(&schema, &request.query).map_err(index_status)?;
         let facet_limits = compiled
             .facets
@@ -103,12 +105,18 @@ impl V6LocalIndexQueryExecutor {
             )
             .await;
         };
+        tracing::debug!(
+            query.partition_count = pinned.roots.len(),
+            "v6 query pinned its common-cut root vector"
+        );
 
+        tracing::debug!("v6 query begins working-memory admission");
         let memory = self
             .memory
             .acquire_up_to(MIN_QUERY_MEMORY_BYTES, PREFERRED_QUERY_MEMORY_BYTES)
             .await
             .map_err(|error| Status::resource_exhausted(error.to_string()))?;
+        tracing::debug!("v6 query acquired working-memory admission");
         let admitted = usize::try_from(memory.charged_bytes()).unwrap_or(usize::MAX);
         let mut credits =
             QueryBlockCredits::from_query_permit(Box::new(memory)).map_err(index_status)?;
@@ -175,6 +183,7 @@ impl V6LocalIndexQueryExecutor {
         )
         .await
         .map_err(index_status)?;
+        tracing::debug!("v6 query completed artifact execution and candidate admission");
 
         self.verify_pin(&request, &recipe, &activation, &pinned)
             .await?;

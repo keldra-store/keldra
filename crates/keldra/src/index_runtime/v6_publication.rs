@@ -1123,9 +1123,17 @@ impl V6ProjectionPublisher {
     ) -> Result<Option<(Vec<u8>, VersionId)>, Status> {
         let key = ObjectKey::new(storage_tenant, bucket, path)
             .map_err(|error| Status::internal(error.to_string()))?;
+        tracing::debug!(
+            projection.path = path,
+            "v6 artifact read begins stable head selection"
+        );
         let Some(version) = self.reader.head_stable(&key, tenant_id, bucket_id).await? else {
             return Ok(None);
         };
+        tracing::debug!(
+            projection.path = path,
+            "v6 artifact read selected its stable head"
+        );
         if version.deleted {
             return Err(Status::data_loss("v6 projection artifact is deleted"));
         }
@@ -1160,6 +1168,7 @@ impl V6ProjectionPublisher {
         let mut bytes = Vec::with_capacity(blob.length as usize);
         match self.store.open_blob(blob).await {
             Ok(mut payload) => {
+                tracing::debug!("v6 artifact read opened its local integrated blob");
                 let mut chunk = [0_u8; 8 * 1024];
                 while bytes.len() < blob.length as usize {
                     let read = payload.read(&mut chunk).await.map_err(|error| {
@@ -1172,6 +1181,7 @@ impl V6ProjectionPublisher {
                 }
             }
             Err(MutationError::BlobNotFound) => {
+                tracing::debug!("v6 artifact read falls back to distributed reconstruction");
                 let mut payload = self.reader.open_blob_payload(blob).await?;
                 payload
                     .by_ref()
