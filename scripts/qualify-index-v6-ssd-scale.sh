@@ -145,7 +145,7 @@ summary_rows="${run_dir}/cells.jsonl"
   lsblk -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,ROTA,MODEL
 } >"${run_dir}/host-info.txt"
 
-server_pid=""; sampler_pid=""; vmstat_pid=""; server_started_epoch_milliseconds=""; active_work=""; active_cell=""
+server_pid=""; sampler_pid=""; vmstat_pid=""; active_work=""; active_cell=""
 stop_server() {
   if [[ -n "${sampler_pid}" ]]; then kill -TERM "${sampler_pid}" 2>/dev/null || true; wait "${sampler_pid}" 2>/dev/null || true; fi
   if [[ -n "${vmstat_pid}" ]]; then kill -TERM "${vmstat_pid}" 2>/dev/null || true; wait "${vmstat_pid}" 2>/dev/null || true; fi
@@ -155,7 +155,7 @@ stop_server() {
     kill -KILL "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
   fi
-  server_pid=""; sampler_pid=""; vmstat_pid=""; server_started_epoch_milliseconds=""
+  server_pid=""; sampler_pid=""; vmstat_pid=""
 }
 cleanup() {
   local status=$?
@@ -193,7 +193,6 @@ sample_process() {
 
 start_server() {
   local port="$1" cell_work="$2" cell_root="$3" credential_file="$4" pipeline_memory_bytes="$5" workers="$6"
-  server_started_epoch_milliseconds="$(date +%s%3N)"
   TMPDIR="${cell_work}/tmp" RUST_LOG="${server_rust_log}" \
   KELDRA_LISTEN="127.0.0.1:${port}" KELDRA_PEER_LISTEN="127.0.0.1:$((port + 1))" \
   KELDRA_DATA_DIR="${cell_work}" KELDRA_STATE_DIR="${cell_work}/state" \
@@ -221,12 +220,12 @@ start_server() {
 }
 
 extract_v6_telemetry() {
-  local server_log="$1" server_started_ms="$2" output="$3"
-  awk -v started_ms="${server_started_ms}" '
+  local server_log="$1" output="$2"
+  awk '
     /keldra_index_v6_summary/ {
       elapsed = metric($0, "keldra_index_v6_summary_elapsed_milliseconds")
       if (elapsed == "null") next
-      printf "{\"timestamp_unix_milliseconds\":%s,\"summary_elapsed_milliseconds\":%s,\"source_rows_total\":%s,\"source_bytes_total\":%s,\"hot_raw_hits_total\":%s,\"hot_prepared_hits_total\":%s,\"hot_misses_total\":%s,\"hot_evictions_total\":%s,\"selected_bytes_total\":%s,\"prepared_bytes_total\":%s,\"projected_bytes_total\":%s,\"sealed_bytes_total\":%s,\"published_source_rows_total\":%s,\"published_source_bytes_total\":%s,\"checkpointed_source_rows_total\":%s,\"checkpointed_source_bytes_total\":%s,\"catalog_source_rows_total\":%s,\"catalog_source_bytes_total\":%s,\"catalog_checkpointed_source_rows_total\":%s,\"catalog_checkpointed_source_bytes_total\":%s}\n", started_ms + elapsed, elapsed, metric($0, "keldra_index_v6_source_rows_total"), metric($0, "keldra_index_v6_source_bytes_total"), metric($0, "keldra_index_v6_hot_raw_hits_total"), metric($0, "keldra_index_v6_hot_prepared_hits_total"), metric($0, "keldra_index_v6_hot_misses_total"), metric($0, "keldra_index_v6_hot_evictions_total"), metric($0, "keldra_index_v6_selected_bytes_total"), metric($0, "keldra_index_v6_prepared_bytes_total"), metric($0, "keldra_index_v6_projected_bytes_total"), metric($0, "keldra_index_v6_sealed_bytes_total"), metric($0, "keldra_index_v6_published_source_rows_total"), metric($0, "keldra_index_v6_published_source_bytes_total"), metric($0, "keldra_index_v6_checkpointed_source_rows_total"), metric($0, "keldra_index_v6_checkpointed_source_bytes_total"), metric($0, "keldra_index_v6_catalog_source_rows_total"), metric($0, "keldra_index_v6_catalog_source_bytes_total"), metric($0, "keldra_index_v6_catalog_checkpointed_source_rows_total"), metric($0, "keldra_index_v6_catalog_checkpointed_source_bytes_total")
+      printf "{\"timestamp_utc\":\"%s\",\"summary_elapsed_milliseconds\":%s,\"source_rows_total\":%s,\"source_bytes_total\":%s,\"hot_raw_hits_total\":%s,\"hot_prepared_hits_total\":%s,\"hot_misses_total\":%s,\"hot_evictions_total\":%s,\"selected_bytes_total\":%s,\"prepared_bytes_total\":%s,\"projected_bytes_total\":%s,\"sealed_bytes_total\":%s,\"published_source_rows_total\":%s,\"published_source_bytes_total\":%s,\"checkpointed_source_rows_total\":%s,\"checkpointed_source_bytes_total\":%s,\"catalog_source_rows_total\":%s,\"catalog_source_bytes_total\":%s,\"catalog_checkpointed_source_rows_total\":%s,\"catalog_checkpointed_source_bytes_total\":%s}\n", $1, elapsed, metric($0, "keldra_index_v6_source_rows_total"), metric($0, "keldra_index_v6_source_bytes_total"), metric($0, "keldra_index_v6_hot_raw_hits_total"), metric($0, "keldra_index_v6_hot_prepared_hits_total"), metric($0, "keldra_index_v6_hot_misses_total"), metric($0, "keldra_index_v6_hot_evictions_total"), metric($0, "keldra_index_v6_selected_bytes_total"), metric($0, "keldra_index_v6_prepared_bytes_total"), metric($0, "keldra_index_v6_projected_bytes_total"), metric($0, "keldra_index_v6_sealed_bytes_total"), metric($0, "keldra_index_v6_published_source_rows_total"), metric($0, "keldra_index_v6_published_source_bytes_total"), metric($0, "keldra_index_v6_checkpointed_source_rows_total"), metric($0, "keldra_index_v6_checkpointed_source_bytes_total"), metric($0, "keldra_index_v6_catalog_source_rows_total"), metric($0, "keldra_index_v6_catalog_source_bytes_total"), metric($0, "keldra_index_v6_catalog_checkpointed_source_rows_total"), metric($0, "keldra_index_v6_catalog_checkpointed_source_bytes_total")
     }
     function metric(line, key, fragment, position) {
       position = index(line, key "=")
@@ -235,7 +234,15 @@ extract_v6_telemetry() {
       sub(/[^0-9.].*$/, "", fragment)
       return fragment == "" ? "null" : fragment
     }
-  ' "${server_log}" >"${output}"
+  ' "${server_log}" | jq -c '
+    (.timestamp_utc
+      | capture("^(?<whole>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<fraction>[0-9]+))?Z$")) as $timestamp
+    | .timestamp_unix_milliseconds = (
+        ($timestamp.whole + "Z" | fromdateiso8601) * 1000
+        + (((($timestamp.fraction // "0") + "000")[0:3]) | tonumber)
+      )
+    | del(.timestamp_utc)
+  ' >"${output}"
 }
 
 remove_cell_work() {
@@ -274,15 +281,15 @@ summarize_cell() {
     ($progress | map(select(.phase == "concurrent" and (.timestamp_unix_milliseconds? != null))) | if length == 0 then null else {start:(map(.timestamp_unix_milliseconds) | min),end:(map(.timestamp_unix_milliseconds) | max)} end) as $window
     | if $window == null then {measurement:"missing-driver-phase-wall-clock",samples:0}
       else ($telemetry | map(select(.timestamp_unix_milliseconds >= $window.start and .timestamp_unix_milliseconds <= $window.end)) | sort_by(.timestamp_unix_milliseconds)) as $samples
-      | if length < 2 then {measurement:"insufficient-v6-summary-samples",samples:length,window:$window}
+      | if ($samples | length) < 2 then {measurement:"insufficient-v6-summary-samples",samples:($samples | length),window:$window}
         else ($samples[0]) as $first | ($samples[-1]) as $last
         | ["source_rows_total","source_bytes_total","selected_bytes_total","prepared_bytes_total","projected_bytes_total","sealed_bytes_total","checkpointed_source_rows_total","checkpointed_source_bytes_total"] as $required
         | [$required[] | select($first[.] == null or $last[.] == null)] as $missing
         | (($last.timestamp_unix_milliseconds - $first.timestamp_unix_milliseconds) / 1000) as $seconds
-        | if ($missing | length) > 0 then {measurement:"incomplete-v6-summary-counters",samples:length,window:$window,missing:$missing}
-          elif $seconds <= 0 then {measurement:"nonpositive-v6-summary-interval",samples:length,window:$window}
+        | if ($missing | length) > 0 then {measurement:"incomplete-v6-summary-counters",samples:($samples | length),window:$window,missing:$missing}
+          elif $seconds <= 0 then {measurement:"nonpositive-v6-summary-interval",samples:($samples | length),window:$window}
           else def rate($key): (($last[$key] - $first[$key]) / $seconds);
-            {measurement:"v6-summary-counter-delta",samples:length,window:$window,elapsed_seconds:$seconds,source_rows_per_second:rate("source_rows_total"),source_bytes_per_second:rate("source_bytes_total"),selected_bytes_per_second:rate("selected_bytes_total"),prepared_bytes_per_second:rate("prepared_bytes_total"),projected_bytes_per_second:rate("projected_bytes_total"),sealed_bytes_per_second:rate("sealed_bytes_total"),checkpointed_source_rows_per_second:rate("checkpointed_source_rows_total"),checkpointed_source_bytes_per_second:rate("checkpointed_source_bytes_total")}
+            {measurement:"v6-summary-counter-delta",samples:($samples | length),window:$window,elapsed_seconds:$seconds,source_rows_per_second:rate("source_rows_total"),source_bytes_per_second:rate("source_bytes_total"),selected_bytes_per_second:rate("selected_bytes_total"),prepared_bytes_per_second:rate("prepared_bytes_total"),projected_bytes_per_second:rate("projected_bytes_total"),sealed_bytes_per_second:rate("sealed_bytes_total"),checkpointed_source_rows_per_second:rate("checkpointed_source_rows_total"),checkpointed_source_bytes_per_second:rate("checkpointed_source_bytes_total")}
           end
         end
       end
@@ -426,10 +433,9 @@ for definitions in "${definitions_values[@]}"; do
           driver_status=$?
           set -e
           store_bytes="$(du -sb "${active_work}/metadata" "${active_work}/payload" "${active_work}/wal" 2>/dev/null | awk '{total += $1} END {print total + 0}')"
-          server_start_ms="${server_started_epoch_milliseconds}"
           stop_server
           telemetry_samples="${active_cell}/v6-summary.jsonl"
-          extract_v6_telemetry "${active_cell}/server.log" "${server_start_ms}" "${telemetry_samples}"
+          extract_v6_telemetry "${active_cell}/server.log" "${telemetry_samples}"
           [[ -s "${report}" ]] || printf '{"result":"missing-report"}\n' >"${report}"
           classification="$(summarize_cell "${cell}" "${report}" "${progress}" "${active_cell}/server-resources.tsv" "${telemetry_samples}" "${definitions}" "${recipes}" "${workers}" "${memory_per_worker}" "${offered_rate}" "${object_bytes}" "${driver_status}" "${store_bytes}")"
           printf '%s\n' "${classification}" >"${active_cell}/status.txt"
