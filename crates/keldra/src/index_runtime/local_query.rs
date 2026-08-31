@@ -53,6 +53,12 @@ use opened_views::{
     OpenedCommittedViewRegistry, opened_pack_charge,
 };
 
+#[path = "local_query/candidate_gate.rs"]
+mod candidate_gate;
+use candidate_gate::RuntimeCandidateGate;
+#[cfg(test)]
+use candidate_gate::runtime_gate_envelope_bytes;
+
 #[derive(Clone)]
 struct QueryReadObserver {
     inner: Arc<QueryReadObserverInner>,
@@ -176,124 +182,6 @@ impl keldra_index::IndexFileRead for QueryObservedFile {
             .record_read_and_yield(slice.as_ref().len())
             .await;
         Ok(slice)
-    }
-}
-
-struct RuntimeCandidateGate {
-    storage_tenant: String,
-    bucket: String,
-    visibility: Arc<dyn IndexCandidateVisibility>,
-    statistics: NativeQueryStatisticsRecorder,
-}
-
-impl RuntimeCandidateGate {
-    fn working_memory_bytes(&self, batch: usize) -> Result<usize, IndexError> {
-        runtime_gate_envelope_bytes(batch, self.storage_tenant.len(), self.bucket.len())
-    }
-}
-
-/// Additional outer-runtime state retained while one native candidate batch is
-/// authorized and checked against exact-current heads. The native executor
-/// already charges its pending candidates and `CandidateReference`s; this
-/// charge covers the concrete API candidate, object-key, evidence, and snapshot
-/// representations created by Keldra around that boundary.
-fn runtime_gate_envelope_bytes(
-    batch: usize,
-    tenant_bytes: usize,
-    bucket_bytes: usize,
-) -> Result<usize, IndexError> {
-    if tenant_bytes > MAX_OBJECT_TENANT_BYTES || bucket_bytes > MAX_OBJECT_BUCKET_BYTES {
-        return Err(IndexError::InvalidQuery(
-            "candidate gate scope exceeds object-name bounds".into(),
-        ));
-    }
-    let path_bytes = MAX_OBJECT_PATH_BYTES;
-    let object_key_dynamic = tenant_bytes
-        .checked_add(bucket_bytes)
-        .and_then(|bytes| bytes.checked_add(path_bytes))
-        .ok_or(IndexError::OffsetOverflow)?;
-    let candidate = std::mem::size_of::<IndexCandidateIdentity>()
-        .checked_add(
-            path_bytes
-                .checked_mul(2)
-                .and_then(|bytes| bytes.checked_add(tenant_bytes))
-                .and_then(|bytes| bytes.checked_add(bucket_bytes))
-                .ok_or(IndexError::OffsetOverflow)?,
-        )
-        .ok_or(IndexError::OffsetOverflow)?;
-    let authorization_phase = std::mem::size_of::<ObjectKey>()
-        .checked_add(std::mem::size_of::<(ObjectKey, ObjectPermission)>())
-        .and_then(|bytes| bytes.checked_add(object_key_dynamic.checked_mul(2)?))
-        .ok_or(IndexError::OffsetOverflow)?;
-    let current_phase = std::mem::size_of::<ObjectKey>()
-        .checked_add(std::mem::size_of::<usize>())
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Option<CurrentObjectSnapshot>>()))
-        .and_then(|bytes| bytes.checked_add(object_key_dynamic))
-        .and_then(|bytes| bytes.checked_add(path_bytes))
-        .and_then(|bytes| bytes.checked_add(MAX_CONTENT_TYPE_BYTES))
-        .ok_or(IndexError::OffsetOverflow)?;
-    let per_candidate = candidate
-        .checked_add(std::mem::size_of::<bool>())
-        .and_then(|bytes| bytes.checked_add(authorization_phase.max(current_phase)))
-        .ok_or(IndexError::OffsetOverflow)?;
-    // Candidate/source/check/evidence in the authorization phase; candidate/
-    // source/evidence/positions/snapshots in the exact-current phase.
-    let vector_headers = 5usize
-        .checked_mul(std::mem::size_of::<Vec<()>>())
-        .ok_or(IndexError::OffsetOverflow)?;
-    batch
-        .checked_mul(per_candidate)
-        .and_then(|bytes| bytes.checked_add(vector_headers))
-        .ok_or(IndexError::OffsetOverflow)
-}
-
-impl CandidateGate for RuntimeCandidateGate {
-    type Error = Status;
-
-    fn evaluate(
-        &self,
-        candidates: &[CandidateReference],
-    ) -> impl std::future::Future<Output = Result<CandidateGateEvidence, Self::Error>> + Send {
-        async move {
-            let references = candidates.to_vec();
-            let candidates = candidates
-                .iter()
-                .map(|candidate| IndexCandidateIdentity {
-                    source_path: candidate.source.path.clone(),
-                    source_version: candidate.source.version,
-                    result: IndexQueryHit {
-                        address: Some(ObjectAddress {
-                            tenant: self.storage_tenant.clone(),
-                            bucket: self.bucket.clone(),
-                            path: candidate.result.path.clone(),
-                        }),
-                        object_version: candidate.result.version,
-                        score: None,
-                    },
-                })
-                .collect::<Vec<_>>();
-            let started = std::time::Instant::now();
-            let result = self.visibility.evaluate(&candidates).await;
-            self.statistics
-                .phase_elapsed(NativeQueryPhase::CandidateVisibility, started.elapsed());
-            let CandidateVisibilityEvidence {
-                visible,
-                authorization_revision,
-                denied,
-                stale,
-            } = result?;
-            let resolved = references
-                .into_iter()
-                .zip(visible)
-                .map(|(candidate, visible)| visible.then_some(candidate))
-                .collect();
-            Ok(CandidateGateEvidence {
-                resolved,
-                authorization_revision,
-                denied,
-                stale,
-            })
-        }
     }
 }
 
@@ -1212,12 +1100,21 @@ impl LocalRevisionQueryExecutor {
             specification,
         )
         .map_err(index_status)?;
-        let schema = if logical_schema.kind == IndexKind::TypedJson {
+        let projection_family = if logical_schema.kind == IndexKind::TypedJson {
             let family = CatalogDefinition::family_identity_for_schema(
                 request.tenant_id,
                 request.bucket_id,
                 &logical_schema,
             )?;
+            let source_scope = logical_schema
+                .recipe_fingerprints()
+                .map_err(index_status)?
+                .membership;
+            Some((family, source_scope))
+        } else {
+            None
+        };
+        let schema = if let Some((family, _)) = projection_family {
             self.projection_mapper
                 .family_query_schema(family, &logical_schema)?
                 .ok_or_else(|| {
@@ -1309,13 +1206,49 @@ impl LocalRevisionQueryExecutor {
             aggregates: compiled.aggregates,
         };
         native.validate().map_err(index_status)?;
+        let projection = if let Some((family, source_scope)) = projection_family {
+            let required = loaded
+                .manifest
+                .barrier()
+                .map_err(|error| Status::data_loss(error.to_string()))?;
+            let required = super::projection_family_writer::projection_barrier(&required)?;
+            let loaded_projection = self
+                .publisher
+                .load_projection_generation(
+                    &request.storage_tenant,
+                    &request.definition.bucket,
+                    family.tenant_id,
+                    family.bucket_id,
+                    family.family_id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    Status::data_loss("typed index cache has no canonical projection generation")
+                })?;
+            if !loaded_projection.generation.barrier.covers(&required) {
+                return Err(Status::unavailable(
+                    "canonical projection generation is behind the selected query cache",
+                ));
+            }
+            Some(candidate_gate::ProjectionCandidateGate {
+                publisher: self.publisher.clone(),
+                generation: loaded_projection.generation,
+                source_scope,
+                tenant_id: family.tenant_id,
+                bucket_id: family.bucket_id,
+            })
+        } else {
+            None
+        };
         let gate = RuntimeCandidateGate {
             storage_tenant: request.storage_tenant.clone(),
             bucket: request.definition.bucket.clone(),
             visibility: request.candidate_visibility,
             statistics: statistics.clone(),
+            projection,
         };
-        let limits = NativeQueryLimits::default();
+        let mut limits = NativeQueryLimits::default();
+        limits.candidate_gate_batch = gate.candidate_batch_limit(limits.candidate_gate_batch);
         let gate_memory_bytes = gate
             .working_memory_bytes(limits.candidate_gate_batch)
             .map_err(index_status)?;
@@ -1896,9 +1829,13 @@ mod tests {
     #[test]
     fn query_admission_charges_the_outer_candidate_gate_envelope() {
         let batch = NativeQueryLimits::default().candidate_gate_batch;
-        let bytes =
-            runtime_gate_envelope_bytes(batch, MAX_OBJECT_TENANT_BYTES, MAX_OBJECT_BUCKET_BYTES)
-                .unwrap();
+        let bytes = runtime_gate_envelope_bytes(
+            batch,
+            MAX_OBJECT_TENANT_BYTES,
+            MAX_OBJECT_BUCKET_BYTES,
+            false,
+        )
+        .unwrap();
         let retained_path_payload = batch * 4 * MAX_OBJECT_PATH_BYTES;
 
         assert!(bytes > retained_path_payload);
@@ -1907,6 +1844,7 @@ mod tests {
                 batch,
                 MAX_OBJECT_TENANT_BYTES + 1,
                 MAX_OBJECT_BUCKET_BYTES,
+                false,
             )
             .is_err()
         );

@@ -1,7 +1,15 @@
 //! Bounded exact-version journal catch-up.
-
 #[path = "catch_up/alias_paths.rs"]
 mod alias_paths;
+#[path = "catch_up/atomic_projection.rs"]
+mod atomic_projection;
+pub(super) use atomic_projection::AtomicProjectionWork;
+use atomic_projection::{AtomicProjectionPhase, transient_atomic_projection_error};
+#[path = "catch_up/family_projection.rs"]
+mod family_projection;
+#[path = "catch_up/progress.rs"]
+mod progress;
+use progress::*;
 #[path = "catch_up/timing.rs"]
 mod timing;
 use keldra_store::MAX_OBJECT_RECORD_EXPORT_RECORDS;
@@ -27,26 +35,6 @@ pub(super) struct JournalPageWork {
     pub(super) through: IndexBarrier,
     pub(super) first_changed_at: Option<BufferAge>,
     pub(super) atomic_pending: bool,
-}
-
-pub(super) struct AtomicProjectionWork {
-    cursor: u64,
-    bundle_hash: keldra_store::PreparedBundleHash,
-    paths: Vec<ExactSourcePath>,
-    next_path: usize,
-    staged: CandidateCommit,
-    builder: NativeSegmentBuild,
-    plan: SegmentMemoryPlan,
-    source_payload_bytes: u64,
-    phase: AtomicProjectionPhase,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AtomicProjectionPhase {
-    Project,
-    Flush,
-    Compact,
-    Done,
 }
 
 const ORDINARY_MUTATION_MICROBATCH: usize = 64;
@@ -204,6 +192,21 @@ pub(super) async fn process_journal_page(
                         && !contains_reserved_segment(&mutation.exact_path)
                 });
                 if !has_paths {
+                    let target = barrier_after_changes(from, &page.changes[..end])?;
+                    if kind == IndexKind::TypedJson {
+                        family_projection::project_typed_json_family_unit(
+                            definition,
+                            plan,
+                            &[],
+                            target,
+                            builder,
+                            candidate,
+                            dependencies,
+                            true,
+                            &mut source_payload_bytes,
+                        )
+                        .await?;
+                    }
                     invalidation::materialize_pending_live_masks(
                         definition,
                         candidate,
@@ -228,12 +231,14 @@ pub(super) async fn process_journal_page(
                         &definition.stored.path_prefix,
                         batch,
                     );
+                    let target = barrier_after_changes(from, &page.changes[..end])?;
                     *atomic_projection = Some(
                         start_atomic_projection(
                             definition,
                             kind,
                             unit_plan,
                             paths,
+                            target,
                             batch,
                             builder,
                             candidate,
@@ -302,30 +307,49 @@ pub(super) async fn process_journal_page(
                 deadline.get_or_insert(changed_at);
             }
             changed |= !paths.is_empty();
-            for paths in paths.chunks(MAX_OBJECT_RECORD_EXPORT_RECORDS as usize) {
-                let phase_started = Instant::now();
-                let sources = load_exact_sources(definition, paths, dependencies).await?;
-                timing::complete(definition, "exact_source_read", paths.len(), phase_started);
-                source_payload_bytes =
-                    add_source_payload_bytes(source_payload_bytes, &definition.schema, &sources)?;
-                let phase_started = Instant::now();
-                project_sources(
+            let target = barrier_after_changes(from, &page.changes[..end])?;
+            if kind == IndexKind::TypedJson {
+                family_projection::project_typed_json_family_unit(
                     definition,
-                    kind,
                     plan,
-                    sources,
+                    &paths,
+                    target,
                     builder,
                     candidate,
                     dependencies,
                     true,
+                    &mut source_payload_bytes,
                 )
                 .await?;
-                timing::complete(
-                    definition,
-                    "source_projection_and_apply",
-                    paths.len(),
-                    phase_started,
-                );
+            } else {
+                for paths in paths.chunks(MAX_OBJECT_RECORD_EXPORT_RECORDS as usize) {
+                    let phase_started = Instant::now();
+                    let sources = load_exact_sources(definition, paths, dependencies).await?;
+                    timing::complete(definition, "exact_source_read", paths.len(), phase_started);
+                    source_payload_bytes = add_source_payload_bytes(
+                        source_payload_bytes,
+                        &definition.schema,
+                        &sources,
+                    )?;
+                    let phase_started = Instant::now();
+                    project_sources(
+                        definition,
+                        kind,
+                        plan,
+                        sources,
+                        builder,
+                        candidate,
+                        dependencies,
+                        true,
+                    )
+                    .await?;
+                    timing::complete(
+                        definition,
+                        "source_projection_and_apply",
+                        paths.len(),
+                        phase_started,
+                    );
+                }
             }
         }
         position = end;
@@ -361,6 +385,7 @@ async fn start_atomic_projection(
     kind: IndexKind,
     plan: SegmentMemoryPlan,
     paths: Vec<ExactSourcePath>,
+    target: IndexBarrier,
     batch: &keldra_store::AtomicBatchPublished,
     builder: &mut NativeSegmentBuild,
     candidate: &mut CandidateCommit,
@@ -385,6 +410,9 @@ async fn start_atomic_projection(
         builder.runnable.clone(),
         dependencies,
     )?;
+    let projection_target = (kind == IndexKind::TypedJson)
+        .then(|| super::super::projection_family_writer::projection_barrier(&target))
+        .transpose()?;
     Ok(AtomicProjectionWork {
         cursor: batch.cursor,
         bundle_hash: batch.bundle_hash,
@@ -394,6 +422,8 @@ async fn start_atomic_projection(
         builder: staged_builder,
         plan,
         source_payload_bytes: 0,
+        projection_target,
+        projection_staged: None,
         phase: AtomicProjectionPhase::Project,
     })
 }
@@ -429,17 +459,32 @@ async fn advance_atomic_projection(
                 load_exact_sources(definition, &work.paths[work.next_path..end], dependencies)
                     .await?;
             let payload = add_source_payload_bytes(0, &definition.schema, &sources)?;
-            project_sources(
-                definition,
-                kind,
-                work.plan,
-                sources,
-                &mut work.builder,
-                &mut work.staged,
-                dependencies,
-                false,
-            )
-            .await?;
+            if let Some(target) = &work.projection_target {
+                family_projection::stage_typed_json_family_sources(
+                    definition,
+                    work.plan,
+                    sources,
+                    target.clone(),
+                    &mut work.projection_staged,
+                    &mut work.builder,
+                    &mut work.staged,
+                    dependencies,
+                    false,
+                )
+                .await?;
+            } else {
+                project_sources(
+                    definition,
+                    kind,
+                    work.plan,
+                    sources,
+                    &mut work.builder,
+                    &mut work.staged,
+                    dependencies,
+                    false,
+                )
+                .await?;
+            }
             // An atomic projection can span scheduler turns. Do not carry
             // pending mask memory across the turn that will admit the next
             // journal/source page under the same permit.
@@ -473,6 +518,10 @@ async fn advance_atomic_projection(
                 dependencies,
             )
             .await?;
+            if let Some(staged) = work.projection_staged.take() {
+                family_projection::finish_typed_json_family(definition, staged, dependencies)
+                    .await?;
+            }
             work.staged
                 .record_atomic_batch(work.cursor, work.bundle_hash)?;
             work.phase = AtomicProjectionPhase::Compact;
@@ -498,16 +547,6 @@ async fn advance_atomic_projection(
         AtomicProjectionPhase::Done => {}
     }
     Ok(())
-}
-
-fn transient_atomic_projection_error(error: &Status) -> bool {
-    matches!(
-        error.code(),
-        tonic::Code::Unavailable
-            | tonic::Code::DeadlineExceeded
-            | tonic::Code::Cancelled
-            | tonic::Code::Unknown
-    )
 }
 
 fn atomic_staging_overhead_bytes(
@@ -729,45 +768,6 @@ fn atomic_batch_already_materialized(
         .atomic
         .finalized_through()
         .is_some_and(|finalized| batch.cursor <= finalized))
-}
-
-fn processed_journal_encoded_bytes(changes: &[IndexJournalChange]) -> Result<u64, Status> {
-    changes.iter().try_fold(0_u64, |total, change| {
-        total
-            .checked_add(index_journal_change_encoded_len(change).map_err(event_status)?)
-            .ok_or_else(|| Status::resource_exhausted("processed journal bytes overflow"))
-    })
-}
-
-fn add_source_payload_bytes(
-    initial: u64,
-    schema: &Schema,
-    sources: &[IndexSourceMutation],
-) -> Result<u64, Status> {
-    sources.iter().try_fold(initial, |total, source| {
-        total
-            .checked_add(source_payload_bytes_for(schema, source))
-            .ok_or_else(|| Status::resource_exhausted("index source payload bytes overflow"))
-    })
-}
-
-fn barrier_after_changes(
-    from: &IndexBarrier,
-    entries: &[IndexJournalChange],
-) -> Result<IndexBarrier, Status> {
-    let mut through = from.clone();
-    for entry in entries {
-        let cursor = through
-            .sources
-            .get_mut(&entry.node)
-            .ok_or_else(|| Status::data_loss("journal page names an unknown source node"))?;
-        cursor.next_offset = entry
-            .change
-            .offset()
-            .checked_add(1)
-            .ok_or_else(|| Status::data_loss("journal change offset overflow"))?;
-    }
-    Ok(through)
 }
 
 #[cfg(test)]

@@ -76,16 +76,30 @@ impl StableDocumentKey {
     }
 
     /// Stable synthetic identity embedded in disposable native query-cache
-    /// segments. Its version never tracks an ordinary object version; query
-    /// admission resolves it through the pinned format-v5 document-head root.
-    pub fn query_cache_identity(self) -> ObjectIdentity {
+    /// segments. The version is the source version at which indexed material
+    /// last changed, not necessarily the current ordinary object version.
+    /// Query admission resolves the stable key through the pinned format-v5
+    /// document-head root and admits this cache entry only while that material
+    /// version still matches.
+    pub fn query_cache_identity(
+        self,
+        material_source_version: u64,
+    ) -> Result<ObjectIdentity, IndexError> {
+        if material_source_version == 0 {
+            return Err(IndexError::InvalidDefinition(
+                "query-cache material source version must be non-zero".into(),
+            ));
+        }
         let mut path = String::with_capacity(QUERY_CACHE_IDENTITY_PREFIX.len() + 64);
         path.push_str(QUERY_CACHE_IDENTITY_PREFIX);
         for byte in self.0 {
             use std::fmt::Write as _;
             write!(&mut path, "{byte:02x}").expect("writing to a String is infallible");
         }
-        ObjectIdentity { path, version: 1 }
+        Ok(ObjectIdentity {
+            path,
+            version: material_source_version,
+        })
     }
 
     pub fn from_query_cache_identity(identity: &ObjectIdentity) -> Result<Self, IndexError> {
@@ -95,7 +109,7 @@ impl StableDocumentKey {
             .ok_or(IndexError::InvalidFormat(
                 "format-v5 query-cache identity prefix",
             ))?;
-        if identity.version != 1 || encoded.len() != 64 {
+        if identity.version == 0 || encoded.len() != 64 {
             return Err(IndexError::InvalidFormat(
                 "format-v5 query-cache identity shape",
             ));
@@ -120,6 +134,14 @@ pub struct DocumentHead {
     pub source_path: String,
     pub source_record: u32,
     pub source_version: u64,
+    /// Exact ordinary source version whose membership or indexed field bytes
+    /// produced the current native cache entry. Payload-only updates preserve
+    /// this value while advancing `source_version` and the public result.
+    pub material_source_version: u64,
+    /// Canonical native physical-order bytes for this record. They are kept
+    /// with the exact head so the disposable cache can be reconstructed
+    /// without reopening the source payload.
+    pub order_key: Vec<u8>,
     pub result: Option<ObjectIdentity>,
     pub live: bool,
 }
@@ -139,6 +161,8 @@ impl DocumentHead {
             source_path,
             source_record,
             source_version,
+            material_source_version: source_version,
+            order_key: Vec::new(),
             result,
             live,
         };
@@ -153,9 +177,11 @@ impl DocumentHead {
         })
     }
 
-    fn validate(&self, source_scope: [u8; 32]) -> Result<(), IndexError> {
+    pub(super) fn validate(&self, source_scope: [u8; 32]) -> Result<(), IndexError> {
         validate_path(&self.source_path)?;
         if self.source_version == 0
+            || self.material_source_version == 0
+            || self.order_key.len() > crate::v4::INDEX_COMPONENT_BYTES
             || self.stable_key
                 != StableDocumentKey::derive(source_scope, &self.source_path, self.source_record)?
             || self
@@ -318,6 +344,33 @@ pub struct ProjectedDocumentDelta {
     pub head: Option<DocumentHead>,
     pub memberships: Vec<RecipeDelta>,
     pub fields: Vec<RecipeDelta>,
+}
+
+/// Carry the cache material version across a projection-preserving source
+/// update. Stable keys absent from `previous`, or records whose membership,
+/// indexed field bytes, or physical order changed, retain the incoming exact
+/// source version as their new material version.
+pub fn inherit_projection_preserving_versions(
+    current: &mut [ProjectedDocumentState],
+    previous: &[ProjectedDocumentState],
+) -> Result<(), IndexError> {
+    for state in current {
+        state.validate()?;
+        let previous = previous
+            .iter()
+            .find(|candidate| candidate.head.stable_key == state.head.stable_key);
+        if let Some(previous) = previous {
+            previous.validate()?;
+            if state.memberships == previous.memberships
+                && state.fields == previous.fields
+                && state.head.order_key == previous.head.order_key
+            {
+                state.head.material_source_version = previous.head.material_source_version;
+                state.validate()?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl ProjectedDocumentDelta {
@@ -485,7 +538,7 @@ mod tests {
     #[test]
     fn query_cache_identity_round_trips_and_rejects_noncanonical_aliases() {
         let key = StableDocumentKey::derive([7; 32], "objects/a", 3).unwrap();
-        let identity = key.query_cache_identity();
+        let identity = key.query_cache_identity(19).unwrap();
         assert_eq!(
             StableDocumentKey::from_query_cache_identity(&identity).unwrap(),
             key
@@ -494,8 +547,8 @@ mod tests {
         let mut uppercase = identity.clone();
         uppercase.path.make_ascii_uppercase();
         assert!(StableDocumentKey::from_query_cache_identity(&uppercase).is_err());
-        let mut wrong_version = identity;
-        wrong_version.version = 2;
-        assert!(StableDocumentKey::from_query_cache_identity(&wrong_version).is_err());
+        let mut zero_version = identity;
+        zero_version.version = 0;
+        assert!(StableDocumentKey::from_query_cache_identity(&zero_version).is_err());
     }
 }

@@ -5,6 +5,7 @@ use crate::IndexError;
 use super::{
     CanonicalRecipeState, ComponentIdentity, DocumentHead, ProjectedDocumentDelta,
     ProjectedDocumentState, RecipeIdentity, StableDocumentKey, encode_projected_document_state,
+    inherit_projection_preserving_versions,
 };
 
 const SEGMENT_MAGIC: &[u8; 8] = b"K5DELTA1";
@@ -129,6 +130,8 @@ impl ProjectionMutationBuffer {
                 "projected source update has an invalid identity".into(),
             ));
         }
+        let mut current = current;
+        inherit_projection_preserving_versions(&mut current, &previous)?;
         let current =
             validate_source_state_set(source_scope, source_path, Some(source_version), current)?;
         let previous = validate_source_state_set(source_scope, source_path, None, previous)?;
@@ -357,6 +360,8 @@ pub fn encode_document_head(head: &DocumentHead) -> Result<Vec<u8>, IndexError> 
     put_bytes(&mut bytes, head.source_path.as_bytes())?;
     put_u32(&mut bytes, head.source_record);
     put_u64(&mut bytes, head.source_version);
+    put_u64(&mut bytes, head.material_source_version);
+    put_bytes(&mut bytes, &head.order_key)?;
     bytes.push(u8::from(head.live));
     match &head.result {
         Some(result) => {
@@ -382,6 +387,9 @@ pub fn decode_document_head(
         .to_owned();
     let source_record = input.u32()?;
     let source_version = input.u64()?;
+    let material_source_version = input.u64()?;
+    let order_key_length = usize::try_from(input.u32()?).map_err(|_| IndexError::OffsetOverflow)?;
+    let order_key = input.take(order_key_length)?.to_vec();
     let live = match input.byte()? {
         0 => false,
         1 => true,
@@ -402,7 +410,7 @@ pub fn decode_document_head(
         _ => return Err(IndexError::Integrity),
     };
     input.finish()?;
-    let head = DocumentHead::new(
+    let mut head = DocumentHead::new(
         source_scope,
         source_path,
         source_record,
@@ -410,6 +418,9 @@ pub fn decode_document_head(
         result,
         live,
     )?;
+    head.material_source_version = material_source_version;
+    head.order_key = order_key;
+    head.validate(source_scope)?;
     if head.stable_key != stable_key {
         return Err(IndexError::Integrity);
     }
@@ -691,6 +702,52 @@ mod tests {
             assert_eq!(decoded.component, segment.component);
             assert_eq!(decoded.records.len(), 1);
         }
+    }
+
+    #[test]
+    fn complete_projection_preserving_update_keeps_the_cache_material_version() {
+        let previous = vec![state(7, b"stable", b"also stable")];
+        let current = vec![state(19, b"stable", b"also stable")];
+        let key = current[0].head.stable_key;
+        let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
+        buffer
+            .apply_source_states([9; 32], "objects/a", 19, current, previous)
+            .unwrap();
+        let sealed = buffer.seal().unwrap();
+        let head = sealed
+            .iter()
+            .find(|delta| delta.component == ComponentIdentity::DocumentHead)
+            .unwrap();
+        let decoded = decode_component_delta_segment(&head.bytes).unwrap();
+        let replacement = decoded.records[0].replacement.as_deref().unwrap();
+        let head = decode_document_head([9; 32], key, replacement).unwrap();
+        assert_eq!(head.source_version, 19);
+        assert_eq!(head.material_source_version, 7);
+        assert_eq!(head.stable_key.query_cache_identity(7).unwrap().version, 7);
+    }
+
+    #[test]
+    fn indexed_change_advances_the_cache_material_version() {
+        let previous = vec![state(7, b"old", b"stable")];
+        let current = vec![state(19, b"new", b"stable")];
+        let key = current[0].head.stable_key;
+        let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
+        buffer
+            .apply_source_states([9; 32], "objects/a", 19, current, previous)
+            .unwrap();
+        let sealed = buffer.seal().unwrap();
+        let head = sealed
+            .iter()
+            .find(|delta| delta.component == ComponentIdentity::DocumentHead)
+            .unwrap();
+        let decoded = decode_component_delta_segment(&head.bytes).unwrap();
+        let replacement = decoded.records[0].replacement.as_deref().unwrap();
+        assert_eq!(
+            decode_document_head([9; 32], key, replacement)
+                .unwrap()
+                .material_source_version,
+            19
+        );
     }
 
     #[test]

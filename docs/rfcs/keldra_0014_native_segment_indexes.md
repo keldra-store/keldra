@@ -2,12 +2,14 @@
 
 Status: Accepted
 
-KELDRA-0020 amends physical ownership and update granularity. Format-v4 remains
-the authority for component/query semantics until its replacement lands, but a
-logical definition is no longer the required owner of a complete independent
-segment tree. Canonically compatible definitions may share document,
-membership, field, and generation components, and projection-preserving source
-updates do not rewrite unchanged components.
+KELDRA-0020 amends physical ownership and update granularity. Format v5 is now
+the canonical durable projection authority for Typed JSON. The mature format-v4
+postings/points/doc-values executor remains its disposable native query-cache
+implementation, keyed by stable document and material versions rather than by
+ordinary object versions. A logical definition is no longer the required owner
+of a complete independent segment tree. Canonically compatible definitions
+share document, membership, field, generation, and cache components, and
+projection-preserving source updates do not rewrite unchanged components.
 
 Supersedes: KELDRA-0013 in full
 

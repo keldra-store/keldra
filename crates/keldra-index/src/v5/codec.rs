@@ -359,6 +359,8 @@ pub fn encode_projected_document_state(
     put_bytes(&mut out, state.head.source_path.as_bytes())?;
     put_u32(&mut out, state.head.source_record);
     put_u64(&mut out, state.head.source_version);
+    put_u64(&mut out, state.head.material_source_version);
+    put_bytes(&mut out, &state.head.order_key)?;
     out.push(u8::from(state.head.live));
     match &state.head.result {
         Some(result) => {
@@ -388,6 +390,8 @@ pub fn decode_projected_document_state(bytes: &[u8]) -> Result<ProjectedDocument
     let source_path = input.string()?;
     let source_record = input.u32()?;
     let source_version = input.u64()?;
+    let material_source_version = input.u64()?;
+    let order_key = input.byte_vector()?;
     let live = input.boolean()?;
     let result = match input.byte()? {
         0 => None,
@@ -401,7 +405,7 @@ pub fn decode_projected_document_state(bytes: &[u8]) -> Result<ProjectedDocument
             ));
         }
     };
-    let head = DocumentHead::new(
+    let mut head = DocumentHead::new(
         source_scope,
         source_path,
         source_record,
@@ -409,6 +413,9 @@ pub fn decode_projected_document_state(bytes: &[u8]) -> Result<ProjectedDocument
         result,
         live,
     )?;
+    head.material_source_version = material_source_version;
+    head.order_key = order_key;
+    head.validate(source_scope)?;
     if head.stable_key != encoded_key {
         return Err(IndexError::Integrity);
     }
@@ -836,6 +843,10 @@ impl<'a> Decoder<'a> {
         let length = self.u32()? as usize;
         String::from_utf8(self.take(length)?.to_vec())
             .map_err(|_| IndexError::Decode("string is not UTF-8".into()))
+    }
+    fn byte_vector(&mut self) -> Result<Vec<u8>, IndexError> {
+        let length = self.u32()? as usize;
+        Ok(self.take(length)?.to_vec())
     }
     fn recipe_states(&mut self) -> Result<Vec<CanonicalRecipeState>, IndexError> {
         let count = self.u32()? as usize;

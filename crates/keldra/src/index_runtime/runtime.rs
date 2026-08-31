@@ -198,6 +198,11 @@ pub(crate) async fn start(
     );
     let budgets = IndexMemoryBudgets::from_config(config, working_memory)
         .context("validate per-kind index construction budgets")?;
+    let projection_family_writer =
+        super::projection_family_writer::SharedProjectionFamilyWriter::new(
+            projection_mapper.clone(),
+            publisher.clone(),
+        );
     let builders = IndexBuilderManagerTask::start(
         local_node,
         decisions,
@@ -213,6 +218,7 @@ pub(crate) async fn start(
             budgets,
             cpu,
             projection_mapper,
+            projection_family_writer,
             config,
             derived_progress,
             maintenance_work_slots: IndexMaintenanceWorkSlots::default(),

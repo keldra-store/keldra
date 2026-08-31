@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use keldra_index::v4::ObjectIdentity;
 use keldra_index::v5::{
-    ProjectionBarrier, ProjectionGeneration, ProjectionMutationBuffer, decode_projection_generation,
+    ProjectionBarrier, ProjectionGeneration, ProjectionMutationBuffer,
+    decode_projection_generation, inherit_projection_preserving_versions, query_cache_mutations,
 };
 use keldra_store::VersionId;
 use tonic::Status;
@@ -20,6 +21,7 @@ use super::publication::DerivedArtifactAdmission;
 use super::publisher::{
     IndexCommitPublisher, PublishedProjectionArtifacts, PublishedProjectionGeneration,
 };
+use super::source::IndexBuildDiagnostics;
 use super::source::IndexSourceMutation;
 
 const WRITER_STRIPES: usize = 64;
@@ -39,6 +41,27 @@ pub(crate) struct StagedProjectionFamily {
     published: PublishedProjectionArtifacts,
 }
 
+pub(crate) struct StagedProjectionAdvance {
+    pub(crate) plan_fingerprint: [u8; 32],
+    pub(crate) generation: ProjectionGeneration,
+    pub(crate) generation_hash: [u8; 32],
+    expected_current: Option<VersionId>,
+    published: PublishedProjectionArtifacts,
+    pub(crate) cache_mutations: Vec<keldra_index::v4::build::MergeMutation>,
+    pub(crate) diagnostics: IndexBuildDiagnostics,
+}
+
+struct ProjectedFamilyFrame {
+    deltas: Vec<keldra_index::v5::SealedComponentDelta>,
+    cache_mutations: Vec<keldra_index::v4::build::MergeMutation>,
+    diagnostics: IndexBuildDiagnostics,
+}
+
+pub(crate) struct PublishedProjectionFrame {
+    pub(crate) cache_mutations: Vec<keldra_index::v4::build::MergeMutation>,
+    pub(crate) diagnostics: IndexBuildDiagnostics,
+}
+
 impl SharedProjectionFamilyWriter {
     pub(crate) fn new(mapper: SharedProjectionMapper, publisher: IndexCommitPublisher) -> Self {
         Self {
@@ -56,7 +79,7 @@ impl SharedProjectionFamilyWriter {
         barrier: ProjectionBarrier,
         maximum_workspace_bytes: usize,
         admission: DerivedArtifactAdmission,
-    ) -> Result<PublishedProjectionGeneration, Status> {
+    ) -> Result<Option<PublishedProjectionGeneration>, Status> {
         let _family = self.stripes[stripe(plan.identity.family_id)].lock().await;
         let previous = self
             .publisher
@@ -72,12 +95,15 @@ impl SharedProjectionFamilyWriter {
             .as_ref()
             .is_some_and(|loaded| loaded.generation.barrier.covers(&barrier))
         {
-            return Err(Status::already_exists(
-                "projection family already covers the requested source barrier",
-            ));
+            return Ok(None);
         }
-        let deltas = self
-            .project_sources(plan, previous.as_ref(), sources, maximum_workspace_bytes)
+        let projected = self
+            .project_sources(
+                plan,
+                previous.as_ref().map(|loaded| &loaded.generation),
+                sources,
+                maximum_workspace_bytes,
+            )
             .await?;
         self.publisher
             .advance_projection_generation(
@@ -88,7 +114,132 @@ impl SharedProjectionFamilyWriter {
                 plan.identity.family_id,
                 previous.as_ref(),
                 barrier,
-                deltas,
+                projected.deltas,
+                admission,
+            )
+            .await
+            .map(Some)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_incremental_frame(
+        &self,
+        plan: &ProjectionFamilyPlan,
+        previous: Option<&StagedProjectionAdvance>,
+        sources: Vec<IndexSourceMutation>,
+        barrier: ProjectionBarrier,
+        maximum_workspace_bytes: usize,
+        admission: DerivedArtifactAdmission,
+    ) -> Result<Option<StagedProjectionAdvance>, Status> {
+        let _family = self.stripes[stripe(plan.identity.family_id)].lock().await;
+        if previous.is_some_and(|previous| previous.plan_fingerprint != plan.schema_fingerprint) {
+            return Err(Status::aborted(
+                "projection family recipes changed during incremental staging",
+            ));
+        }
+        let loaded = if previous.is_none() {
+            self.publisher
+                .load_projection_generation(
+                    &plan.storage_tenant,
+                    &plan.bucket,
+                    plan.identity.tenant_id,
+                    plan.identity.bucket_id,
+                    plan.identity.family_id,
+                )
+                .await?
+        } else {
+            None
+        };
+        let predecessor = previous
+            .map(|staged| (&staged.generation, staged.generation_hash))
+            .or_else(|| {
+                loaded
+                    .as_ref()
+                    .map(|loaded| (&loaded.generation, loaded.current.generation_hash))
+            });
+        // A loaded current covering the target means this journal unit already
+        // completed. A caller-supplied staged predecessor is one earlier frame
+        // of the same bounded unit and may intentionally carry the final
+        // barrier while further source chunks append to its immutable roots.
+        if predecessor.is_some_and(|(generation, _)| {
+            projection_unit_already_completed(previous.is_some(), generation, &barrier)
+        }) {
+            return Ok(None);
+        }
+        let projected = self
+            .project_sources(
+                plan,
+                predecessor.map(|(generation, _)| generation),
+                sources,
+                maximum_workspace_bytes,
+            )
+            .await?;
+        let prepared = self
+            .publisher
+            .prepare_projection_advance(
+                &plan.storage_tenant,
+                &plan.bucket,
+                plan.identity.tenant_id,
+                plan.identity.bucket_id,
+                plan.identity.family_id,
+                predecessor,
+                barrier,
+                projected.deltas,
+            )
+            .await?;
+        let generation_hash = prepared.generation.hash;
+        let generation = decode_projection_generation(
+            &prepared.generation.bytes,
+            &prepared.generation.component_directory,
+        )
+        .map_err(index_status)?;
+        let published = self
+            .publisher
+            .publish_projection_artifacts(
+                &plan.storage_tenant,
+                &plan.bucket,
+                plan.identity.tenant_id,
+                plan.identity.bucket_id,
+                plan.identity.family_id,
+                prepared,
+                admission,
+            )
+            .await?;
+        Ok(Some(StagedProjectionAdvance {
+            plan_fingerprint: plan.schema_fingerprint,
+            generation,
+            generation_hash,
+            expected_current: previous
+                .map(|staged| staged.expected_current)
+                .unwrap_or_else(|| loaded.map(|loaded| loaded.current_object_version)),
+            published,
+            cache_mutations: projected.cache_mutations,
+            diagnostics: projected.diagnostics,
+        }))
+    }
+
+    pub(crate) async fn finish_incremental_frames(
+        &self,
+        plan: &ProjectionFamilyPlan,
+        staged: StagedProjectionAdvance,
+        admission: DerivedArtifactAdmission,
+    ) -> Result<PublishedProjectionGeneration, Status> {
+        let _family = self.stripes[stripe(plan.identity.family_id)].lock().await;
+        if staged.plan_fingerprint != plan.schema_fingerprint
+            || staged.generation.family_id != plan.identity.family_id
+        {
+            return Err(Status::aborted(
+                "projection family recipes changed before incremental installation",
+            ));
+        }
+        self.publisher
+            .install_projection_current(
+                &plan.storage_tenant,
+                &plan.bucket,
+                plan.identity.tenant_id,
+                plan.identity.bucket_id,
+                staged.expected_current,
+                staged.published,
                 admission,
             )
             .await
@@ -114,7 +265,7 @@ impl SharedProjectionFamilyWriter {
                 "projection family recipes changed during its baseline rebuild",
             ));
         }
-        let deltas = self
+        let projected = self
             .project_rebuild_sources(plan, sources, maximum_workspace_bytes)
             .await?;
         let prepared = self
@@ -127,7 +278,7 @@ impl SharedProjectionFamilyWriter {
                 plan.identity.family_id,
                 previous.map(|previous| (&previous.generation, previous.generation_hash)),
                 barrier,
-                deltas,
+                projected.deltas,
             )
             .await?;
         let generation_hash = prepared.generation.hash;
@@ -153,6 +304,53 @@ impl SharedProjectionFamilyWriter {
             generation,
             generation_hash,
             published,
+        })
+    }
+
+    /// Durably append one bounded baseline frame while the logical definition
+    /// remains unbound. Equal source barriers are legal here because each
+    /// snapshot frame contains a disjoint stable source range. Installing the
+    /// partial family current makes rebuild restart bounded; it does not make
+    /// the definition query-visible before its native cache root is complete.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn advance_rebuild_visible_frame(
+        &self,
+        plan: &ProjectionFamilyPlan,
+        sources: Vec<IndexSourceMutation>,
+        barrier: ProjectionBarrier,
+        maximum_workspace_bytes: usize,
+        admission: DerivedArtifactAdmission,
+    ) -> Result<PublishedProjectionFrame, Status> {
+        let _family = self.stripes[stripe(plan.identity.family_id)].lock().await;
+        let previous = self
+            .publisher
+            .load_projection_generation(
+                &plan.storage_tenant,
+                &plan.bucket,
+                plan.identity.tenant_id,
+                plan.identity.bucket_id,
+                plan.identity.family_id,
+            )
+            .await?;
+        let projected = self
+            .project_rebuild_sources(plan, sources, maximum_workspace_bytes)
+            .await?;
+        self.publisher
+            .advance_projection_generation(
+                &plan.storage_tenant,
+                &plan.bucket,
+                plan.identity.tenant_id,
+                plan.identity.bucket_id,
+                plan.identity.family_id,
+                previous.as_ref(),
+                barrier,
+                projected.deltas,
+                admission,
+            )
+            .await?;
+        Ok(PublishedProjectionFrame {
+            cache_mutations: projected.cache_mutations,
+            diagnostics: projected.diagnostics,
         })
     }
 
@@ -187,11 +385,13 @@ impl SharedProjectionFamilyWriter {
     async fn project_sources(
         &self,
         plan: &ProjectionFamilyPlan,
-        previous: Option<&super::publisher::LoadedProjectionGeneration>,
+        previous: Option<&ProjectionGeneration>,
         sources: Vec<IndexSourceMutation>,
         maximum_workspace_bytes: usize,
-    ) -> Result<Vec<keldra_index::v5::SealedComponentDelta>, Status> {
+    ) -> Result<ProjectedFamilyFrame, Status> {
         let mut buffer = family_buffer(maximum_workspace_bytes)?;
+        let mut cache_mutations = Vec::new();
+        let mut diagnostics = IndexBuildDiagnostics::default();
         for source in sources {
             let (path, version) = source_identity(&source);
             let prior = match previous {
@@ -216,10 +416,16 @@ impl SharedProjectionFamilyWriter {
                 }
                 None => Vec::new(),
             };
-            let (current, _) = self
+            let (mut current, source_diagnostics) = self
                 .mapper
                 .project_family(plan.identity, source, maximum_workspace_bytes / 2)
                 .await?;
+            inherit_projection_preserving_versions(&mut current, &prior).map_err(index_status)?;
+            cache_mutations.extend(
+                query_cache_mutations(&plan.schema, version, &current, &prior)
+                    .map_err(index_status)?,
+            );
+            diagnostics.add(source_diagnostics);
             buffer
                 .apply_source_states(
                     plan.schema
@@ -233,7 +439,24 @@ impl SharedProjectionFamilyWriter {
                 )
                 .map_err(index_status)?;
         }
-        buffer.seal().map_err(index_status)
+        cache_mutations.sort_by(|left, right| {
+            mutation_identity(left)
+                .path
+                .cmp(&mutation_identity(right).path)
+        });
+        if cache_mutations
+            .windows(2)
+            .any(|pair| mutation_identity(&pair[0]).path == mutation_identity(&pair[1]).path)
+        {
+            return Err(Status::data_loss(
+                "projection frame produced one stable cache key twice",
+            ));
+        }
+        Ok(ProjectedFamilyFrame {
+            deltas: buffer.seal().map_err(index_status)?,
+            cache_mutations,
+            diagnostics,
+        })
     }
 
     async fn project_rebuild_sources(
@@ -241,8 +464,10 @@ impl SharedProjectionFamilyWriter {
         plan: &ProjectionFamilyPlan,
         sources: Vec<IndexSourceMutation>,
         maximum_workspace_bytes: usize,
-    ) -> Result<Vec<keldra_index::v5::SealedComponentDelta>, Status> {
+    ) -> Result<ProjectedFamilyFrame, Status> {
         let mut buffer = family_buffer(maximum_workspace_bytes)?;
+        let mut cache_mutations = Vec::new();
+        let mut diagnostics = IndexBuildDiagnostics::default();
         let source_scope = plan
             .schema
             .recipe_fingerprints()
@@ -250,15 +475,37 @@ impl SharedProjectionFamilyWriter {
             .membership;
         for source in sources {
             let (path, version) = source_identity(&source);
-            let (current, _) = self
+            let (current, source_diagnostics) = self
                 .mapper
                 .project_family(plan.identity, source, maximum_workspace_bytes / 2)
                 .await?;
+            cache_mutations.extend(
+                query_cache_mutations(&plan.schema, version, &current, &[])
+                    .map_err(index_status)?,
+            );
+            diagnostics.add(source_diagnostics);
             buffer
                 .apply_source_states(source_scope, &path, version, current, Vec::new())
                 .map_err(index_status)?;
         }
-        buffer.seal().map_err(index_status)
+        cache_mutations.sort_by(|left, right| {
+            mutation_identity(left)
+                .path
+                .cmp(&mutation_identity(right).path)
+        });
+        if cache_mutations
+            .windows(2)
+            .any(|pair| mutation_identity(&pair[0]).path == mutation_identity(&pair[1]).path)
+        {
+            return Err(Status::data_loss(
+                "rebuild projection frame produced one stable cache key twice",
+            ));
+        }
+        Ok(ProjectedFamilyFrame {
+            deltas: buffer.seal().map_err(index_status)?,
+            cache_mutations,
+            diagnostics,
+        })
     }
 }
 
@@ -290,6 +537,13 @@ fn source_identity(source: &IndexSourceMutation) -> (String, u64) {
     }
 }
 
+fn mutation_identity(mutation: &keldra_index::v4::build::MergeMutation) -> &ObjectIdentity {
+    match mutation {
+        keldra_index::v4::build::MergeMutation::Upsert(source) => &source.source_identity,
+        keldra_index::v4::build::MergeMutation::Delete(identity) => identity,
+    }
+}
+
 fn require_state_bound(
     states: &[keldra_index::v5::ProjectedDocumentState],
     maximum_bytes: usize,
@@ -309,6 +563,14 @@ fn require_state_bound(
 
 fn stripe(family_id: [u8; 32]) -> usize {
     usize::from(family_id[0]) % WRITER_STRIPES
+}
+
+fn projection_unit_already_completed(
+    has_staged_predecessor: bool,
+    predecessor: &ProjectionGeneration,
+    target: &ProjectionBarrier,
+) -> bool {
+    !has_staged_predecessor && predecessor.barrier.covers(target)
 }
 
 fn index_status(error: keldra_index::IndexError) -> Status {
@@ -357,5 +619,27 @@ mod tests {
         let first = ProjectionBarrier::new(vec![(1, [1; 32], 8)], None).unwrap();
         let next_epoch = ProjectionBarrier::new(vec![(1, [2; 32], 9)], None).unwrap();
         assert!(!next_epoch.covers(&first));
+    }
+
+    #[test]
+    fn a_staged_frame_at_the_final_barrier_does_not_skip_later_frames() {
+        let barrier = ProjectionBarrier::new(vec![(1, [1; 32], 8)], None).unwrap();
+        let generation = ProjectionGeneration {
+            family_id: [3; 32],
+            revision: 1,
+            barrier: barrier.clone(),
+            roots: Vec::new(),
+            previous_generation_hash: None,
+        };
+        assert!(projection_unit_already_completed(
+            false,
+            &generation,
+            &barrier
+        ));
+        assert!(!projection_unit_already_completed(
+            true,
+            &generation,
+            &barrier
+        ));
     }
 }

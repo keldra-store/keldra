@@ -238,7 +238,7 @@ impl IndexCommitPublisher {
         bucket: &str,
         tenant_id: u64,
         bucket_id: u64,
-        loaded: &LoadedProjectionGeneration,
+        generation: &ProjectionGeneration,
         component: ComponentIdentity,
         stable_key: StableDocumentKey,
     ) -> Result<Option<Vec<u8>>, Status> {
@@ -248,7 +248,7 @@ impl IndexCommitPublisher {
                 bucket,
                 tenant_id,
                 bucket_id,
-                loaded,
+                generation,
                 component,
                 &[stable_key],
             )
@@ -263,7 +263,7 @@ impl IndexCommitPublisher {
         bucket: &str,
         tenant_id: u64,
         bucket_id: u64,
-        loaded: &LoadedProjectionGeneration,
+        generation: &ProjectionGeneration,
         source_scope: [u8; 32],
         source_path: &str,
     ) -> Result<Vec<keldra_index::v5::ProjectedDocumentState>, Status> {
@@ -275,7 +275,7 @@ impl IndexCommitPublisher {
                 bucket,
                 tenant_id,
                 bucket_id,
-                loaded,
+                generation,
                 ComponentIdentity::SourceRecords,
                 locator_key,
             )
@@ -291,7 +291,7 @@ impl IndexCommitPublisher {
                 bucket,
                 tenant_id,
                 bucket_id,
-                loaded,
+                generation,
                 ComponentIdentity::ProjectedState,
                 &stable_keys,
             )
@@ -323,7 +323,7 @@ impl IndexCommitPublisher {
         bucket: &str,
         tenant_id: u64,
         bucket_id: u64,
-        loaded: &LoadedProjectionGeneration,
+        generation: &ProjectionGeneration,
         component: ComponentIdentity,
         stable_keys: &[StableDocumentKey],
     ) -> Result<BTreeMap<StableDocumentKey, Option<Vec<u8>>>, Status> {
@@ -332,7 +332,7 @@ impl IndexCommitPublisher {
                 "projection record lookup keys are not sorted and unique",
             ));
         }
-        let Some(root) = loaded.generation.root(component) else {
+        let Some(root) = generation.root(component) else {
             return Ok(stable_keys.iter().map(|key| (*key, None)).collect());
         };
         let directory = self
@@ -341,7 +341,7 @@ impl IndexCommitPublisher {
                 bucket,
                 tenant_id,
                 bucket_id,
-                loaded.current.family_id,
+                generation.family_id,
                 root,
             )
             .await?;
@@ -352,7 +352,7 @@ impl IndexCommitPublisher {
             .iter()
             .rev()
         {
-            let path = projection_pack_path(loaded.current.family_id, descriptor.pack_hash);
+            let path = projection_pack_path(generation.family_id, descriptor.pack_hash);
             let (pack, _) = self
                 .read_projection_object(
                     storage_tenant,

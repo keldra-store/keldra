@@ -274,6 +274,9 @@ ProjectedDocumentState {
     source_path
     source_record
     current_source_version
+    material_source_version
+    exact_result_identity
+    physical_order_key
     live
     membership_values[]
     canonical_field_values[]
@@ -307,7 +310,11 @@ stable document key -> generation-pinned live state and exact result identity
 
 This is the analogue of an index entry continuing to reach a newer PostgreSQL
 tuple through HOT indirection. An unchanged indexed value remains valid when an
-ordinary object's version changes.
+ordinary object's version changes. `current_source_version` and the exact result
+identity always advance. `material_source_version` advances only when
+membership, an indexed field, physical order, expansion, or liveness changes.
+The disposable native cache identity is `(stable_document_key,
+material_source_version)`, never the ordinary object version.
 
 Projected-document state is not an object-data authority. Losing it causes
 replay or bounded rebuild from ordinary objects and source journals.
@@ -394,7 +401,8 @@ Format-v5 immutable streams are separated by authority:
 ```text
 document-head delta:
     stable key -> source path, record identity, current source version,
-                  current result identity, live/deleted state
+                  material source version, current result identity,
+                  physical order key, live/deleted state
 
 membership delta for recipe R:
     stable key -> present/absent
@@ -423,12 +431,15 @@ enters that assembler. The assembled structures retain stable document keys,
 not source object versions or definition-local document IDs.
 
 The cache may lag the durable projection generation while assembly is in
-progress. A query pins the newest complete cache generation whose recipe roots
-all cover one common projection barrier. Newer head-only generations can be
-applied through the stable-key head map without rebuilding unchanged query
-components. Material recipe deltas become visible only when the corresponding
-bounded cache delta is complete; the public freshness watermark reports that
-complete query-visible barrier rather than merely the writer's durable barrier.
+progress. A native candidate is admitted only when the pinned canonical head is
+live and its `material_source_version` exactly equals the version embedded in
+the cache identity. The gate then substitutes the head's exact current
+source/result identities before authorization and exact-current evaluation.
+Consequently a newer head-only generation immediately returns the newer public
+version through unchanged postings, while a material change immediately rejects
+the preceding cache entry until its bounded cache delta is published. The public
+freshness watermark reports the complete query-visible cache barrier rather
+than merely the writer's durable barrier.
 
 Query-cache segments are append-only immutable values. Cache compaction merges
 segments newest-by-stable-key in the background and atomically replaces only a
@@ -545,6 +556,15 @@ Crash points are recovered as follows:
   contains every recipe it names;
 - restart rebuilds immutable routing pages from the durable catalog in bounded
   pages and resumes source partitions from physical barriers.
+
+Installing canonical family `current` precedes publishing the corresponding
+disposable cache current. If a process dies in that interval, startup compares
+the two exact barriers and discards/rebuilds the native cache from a fresh
+bounded source snapshot instead of treating the already-covered journal unit as
+having produced cache mutations. During that recovery, the material-version
+gate can reject an obsolete cache entry but can never return stale material.
+Crash replay may leave duplicate immutable v5 deltas; newest-by-stable-key
+resolution is idempotent and ordinary artifact GC reclaims unattached packs.
 
 GC deletes a pack only after no retained projection generation, logical
 binding, in-flight query lease, rebuild root, or publication attempt references
@@ -851,10 +871,10 @@ Implemented groundwork on `feat/shared-index-projection`:
   durable first and atomically install only the generation record last; and
 - an empty captured family is represented by a canonical empty component
   directory and a complete source barrier, rather than fabricated records or
-  the absence of a checkpoint. Rebuild publication is split into an immutable
-  generation stage and a final exact-version `current` installation: bounded
-  rebuild frames can therefore become durable without exposing a partial
-  snapshot, and only the final complete frame becomes query-visible; and
+  the absence of a checkpoint. Bounded rebuild frames become durable canonical
+  generations as they complete, but the logical definition's native cache root
+  is not published until the complete baseline is assembled. The candidate
+  gate therefore cannot expose a partial baseline; and
 - the production artifact boundary now admits those canonical format-v5 paths,
   verifies every immutable path against its exact payload hash, stages and
   publishes the complete immutable dependency set through ordinary integrated
@@ -875,25 +895,33 @@ Implemented groundwork on `feat/shared-index-projection`:
   source path and every derived stable-key ordinal before prior projected state
   is admitted. Runtime generation advancement reuses the verified predecessor
   pages, publishes all new immutable artifacts, and CAS-installs `current` last.
-  This is now a complete restart-safe storage seam, but it is not yet the source
-  journal or public query cutover.
+  This is now the restart-safe storage seam used by source-journal projection
+  and public Typed JSON query admission.
 
 The runtime now also has a bounded family writer seam. It accepts the compiled
 distinct-recipe plan rather than a logical definition, preserves exact journal
 epochs in format-v5 barriers, loads prior projected state by source locator,
-and applies a complete source unit transactionally. Its rebuild mode stages
-successive immutable frame generations and exposes only the final one; its
-incremental mode serializes a family and installs one complete page directly.
-The source-partition scheduler still has to become the sole caller before this
-changes production work ownership.
+and applies a complete source unit transactionally. Its rebuild mode durably
+appends bounded immutable frame generations while withholding the incomplete
+native cache root; its incremental mode serializes a family and installs one
+complete source unit directly.
+The production ordinary and atomic source-journal paths now call this seam.
+Ordinary microbatches install one complete canonical generation; an atomic batch
+stages every bounded source frame and installs exactly one family current only
+after all paths have been represented. Empty relevant units still advance the
+family barrier without fabricating document changes. The native assembler
+receives only material cache mutations returned by that same family pass.
 
 The in-memory catalog and projection pass now satisfy the field-subset grouping
 rule: one payload is parsed against the family's distinct-recipe union and is
 converted into canonical format-v5 projected-document state once. The
-production source-journal writer does not yet call that format-v5 family pass,
-and public queries do not yet resolve logical bindings through independently
-reusable format-v5 component generations. Those two cutovers remain before
-Milestone B is complete.
+production source-journal writer now calls that format-v5 family pass. Public
+Typed JSON queries load the exact family generation, require it to cover the
+selected native-cache barrier, resolve stable cache keys through canonical
+document heads, and apply the material-version gate described in section 8.1.
+Focused tests prove that 10,000 successive unindexed source versions create only
+head changes, retain one cache material identity, and emit no native cache
+mutation; a field change advances that identity and emits one stable upsert.
 
 The existing native segment assembler and query engine currently provide a
 temporary production bridge. For Typed JSON, the runtime's compact
@@ -911,10 +939,10 @@ IDs, and only then are its public names bound onto a complete union schema for
 the native query executor. Schema fingerprints intentionally exclude those
 public names, so the manifest remains the same physical generation. Unrequested
 union fields receive collision-free internal names and cannot be addressed by
-the logical query. This bridge keeps the existing postings/points/doc-values
-query path functional, but format v5 is not yet its durable projection
-authority. Calling the bridge a query-cache assembler before the source writer
-and query binding are cut over would hide the exact integration gap.
+the logical query. The existing postings/points/doc-values executor is now the
+disposable native query cache while format v5 is its canonical durable
+projection authority. Cache and projection barriers are checked independently;
+disagreement is a recovery condition, not an implicit cache hit.
 
 The bridge is also the first production field-subset scale point: definitions
 with the same tenant, bucket, path/content scope and source semantics but
@@ -925,8 +953,9 @@ The pending server qualification must prove that this behavior remains bounded
 for mixed subsets at D640 and under catalog churn; until then this is
 code-complete and compile-validated, not a scale claim.
 
-Milestone B is therefore storage- and projection-core complete, but not
-production complete.
+Milestone B is therefore production-integrated. Its release gate remains the
+full correctness, crash, heterogeneous-recipe, and D1-through-D640 scale
+qualification in sections 14 and 15.
 
 ### 18.3 Milestone C: projected-document state
 
@@ -942,8 +971,9 @@ updates, and seals canonical integrity-checked delta segments. Focused tests
 prove that an unindexed update writes only the disposable exact projected state
 and document head—no membership or query field—and that changing one indexed
 field adds only that field recipe. Durable generation publication and
-production query resolution still have to consume these records before
-Milestone C is complete.
+production source projection and query resolution consume these records. The
+remaining Milestone C gate is end-to-end qualification under sustained
+projection-preserving and material-changing workloads.
 
 The writer also maintains one source-record-set component. It lets overwrite,
 delete, and expansion shrink load exactly the prior stable keys for that source

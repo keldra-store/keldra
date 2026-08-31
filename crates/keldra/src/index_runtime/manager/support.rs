@@ -187,6 +187,45 @@ pub(super) fn reduced_source_wire_limit(current: u64) -> Option<u64> {
     (current > MINIMUM_SOURCE_WIRE_BYTES).then(|| (current / 2).max(MINIMUM_SOURCE_WIRE_BYTES))
 }
 
+/// A native TypedJson cache is disposable and may lag its canonical family if
+/// a process dies after installing v5 current but before publishing the cache
+/// manifest. Rebuild that cache from a fresh source snapshot instead of
+/// replaying an already-covered journal unit and silently omitting its material
+/// mutations.
+pub(super) async fn projection_cache_is_coherent(
+    definition: &CatalogDefinition,
+    current: &CommittedIndexView,
+    dependencies: &IndexBuilderDependencies,
+) -> Result<bool, Status> {
+    if definition.schema.kind != IndexKind::TypedJson {
+        return Ok(true);
+    }
+    let family = definition.projection_family_identity();
+    let Some(projection) = dependencies
+        .publisher
+        .load_projection_generation(
+            &definition.stored.tenant,
+            &definition.stored.bucket,
+            family.tenant_id,
+            family.bucket_id,
+            family.family_id,
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let cache = current.manifest.barrier().map_err(commit_view_status)?;
+    let cache = super::super::projection_family_writer::projection_barrier(&cache)?;
+    Ok(projection.generation.barrier == cache)
+}
+
+pub(super) fn emit_projection_cache_rebuild(definition: &CatalogDefinition) {
+    tracing::warn!(
+        index.id = definition.stored.index_id,
+        "rebuilding disposable native cache whose canonical projection barrier differs"
+    );
+}
+
 pub(super) fn work_plan_for_limit(
     limit: u64,
     source_resident_bytes: u64,

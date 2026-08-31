@@ -1,7 +1,7 @@
 use crate::IndexError;
 use crate::v4::build::{
-    ProjectedDocValue, ProjectedPoint, ProjectedRecord, ProjectedSource, ProjectedTerm,
-    ProjectedVector,
+    MergeMutation, ProjectedDocValue, ProjectedPoint, ProjectedRecord, ProjectedSource,
+    ProjectedTerm, ProjectedVector,
 };
 use crate::v4::{DocValueCell, FieldId, ScalarValue, Schema};
 
@@ -106,7 +106,7 @@ pub fn projected_document_states(
     let mut states = Vec::with_capacity(source.records.len());
     for (source_record, record) in source.records.iter().enumerate() {
         let source_record = u32::try_from(source_record).map_err(|_| IndexError::OffsetOverflow)?;
-        let head = DocumentHead::new(
+        let mut head = DocumentHead::new(
             recipes.membership,
             source.source_identity.path.clone(),
             source_record,
@@ -114,6 +114,8 @@ pub fn projected_document_states(
             record.result_identity.clone(),
             true,
         )?;
+        head.order_key = record.order_key.clone();
+        head.validate(recipes.membership)?;
         let memberships = vec![CanonicalRecipeState::new(membership, vec![1])?];
         let mut fields = schema
             .fields
@@ -340,6 +342,109 @@ pub fn decode_canonical_field_state(
     Ok(record)
 }
 
+/// Assemble only records whose query-visible material changed into disposable
+/// native cache mutations. Projection-preserving source versions therefore do
+/// not enter a segment writer, while removals invalidate the exact stable key.
+pub fn query_cache_mutations(
+    schema: &Schema,
+    source_version: u64,
+    current: &[ProjectedDocumentState],
+    previous: &[ProjectedDocumentState],
+) -> Result<Vec<MergeMutation>, IndexError> {
+    schema.validate()?;
+    if source_version == 0 {
+        return Err(IndexError::InvalidDefinition(
+            "query-cache source version must be non-zero".into(),
+        ));
+    }
+    let recipes = schema.recipe_fingerprints()?.fields;
+    if recipes.len() != schema.fields.len() {
+        return Err(IndexError::InvalidDefinition(
+            "query-cache field recipe catalogue is incomplete".into(),
+        ));
+    }
+    let mut previous_by_key = previous
+        .iter()
+        .map(|state| {
+            state.validate()?;
+            Ok((state.head.stable_key, state))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, IndexError>>()?;
+    if previous_by_key.len() != previous.len() {
+        return Err(IndexError::InvalidDefinition(
+            "query-cache predecessor contains duplicate stable keys".into(),
+        ));
+    }
+    let mut mutations = Vec::new();
+    for state in current {
+        state.validate()?;
+        let predecessor = previous_by_key.remove(&state.head.stable_key);
+        if predecessor.is_some_and(|previous| {
+            previous.head.material_source_version == state.head.material_source_version
+        }) {
+            continue;
+        }
+        let mut record = ProjectedRecord {
+            result_identity: Some(state.head.result_or_source()),
+            order_key: state.head.order_key.clone(),
+            terms: Vec::new(),
+            points: Vec::new(),
+            doc_values: Vec::new(),
+            vectors: Vec::new(),
+            field_lengths: Vec::new(),
+        };
+        for (field, recipe) in schema.fields.iter().zip(&recipes) {
+            let recipe = RecipeIdentity::new(*recipe)?;
+            let canonical = state
+                .fields
+                .binary_search_by_key(&recipe, |field| field.recipe)
+                .ok()
+                .and_then(|position| state.fields.get(position))
+                .ok_or_else(|| {
+                    IndexError::InvalidDefinition(
+                        "query-cache state omits a physical field recipe".into(),
+                    )
+                })?;
+            let decoded = decode_canonical_field_state(field.id, &canonical.value)?;
+            record.terms.extend(decoded.terms);
+            record.points.extend(decoded.points);
+            record.doc_values.extend(decoded.doc_values);
+            record.vectors.extend(decoded.vectors);
+            record.field_lengths.extend(decoded.field_lengths);
+        }
+        record.points.sort_by_key(|point| point.field_id);
+        record.doc_values.sort_by_key(|column| column.field_id);
+        record.vectors.sort_by_key(|vector| vector.field_id);
+        record.field_lengths.sort_by_key(|(field, _)| *field);
+        record.validate()?;
+        let source_identity = state
+            .head
+            .stable_key
+            .query_cache_identity(state.head.material_source_version)?;
+        mutations.push(MergeMutation::Upsert(ProjectedSource {
+            source_identity,
+            records: vec![record],
+        }));
+    }
+    for previous in previous_by_key.into_values() {
+        mutations.push(MergeMutation::Delete(
+            previous
+                .head
+                .stable_key
+                .query_cache_identity(source_version)?,
+        ));
+    }
+    mutations.sort_by(|left, right| cache_mutation_path(left).cmp(cache_mutation_path(right)));
+    Ok(mutations)
+}
+
+fn cache_mutation_path(mutation: &MergeMutation) -> &str {
+    match mutation {
+        MergeMutation::Upsert(source) => &source.source_identity.path,
+        MergeMutation::Delete(identity) => &identity.path,
+    }
+}
+
 struct FieldStateDecoder<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -511,6 +616,7 @@ mod tests {
         FieldComponents, FieldSchema, FieldType, IndexKind, IndexSemantics, ObjectIdentity,
         ScalarValue, TERM_TYPE_STRING, TERM_TYPE_TEXT,
     };
+    use crate::v5::{StableDocumentKey, inherit_projection_preserving_versions};
 
     use super::*;
 
@@ -601,6 +707,62 @@ mod tests {
         let delta = new[0].delta_from(Some(&old[0])).unwrap();
         assert_eq!(delta.fields.len(), 1);
         assert_eq!(delta.fields[0].recipe, old[0].fields[0].recipe);
+    }
+
+    #[test]
+    fn projection_preserving_update_emits_no_native_cache_mutation() {
+        let schema = schema();
+        let previous = projected_document_states(&schema, &source(7, "open")).unwrap();
+        let mut current = projected_document_states(&schema, &source(19, "open")).unwrap();
+        inherit_projection_preserving_versions(&mut current, &previous).unwrap();
+        assert_eq!(current[0].head.source_version, 19);
+        assert_eq!(current[0].head.material_source_version, 7);
+        assert!(
+            query_cache_mutations(&schema, 19, &current, &previous)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn material_change_emits_one_stable_native_cache_record() {
+        let schema = schema();
+        let previous = projected_document_states(&schema, &source(7, "open")).unwrap();
+        let mut current = projected_document_states(&schema, &source(19, "fixed")).unwrap();
+        inherit_projection_preserving_versions(&mut current, &previous).unwrap();
+        let mutations = query_cache_mutations(&schema, 19, &current, &previous).unwrap();
+        let MergeMutation::Upsert(projected) = &mutations[0] else {
+            panic!("material change must upsert its stable cache record");
+        };
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(projected.source_identity.version, 19);
+        assert_eq!(
+            StableDocumentKey::from_query_cache_identity(&projected.source_identity).unwrap(),
+            current[0].head.stable_key
+        );
+        assert_eq!(
+            projected.records[0].result_identity,
+            Some(ObjectIdentity {
+                path: "objects/a".into(),
+                version: 19,
+            })
+        );
+    }
+
+    #[test]
+    fn removed_expanded_record_emits_one_stable_tombstone() {
+        let schema = schema();
+        let previous = projected_document_states(&schema, &source(7, "open")).unwrap();
+        let mutations = query_cache_mutations(&schema, 19, &[], &previous).unwrap();
+        let MergeMutation::Delete(identity) = &mutations[0] else {
+            panic!("removed record must tombstone its stable cache identity");
+        };
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(identity.version, 19);
+        assert_eq!(
+            StableDocumentKey::from_query_cache_identity(identity).unwrap(),
+            previous[0].head.stable_key
+        );
     }
 
     #[test]

@@ -6,7 +6,11 @@ KELDRA-0020 amends the unit of source consumption, buffering, checkpointing,
 publication, and retention. These remain journal-backed immutable-segment
 operations, but they are owned by a physical projection family/source partition
 rather than repeated for every logical definition. One physical generation may
-serve many authorized logical bindings.
+serve many authorized logical bindings. For Typed JSON, the format-v5 family
+generation is canonical durable projection state; the format-v4 manifest is a
+disposable native query-cache root. Its exact barrier must match or trail the
+canonical generation under the material-version candidate gate, and barrier
+disagreement on restart rebuilds the cache rather than replaying covered work.
 
 Amends: KELDRA-0014 sections 5, 7.3, 9.5, 9.6, 14, 17, 19, 20, and 21
 
@@ -17,9 +21,11 @@ Audience: Keldra implementors, operators, client authors, and reviewers
 Keldra will use its durable source journals and immutable source objects as the
 replay authority for incremental derived-index construction. Index builders
 accumulate complete source mutations in bounded RAM buffers and flush those
-buffers into immutable, durable Keldra segment objects. One small commit
-manifest atomically binds the searchable segment set to the exact source
-journal positions it represents.
+buffers into immutable, durable Keldra segment objects. One small physical
+publication root atomically binds immutable state to the exact source-journal
+positions it represents. For pre-v5 kinds that root is the commit manifest. For
+Typed JSON it is the canonical projection-family generation; a separately
+published native-cache manifest never becomes replay or comparison authority.
 
 There is no heavyweight generation build in the steady-state incremental path.
 The durable model contains only:

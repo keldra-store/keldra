@@ -26,10 +26,11 @@ pub use paths::{
 };
 pub use projected_state::{
     CanonicalRecipeState, DocumentHead, ProjectedDocumentDelta, ProjectedDocumentState,
-    RecipeDelta, RecipeIdentity, StableDocumentKey,
+    RecipeDelta, RecipeIdentity, StableDocumentKey, inherit_projection_preserving_versions,
 };
 pub use projector::{
     decode_canonical_field_state, merge_projected_document_states, projected_document_states,
+    query_cache_mutations,
 };
 pub use publication::{PreparedProjectionGeneration, prepare_projection_generation};
 pub use stream::{

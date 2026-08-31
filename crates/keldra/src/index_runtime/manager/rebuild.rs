@@ -654,8 +654,16 @@ async fn process_snapshot_frame(
                 &mut batch,
                 ProjectionBatch::new(projection_budget, max_parallel),
             );
-            project_snapshot_batch(definition, plan, full, builder, candidate, dependencies)
-                .await?;
+            project_snapshot_batch(
+                definition,
+                barrier,
+                plan,
+                full,
+                builder,
+                candidate,
+                dependencies,
+            )
+            .await?;
             if batch.try_push(pending)?.is_some() {
                 return Err(Status::internal(
                     "projection source was rejected by an empty batch after admission",
@@ -664,7 +672,16 @@ async fn process_snapshot_frame(
         }
     }
     if !batch.is_empty() {
-        project_snapshot_batch(definition, plan, batch, builder, candidate, dependencies).await?;
+        project_snapshot_batch(
+            definition,
+            barrier,
+            plan,
+            batch,
+            builder,
+            candidate,
+            dependencies,
+        )
+        .await?;
     }
     Ok(source_payload_bytes)
 }
@@ -804,6 +821,7 @@ fn require_visible_head(head: &Head, barrier: &IndexBarrier) -> Result<(), Statu
 
 async fn project_snapshot_batch(
     definition: &CatalogDefinition,
+    barrier: &IndexBarrier,
     plan: SegmentMemoryPlan,
     batch: ProjectionBatch,
     builder: &mut NativeSegmentBuild,
@@ -881,6 +899,7 @@ async fn project_snapshot_batch(
     });
     let result = project_snapshot_batch_inner(
         definition,
+        barrier,
         &definition.schema,
         batch.sources,
         effective_lanes,
@@ -1139,6 +1158,7 @@ where
 
 async fn project_snapshot_batch_inner(
     definition: &CatalogDefinition,
+    barrier: &IndexBarrier,
     schema: &Schema,
     sources: Vec<PreparedProjection>,
     effective_lanes: usize,
@@ -1148,62 +1168,44 @@ async fn project_snapshot_batch_inner(
     dependencies: &IndexBuilderDependencies,
 ) -> Result<ProjectionWaveTotals, Status> {
     if schema.kind == IndexKind::TypedJson {
-        let source_count = sources.len();
-        let lanes = partition_projection_lanes(sources, effective_lanes);
-        let mut senders = Vec::with_capacity(lanes.len());
-        let mut receivers = Vec::with_capacity(lanes.len());
-        for _ in 0..lanes.len() {
-            let (sender, receiver) = tokio::sync::mpsc::channel(1);
-            senders.push(sender);
-            receivers.push(receiver);
-        }
-        let projection_task = AbortOnDropTask::new(tokio::spawn(run_shared_projection_lanes(
-            definition.clone(),
-            lanes,
-            senders,
-            lane_limit,
-            dependencies.projection_mapper.clone(),
-        )));
+        let family_plan = dependencies
+            .projection_mapper
+            .family_plan(definition.projection_family_identity())?
+            .ok_or_else(|| Status::failed_precondition("projection family is not registered"))?;
+        let sources = sources
+            .into_iter()
+            .map(|prepared| prepared.source)
+            .collect();
+        let projected = dependencies
+            .projection_family_writer
+            .advance_rebuild_visible_frame(
+                &family_plan,
+                sources,
+                super::super::projection_family_writer::projection_barrier(barrier)?,
+                lane_limit,
+                DerivedArtifactAdmission::PublicationProgress,
+            )
+            .await?;
         let mut totals = ProjectionWaveTotals::default();
-        let mut failure = None;
-        for position in 0..source_count {
-            let Some(projected) = receive_ordered_lane_item(&mut receivers, position).await else {
-                failure = Some(Status::internal("shared projection lane omitted a source"));
-                break;
+        totals.accepted = projected.diagnostics.accepted_objects;
+        totals.skipped = projected.diagnostics.skipped_objects;
+        candidate.diagnostics.add(projected.diagnostics);
+        for mutation in projected.cache_mutations {
+            let MergeMutation::Upsert(source) = mutation else {
+                return Err(Status::data_loss(
+                    "baseline projection emitted a stable cache tombstone",
+                ));
             };
-            let (mutation, diagnostics) = match projected {
-                Ok(value) => value,
-                Err(error) => {
-                    failure = Some(error);
-                    break;
-                }
-            };
-            totals.accepted = totals.accepted.saturating_add(diagnostics.accepted_objects);
-            totals.skipped = totals.skipped.saturating_add(diagnostics.skipped_objects);
-            candidate.diagnostics.add(diagnostics);
-            if let MergeMutation::Upsert(source) = mutation {
-                if let Err(error) = push_or_flush(
-                    definition,
-                    runtime_kind(definition.schema.kind),
-                    builder,
-                    source,
-                    candidate,
-                    dependencies,
-                    true,
-                )
-                .await
-                {
-                    failure = Some(error);
-                    break;
-                }
-            }
-        }
-        drop(receivers);
-        projection_task.join().await.map_err(|error| {
-            Status::internal(format!("shared projection batch task failed: {error}"))
-        })??;
-        if let Some(error) = failure {
-            return Err(error);
+            push_or_flush(
+                definition,
+                runtime_kind(definition.schema.kind),
+                builder,
+                source,
+                candidate,
+                dependencies,
+                true,
+            )
+            .await?;
         }
         return Ok(totals);
     }

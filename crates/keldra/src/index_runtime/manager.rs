@@ -40,6 +40,7 @@ use super::cpu::{IndexCpuPool, IndexCpuPoolError};
 use super::directory::ManifestArtifactDirectory;
 use super::events::{IndexBarrier, IndexEventError, IndexEventJournal, IndexJournalPage};
 use super::placement::{IndexIdentity, IndexPlacement};
+use super::projection_family_writer::SharedProjectionFamilyWriter;
 use super::projection_mapper::SharedProjectionMapper;
 use super::publication::DerivedArtifactAdmission;
 use super::publisher::{CommittedIndexView, IndexCommitPublisher};
@@ -162,6 +163,7 @@ pub(crate) struct IndexBuilderDependencies {
     pub(crate) budgets: IndexMemoryBudgets,
     pub(crate) cpu: IndexCpuPool,
     pub(crate) projection_mapper: SharedProjectionMapper,
+    pub(crate) projection_family_writer: SharedProjectionFamilyWriter,
     pub(crate) config: IndexRuntimeConfig,
     pub(crate) derived_progress: DerivedProgressReporter,
     pub(crate) maintenance_work_slots: IndexMaintenanceWorkSlots,
@@ -963,7 +965,15 @@ async fn inspect_builder(
         return Ok((BuilderPhase::Rebuild(work), BuilderDisposition::Ready, None));
     }
     emit_publication_age(job.kind, current.as_ref());
+    let cache_coherent = match current.as_ref() {
+        Some(current) => projection_cache_is_coherent(definition, current, dependencies).await?,
+        None => true,
+    };
+    if !cache_coherent {
+        emit_projection_cache_rebuild(definition);
+    }
     if let Some(current) = current.as_ref()
+        && cache_coherent
         && current.manifest.definition_version == definition.physical_definition_version()
         && current.manifest.kind == definition.schema.kind
     {
