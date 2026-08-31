@@ -2,6 +2,7 @@ use serde::Serialize;
 
 pub const CONTENT_TYPE: &str = "application/json";
 pub const INDEX_NAME_PREFIX: &str = "contention";
+pub const PROJECTION_PRESERVING_MARKERS: u64 = 256;
 
 #[derive(Serialize)]
 struct Record<'a> {
@@ -23,12 +24,26 @@ pub fn marker_path(sequence: u64) -> String {
     format!("contention/marker/{sequence:016}.json")
 }
 
+pub fn marker_id(ordinal: u64) -> u64 {
+    (1u64 << 63) | ordinal
+}
+
 pub fn payload(seed: u64, id: u64, class: &'static str, generation: u64) -> Vec<u8> {
-    let mixed = mix64(seed ^ id.rotate_left(19) ^ generation.rotate_left(37));
+    payload_with_generations(seed, id, class, generation, generation)
+}
+
+pub fn payload_with_generations(
+    seed: u64,
+    id: u64,
+    class: &'static str,
+    indexed_generation: u64,
+    payload_generation: u64,
+) -> Vec<u8> {
+    let mixed = mix64(seed ^ id.rotate_left(19) ^ payload_generation.rotate_left(37));
     serde_json::to_vec(&Record {
         record_id: id,
         class,
-        generation,
+        generation: indexed_generation,
         payload: format!("{mixed:016x}-{seed:016x}"),
     })
     .expect("generated contention record is serializable")
@@ -41,16 +56,28 @@ pub fn payload_at_least(
     generation: u64,
     minimum_bytes: usize,
 ) -> Vec<u8> {
-    let mut encoded = payload(seed, id, class, generation);
+    payload_with_generations_at_least(seed, id, class, generation, generation, minimum_bytes)
+}
+
+pub fn payload_with_generations_at_least(
+    seed: u64,
+    id: u64,
+    class: &'static str,
+    indexed_generation: u64,
+    payload_generation: u64,
+    minimum_bytes: usize,
+) -> Vec<u8> {
+    let mut encoded =
+        payload_with_generations(seed, id, class, indexed_generation, payload_generation);
     if encoded.len() >= minimum_bytes {
         return encoded;
     }
     let missing = minimum_bytes - encoded.len();
-    let mixed = mix64(seed ^ id.rotate_left(19) ^ generation.rotate_left(37));
+    let mixed = mix64(seed ^ id.rotate_left(19) ^ payload_generation.rotate_left(37));
     encoded = serde_json::to_vec(&Record {
         record_id: id,
         class,
-        generation,
+        generation: indexed_generation,
         payload: format!("{mixed:016x}-{seed:016x}{}", "x".repeat(missing)),
     })
     .expect("generated contention record is serializable");
@@ -97,6 +124,10 @@ mod tests {
         assert_eq!(corpus_digest(7, 4, 3), corpus_digest(7, 4, 3));
         assert_ne!(corpus_digest(7, 4, 3), corpus_digest(8, 4, 3));
         assert_ne!(payload(7, 2, "mutable", 1), payload(7, 2, "mutable", 2));
+        assert_ne!(
+            payload_with_generations(7, 2, "mutable", 0, 1),
+            payload_with_generations(7, 2, "mutable", 0, 2)
+        );
         let padded = payload_at_least(7, 2, "mutable", 1, 25_000);
         assert_eq!(padded.len(), 25_000);
         assert_eq!(

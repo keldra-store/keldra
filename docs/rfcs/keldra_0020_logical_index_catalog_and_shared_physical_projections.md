@@ -688,7 +688,12 @@ public query against an independent expected result.
 Continuously mutate large unindexed properties while indexed values remain
 constant, then change one indexed field and one membership predicate. Prove
 zero physical field work in the first phase and exact component-local work in
-the later phases.
+the later phases. The black-box contention driver exposes this as
+`KELDRA_INDEX_CONTENTION_MUTATION_WORKLOAD=projection-preserving`: it pre-seeds
+a bounded marker pool, changes only unindexed bytes and source versions, and
+requires ordinary queries to return the newest exact source version through the
+unchanged material posting. The material-changing workload remains a distinct
+run so its physical work cannot mask the HOT-equivalent result.
 
 ### 15.5 Sustained keep-up
 

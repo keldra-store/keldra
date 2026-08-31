@@ -14,7 +14,7 @@ mod metrics;
 mod progress;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use config::Config;
+use config::{Config, MutationWorkload};
 use data::CONTENT_TYPE;
 use keldra_storage::v1::bulk_operation::Operation as BulkOperationValue;
 use keldra_storage::v1::bulk_outcome::Outcome as BulkOutcomeValue;
@@ -490,6 +490,17 @@ async fn setup(config: &Config, channel: &Channel, token: &str) -> Result<()> {
             data::payload(config.seed, id, "mutable", 0),
             format!("contention-initial-mutable-{id}"),
         ));
+    }
+    if config.mutation_workload == MutationWorkload::ProjectionPreserving {
+        for ordinal in 0..data::PROJECTION_PRESERVING_MARKERS {
+            let id = data::marker_id(ordinal);
+            operations.push(put(
+                config,
+                data::marker_path(ordinal),
+                data::payload_with_generations(config.seed, id, "marker", 0, 0),
+                format!("contention-initial-marker-{ordinal}"),
+            ));
+        }
     }
     for (batch, chunk) in operations.chunks(1_000).enumerate() {
         let outcomes = client
@@ -1026,13 +1037,23 @@ async fn execute_mutation(
             .saturating_mul(config.mutation_batch_size as u64)
             .saturating_add(offset as u64);
         let id = ordinal % config.mutable_records;
-        let payload = data::payload_at_least(
-            config.seed,
-            id,
-            "mutable",
-            job.sequence + 1,
-            config.mutation_record_bytes,
-        );
+        let payload = match config.mutation_workload {
+            MutationWorkload::MaterialChange => data::payload_at_least(
+                config.seed,
+                id,
+                "mutable",
+                job.sequence + 1,
+                config.mutation_record_bytes,
+            ),
+            MutationWorkload::ProjectionPreserving => data::payload_with_generations_at_least(
+                config.seed,
+                id,
+                "mutable",
+                0,
+                job.sequence + 1,
+                config.mutation_record_bytes,
+            ),
+        };
         bytes = bytes.saturating_add(payload.len() as u64);
         operations.push(put(
             config,
@@ -1041,12 +1062,25 @@ async fn execute_mutation(
             format!("contention-mutation-{}-{offset}", job.sequence),
         ));
     }
-    let marker_id = (1u64 << 63) | job.sequence;
-    let marker_payload = data::payload(config.seed, marker_id, "marker", job.sequence);
+    let marker_ordinal = match config.mutation_workload {
+        MutationWorkload::MaterialChange => job.sequence,
+        MutationWorkload::ProjectionPreserving => {
+            job.sequence % data::PROJECTION_PRESERVING_MARKERS
+        }
+    };
+    let marker_id = data::marker_id(marker_ordinal);
+    let marker_payload = match config.mutation_workload {
+        MutationWorkload::MaterialChange => {
+            data::payload(config.seed, marker_id, "marker", job.sequence)
+        }
+        MutationWorkload::ProjectionPreserving => {
+            data::payload_with_generations(config.seed, marker_id, "marker", 0, job.sequence)
+        }
+    };
     bytes = bytes.saturating_add(marker_payload.len() as u64);
     operations.push(put(
         config,
-        data::marker_path(job.sequence),
+        data::marker_path(marker_ordinal),
         marker_payload,
         format!("contention-marker-{}", job.sequence),
     ));
@@ -1082,7 +1116,7 @@ async fn execute_mutation(
         bytes,
         elapsed: accepted_at.saturating_duration_since(started),
         canary: Some(Canary {
-            id: job.sequence,
+            id: marker_ordinal,
             version: marker_version.context("marker receipt missing")?,
             accepted_at,
         }),

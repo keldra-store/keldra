@@ -6,6 +6,28 @@ const MAX_QUALIFICATION_DEFINITIONS: usize = 1_024;
 
 const PREFIX: &str = "KELDRA_INDEX_CONTENTION_";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MutationWorkload {
+    MaterialChange,
+    ProjectionPreserving,
+}
+
+impl MutationWorkload {
+    fn from_env() -> Result<Self> {
+        let value =
+            env::var(name("MUTATION_WORKLOAD")).unwrap_or_else(|_| "material-change".to_owned());
+        match value.as_str() {
+            "material-change" => Ok(Self::MaterialChange),
+            "projection-preserving" => Ok(Self::ProjectionPreserving),
+            _ => anyhow::bail!(
+                "{} must be material-change or projection-preserving",
+                name("MUTATION_WORKLOAD")
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub endpoints: Vec<String>,
@@ -22,6 +44,7 @@ pub struct Config {
     pub mutable_records: u64,
     pub seed: u64,
     pub mutation_workers: usize,
+    pub mutation_workload: MutationWorkload,
     pub mutation_batch_size: usize,
     pub mutation_record_bytes: usize,
     pub mutation_queue_depth: usize,
@@ -56,6 +79,7 @@ pub struct PublicConfig {
     pub mutable_records: u64,
     pub seed_hex: String,
     pub mutation_workers: usize,
+    pub mutation_workload: MutationWorkload,
     pub mutation_batch_size: usize,
     pub mutation_record_bytes: usize,
     pub mutation_queue_depth: usize,
@@ -164,6 +188,7 @@ impl Config {
             mutable_records,
             seed: number("SEED", 0x6b65_6c64_7261_0016)?,
             mutation_workers,
+            mutation_workload: MutationWorkload::from_env()?,
             mutation_batch_size,
             mutation_record_bytes,
             mutation_queue_depth,
@@ -202,6 +227,7 @@ impl Config {
             mutable_records: self.mutable_records,
             seed_hex: format!("0x{:016x}", self.seed),
             mutation_workers: self.mutation_workers,
+            mutation_workload: self.mutation_workload,
             mutation_batch_size: self.mutation_batch_size,
             mutation_record_bytes: self.mutation_record_bytes,
             mutation_queue_depth: self.mutation_queue_depth,

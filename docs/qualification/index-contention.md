@@ -61,6 +61,27 @@ KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=8 \
 The evidence records all three settings. A result at one intensity must not be
 compared with another intensity as a before/after performance claim.
 
+The default mutation workload, `material-change`, changes an indexed generation
+on every update. The format-v5 projection-preserving path is qualified
+separately with:
+
+```bash
+KELDRA_IMAGE=keldra:qa-<commit> \
+KELDRA_INDEX_CONTENTION_MODE=sustained \
+KELDRA_INDEX_CONTENTION_MATRIX=1,4,16,64,256,640 \
+KELDRA_INDEX_CONTENTION_MUTATION_WORKLOAD=projection-preserving \
+KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=100 \
+  ./scripts/qualify-index-contention.sh
+```
+
+That mode continuously changes source versions and the unindexed payload while
+keeping every indexed value constant. It pre-creates a bounded set of marker
+objects and rotates visibility samples across them, so marker observation also
+uses the projection-preserving path. A sample passes only when an ordinary
+query returns the newest exact source version; merely suppressing physical
+index work cannot satisfy the oracle. Reported results from the two workload
+modes are separate populations and must not be combined.
+
 `KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES` optionally pads each mutable
 JSON record to an exact minimum byte size. Its default `0` preserves the normal
 small-record corpus. Set it together with the batch size and worker count to
@@ -167,7 +188,7 @@ watch -n 2 cat ../../releases/keldra/index-contention/latest/status.json
 `run.json` records the source commit, immutable image ID and revision, image
 platform, topology, matrix, phase durations, host resources, and Docker resource
 allocation. It also records mutation workers, batch size, queue depth, and the
-optional fixed offered operation rate, plus
+optional fixed offered operation rate, mutation workload, plus
 the request, drain, visibility polling and total
 visibility-observation timeouts, sampling interval, and both absolute p99
 acceptance bounds. Every cell retains the client report, client stdout/stderr, and
