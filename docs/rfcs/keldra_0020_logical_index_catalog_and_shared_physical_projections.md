@@ -547,6 +547,15 @@ latency and liveness invariant, not an unaccounted memory reserve: compaction
 still charges its complete admitted workspace and the hard node ceiling remains
 unchanged.
 
+Format-v4 merge scratch traffic is not an acceptable implementation of this
+model. Qualification showed repeated page-cache reads and cancelled temporary
+writes many orders of magnitude larger than the changed source payload, even
+when RocksDB and the storage device were not stalled. The v5 writer must report
+logical bytes read and written separately from physical device bytes and must
+prove that a projection-preserving update creates no field or membership merge
+input. Raising merge concurrency, delaying merges, or suppressing scratch I/O
+is not a substitute for eliminating unchanged component work.
+
 ## 13. Telemetry
 
 Required counters and histograms are labelled by physical family/recipe class,

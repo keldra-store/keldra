@@ -357,8 +357,8 @@ and retained identities all contribute to the estimate. The output may be
 smaller or larger after encoding.
 
 The 1-second age boundary applies only to a non-empty active buffer. An idle
-definition does not publish empty segments merely because time passes. The
-timer starts when the first mutation enters an empty active buffer.
+physical projection family does not publish empty segments merely because time
+passes. The timer starts when the first mutation enters an empty active buffer.
 
 The operation cap is a safety boundary for mutation shapes whose temporary
 memory is not well predicted by encoded source bytes. Its default must be
@@ -369,22 +369,22 @@ enforce a hard maximum atomic-program and source-object shape. A mutation which
 cannot fit within the documented hard bound fails closed at its authoritative
 ingress rather than causing unbounded index-builder memory.
 
-Every process has one global index-builder memory budget. Per-definition buffer
-targets do not multiply without limit as definitions become active. Scheduler
-admission, active buffers, frozen buffers, encoders, and pending publication
-bytes all charge the global budget.
+Every process has one global index-builder memory budget. Per-family buffer
+targets do not multiply without limit as logical definitions become active.
+Scheduler admission, active buffers, frozen buffers, encoders, and pending
+publication bytes all charge the global budget.
 
 The minimum complete pipeline is:
 
 ```text
-one active buffer per admitted definition
+one active buffer per admitted physical family
 bounded frozen-buffer queue
 bounded segment encoders
 bounded durable segment publications
 bounded background merges
 ```
 
-When a downstream queue is full, the affected definition stops pulling new
+When a downstream queue is full, the affected physical family stops pulling new
 journal pages. It does not allocate another unaccounted buffer and does not
 discard frozen work in favour of a newer target.
 
@@ -394,7 +394,8 @@ A frozen buffer is sorted and encoded entirely independently of later source
 mutations. It produces one logical immutable segment with:
 
 - native postings, term dictionaries, points, doc values, positions, norms,
-  vectors, identities, locators, and statistics required by the definition;
+  vectors, identities, locators, and statistics required by the family's
+  distinct physical recipes;
 - new documents for creates and updates;
 - live-document or tombstone effects for replaced and deleted identities;
 - the source and atomic cursor ranges represented by the segment;
@@ -691,11 +692,11 @@ An initial build and an explicit rebuild use the same 16 MiB segment production
 path. They differ from steady-state catch-up because no partial baseline may be
 served as a complete index.
 
-At most one non-serving build root exists per definition. It records the stable
-source scan boundary, completed durable segment set, baseline progress, and
-journal catch-up checkpoint. The build root exists solely to retain and resume
-already durable rebuild segments; it is not a second serving authority and is
-not visible to queries.
+At most one non-serving build root exists per missing physical family or recipe
+backfill. It records the stable source scan boundary, completed durable segment
+set, baseline progress, and journal catch-up checkpoint. The build root exists
+solely to retain and resume already durable rebuild segments; it is not a
+second serving authority and is not visible to queries.
 
 ```text
 current pointer
@@ -760,8 +761,8 @@ that consequence.
    frozen-buffer queue, encoder workspaces, and permitted mutation-unit
    overshoot.
 9. Segment-publication and merge concurrency and bytes are independently
-   bounded. Cross-definition physical publication cohorts retain independent
-   per-definition receipts, CAS outcomes, and checkpoints.
+   bounded. Physical publication cohorts preserve exact per-family outcomes;
+   logical definitions bind only complete compatible generations.
 10. Journal pressure prioritizes incremental publication over merge and rebuild
     work.
 11. A saturated derived pipeline backpressures journal consumption and

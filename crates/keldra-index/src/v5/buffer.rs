@@ -647,6 +647,46 @@ mod tests {
     }
 
     #[test]
+    fn pathological_repeated_unindexed_updates_coalesce_without_field_amplification() {
+        let mut previous = state(1, b"stable", b"also stable");
+        let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
+        for version in 2..=10_001 {
+            let current = state(version, b"stable", b"also stable");
+            buffer.apply_state(&current, Some(&previous)).unwrap();
+            previous = current;
+        }
+
+        let sealed = buffer.seal().unwrap();
+        assert_eq!(
+            sealed
+                .iter()
+                .map(|segment| segment.component)
+                .collect::<Vec<_>>(),
+            vec![
+                ComponentIdentity::DocumentHead,
+                ComponentIdentity::ProjectedState,
+            ]
+        );
+        assert!(sealed.iter().all(|segment| segment.records == 1));
+        assert!(sealed.iter().all(|segment| {
+            !matches!(
+                segment.component,
+                ComponentIdentity::Membership(_)
+                    | ComponentIdentity::Field(_)
+                    | ComponentIdentity::Order(_)
+            )
+        }));
+        assert!(
+            sealed
+                .iter()
+                .map(|segment| segment.encoded_bytes)
+                .sum::<u64>()
+                < 1_024,
+            "ten thousand source versions must collapse to one bounded head/state delta"
+        );
+    }
+
+    #[test]
     fn one_field_change_does_not_seal_the_other_field() {
         let old = state(1, b"old", b"stable");
         let new = state(2, b"new", b"stable");
