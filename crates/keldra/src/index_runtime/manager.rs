@@ -81,7 +81,7 @@ use maintenance::{acquire_compaction_memory, acquire_maintenance_memory};
 mod observability;
 #[path = "manager/publication.rs"]
 mod publication;
-use publication::{AbortOnDropTask, start_candidate_publication};
+use publication::{AbortOnDropTask, publication_join_required, start_candidate_publication};
 mod source_admission;
 pub(crate) use publication::{IndexMaintenanceWorkSlots, IndexPublicationSlots};
 #[path = "manager/publication_cohort.rs"]
@@ -1595,16 +1595,6 @@ async fn advance_catch_up(
         }
     }
 }
-
-const fn publication_join_required(
-    publishing: bool,
-    has_active_projection: bool,
-    has_atomic_projection: bool,
-    publication_finished: bool,
-) -> bool {
-    publishing && (publication_finished || (!has_active_projection && !has_atomic_projection))
-}
-
 async fn enqueue_candidate_publication(
     job: &BuilderJob,
     work: &mut CatchUpWork,
