@@ -112,6 +112,7 @@ pub(super) async fn run(
         .context("create capability index exceeded request timeout")??;
 
     let deadline = Instant::now() + config.drain_timeout;
+    let mut last_query_failure = "capability query has not completed".to_owned();
     loop {
         match execute(
             &mut client,
@@ -132,9 +133,19 @@ pub(super) async fn run(
             {
                 break;
             }
-            _ if Instant::now() < deadline => sleep(config.visibility_poll).await,
-            _ => anyhow::bail!("capability index did not become query-ready"),
+            Ok(response) => {
+                last_query_failure = format!(
+                    "unexpected paths {:?} with freshness {:?}",
+                    paths(&response)?,
+                    response.freshness
+                );
+            }
+            Err(error) => last_query_failure = format!("{error:#}"),
         }
+        if Instant::now() >= deadline {
+            anyhow::bail!("capability index did not become query-ready: {last_query_failure}");
+        }
+        sleep(config.visibility_poll).await;
     }
 
     let range = execute(
