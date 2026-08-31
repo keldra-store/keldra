@@ -81,7 +81,7 @@ use maintenance::{acquire_compaction_memory, acquire_maintenance_memory};
 mod observability;
 #[path = "manager/publication.rs"]
 mod publication;
-use publication::{AbortOnDropTask, publication_join_required, start_candidate_publication};
+use publication::{AbortOnDropTask, start_candidate_publication};
 mod source_admission;
 pub(crate) use publication::{IndexMaintenanceWorkSlots, IndexPublicationSlots};
 #[path = "manager/publication_cohort.rs"]
@@ -1104,35 +1104,15 @@ async fn advance_catch_up(
         )
     };
     let admission = publication_admission(work.maintenance);
-    if work.publishing.is_some()
-        && work.atomic_projection.is_none()
-        && work
-            .active
-            .as_ref()
-            .is_some_and(|active| active.builder.is_empty() && active.builder.frozen.is_none())
-    {
-        work.active = None;
-    }
-    let publication_finished = work
+    if work
         .publishing
         .as_ref()
-        .is_some_and(|publication| publication.task.is_finished());
-    let join_publication_now = publication_join_required(
-        work.publishing.is_some(),
-        work.active.is_some(),
-        work.atomic_projection.is_some(),
-        publication_finished,
-    );
-    // Once no useful intake or atomic projection can overlap the publication,
-    // keep its completion attached to this admitted builder turn. Polling the
-    // already-owned task through the global delayed queue lets unrelated
-    // catalog traffic postpone observing a durable commit for an unbounded
-    // wall-clock interval.
-    if join_publication_now {
+        .is_some_and(|publication| publication.task.is_finished())
+    {
         let publication = work
             .publishing
             .take()
-            .expect("publication selected for joining remains installed");
+            .expect("finished publication remains installed");
         let InFlightPublication {
             current,
             barrier,
@@ -1140,7 +1120,7 @@ async fn advance_catch_up(
             admission,
             task,
         } = publication;
-        match await_with_builder_heartbeats(&work.progress, task.join()).await {
+        match task.join().await {
             Ok(Ok(published)) => {
                 if catch_up::published_candidate_requires_locator_maintenance(&work, &published)? {
                     work.progress.complete();
@@ -1205,6 +1185,15 @@ async fn advance_catch_up(
                 ));
             }
         }
+    }
+    if work.publishing.is_some()
+        && work.atomic_projection.is_none()
+        && work
+            .active
+            .as_ref()
+            .is_some_and(|active| active.builder.is_empty() && active.builder.frozen.is_none())
+    {
+        work.active = None;
     }
     if work.publishing.is_some() && work.active.is_none() {
         return Ok((

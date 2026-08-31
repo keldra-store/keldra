@@ -723,21 +723,35 @@ seconds and p95 4.96 seconds, but one sample reached 74.51 seconds; exact drain
 was 51.55 seconds. The archive SHA-256 is
 `12fbaae88f901bbcb9f69ed52db64c7af98d3f56a3f3d8e72843691bd6b7051d`.
 
-That trace places the outlier after durable publication, rather than inside the
-v4 merge work. The affected catch-up admitted one 271-record page, completed
-projection and assembly, and published revision 369 in 76.7 milliseconds. The
-publication completion event occurred at 02:08:02.088. The same physical
-builder did not finish its catch-up progress span until 02:09:20.144: 78.056
-seconds in which the already-completed owned publication was not observed.
+The publication completion appeared 78.056 seconds before the logical catch-up
+progress span ended. An initial interpretation blamed completion polling
+through the global builder delayed queue. Candidate `931f46e6728d` changed an
+otherwise-idle builder to join its owned publication directly and repeated the
+exact ten-minute cell. That experiment falsified the interpretation: it again
+accepted all 59,994 mutations at 99.99 operations/s, completed all 40,320
+queries with zero errors, and returned exact results for all 640 definitions,
+but one of 94 visibility samples still reached 76.35 seconds. Query p99 was
+719.87 milliseconds and drain was 52.37 seconds. The archive SHA-256 is
+`cc518777878e7f295f7687a13c8d315f42c584bda23e9b6263e3fcb493e7222a`.
+The speculative join change was consequently removed rather than retained as
+an unproven scheduler workaround.
 
-The control-flow cause was completion polling through the global builder
-delayed queue. `enqueue_candidate_publication` detached an owned publication
-task and returned a 10-millisecond retry. Even when the builder had released
-its active buffer and had no projection work it could overlap, only a later
-global scheduler turn joined that task. Sustained catalog and builder traffic
-could therefore postpone recognizing an already durable commit by an
-unbounded wall-clock interval. The correction preserves useful overlap while a
-builder has buffered or atomic work, but when publication is the builder's only
-remaining progress it joins that exact owned task directly under builder
-heartbeats. This correction requires a same-candidate sustained SSD rerun; the
-targeted failed result remains evidence, not a post-fix pass.
+The corrected reading is that one `BuilderProgress` object spans multiple
+admitted scheduler turns. Publication revision 369 completed early, after
+which the same catch-up state entered v4 mandatory maintenance before it could
+advance or close the span. The exact comparison run stayed in ordinary
+one-to-two-second, approximately 100-record turns during sustained ingestion.
+At the end of the run it hit the v4 segment/locator bound: one maintenance turn
+took 30.000 seconds while processing 344 records, the following turn consumed
+the resulting 10,349-record backlog in 23.984 seconds, and a final zero-record
+maintenance turn took 19.462 seconds. Those three turns account for the
+visibility tail. This is why publication could be fast and the encompassing
+catch-up span could still remain open for tens of seconds.
+
+The discrete failure and the physical-amplification evidence therefore have
+one architectural root: v4 eventually must read and rewrite accumulated
+segment/locator state before source intake can proceed. Avoiding normal merge
+debt on the journal critical path cannot avoid a hard segment/locator bound.
+The final correction is not another timeout, lane, or wakeup rule; it is the v5
+stable-key, changed-component-only stream and bounded path-copy generation
+specified by KELDRA-0020.

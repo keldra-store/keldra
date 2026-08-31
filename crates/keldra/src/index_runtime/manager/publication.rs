@@ -128,15 +128,6 @@ impl<T> Drop for AbortOnDropTask<T> {
     }
 }
 
-pub(super) const fn publication_join_required(
-    publishing: bool,
-    has_active_projection: bool,
-    has_atomic_projection: bool,
-    publication_finished: bool,
-) -> bool {
-    publishing && (publication_finished || (!has_active_projection && !has_atomic_projection))
-}
-
 pub(super) fn start_candidate_publication(
     definition: CatalogDefinition,
     kind: IndexKind,

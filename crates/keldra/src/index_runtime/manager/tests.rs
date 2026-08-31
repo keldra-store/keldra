@@ -23,15 +23,6 @@ fn publication_progress_is_narrow_and_compaction_stays_bounded() {
 }
 
 #[test]
-fn idle_builder_joins_its_owned_publication_without_scheduler_polling() {
-    assert!(publication_join_required(true, false, false, false));
-    assert!(publication_join_required(true, true, false, true));
-    assert!(!publication_join_required(true, true, false, false));
-    assert!(!publication_join_required(true, false, true, false));
-    assert!(!publication_join_required(false, false, false, true));
-}
-
-#[test]
 fn journal_catch_up_never_waits_for_normal_merge_debt() {
     assert!(!catch_up::should_compact_before_catch_up(false, 0, 0));
     assert!(!catch_up::should_compact_before_catch_up(
