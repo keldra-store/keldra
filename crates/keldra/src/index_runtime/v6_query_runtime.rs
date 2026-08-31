@@ -14,13 +14,14 @@ use keldra_index::IndexError;
 use keldra_index::typed_json::{AggregateOperation, FieldSchema, FieldType, ScalarValue};
 use keldra_index::v6::{
     AuthorizedQueryCandidate, LogicalFieldBinding, LogicalProjectionBinding,
-    PinnedPartitionQueryRoot, ProjectionCatalogActivation, ProjectionFamilyPartitionDirectory,
-    ProjectionGenerationHeader, ProjectionPartitionIdentity, QueryAdmissionContext,
-    QueryArtifactKind, QueryArtifactLoad, QueryArtifactLoader, QueryBlockCredits, QueryBlockLimits,
-    QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits, QueryFieldBinding,
-    QueryMemoryPermit, QueryRootCutProof, RecipeIdentity, TypedJsonQueryRequest,
-    decode_projection_generation_header, execute_typed_json_query, projection_generation_path,
-    projection_query_run_pack_path, projection_query_run_stream_page_path,
+    MAX_QUERY_CANDIDATE_ADMISSION_BATCH, PinnedPartitionQueryRoot, ProjectionCatalogActivation,
+    ProjectionFamilyPartitionDirectory, ProjectionGenerationHeader, ProjectionPartitionIdentity,
+    QueryAdmissionContext, QueryArtifactKind, QueryArtifactLoad, QueryArtifactLoader,
+    QueryBlockCredits, QueryBlockLimits, QueryCandidateAdmission, QueryCommonCut,
+    QueryExecutionLimits, QueryFieldBinding, QueryMemoryPermit, QueryRootCutProof, RecipeIdentity,
+    TypedJsonQueryRequest, decode_projection_generation_header, execute_typed_json_query,
+    projection_generation_path, projection_query_run_pack_path,
+    projection_query_run_stream_page_path,
 };
 use keldra_store::{BlobRef, ObjectKey, PlacementLogId};
 use tonic::Status;
@@ -708,44 +709,70 @@ struct RuntimeCandidateAdmission {
 }
 
 impl QueryCandidateAdmission for RuntimeCandidateAdmission {
-    fn admit_exact_current_authorized(
+    fn admit_exact_current_authorized_batch(
         &mut self,
-        context: QueryAdmissionContext,
-    ) -> impl std::future::Future<Output = Result<Option<AuthorizedQueryCandidate>, IndexError>> + Send
-    {
+        contexts: Vec<QueryAdmissionContext>,
+    ) -> impl std::future::Future<Output = Result<Vec<Option<AuthorizedQueryCandidate>>, IndexError>>
+    + Send {
         async move {
-            let identity = IndexCandidateIdentity {
-                source_path: context.candidate.source_path.clone(),
-                source_version: context.candidate.current_source_version,
-                result: IndexQueryHit {
-                    address: Some(ObjectAddress {
-                        tenant: self.storage_tenant.clone(),
-                        bucket: self.bucket.clone(),
-                        path: context.candidate.result_path.clone(),
-                    }),
-                    object_version: context.candidate.result_version,
-                    score: None,
-                },
-            };
-            let CandidateVisibilityEvidence {
-                visible,
-                authorization_revision,
-                ..
-            } = self
-                .visibility
-                .evaluate(std::slice::from_ref(&identity))
-                .await
-                .map_err(|error| IndexError::Io(error.to_string()))?;
-            if authorization_revision != self.authorization_revision || visible.len() != 1 {
-                return Err(IndexError::Integrity);
+            if contexts.is_empty() || contexts.len() > MAX_QUERY_CANDIDATE_ADMISSION_BATCH {
+                return Err(IndexError::InvalidQuery(
+                    "v6 candidate admission batch is empty or exceeds its bound".into(),
+                ));
             }
-            let result_path = context.candidate.result_path.clone();
-            let result_version = context.candidate.result_version;
-            Ok(visible[0].then(|| AuthorizedQueryCandidate {
-                candidate: context.candidate,
-                result_path,
-                result_version,
-            }))
+            let mut output = Vec::with_capacity(contexts.len());
+            let mut contexts = contexts.into_iter();
+            loop {
+                let batch = contexts
+                    .by_ref()
+                    .take(MAX_QUERY_CANDIDATE_ADMISSION_BATCH)
+                    .collect::<Vec<_>>();
+                if batch.is_empty() {
+                    break;
+                }
+                let identities = batch
+                    .iter()
+                    .map(|context| IndexCandidateIdentity {
+                        source_path: context.candidate.source_path.clone(),
+                        source_version: context.candidate.current_source_version,
+                        result: IndexQueryHit {
+                            address: Some(ObjectAddress {
+                                tenant: self.storage_tenant.clone(),
+                                bucket: self.bucket.clone(),
+                                path: context.candidate.result_path.clone(),
+                            }),
+                            object_version: context.candidate.result_version,
+                            score: None,
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                let CandidateVisibilityEvidence {
+                    visible,
+                    authorization_revision,
+                    ..
+                } = self
+                    .visibility
+                    .evaluate(&identities)
+                    .await
+                    .map_err(|error| IndexError::Io(error.to_string()))?;
+                if authorization_revision != self.authorization_revision
+                    || visible.len() != batch.len()
+                {
+                    return Err(IndexError::Integrity);
+                }
+                output.extend(batch.into_iter().zip(visible).map(|(context, visible)| {
+                    visible.then(|| {
+                        let result_path = context.candidate.result_path.clone();
+                        let result_version = context.candidate.result_version;
+                        AuthorizedQueryCandidate {
+                            candidate: context.candidate,
+                            result_path,
+                            result_version,
+                        }
+                    })
+                }));
+            }
+            Ok(output)
         }
     }
 }
@@ -1005,6 +1032,7 @@ fn index_status(error: IndexError) -> Status {
 mod tests {
     use super::*;
     use keldra_index::v6::{ProjectionQueryStreamRoot, QueryAdmissionCandidate, StableDocumentKey};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn partition(producer: u64, placement_index: u64) -> ProjectionPartitionIdentity {
         ProjectionPartitionIdentity::new([1; 32], 7, [2; 32], producer, 3, placement_index).unwrap()
@@ -1105,6 +1133,7 @@ mod tests {
             &self,
             candidates: &[IndexCandidateIdentity],
         ) -> Result<CandidateVisibilityEvidence, Status> {
+            assert_eq!(candidates.len(), 1);
             assert_eq!(candidates[0].source_path, "sources/a");
             assert_eq!(candidates[0].source_version, 12);
             assert_eq!(
@@ -1131,19 +1160,82 @@ mod tests {
             authorization_revision: 4,
         };
         let admitted = admission
-            .admit_exact_current_authorized(QueryAdmissionContext {
+            .admit_exact_current_authorized_batch(vec![QueryAdmissionContext {
                 logical_index_id: 1,
                 logical_definition_version: 2,
                 common_cut: QueryCommonCut {
                     through_atomic_position: 9,
                 },
                 candidate,
-            })
+            }])
             .await
             .unwrap()
+            .pop()
             .unwrap();
+        let admitted = admitted.unwrap();
         assert_eq!(admitted.result_path, "results/a");
         assert_eq!(admitted.result_version, 15);
+    }
+
+    struct BatchVisibility {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl IndexCandidateVisibility for BatchVisibility {
+        async fn evaluate(
+            &self,
+            candidates: &[IndexCandidateIdentity],
+        ) -> Result<CandidateVisibilityEvidence, Status> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(candidates.len(), 64);
+            Ok(CandidateVisibilityEvidence {
+                visible: (0..candidates.len()).map(|index| index % 3 != 1).collect(),
+                authorization_revision: 4,
+                denied: 21,
+                stale: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_batches_sixty_four_candidates_once_and_preserves_denial_alignment() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut admission = RuntimeCandidateAdmission {
+            visibility: Arc::new(BatchVisibility {
+                calls: calls.clone(),
+            }),
+            storage_tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            authorization_revision: 4,
+        };
+        let contexts = (0..64u8)
+            .map(|index| QueryAdmissionContext {
+                logical_index_id: 1,
+                logical_definition_version: 2,
+                common_cut: QueryCommonCut {
+                    through_atomic_position: 9,
+                },
+                candidate: authorized(index + 1, &format!("candidate-{index}")).candidate,
+            })
+            .collect();
+        let admitted = admission
+            .admit_exact_current_authorized_batch(contexts)
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(admitted.len(), 64);
+        for (index, candidate) in admitted.into_iter().enumerate() {
+            if index % 3 == 1 {
+                assert!(candidate.is_none());
+            } else {
+                assert_eq!(
+                    candidate.unwrap().candidate.document.bytes(),
+                    [(index + 1) as u8; 32]
+                );
+            }
+        }
     }
 
     #[test]

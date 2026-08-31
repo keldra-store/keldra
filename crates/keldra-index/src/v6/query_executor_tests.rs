@@ -243,6 +243,119 @@ fn handoff_replacement_owns_exactly_one_candidate_charge() {
     );
 }
 
+struct BatchAdmission {
+    calls: usize,
+    reorder: bool,
+}
+
+impl QueryCandidateAdmission for BatchAdmission {
+    fn admit_exact_current_authorized_batch(
+        &mut self,
+        contexts: Vec<QueryAdmissionContext>,
+    ) -> impl std::future::Future<Output = Result<Vec<Option<AuthorizedQueryCandidate>>, IndexError>>
+    + Send {
+        self.calls += 1;
+        let reorder = self.reorder;
+        async move {
+            let mut output = contexts
+                .into_iter()
+                .enumerate()
+                .map(|(index, context)| {
+                    (index % 3 != 1).then(|| AuthorizedQueryCandidate {
+                        result_path: context.candidate.result_path.clone(),
+                        result_version: context.candidate.result_version,
+                        candidate: context.candidate,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if reorder {
+                output.swap(0, 2);
+            }
+            Ok(output)
+        }
+    }
+}
+
+fn selected_candidates(
+    count: u8,
+    credits: &mut QueryBlockCredits,
+    budget: &mut Budget,
+) -> BTreeMap<StableDocumentKey, QueryAdmissionCandidate> {
+    let mut selected = BTreeMap::new();
+    for index in 0..count {
+        let mut value = candidate(partition(1), u64::from(index) + 1);
+        value.document = StableDocumentKey::from_bytes([index + 1; 32]).unwrap();
+        value.source_path = format!("objects/source-{index}.json");
+        value.result_path = format!("objects/result-{index}.json");
+        select_handoff_candidate(&mut selected, value, credits, budget).unwrap();
+    }
+    selected
+}
+
+#[test]
+fn sixty_four_candidates_use_one_aligned_admission_batch_with_denials() {
+    let mut credits = credits(1024 * 1024);
+    let mut budget = budget();
+    let selected = selected_candidates(64, &mut credits, &mut budget);
+    let mut admission = BatchAdmission {
+        calls: 0,
+        reorder: false,
+    };
+    let (authorized, candidates) = ready(authorize_selected_candidates(
+        &mut admission,
+        selected,
+        1,
+        2,
+        QueryCommonCut {
+            through_atomic_position: 3,
+        },
+        &mut credits,
+        &mut budget,
+    ))
+    .unwrap();
+
+    assert_eq!(admission.calls, 1);
+    assert_eq!(authorized.len(), 43);
+    assert_eq!(candidates.len(), 43);
+    for candidate in candidates {
+        let index = usize::from(candidate.document.bytes()[0] - 1);
+        assert_ne!(index % 3, 1);
+        assert_eq!(
+            authorized
+                .get(&(candidate.partition, candidate.document))
+                .unwrap()
+                .candidate
+                .document,
+            candidate.document
+        );
+    }
+}
+
+#[test]
+fn reordered_admission_batch_is_rejected() {
+    let mut credits = credits(64 * 1024);
+    let mut budget = budget();
+    let selected = selected_candidates(3, &mut credits, &mut budget);
+    let mut admission = BatchAdmission {
+        calls: 0,
+        reorder: true,
+    };
+    assert!(matches!(
+        ready(authorize_selected_candidates(
+            &mut admission,
+            selected,
+            1,
+            2,
+            QueryCommonCut {
+                through_atomic_position: 3,
+            },
+            &mut credits,
+            &mut budget,
+        )),
+        Err(IndexError::Integrity)
+    ));
+}
+
 #[test]
 fn absent_predicate_matches_the_live_membership_universe_only() {
     let live = StableDocumentKey::from_bytes([1; 32]).unwrap();

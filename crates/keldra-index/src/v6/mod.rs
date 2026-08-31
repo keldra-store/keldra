@@ -85,11 +85,11 @@ pub use query_compaction::{ChargedQueryRunCompaction, compact_encoded_query_runs
 pub use query_credits::{QueryBlockCredits, QueryMemoryPermit};
 pub use query_doc_values::{decode_doc_value, encode_doc_value};
 pub use query_executor::{
-    AuthorizedQueryCandidate, PinnedPartitionQueryRoot, QueryAdmissionCandidate,
-    QueryAdmissionContext, QueryArtifactKind, QueryArtifactLoad, QueryArtifactLoader,
-    QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits, QueryFieldBinding,
-    QueryLoadEvidence, QueryRootCutProof, TypedJsonQueryRequest, TypedJsonQueryResult,
-    execute_typed_json_query,
+    AuthorizedQueryCandidate, MAX_QUERY_CANDIDATE_ADMISSION_BATCH, PinnedPartitionQueryRoot,
+    QueryAdmissionCandidate, QueryAdmissionContext, QueryArtifactKind, QueryArtifactLoad,
+    QueryArtifactLoader, QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits,
+    QueryFieldBinding, QueryLoadEvidence, QueryRootCutProof, TypedJsonQueryRequest,
+    TypedJsonQueryResult, execute_typed_json_query,
 };
 pub use query_gate::{
     MAX_QUERY_DOCUMENT_PATH_BYTES, QueryDocumentGate, decode_document_gate, encode_document_gate,

@@ -20,12 +20,15 @@ use super::{
 
 #[path = "query_executor_admission.rs"]
 mod admission;
-use admission::match_all_live_documents;
 pub use admission::{
-    AuthorizedQueryCandidate, PinnedPartitionQueryRoot, QueryAdmissionCandidate,
-    QueryAdmissionContext, QueryArtifactKind, QueryArtifactLoad, QueryCandidateAdmission,
-    QueryCommonCut, QueryRootCutProof,
+    AuthorizedQueryCandidate, MAX_QUERY_CANDIDATE_ADMISSION_BATCH, PinnedPartitionQueryRoot,
+    QueryAdmissionCandidate, QueryAdmissionContext, QueryArtifactKind, QueryArtifactLoad,
+    QueryCandidateAdmission, QueryCommonCut, QueryRootCutProof,
 };
+#[path = "query_executor_authorization.rs"]
+mod authorization;
+use admission::{match_all_live_documents, resident_gate_bytes, resident_selected_candidate_bytes};
+use authorization::authorize_selected_candidates;
 #[path = "query_executor_values.rs"]
 mod values;
 use values::{
@@ -446,43 +449,16 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
         budget.release_heap(block_credits, remaining_gate_bytes)?;
     }
 
-    let mut authorized = BTreeMap::new();
-    let mut candidates = Vec::new();
-    for candidate in selected.into_values() {
-        let selected_bytes = resident_selected_candidate_bytes(&candidate)?;
-        let context = QueryAdmissionContext {
-            logical_index_id: request.logical.logical_index_id,
-            logical_definition_version: request.logical.logical_definition_version,
-            common_cut,
-            candidate: candidate.clone(),
-        };
-        if let Some(admitted) = admission.admit_exact_current_authorized(context).await? {
-            admitted.validate_for(&candidate)?;
-            budget.reserve_heap(
-                block_credits,
-                std::mem::size_of::<AuthorizedQueryCandidate>()
-                    .checked_add(std::mem::size_of::<QueryCandidate>())
-                    .and_then(|bytes| {
-                        bytes.checked_add(std::mem::size_of::<(
-                            ProjectionPartitionIdentity,
-                            StableDocumentKey,
-                        )>())
-                    })
-                    .and_then(|bytes| bytes.checked_add(admitted.result_path.len()))
-                    .and_then(|bytes| bytes.checked_add(candidate.source_path.len()))
-                    .and_then(|bytes| bytes.checked_add(candidate.result_path.len()))
-                    .ok_or(IndexError::OffsetOverflow)?,
-            )?;
-            let key = (candidate.partition, candidate.document);
-            authorized.insert(key, admitted);
-            candidates.push(QueryCandidate {
-                partition: candidate.partition,
-                document: candidate.document,
-                material_source_version: candidate.material_source_version,
-            });
-        }
-        budget.release_heap(block_credits, selected_bytes)?;
-    }
+    let (mut authorized, mut candidates) = authorize_selected_candidates(
+        admission,
+        selected,
+        request.logical.logical_index_id,
+        request.logical.logical_definition_version,
+        common_cut,
+        block_credits,
+        &mut budget,
+    )
+    .await?;
 
     let needed_values = requested_value_recipes(request, &contracts)?;
     let mut values = BTreeMap::new();
@@ -1159,24 +1135,6 @@ fn select_handoff_candidate(
         }
     }
     Ok(())
-}
-
-fn resident_gate_bytes(gate: &QueryDocumentGate) -> Result<usize, IndexError> {
-    std::mem::size_of::<StableDocumentKey>()
-        .checked_add(std::mem::size_of::<QueryDocumentGate>())
-        .and_then(|bytes| bytes.checked_add(gate.source_path.as_ref().map_or(0, String::len)))
-        .and_then(|bytes| bytes.checked_add(gate.result_path.as_ref().map_or(0, String::len)))
-        .ok_or(IndexError::OffsetOverflow)
-}
-
-fn resident_selected_candidate_bytes(
-    candidate: &QueryAdmissionCandidate,
-) -> Result<usize, IndexError> {
-    std::mem::size_of::<StableDocumentKey>()
-        .checked_add(std::mem::size_of::<QueryAdmissionCandidate>())
-        .and_then(|bytes| bytes.checked_add(candidate.source_path.len()))
-        .and_then(|bytes| bytes.checked_add(candidate.result_path.len()))
-        .ok_or(IndexError::OffsetOverflow)
 }
 
 fn replace_selected_candidate_charge(

@@ -126,13 +126,44 @@ pub struct QueryAdmissionContext {
     pub candidate: QueryAdmissionCandidate,
 }
 
-/// Runtime trust-boundary admission. `None` means either not exact-current or
-/// unauthorized; the executor deliberately does not distinguish those cases.
+pub const MAX_QUERY_CANDIDATE_ADMISSION_BATCH: usize = 256;
+
+pub(super) fn resident_gate_bytes(gate: &QueryDocumentGate) -> Result<usize, IndexError> {
+    std::mem::size_of::<StableDocumentKey>()
+        .checked_add(std::mem::size_of::<QueryDocumentGate>())
+        .and_then(|bytes| bytes.checked_add(gate.source_path.as_ref().map_or(0, String::len)))
+        .and_then(|bytes| bytes.checked_add(gate.result_path.as_ref().map_or(0, String::len)))
+        .ok_or(IndexError::OffsetOverflow)
+}
+
+pub(super) fn resident_selected_candidate_bytes(
+    candidate: &QueryAdmissionCandidate,
+) -> Result<usize, IndexError> {
+    std::mem::size_of::<StableDocumentKey>()
+        .checked_add(std::mem::size_of::<QueryAdmissionCandidate>())
+        .and_then(|bytes| bytes.checked_add(candidate.source_path.len()))
+        .and_then(|bytes| bytes.checked_add(candidate.result_path.len()))
+        .ok_or(IndexError::OffsetOverflow)
+}
+
+pub(super) fn resident_admission_context_bytes(
+    candidate: &QueryAdmissionCandidate,
+) -> Result<usize, IndexError> {
+    std::mem::size_of::<QueryAdmissionContext>()
+        .checked_add(candidate.source_path.len())
+        .and_then(|bytes| bytes.checked_add(candidate.result_path.len()))
+        .ok_or(IndexError::OffsetOverflow)
+}
+
+/// Runtime trust-boundary admission. Results are position-aligned with the
+/// bounded input. `None` means either not exact-current or unauthorized; the
+/// executor deliberately does not distinguish those cases.
 pub trait QueryCandidateAdmission: Send {
-    fn admit_exact_current_authorized(
+    fn admit_exact_current_authorized_batch(
         &mut self,
-        context: QueryAdmissionContext,
-    ) -> impl std::future::Future<Output = Result<Option<AuthorizedQueryCandidate>, IndexError>> + Send;
+        contexts: Vec<QueryAdmissionContext>,
+    ) -> impl std::future::Future<Output = Result<Vec<Option<AuthorizedQueryCandidate>>, IndexError>>
+    + Send;
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
