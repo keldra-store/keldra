@@ -407,9 +407,6 @@ impl Store {
                         item.operation.key().path(),
                     ));
                 }
-                if let Some(mutation) = value.mutation.as_ref() {
-                    self.stage_object_mutation_reference_proof(&mut batch, mutation)?;
-                }
             }
             evaluated.insert(
                 item.index,
@@ -419,6 +416,11 @@ impl Store {
                 }),
             );
         }
+        let proof_mutations = evaluated
+            .values()
+            .filter_map(|outcome| outcome.as_ref().ok()?.mutation.as_ref())
+            .collect::<Vec<_>>();
+        self.stage_object_mutation_reference_proofs(&mut batch, &proof_mutations)?;
         let evaluate_duration = evaluate_started.elapsed();
 
         let stage_started = std::time::Instant::now();

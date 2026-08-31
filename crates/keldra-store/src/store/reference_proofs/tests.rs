@@ -601,6 +601,76 @@ async fn coordinated_proof(store: &Store, path: &str, command: &str) -> Referenc
 }
 
 #[tokio::test]
+async fn batched_proof_staging_preserves_idempotency_and_conflict_atomicity() {
+    let (_temporary, source, replica) = stores().await;
+    let proofs = [
+        coordinated_proof(&source, "batch/first", "batch-first").await,
+        coordinated_proof(&source, "batch/second", "batch-second").await,
+        coordinated_proof(&source, "batch/third", "batch-third").await,
+        coordinated_proof(&source, "batch/fourth", "batch-fourth").await,
+    ];
+    let mutations = proofs
+        .iter()
+        .map(|proof| match &proof.mutation {
+            ReferenceProofMutation::Object(mutation) => mutation,
+            _ => unreachable!("coordinated puts produce object-mutation proofs"),
+        })
+        .collect::<Vec<_>>();
+
+    let mut initial = WriteBatch::default();
+    replica
+        .stage_object_mutation_reference_proofs(&mut initial, &mutations[..2])
+        .unwrap();
+    replica.db.write(initial).unwrap();
+    for proof in &proofs[..2] {
+        assert_eq!(
+            replica
+                .read_reference_proof(proof.source_id, proof.offset())
+                .unwrap(),
+            Some(proof.clone())
+        );
+    }
+
+    let mut replay = WriteBatch::default();
+    replica
+        .stage_object_mutation_reference_proofs(&mut replay, &mutations[..2])
+        .unwrap();
+    assert!(replay.is_empty());
+
+    let mut conflicting = (*mutations[3]).clone();
+    conflicting.command_id = "conflicting-fourth".into();
+    conflicting.input_fingerprint = [37; 32];
+    conflicting.set_computed_fingerprint();
+    conflicting.validate().unwrap();
+    let mut seed = WriteBatch::default();
+    replica
+        .stage_object_mutation_reference_proof(&mut seed, &conflicting)
+        .unwrap();
+    replica.db.write(seed).unwrap();
+
+    let mut rejected = WriteBatch::default();
+    assert_eq!(
+        replica.stage_object_mutation_reference_proofs(&mut rejected, &mutations[2..]),
+        Err(MutationError::ObjectMutationConflict)
+    );
+    assert!(!rejected.is_empty());
+    drop(rejected);
+    assert!(
+        replica
+            .read_reference_proof(proofs[2].source_id, proofs[2].offset())
+            .unwrap()
+            .is_none(),
+        "a staged prefix remains invisible when the rejected batch is dropped"
+    );
+    assert_eq!(
+        replica
+            .read_reference_proof(proofs[3].source_id, proofs[3].offset())
+            .unwrap(),
+        Some(proof_for_mutation(&conflicting).unwrap())
+    );
+}
+
+#[tokio::test]
 async fn prune_is_source_scoped_and_through_inclusive() {
     let temporary = tempfile::tempdir().unwrap();
     let first_source = Store::open(StoreOptions::new(temporary.path().join("first"), 1))

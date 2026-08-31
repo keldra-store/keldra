@@ -10,6 +10,7 @@ pub const MAX_REFERENCE_PROOF_EXPORT_RECORDS: u32 = 1_000;
 pub const MAX_REFERENCE_PROOF_EXPORT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_REFERENCE_PROOF_PRUNE_RECORDS: u32 = 1_000;
 pub const MAX_REFERENCE_PROOF_PRUNE_BYTES: u64 = 64 * 1024 * 1024;
+const REFERENCE_PROOF_KEYS_PER_MULTI_GET: usize = 256;
 
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ReferenceProofExportError {
@@ -373,6 +374,49 @@ impl Store {
     ) -> Result<bool, MutationError> {
         let expected = proof_for_mutation(mutation)?;
         self.stage_reference_proof_if_absent(batch, &expected)
+    }
+
+    pub(super) fn stage_object_mutation_reference_proofs(
+        &self,
+        batch: &mut WriteBatch,
+        mutations: &[&ObjectMutation],
+    ) -> Result<(), MutationError> {
+        let proofs = mutations
+            .iter()
+            .map(|mutation| proof_for_mutation(mutation))
+            .collect::<Result<Vec<_>, _>>()?;
+        let cf = self.cf(CF_LOCAL_INVALIDATIONS)?;
+        for chunk in proofs.chunks(REFERENCE_PROOF_KEYS_PER_MULTI_GET) {
+            let keys = chunk
+                .iter()
+                .map(|proof| reference_proof_key(proof.source_id, proof.offset()))
+                .collect::<Vec<_>>();
+            let fetched = self
+                .db
+                .multi_get_cf(keys.iter().map(|key| (cf, key.as_slice())));
+            if fetched.len() != chunk.len() {
+                return Err(MutationError::Storage(
+                    "reference-proof bulk lookup returned the wrong result count".into(),
+                ));
+            }
+            for ((proof, key), existing) in chunk.iter().zip(keys).zip(fetched) {
+                validate_stored_proof(proof).map_err(MutationError::InvalidObjectMutation)?;
+                match existing.map_err(storage_error)? {
+                    Some(encoded) => {
+                        let existing = decode_reference_proof(&encoded).map_err(storage_error)?;
+                        if existing != *proof {
+                            return Err(MutationError::ObjectMutationConflict);
+                        }
+                    }
+                    None => batch.put_cf(
+                        cf,
+                        key,
+                        encode_reference_proof(proof).map_err(storage_error)?,
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 }
 

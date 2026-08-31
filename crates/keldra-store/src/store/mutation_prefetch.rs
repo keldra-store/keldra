@@ -5,7 +5,9 @@
 //! enter the existing pending maps in input order and share the existing final
 //! `WriteBatch`.
 
+use super::object_alias_registry::decode_registry;
 use super::*;
+use crate::ObjectAliasRegistry;
 
 const PREFETCH_KEYS_PER_MULTI_GET: usize = 256;
 
@@ -18,6 +20,7 @@ pub(super) struct MutationReadCache {
     receipts: BTreeMap<Vec<u8>, Cached<StoredReceipt>>,
     blob_references: BTreeMap<Vec<u8>, Cached<BlobReferenceState>>,
     inline_payloads: BTreeMap<Vec<u8>, Cached<Vec<u8>>>,
+    alias_registries: BTreeMap<Vec<u8>, Cached<ObjectAliasRegistry>>,
     policies: BTreeMap<Vec<u8>, Result<BucketPolicy, MutationError>>,
     versioning: BTreeMap<Vec<u8>, Result<ObjectVersioning, MutationError>>,
 }
@@ -29,6 +32,7 @@ struct PrefetchMetrics {
     receipt_keys: u64,
     blob_reference_keys: u64,
     inline_payload_keys: u64,
+    alias_registry_keys: u64,
     policy_keys: u64,
     versioning_keys: u64,
     head_seconds: f64,
@@ -36,6 +40,7 @@ struct PrefetchMetrics {
     receipt_seconds: f64,
     blob_reference_seconds: f64,
     inline_payload_seconds: f64,
+    alias_registry_seconds: f64,
     policy_seconds: f64,
     versioning_seconds: f64,
 }
@@ -66,6 +71,18 @@ impl MutationReadCache {
         let (heads, elapsed) = multi_get_json::<Head>(store, CF_HEADS, &head_keys)?;
         metrics.head_keys = head_keys.len() as u64;
         metrics.head_seconds = elapsed;
+
+        let started = std::time::Instant::now();
+        let alias_registries = multi_get_raw(store, CF_OBJECT_ALIAS_REGISTRIES, &head_keys)?
+            .into_iter()
+            .map(|(key, cached)| {
+                let decoded = cached
+                    .and_then(|value| value.map(|encoded| decode_registry(&encoded)).transpose());
+                (key, decoded)
+            })
+            .collect();
+        metrics.alias_registry_keys = head_keys.len() as u64;
+        metrics.alias_registry_seconds = started.elapsed().as_secs_f64();
 
         let mut version_key_by_head = BTreeMap::new();
         let mut version_keys = BTreeSet::new();
@@ -173,6 +190,7 @@ impl MutationReadCache {
             receipts,
             blob_references,
             inline_payloads,
+            alias_registries,
             policies,
             versioning,
         })
@@ -206,6 +224,21 @@ impl MutationReadCache {
             .cloned()
     }
 
+    pub(super) fn alias_registry(
+        &self,
+        head_key: &[u8],
+        canonical_path: &str,
+    ) -> Option<Cached<ObjectAliasRegistry>> {
+        self.alias_registries.get(head_key).cloned().map(|cached| {
+            cached.and_then(|registry| {
+                if let Some(registry) = registry.as_ref() {
+                    registry.validate(canonical_path)?;
+                }
+                Ok(registry)
+            })
+        })
+    }
+
     pub(super) fn seed_bucket_settings(
         &self,
         policies: &mut BTreeMap<Vec<u8>, Result<BucketPolicy, MutationError>>,
@@ -232,6 +265,8 @@ impl PrefetchMetrics {
                 self.blob_reference_keys,
             monotonic_counter.keldra_store_bulk_prefetch_inline_payload_keys_total =
                 self.inline_payload_keys,
+            monotonic_counter.keldra_store_bulk_prefetch_alias_registry_keys_total =
+                self.alias_registry_keys,
             monotonic_counter.keldra_store_bulk_prefetch_policy_keys_total = self.policy_keys,
             monotonic_counter.keldra_store_bulk_prefetch_versioning_keys_total =
                 self.versioning_keys,
@@ -242,6 +277,8 @@ impl PrefetchMetrics {
                 self.blob_reference_seconds,
             histogram.keldra_store_bulk_prefetch_inline_payloads_duration_seconds =
                 self.inline_payload_seconds,
+            histogram.keldra_store_bulk_prefetch_alias_registries_duration_seconds =
+                self.alias_registry_seconds,
             histogram.keldra_store_bulk_prefetch_policies_duration_seconds = self.policy_seconds,
             histogram.keldra_store_bulk_prefetch_versioning_duration_seconds =
                 self.versioning_seconds,

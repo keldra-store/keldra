@@ -1572,7 +1572,10 @@ impl Store {
                 "protected alias descriptors must be mutated through sealed link authority".into(),
             ));
         }
-        let alias_registry = self.alias_registry_locked(operation.identity(), key.path())?;
+        let alias_registry = match read_cache.alias_registry(&encoded_key, key.path()) {
+            Some(cached) => cached?,
+            None => self.alias_registry_locked(operation.identity(), key.path())?,
+        };
         let alias_snapshot = match alias_registry {
             Some(registry) => {
                 if matches!(operation, PreparedOperation::Delete { .. }) {
