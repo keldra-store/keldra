@@ -1,7 +1,6 @@
 //! Format-v6 local query execution over one verified family root vector.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,6 +150,7 @@ impl V6LocalIndexQueryExecutor {
         };
         let mut loader = RuntimeArtifactLoader::new(
             self.reader.clone(),
+            self.projections.clone(),
             request.storage_tenant.clone(),
             request.definition.bucket.clone(),
             request.tenant_id,
@@ -601,6 +601,7 @@ struct PinnedRootVector {
 
 struct RuntimeArtifactLoader {
     reader: ClusterObjectReader,
+    projections: V6ProjectionPublisher,
     storage_tenant: String,
     bucket: String,
     tenant_id: u64,
@@ -612,6 +613,7 @@ struct RuntimeArtifactLoader {
 impl RuntimeArtifactLoader {
     fn new(
         reader: ClusterObjectReader,
+        projections: V6ProjectionPublisher,
         storage_tenant: String,
         bucket: String,
         tenant_id: u64,
@@ -620,6 +622,7 @@ impl RuntimeArtifactLoader {
     ) -> Self {
         Self {
             reader,
+            projections,
             storage_tenant,
             bucket,
             tenant_id,
@@ -678,20 +681,11 @@ impl QueryArtifactLoader for RuntimeArtifactLoader {
             if blob.length != request.encoded_bytes as u64 {
                 return Err(IndexError::Integrity);
             }
-            let mut payload = self
-                .reader
-                .open_blob_payload(&blob)
+            let bytes = self
+                .projections
+                .read_blob_local_first(&blob, request.encoded_bytes)
                 .await
                 .map_err(|error| IndexError::Io(error.to_string()))?;
-            let mut bytes = Vec::with_capacity(request.encoded_bytes);
-            payload
-                .by_ref()
-                .take(request.encoded_bytes as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|error| IndexError::Io(error.to_string()))?;
-            if bytes.len() != request.encoded_bytes {
-                return Err(IndexError::Integrity);
-            }
             Ok(bytes)
         }
     }

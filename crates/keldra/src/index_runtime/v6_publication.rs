@@ -26,7 +26,7 @@ use keldra_index::v6::{
     projection_query_run_pack_path, projection_query_run_stream_page_path, projection_routing_id,
     projection_stream_page_path,
 };
-use keldra_store::{BlobRef, ObjectKey, Store, VersionId};
+use keldra_store::{BlobRef, MutationError, ObjectKey, Store, VersionId};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
@@ -1123,18 +1123,13 @@ impl V6ProjectionPublisher {
     ) -> Result<Option<(Vec<u8>, VersionId)>, Status> {
         let key = ObjectKey::new(storage_tenant, bucket, path)
             .map_err(|error| Status::internal(error.to_string()))?;
-        let Some(mut opened) = self
-            .reader
-            .open_stable(&key, tenant_id, bucket_id, None)
-            .await?
-        else {
+        let Some(version) = self.reader.head_stable(&key, tenant_id, bucket_id).await? else {
             return Ok(None);
         };
-        if opened.version.deleted {
+        if version.deleted {
             return Err(Status::data_loss("v6 projection artifact is deleted"));
         }
-        let blob = opened
-            .version
+        let blob = version
             .blob
             .as_ref()
             .ok_or_else(|| Status::data_loss("v6 projection artifact has no blob"))?;
@@ -1143,22 +1138,59 @@ impl V6ProjectionPublisher {
                 "v6 projection path and payload hash differ",
             ));
         }
-        let mut payload = opened
-            .payload
-            .take()
-            .ok_or_else(|| Status::data_loss("v6 projection artifact has no payload"))?;
-        let mut bytes = Vec::new();
-        payload
-            .by_ref()
-            .take(maximum_bytes as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| Status::internal(format!("read v6 projection artifact: {error}")))?;
+        let bytes = self.read_blob_local_first(blob, maximum_bytes).await?;
+        Ok(Some((bytes, version.id)))
+    }
+
+    /// Reads an immutable artifact from the local integrated blob store when
+    /// present, reconstructing it from peers only when this node lacks it.
+    pub(crate) async fn read_blob_local_first(
+        &self,
+        blob: &BlobRef,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, Status> {
+        if blob.length > maximum_bytes as u64 {
+            return Err(Status::data_loss(
+                "v6 projection artifact violates its exact byte bound",
+            ));
+        }
+        let read_limit = u64::try_from(maximum_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut bytes = Vec::with_capacity(blob.length as usize);
+        match self.store.open_blob(blob).await {
+            Ok(mut payload) => {
+                let mut chunk = [0_u8; 8 * 1024];
+                while bytes.len() < blob.length as usize {
+                    let read = payload.read(&mut chunk).await.map_err(|error| {
+                        Status::internal(format!("read local v6 projection artifact: {error}"))
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                }
+            }
+            Err(MutationError::BlobNotFound) => {
+                let mut payload = self.reader.open_blob_payload(blob).await?;
+                payload
+                    .by_ref()
+                    .take(read_limit)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| {
+                        Status::internal(format!(
+                            "read distributed v6 projection artifact: {error}"
+                        ))
+                    })?;
+            }
+            Err(error) => return Err(Status::unavailable(error.to_string())),
+        }
         if bytes.len() > maximum_bytes || bytes.len() as u64 != blob.length {
             return Err(Status::data_loss(
                 "v6 projection artifact violates its exact byte bound",
             ));
         }
-        Ok(Some((bytes, opened.version.id)))
+        Ok(bytes)
     }
 }
 
