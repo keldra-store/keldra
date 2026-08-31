@@ -3,6 +3,7 @@
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::DistributedEvaluationContext;
+use super::single_node_group_commit::{SingleNodeOperations, SingleNodeOutcomes};
 use super::*;
 use crate::model::{CoordinatedObjectMutation, ObjectMutationContext, ObjectMutationGovernance};
 use crate::{BatchOperation, DefinitionMutationIntent};
@@ -11,6 +12,11 @@ struct PreparedDistributedMutation {
     index: usize,
     operation: PreparedOperation,
     definition_intent: Option<DefinitionMutationIntent>,
+}
+
+struct CoordinatedBatchEvaluation {
+    outcomes: Vec<Result<CoordinatedObjectMutation, MutationError>>,
+    receipt_capacity_at: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -32,12 +38,18 @@ impl Store {
         )>,
         context: ObjectMutationContext,
     ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
-        self.coordinate_mutation_batch(
-            operations,
-            context,
-            CoordinatorBatchPayloadPreparation::Distributed,
-        )
-        .await
+        let evaluated = self
+            .coordinate_mutation_batch(
+                operations,
+                context,
+                CoordinatorBatchPayloadPreparation::Distributed,
+            )
+            .await?;
+        if evaluated.receipt_capacity_at.is_some() {
+            Err(MutationError::ReceiptCapacity)
+        } else {
+            Ok(evaluated.outcomes)
+        }
     }
 
     /// Coordinate one independently receipted batch when the serving topology
@@ -51,19 +63,66 @@ impl Store {
     /// rules.
     pub async fn coordinate_single_node_mutation_batch(
         &self,
-        operations: Vec<(
-            BatchOperation,
-            ObjectMutationGovernance,
-            Option<DefinitionMutationIntent>,
-        )>,
+        operations: SingleNodeOperations,
         context: ObjectMutationContext,
     ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
-        self.coordinate_mutation_batch(
-            operations,
-            context,
-            CoordinatorBatchPayloadPreparation::SingleNode,
-        )
-        .await
+        if operations.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.single_node_group_commit
+            .submit(self.clone(), operations, context)
+            .await
+    }
+
+    pub(super) async fn coordinate_single_node_mutation_group(
+        &self,
+        operations: SingleNodeOperations,
+        context: ObjectMutationContext,
+        request_operation_counts: &[usize],
+    ) -> Vec<SingleNodeOutcomes> {
+        let total = operations.len();
+        let evaluated = self
+            .coordinate_mutation_batch(
+                operations,
+                context,
+                CoordinatorBatchPayloadPreparation::SingleNode,
+            )
+            .await;
+        let mut evaluated = match evaluated {
+            Ok(evaluated) => evaluated,
+            Err(error) => {
+                return request_operation_counts
+                    .iter()
+                    .map(|_| Err(error.clone()))
+                    .collect();
+            }
+        };
+        if request_operation_counts.iter().sum::<usize>() != total {
+            return request_operation_counts
+                .iter()
+                .map(|_| {
+                    Err(MutationError::Storage(
+                        "single-node group boundary is inconsistent".into(),
+                    ))
+                })
+                .collect();
+        }
+        let mut responses = Vec::with_capacity(request_operation_counts.len());
+        let mut start = 0;
+        for count in request_operation_counts {
+            let end = start + count;
+            let outcomes = evaluated.outcomes.drain(..*count).collect();
+            if evaluated
+                .receipt_capacity_at
+                .is_some_and(|capacity| capacity < end)
+            {
+                responses.push(Err(MutationError::ReceiptCapacity));
+            } else {
+                responses.push(Ok(outcomes));
+            }
+            start = end;
+        }
+        responses
     }
 
     async fn coordinate_mutation_batch(
@@ -75,14 +134,17 @@ impl Store {
         )>,
         context: ObjectMutationContext,
         payload_preparation: CoordinatorBatchPayloadPreparation,
-    ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
+    ) -> Result<CoordinatedBatchEvaluation, MutationError> {
         if context.serving_fence_term == 0 {
             return Err(MutationError::InvalidObjectMutation(
                 "serving-fence term must be non-zero".into(),
             ));
         }
         if operations.is_empty() {
-            return Ok(Vec::new());
+            return Ok(CoordinatedBatchEvaluation {
+                outcomes: Vec::new(),
+                receipt_capacity_at: None,
+            });
         }
 
         let total = operations.len();
@@ -212,6 +274,7 @@ impl Store {
         let mut high_watermark = None;
         let mut evaluated = BTreeMap::new();
         let mut receipt_capacity_exhausted = false;
+        let mut receipt_capacity_at = None;
 
         for item in &prepared {
             let outcome = self
@@ -243,6 +306,7 @@ impl Store {
                 .is_err_and(|error| matches!(error, MutationError::ReceiptCapacity))
             {
                 receipt_capacity_exhausted = true;
+                receipt_capacity_at = Some(item.index);
                 break;
             }
             if let Ok(value) = &outcome {
@@ -315,20 +379,24 @@ impl Store {
             }
             self.notify_local_invalidations();
         }
-        if receipt_capacity_exhausted {
-            return Err(MutationError::ReceiptCapacity);
-        }
-
         let mut outcomes = Vec::with_capacity(total);
         for index in 0..total {
-            outcomes.push(match evaluated.remove(&index) {
-                Some(outcome) => outcome,
-                None => Err(early.remove(&index).ok_or_else(|| {
-                    MutationError::Storage("distributed batch outcome index is inconsistent".into())
-                })?),
+            outcomes.push(if let Some(outcome) = evaluated.remove(&index) {
+                outcome
+            } else if let Some(error) = early.remove(&index) {
+                Err(error)
+            } else if receipt_capacity_exhausted {
+                Err(MutationError::ReceiptCapacity)
+            } else {
+                return Err(MutationError::Storage(
+                    "distributed batch outcome index is inconsistent".into(),
+                ));
             });
         }
-        Ok(outcomes)
+        Ok(CoordinatedBatchEvaluation {
+            outcomes,
+            receipt_capacity_at,
+        })
     }
 
     async fn prepare_single_node_coordinated(

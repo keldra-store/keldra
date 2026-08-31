@@ -376,6 +376,7 @@ pub struct Store {
     /// Exact-path locks owned only by the nominated atomic-program executor.
     pub(crate) program_locks: LocalLockManager,
     pub(crate) commit_lock: Arc<tokio::sync::Mutex<()>>,
+    single_node_group_commit: single_node_group_commit::SingleNodeGroupCommit,
     pub(crate) policy_gate: Arc<tokio::sync::RwLock<()>>,
     pub(crate) authz_write_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) bucket_options_lock: Arc<std::sync::Mutex<()>>,
@@ -999,6 +1000,7 @@ impl Store {
             ordinary_locks: LocalLockManager::default(),
             program_locks: LocalLockManager::default(),
             commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            single_node_group_commit: single_node_group_commit::SingleNodeGroupCommit::default(),
             policy_gate: Arc::new(tokio::sync::RwLock::new(())),
             authz_write_lock: Arc::new(std::sync::Mutex::new(())),
             bucket_options_lock: Arc::new(std::sync::Mutex::new(())),
@@ -1441,6 +1443,7 @@ mod mutation_types;
 mod mutation_unary;
 mod mutations;
 mod options;
+mod single_node_group_commit;
 use mutation_fingerprint::*;
 mod object_alias_registry;
 mod object_mutation_replica_batch;
