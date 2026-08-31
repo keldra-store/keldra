@@ -80,11 +80,13 @@ pub struct IndexingMemoryPermit {
 impl IndexingMemoryPermit {
     /// Exact admission held by this permit. Consumers may subdivide it, but
     /// cannot grow it without returning to `IndexingMemoryCredits`.
-    pub(crate) const fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.bytes
     }
 
-    fn shrink_to(&mut self, bytes: usize) -> Result<(), IndexError> {
+    /// Release construction headroom after the retained value's exact size is
+    /// known. The permit remains charged to its original stage.
+    pub fn shrink_to(&mut self, bytes: usize) -> Result<(), IndexError> {
         if bytes > self.bytes {
             return Err(IndexError::InvalidDefinition(
                 "indexing memory permit cannot grow without admission".into(),
@@ -809,6 +811,48 @@ mod tests {
         );
         drop(charged);
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn construction_permit_releases_unused_headroom() {
+        let memory = credits(4096);
+        let mut permit = memory
+            .acquire(IndexingMemoryStage::ReplayInput, 4096)
+            .unwrap();
+
+        permit.shrink_to(37).unwrap();
+
+        assert_eq!(permit.bytes(), 37);
+        assert_eq!(memory.used_bytes(), 37);
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::ReplayInput),
+            37
+        );
+        assert!(permit.shrink_to(38).is_err());
+        assert_eq!(memory.used_bytes(), 37);
+    }
+
+    #[test]
+    fn many_small_values_do_not_retain_their_construction_reservations() {
+        let memory = credits(4096);
+        let _long_lived_pipeline_state = memory
+            .acquire(IndexingMemoryStage::OrderingCatalog, 2048)
+            .unwrap();
+        let mut retained = Vec::new();
+
+        for _ in 0..100 {
+            let mut permit = memory
+                .acquire(IndexingMemoryStage::ReplayInput, 1024)
+                .unwrap();
+            permit.shrink_to(8).unwrap();
+            retained.push(permit);
+        }
+
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::ReplayInput),
+            800
+        );
+        assert_eq!(memory.used_bytes(), 2848);
     }
 
     #[test]

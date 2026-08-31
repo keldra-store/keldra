@@ -587,7 +587,7 @@ async fn select_mutation(
     current: Option<LoadedV6ProjectionGeneration>,
     scope: [u8; 32],
     mutation: Mutation,
-    input: keldra_index::v6::IndexingMemoryPermit,
+    mut input: keldra_index::v6::IndexingMemoryPermit,
 ) -> Result<Option<SelectedMutation>, Status> {
     let source = load_exact_mutation(
         &reader,
@@ -634,6 +634,16 @@ async fn select_mutation(
         }
         None => Vec::new(),
     };
+    let retained_bytes = selected_mutation_resident_bytes(&mutation, &selected, &previous)?;
+    if retained_bytes > input.bytes() {
+        return Err(Status::resource_exhausted(format!(
+            "v6 replay selection requires {retained_bytes} bytes but its construction bound is {}",
+            input.bytes()
+        )));
+    }
+    input
+        .shrink_to(retained_bytes.max(1))
+        .map_err(index_status)?;
     Ok(Some(SelectedMutation {
         mutation,
         selected,
@@ -641,6 +651,55 @@ async fn select_mutation(
         source_bytes,
         _input: input,
     }))
+}
+
+fn selected_mutation_resident_bytes(
+    mutation: &Mutation,
+    selected: &SelectedV6Source,
+    previous: &[keldra_index::v6::ProjectedDocumentState],
+) -> Result<usize, Status> {
+    let mut bytes = std::mem::size_of::<SelectedMutation>()
+        .checked_add(mutation.path.capacity())
+        .ok_or_else(|| Status::resource_exhausted("v6 replay selection size overflow"))?;
+    bytes = bytes
+        .checked_add(
+            match &selected.source {
+                IndexSourceMutation::Upsert(object) => std::mem::size_of::<IndexBuildObject>()
+                    .checked_add(object.path.capacity())
+                    .and_then(|value| {
+                        value.checked_add(
+                            object
+                                .content_type
+                                .as_ref()
+                                .map_or(0, |content_type| content_type.capacity()),
+                        )
+                    }),
+                IndexSourceMutation::Remove(identity) => {
+                    std::mem::size_of_val(identity).checked_add(identity.path.capacity())
+                }
+            }
+            .ok_or_else(|| Status::resource_exhausted("v6 replay selection size overflow"))?,
+        )
+        .ok_or_else(|| Status::resource_exhausted("v6 replay selection size overflow"))?;
+    if let Some(projection) = &selected.selected {
+        bytes = bytes
+            .checked_add(projection.resident_bytes().map_err(index_status)?)
+            .ok_or_else(|| Status::resource_exhausted("v6 replay selection size overflow"))?;
+    }
+    bytes = bytes
+        .checked_add(
+            previous
+                .len()
+                .checked_mul(std::mem::size_of::<keldra_index::v6::ProjectedDocumentState>())
+                .ok_or_else(|| Status::resource_exhausted("v6 replay selection size overflow"))?,
+        )
+        .ok_or_else(|| Status::resource_exhausted("v6 replay selection size overflow"))?;
+    for state in previous {
+        bytes = bytes
+            .checked_add(state.resident_bytes().map_err(index_status)?)
+            .ok_or_else(|| Status::resource_exhausted("v6 replay selection size overflow"))?;
+    }
+    Ok(bytes)
 }
 
 fn apply_rows(
@@ -1136,5 +1195,22 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
+    }
+
+    #[test]
+    fn replay_selection_holds_measured_metadata_not_construction_headroom() {
+        let mutation = mutation("objects/a", 7);
+        let selected = SelectedV6Source {
+            source: IndexSourceMutation::Remove(keldra_index::v6::ObjectIdentity {
+                path: "objects/a".into(),
+                version: 7,
+            }),
+            selected: None,
+        };
+
+        let retained = selected_mutation_resident_bytes(&mutation, &selected, &[]).unwrap();
+
+        assert!(retained < 1024);
+        assert!(retained >= std::mem::size_of::<SelectedMutation>());
     }
 }

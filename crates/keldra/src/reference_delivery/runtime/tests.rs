@@ -48,6 +48,13 @@ fn replicated_acknowledgement_requires_every_selected_cursor() {
     assert!(!reference_cursors_reached(&[], 9));
 }
 
+#[test]
+fn one_node_reference_delivery_uses_its_only_current_destination() {
+    assert_eq!(reference_delivery_durability(1), Durability::Local);
+    assert_eq!(reference_delivery_durability(2), Durability::Replicated);
+    assert_eq!(reference_delivery_durability(3), Durability::Replicated);
+}
+
 #[tokio::test]
 async fn stop_interrupts_a_long_worker_delay() {
     let (stop, mut signal) = tokio::sync::watch::channel(false);
