@@ -1157,13 +1157,13 @@ async fn project_snapshot_batch_inner(
             senders.push(sender);
             receivers.push(receiver);
         }
-        let projection_task = tokio::spawn(run_shared_projection_lanes(
+        let projection_task = AbortOnDropTask::new(tokio::spawn(run_shared_projection_lanes(
             definition.clone(),
             lanes,
             senders,
             lane_limit,
             dependencies.projection_mapper.clone(),
-        ));
+        )));
         let mut totals = ProjectionWaveTotals::default();
         let mut failure = None;
         for position in 0..source_count {
@@ -1199,7 +1199,7 @@ async fn project_snapshot_batch_inner(
             }
         }
         drop(receivers);
-        projection_task.await.map_err(|error| {
+        projection_task.join().await.map_err(|error| {
             Status::internal(format!("shared projection batch task failed: {error}"))
         })??;
         if let Some(error) = failure {
@@ -1219,7 +1219,7 @@ async fn project_snapshot_batch_inner(
     }
     let cpu = dependencies.cpu.clone();
     let projection_schema = schema.clone();
-    let cpu_task = tokio::spawn(run_projection_lanes(
+    let cpu_task = AbortOnDropTask::new(tokio::spawn(run_projection_lanes(
         cpu,
         lanes,
         senders,
@@ -1230,7 +1230,7 @@ async fn project_snapshot_batch_inner(
                 .map(|payload| payload as &mut dyn std::io::Read);
             project_mutation(&projection_schema, fetched.source, reader, lane_limit)
         },
-    ));
+    )));
 
     let mut totals = ProjectionWaveTotals::default();
     let mut failure = None;
@@ -1271,6 +1271,7 @@ async fn project_snapshot_batch_inner(
     }
     drop(receivers);
     let timing = cpu_task
+        .join()
         .await
         .map_err(|error| Status::internal(format!("projection batch task failed: {error}")))??;
     if let Some(error) = failure {

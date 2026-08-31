@@ -628,3 +628,37 @@ compaction permit and proves a second Typed JSON writer obtains its complete
 mandatory turn without waiting for compaction to finish. A sustained exact-
 candidate rerun on SSD and rotational storage is required before this defect is
 closed; the failed cell remains part of the record.
+
+Server commit `d25286ba0258` bounded every observed compaction lease to its
+256 MiB Typed JSON share. The rotational host then accepted all 4,785 offered
+operations at 40 operations/s with D640, returned exact results for all 640
+definitions, held concurrent-query p99 to 328.70 milliseconds, observed
+publication visibility p99/maximum of 23.30 seconds, and drained in 61.01
+seconds. The archive SHA-256 is
+`4329d9a294907b9e71a6175bd94bb8f43801f18cc5e290a026c31240ace30f8e`.
+The same noisy host's D1 control had a worse 32.67-second visibility maximum,
+so this is definition-scale evidence rather than a clean storage comparison.
+
+The corresponding ten-minute SSD D640 run remained a failed keep-up cell. It
+accepted all 59,994 offered operations at 99.99 operations/s, completed all
+38,400 concurrent queries with zero errors, timeouts, drops, or correctness
+failures, and held mutation p99 to 122.37 milliseconds. Visibility was p50
+2.42 seconds and p95 5.19 seconds, but one of 97 samples reached 79.50 seconds;
+drain was 114.16 seconds. Its archive SHA-256 is
+`e368d1b6ba4e985e413d8c6aa17866c736889c593d33645afb46291e46bdb077`.
+This improves the preceding outlier but does not pass the gate.
+
+That trace exposed a separate cancellation-lifetime defect. Rapid catalog
+creation repeatedly expands the membership family's field union and replaces
+the representative builder. Catch-up and rebuild launched projection lanes as
+detached Tokio tasks. Cancelling the obsolete builder therefore discarded its
+result but not its child task. Before the SSD outlier, an active builder
+processed one 436-record page and then spent 77.23 seconds without progress
+behind obsolete work on the same per-source projection stripe. Another turn
+lasted 87.19 seconds while making progress through the accumulated CPU queue.
+The replacement makes projection lane tasks abort-on-owner-drop and makes
+not-yet-started Rayon submissions cancellation-aware. Intermediate catalog
+plans can no longer consume CPU or a source stripe after their only publisher
+has been replaced. Focused tests prove a cancelled queued submission performs
+zero work after the worker reaches its queue position. A new exact-candidate
+SSD sustained cell is required to close this failure.

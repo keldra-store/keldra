@@ -1071,13 +1071,13 @@ async fn project_catch_up_batch(
             senders.push(sender);
             receivers.push(receiver);
         }
-        let projection_task = tokio::spawn(run_shared_projection_lanes(
+        let projection_task = AbortOnDropTask::new(tokio::spawn(run_shared_projection_lanes(
             definition.clone(),
             lanes,
             senders,
             lane_limit,
             dependencies.projection_mapper.clone(),
-        ));
+        )));
         let mut failure = None;
         let mut mutations = Vec::with_capacity(source_count);
         for position in 0..source_count {
@@ -1097,7 +1097,7 @@ async fn project_catch_up_batch(
             }
         }
         drop(receivers);
-        projection_task.await.map_err(|error| {
+        projection_task.join().await.map_err(|error| {
             Status::internal(format!("shared projection batch task failed: {error}"))
         })??;
         if let Some(error) = failure {
@@ -1128,7 +1128,7 @@ async fn project_catch_up_batch(
     let cpu = dependencies.cpu.clone();
     let projection_schema = definition.schema.clone();
     let runnable = builder.runnable.clone();
-    let cpu_task = tokio::spawn(run_projection_lanes(
+    let cpu_task = AbortOnDropTask::new(tokio::spawn(run_projection_lanes(
         cpu,
         lanes,
         senders,
@@ -1141,7 +1141,7 @@ async fn project_catch_up_batch(
                 project_mutation(&projection_schema, fetched.source, reader, lane_limit)
             })
         },
-    ));
+    )));
 
     let mut failure = None;
     let mut mutations = Vec::with_capacity(source_count);
@@ -1168,6 +1168,7 @@ async fn project_catch_up_batch(
     }
     drop(receivers);
     cpu_task
+        .join()
         .await
         .map_err(|error| Status::internal(format!("catch-up projection task failed: {error}")))??;
     if let Some(error) = failure {

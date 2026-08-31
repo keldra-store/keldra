@@ -24,6 +24,22 @@ pub(crate) struct IndexCompactionExecutor {
     cpu: IndexCpuPool,
 }
 
+struct CancelQueuedCpuWork(Option<Arc<AtomicBool>>);
+
+impl CancelQueuedCpuWork {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelQueuedCpuWork {
+    fn drop(&mut self) {
+        if let Some(cancelled) = self.0.take() {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl IndexCompactionExecutor {
     pub(crate) fn new(cpu: IndexCpuPool) -> Self {
         Self { cpu }
@@ -158,17 +174,27 @@ impl IndexCpuPool {
         T: Send + 'static,
     {
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let mut cancel_on_drop = CancelQueuedCpuWork(Some(cancelled));
         self.background.spawn(move || {
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
             let outcome = catch_unwind(AssertUnwindSafe(work));
             let _ = sender.send(outcome);
         });
-        match receiver.await {
+        let result = match receiver.await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(_)) => Err(IndexCpuPoolError::Task(
                 "index CPU task panicked".to_owned(),
             )),
             Err(error) => Err(IndexCpuPoolError::Task(error.to_string())),
-        }
+        };
+        // The work has either completed or the pool has closed its sender.
+        // Prevent the cancellation guard from changing a completed outcome.
+        cancel_on_drop.disarm();
+        result
     }
 
     /// Execute one already-materialized query CPU chunk on the process-owned
@@ -326,6 +352,58 @@ mod tests {
             .await
             .unwrap();
         assert!(name.starts_with("keldra-index-"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_submission_skips_obsolete_cpu_work() {
+        use std::sync::atomic::AtomicUsize;
+
+        let pool = IndexCpuPool::new(1).unwrap();
+        let blocker_started = Arc::new(AtomicBool::new(false));
+        let blocker_release = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&blocker_started);
+        let release = Arc::clone(&blocker_release);
+        let blocker = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.submit(move || {
+                    started.store(true, Ordering::Release);
+                    while !release.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                })
+                .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !blocker_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first CPU submission should occupy the only worker");
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let executions_by_work = Arc::clone(&executions);
+        let obsolete = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.submit(move || {
+                    executions_by_work.fetch_add(1, Ordering::Release);
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        obsolete.abort();
+        let _ = obsolete.await;
+        blocker_release.store(true, Ordering::Release);
+        blocker.await.unwrap().unwrap();
+
+        // A final submission is a barrier proving that the cancelled work's
+        // queue position has been consumed by the Rayon worker.
+        pool.submit(|| ()).await.unwrap();
+        assert_eq!(executions.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

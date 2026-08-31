@@ -162,6 +162,17 @@ Catalog changes compile a new immutable routing snapshot. A source mutation
 never scans all logical definitions and never takes a process-wide mutable
 catalog lock.
 
+Replacing that snapshot also cancels every obsolete projection owned by the
+previous physical-family builder. Projection lane tasks are children of the
+builder turn for cancellation purposes, even when Tokio executes them on a
+separate task. CPU submissions which have not started are cancellation-aware:
+when their owning builder is replaced, they leave the bounded CPU queue without
+parsing or assembling their now-unpublishable result. A rapid sequence of
+catalog additions must therefore converge to the newest family plan; it must
+not leave one queued projection per intermediate catalog state. Work already
+executing remains a finite source unit and may finish, but its result cannot be
+published by the replacement builder.
+
 Process-local assignment notifications are wakeups, not a change journal. A
 receiver which falls behind must retain already completed physical progress and
 reconcile from an exact bounded-memory view of the durable catalog. It must not
