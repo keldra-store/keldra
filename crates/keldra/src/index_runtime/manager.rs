@@ -1791,6 +1791,7 @@ async fn freeze_builder(
         // admits projection work, so active and frozen state cannot each spend
         // the same reserved bytes.
         resident_charge: seal_workspace as u64,
+        started: Instant::now(),
         task: AbortOnDropTask::new(tokio::spawn(async move {
             let built = full.writer.seal(&mut sink).await.map_err(index_status)?;
             Ok(FrozenSegment {
@@ -1832,11 +1833,31 @@ async fn finish_frozen_segment(
     let Some(frozen_task) = builder.frozen.take() else {
         return Ok(());
     };
+    let seal_started = frozen_task.started;
+    let join_started = Instant::now();
     let frozen =
         frozen_task.task.join().await.map_err(|error| {
             Status::internal(format!("index segment flush task failed: {error}"))
         })??;
+    let join_elapsed = join_started.elapsed();
+    let total_elapsed = seal_started.elapsed();
     let built = frozen.built;
+    tracing::debug!(
+        index.id = built.descriptor.identity.index_id,
+        index.kind = ?kind,
+        histogram.keldra_index_segment_seal_duration_seconds = total_elapsed.as_secs_f64(),
+        histogram.keldra_index_segment_seal_join_wait_seconds = join_elapsed.as_secs_f64(),
+        "index frozen segment joined"
+    );
+    if total_elapsed >= Duration::from_secs(5) {
+        tracing::info!(
+            index.id = built.descriptor.identity.index_id,
+            index.kind = ?kind,
+            index.segment_seal_duration_seconds = total_elapsed.as_secs_f64(),
+            index.segment_seal_join_wait_seconds = join_elapsed.as_secs_f64(),
+            "slow index frozen segment joined"
+        );
+    }
     observability::emit_frozen_buffer(
         built.descriptor.identity.index_id,
         kind,

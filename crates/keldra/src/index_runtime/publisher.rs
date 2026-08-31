@@ -1209,7 +1209,23 @@ impl IndexComponentBatchSink {
     }
 
     async fn stage_reserved_pack(&self, pack: ReservedIndexPack) -> Result<(), IndexError> {
+        let started = std::time::Instant::now();
         let result = stage_index_bytes_with_retry(&self.store, &pack.bytes, self.admission).await;
+        let elapsed = started.elapsed();
+        tracing::debug!(
+            index.id = pack.identity.index_id,
+            index.pack_bytes = pack.bytes.len() as u64,
+            histogram.keldra_index_pack_stage_duration_seconds = elapsed.as_secs_f64(),
+            "index component pack staged"
+        );
+        if elapsed >= Duration::from_secs(5) {
+            tracing::info!(
+                index.id = pack.identity.index_id,
+                index.pack_bytes = pack.bytes.len() as u64,
+                index.pack_stage_duration_seconds = elapsed.as_secs_f64(),
+                "slow index component pack stage completed"
+            );
+        }
         // Store staging is the content-address authority and has already
         // computed the BLAKE3 identity while writing these exact bytes.
         let result = match result {
@@ -1278,6 +1294,7 @@ impl IndexComponentBatchSink {
                     "single segment publication returned no pack references",
                 ))
             });
+        let elapsed = started.elapsed();
         let failed = result.is_err();
         span.in_scope(|| {
             tracing::debug!(
@@ -1291,10 +1308,21 @@ impl IndexComponentBatchSink {
                 monotonic_counter.keldra_index_v4_packs_published_total =
                     if failed { 0 } else { pack_count },
                 histogram.keldra_index_v4_component_publish_duration_seconds =
-                    started.elapsed().as_secs_f64(),
+                    elapsed.as_secs_f64(),
                 "format-v4 index components publication finished"
             );
         });
+        if elapsed >= Duration::from_secs(5) {
+            tracing::info!(
+                index.id = self.definition.index_id,
+                component.count = component_count,
+                component.bytes = encoded_bytes,
+                pack.count = pack_count,
+                publish.outcome = if failed { "failed" } else { "completed" },
+                index.component_publish_duration_seconds = elapsed.as_secs_f64(),
+                "slow format-v4 index component publication completed"
+            );
+        }
         if !failed && let Some(progress) = &self.progress {
             progress.record_output(0, encoded_bytes, component_count);
         }

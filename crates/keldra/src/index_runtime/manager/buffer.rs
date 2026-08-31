@@ -39,6 +39,7 @@ pub(super) struct FrozenSegmentTask {
     pub(super) task: AbortOnDropTask<Result<FrozenSegment, Status>>,
     pub(super) source_paths: BTreeMap<String, u64>,
     pub(super) resident_charge: u64,
+    pub(super) started: std::time::Instant,
 }
 
 pub(super) struct FrozenSegment {

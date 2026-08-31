@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use keldra_index::IndexKind;
 use keldra_index::v4::build::MergeMutation;
@@ -36,6 +36,25 @@ const CACHE_ENTRY_FIXED_BYTES: usize = 256;
 const OUTPUT_ENTRY_FIXED_BYTES: usize = 128;
 const PLAN_POINTER_FIXED_BYTES: usize = 128;
 const TELEMETRY_REPORT_INTERVAL: u64 = 16_384;
+const SLOW_PROJECTION_PHASE: Duration = Duration::from_secs(5);
+
+fn emit_projection_phase(index_id: u64, phase: &'static str, started: Instant) {
+    let elapsed = started.elapsed();
+    tracing::debug!(
+        index.id = index_id,
+        index.projection_phase = phase,
+        histogram.keldra_index_projection_phase_duration_seconds = elapsed.as_secs_f64(),
+        "index projection phase completed"
+    );
+    if elapsed >= SLOW_PROJECTION_PHASE {
+        tracing::info!(
+            index.id = index_id,
+            index.projection_phase = phase,
+            index.projection_phase_duration_seconds = elapsed.as_secs_f64(),
+            "slow index projection phase completed"
+        );
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct SharedProjectionMapper {
@@ -941,7 +960,13 @@ impl SharedProjectionMapper {
         }
 
         let stripe = cache_stripe(&plan.key);
+        let stripe_started = Instant::now();
         let _exclusive_source = self.inner.stripes[stripe].lock().await;
+        emit_projection_phase(
+            definition.physical_index_id(),
+            "source_cache_lock",
+            stripe_started,
+        );
         if let Some(output) = self.cached_output(
             &plan.key,
             definition.schema_fingerprint,
@@ -952,7 +977,10 @@ impl SharedProjectionMapper {
 
         let selected = match self.cached_selected(&plan.key)? {
             Some(selected) => selected,
-            None => match self.map_source(&plan, object).await {
+            None => match self
+                .map_source(definition.physical_index_id(), &plan, object)
+                .await
+            {
                 Ok(selected) => selected,
                 // A union of many definitions can be larger than this
                 // mapper's bounded workspace even though the requesting
@@ -997,6 +1025,11 @@ impl SharedProjectionMapper {
             .map_err(|error| Status::internal(error.to_string()))?
             .map_err(index_status)?;
         let assembly_seconds = assembly_started.elapsed().as_secs_f64();
+        emit_projection_phase(
+            definition.physical_index_id(),
+            "definition_assembly",
+            assembly_started,
+        );
         self.cache_output(
             plan.key,
             definition.schema_fingerprint,
@@ -1104,6 +1137,7 @@ impl SharedProjectionMapper {
 
     async fn map_source(
         &self,
+        index_id: u64,
         plan: &ProjectionPlan,
         object: &IndexBuildObject,
     ) -> Result<Option<Arc<ProjectedScalarPointers>>, Status> {
@@ -1137,6 +1171,7 @@ impl SharedProjectionMapper {
             .map_err(|error| Status::internal(error.to_string()))?
             .map_err(index_status)?
             .map(Arc::new);
+        emit_projection_phase(index_id, "source_read_and_map", map_started);
         self.cache_selected(plan.key.clone(), mapped.clone())?;
         self.inner
             .telemetry

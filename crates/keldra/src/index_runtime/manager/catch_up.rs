@@ -2,7 +2,8 @@
 
 #[path = "catch_up/alias_paths.rs"]
 mod alias_paths;
-
+#[path = "catch_up/timing.rs"]
+mod timing;
 use keldra_store::MAX_OBJECT_RECORD_EXPORT_RECORDS;
 
 use crate::index_runtime::committed_view::MAX_PENDING_ATOMIC_BATCHES;
@@ -302,9 +303,12 @@ pub(super) async fn process_journal_page(
             }
             changed |= !paths.is_empty();
             for paths in paths.chunks(MAX_OBJECT_RECORD_EXPORT_RECORDS as usize) {
+                let phase_started = Instant::now();
                 let sources = load_exact_sources(definition, paths, dependencies).await?;
+                timing::complete(definition, "exact_source_read", paths.len(), phase_started);
                 source_payload_bytes =
                     add_source_payload_bytes(source_payload_bytes, &definition.schema, &sources)?;
+                let phase_started = Instant::now();
                 project_sources(
                     definition,
                     kind,
@@ -316,6 +320,12 @@ pub(super) async fn process_journal_page(
                     true,
                 )
                 .await?;
+                timing::complete(
+                    definition,
+                    "source_projection_and_apply",
+                    paths.len(),
+                    phase_started,
+                );
             }
         }
         position = end;
@@ -345,9 +355,6 @@ pub(super) async fn process_journal_page(
     })
 }
 
-/// Projects an atomic journal event into isolated candidate state. Immutable
-/// artifacts written by an unsuccessful attempt are intentionally unattached;
-/// the orphan scrub reclaims them after its safety horizon.
 #[allow(clippy::too_many_arguments)]
 async fn start_atomic_projection(
     definition: &CatalogDefinition,
@@ -359,9 +366,6 @@ async fn start_atomic_projection(
     candidate: &mut CandidateCommit,
     dependencies: &IndexBuilderDependencies,
 ) -> Result<AtomicProjectionWork, Status> {
-    // Ordinary work preceding the atomic unit is complete before we establish
-    // the base graph. Nothing from the atomic event can attach to that graph
-    // until its complete exact output is known to fit.
     flush_builder(definition, kind, builder, candidate, dependencies).await?;
     invalidation::materialize_pending_live_masks(definition, candidate, dependencies).await?;
     let base_segments = candidate.segments.len();
