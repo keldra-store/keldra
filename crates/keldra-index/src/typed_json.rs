@@ -457,13 +457,17 @@ pub fn encode_scalar_sort_key(value: &ScalarValue) -> Result<Vec<u8>, IndexError
         }
         ScalarValue::String(value) => {
             out.push(5);
+            // Zero is escaped as `00 01` and `00 00` terminates the string.
+            // Besides preserving bytewise string order, the distinct second
+            // byte makes the key self-delimiting when a block-specific suffix
+            // (for example a stable document key) follows it.
             for byte in value.as_bytes() {
                 match byte {
-                    0 => out.extend_from_slice(&[0, 0xff]),
+                    0 => out.extend_from_slice(&[0, 1]),
                     _ => out.push(*byte),
                 }
             }
-            out.push(0);
+            out.extend_from_slice(&[0, 0]);
         }
     }
     Ok(out)
@@ -537,13 +541,14 @@ pub fn decode_scalar_sort_key(bytes: &[u8]) -> Result<(ScalarValue, usize), Inde
                 cursor += 1;
                 match byte {
                     0 => match bytes.get(cursor) {
-                        None => {
+                        Some(0) => {
+                            cursor += 1;
                             let value = String::from_utf8(value).map_err(|_| {
                                 IndexError::InvalidFormat("Typed JSON scalar string")
                             })?;
                             return Ok((ScalarValue::String(value), cursor));
                         }
-                        Some(0xff) => {
+                        Some(1) => {
                             value.push(0);
                             cursor += 1;
                         }
@@ -1403,7 +1408,11 @@ mod tests {
             ScalarValue::Number(1.5f64.to_bits()),
             ScalarValue::Unsigned(0),
             ScalarValue::Unsigned(1),
+            ScalarValue::String(String::new()),
+            ScalarValue::String("a".into()),
+            ScalarValue::String("a\0".into()),
             ScalarValue::String("a\0b".into()),
+            ScalarValue::String("a\u{1}".into()),
             ScalarValue::String("z".into()),
         ];
         let keys = values
@@ -1415,6 +1424,12 @@ mod tests {
         for (value, key) in values.iter().zip(keys) {
             assert_eq!(
                 decode_scalar_sort_key(&key).unwrap(),
+                (value.clone(), key.len())
+            );
+            let mut suffixed = key.clone();
+            suffixed.extend_from_slice(&[0xff; 32]);
+            assert_eq!(
+                decode_scalar_sort_key(&suffixed).unwrap(),
                 (value.clone(), key.len())
             );
         }

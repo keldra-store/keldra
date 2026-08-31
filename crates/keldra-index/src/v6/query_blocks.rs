@@ -1590,7 +1590,7 @@ mod tests {
         );
 
         let point = QueryPoint {
-            value: ScalarValue::Signed(-8),
+            value: ScalarValue::String("rust\0index".into()),
             document: key(3),
             material_source_version: 4,
             live: true,

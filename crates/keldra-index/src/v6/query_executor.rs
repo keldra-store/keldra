@@ -1477,6 +1477,7 @@ async fn load_selected_terms<L: QueryArtifactLoader>(
     let prefix_end = prefix_start.as_ref().map(|start| {
         let mut end = start.clone();
         debug_assert_eq!(end.pop(), Some(0));
+        debug_assert_eq!(end.pop(), Some(0));
         end.push(0xff);
         end
     });

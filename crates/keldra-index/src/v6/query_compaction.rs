@@ -644,7 +644,7 @@ mod tests {
                         material_source_version: version,
                         value: Some(vec![
                             ScalarValue::Signed(version as i64),
-                            ScalarValue::Signed(version as i64),
+                            ScalarValue::String(format!("value-{version}")),
                         ]),
                     }),
                     terms: vec![
@@ -663,12 +663,20 @@ mod tests {
                             positions: vec![beta],
                         },
                     ],
-                    points: vec![QueryPoint {
-                        value: ScalarValue::Signed(version as i64),
-                        document,
-                        material_source_version: version,
-                        live: true,
-                    }],
+                    points: vec![
+                        QueryPoint {
+                            value: ScalarValue::Signed(version as i64),
+                            document,
+                            material_source_version: version,
+                            live: true,
+                        },
+                        QueryPoint {
+                            value: ScalarValue::String(format!("value-{version}")),
+                            document,
+                            material_source_version: version,
+                            live: true,
+                        },
+                    ],
                 },
             }],
         }

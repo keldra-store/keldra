@@ -63,7 +63,6 @@ struct Writer {
     query: PreparedQueryMutationBatch,
     query_credits: QueryBlockCredits,
     since: Option<Instant>,
-    operations: u64,
     source_bytes: u64,
     pending_prepared_rows: u64,
     pending_prepared_bytes: u64,
@@ -328,7 +327,6 @@ async fn open_writer(
         query: PreparedQueryMutationBatch::default(),
         query_credits: QueryBlockCredits::from_pipeline_permit(query_permit),
         since: None,
-        operations: 0,
         source_bytes: 0,
         pending_prepared_rows: 0,
         pending_prepared_bytes: 0,
@@ -497,7 +495,6 @@ async fn prepare_page(
     let mut units = Vec::new();
     for dispatch in dispatches {
         let (atomic, mut group) = dispatch_mutations(dispatch)?;
-        writer.operations = writer.operations.saturating_add(1);
         group.retain(|mutation| mutation.offset >= first && mutation.offset < safe_next);
         if !group.is_empty() {
             units.push((atomic, group));
@@ -690,7 +687,17 @@ fn apply_rows(
                     Status::resource_exhausted("v6 projected rows exceed telemetry")
                 })?,
             );
-            writer.since.get_or_insert_with(Instant::now);
+            // Cursor-only batches are expected for reserved projection and
+            // catalog objects. They advance the in-memory contiguous cut, but
+            // must not arm publication: an empty Current creates another
+            // reserved source event and otherwise feeds itself forever. The
+            // preceding Current remains the conservative durable retention
+            // proof. A later matching mutation publishes one range spanning
+            // every skipped control event; restart safely replays the retained
+            // gap from that preceding Current.
+            if source_rows != 0 {
+                writer.since.get_or_insert_with(Instant::now);
+            }
             Ok(())
         }
         ProjectionBatchAdmission::ReplayRequired { .. } => {
@@ -700,11 +707,16 @@ fn apply_rows(
 }
 
 fn should_flush(writer: &Writer, limits: Limits) -> bool {
-    writer.accumulator.buffered_bytes() >= limits.flush_bytes
-        || writer.operations >= limits.flush_operations
-        || writer
-            .since
-            .is_some_and(|since| since.elapsed() >= limits.flush_age)
+    has_publication_work(writer.current.is_some(), writer.pending_prepared_rows)
+        && (writer.accumulator.buffered_bytes() >= limits.flush_bytes
+            || writer.pending_prepared_rows >= limits.flush_operations
+            || writer
+                .since
+                .is_some_and(|since| since.elapsed() >= limits.flush_age))
+}
+
+fn has_publication_work(has_current: bool, prepared_source_rows: u64) -> bool {
+    !has_current || prepared_source_rows != 0
 }
 
 async fn flush(
@@ -713,6 +725,9 @@ async fn flush(
     credits: &IndexingMemoryCredits,
     limits: Limits,
 ) -> Result<(), Status> {
+    if !has_publication_work(writer.current.is_some(), writer.pending_prepared_rows) {
+        return Ok(());
+    }
     let start = publication_start(writer.current.as_ref());
     let next = writer.accumulator.next_offset();
     if next <= start {
@@ -886,7 +901,6 @@ async fn flush(
     );
     super::v6_telemetry::V6PipelineTelemetry::add(&telemetry.projected_bytes, projected_bytes);
     writer.since = None;
-    writer.operations = 0;
     writer.source_bytes = 0;
     writer.pending_prepared_rows = 0;
     writer.pending_prepared_bytes = 0;
@@ -1073,6 +1087,21 @@ mod tests {
     #[test]
     fn fresh_partition_publication_starts_at_the_zero_sentinel() {
         assert_eq!(publication_start(None), 0);
+    }
+
+    #[test]
+    fn reserved_only_progress_does_not_request_an_empty_current_publication() {
+        // A fresh partition needs its one baseline Current for activation,
+        // even when the baseline contains no matching objects.
+        assert!(has_publication_work(false, 0));
+
+        // Once Current exists, filtered control events advance only the replay
+        // cursor. They cannot generate another Current/source event alone.
+        assert!(!has_publication_work(true, 0));
+
+        // The first later matching mutation makes the complete contiguous
+        // range, including the skipped control positions, publishable.
+        assert!(has_publication_work(true, 1));
     }
 
     #[test]
