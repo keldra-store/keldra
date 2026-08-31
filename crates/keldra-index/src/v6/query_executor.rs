@@ -28,7 +28,10 @@ pub use admission::{
 };
 #[path = "query_executor_values.rs"]
 mod values;
-use values::{resident_scalar_bytes, resource, scalar_number, validate_scalar, verify_hash};
+use values::{
+    leaf_field, resident_scalar_bytes, resource, scalar_number, validate_leaf_capability,
+    verify_hash,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryExecutionLimits {
@@ -203,6 +206,18 @@ impl Budget {
         credits.reserve(bytes)?;
         self.heap_bytes = next;
         Ok(())
+    }
+
+    fn release_heap(
+        &mut self,
+        credits: &mut QueryBlockCredits,
+        bytes: usize,
+    ) -> Result<(), IndexError> {
+        self.heap_bytes = self
+            .heap_bytes
+            .checked_sub(bytes)
+            .ok_or(IndexError::Integrity)?;
+        credits.release(bytes)
     }
 }
 
@@ -658,7 +673,7 @@ async fn load_next_descriptor<L: QueryArtifactLoader>(
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<Option<ProjectionQueryRunDescriptor>, IndexError> {
+) -> Result<Option<(ProjectionQueryRunDescriptor, usize)>, IndexError> {
     let Some(reference) = stream.next(loader, credits, budget).await? else {
         return Ok(None);
     };
@@ -693,7 +708,7 @@ async fn load_next_descriptor<L: QueryArtifactLoader>(
             return Err(IndexError::Integrity);
         }
     }
-    Ok(Some(descriptor))
+    Ok(Some((descriptor, bytes.len())))
 }
 
 fn page_summary(hash: [u8; 32], page: &QueryRunPage) -> Result<QueryRunChild, IndexError> {
@@ -741,7 +756,7 @@ async fn load_latest_gates<L: QueryArtifactLoader>(
 ) -> Result<BTreeMap<StableDocumentKey, QueryDocumentGate>, IndexError> {
     let mut gates = BTreeMap::new();
     let mut stream = QueryRunStream::new(view.pin.root);
-    while let Some(run) =
+    while let Some((run, run_bytes)) =
         load_next_descriptor(loader, view, &mut stream, block_limits, credits, budget).await?
     {
         for descriptor in run
@@ -749,7 +764,8 @@ async fn load_latest_gates<L: QueryArtifactLoader>(
             .iter()
             .filter(|block| block.kind == kind && block.recipe == recipe)
         {
-            let records = load_block(loader, descriptor, block_limits, credits, budget).await?;
+            let (records, record_bytes) =
+                load_block(loader, descriptor, block_limits, credits, budget).await?;
             for record in records {
                 let gate = decode_document_gate(record.as_ref())?;
                 if (kind == QueryBlockKind::Gate) != gate.source_path.is_some() {
@@ -766,7 +782,9 @@ async fn load_latest_gates<L: QueryArtifactLoader>(
                     gates.insert(gate.document, gate);
                 }
             }
+            budget.release_heap(credits, record_bytes)?;
         }
+        credits.release(run_bytes)?;
     }
     budget.candidates(gates.len())?;
     Ok(gates)
@@ -1141,7 +1159,7 @@ async fn seek_terms<L: QueryArtifactLoader>(
 ) -> Result<BTreeMap<StableDocumentKey, u64>, IndexError> {
     let mut newest = BTreeMap::<ScalarValue, BTreeMap<StableDocumentKey, QueryPosting>>::new();
     let mut stream = QueryRunStream::new(view.pin.root);
-    while let Some(run) =
+    while let Some((run, run_bytes)) =
         load_next_descriptor(loader, view, &mut stream, block_limits, credits, budget).await?
     {
         for descriptor in run
@@ -1149,7 +1167,7 @@ async fn seek_terms<L: QueryArtifactLoader>(
             .iter()
             .filter(|block| block.kind == QueryBlockKind::TermDictionary && block.recipe == recipe)
         {
-            let entries = load_selected_terms(
+            let (entries, entry_bytes) = load_selected_terms(
                 loader,
                 descriptor,
                 exact,
@@ -1168,7 +1186,7 @@ async fn seek_terms<L: QueryArtifactLoader>(
                         QueryBlockKind::Posting,
                         recipe,
                     )?;
-                    let postings =
+                    let (postings, posting_bytes) =
                         load_block(loader, posting_descriptor, block_limits, credits, budget)
                             .await?;
                     if postings.len() != shard.posting_records as usize {
@@ -1190,12 +1208,15 @@ async fn seek_terms<L: QueryArtifactLoader>(
                             term.insert(posting.document, posting);
                         }
                     }
+                    budget.release_heap(credits, posting_bytes)?;
                 }
                 if newest.len() > budget.limits.maximum_expanded_terms {
                     return resource(newest.len(), budget.limits.maximum_expanded_terms);
                 }
             }
+            budget.release_heap(credits, entry_bytes)?;
         }
+        credits.release(run_bytes)?;
     }
     let mut output = BTreeMap::<StableDocumentKey, u64>::new();
     for postings in newest.into_values() {
@@ -1227,7 +1248,7 @@ async fn seek_range<L: QueryArtifactLoader>(
 ) -> Result<BTreeMap<StableDocumentKey, u64>, IndexError> {
     let mut newest = BTreeMap::<(ScalarValue, StableDocumentKey), (bool, u64)>::new();
     let mut stream = QueryRunStream::new(view.pin.root);
-    while let Some(run) =
+    while let Some((run, run_bytes)) =
         load_next_descriptor(loader, view, &mut stream, block_limits, credits, budget).await?
     {
         for descriptor in run
@@ -1238,7 +1259,8 @@ async fn seek_range<L: QueryArtifactLoader>(
             if !point_descriptor_overlaps(descriptor, lower, upper)? {
                 continue;
             }
-            let records = load_block(loader, descriptor, block_limits, credits, budget).await?;
+            let (records, record_bytes) =
+                load_block(loader, descriptor, block_limits, credits, budget).await?;
             for record in records {
                 let point = decode_point(record.as_ref())?;
                 if in_range(&point.value, lower, upper) {
@@ -1254,7 +1276,9 @@ async fn seek_range<L: QueryArtifactLoader>(
                     }
                 }
             }
+            budget.release_heap(credits, record_bytes)?;
         }
+        credits.release(run_bytes)?;
     }
     let mut output = BTreeMap::<StableDocumentKey, u64>::new();
     for ((_, key), (live, version)) in newest {
@@ -1313,13 +1337,13 @@ async fn verify_phrase<L: QueryArtifactLoader>(
     for term in terms {
         let mut decided = BTreeSet::new();
         let mut stream = QueryRunStream::new(view.pin.root);
-        while let Some(run) =
+        while let Some((run, run_bytes)) =
             load_next_descriptor(loader, view, &mut stream, block_limits, credits, budget).await?
         {
             for dictionary in run.blocks.iter().filter(|block| {
                 block.kind == QueryBlockKind::TermDictionary && block.recipe == recipe
             }) {
-                let entries = load_selected_terms(
+                let (entries, entry_bytes) = load_selected_terms(
                     loader,
                     dictionary,
                     std::slice::from_ref(term),
@@ -1337,7 +1361,7 @@ async fn verify_phrase<L: QueryArtifactLoader>(
                             QueryBlockKind::Posting,
                             recipe,
                         )?;
-                        let postings =
+                        let (postings, posting_bytes) =
                             load_block(loader, posting_descriptor, block_limits, credits, budget)
                                 .await?;
                         if postings.len() != shard.posting_records as usize {
@@ -1356,20 +1380,46 @@ async fn verify_phrase<L: QueryArtifactLoader>(
                             };
                             let descriptor =
                                 find_block(&run, hash, QueryBlockKind::Position, recipe)?;
-                            let records =
+                            let (records, position_bytes) =
                                 load_block(loader, descriptor, block_limits, credits, budget)
                                     .await?;
                             if let Some(record) = records.iter().find(|record| {
                                 record.key.as_slice() == posting.document.bytes().as_slice()
                             }) {
-                                positions.entry((term.clone(), posting.document)).or_insert(
-                                    decode_positions(record.as_ref(), block_limits)?.positions,
-                                );
+                                let key = (term.clone(), posting.document);
+                                if let std::collections::btree_map::Entry::Vacant(entry) =
+                                    positions.entry(key)
+                                {
+                                    let decoded =
+                                        decode_positions(record.as_ref(), block_limits)?.positions;
+                                    budget.reserve_heap(
+                                        credits,
+                                        std::mem::size_of::<(ScalarValue, StableDocumentKey)>()
+                                            .checked_add(std::mem::size_of::<Vec<u32>>())
+                                            .and_then(|bytes| {
+                                                bytes.checked_add(resident_scalar_bytes(term))
+                                            })
+                                            .and_then(|bytes| {
+                                                decoded
+                                                    .len()
+                                                    .checked_mul(std::mem::size_of::<u32>())
+                                                    .and_then(|positions| {
+                                                        bytes.checked_add(positions)
+                                                    })
+                                            })
+                                            .ok_or(IndexError::OffsetOverflow)?,
+                                    )?;
+                                    entry.insert(decoded);
+                                }
                             }
+                            budget.release_heap(credits, position_bytes)?;
                         }
+                        budget.release_heap(credits, posting_bytes)?;
                     }
+                    budget.release_heap(credits, entry_bytes)?;
                 }
             }
+            credits.release(run_bytes)?;
         }
     }
     candidates.retain(|key| {
@@ -1421,7 +1471,7 @@ async fn load_block<L: QueryArtifactLoader>(
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<Vec<OwnedRecord>, IndexError> {
+) -> Result<(Vec<OwnedRecord>, usize), IndexError> {
     let maximum = usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
     let bytes = load_pre_admitted(
         loader,
@@ -1438,13 +1488,11 @@ async fn load_block<L: QueryArtifactLoader>(
     }
     credits.release(bytes.len())?;
     let mut cursor = QueryBlockCursor::new(descriptor, &bytes, limits, credits)?;
-    budget.reserve_heap(
-        credits,
-        (descriptor.records as usize)
-            .checked_mul(std::mem::size_of::<OwnedRecord>())
-            .and_then(|bytes| bytes.checked_add(maximum))
-            .ok_or(IndexError::OffsetOverflow)?,
-    )?;
+    let resident_bytes = (descriptor.records as usize)
+        .checked_mul(std::mem::size_of::<OwnedRecord>())
+        .and_then(|bytes| bytes.checked_add(maximum))
+        .ok_or(IndexError::OffsetOverflow)?;
+    budget.reserve_heap(credits, resident_bytes)?;
     let mut output = Vec::with_capacity(descriptor.records as usize);
     while let Some(record) = cursor.next()? {
         output.push(OwnedRecord {
@@ -1454,7 +1502,7 @@ async fn load_block<L: QueryArtifactLoader>(
     }
     drop(cursor);
     credits.release_loaded_block(bytes.len())?;
-    Ok(output)
+    Ok((output, resident_bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1466,7 +1514,7 @@ async fn load_selected_terms<L: QueryArtifactLoader>(
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<Vec<QueryTermEntry>, IndexError> {
+) -> Result<(Vec<QueryTermEntry>, usize), IndexError> {
     let exact_keys = exact
         .iter()
         .map(encode_scalar_sort_key)
@@ -1491,7 +1539,7 @@ async fn load_selected_terms<L: QueryArtifactLoader>(
         },
     );
     if !relevant {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let maximum = usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
     let bytes = load_pre_admitted(
@@ -1509,13 +1557,11 @@ async fn load_selected_terms<L: QueryArtifactLoader>(
     }
     credits.release(bytes.len())?;
     let mut cursor = QueryBlockCursor::new(descriptor, &bytes, limits, credits)?;
-    budget.reserve_heap(
-        credits,
-        (descriptor.records as usize)
-            .checked_mul(std::mem::size_of::<QueryTermEntry>())
-            .and_then(|bytes| bytes.checked_add(maximum))
-            .ok_or(IndexError::OffsetOverflow)?,
-    )?;
+    let resident_bytes = (descriptor.records as usize)
+        .checked_mul(std::mem::size_of::<QueryTermEntry>())
+        .and_then(|bytes| bytes.checked_add(maximum))
+        .ok_or(IndexError::OffsetOverflow)?;
+    budget.reserve_heap(credits, resident_bytes)?;
     let mut output = Vec::new();
     for (term, key) in exact.iter().zip(&exact_keys) {
         if let Some(record) = cursor.seek_to(key)? {
@@ -1543,7 +1589,7 @@ async fn load_selected_terms<L: QueryArtifactLoader>(
     output.dedup_by(|left, right| left.term == right.term);
     drop(cursor);
     credits.release_loaded_block(bytes.len())?;
-    Ok(output)
+    Ok((output, resident_bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1558,7 +1604,7 @@ async fn load_candidate_doc_values<L: QueryArtifactLoader>(
 ) -> Result<BTreeMap<StableDocumentKey, Option<Vec<ScalarValue>>>, IndexError> {
     let mut output = BTreeMap::new();
     let mut stream = QueryRunStream::new(view.pin.root);
-    while let Some(run) =
+    while let Some((run, run_bytes)) =
         load_next_descriptor(loader, view, &mut stream, block_limits, credits, budget).await?
     {
         for descriptor in run
@@ -1626,7 +1672,16 @@ async fn load_candidate_doc_values<L: QueryArtifactLoader>(
             }
             drop(cursor);
             credits.release_loaded_block(bytes.len())?;
+            budget.release_heap(
+                credits,
+                candidates
+                    .len()
+                    .checked_mul(std::mem::size_of::<Vec<ScalarValue>>())
+                    .and_then(|bytes| bytes.checked_add(maximum))
+                    .ok_or(IndexError::OffsetOverflow)?,
+            )?;
         }
+        credits.release(run_bytes)?;
     }
     Ok(output)
 }
@@ -1925,59 +1980,6 @@ fn sum_pair(current: ScalarValue, next: &ScalarValue) -> Result<ScalarValue, Ind
             "aggregate scalar types differ".into(),
         )),
     }
-}
-
-fn leaf_field(predicate: &Predicate) -> Option<FieldId> {
-    match predicate {
-        Predicate::Equal { field_id, .. }
-        | Predicate::In { field_id, .. }
-        | Predicate::Prefix { field_id, .. }
-        | Predicate::Range { field_id, .. }
-        | Predicate::Exists { field_id, .. }
-        | Predicate::FullText { field_id, .. }
-        | Predicate::Phrase { field_id, .. } => Some(*field_id),
-        _ => None,
-    }
-}
-
-fn validate_leaf_capability(field: &FieldSchema, predicate: &Predicate) -> Result<(), IndexError> {
-    let required = match predicate {
-        Predicate::Equal { .. } | Predicate::In { .. } | Predicate::Exists { .. } => {
-            FieldCapabilities::EXACT
-        }
-        Predicate::Prefix { .. } => FieldCapabilities::PREFIX,
-        Predicate::Range { .. } => FieldCapabilities::RANGE,
-        Predicate::FullText { .. } | Predicate::Phrase { .. } => FieldCapabilities::FULL_TEXT,
-        _ => return Err(IndexError::InvalidQuery("expected leaf predicate".into())),
-    };
-    if !field.capabilities.contains(required) {
-        return Err(IndexError::InvalidQuery(
-            "field lacks query capability".into(),
-        ));
-    }
-    let values = match predicate {
-        Predicate::Equal { value, .. } => std::slice::from_ref(value),
-        Predicate::In { values, .. } => values.as_slice(),
-        Predicate::Range { lower, upper, .. } => {
-            for bound in lower.iter().chain(upper.iter()) {
-                validate_scalar(field.field_type, &bound.value)?;
-                if matches!(bound.value, ScalarValue::Null) {
-                    return Err(IndexError::InvalidQuery(
-                        "range does not accept null".into(),
-                    ));
-                }
-            }
-            return Ok(());
-        }
-        _ => return Ok(()),
-    };
-    for value in values {
-        if matches!(value, ScalarValue::Null) && !field.allow_null {
-            return Err(IndexError::InvalidQuery("field does not admit null".into()));
-        }
-        validate_scalar(field.field_type, value)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

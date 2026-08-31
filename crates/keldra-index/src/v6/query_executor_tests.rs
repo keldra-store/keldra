@@ -99,6 +99,54 @@ fn artifact_memory_refusal_happens_before_payload_loader() {
 }
 
 #[test]
+fn sequential_block_scans_reuse_transient_heap_credits() {
+    let limits = QueryBlockLimits::default_for_memory();
+    let recipe = RecipeIdentity::new([3; 32]).unwrap();
+    let records = (0..64u32)
+        .map(|value| super::super::QueryBlockRecord {
+            key: value.to_be_bytes().to_vec(),
+            value: vec![value as u8; 128],
+        })
+        .collect::<Vec<_>>();
+    let mut encoding_credits = credits(1024 * 1024);
+    let encoded = super::super::encode_query_block(
+        QueryBlockKind::Point,
+        recipe,
+        &records,
+        limits,
+        &mut encoding_credits,
+    )
+    .unwrap();
+    let hash = encoded.descriptor.hash;
+    let mut loader = Loader {
+        artifacts: [(hash, encoded.bytes)].into(),
+        payload_loads: 0,
+    };
+    let resident_bytes = encoded.descriptor.records as usize * std::mem::size_of::<OwnedRecord>()
+        + encoded.descriptor.encoded_bytes as usize;
+    let admitted = resident_bytes + encoded.descriptor.encoded_bytes as usize * 2;
+    let mut credits = credits(admitted);
+    let initial = credits.remaining();
+    let mut budget = budget();
+
+    for _ in 0..64 {
+        let (loaded, charged) = ready(load_block(
+            &mut loader,
+            &encoded.descriptor,
+            limits,
+            &mut credits,
+            &mut budget,
+        ))
+        .unwrap();
+        assert_eq!(loaded.len(), records.len());
+        drop(loaded);
+        budget.release_heap(&mut credits, charged).unwrap();
+        assert_eq!(credits.remaining(), initial);
+        assert_eq!(budget.heap_bytes, 0);
+    }
+}
+
+#[test]
 fn unequal_partition_roots_can_prove_one_common_cut() {
     let cut = QueryCommonCut {
         through_atomic_position: 20,
