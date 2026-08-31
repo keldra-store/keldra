@@ -176,8 +176,10 @@ impl SingleNodeGroupCommit {
 
     async fn run(self, store: Store) {
         loop {
+            let dwell_started = std::time::Instant::now();
             tokio::time::sleep(MAX_GROUP_DWELL).await;
-            let requests = {
+            let dwell_duration = dwell_started.elapsed();
+            let (requests, queued_requests, stop_reason) = {
                 let mut state = self.state.lock().await;
                 let Some(first) = state.requests.pop_front() else {
                     state.worker_running = false;
@@ -188,13 +190,16 @@ impl SingleNodeGroupCommit {
                 let mut inline_bytes = group[0].inline_bytes();
                 let context = group[0].context;
                 let mut governance = group[0].consistent_governance();
+                let mut stop_reason = "max_requests";
                 while group.len() < MAX_GROUP_REQUESTS {
                     let Some(candidate) = state.requests.front() else {
+                        stop_reason = "queue_empty";
                         break;
                     };
                     let (Some(group_governance), Some(candidate_governance)) =
                         (governance.as_ref(), candidate.consistent_governance())
                     else {
+                        stop_reason = "inconsistent_governance";
                         break;
                     };
                     let candidate_operations = candidate.operation_count();
@@ -205,11 +210,20 @@ impl SingleNodeGroupCommit {
                                 .get(&identity)
                                 .is_none_or(|existing| existing == value)
                         });
-                    if candidate.context != context
-                        || !compatible_governance
-                        || operations.saturating_add(candidate_operations) > MAX_GROUP_OPERATIONS
-                        || inline_bytes.saturating_add(candidate_bytes) > MAX_GROUP_INLINE_BYTES
-                    {
+                    if candidate.context != context {
+                        stop_reason = "context";
+                        break;
+                    }
+                    if !compatible_governance {
+                        stop_reason = "governance";
+                        break;
+                    }
+                    if operations.saturating_add(candidate_operations) > MAX_GROUP_OPERATIONS {
+                        stop_reason = "operations";
+                        break;
+                    }
+                    if inline_bytes.saturating_add(candidate_bytes) > MAX_GROUP_INLINE_BYTES {
+                        stop_reason = "inline_bytes";
                         break;
                     }
                     let candidate = state.requests.pop_front().expect("front exists");
@@ -224,9 +238,10 @@ impl SingleNodeGroupCommit {
                     }
                     group.push(candidate);
                 }
-                group
+                (group, state.requests.len(), stop_reason)
             };
 
+            let request_count = requests.len();
             let operation_counts = requests
                 .iter()
                 .map(SingleNodeCommitRequest::operation_count)
@@ -234,13 +249,50 @@ impl SingleNodeGroupCommit {
             let context = requests[0].context;
             let mut operations = Vec::with_capacity(operation_counts.iter().sum());
             let mut replies = Vec::with_capacity(requests.len());
+            let inline_bytes = requests.iter().fold(0_usize, |total, request| {
+                total.saturating_add(request.inline_bytes())
+            });
             for request in requests {
                 operations.extend(request.operations);
                 replies.push((request.response, request._queue_permits));
             }
-            let results = store
+            let operation_count = operations.len();
+            let execute_started = std::time::Instant::now();
+            let (results, metrics) = store
                 .coordinate_single_node_mutation_group(operations, context, &operation_counts)
                 .await;
+            let execute_duration = execute_started.elapsed();
+            let failed_requests = results.iter().filter(|result| result.is_err()).count();
+            let metrics = metrics.unwrap_or_default();
+            tracing::info!(
+                target: "keldra_store::single_node_group_commit_phases",
+                attempts = 1_u64,
+                physical_commits = metrics.physical_commit as u64,
+                request_count,
+                operation_count,
+                inline_bytes,
+                failed_requests,
+                dwell_seconds = dwell_duration.as_secs_f64(),
+                execute_seconds = execute_duration.as_secs_f64(),
+                prepare_seconds = metrics.prepare.as_secs_f64(),
+                policy_wait_seconds = metrics.policy_wait.as_secs_f64(),
+                path_wait_seconds = metrics.path_wait.as_secs_f64(),
+                commit_wait_seconds = metrics.commit_wait.as_secs_f64(),
+                locked_setup_seconds = metrics.locked_setup.as_secs_f64(),
+                locked_prefetch_seconds = metrics.locked_prefetch.as_secs_f64(),
+                evaluate_seconds = metrics.evaluate.as_secs_f64(),
+                stage_seconds = metrics.stage.as_secs_f64(),
+                db_write_sync_seconds = metrics.persist.as_secs_f64(),
+                settle_seconds = metrics.settle.as_secs_f64(),
+                commit_hold_seconds = metrics.commit_hold.as_secs_f64(),
+                store_seconds = metrics.total.as_secs_f64(),
+                total_seconds = dwell_duration.saturating_add(execute_duration).as_secs_f64(),
+                queued_requests,
+                stop_reason,
+                phase_complete = metrics.total != std::time::Duration::ZERO,
+                physical_commit = metrics.physical_commit,
+                "single-node mutation group completed"
+            );
             for ((response, _permits), result) in replies.into_iter().zip(results) {
                 let _ = response.send(result);
             }

@@ -17,6 +17,24 @@ struct PreparedDistributedMutation {
 struct CoordinatedBatchEvaluation {
     outcomes: Vec<Result<CoordinatedObjectMutation, MutationError>>,
     receipt_capacity_at: Option<usize>,
+    metrics: CoordinatorBatchMetrics,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct CoordinatorBatchMetrics {
+    pub(super) prepare: std::time::Duration,
+    pub(super) policy_wait: std::time::Duration,
+    pub(super) path_wait: std::time::Duration,
+    pub(super) commit_wait: std::time::Duration,
+    pub(super) locked_setup: std::time::Duration,
+    pub(super) locked_prefetch: std::time::Duration,
+    pub(super) evaluate: std::time::Duration,
+    pub(super) stage: std::time::Duration,
+    pub(super) persist: std::time::Duration,
+    pub(super) settle: std::time::Duration,
+    pub(super) commit_hold: std::time::Duration,
+    pub(super) total: std::time::Duration,
+    pub(super) physical_commit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -79,7 +97,7 @@ impl Store {
         operations: SingleNodeOperations,
         context: ObjectMutationContext,
         request_operation_counts: &[usize],
-    ) -> Vec<SingleNodeOutcomes> {
+    ) -> (Vec<SingleNodeOutcomes>, Option<CoordinatorBatchMetrics>) {
         let total = operations.len();
         let evaluated = self
             .coordinate_mutation_batch(
@@ -91,21 +109,27 @@ impl Store {
         let mut evaluated = match evaluated {
             Ok(evaluated) => evaluated,
             Err(error) => {
-                return request_operation_counts
-                    .iter()
-                    .map(|_| Err(error.clone()))
-                    .collect();
+                return (
+                    request_operation_counts
+                        .iter()
+                        .map(|_| Err(error.clone()))
+                        .collect(),
+                    None,
+                );
             }
         };
         if request_operation_counts.iter().sum::<usize>() != total {
-            return request_operation_counts
-                .iter()
-                .map(|_| {
-                    Err(MutationError::Storage(
-                        "single-node group boundary is inconsistent".into(),
-                    ))
-                })
-                .collect();
+            return (
+                request_operation_counts
+                    .iter()
+                    .map(|_| {
+                        Err(MutationError::Storage(
+                            "single-node group boundary is inconsistent".into(),
+                        ))
+                    })
+                    .collect(),
+                None,
+            );
         }
         let mut responses = Vec::with_capacity(request_operation_counts.len());
         let mut start = 0;
@@ -122,7 +146,7 @@ impl Store {
             }
             start = end;
         }
-        responses
+        (responses, Some(evaluated.metrics))
     }
 
     async fn coordinate_mutation_batch(
@@ -135,6 +159,7 @@ impl Store {
         context: ObjectMutationContext,
         payload_preparation: CoordinatorBatchPayloadPreparation,
     ) -> Result<CoordinatedBatchEvaluation, MutationError> {
+        let total_started = std::time::Instant::now();
         if context.serving_fence_term == 0 {
             return Err(MutationError::InvalidObjectMutation(
                 "serving-fence term must be non-zero".into(),
@@ -144,6 +169,7 @@ impl Store {
             return Ok(CoordinatedBatchEvaluation {
                 outcomes: Vec::new(),
                 receipt_capacity_at: None,
+                metrics: CoordinatorBatchMetrics::default(),
             });
         }
 
@@ -155,6 +181,7 @@ impl Store {
         let mut prepared = Vec::with_capacity(total);
         let mut early = BTreeMap::new();
         let mut bucket_governance = BTreeMap::<Vec<u8>, ObjectMutationGovernance>::new();
+        let prepare_started = std::time::Instant::now();
         for (index, (operation, governance, definition_intent)) in
             operations.into_iter().enumerate()
         {
@@ -212,8 +239,12 @@ impl Store {
                 }
             }
         }
+        let prepare_duration = prepare_started.elapsed();
 
+        let policy_wait_started = std::time::Instant::now();
         let _policy_guard = self.policy_gate.read().await;
+        let policy_wait_duration = policy_wait_started.elapsed();
+        let path_wait_started = std::time::Instant::now();
         let _path_guards = self
             .ordinary_locks
             .acquire(
@@ -223,7 +254,12 @@ impl Store {
                     .collect::<Vec<_>>(),
             )
             .await;
+        let path_wait_duration = path_wait_started.elapsed();
+        let commit_wait_started = std::time::Instant::now();
         let _commit_guard = self.lock_commit("distributed_publish").await;
+        let commit_wait_duration = commit_wait_started.elapsed();
+        let commit_hold_started = std::time::Instant::now();
+        let locked_setup_started = std::time::Instant::now();
         let mut reserved = BTreeMap::new();
         for item in &prepared {
             if let Err(error) = self.require_unreserved_object_locked(
@@ -250,6 +286,8 @@ impl Store {
         let initial_receipt_status = receipt_status;
         let pruned_receipts =
             self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
+        let locked_setup_duration = locked_setup_started.elapsed();
+        let locked_prefetch_started = std::time::Instant::now();
         let read_cache = MutationReadCache::load(
             self,
             &prepared
@@ -257,6 +295,7 @@ impl Store {
                 .map(|item| &item.operation)
                 .collect::<Vec<_>>(),
         )?;
+        let locked_prefetch_duration = locked_prefetch_started.elapsed();
         let mut pending_heads = BTreeMap::new();
         let mut pending_versions = BTreeMap::new();
         let mut pending_receipts = BTreeMap::new();
@@ -276,6 +315,7 @@ impl Store {
         let mut receipt_capacity_exhausted = false;
         let mut receipt_capacity_at = None;
 
+        let evaluate_started = std::time::Instant::now();
         for item in &prepared {
             let outcome = self
                 .evaluate_operation(
@@ -353,7 +393,9 @@ impl Store {
                 }),
             );
         }
+        let evaluate_duration = evaluate_started.elapsed();
 
+        let stage_started = std::time::Instant::now();
         if receipt_status != initial_receipt_status {
             self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
         }
@@ -365,11 +407,16 @@ impl Store {
                 serde_json::to_vec(&high_watermark).map_err(storage_error)?,
             );
         }
-        if !batch.is_empty() {
+        let stage_duration = stage_started.elapsed();
+        let persist_started = std::time::Instant::now();
+        let physical_commit = !batch.is_empty();
+        if physical_commit {
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
             self.db.write_opt(batch, &options).map_err(storage_error)?;
         }
+        let persist_duration = persist_started.elapsed();
+        let settle_started = std::time::Instant::now();
         if !pruned_receipts.is_empty() {
             self.mutation_capacity_notify.notify_waiters();
         }
@@ -379,6 +426,7 @@ impl Store {
             }
             self.notify_local_invalidations();
         }
+        let settle_duration = settle_started.elapsed();
         let mut outcomes = Vec::with_capacity(total);
         for index in 0..total {
             outcomes.push(if let Some(outcome) = evaluated.remove(&index) {
@@ -393,10 +441,27 @@ impl Store {
                 ));
             });
         }
-        Ok(CoordinatedBatchEvaluation {
+        let commit_hold_duration = commit_hold_started.elapsed();
+        let outcome = CoordinatedBatchEvaluation {
             outcomes,
             receipt_capacity_at,
-        })
+            metrics: CoordinatorBatchMetrics {
+                prepare: prepare_duration,
+                policy_wait: policy_wait_duration,
+                path_wait: path_wait_duration,
+                commit_wait: commit_wait_duration,
+                locked_setup: locked_setup_duration,
+                locked_prefetch: locked_prefetch_duration,
+                evaluate: evaluate_duration,
+                stage: stage_duration,
+                persist: persist_duration,
+                settle: settle_duration,
+                commit_hold: commit_hold_duration,
+                total: total_started.elapsed(),
+                physical_commit,
+            },
+        };
+        Ok(outcome)
     }
 
     async fn prepare_single_node_coordinated(
