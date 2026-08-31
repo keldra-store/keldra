@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_index::v6::{
-    IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage,
+    IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryPermit, IndexingMemoryStage,
     PartitionProjectionAccumulator, PreparedProjectionBatchReservation, PreparedProjectionRow,
     PreparedQueryMutationBatch, ProjectionBatchAdmission, ProjectionPackCredits,
     ProjectionPartitionIdentity, QueryBlockCredits,
@@ -68,6 +68,12 @@ struct Writer {
     pending_prepared_bytes: u64,
     pending_projected_rows: u64,
     through_atomic: u64,
+    pending_mutations: BTreeMap<String, Mutation>,
+    pending_mutation_bytes: usize,
+    pending_operations: u64,
+    pending_next: u64,
+    pending_mutation_capacity: usize,
+    _pending_mutation_permit: IndexingMemoryPermit,
 }
 
 #[derive(Clone)]
@@ -316,6 +322,10 @@ async fn open_writer(
         || target.atomic.finalized_through().unwrap_or(0),
         |loaded| loaded.current.through_atomic_position,
     );
+    let pending_mutation_capacity = limits.flush_bytes.max(1);
+    let pending_mutation_permit = credits
+        .acquire(IndexingMemoryStage::ReplayInput, pending_mutation_capacity)
+        .map_err(|_| Status::resource_exhausted("v6 mutation-window memory unavailable"))?;
     Ok(Writer {
         recipe,
         source,
@@ -332,12 +342,19 @@ async fn open_writer(
         pending_prepared_bytes: 0,
         pending_projected_rows: 0,
         through_atomic,
+        pending_mutations: BTreeMap::new(),
+        pending_mutation_bytes: 0,
+        pending_operations: 0,
+        pending_next: accumulator_start,
+        pending_mutation_capacity,
+        _pending_mutation_permit: pending_mutation_permit,
     })
 }
 
 async fn backfill(
     writer: &mut Writer,
     scanner: &super::scanner::ClusterIndexScanner,
+    reader: &ClusterObjectReader,
     extractor: &V6ProjectionExtractor,
     publisher: &V6ProjectionPublisher,
     credits: &IndexingMemoryCredits,
@@ -417,7 +434,8 @@ async fn backfill(
         .get_mut(&node)
         .ok_or_else(|| Status::data_loss("v6 baseline source cursor is absent"))?
         .next_offset = captured_next;
-    flush(writer, publisher, credits, limits).await
+    writer.pending_next = captured_next;
+    flush(writer, reader, extractor, publisher, credits, limits).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -433,10 +451,16 @@ async fn advance(
     limits: Limits,
 ) -> Result<(), Status> {
     if writer.current.is_none() && writer.accumulator.next_offset() == 0 {
-        backfill(writer, scanner, extractor, publisher, credits, limits).await?;
+        backfill(
+            writer, scanner, reader, extractor, publisher, credits, limits,
+        )
+        .await?;
         return Ok(());
     }
-    let max_page = u64::try_from(limits.flush_bytes)
+    // A mutation-window entry owns two path strings plus its map node. Keep
+    // journal pages below one quarter of the charged window so one fresh page
+    // can always be represented conservatively before the threshold flush.
+    let max_page = u64::try_from(limits.flush_bytes.saturating_div(4).max(1))
         .unwrap_or(u64::MAX)
         .min(MAX_INDEX_EVENT_PAGE_BYTES)
         .max(1);
@@ -460,37 +484,42 @@ async fn advance(
         let node = NodeId(u64::from(writer.source.node_id));
         let proposed = writer.scanned.sources[&node].next_offset;
         let safe_next = writer.dispatcher.checkpoint_limit(writer.source, proposed);
-        prepare_page(
-            writer, dispatches, safe_next, reader, extractor, publisher, credits, limits,
-        )
-        .await?;
+        if safe_next <= writer.pending_next {
+            continue;
+        }
+        let (page_atomic, mutations) = prepare_page(writer, dispatches, safe_next)?;
+        if !writer.pending_mutations.is_empty()
+            && mutation_window_needed(
+                &writer.pending_mutations,
+                writer.pending_mutation_bytes,
+                &mutations,
+            )? > writer.pending_mutation_capacity
+        {
+            flush(writer, reader, extractor, publisher, credits, limits).await?;
+        }
+        writer.through_atomic = writer.through_atomic.max(page_atomic);
+        queue_mutations(writer, mutations, safe_next)?;
         if should_flush(writer, limits) {
-            flush(writer, publisher, credits, limits).await?;
+            flush(writer, reader, extractor, publisher, credits, limits).await?;
         }
     }
     if writer
         .since
         .is_some_and(|since| since.elapsed() >= limits.flush_age)
     {
-        flush(writer, publisher, credits, limits).await?;
+        flush(writer, reader, extractor, publisher, credits, limits).await?;
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn prepare_page(
-    writer: &mut Writer,
+fn prepare_page(
+    writer: &Writer,
     dispatches: Vec<V6SourceDispatch>,
     safe_next: u64,
-    reader: &ClusterObjectReader,
-    extractor: &V6ProjectionExtractor,
-    publisher: &V6ProjectionPublisher,
-    credits: &IndexingMemoryCredits,
-    limits: Limits,
-) -> Result<(), Status> {
-    let first = writer.accumulator.next_offset();
+) -> Result<(u64, Vec<Mutation>), Status> {
+    let first = writer.pending_next;
     if safe_next <= first {
-        return Ok(());
+        return Ok((0, Vec::new()));
     }
     let mut units = Vec::new();
     for dispatch in dispatches {
@@ -500,12 +529,87 @@ async fn prepare_page(
             units.push((atomic, group));
         }
     }
-    let (through_atomic, mutations) = coalesce_units(writer.through_atomic, units)?;
-    writer.through_atomic = through_atomic;
-    prepare_lane(
-        writer, mutations, safe_next, reader, extractor, publisher, credits, limits,
-    )
-    .await
+    coalesce_units(0, units)
+}
+
+fn queue_mutations(
+    writer: &mut Writer,
+    mutations: Vec<Mutation>,
+    safe_next: u64,
+) -> Result<(), Status> {
+    let arms_age = !mutations.is_empty();
+    queue_mutation_window(
+        &mut writer.pending_mutations,
+        &mut writer.pending_mutation_bytes,
+        &mut writer.pending_operations,
+        &mut writer.pending_next,
+        writer.pending_mutation_capacity,
+        mutations,
+        safe_next,
+    )?;
+    if arms_age {
+        writer.since.get_or_insert_with(Instant::now);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_mutation_window(
+    latest: &mut BTreeMap<String, Mutation>,
+    resident_bytes: &mut usize,
+    observed_operations: &mut u64,
+    next_offset: &mut u64,
+    capacity: usize,
+    mutations: Vec<Mutation>,
+    safe_next: u64,
+) -> Result<(), Status> {
+    let needed = mutation_window_needed(latest, *resident_bytes, &mutations)?;
+    if needed > capacity {
+        return Err(Status::resource_exhausted(format!(
+            "v6 mutation window requires {needed} bytes but admits {}",
+            capacity
+        )));
+    }
+    let operations = u64::try_from(mutations.len())
+        .map_err(|_| Status::resource_exhausted("v6 mutation-window operations overflow"))?;
+    for mutation in mutations {
+        let replace = latest.get(&mutation.path).is_none_or(|previous| {
+            (mutation.offset, mutation.ordinal) > (previous.offset, previous.ordinal)
+        });
+        if replace {
+            latest.insert(mutation.path.clone(), mutation);
+        }
+    }
+    *resident_bytes = needed;
+    *observed_operations = observed_operations.saturating_add(operations);
+    *next_offset = safe_next;
+    Ok(())
+}
+
+fn mutation_window_needed(
+    latest: &BTreeMap<String, Mutation>,
+    resident_bytes: usize,
+    mutations: &[Mutation],
+) -> Result<usize, Status> {
+    mutations
+        .iter()
+        .try_fold(resident_bytes, |mut needed, mutation| {
+            if let Some(previous) = latest.get(&mutation.path) {
+                if (mutation.offset, mutation.ordinal) <= (previous.offset, previous.ordinal) {
+                    return Ok(needed);
+                }
+                needed = needed.saturating_sub(mutation_window_bytes(previous));
+            }
+            needed
+                .checked_add(mutation_window_bytes(mutation))
+                .ok_or_else(|| Status::resource_exhausted("v6 mutation-window size overflow"))
+        })
+}
+
+fn mutation_window_bytes(mutation: &Mutation) -> usize {
+    std::mem::size_of::<Mutation>()
+        .saturating_add(mutation.path.capacity().saturating_mul(2))
+        .saturating_add(std::mem::size_of::<usize>().saturating_mul(4))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -766,9 +870,9 @@ fn apply_rows(
 }
 
 fn should_flush(writer: &Writer, limits: Limits) -> bool {
-    has_publication_work(writer.current.is_some(), writer.pending_prepared_rows)
-        && (writer.accumulator.buffered_bytes() >= limits.flush_bytes
-            || writer.pending_prepared_rows >= limits.flush_operations
+    !writer.pending_mutations.is_empty()
+        && (writer.pending_mutation_bytes >= limits.flush_bytes
+            || writer.pending_operations >= limits.flush_operations
             || writer
                 .since
                 .is_some_and(|since| since.elapsed() >= limits.flush_age))
@@ -780,11 +884,30 @@ fn has_publication_work(has_current: bool, prepared_source_rows: u64) -> bool {
 
 async fn flush(
     writer: &mut Writer,
+    reader: &ClusterObjectReader,
+    extractor: &V6ProjectionExtractor,
     publisher: &V6ProjectionPublisher,
     credits: &IndexingMemoryCredits,
     limits: Limits,
 ) -> Result<(), Status> {
+    if !writer.pending_mutations.is_empty() {
+        let next = writer.pending_next;
+        let mut mutations = writer
+            .pending_mutations
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        mutations.sort_by_key(|mutation| (mutation.offset, mutation.ordinal));
+        prepare_lane(
+            writer, mutations, next, reader, extractor, publisher, credits, limits,
+        )
+        .await?;
+    }
     if !has_publication_work(writer.current.is_some(), writer.pending_prepared_rows) {
+        writer.pending_mutations.clear();
+        writer.pending_mutation_bytes = 0;
+        writer.pending_operations = 0;
+        writer.since = None;
         return Ok(());
     }
     let start = publication_start(writer.current.as_ref());
@@ -964,6 +1087,9 @@ async fn flush(
     writer.pending_prepared_rows = 0;
     writer.pending_prepared_bytes = 0;
     writer.pending_projected_rows = 0;
+    writer.pending_mutations.clear();
+    writer.pending_mutation_bytes = 0;
+    writer.pending_operations = 0;
     Ok(())
 }
 
@@ -1131,6 +1257,28 @@ fn current_placement(decisions: &DecisionRaft) -> Result<ClusterPlacement, Statu
 mod tests {
     use super::*;
 
+    fn query_update(
+        document: keldra_index::v6::StableDocumentKey,
+        path: &str,
+        version: u64,
+    ) -> PreparedQueryMutationBatch {
+        PreparedQueryMutationBatch {
+            membership: Some(keldra_index::v6::PreparedQueryMembershipDelta {
+                recipe: keldra_index::v6::RecipeIdentity::new([3; 32]).unwrap(),
+                gates: vec![keldra_index::v6::QueryDocumentGate {
+                    document,
+                    material_source_version: version,
+                    current_source_version: version,
+                    live: true,
+                    source_path: Some(path.into()),
+                    result_path: Some(path.into()),
+                    result_version: version,
+                }],
+            }),
+            fields: Vec::new(),
+        }
+    }
+
     fn mutation(path: &str, offset: u64) -> Mutation {
         Mutation {
             offset,
@@ -1195,6 +1343,156 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
+    }
+
+    #[test]
+    fn publication_window_is_newest_wins_across_page_boundaries() {
+        let mut latest = BTreeMap::new();
+        let mut bytes = 0;
+        let mut operations = 0;
+        let mut next = 1;
+        let mut changed = mutation("objects/a", 2);
+        changed.version = 20;
+        queue_mutation_window(
+            &mut latest,
+            &mut bytes,
+            &mut operations,
+            &mut next,
+            usize::MAX,
+            vec![changed],
+            3,
+        )
+        .unwrap();
+        let mut restored = mutation("objects/a", 3);
+        restored.version = 10;
+        queue_mutation_window(
+            &mut latest,
+            &mut bytes,
+            &mut operations,
+            &mut next,
+            usize::MAX,
+            vec![restored],
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest["objects/a"].version, 10);
+        assert_eq!(next, 4);
+        assert_eq!(operations, 2);
+    }
+
+    #[test]
+    fn create_then_delete_remains_an_empty_latest_mutation_and_advances() {
+        let mut latest = BTreeMap::new();
+        let mut bytes = 0;
+        let mut operations = 0;
+        let mut next = 0;
+        queue_mutation_window(
+            &mut latest,
+            &mut bytes,
+            &mut operations,
+            &mut next,
+            usize::MAX,
+            vec![mutation("objects/a", 1)],
+            2,
+        )
+        .unwrap();
+        let mut deleted = mutation("objects/a", 2);
+        deleted.deleted = true;
+        queue_mutation_window(
+            &mut latest,
+            &mut bytes,
+            &mut operations,
+            &mut next,
+            usize::MAX,
+            vec![deleted],
+            3,
+        )
+        .unwrap();
+
+        assert!(latest["objects/a"].deleted);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn ten_thousand_hot_updates_prepare_only_256_query_documents() {
+        let scope = [9; 32];
+        let mut latest = BTreeMap::new();
+        let mut bytes = 0;
+        let mut operations = 0;
+        let mut next = 0;
+        for offset in 1..=10_000_u64 {
+            queue_mutation_window(
+                &mut latest,
+                &mut bytes,
+                &mut operations,
+                &mut next,
+                usize::MAX,
+                vec![mutation(&format!("objects/{:03}", offset % 256), offset)],
+                offset + 1,
+            )
+            .unwrap();
+        }
+        assert_eq!(latest.len(), 256);
+        assert_eq!(operations, 10_000);
+        assert_eq!(next, 10_001);
+
+        let mut pending = PreparedQueryMutationBatch::default();
+        let mut preparations = 0;
+        for mutation in latest.into_values() {
+            let document =
+                keldra_index::v6::StableDocumentKey::derive(scope, &mutation.path, 0).unwrap();
+            merge_query(
+                &mut pending,
+                query_update(document, &mutation.path, mutation.version),
+            )
+            .unwrap();
+            preparations += 1;
+        }
+
+        let membership = pending.membership.as_ref().unwrap();
+        assert_eq!(membership.gates.len(), 256);
+        assert_eq!(preparations, 256);
+        assert!(membership.gates.iter().all(|gate| {
+            let path = gate.source_path.as_deref().unwrap();
+            let suffix = path.rsplit('/').next().unwrap().parse::<u64>().unwrap();
+            gate.current_source_version == 10_000 - ((10_000 - suffix) % 256)
+        }));
+
+        let bytes = 4 * 1024 * 1024;
+        let memory = IndexingMemoryCredits::new(
+            bytes,
+            IndexingMemoryLimits {
+                hot_payload_bytes: bytes,
+                worker_scratch_bytes: bytes,
+                prepared_rows_bytes: bytes,
+                replay_input_bytes: bytes,
+                projection_accumulator_bytes: bytes,
+                seal_scratch_bytes: bytes,
+                ordering_catalog_bytes: bytes,
+            },
+        )
+        .unwrap();
+        let credits = QueryBlockCredits::from_pipeline_permit(
+            memory
+                .acquire(IndexingMemoryStage::OrderingCatalog, bytes)
+                .unwrap(),
+        );
+        let artifacts = keldra_index::v6::prepare_projection_query_run(
+            ProjectionPartitionIdentity::new([1; 32], 2, [3; 32], 2, 4, 5).unwrap(),
+            [6; 32],
+            1,
+            1,
+            10_001,
+            10_000,
+            pending,
+            keldra_index::v6::QueryBlockLimits::default_for_memory(),
+            credits,
+        )
+        .unwrap();
+        assert!(!artifacts.artifacts().blocks.is_empty());
     }
 
     #[test]
