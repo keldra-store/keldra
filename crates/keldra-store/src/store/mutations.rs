@@ -633,6 +633,7 @@ impl Store {
                     mutation: context,
                     source_id: source.source_id,
                     source_journal_position,
+                    reference_effects: LocalReferenceEffects::Deferred,
                 }),
                 definition_intent,
             )
@@ -1722,7 +1723,9 @@ impl Store {
             transition.validate().map_err(definition_mutation_error)?;
         }
         let fingerprint = operation.fingerprint();
-        let apply_content_lifecycle = distributed.is_none();
+        let apply_content_lifecycle = distributed.is_none_or(|distributed| {
+            distributed.reference_effects == LocalReferenceEffects::AppliedInline
+        });
         let released_predecessor = (versioning == ObjectVersioning::Unversioned)
             .then_some(current_version.as_ref())
             .flatten()

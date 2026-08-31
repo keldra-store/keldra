@@ -342,11 +342,18 @@ impl ObjectDistribution {
                 .collect();
             let completed = complete_metadata(async move {
                 let _permit = permit;
-                let coordinated = completion
-                    .store
-                    .coordinate_distributed_mutation_batch(store_operations, context)
-                    .await
-                    .map_err(mutation_status)?;
+                let coordinated = if single_node {
+                    completion
+                        .store
+                        .coordinate_single_node_mutation_batch(store_operations, context)
+                        .await
+                } else {
+                    completion
+                        .store
+                        .coordinate_distributed_mutation_batch(store_operations, context)
+                        .await
+                }
+                .map_err(mutation_status)?;
                 let durable = completion
                     .replicate_mutation_group_batch(
                         &completion_placement,
@@ -838,7 +845,7 @@ mod tests {
             .collect();
 
         let outcomes = store
-            .coordinate_distributed_mutation_batch(
+            .coordinate_single_node_mutation_batch(
                 operations,
                 ObjectMutationContext {
                     active_placement_log_id: PlacementLogId { term: 1, index: 1 },
