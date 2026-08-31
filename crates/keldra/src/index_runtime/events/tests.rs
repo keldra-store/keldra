@@ -1,6 +1,9 @@
 use std::sync::Mutex;
 
-use keldra_store::{ObjectHeadChange, ObjectHeadChangeKind, ReferenceDelta, VersionId};
+use keldra_store::{
+    DefinitionKind, DefinitionOperation, DefinitionTransition, ObjectHeadChange,
+    ObjectHeadChangeKind, ReferenceDelta, VersionId,
+};
 
 use super::*;
 
@@ -25,6 +28,7 @@ struct MemorySources {
     journals: Arc<Mutex<BTreeMap<NodeId, (WatchJournalStatus, Vec<LocalChange>)>>>,
     status_reads: Arc<Mutex<Vec<NodeId>>>,
     reads: Arc<Mutex<Vec<(NodeId, u64, u64)>>>,
+    definition_reads: Arc<Mutex<Vec<(NodeId, keldra_store::DefinitionKind)>>>,
     raw_reads: Arc<Mutex<Vec<NodeId>>>,
 }
 
@@ -89,6 +93,38 @@ impl IndexEventSources for MemorySources {
             limit,
             max_bytes,
             |change| change_bucket(change) == Some((tenant_id, bucket_id)),
+        )
+    }
+
+    async fn read_definition_page(
+        &self,
+        source: &IndexSource,
+        expected_source: SourceId,
+        after_offset: u64,
+        target_offset: u64,
+        kind: keldra_store::DefinitionKind,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<IndexSourcePage, IndexEventError> {
+        self.definition_reads
+            .lock()
+            .unwrap()
+            .push((source.node, kind));
+        memory_page(
+            &self.journals,
+            source,
+            expected_source,
+            after_offset,
+            target_offset,
+            limit,
+            max_bytes,
+            |change| {
+                matches!(
+                    change,
+                    LocalChange::ObjectHead(head)
+                        if head.definition_transition.as_ref().is_some_and(|transition| transition.kind == kind)
+                )
+            },
         )
     }
 }
@@ -192,6 +228,23 @@ fn change_at_path(
         accounting_transition: None,
         definition_transition: None,
     })
+}
+
+fn definition_change(offset: u64, kind: DefinitionKind) -> LocalChange {
+    let mut change = change_at_path(1, offset, 1, 2, "_keldra/indexes/example.json");
+    let LocalChange::ObjectHead(head) = &mut change else {
+        unreachable!("test helper always creates an object-head change");
+    };
+    head.definition_transition = Some(DefinitionTransition {
+        kind,
+        tenant_id: 1,
+        bucket_id: 2,
+        definition_id: 3,
+        path: head.exact_path.clone(),
+        object_version: head.path_version,
+        operation: DefinitionOperation::Upsert,
+    });
+    change
 }
 
 fn change_bucket(change: &LocalChange) -> Option<(u64, u64)> {
@@ -493,6 +546,89 @@ async fn routed_index_effects_do_no_source_reads_for_an_idle_vector() {
 
     assert!(effects.is_empty());
     assert!(sources.reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sparse_definition_page_skips_ordinary_rows_and_keeps_exact_source_coverage() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (
+            status(1, 10_000),
+            vec![
+                change(1, 1),
+                definition_change(4_000, DefinitionKind::Index),
+                change(1, 10_000),
+            ],
+        ),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let target = journal(vec![placement(clear)], &sources)
+        .capture_barrier()
+        .await
+        .unwrap();
+    let from = barrier(clear, 1, 1);
+
+    let page = journal(vec![placement(clear)], &sources)
+        .next_definition_page(
+            DefinitionKind::Index,
+            &from,
+            &target,
+            MAX_INDEX_EVENT_PAGE_BYTES,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(page.changes.len(), 1);
+    assert_eq!(page.changes[0].change.offset(), 4_000);
+    assert_eq!(page.through, target);
+    assert!(sources.raw_reads.lock().unwrap().is_empty());
+    assert_eq!(
+        sources.definition_reads.lock().unwrap().as_slice(),
+        &[(NodeId(1), DefinitionKind::Index)]
+    );
+}
+
+#[tokio::test]
+async fn empty_definition_route_advances_through_irrelevant_source_traffic() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 10_000), vec![change(1, 10_000)]));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let target = journal(vec![placement(clear)], &sources)
+        .capture_barrier()
+        .await
+        .unwrap();
+    let from = barrier(clear, 1, 1);
+
+    let page = journal(vec![placement(clear)], &sources)
+        .next_definition_page(
+            DefinitionKind::Index,
+            &from,
+            &target,
+            MAX_INDEX_EVENT_PAGE_BYTES,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(page.changes.is_empty());
+    assert_eq!(page.encoded_bytes, 0);
+    assert_eq!(page.through, target);
 }
 
 #[tokio::test]

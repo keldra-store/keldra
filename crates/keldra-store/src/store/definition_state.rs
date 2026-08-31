@@ -344,6 +344,9 @@ impl Store {
         }) {
             return Err(DefinitionStateError::CheckpointRegression);
         }
+        if mutations.is_empty() && existing_checkpoint == Some(*checkpoint) {
+            return Ok(());
+        }
         let mut batch = WriteBatch::default();
         let assignments_changed = self.stage_assignment_mutations(&mut batch, mutations)?;
         batch.put_cf(

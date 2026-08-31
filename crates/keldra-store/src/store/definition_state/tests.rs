@@ -284,6 +284,36 @@ async fn assignment_page_and_checkpoint_commit_and_page_together() {
 }
 
 #[tokio::test]
+async fn identical_empty_checkpoint_page_is_a_storage_no_op() {
+    let (_temporary, store) = store().await;
+    let checkpoint = DefinitionCheckpoint {
+        consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
+        source_id: SourceId {
+            node_id: 4,
+            source_epoch: [8; 32],
+        },
+        next_offset: 21,
+        observed_fence: fence(19),
+    };
+    store
+        .apply_definition_assignment_page(&[], &checkpoint)
+        .unwrap();
+    let sequence = store.db.latest_sequence_number();
+
+    store
+        .apply_definition_assignment_page(&[], &checkpoint)
+        .unwrap();
+
+    assert_eq!(store.db.latest_sequence_number(), sequence);
+    assert_eq!(
+        store
+            .definition_checkpoint(checkpoint.consumer_kind, checkpoint.source_id.node_id)
+            .unwrap(),
+        Some(checkpoint)
+    );
+}
+
+#[tokio::test]
 async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() {
     let (_temporary, store) = store().await;
     let mut changes = store.subscribe_definition_assignment_changes();

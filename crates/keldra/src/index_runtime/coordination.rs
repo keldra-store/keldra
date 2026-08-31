@@ -545,22 +545,20 @@ async fn run_index_catalog_epoch(
             .await
             .map_err(index_event_status)?;
         while let Some(page) = journal
-            .next_raw_page(&cursor, &target, MAX_INDEX_EVENT_PAGE_BYTES)
+            .next_definition_page(
+                DefinitionKind::Index,
+                &cursor,
+                &target,
+                MAX_INDEX_EVENT_PAGE_BYTES,
+            )
             .await
             .map_err(index_event_status)?
         {
             replayed_rows = replayed_rows.saturating_add(page.changes.len() as u64);
             replayed_bytes = replayed_bytes.saturating_add(page.encoded_bytes);
             for change in &page.changes {
-                let keldra_store::LocalChange::ObjectHead(head) = &change.change else {
-                    continue;
-                };
-                let Some(transition) = &head.definition_transition else {
-                    continue;
-                };
-                if transition.kind == DefinitionKind::Index {
-                    apply_index_catalog_transition(reader, catalog, transition).await?;
-                }
+                let transition = definition_transition(DefinitionKind::Index, &change.change)?;
+                apply_index_catalog_transition(reader, catalog, transition).await?;
             }
             cursor = page.through;
         }
