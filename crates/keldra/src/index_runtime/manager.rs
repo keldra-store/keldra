@@ -1104,15 +1104,35 @@ async fn advance_catch_up(
         )
     };
     let admission = publication_admission(work.maintenance);
-    if work
+    if work.publishing.is_some()
+        && work.atomic_projection.is_none()
+        && work
+            .active
+            .as_ref()
+            .is_some_and(|active| active.builder.is_empty() && active.builder.frozen.is_none())
+    {
+        work.active = None;
+    }
+    let publication_finished = work
         .publishing
         .as_ref()
-        .is_some_and(|publication| publication.task.is_finished())
-    {
+        .is_some_and(|publication| publication.task.is_finished());
+    let join_publication_now = publication_join_required(
+        work.publishing.is_some(),
+        work.active.is_some(),
+        work.atomic_projection.is_some(),
+        publication_finished,
+    );
+    // Once no useful intake or atomic projection can overlap the publication,
+    // keep its completion attached to this admitted builder turn. Polling the
+    // already-owned task through the global delayed queue lets unrelated
+    // catalog traffic postpone observing a durable commit for an unbounded
+    // wall-clock interval.
+    if join_publication_now {
         let publication = work
             .publishing
             .take()
-            .expect("finished publication remains installed");
+            .expect("publication selected for joining remains installed");
         let InFlightPublication {
             current,
             barrier,
@@ -1120,7 +1140,7 @@ async fn advance_catch_up(
             admission,
             task,
         } = publication;
-        match task.join().await {
+        match await_with_builder_heartbeats(&work.progress, task.join()).await {
             Ok(Ok(published)) => {
                 if catch_up::published_candidate_requires_locator_maintenance(&work, &published)? {
                     work.progress.complete();
@@ -1185,15 +1205,6 @@ async fn advance_catch_up(
                 ));
             }
         }
-    }
-    if work.publishing.is_some()
-        && work.atomic_projection.is_none()
-        && work
-            .active
-            .as_ref()
-            .is_some_and(|active| active.builder.is_empty() && active.builder.frozen.is_none())
-    {
-        work.active = None;
     }
     if work.publishing.is_some() && work.active.is_none() {
         return Ok((
@@ -1583,6 +1594,15 @@ async fn advance_catch_up(
             return Ok((BuilderPhase::CatchUp(work), BuilderDisposition::Ready, None));
         }
     }
+}
+
+const fn publication_join_required(
+    publishing: bool,
+    has_active_projection: bool,
+    has_atomic_projection: bool,
+    publication_finished: bool,
+) -> bool {
+    publishing && (publication_finished || (!has_active_projection && !has_atomic_projection))
 }
 
 async fn enqueue_candidate_publication(

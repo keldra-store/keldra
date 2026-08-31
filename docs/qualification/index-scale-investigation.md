@@ -662,3 +662,82 @@ plans can no longer consume CPU or a source stripe after their only publisher
 has been replaced. Focused tests prove a cancelled queued submission performs
 zero work after the worker reaches its queue position. A new exact-candidate
 SSD sustained cell is required to close this failure.
+
+Server commit `492b96944b0a` closed the remaining task-ownership hole by
+keeping an owned projection task attached while its result is joined. A
+five-minute D640 cell on the rotational host accepted every offered mutation
+at 39.97 operations/s, returned exact final results for all 640 definitions,
+held concurrent-query p99 to 486 milliseconds, observed visibility maximum
+6.28 seconds, and drained in 25.85 seconds. Its archive SHA-256 is
+`a0acebe23c06787b3ff0cb8d94ce39a995e9e90aca85e9871f530f8b0cbfa241`.
+
+The corresponding ten-minute SSD cell remained correctness-clean but exposed
+one residual tail: all 59,994 mutations were accepted at 99.99 operations/s,
+all 38,400 concurrent queries completed without error, query p99 was 737.79
+milliseconds, and all 640 definitions were exact after drain. Visibility was
+p50 2.48 seconds and p95 4.69 seconds, but one sample reached 94.77 seconds;
+drain was 157.13 seconds. Its archive SHA-256 is
+`6eaa7a5d7b60c4d8f92a36220619f34fc950df8fe0210f5996d3fbbb7f148467`.
+
+Commit `ae77005fa6c6` added explicit source-read, projection/application,
+segment-seal, pack-stage, and component-publication phase timing. Its exact
+ten-minute SSD rerun again accepted all 59,994 mutations at 99.99 operations/s
+and returned exact results for all 640 definitions. Concurrent-query p99 was
+982.53 milliseconds with zero request, timeout, or correctness errors; 44 of
+38,400 open-loop query offers were deliberately dropped by the bounded client
+rather than queued. Of 98 visibility samples, 97 stayed in the normal band
+(p50 2.42 seconds, p95 4.46 seconds) and one reached 89.72 seconds; drain was
+53.17 seconds. Its archive SHA-256 is
+`72b7660b39ad0066ff78f2393f29dce103188c74a3c3e0babb8387d7c923771d`.
+
+That phase trace rules out exact source reads, shared projection parsing,
+logical assembly, segment sealing, immutable pack staging, and component
+publication as the long operation: none reported a slow completion during the
+zero-progress interval. Process accounting initially appeared to show 9.53 GB
+of writes during the 90-second interval, but live `/proc/<pid>/io` attribution
+proved that almost all such bytes are `cancelled_write_bytes` from disposable
+format-v4 merge scratch files. Host block I/O remained low and RocksDB recorded
+no write stall; its flushes and compactions were sub-second and only tens of
+megabytes. Conversely `rchar` advanced by hundreds of megabytes per second
+with zero physical read bytes, demonstrating repeated page-cache reads of
+existing v4 artifacts. Open descriptors during the reproduction continuously
+named `.merge-*.tmp` files beneath the bounded scratch directory.
+
+This establishes a separate physical-amplification defect: the storage device
+was not servicing 9.53 GB of durable writes, but the process still spent CPU,
+memory bandwidth, page-cache capacity, and allocator work repeatedly reading
+and constructing disposable v4 merge state. A scheduler or timeout adjustment
+cannot remove that work. The coherent correction remains the format-v5
+delta/component generation in KELDRA-0020: stable document keys, exact
+projected-state comparison, changed-recipe-only appends, and component-local
+compaction. The v4 bridge remains useful evidence that logical catalog
+cardinality and equivalent definitions can share one writer, but it cannot
+establish the final physical write-amplification gate.
+
+A second targeted run enabled only the builder/publication DEBUG spans needed
+to place the discrete visibility outlier. It accepted all 59,994 mutations at
+99.98 operations/s, returned exact final results for all 640 definitions, and
+completed 38,365 of 38,400 open-loop query offers with no request, timeout, or
+correctness error. Query p99 was 970.24 milliseconds. Visibility was p50 2.41
+seconds and p95 4.96 seconds, but one sample reached 74.51 seconds; exact drain
+was 51.55 seconds. The archive SHA-256 is
+`12fbaae88f901bbcb9f69ed52db64c7af98d3f56a3f3d8e72843691bd6b7051d`.
+
+That trace places the outlier after durable publication, rather than inside the
+v4 merge work. The affected catch-up admitted one 271-record page, completed
+projection and assembly, and published revision 369 in 76.7 milliseconds. The
+publication completion event occurred at 02:08:02.088. The same physical
+builder did not finish its catch-up progress span until 02:09:20.144: 78.056
+seconds in which the already-completed owned publication was not observed.
+
+The control-flow cause was completion polling through the global builder
+delayed queue. `enqueue_candidate_publication` detached an owned publication
+task and returned a 10-millisecond retry. Even when the builder had released
+its active buffer and had no projection work it could overlap, only a later
+global scheduler turn joined that task. Sustained catalog and builder traffic
+could therefore postpone recognizing an already durable commit by an
+unbounded wall-clock interval. The correction preserves useful overlap while a
+builder has buffered or atomic work, but when publication is the builder's only
+remaining progress it joins that exact owned task directly under builder
+heartbeats. This correction requires a same-candidate sustained SSD rerun; the
+targeted failed result remains evidence, not a post-fix pass.
