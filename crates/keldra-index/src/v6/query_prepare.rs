@@ -229,6 +229,11 @@ pub fn prepare_projection_query_run(
         )?;
     }
     blocks.sort_unstable_by(|left, right| descriptor_order(left).cmp(&descriptor_order(right)));
+    // Query blocks are addressed by their exact encoded hash. Different terms
+    // can produce identical position (and therefore posting) blocks, so retain
+    // one artifact descriptor while every semantic reference keeps using the
+    // same content hash.
+    blocks.dedup_by(|left, right| left.descriptor == right.descriptor && left.bytes == right.bytes);
     let descriptor_bytes = blocks.iter().try_fold(0usize, |bytes, block| {
         bytes
             .checked_add(size_of::<super::QueryBlockDescriptor>())
@@ -911,5 +916,94 @@ mod tests {
             .map(|block| block.descriptor.records as usize)
             .sum::<usize>();
         assert_eq!(postings, 2);
+    }
+
+    #[test]
+    fn terms_with_identical_positions_share_one_canonical_block() {
+        let pool = memory(8 * 1024 * 1024);
+        let reservation = credits(&pool, 8 * 1024 * 1024);
+        let recipe = RecipeIdentity::new([7; 32]).unwrap();
+        let document = StableDocumentKey::from_bytes([4; 32]).unwrap();
+        let term = |value: &str| super::super::PreparedQueryTermDelta {
+            term: ScalarValue::String(value.into()),
+            document,
+            material_source_version: 1,
+            live: true,
+            positions: vec![0],
+        };
+
+        let prepared = prepare_projection_query_run(
+            partition(),
+            [8; 32],
+            1,
+            0,
+            1,
+            1,
+            PreparedQueryMutationBatch {
+                membership: None,
+                fields: vec![PreparedQueryRecipeDelta {
+                    recipe,
+                    delta: PreparedQueryFieldDelta {
+                        presence: QueryDocumentGate {
+                            document,
+                            material_source_version: 1,
+                            current_source_version: 1,
+                            live: true,
+                            source_path: None,
+                            result_path: None,
+                            result_version: 0,
+                        },
+                        doc_value: None,
+                        terms: vec![term("alpha"), term("beta")],
+                        points: Vec::new(),
+                    },
+                }],
+            },
+            QueryBlockLimits::default_for_memory(),
+            reservation,
+        )
+        .unwrap();
+        let artifacts = prepared.artifacts();
+        assert_eq!(
+            artifacts
+                .blocks
+                .iter()
+                .filter(|block| block.descriptor.kind == QueryBlockKind::Position)
+                .count(),
+            1
+        );
+        assert_eq!(
+            artifacts
+                .blocks
+                .iter()
+                .filter(|block| block.descriptor.kind == QueryBlockKind::Posting)
+                .count(),
+            1
+        );
+        assert_eq!(
+            artifacts
+                .blocks
+                .iter()
+                .find(|block| block.descriptor.kind == QueryBlockKind::TermDictionary)
+                .unwrap()
+                .descriptor
+                .records,
+            2
+        );
+        assert_eq!(
+            {
+                let verification_pool = memory(1024 * 1024);
+                let mut verification = credits(&verification_pool, 1024 * 1024);
+                decode_projection_query_run(
+                    &artifacts.run.bytes,
+                    QueryBlockLimits::default_for_memory(),
+                    &mut verification,
+                )
+                .unwrap()
+                .blocks
+                .len()
+            },
+            artifacts.blocks.len()
+        );
     }
 }
