@@ -41,6 +41,10 @@ counters!(
     published_source_bytes,
     checkpointed_source_rows,
     checkpointed_source_bytes,
+    catalog_source_rows,
+    catalog_source_bytes,
+    catalog_checkpointed_source_rows,
+    catalog_checkpointed_source_bytes,
     catalog_directory_publications,
     catalog_activations,
     stage_cpu_nanos,
@@ -106,6 +110,10 @@ impl V6PipelineTelemetry {
             keldra_index_v6_published_source_bytes_total = Self::load(&self.published_source_bytes),
             keldra_index_v6_checkpointed_source_rows_total = Self::load(&self.checkpointed_source_rows),
             keldra_index_v6_checkpointed_source_bytes_total = Self::load(&self.checkpointed_source_bytes),
+            keldra_index_v6_catalog_source_rows_total = Self::load(&self.catalog_source_rows),
+            keldra_index_v6_catalog_source_bytes_total = Self::load(&self.catalog_source_bytes),
+            keldra_index_v6_catalog_checkpointed_source_rows_total = Self::load(&self.catalog_checkpointed_source_rows),
+            keldra_index_v6_catalog_checkpointed_source_bytes_total = Self::load(&self.catalog_checkpointed_source_bytes),
             keldra_index_v6_catalog_directory_publications_total = Self::load(&self.catalog_directory_publications),
             keldra_index_v6_catalog_activations_total = Self::load(&self.catalog_activations),
             keldra_index_v6_stage_cpu_nanoseconds_total = Self::load(&self.stage_cpu_nanos),
@@ -118,5 +126,59 @@ impl V6PipelineTelemetry {
             keldra_index_v6_lag_oldest_age_milliseconds = Self::load(&self.lag_oldest_age_millis),
             "keldra_index_v6_summary"
         );
+    }
+
+    pub(crate) fn record_catalog_checkpoint(&self, rows: u64, bytes: u64) {
+        Self::add(&self.catalog_source_rows, rows);
+        Self::add(&self.catalog_source_bytes, bytes);
+        Self::add(&self.catalog_checkpointed_source_rows, rows);
+        Self::add(&self.catalog_checkpointed_source_bytes, bytes);
+    }
+
+    /// An empty cursor-advance batch retains control metadata but prepares no
+    /// object row. Keep those bytes out of indexed-object throughput.
+    pub(crate) const fn indexed_prepared_bytes(source_rows: u64, resident_bytes: u64) -> u64 {
+        if source_rows == 0 { 0 } else { resident_bytes }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_checkpoint_does_not_claim_projection_progress() {
+        let telemetry = V6PipelineTelemetry::default();
+        telemetry.record_catalog_checkpoint(7, 4096);
+
+        assert_eq!(V6PipelineTelemetry::load(&telemetry.source_rows), 0);
+        assert_eq!(V6PipelineTelemetry::load(&telemetry.source_bytes), 0);
+        assert_eq!(
+            V6PipelineTelemetry::load(&telemetry.checkpointed_source_rows),
+            0
+        );
+        assert_eq!(
+            V6PipelineTelemetry::load(&telemetry.checkpointed_source_bytes),
+            0
+        );
+        assert_eq!(V6PipelineTelemetry::load(&telemetry.catalog_source_rows), 7);
+        assert_eq!(
+            V6PipelineTelemetry::load(&telemetry.catalog_source_bytes),
+            4096
+        );
+        assert_eq!(
+            V6PipelineTelemetry::load(&telemetry.catalog_checkpointed_source_rows),
+            7
+        );
+        assert_eq!(
+            V6PipelineTelemetry::load(&telemetry.catalog_checkpointed_source_bytes),
+            4096
+        );
+    }
+
+    #[test]
+    fn empty_control_batch_has_no_indexed_prepared_bytes() {
+        assert_eq!(V6PipelineTelemetry::indexed_prepared_bytes(0, 6096), 0);
+        assert_eq!(V6PipelineTelemetry::indexed_prepared_bytes(1, 6096), 6096);
     }
 }

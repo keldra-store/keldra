@@ -72,15 +72,16 @@ pub(super) fn parse_artifact_path(
         }
         let parsed = keldra_index::v6::parse_projection_catalog_path(path)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let routing_generation = parsed
-            .physical_catalog_generation
-            .unwrap_or(parsed.family_id);
-        if keldra_index::v6::projection_catalog_routing_id(parsed.family_id, routing_generation)
+        // The family directory and every generation-specific activation are
+        // mutable state owned by one stable family lifecycle authority. The
+        // physical generation in an activation path identifies catalog state;
+        // it must not change routing or split that lifecycle across nodes.
+        if keldra_index::v6::projection_catalog_routing_id(parsed.family_id, parsed.family_id)
             .map_err(|error| Status::invalid_argument(error.to_string()))?
             != expected_index
         {
             return Err(Status::invalid_argument(
-                "projection catalog routing identity does not match its full identity",
+                "projection catalog routing identity does not match its stable family authority",
             ));
         }
         return Ok(ArtifactPathKind::ProjectionCatalogMutable);
@@ -148,6 +149,33 @@ pub(crate) fn artifact_hash_from_path(index_id: u64, path: &str) -> Option<[u8; 
         _ => return None,
     };
     hex::decode(digest).ok()?.try_into().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_specific_activation_uses_stable_family_routing_authority() {
+        let family_id = [7; 32];
+        let physical_catalog_generation = [9; 32];
+        let path = keldra_index::v6::projection_catalog_activation_path(
+            family_id,
+            physical_catalog_generation,
+        );
+        let family_routing =
+            keldra_index::v6::projection_catalog_routing_id(family_id, family_id).unwrap();
+        let generation_routing =
+            keldra_index::v6::projection_catalog_routing_id(family_id, physical_catalog_generation)
+                .unwrap();
+
+        assert_ne!(family_routing, generation_routing);
+        assert_eq!(
+            parse_artifact_path(&path, family_routing).unwrap(),
+            ArtifactPathKind::ProjectionCatalogMutable
+        );
+        assert!(parse_artifact_path(&path, generation_routing).is_err());
+    }
 }
 
 pub(super) fn immutable_content_hash_from_path(index_id: u64, path: &str) -> Option<[u8; 32]> {

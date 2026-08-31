@@ -32,6 +32,7 @@ use tonic::Status;
 use crate::cluster_object_read::ClusterObjectReader;
 
 use super::publication::{DerivedArtifactAdmission, IndexArtifactPublish, IndexArtifactRouter};
+use super::v6_compaction::{V6CompactionArtifacts, V6CompactionBase};
 
 const MAX_STREAM_DIRECTORY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STREAM_PAGE_BYTES: usize = 32 * 1024;
@@ -103,6 +104,88 @@ impl V6ProjectionPublisher {
         pack_credits: ProjectionPackCredits,
         maximum_preload_bytes: usize,
     ) -> Result<PreparedAtomicProjectionGeneration, Status> {
+        self.prepare_atomic_generation_inner(
+            storage_tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            partition,
+            physical_catalog_generation,
+            previous,
+            None,
+            source_start_offset,
+            next_offset,
+            through_atomic_position,
+            deltas,
+            query_batch,
+            query_credits,
+            pack_credits,
+            maximum_preload_bytes,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_atomic_generation_after_compaction(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        partition: ProjectionPartitionIdentity,
+        physical_catalog_generation: [u8; 32],
+        previous: &LoadedV6ProjectionGeneration,
+        compaction: &V6CompactionBase,
+        source_start_offset: u64,
+        next_offset: u64,
+        through_atomic_position: u64,
+        deltas: Vec<keldra_index::v6::SealedComponentDelta>,
+        query_batch: PreparedQueryMutationBatch,
+        query_credits: QueryBlockCredits,
+        pack_credits: ProjectionPackCredits,
+        maximum_preload_bytes: usize,
+    ) -> Result<PreparedAtomicProjectionGeneration, Status> {
+        self.prepare_atomic_generation_inner(
+            storage_tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            partition,
+            physical_catalog_generation,
+            Some(previous),
+            Some(compaction),
+            source_start_offset,
+            next_offset,
+            through_atomic_position,
+            deltas,
+            query_batch,
+            query_credits,
+            pack_credits,
+            maximum_preload_bytes,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_atomic_generation_inner(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        partition: ProjectionPartitionIdentity,
+        physical_catalog_generation: [u8; 32],
+        previous: Option<&LoadedV6ProjectionGeneration>,
+        compaction: Option<&V6CompactionBase>,
+        source_start_offset: u64,
+        next_offset: u64,
+        through_atomic_position: u64,
+        deltas: Vec<keldra_index::v6::SealedComponentDelta>,
+        query_batch: PreparedQueryMutationBatch,
+        query_credits: QueryBlockCredits,
+        pack_credits: ProjectionPackCredits,
+        maximum_preload_bytes: usize,
+    ) -> Result<PreparedAtomicProjectionGeneration, Status> {
         let mut component_pages = BTreeMap::new();
         let mut query_pages = BTreeMap::new();
         let mut preloaded_bytes = 0usize;
@@ -111,8 +194,8 @@ impl V6ProjectionPublisher {
             .map(|delta| delta.component)
             .collect::<BTreeSet<_>>();
         if let Some(previous) = previous {
-            for root in previous
-                .generation
+            let base = compaction.map_or(&previous.generation, |value| &value.predecessor);
+            for root in base
                 .roots
                 .iter()
                 .filter(|root| changed.contains(&root.component))
@@ -122,9 +205,13 @@ impl V6ProjectionPublisher {
                     if component_pages.contains_key(&hash) {
                         continue;
                     }
-                    let path = projection_stream_page_path(partition, hash);
-                    let (bytes, _) = self
-                        .read_object(
+                    let bytes = if let Some(bytes) =
+                        compaction.and_then(|compaction| compaction.component_page(&hash))
+                    {
+                        bytes.clone()
+                    } else {
+                        let path = projection_stream_page_path(partition, hash);
+                        self.read_object(
                             storage_tenant,
                             bucket,
                             tenant_id,
@@ -134,7 +221,9 @@ impl V6ProjectionPublisher {
                             MAX_STREAM_PAGE_BYTES,
                         )
                         .await?
-                        .ok_or_else(|| Status::data_loss("v6 component stream page is absent"))?;
+                        .map(|(bytes, _)| bytes)
+                        .ok_or_else(|| Status::data_loss("v6 component stream page is absent"))?
+                    };
                     preloaded_bytes = preloaded_bytes
                         .checked_add(bytes.len())
                         .filter(|bytes| *bytes <= maximum_preload_bytes)
@@ -153,15 +242,19 @@ impl V6ProjectionPublisher {
                     component_pages.insert(hash, bytes);
                 }
             }
-            if previous.generation.query_stream_root.run_count > 0 {
-                let mut pending = vec![previous.generation.query_stream_root.stream_root_hash];
+            if base.query_stream_root.run_count > 0 {
+                let mut pending = vec![base.query_stream_root.stream_root_hash];
                 while let Some(hash) = pending.pop() {
                     if query_pages.contains_key(&hash) {
                         continue;
                     }
-                    let path = projection_query_run_stream_page_path(partition, hash);
-                    let (bytes, _) = self
-                        .read_object(
+                    let bytes = if let Some(bytes) =
+                        compaction.and_then(|compaction| compaction.query_page(&hash))
+                    {
+                        bytes.clone()
+                    } else {
+                        let path = projection_query_run_stream_page_path(partition, hash);
+                        self.read_object(
                             storage_tenant,
                             bucket,
                             tenant_id,
@@ -171,7 +264,9 @@ impl V6ProjectionPublisher {
                             MAX_STREAM_PAGE_BYTES,
                         )
                         .await?
-                        .ok_or_else(|| Status::data_loss("v6 query stream page is absent"))?;
+                        .map(|(bytes, _)| bytes)
+                        .ok_or_else(|| Status::data_loss("v6 query stream page is absent"))?
+                    };
                     let page = decode_query_run_page(&bytes).map_err(index_status)?;
                     if let QueryRunPage::Branch(children) = page {
                         if let Some(child) = children.last() {
@@ -193,7 +288,12 @@ impl V6ProjectionPublisher {
         prepare_atomic_projection_generation(
             partition,
             physical_catalog_generation,
-            previous.map(|previous| (&previous.generation, previous.current.generation_hash)),
+            previous.map(|previous| {
+                (
+                    compaction.map_or(&previous.generation, |value| &value.predecessor),
+                    previous.current.generation_hash,
+                )
+            }),
             source_start_offset,
             next_offset,
             through_atomic_position,
@@ -499,6 +599,98 @@ impl V6ProjectionPublisher {
             current_object_version: outcome.version,
             generation: loaded_generation,
         })
+    }
+
+    /// Make every immutable compaction output durable before the successor
+    /// generation that references it reaches the partition Current CAS.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn publish_compaction_artifacts(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        partition: ProjectionPartitionIdentity,
+        compaction: V6CompactionArtifacts,
+    ) -> Result<(), Status> {
+        let mut artifacts = BTreeMap::new();
+        if let Some(component) = &compaction.component {
+            for pack in &component.packs.packs {
+                insert_artifact(
+                    &mut artifacts,
+                    projection_pack_path(partition, pack.hash),
+                    keldra_index::v6::ProjectionArtifactKind::Pack,
+                    pack.hash,
+                    pack.bytes.clone(),
+                )?;
+            }
+            for page in &component.pages {
+                insert_artifact(
+                    &mut artifacts,
+                    projection_stream_page_path(partition, page.hash),
+                    keldra_index::v6::ProjectionArtifactKind::StreamPage,
+                    page.hash,
+                    page.bytes.clone(),
+                )?;
+            }
+        }
+        if let Some(query) = &compaction.query {
+            for block in &query.artifacts().blocks {
+                insert_artifact(
+                    &mut artifacts,
+                    projection_query_run_pack_path(partition, block.descriptor.hash),
+                    keldra_index::v6::ProjectionArtifactKind::QueryRunPack,
+                    block.descriptor.hash,
+                    block.bytes.clone(),
+                )?;
+            }
+            let run = &query.artifacts().run;
+            insert_artifact(
+                &mut artifacts,
+                projection_query_run_pack_path(partition, run.hash),
+                keldra_index::v6::ProjectionArtifactKind::QueryRunPack,
+                run.hash,
+                run.bytes.clone(),
+            )?;
+            for page in &query.splice().pages {
+                insert_artifact(
+                    &mut artifacts,
+                    projection_query_run_stream_page_path(partition, page.hash),
+                    keldra_index::v6::ProjectionArtifactKind::QueryRunStreamPage,
+                    page.hash,
+                    page.bytes.clone(),
+                )?;
+            }
+        }
+        let mut publications = Vec::with_capacity(artifacts.len());
+        for artifact in artifacts.into_values() {
+            let blob = self.stage(&artifact.bytes).await?;
+            if blob.hash != artifact.hash || blob.length != artifact.bytes.len() as u64 {
+                return Err(Status::data_loss(
+                    "staged v6 compaction artifact changed its exact bytes",
+                ));
+            }
+            let routing_id =
+                projection_artifact_routing_id(partition.family_id, artifact.kind, artifact.hash)
+                    .map_err(index_status)?;
+            publications.push(request(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                routing_id,
+                artifact.path,
+                blob,
+                None,
+            ));
+        }
+        require_all_immutable_publications(
+            self.artifacts.publish_immutable_many(publications).await?,
+        )?;
+        // Keep the byte-credit guardians alive until every cloned publication
+        // payload has left this future.
+        drop(compaction);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -25,6 +25,7 @@ use super::source::{IndexBuildObject, IndexSourceMutation};
 use super::v6_backfill::open_partition_baseline;
 use super::v6_extractor::{SelectedV6Source, V6ProjectionExtractor, matching_recipes};
 use super::v6_journal_dispatch::{V6OrderedSourceDispatcher, V6SourceDispatch};
+use super::v6_mutation_window::coalesce_latest_by_source_path;
 use super::v6_publication::{LoadedV6ProjectionGeneration, V6ProjectionPublisher};
 
 const POLL: Duration = Duration::from_millis(25);
@@ -61,7 +62,6 @@ struct Writer {
     accumulator: PartitionProjectionAccumulator,
     query: PreparedQueryMutationBatch,
     query_credits: QueryBlockCredits,
-    touched: BTreeSet<[u8; 32]>,
     since: Option<Instant>,
     operations: u64,
     source_bytes: u64,
@@ -327,7 +327,6 @@ async fn open_writer(
         accumulator,
         query: PreparedQueryMutationBatch::default(),
         query_credits: QueryBlockCredits::from_pipeline_permit(query_permit),
-        touched: BTreeSet::new(),
         since: None,
         operations: 0,
         source_bytes: 0,
@@ -390,9 +389,6 @@ async fn backfill(
             )?;
             merge_query(&mut writer.query, prepared.query)?;
             previous.insert(path.clone(), Vec::new());
-            writer
-                .touched
-                .insert(*blake3::hash(path.as_bytes()).as_bytes());
             writer.source_bytes = writer.source_bytes.saturating_add(item.source_bytes);
             // Reading the exact journal position is intentional lineage
             // validation even though the accumulator uses dense baseline
@@ -507,39 +503,10 @@ async fn prepare_page(
             units.push((atomic, group));
         }
     }
-    let mut lane = Vec::new();
-    let mut lane_paths = BTreeSet::new();
-    let mut lane_atomic = writer.through_atomic;
-    for (atomic, unit) in units {
-        let unit_paths = mutation_paths(&unit);
-        if unit_paths.len() != unit.len() {
-            return Err(Status::data_loss(
-                "one atomic mutation unit repeats an exact source path",
-            ));
-        }
-        let conflicts = paths_conflict(&writer.touched, &lane_paths, &unit_paths);
-        if conflicts {
-            let boundary = unit
-                .iter()
-                .map(|mutation| mutation.offset)
-                .min()
-                .ok_or_else(|| Status::data_loss("v6 mutation unit is empty"))?;
-            writer.through_atomic = lane_atomic;
-            prepare_lane(
-                writer, lane, boundary, reader, extractor, publisher, credits, limits,
-            )
-            .await?;
-            flush(writer, publisher, credits, limits).await?;
-            lane = Vec::new();
-            lane_paths.clear();
-        }
-        lane_atomic = lane_atomic.max(atomic);
-        lane_paths.extend(unit_paths);
-        lane.extend(unit);
-    }
-    writer.through_atomic = lane_atomic;
+    let (through_atomic, mutations) = coalesce_units(writer.through_atomic, units)?;
+    writer.through_atomic = through_atomic;
     prepare_lane(
-        writer, lane, safe_next, reader, extractor, publisher, credits, limits,
+        writer, mutations, safe_next, reader, extractor, publisher, credits, limits,
     )
     .await
 }
@@ -603,9 +570,6 @@ async fn prepare_lane(
         )?;
         merge_query(&mut writer.query, prepared.query)?;
         previous.insert(mutation.path.clone(), value.previous);
-        writer
-            .touched
-            .insert(*blake3::hash(mutation.path.as_bytes()).as_bytes());
         writer.source_bytes = writer.source_bytes.saturating_add(value.source_bytes);
         rows.push(PreparedProjectionRow {
             source_offset: mutation.offset,
@@ -712,13 +676,15 @@ fn apply_rows(
             coalesced_rows,
             ..
         } => {
-            writer.pending_prepared_rows = writer
-                .pending_prepared_rows
-                .saturating_add(u64::try_from(source_rows).map_err(|_| {
-                    Status::resource_exhausted("v6 prepared rows exceed telemetry")
-                })?);
-            writer.pending_prepared_bytes =
-                writer.pending_prepared_bytes.saturating_add(prepared_bytes);
+            let source_rows = u64::try_from(source_rows)
+                .map_err(|_| Status::resource_exhausted("v6 prepared rows exceed telemetry"))?;
+            writer.pending_prepared_rows = writer.pending_prepared_rows.saturating_add(source_rows);
+            writer.pending_prepared_bytes = writer.pending_prepared_bytes.saturating_add(
+                super::v6_telemetry::V6PipelineTelemetry::indexed_prepared_bytes(
+                    source_rows,
+                    prepared_bytes,
+                ),
+            );
             writer.pending_projected_rows = writer.pending_projected_rows.saturating_add(
                 u64::try_from(coalesced_rows).map_err(|_| {
                     Status::resource_exhausted("v6 projected rows exceed telemetry")
@@ -754,16 +720,12 @@ async fn flush(
     }
     let projected_bytes = u64::try_from(writer.accumulator.buffered_bytes())
         .map_err(|_| Status::resource_exhausted("v6 projected bytes exceed telemetry"))?;
-    if let Some(current) = &writer.current {
-        let runs = current.generation.query_stream_root.run_count;
-        if runs >= limits.lsm_runs
-            || runs.saturating_mul(limits.flush_bytes as u64) >= limits.lsm_bytes
-        {
-            return Err(Status::resource_exhausted(
-                "v6 LSM compaction debt limit reached",
-            ));
-        }
-    }
+    let needs_compaction = writer.current.as_ref().is_some_and(|current| {
+        current.generation.query_stream_root.run_count >= limits.lsm_runs
+            || current.generation.roots.iter().any(|root| {
+                root.segment_count >= limits.lsm_runs || root.encoded_bytes >= limits.lsm_bytes
+            })
+    });
     let sealed = writer.accumulator.seal_and_reset().map_err(index_status)?;
     let (sealed, source_permit) = sealed.into_parts();
     let packed = sealed.deltas.iter().try_fold(0usize, |sum, delta| {
@@ -777,6 +739,48 @@ async fn flush(
     let _preload = credits
         .acquire(IndexingMemoryStage::ReplayInput, preload_bytes)
         .map_err(|_| Status::resource_exhausted("v6 spine preload memory unavailable"))?;
+    let compaction = if needs_compaction {
+        let component_permit = credits
+            .acquire(
+                IndexingMemoryStage::SealScratch,
+                limits.bytes.saturating_div(8).max(1),
+            )
+            .map_err(|_| {
+                Status::resource_exhausted("v6 component compaction memory unavailable")
+            })?;
+        let query_permit = credits
+            .acquire(
+                IndexingMemoryStage::OrderingCatalog,
+                limits.bytes.saturating_div(8).max(1),
+            )
+            .map_err(|_| Status::resource_exhausted("v6 query compaction memory unavailable"))?;
+        Some(
+            publisher
+                .prepare_compaction(
+                    &writer.recipe.storage_tenant,
+                    &writer.recipe.bucket,
+                    writer.recipe.family.tenant_id,
+                    writer.recipe.family.bucket_id,
+                    writer
+                        .current
+                        .as_ref()
+                        .expect("compaction requires Current"),
+                    usize::try_from(limits.lsm_runs).map_err(|_| {
+                        Status::invalid_argument("v6 LSM run bound exceeds this platform")
+                    })?,
+                    usize::try_from(limits.lsm_bytes).map_err(|_| {
+                        Status::invalid_argument("v6 LSM byte bound exceeds this platform")
+                    })?,
+                    preload_bytes,
+                    ProjectionPackCredits::from_pipeline_permit(component_permit),
+                    QueryBlockCredits::from_pipeline_permit(query_permit),
+                )
+                .await?
+                .into_parts(),
+        )
+    } else {
+        None
+    };
     let query = std::mem::take(&mut writer.query);
     let placeholder = credits
         .acquire(IndexingMemoryStage::OrderingCatalog, 1)
@@ -785,36 +789,67 @@ async fn flush(
         &mut writer.query_credits,
         QueryBlockCredits::from_pipeline_permit(placeholder),
     );
-    let prepared = publisher
-        .prepare_atomic_generation(
-            &writer.recipe.storage_tenant,
-            &writer.recipe.bucket,
-            writer.recipe.family.tenant_id,
-            writer.recipe.family.bucket_id,
-            writer.partition,
-            writer.recipe.physical_generation,
-            writer.current.as_ref(),
-            start,
-            next,
-            writer.through_atomic,
-            sealed.deltas,
-            query,
-            query_credits,
-            ProjectionPackCredits::from_pipeline_permit(pack_permit),
-            preload_bytes,
-        )
-        .await?;
-    let next_query_permit = credits
-        .acquire(
-            IndexingMemoryStage::OrderingCatalog,
-            limits.bytes.saturating_div(4).max(1),
-        )
-        .map_err(|_| Status::resource_exhausted("v6 next query memory unavailable"))?;
-    writer.query_credits = QueryBlockCredits::from_pipeline_permit(next_query_permit);
+    let prepared = if let Some((base, _)) = &compaction {
+        publisher
+            .prepare_atomic_generation_after_compaction(
+                &writer.recipe.storage_tenant,
+                &writer.recipe.bucket,
+                writer.recipe.family.tenant_id,
+                writer.recipe.family.bucket_id,
+                writer.partition,
+                writer.recipe.physical_generation,
+                writer
+                    .current
+                    .as_ref()
+                    .expect("compaction requires Current"),
+                base,
+                start,
+                next,
+                writer.through_atomic,
+                sealed.deltas,
+                query,
+                query_credits,
+                ProjectionPackCredits::from_pipeline_permit(pack_permit),
+                preload_bytes,
+            )
+            .await?
+    } else {
+        publisher
+            .prepare_atomic_generation(
+                &writer.recipe.storage_tenant,
+                &writer.recipe.bucket,
+                writer.recipe.family.tenant_id,
+                writer.recipe.family.bucket_id,
+                writer.partition,
+                writer.recipe.physical_generation,
+                writer.current.as_ref(),
+                start,
+                next,
+                writer.through_atomic,
+                sealed.deltas,
+                query,
+                query_credits,
+                ProjectionPackCredits::from_pipeline_permit(pack_permit),
+                preload_bytes,
+            )
+            .await?
+    };
     drop(source_permit);
     let rows = next
         .checked_sub(start)
         .ok_or_else(|| Status::data_loss("v6 cut regressed"))?;
+    if let Some((_, artifacts)) = compaction {
+        publisher
+            .publish_compaction_artifacts(
+                &writer.recipe.storage_tenant,
+                &writer.recipe.bucket,
+                writer.recipe.family.tenant_id,
+                writer.recipe.family.bucket_id,
+                writer.partition,
+                artifacts,
+            )
+            .await?;
+    }
     let published = publisher
         .publish_atomic_generation(
             &writer.recipe.storage_tenant,
@@ -828,6 +863,13 @@ async fn flush(
             writer.source_bytes,
         )
         .await?;
+    let next_query_permit = credits
+        .acquire(
+            IndexingMemoryStage::OrderingCatalog,
+            limits.bytes.saturating_div(4).max(1),
+        )
+        .map_err(|_| Status::resource_exhausted("v6 next query memory unavailable"))?;
+    writer.query_credits = QueryBlockCredits::from_pipeline_permit(next_query_permit);
     writer.current = Some(published);
     let telemetry = super::v6_telemetry::global();
     super::v6_telemetry::V6PipelineTelemetry::add(
@@ -843,7 +885,6 @@ async fn flush(
         writer.pending_projected_rows,
     );
     super::v6_telemetry::V6PipelineTelemetry::add(&telemetry.projected_bytes, projected_bytes);
-    writer.touched.clear();
     writer.since = None;
     writer.operations = 0;
     writer.source_bytes = 0;
@@ -982,21 +1023,28 @@ fn publication_start(current: Option<&LoadedV6ProjectionGeneration>) -> u64 {
     current.map_or(0, |value| value.current.next_offset)
 }
 
-fn mutation_paths(mutations: &[Mutation]) -> BTreeSet<[u8; 32]> {
-    mutations
-        .iter()
-        .map(|mutation| *blake3::hash(mutation.path.as_bytes()).as_bytes())
-        .collect()
-}
-
-fn paths_conflict(
-    durable_lane: &BTreeSet<[u8; 32]>,
-    page_lane: &BTreeSet<[u8; 32]>,
-    incoming: &BTreeSet<[u8; 32]>,
-) -> bool {
-    incoming
-        .iter()
-        .any(|path| durable_lane.contains(path) || page_lane.contains(path))
+fn coalesce_units(
+    mut through_atomic: u64,
+    units: Vec<(u64, Vec<Mutation>)>,
+) -> Result<(u64, Vec<Mutation>), Status> {
+    let mut mutations = Vec::new();
+    for (atomic, unit) in units {
+        let unique = unit
+            .iter()
+            .map(|mutation| mutation.path.as_str())
+            .collect::<BTreeSet<_>>();
+        if unique.len() != unit.len() {
+            return Err(Status::data_loss(
+                "one atomic mutation unit repeats an exact source path",
+            ));
+        }
+        through_atomic = through_atomic.max(atomic);
+        mutations.extend(unit);
+    }
+    let mutations = coalesce_latest_by_source_path(mutations, |mutation| {
+        (mutation.path.clone(), mutation.offset, mutation.ordinal)
+    })?;
+    Ok((through_atomic, mutations))
 }
 
 fn current_placement(decisions: &DecisionRaft) -> Result<ClusterPlacement, Status> {
@@ -1028,10 +1076,36 @@ mod tests {
     }
 
     #[test]
-    fn repeated_path_in_one_page_forces_a_lane_boundary() {
-        let durable = BTreeSet::new();
-        let first = mutation_paths(&[mutation("objects/a", 3)]);
-        let second = mutation_paths(&[mutation("objects/a", 8)]);
-        assert!(paths_conflict(&durable, &first, &second));
+    fn repeated_hot_paths_coalesce_without_losing_the_safe_atomic_cut() {
+        let units = (0..10_000_u64)
+            .map(|offset| {
+                (
+                    offset + 10,
+                    vec![mutation(
+                        &format!("objects/{:03}", offset % 256),
+                        offset + 1,
+                    )],
+                )
+            })
+            .collect();
+        let (through_atomic, output) = coalesce_units(7, units).unwrap();
+        assert_eq!(through_atomic, 10_009);
+        assert_eq!(output.len(), 256);
+        assert!(
+            output
+                .windows(2)
+                .all(|pair| pair[0].offset < pair[1].offset)
+        );
+        assert!(output.iter().all(|mutation| mutation.offset > 9_744));
+    }
+
+    #[test]
+    fn duplicate_path_inside_one_atomic_unit_still_fails_closed() {
+        let error = coalesce_units(
+            0,
+            vec![(9, vec![mutation("objects/a", 3), mutation("objects/a", 3)])],
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
     }
 }

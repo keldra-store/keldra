@@ -315,29 +315,6 @@ impl ObjectDistribution {
             }
         }
 
-        if placement.active_node_ids().len() == 1 {
-            if upload_source != self.local_node {
-                return Err(Status::failed_precondition(
-                    "the ready capability names another upload source",
-                ));
-            }
-            let _permit = self.mutation_admission.enter()?;
-            let outcomes = if derived_progress {
-                self.store
-                    .bulk_write_derived_progress_with_backpressure(requests)
-                    .await
-            } else {
-                self.store
-                    .bulk_write_with_backpressure(
-                        requests.into_iter().map(BatchOperation::Publish).collect(),
-                    )
-                    .await
-            };
-            return Ok(outcomes
-                .into_iter()
-                .map(|outcome| outcome.result.map_err(mutation_status))
-                .collect());
-        }
         if !placement.active_node_ids().contains(&upload_source) {
             return Err(Status::failed_precondition(
                 "the upload source is not ACTIVE in the current placement",
@@ -471,7 +448,12 @@ impl ObjectDistribution {
                     Ok(coordinated) => {
                         match request.durability {
                             Durability::Local => {
-                                self.continue_payload_placement(upload_source, request.blob.clone())
+                                if placement.active_node_ids().len() > 1 {
+                                    self.continue_payload_placement(
+                                        upload_source,
+                                        request.blob.clone(),
+                                    );
+                                }
                             }
                             Durability::Replicated => {
                                 self.wait_for_replicated_reference(
@@ -538,44 +520,6 @@ impl ObjectDistribution {
         definition_intent: Option<DefinitionMutationIntent>,
         derived_progress: bool,
     ) -> Result<MutationReceipt, Status> {
-        if self.is_single_node()? {
-            if upload_source != self.local_node {
-                return Err(Status::failed_precondition(
-                    "the ready capability names another upload source",
-                ));
-            }
-            let _permit = self.mutation_admission.enter()?;
-            return match (definition_intent, derived_progress) {
-                (Some(intent), false) => {
-                    self.store
-                        .mutate_definition_with_governance_and_backpressure(
-                            BatchOperation::Publish(request),
-                            governance,
-                            intent,
-                        )
-                        .await
-                }
-                (None, false) => {
-                    self.store
-                        .mutate_with_governance_and_backpressure(
-                            BatchOperation::Publish(request),
-                            governance,
-                        )
-                        .await
-                }
-                (None, true) => {
-                    self.store
-                        .mutate_derived_progress_with_governance_and_backpressure(
-                            request, governance,
-                        )
-                        .await
-                }
-                (Some(_), true) => Err(MutationError::InvalidObjectMutation(
-                    "definition publication cannot claim derived progress admission".into(),
-                )),
-            }
-            .map_err(mutation_status);
-        }
         loop {
             let result = self
                 .publish_from_source_with_governance_and_definition_intent_once(
@@ -606,42 +550,6 @@ impl ObjectDistribution {
     ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
-        if placement.active_node_ids().len() == 1 {
-            if upload_source != self.local_node {
-                return Err(Status::failed_precondition(
-                    "the ready capability names another upload source",
-                ));
-            }
-            let _permit = self.mutation_admission.enter()?;
-            return match (definition_intent, derived_progress) {
-                (Some(intent), false) => {
-                    self.store
-                        .mutate_definition_with_governance(
-                            BatchOperation::Publish(request),
-                            governance,
-                            intent,
-                        )
-                        .await
-                }
-                (None, false) => {
-                    self.store
-                        .mutate_with_governance(BatchOperation::Publish(request), governance)
-                        .await
-                }
-                (None, true) => {
-                    self.store
-                        .mutate_derived_progress_with_governance_and_backpressure(
-                            request, governance,
-                        )
-                        .await
-                }
-                (Some(_), true) => Err(MutationError::InvalidObjectMutation(
-                    "definition publication cannot claim derived progress admission".into(),
-                )),
-            }
-            .map_err(mutation_status);
-        }
-
         let group = self.replica_group_stable(
             &placement,
             governance.tenant_id,
@@ -727,7 +635,11 @@ impl ObjectDistribution {
         .await?;
 
         match durability {
-            Durability::Local => self.continue_payload_placement(upload_source, reference),
+            Durability::Local => {
+                if placement.active_node_ids().len() > 1 {
+                    self.continue_payload_placement(upload_source, reference);
+                }
+            }
             Durability::Replicated => {
                 self.wait_for_replicated_reference(&placement, &reference, &evidence, &coordinated)
                     .await?;
@@ -736,9 +648,8 @@ impl ObjectDistribution {
         Ok(coordinated.receipt)
     }
 
-    /// Apply one operation locally when this is the released one-node shape,
-    /// otherwise require this node to be the current exact-path coordinator
-    /// and durably replicate the resulting typed mutation to its quorum.
+    /// Coordinate one exact-path operation and durably apply its typed mutation
+    /// to the current metadata replica group.
     pub(crate) async fn mutate(
         &self,
         operation: BatchOperation,
@@ -808,7 +719,7 @@ impl ObjectDistribution {
         let hot = self.hot_indexing.get().and_then(|ingress| {
             ingress.pending(governance.tenant_id, governance.bucket_id, &operation)
         });
-        if self.is_single_node()? {
+        if matches!(&operation, BatchOperation::Clone(_)) && self.is_single_node()? {
             let _permit = self.mutation_admission.enter()?;
             let result = match definition_intent {
                 Some(intent) => {
@@ -828,29 +739,6 @@ impl ObjectDistribution {
             self.admit_hot_result(hot, &result);
             return result;
         }
-        // Seal a distributed inline payload once before any bounded-state
-        // backpressure retries. Retries then copy only the compact descriptor.
-        let operation = match operation {
-            BatchOperation::Put(request) => {
-                let publish = stage_distributed_put(&self.store, request).await?;
-                let result = self
-                    .publish_from_source_with_governance_and_definition_intent(
-                        publish,
-                        self.local_node,
-                        governance,
-                        definition_intent,
-                    )
-                    .await;
-                self.admit_hot_result(hot, &result);
-                return result;
-            }
-            BatchOperation::Clone(_) => {
-                return Err(Status::unavailable(
-                    "distributed CloneObject requires an exact retained-version atomic precondition and is not enabled",
-                ));
-            }
-            operation => operation,
-        };
         loop {
             let result = self
                 .mutate_with_governance_and_definition_intent_once(
@@ -865,6 +753,7 @@ impl ObjectDistribution {
                 self.wait_for_mutation_capacity(capacity).await;
                 continue;
             }
+            self.admit_hot_result(hot, &result);
             return result;
         }
     }
@@ -877,29 +766,13 @@ impl ObjectDistribution {
     ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
-        if placement.active_node_ids().len() == 1 {
-            let _permit = self.mutation_admission.enter()?;
-            return match definition_intent {
-                Some(intent) => {
-                    self.store
-                        .mutate_definition_with_governance(operation, governance, intent)
-                        .await
-                }
-                None => {
-                    self.store
-                        .mutate_with_governance(operation, governance)
-                        .await
-                }
-            }
-            .map_err(mutation_status);
-        }
-
         // A unary bulk put arrives with inline bytes rather than a previously
         // sealed upload token. Seal those bytes on this path coordinator, then
         // use the same payload preparation and verified Publish path as PutEnd.
         // Metadata is not evaluated until the requested payload durability has
         // been proved.
         let operation = match operation {
+            operation if placement.active_node_ids().len() == 1 => operation,
             BatchOperation::Put(request) => {
                 let publish = stage_distributed_put(&self.store, request).await?;
                 return self

@@ -538,6 +538,46 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_window_compares_final_value_with_durable_current() {
+        let mut durable_memory = credits();
+        let durable = prepare_typed_json_document(
+            input(1, Some(vec!["alpha"]), true),
+            Vec::new(),
+            &mut durable_memory,
+        )
+        .unwrap();
+        let durable_state = durable.current;
+
+        // Version 2 is inspected inside the same unpublished window, but the
+        // final version returns to the durable indexed value. Comparing the
+        // final version directly with durable Current is therefore a genuine
+        // head-only update; publishing version 2's transient material would
+        // create needless removals and additions.
+        let mut intermediate_memory = credits();
+        let intermediate = prepare_typed_json_document(
+            input(2, Some(vec!["beta"]), true),
+            durable_state.clone(),
+            &mut intermediate_memory,
+        )
+        .unwrap();
+        assert_eq!(intermediate.current[0].head.material_source_version, 2);
+
+        let mut final_memory = credits();
+        let final_document = prepare_typed_json_document(
+            input(3, Some(vec!["alpha"]), true),
+            durable_state,
+            &mut final_memory,
+        )
+        .unwrap();
+        assert_eq!(final_document.current[0].head.source_version, 3);
+        assert_eq!(final_document.current[0].head.material_source_version, 1);
+        assert!(final_document.query.fields.is_empty());
+        let gate = &final_document.query.membership.unwrap().gates[0];
+        assert_eq!(gate.material_source_version, 1);
+        assert_eq!(gate.current_source_version, 3);
+    }
+
+    #[test]
     fn delete_emits_membership_presence_and_old_value_tombstones() {
         let mut first_memory = credits();
         let first = prepare_typed_json_document(

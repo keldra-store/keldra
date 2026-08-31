@@ -29,16 +29,6 @@ pub(super) async fn persist(
         .map_err(join_status)?
         .map_err(internal_status)?;
     }
-    let telemetry = super::super::v6_telemetry::global();
-    super::super::v6_telemetry::V6PipelineTelemetry::add(&telemetry.source_rows, replayed_rows);
-    super::super::v6_telemetry::V6PipelineTelemetry::add(&telemetry.source_bytes, replayed_bytes);
-    super::super::v6_telemetry::V6PipelineTelemetry::add(
-        &telemetry.checkpointed_source_rows,
-        replayed_rows,
-    );
-    super::super::v6_telemetry::V6PipelineTelemetry::add(
-        &telemetry.checkpointed_source_bytes,
-        replayed_bytes,
-    );
+    super::super::v6_telemetry::global().record_catalog_checkpoint(replayed_rows, replayed_bytes);
     Ok(())
 }
