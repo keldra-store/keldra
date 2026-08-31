@@ -153,7 +153,7 @@ async fn retained_prefix_page_seeks_past_many_unrelated_versions() {
             .await
             .unwrap();
     }
-    let path = "_keldra/indices/v4/9/current";
+    let path = "_keldra/index-projections/v6/0000000000000000000000000000000000000000000000000000000000000001/partitions/7/0202020202020202020202020202020202020202020202020202020202020202/3/4/current";
     let first = store
         .put(put(path, b"one", "put-target-one"))
         .await
@@ -164,7 +164,7 @@ async fn retained_prefix_page_seeks_past_many_unrelated_versions() {
         .unwrap();
     store
         .put(put(
-            "_keldra/indices/v4/90/current",
+            "_keldra/index-projections/v6/0000000000000000000000000000000000000000000000000000000000000001/partitions/7/0202020202020202020202020202020202020202020202020202020202020202/3/5/current",
             b"adjacent",
             "put-adjacent-index",
         ))
@@ -176,7 +176,7 @@ async fn retained_prefix_page_seeks_past_many_unrelated_versions() {
         .export_retained_objects_by_prefix(
             tenant_id,
             bucket_id,
-            "_keldra/indices/v4/9/",
+            "_keldra/index-projections/v6/0000000000000000000000000000000000000000000000000000000000000001/partitions/7/0202020202020202020202020202020202020202020202020202020202020202/3/4/",
             None,
             1,
             1024 * 1024,
@@ -191,7 +191,7 @@ async fn retained_prefix_page_seeks_past_many_unrelated_versions() {
         .export_retained_objects_by_prefix(
             tenant_id,
             bucket_id,
-            "_keldra/indices/v4/9/",
+            "_keldra/index-projections/v6/0000000000000000000000000000000000000000000000000000000000000001/partitions/7/0202020202020202020202020202020202020202020202020202020202020202/3/4/",
             Some(&cursor),
             1,
             1024 * 1024,
@@ -208,7 +208,7 @@ async fn retained_prefix_page_seeks_past_many_unrelated_versions() {
         store.export_retained_objects_by_prefix(
             tenant_id,
             bucket_id,
-            "_keldra/indices/v4/8/",
+            "_keldra/index-projections/v6/0000000000000000000000000000000000000000000000000000000000000001/partitions/7/0202020202020202020202020202020202020202020202020202020202020202/3/3/",
             Some(&decoded),
             1,
             1024 * 1024,

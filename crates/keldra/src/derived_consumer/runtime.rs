@@ -13,12 +13,10 @@ use tonic::Status;
 
 use crate::accounting::{AccountingCatalog, LoadedAccountingDefinition, read_rollup};
 use crate::cluster_object_read::ClusterObjectReader;
-use crate::index_runtime::catalog::IndexCatalog;
-use crate::index_runtime::coordination::{current_placement, load_index_assignment};
+use crate::index_runtime::coordination::current_placement;
 use crate::index_runtime::events::{
     IndexBarrier, IndexEventJournal, MAX_INDEX_EVENT_PAGE_BYTES, RoutedSourceEffect,
 };
-use crate::index_runtime::publisher::IndexCommitPublisher;
 
 use super::{
     DerivedBarrierEvidence, DerivedCheckpointPublisher, DerivedDefinitionIdentity,
@@ -72,13 +70,6 @@ impl DerivedProgressReporter {
 
 #[derive(Clone)]
 pub(crate) enum DerivedEvidenceResolver {
-    Index {
-        local_node: NodeId,
-        decisions: DecisionRaft,
-        reader: ClusterObjectReader,
-        publisher: IndexCommitPublisher,
-        catalog: IndexCatalog,
-    },
     Accounting {
         local_node: NodeId,
         decisions: DecisionRaft,
@@ -88,22 +79,6 @@ pub(crate) enum DerivedEvidenceResolver {
 }
 
 impl DerivedEvidenceResolver {
-    pub(crate) fn index(
-        local_node: NodeId,
-        decisions: DecisionRaft,
-        reader: ClusterObjectReader,
-        publisher: IndexCommitPublisher,
-        catalog: IndexCatalog,
-    ) -> Self {
-        Self::Index {
-            local_node,
-            decisions,
-            reader,
-            publisher,
-            catalog,
-        }
-    }
-
     pub(crate) fn accounting(
         local_node: NodeId,
         decisions: DecisionRaft,
@@ -124,44 +99,6 @@ impl DerivedEvidenceResolver {
         effects: &BTreeMap<SourceId, RoutedSourceEffect>,
     ) -> Result<Option<DerivedBarrierEvidence>, Status> {
         match self {
-            Self::Index {
-                local_node,
-                decisions,
-                reader,
-                publisher,
-                catalog,
-            } => {
-                let Some(definition) =
-                    load_index_assignment(*local_node, decisions, reader, assignment).await?
-                else {
-                    return Ok(None);
-                };
-                let physical_definition = definition.physical_stored();
-                let current = publisher
-                    .load_current(
-                        &physical_definition,
-                        definition.tenant_id,
-                        definition.bucket_id,
-                    )
-                    .await?;
-                let evidence = current
-                    .filter(|current| {
-                        current.manifest.definition_version
-                            == definition.physical_definition_version()
-                    })
-                    .map(|current| {
-                        current
-                            .manifest
-                            .barrier()
-                            .map(DerivedBarrierEvidence::Published)
-                            .map_err(|error| Status::data_loss(error.to_string()))
-                    })
-                    .transpose()?;
-                if !evidence_covers_effects(evidence.as_ref(), effects) {
-                    catalog.upsert_wait(definition).await?;
-                }
-                Ok(evidence)
-            }
             Self::Accounting {
                 local_node,
                 decisions,

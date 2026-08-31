@@ -51,7 +51,7 @@ fn keys_are_versioned_fixed_width_and_big_endian() {
         [STORAGE_KEY_FORMAT_VERSION, b'C', 1, 0x12, 0x34]
     );
     assert_eq!(
-        checkpoint_key(DefinitionConsumerKind::IndexDelivery, 0x1234).unwrap(),
+        checkpoint_key(DefinitionConsumerKind::V6IndexCatalog, 0x1234).unwrap(),
         [STORAGE_KEY_FORMAT_VERSION, b'C', 3, 0x12, 0x34]
     );
     assert_eq!(
@@ -150,7 +150,7 @@ fn value_codecs_reject_unknown_versions_and_identity_mismatches() {
     );
 
     let checkpoint = DefinitionCheckpoint {
-        consumer_kind: DefinitionConsumerKind::IndexDelivery,
+        consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
         source_id: SourceId {
             node_id: 4,
             source_epoch: [8; 32],
@@ -292,7 +292,7 @@ async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() 
         tenant_id: 7,
         bucket_id: 9,
         definition_id: 11,
-        definition_path: "_keldra/indices/v4/definitions/example".into(),
+        definition_path: "_keldra/indices/v6/definitions/example".into(),
         object_version: VersionId(13),
         observed_fence: fence(17),
         rank: 0,
@@ -352,7 +352,7 @@ async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() 
     assert_eq!(due.definition_object_version, VersionId(14));
     assert_eq!(
         due.definition_path,
-        "_keldra/indices/v4/definitions/example"
+        "_keldra/indices/v6/definitions/example"
     );
     assert!(due.due_at_unix_millis > 0);
     assert_eq!(

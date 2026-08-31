@@ -1,4 +1,4 @@
-# Keldra 0.9 observability
+# Keldra observability
 
 Keldra always writes its structured `tracing` logs to stdout. OTLP export is an
 optional startup setting and carries metrics and traces only; logs remain on
@@ -28,7 +28,7 @@ API.
 Metrics and traces share these resource attributes:
 
 - `service.name=keldra`
-- `service.version=0.9.4`
+- `service.version=<running Keldra version>`
 - `node.id=<KELDRA_NODE_ID>`
 
 Trace export uses a dedicated worker with a 2,048-span queue and batches of at
@@ -72,36 +72,24 @@ The Keldra 0.9 process metric vocabulary covers:
   `source_journal_settlement`, or `capacity_wait`; and
 - blob garbage-collection run, removal, and failure counts.
 
-Index runtime metrics use only the bounded `index.kind` attribute. Builder
-failure metrics may also use the closed `builder.phase` or `recovery.action`
-values, and range-aware compaction measurements carry the bounded
+Index runtime metrics use only bounded attributes such as
+`pipeline.stage`, `pipeline.reason`, `update.kind`, and `recovery.action`.
+Stable logical-definition, physical-recipe, partition, root, and segment IDs
+belong in traces, never metric labels. Range-aware compaction measurements use
+the bounded
 `compaction.lane_limit_reason=configured|workers|budget|ranges` value. Index,
 tenant, and bucket IDs are deliberately absent from metrics.
 
-Index working memory has one hard aggregate ceiling. Query and per-kind
-construction settings are fair-share planning targets, and idle bytes may be
-borrowed without crossing that ceiling. The low-cardinality `memory.class`
-dimension is `query` or one of the eight fixed index kinds. The shared parent
-reports `keldra_index_working_memory_configured_bytes`, `used_bytes`,
-`peak_bytes`, `share_bytes`, `class_used_bytes`, `borrowed_bytes`, `waiting`,
-and `waiting_bytes`.
-
-Construction memory is then split into configuration, admission, and observed
-builder state:
-
-- `keldra_index_construction_configured_bytes`,
-  `keldra_index_construction_leased_bytes`,
-  `keldra_index_construction_peak_leased_bytes`, and
-  `keldra_index_construction_waiting` describe each kind's shared admission
-  class. The existing names remain available for operational dashboard
-  continuity;
-- `keldra_index_construction_minimum_bytes`, `desired_bytes`, `granted_bytes`,
-  and `borrowed_bytes` show each elastic admission;
-- `keldra_index_construction_resident_bytes` and
-  `keldra_index_construction_workspace_bytes` describe the builder involved in
-  a completed flush. Resident bytes are the currently buffered subset of the
-  admitted workspace, so the two values must not be added. Leased bytes are a
-  budget reservation; they are not reported as resident memory.
+The v6 Typed JSON pipeline emits one structured summary every ten seconds on
+the `keldra::index_runtime::v6_summary` target. Every field is prefixed
+`keldra_index_v6_`. The live counters cover source rows/bytes; hot raw hits,
+prepared hits, misses, and evictions; payload parsed, selected, extracted,
+prepared, projected, sealed, published, and checkpointed rows/bytes; catalog
+directory publications and activations; and stage CPU and queue-wait
+nanoseconds. The live gauges are `stage_resident_bytes`, `stage_limit_bytes`,
+`local_next_offset`, `local_tail`, `lag_entries`, and
+`lag_oldest_age_milliseconds`. These are admission/accounting values, not
+sampled process RSS. The default planning frame is 256 MiB per indexing core.
 
 Compaction admission reports
 `keldra_index_compaction_configured_lanes`,
@@ -116,7 +104,7 @@ input segments/documents/bytes, input component rows/read bytes/blocks, output
 component rows/bytes/blocks, elapsed time, last-progress age, attempts,
 failures, and duration. An input document is the document count declared by a
 selected immutable segment. An input component row is one row decoded at a
-path, document, typed-key, posting, vector, projection, or spill component
+document, typed-key, posting, projection, or spill component
 boundary. Re-decoding a block counts its rows again, so this is a CPU and
 decoding-work measure and may legitimately be orders of magnitude larger than
 the selected document count. Output component rows similarly count rows emitted
@@ -131,19 +119,13 @@ Projection `rayon_queue_seconds` is aggregate worker queue time summed across
 the finite projection units in one wave. Parallel waits can therefore make it
 larger than wall-clock duration; it is a saturation signal, not elapsed time.
 
-Rebuild and catch-up expose overlap-safe active counters, cumulative
-records/bytes and frames/pages, elapsed and last-progress-age gauges, terminal
-records/bytes/work-unit and duration histograms, and failure counters. Builder
-failures, selected recovery actions, retries, and fail-closed outcomes use the
-`keldra_index_builder_*` counters. Publication exposes the committed manifest
-revision, presence, age, freshness, source lag, CAS success/failure, and
-publication duration; a successful publication resets age and source lag to
-zero and marks the committed view fresh. Publication logs use the stable
-`revision` field and the `index commit published` and
-`index commit publication metrics` events. The latter separates
-`publication.new_segment_bytes` from
-`publication.committed_artifact_bytes`, the total immutable artifact bytes in
-the newly selected committed view.
+Partition-local baseline and journal catch-up expose overlap-safe active
+counters, records and bytes, elapsed time, last-progress age, source reads,
+failures, and selected recovery actions. Publication exposes the v6 partition
+root/current revision, checkpoint, presence, age, freshness, source lag,
+partition-local CAS result, fence result, segment and head-delta bytes, and
+duration. Query materialization separately reports family-directory generation,
+root-vector size, retired-predecessor coverage, readers opened, and cache reuse.
 
 Query execution exposes the complete request and local-work path. Public RPCs
 report `keldra_index_query_requests_total`, failures, deadline expirations, and
@@ -151,8 +133,8 @@ request duration. Local execution reports admission waiting/active counts,
 wait duration, runs, cancellation and failure counts, returned hits, artifact
 read operations and bytes, cooperative yields, and query duration. CPU chunks
 report waiting/active counts, queue time, execution time, chunk count, and
-failures. These metrics are split only by bounded index kind and closed outcome
-or status values. The `keldra.index.query` and `keldra.index.query.cpu` spans may
+failures. These metrics are split only by closed outcome or status values. The
+`keldra.index.query` and `keldra.index.query.cpu` spans may
 carry stable numeric identifiers and detailed terminal snapshots; identifiers
 never become metric attributes. Artifact reads remain asynchronous, while
 decoded-page construction, filtering, ranking, bounded top-k maintenance, and
@@ -167,8 +149,8 @@ separately. Typed JSON computations add
 `keldra_index_query_facet_computation_results_total`,
 `keldra_index_query_facet_documents_processed_total`,
 `keldra_index_query_facet_values_processed_total`, and the corresponding four
-`aggregate` counters. These are cumulative counters split only by
-index kind; document, index, tenant, and bucket identifiers remain trace fields.
+`aggregate` counters. Document, index, tenant, and bucket identifiers remain
+trace fields.
 Each terminal query also reports desired and granted memory, admitted resident
 segment slots, current and peak resident segments, conservatively charged
 decoded bytes, evictions, and reloads. The fixed `index.phase` dimension reports
@@ -205,11 +187,12 @@ plus mutation-receipt occupancy and projected capacity. Collection runs on a
 blocking worker and optional kernel or RocksDB properties fail independently,
 so telemetry sampling cannot stall or fail the storage path.
 
-`keldra.index.builder` and `keldra.index.compaction` are phase-lifetime spans.
-They contain stable numeric index, tenant, and bucket IDs for investigation,
-plus the same progress snapshots and terminal outcome. A phase emits at start,
-at most one heartbeat every 30 seconds, and at completion or failure; it does
-not emit per-record, per-frame, or per-block logs.
+`keldra.index.partition_pipeline` and `keldra.index.compaction` are
+phase-lifetime spans. They contain stable numeric recipe, partition, tenant,
+and bucket IDs for investigation, plus progress snapshots and terminal outcome.
+A phase emits at start, at most one heartbeat every 30 seconds, and at
+completion or failure; it does not emit per-record, per-frame, or per-block
+logs.
 
 The OSV qualification tool separately writes a measured JSON
 report. It is benchmark output, not an OTLP process metric.

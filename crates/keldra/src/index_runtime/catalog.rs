@@ -1,23 +1,22 @@
-//! Bounded process-local handoff for index definitions assigned to this node.
+//! Process-local active index catalog compiled from ordinary definitions.
 //!
-//! Durable `ASSIGNED` records and ordinary definition objects remain the
-//! authorities. This queue only coalesces work between the paged assignment
-//! walker and the bounded builder scheduler. Losing it merely causes the next
-//! assignment walk to offer the definition again.
+//! The catalog is a disposable, version-monotonic projection. Definition
+//! changes mutate active state directly and broadcast only a best-effort wake;
+//! there is no bounded builder handoff or per-definition assignment queue.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use keldra_index::IndexKind;
-use keldra_index::v4::{RecipeFingerprints, Schema};
+use keldra_index::typed_json::{FieldSchema, RecipeFingerprints, TypedJsonSchema};
+use keldra_index::v6::{
+    IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryPermit, IndexingMemoryStage,
+};
 use tonic::Status;
 
 use crate::index_service::{StoredIndexDefinition, definition_path};
 
-use super::v4_schema::compile_schema;
+use super::typed_json_schema::compile_typed_json_schema;
 
-const MAX_PENDING_CATALOG_CHANGES: usize = 1_024;
-const PHYSICAL_PROJECTION_DOMAIN: &[u8] = b"keldra.index.physical-projection/v1";
 const PROJECTION_FAMILY_DOMAIN: &[u8] = b"keldra.index.projection-family/v1";
 
 /// Stable physical identity for one complete canonical source/schema recipe.
@@ -38,7 +37,7 @@ pub(crate) struct PhysicalRecipeIdentity {
     pub(crate) fingerprint: [u8; 32],
 }
 
-/// Exact format-v5 ownership identity for one tenant/bucket source scope.
+/// Exact format-v6 physical-family identity for one tenant/bucket source scope.
 /// Field subsets sharing the same membership universe append to this family;
 /// different authorities or membership semantics never share it.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -56,7 +55,7 @@ pub(crate) struct CatalogDefinition {
     pub(crate) stored: StoredIndexDefinition,
     /// Deterministic runtime contract compiled from the authoritative ordinary
     /// definition object. This is process-local and can always be reconstructed.
-    pub(crate) schema: Schema,
+    pub(crate) schema: TypedJsonSchema,
     pub(crate) schema_fingerprint: [u8; 32],
     pub(crate) recipe_fingerprints: RecipeFingerprints,
 }
@@ -69,7 +68,7 @@ impl CatalogDefinition {
         stored: StoredIndexDefinition,
     ) -> Result<Self, Status> {
         let specification = stored.specification()?;
-        let schema = compile_schema(
+        let schema = compile_typed_json_schema(
             &stored.path_prefix,
             stored.content_type.as_deref(),
             &specification,
@@ -99,27 +98,11 @@ impl CatalogDefinition {
     }
 
     pub(crate) fn physical_identity(&self) -> PhysicalProjectionIdentity {
-        if self.schema.kind == IndexKind::TypedJson {
-            let family = self.projection_family_identity().family_id;
-            let mut index = [0_u8; 8];
-            let mut version = [0_u8; 8];
-            index.copy_from_slice(&family[..8]);
-            version.copy_from_slice(&family[8..16]);
-            return PhysicalProjectionIdentity {
-                index_id: nonzero_identity(index),
-                definition_version: nonzero_identity(version),
-            };
-        }
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(PHYSICAL_PROJECTION_DOMAIN);
-        hasher.update(&self.tenant_id.to_be_bytes());
-        hasher.update(&self.bucket_id.to_be_bytes());
-        hasher.update(&self.schema_fingerprint);
-        let digest = hasher.finalize();
+        let family = self.projection_family_identity().family_id;
         let mut index = [0_u8; 8];
         let mut version = [0_u8; 8];
-        index.copy_from_slice(&digest.as_bytes()[..8]);
-        version.copy_from_slice(&digest.as_bytes()[8..16]);
+        index.copy_from_slice(&family[..8]);
+        version.copy_from_slice(&family[8..16]);
         PhysicalProjectionIdentity {
             index_id: nonzero_identity(index),
             definition_version: nonzero_identity(version),
@@ -138,9 +121,8 @@ impl CatalogDefinition {
         )
     }
 
-    pub(crate) fn replace_runtime_schema(&mut self, schema: Schema) -> Result<(), Status> {
-        if schema.kind != self.schema.kind
-            || schema.path_prefix != self.schema.path_prefix
+    pub(crate) fn replace_runtime_schema(&mut self, schema: TypedJsonSchema) -> Result<(), Status> {
+        if schema.path_prefix != self.schema.path_prefix
             || schema.content_type_scope != self.schema.content_type_scope
         {
             return Err(Status::data_loss(
@@ -156,7 +138,7 @@ impl CatalogDefinition {
     pub(crate) fn family_identity_for_schema(
         tenant_id: u64,
         bucket_id: u64,
-        schema: &Schema,
+        schema: &TypedJsonSchema,
     ) -> Result<ProjectionFamilyIdentity, Status> {
         let recipes = schema.recipe_fingerprints().map_err(schema_status)?;
         Ok(projection_family_identity(
@@ -206,7 +188,7 @@ impl CatalogDefinition {
         // catalog; this handoff intentionally stores only the validated name.
         definition_path(&self.stored.name)?;
         let specification = self.stored.specification()?;
-        let expected_schema = compile_schema(
+        let expected_schema = compile_typed_json_schema(
             &self.stored.path_prefix,
             self.stored.content_type.as_deref(),
             &specification,
@@ -249,36 +231,8 @@ fn projection_family_identity(
 
 fn schema_status(error: keldra_index::IndexError) -> Status {
     Status::data_loss(format!(
-        "stored index definition cannot compile to format-v4 schema: {error}"
+        "stored TypedJson definition cannot compile to its physical recipe catalog: {error}"
     ))
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum CatalogChange {
-    Upsert(CatalogDefinition),
-    Delete {
-        identity: CatalogIdentity,
-        object_version: u64,
-    },
-    Remove(CatalogIdentity),
-}
-
-impl CatalogChange {
-    pub(crate) fn identity(&self) -> CatalogIdentity {
-        match self {
-            Self::Upsert(definition) => definition.identity(),
-            Self::Delete { identity, .. } => *identity,
-            Self::Remove(identity) => *identity,
-        }
-    }
-
-    fn object_version(&self) -> Option<u64> {
-        match self {
-            Self::Upsert(definition) => Some(definition.object_version),
-            Self::Delete { object_version, .. } => Some(*object_version),
-            Self::Remove(_) => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -288,53 +242,179 @@ pub(crate) struct CatalogIdentity {
     pub(crate) index_id: u64,
 }
 
+/// Compact query binding retained once per logical definition. Source routes
+/// and the full compiled schema are interned in `PhysicalCatalogRecipe`.
+#[derive(Clone, Debug)]
+pub(crate) struct LogicalCatalogBinding {
+    pub(crate) identity: CatalogIdentity,
+    pub(crate) object_version: u64,
+    pub(crate) family: ProjectionFamilyIdentity,
+    pub(crate) query_contract: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LogicalQueryContract {
+    pub(crate) identity: [u8; 32],
+    pub(crate) public_fields: Arc<Vec<(String, [u8; 32])>>,
+    references: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicalCatalogRecipe {
+    pub(crate) family: ProjectionFamilyIdentity,
+    pub(crate) storage_tenant: String,
+    pub(crate) bucket: String,
+    pub(crate) membership_recipe: [u8; 32],
+    pub(crate) path_prefix: String,
+    pub(crate) content_type: Option<String>,
+    template: Arc<TypedJsonSchema>,
+    pub(crate) fields: BTreeMap<[u8; 32], Arc<FieldSchema>>,
+    pub(crate) physical_generation: [u8; 32],
+    references: usize,
+    field_references: BTreeMap<[u8; 32], usize>,
+}
+
+impl PhysicalCatalogRecipe {
+    pub(crate) fn projection_schema(&self) -> Result<TypedJsonSchema, Status> {
+        let mut schema = (*self.template).clone();
+        schema.fields = self
+            .fields
+            .iter()
+            .map(|(recipe, field)| {
+                let mut field = (**field).clone();
+                field.name = format!("__keldra_recipe_{}", hex::encode(recipe));
+                field
+            })
+            .collect();
+        schema.physical_order.clear();
+        schema.canonicalize_physical_fields().map_err(schema_status)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct IndexCatalog {
     inner: Arc<Mutex<CatalogState>>,
-    changes: tokio::sync::broadcast::Sender<CatalogIdentity>,
-    capacity_changed: Arc<tokio::sync::Notify>,
+    changes: tokio::sync::broadcast::Sender<CatalogNotice>,
+    _ordering_catalog_memory: Arc<IndexingMemoryPermit>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CatalogNotice {
+    pub(crate) identity: CatalogIdentity,
+    pub(crate) physical_changed: bool,
 }
 
 struct CatalogState {
-    pending: BTreeMap<CatalogIdentity, CatalogChange>,
-    capacity: usize,
+    bindings: BTreeMap<CatalogIdentity, LogicalCatalogBinding>,
+    recipes: BTreeMap<ProjectionFamilyIdentity, PhysicalCatalogRecipe>,
+    query_contracts: BTreeMap<[u8; 32], LogicalQueryContract>,
+    generation: u64,
+    physical_generation: [u8; 32],
+    resident_bytes: usize,
+    maximum_bytes: usize,
 }
 
 impl Default for IndexCatalog {
     fn default() -> Self {
-        Self::with_capacity(MAX_PENDING_CATALOG_CHANGES)
+        Self::with_memory_bytes(128 * 1024 * 1024)
+            .expect("default active index catalog memory is valid")
     }
 }
 
 impl IndexCatalog {
-    fn with_capacity(capacity: usize) -> Self {
-        assert!(capacity > 0, "index catalog capacity must be positive");
-        let (changes, _) = tokio::sync::broadcast::channel(capacity);
-        Self {
+    pub(crate) fn with_memory_bytes(maximum_bytes: u64) -> Result<Self, Status> {
+        let maximum_bytes = usize::try_from(maximum_bytes).map_err(|_| {
+            Status::invalid_argument("active index catalog memory exceeds this platform")
+        })?;
+        if maximum_bytes == 0 {
+            return Err(Status::invalid_argument(
+                "active index catalog memory must be positive",
+            ));
+        }
+        let limits = IndexingMemoryLimits {
+            hot_payload_bytes: maximum_bytes,
+            worker_scratch_bytes: maximum_bytes,
+            prepared_rows_bytes: maximum_bytes,
+            replay_input_bytes: maximum_bytes,
+            projection_accumulator_bytes: maximum_bytes,
+            seal_scratch_bytes: maximum_bytes,
+            ordering_catalog_bytes: maximum_bytes,
+        };
+        let credits = IndexingMemoryCredits::new(maximum_bytes, limits)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Self::with_credits(credits, maximum_bytes)
+    }
+
+    pub(crate) fn with_credits(
+        credits: IndexingMemoryCredits,
+        maximum_bytes: usize,
+    ) -> Result<Self, Status> {
+        let permit = credits
+            .acquire(IndexingMemoryStage::OrderingCatalog, maximum_bytes)
+            .map_err(|_| Status::resource_exhausted("active index catalog memory unavailable"))?;
+        let (changes, _) = tokio::sync::broadcast::channel(1_024);
+        Ok(Self {
             inner: Arc::new(Mutex::new(CatalogState {
-                pending: BTreeMap::new(),
-                capacity,
+                bindings: BTreeMap::new(),
+                recipes: BTreeMap::new(),
+                query_contracts: BTreeMap::new(),
+                generation: 1,
+                physical_generation: physical_catalog_generation(std::iter::empty::<
+                    &PhysicalCatalogRecipe,
+                >()),
+                resident_bytes: 0,
+                maximum_bytes,
             })),
             changes,
-            capacity_changed: Arc::new(tokio::sync::Notify::new()),
-        }
+            _ordering_catalog_memory: Arc::new(permit),
+        })
     }
-
     pub(crate) fn upsert(&self, definition: CatalogDefinition) -> Result<(), Status> {
         definition.validate()?;
-        self.enqueue(CatalogChange::Upsert(definition))
+        let identity = definition.identity();
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| Status::internal("active index catalog lock is poisoned"))?;
+        let current_version = state
+            .bindings
+            .get(&identity)
+            .map(|binding| binding.object_version)
+            .unwrap_or(0);
+        if current_version >= definition.object_version {
+            return Ok(());
+        }
+        ensure_upsert_capacity(&state, &definition)?;
+        let mut physical_changed = false;
+        if let Some(previous) = state.bindings.remove(&identity) {
+            state.resident_bytes = state
+                .resident_bytes
+                .saturating_sub(binding_resident_bytes(&previous)?);
+            physical_changed |= remove_recipe_reference(&mut state, &previous);
+            remove_query_contract_reference(&mut state, previous.query_contract);
+        }
+        let binding = compact_binding(&definition);
+        physical_changed |= add_recipe_reference(&mut state, &definition)?;
+        add_query_contract_reference(&mut state, &definition, binding.query_contract)?;
+        state.resident_bytes = state
+            .resident_bytes
+            .checked_add(binding_resident_bytes(&binding)?)
+            .ok_or_else(|| {
+                Status::resource_exhausted("active index catalog resident size overflow")
+            })?;
+        state.bindings.insert(identity, binding);
+        mark_catalog_changed(&mut state, physical_changed)?;
+        drop(state);
+        let _ = self.changes.send(CatalogNotice {
+            identity,
+            physical_changed,
+        });
+        Ok(())
     }
 
-    /// Losslessly hand one affected definition to the bounded builder queue.
-    ///
-    /// The source-journal demultiplexer cannot acknowledge its aggregate
-    /// checkpoint until this disposable wake has been admitted. Capacity
-    /// pressure therefore delays journal progress instead of dropping the only
-    /// prompt wake for an idle builder. Durable assignments remain the recovery
-    /// authority if the process stops while waiting.
+    /// Apply one committed definition mutation to active catalog state.
     pub(crate) async fn upsert_wait(&self, definition: CatalogDefinition) -> Result<(), Status> {
-        definition.validate()?;
-        self.enqueue_wait(CatalogChange::Upsert(definition)).await
+        self.upsert(definition)
     }
 
     pub(crate) async fn delete_wait(
@@ -347,31 +427,33 @@ impl IndexCatalog {
                 "deleted index definition has a zero object version",
             ));
         }
-        self.enqueue_wait(CatalogChange::Delete {
-            identity,
-            object_version,
-        })
-        .await
-    }
-
-    async fn enqueue_wait(&self, change: CatalogChange) -> Result<(), Status> {
-        let identity = change.identity();
-        loop {
-            let notified = self.capacity_changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            match self.enqueue(change.clone()) {
-                Ok(()) => return Ok(()),
-                Err(error) if error.code() == tonic::Code::ResourceExhausted => {
-                    tracing::debug!(
-                        index.id = identity.index_id,
-                        "affected index wake waits for bounded catalog capacity"
-                    );
-                    notified.await;
-                }
-                Err(error) => return Err(error),
-            }
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| Status::internal("active index catalog lock is poisoned"))?;
+        let current_version = state
+            .bindings
+            .get(&identity)
+            .map(|binding| binding.object_version)
+            .unwrap_or(0);
+        if current_version >= object_version {
+            return Ok(());
         }
+        let mut physical_changed = false;
+        if let Some(previous) = state.bindings.remove(&identity) {
+            state.resident_bytes = state
+                .resident_bytes
+                .saturating_sub(binding_resident_bytes(&previous)?);
+            physical_changed |= remove_recipe_reference(&mut state, &previous);
+            remove_query_contract_reference(&mut state, previous.query_contract);
+        }
+        mark_catalog_changed(&mut state, physical_changed)?;
+        drop(state);
+        let _ = self.changes.send(CatalogNotice {
+            identity,
+            physical_changed,
+        });
+        Ok(())
     }
 
     pub(crate) fn remove(
@@ -380,124 +462,499 @@ impl IndexCatalog {
         bucket_id: u64,
         index_id: u64,
     ) -> Result<(), Status> {
-        self.enqueue(CatalogChange::Remove(CatalogIdentity {
+        let identity = CatalogIdentity {
             tenant_id,
             bucket_id,
             index_id,
-        }))
-    }
-
-    fn enqueue(&self, change: CatalogChange) -> Result<(), Status> {
-        let identity = change.identity();
+        };
         let mut state = self
             .inner
             .lock()
-            .map_err(|_| Status::internal("assigned index handoff lock is poisoned"))?;
-        if !state.pending.contains_key(&identity) && state.pending.len() >= state.capacity {
-            return Err(Status::resource_exhausted(
-                "assigned index handoff is at its bounded capacity",
-            ));
-        }
-        if state
-            .pending
-            .get(&identity)
-            .is_some_and(|current| keep_current_change(current, &change))
-        {
+            .map_err(|_| Status::internal("active index catalog lock is poisoned"))?;
+        let Some(previous) = state.bindings.remove(&identity) else {
             return Ok(());
-        }
-        state.pending.insert(identity, change);
+        };
+        state.resident_bytes = state
+            .resident_bytes
+            .saturating_sub(binding_resident_bytes(&previous)?);
+        let physical_changed = remove_recipe_reference(&mut state, &previous);
+        remove_query_contract_reference(&mut state, previous.query_contract);
+        mark_catalog_changed(&mut state, physical_changed)?;
         drop(state);
-        let _ = self.changes.send(identity);
+        let _ = self.changes.send(CatalogNotice {
+            identity,
+            physical_changed,
+        });
         Ok(())
     }
 
-    pub(crate) fn take(
-        &self,
-        identity: CatalogIdentity,
-        mut admit_upsert: impl FnMut(&CatalogChange) -> bool,
-    ) -> Result<Option<CatalogChange>, Status> {
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| Status::internal("assigned index handoff lock is poisoned"))?;
-        if state.pending.get(&identity).is_some_and(|change| {
-            matches!(change, CatalogChange::Upsert(_)) && !admit_upsert(change)
-        }) {
-            return Ok(None);
-        }
-        let removed = state.pending.remove(&identity);
-        drop(state);
-        if removed.is_some() {
-            self.capacity_changed.notify_waiters();
-        }
-        Ok(removed)
-    }
-
-    pub(crate) fn take_page(
-        &self,
-        limit: usize,
-        mut admit_upsert: impl FnMut(&CatalogChange) -> bool,
-    ) -> Result<Vec<CatalogChange>, Status> {
-        if limit == 0 {
-            return Err(Status::invalid_argument(
-                "assigned index handoff page must be positive",
-            ));
-        }
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| Status::internal("assigned index handoff lock is poisoned"))?;
-        let identities = state
-            .pending
-            .iter()
-            .filter_map(|(identity, change)| match change {
-                CatalogChange::Delete { .. } | CatalogChange::Remove(_) => Some(*identity),
-                CatalogChange::Upsert(_) if admit_upsert(change) => Some(*identity),
-                CatalogChange::Upsert(_) => None,
-            })
-            .take(limit)
-            .collect::<Vec<_>>();
-        let changes = identities
-            .into_iter()
-            .filter_map(|identity| state.pending.remove(&identity))
-            .collect::<Vec<_>>();
-        drop(state);
-        if !changes.is_empty() {
-            self.capacity_changed.notify_waiters();
-        }
-        Ok(changes)
-    }
-
-    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<CatalogIdentity> {
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<CatalogNotice> {
         self.changes.subscribe()
     }
 
-    #[cfg(test)]
-    fn pending_len(&self) -> Result<usize, Status> {
+    pub(crate) fn snapshot(
+        &self,
+    ) -> Result<
+        (
+            u64,
+            [u8; 32],
+            Vec<LogicalCatalogBinding>,
+            Vec<PhysicalCatalogRecipe>,
+            Vec<LogicalQueryContract>,
+        ),
+        Status,
+    > {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| Status::internal("active index catalog lock is poisoned"))?;
+        Ok((
+            state.generation,
+            state.physical_generation,
+            state.bindings.values().cloned().collect(),
+            state.recipes.values().cloned().collect(),
+            state.query_contracts.values().cloned().collect(),
+        ))
+    }
+
+    pub(crate) fn resident_bytes(&self) -> Result<usize, Status> {
         Ok(self
             .inner
             .lock()
-            .map_err(|_| Status::internal("assigned index handoff lock is poisoned"))?
-            .pending
-            .len())
+            .map_err(|_| Status::internal("active index catalog lock is poisoned"))?
+            .resident_bytes)
+    }
+
+    pub(crate) fn hot_router_snapshot(
+        &self,
+    ) -> Result<([u8; 32], Vec<super::hot_ingress::CompiledHotRoute>), Status> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| Status::internal("active index catalog lock is poisoned"))?;
+        let routes = state
+            .recipes
+            .values()
+            .map(|recipe| super::hot_ingress::CompiledHotRoute {
+                tenant_id: recipe.family.tenant_id,
+                bucket_id: recipe.family.bucket_id,
+                path_prefix: recipe.path_prefix.clone(),
+                content_type: recipe.content_type.clone(),
+                pointers: recipe
+                    .template
+                    .fields
+                    .iter()
+                    .map(|field| field.source_selector.clone())
+                    .collect(),
+            })
+            .collect();
+        Ok((state.physical_generation, routes))
     }
 }
 
-fn keep_current_change(current: &CatalogChange, incoming: &CatalogChange) -> bool {
-    match (current, incoming) {
-        (CatalogChange::Delete { .. }, CatalogChange::Remove(_)) => true,
-        (CatalogChange::Delete { .. }, CatalogChange::Upsert(_))
-        | (CatalogChange::Upsert(_), CatalogChange::Delete { .. })
-        | (CatalogChange::Delete { .. }, CatalogChange::Delete { .. }) => {
-            current.object_version() >= incoming.object_version()
-        }
-        _ => false,
+fn ensure_upsert_capacity(
+    state: &CatalogState,
+    definition: &CatalogDefinition,
+) -> Result<(), Status> {
+    let identity = definition.identity();
+    let released = state
+        .bindings
+        .get(&identity)
+        .map(binding_resident_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    let mut needed = binding_resident_bytes(&compact_binding_without_allocations(definition))?;
+    let contract = query_contract_identity(definition);
+    if !state.query_contracts.contains_key(&contract) {
+        needed = needed
+            .checked_add(estimated_query_contract_bytes(definition)?)
+            .ok_or_else(|| Status::resource_exhausted("active index catalog size overflow"))?;
     }
+    let family = definition.projection_family_identity();
+    needed = needed
+        .checked_add(estimated_new_family_recipe_bytes(
+            state.recipes.get(&family),
+            definition,
+        )?)
+        .ok_or_else(|| Status::resource_exhausted("active index catalog size overflow"))?;
+    let projected = state
+        .resident_bytes
+        .saturating_sub(released)
+        .checked_add(needed)
+        .ok_or_else(|| Status::resource_exhausted("active index catalog size overflow"))?;
+    if projected > state.maximum_bytes {
+        return Err(Status::resource_exhausted(format!(
+            "active index catalog requires {projected} bytes but its OrderingCatalog credit is {} bytes",
+            state.maximum_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn compact_binding_without_allocations(definition: &CatalogDefinition) -> LogicalCatalogBinding {
+    LogicalCatalogBinding {
+        identity: definition.identity(),
+        object_version: definition.object_version,
+        family: definition.projection_family_identity(),
+        query_contract: query_contract_identity(definition),
+    }
+}
+
+fn estimated_query_contract_bytes(definition: &CatalogDefinition) -> Result<usize, Status> {
+    definition.schema.fields.iter().try_fold(
+        std::mem::size_of::<LogicalQueryContract>() + 64,
+        |bytes, field| {
+            bytes
+                .checked_add(std::mem::size_of::<(String, [u8; 32])>() + field.name.len())
+                .ok_or_else(|| Status::resource_exhausted("active index catalog size overflow"))
+        },
+    )
+}
+
+fn estimated_new_family_recipe_bytes(
+    current: Option<&PhysicalCatalogRecipe>,
+    definition: &CatalogDefinition,
+) -> Result<usize, Status> {
+    let mut bytes = if current.is_none() {
+        std::mem::size_of::<PhysicalCatalogRecipe>()
+            + 64
+            + definition.stored.tenant.len()
+            + definition.stored.bucket.len()
+            + definition.schema.path_prefix.len()
+            + definition
+                .schema
+                .content_type_scope
+                .as_ref()
+                .map_or(0, String::len)
+    } else {
+        0
+    };
+    for (fingerprint, field) in definition
+        .recipe_fingerprints
+        .fields
+        .iter()
+        .zip(&definition.schema.fields)
+    {
+        if current.is_some_and(|recipe| recipe.fields.contains_key(fingerprint)) {
+            continue;
+        }
+        bytes = bytes
+            .checked_add(
+                std::mem::size_of::<([u8; 32], Arc<FieldSchema>)>()
+                    + std::mem::size_of::<([u8; 32], usize)>()
+                    + 128
+                    + std::mem::size_of::<FieldSchema>()
+                    + field.name.len()
+                    + field.source_selector.len(),
+            )
+            .ok_or_else(|| Status::resource_exhausted("active index catalog size overflow"))?;
+    }
+    Ok(bytes)
+}
+
+fn mark_catalog_changed(state: &mut CatalogState, physical_changed: bool) -> Result<(), Status> {
+    state.generation = state
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| Status::resource_exhausted("active index catalog generation overflow"))?;
+    if physical_changed {
+        state.physical_generation = physical_catalog_generation(state.recipes.values());
+    }
+    Ok(())
+}
+
+fn physical_catalog_generation<'a>(
+    recipes: impl IntoIterator<Item = &'a PhysicalCatalogRecipe>,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"keldra.index.physical-catalog/v1");
+    for recipe in recipes {
+        hasher.update(&recipe.family.tenant_id.to_be_bytes());
+        hasher.update(&recipe.family.bucket_id.to_be_bytes());
+        hasher.update(&recipe.family.family_id);
+        hasher.update(&recipe.membership_recipe);
+        for field in recipe.fields.keys() {
+            hasher.update(field);
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn compact_binding(definition: &CatalogDefinition) -> LogicalCatalogBinding {
+    compact_binding_without_allocations(definition)
+}
+
+fn query_contract_identity(definition: &CatalogDefinition) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"keldra.index.logical-query-contract/v1");
+    for (field, fingerprint) in definition
+        .schema
+        .fields
+        .iter()
+        .zip(definition.recipe_fingerprints.fields.iter())
+    {
+        hasher.update(&(field.name.len() as u64).to_be_bytes());
+        hasher.update(field.name.as_bytes());
+        hasher.update(fingerprint);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn add_query_contract_reference(
+    state: &mut CatalogState,
+    definition: &CatalogDefinition,
+    identity: [u8; 32],
+) -> Result<(), Status> {
+    if let Some(contract) = state.query_contracts.get_mut(&identity) {
+        contract.references = contract.references.saturating_add(1);
+        return Ok(());
+    }
+    let contract = LogicalQueryContract {
+        identity,
+        public_fields: Arc::new(
+            definition
+                .schema
+                .fields
+                .iter()
+                .zip(definition.recipe_fingerprints.fields.iter().copied())
+                .map(|(field, fingerprint)| (field.name.clone(), fingerprint))
+                .collect(),
+        ),
+        references: 1,
+    };
+    state.resident_bytes = state
+        .resident_bytes
+        .checked_add(query_contract_resident_bytes(&contract)?)
+        .ok_or_else(|| Status::resource_exhausted("active index catalog resident size overflow"))?;
+    state.query_contracts.insert(identity, contract);
+    Ok(())
+}
+
+fn remove_query_contract_reference(state: &mut CatalogState, identity: [u8; 32]) {
+    let remove = match state.query_contracts.get_mut(&identity) {
+        Some(contract) if contract.references > 1 => {
+            contract.references -= 1;
+            false
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if remove && let Some(contract) = state.query_contracts.remove(&identity) {
+        state.resident_bytes = state
+            .resident_bytes
+            .saturating_sub(query_contract_resident_bytes(&contract).unwrap_or(0));
+    }
+}
+
+fn add_recipe_reference(
+    state: &mut CatalogState,
+    definition: &CatalogDefinition,
+) -> Result<bool, Status> {
+    let identity = definition.projection_family_identity();
+    match state.recipes.get_mut(&identity) {
+        Some(recipe) => {
+            let before = recipe_resident_bytes(recipe).ok_or_else(|| {
+                Status::resource_exhausted("active index catalog resident size overflow")
+            })?;
+            let old_fields = recipe.fields.len();
+            recipe.references = recipe.references.saturating_add(1);
+            for (fingerprint, field) in definition
+                .recipe_fingerprints
+                .fields
+                .iter()
+                .copied()
+                .zip(&definition.schema.fields)
+            {
+                *recipe.field_references.entry(fingerprint).or_default() += 1;
+                recipe
+                    .fields
+                    .entry(fingerprint)
+                    .or_insert_with(|| Arc::new(field.clone()));
+            }
+            let after = recipe_resident_bytes(recipe).ok_or_else(|| {
+                Status::resource_exhausted("active index catalog resident size overflow")
+            })?;
+            state.resident_bytes = state
+                .resident_bytes
+                .checked_add(after.saturating_sub(before))
+                .ok_or_else(|| {
+                    Status::resource_exhausted("active index catalog resident size overflow")
+                })?;
+            let changed = recipe.fields.len() != old_fields;
+            if changed {
+                recipe.physical_generation = family_physical_generation(recipe);
+            }
+            return Ok(changed);
+        }
+        None => {
+            let mut recipe = PhysicalCatalogRecipe {
+                family: identity,
+                storage_tenant: definition.stored.tenant.clone(),
+                bucket: definition.stored.bucket.clone(),
+                membership_recipe: definition.recipe_fingerprints.membership,
+                path_prefix: definition.schema.path_prefix.clone(),
+                content_type: definition.schema.content_type_scope.clone(),
+                template: Arc::new({
+                    let mut schema = definition.schema.clone();
+                    schema.fields.clear();
+                    schema.physical_order.clear();
+                    schema
+                }),
+                fields: definition
+                    .recipe_fingerprints
+                    .fields
+                    .iter()
+                    .copied()
+                    .zip(&definition.schema.fields)
+                    .map(|(fingerprint, field)| (fingerprint, Arc::new(field.clone())))
+                    .collect(),
+                physical_generation: [0; 32],
+                references: 1,
+                field_references: definition
+                    .recipe_fingerprints
+                    .fields
+                    .iter()
+                    .copied()
+                    .map(|fingerprint| (fingerprint, 1))
+                    .collect(),
+            };
+            recipe.physical_generation = family_physical_generation(&recipe);
+            state.resident_bytes = state
+                .resident_bytes
+                .checked_add(recipe_resident_bytes(&recipe).ok_or_else(|| {
+                    Status::resource_exhausted("active index catalog resident size overflow")
+                })?)
+                .ok_or_else(|| {
+                    Status::resource_exhausted("active index catalog resident size overflow")
+                })?;
+            state.recipes.insert(identity, recipe);
+        }
+    }
+    Ok(true)
+}
+
+fn remove_recipe_reference(state: &mut CatalogState, binding: &LogicalCatalogBinding) -> bool {
+    let field_ids = state
+        .query_contracts
+        .get(&binding.query_contract)
+        .map(|contract| {
+            contract
+                .public_fields
+                .iter()
+                .map(|(_, id)| *id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let remove = match state.recipes.get_mut(&binding.family) {
+        Some(recipe) if recipe.references > 1 => {
+            let before = recipe_resident_bytes(recipe).unwrap_or(0);
+            let old_fields = recipe.fields.len();
+            recipe.references -= 1;
+            for field in field_ids {
+                match recipe.field_references.get_mut(&field) {
+                    Some(references) if *references > 1 => *references -= 1,
+                    Some(_) => {
+                        recipe.field_references.remove(&field);
+                        recipe.fields.remove(&field);
+                    }
+                    None => {}
+                }
+            }
+            let after = recipe_resident_bytes(recipe).unwrap_or(before);
+            if recipe.fields.len() != old_fields {
+                recipe.physical_generation = family_physical_generation(recipe);
+            }
+            state.resident_bytes = state
+                .resident_bytes
+                .saturating_sub(before.saturating_sub(after));
+            return recipe.fields.len() != old_fields;
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if remove && let Some(recipe) = state.recipes.remove(&binding.family) {
+        state.resident_bytes = state
+            .resident_bytes
+            .saturating_sub(recipe_resident_bytes(&recipe).unwrap_or(0));
+    }
+    remove
+}
+
+fn binding_resident_bytes(binding: &LogicalCatalogBinding) -> Result<usize, Status> {
+    let _ = binding;
+    Ok(std::mem::size_of::<LogicalCatalogBinding>() + 64)
+}
+
+fn query_contract_resident_bytes(contract: &LogicalQueryContract) -> Result<usize, Status> {
+    contract.public_fields.iter().try_fold(
+        std::mem::size_of::<LogicalQueryContract>() + 64,
+        |bytes, (name, _)| {
+            bytes
+                .checked_add(std::mem::size_of::<(String, [u8; 32])>())
+                .and_then(|value| value.checked_add(name.capacity()))
+                .ok_or_else(|| {
+                    Status::resource_exhausted("active index catalog resident size overflow")
+                })
+        },
+    )
+}
+
+fn recipe_resident_bytes(recipe: &PhysicalCatalogRecipe) -> Option<usize> {
+    let mut bytes = std::mem::size_of::<PhysicalCatalogRecipe>()
+        .checked_add(64)?
+        .checked_add(recipe.storage_tenant.capacity())?
+        .checked_add(recipe.bucket.capacity())?
+        .checked_add(recipe.path_prefix.capacity())?
+        .checked_add(recipe.content_type.as_ref().map_or(0, String::capacity))?
+        .checked_add(
+            recipe
+                .fields
+                .len()
+                .checked_mul(std::mem::size_of::<([u8; 32], Arc<FieldSchema>)>() + 64)?,
+        )?
+        .checked_add(
+            recipe
+                .field_references
+                .len()
+                .checked_mul(std::mem::size_of::<([u8; 32], usize)>() + 64)?,
+        )?;
+    for field in recipe.fields.values() {
+        bytes = bytes
+            .checked_add(field.name.capacity())?
+            .checked_add(field.source_selector.capacity())?;
+    }
+    Some(bytes)
+}
+
+fn family_physical_generation(recipe: &PhysicalCatalogRecipe) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"keldra.index.physical-family-catalog/v1");
+    hasher.update(&recipe.family.family_id);
+    hasher.update(&recipe.membership_recipe);
+    hasher.update(&(recipe.path_prefix.len() as u64).to_be_bytes());
+    hasher.update(recipe.path_prefix.as_bytes());
+    match &recipe.content_type {
+        Some(content_type) => {
+            hasher.update(&[1]);
+            hasher.update(&(content_type.len() as u64).to_be_bytes());
+            hasher.update(content_type.as_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    };
+    for field in recipe.fields.keys() {
+        hasher.update(field);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 #[cfg(test)]
 mod tests {
-    use keldra_api::v1::{CreateIndexRequest, IndexSpecification, PathIndexSpec};
+    use keldra_api::v1::{
+        CreateIndexRequest, IndexField, IndexFieldCapability, IndexFieldCardinality,
+        IndexSpecification, KeywordIndexField, PathIndexSpec, TypedJsonIndexSpec, index_field,
+    };
 
     use super::*;
 
@@ -529,136 +986,117 @@ mod tests {
         .unwrap()
     }
 
+    fn wide_typed_definition(index_id: u64) -> CatalogDefinition {
+        let fields = (0..32)
+            .map(|field| IndexField {
+                name: format!("public_field_name_{field}"),
+                json_pointer: format!("/payload/value_{field}"),
+                cardinality: IndexFieldCardinality::Single as i32,
+                capabilities: vec![IndexFieldCapability::Exact as i32],
+                field_type: Some(index_field::FieldType::Keyword(KeywordIndexField {})),
+            })
+            .collect();
+        typed_definition(index_id, fields)
+    }
+
+    fn typed_definition(index_id: u64, fields: Vec<IndexField>) -> CatalogDefinition {
+        CatalogDefinition::new(
+            1,
+            2,
+            1,
+            StoredIndexDefinition::create(
+                "tenant".into(),
+                CreateIndexRequest {
+                    bucket: "bucket".into(),
+                    name: format!("wide-{index_id}"),
+                    path_prefix: "objects/".into(),
+                    content_type: "application/json".into(),
+                    specification: Some(IndexSpecification {
+                        specification: Some(
+                            keldra_api::v1::index_specification::Specification::TypedJson(
+                                TypedJsonIndexSpec {
+                                    fields,
+                                    physical_order: Vec::new(),
+                                },
+                            ),
+                        ),
+                    }),
+                    command_id: format!("create-{index_id}"),
+                },
+                index_id,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn keyword_field(name: &str, pointer: &str) -> IndexField {
+        IndexField {
+            name: name.into(),
+            json_pointer: pointer.into(),
+            cardinality: IndexFieldCardinality::Single as i32,
+            capabilities: vec![IndexFieldCapability::Exact as i32],
+            field_type: Some(index_field::FieldType::Keyword(KeywordIndexField {})),
+        }
+    }
+
     #[test]
-    fn changes_are_coalesced_and_consumed() {
-        let catalog = IndexCatalog::with_capacity(2);
+    fn changes_update_active_catalog_without_an_admission_queue() {
+        let catalog = IndexCatalog::default();
         let first = definition(1, 2, 9);
         let mut replacement = first.clone();
         replacement.object_version = 2;
         catalog.upsert(first).unwrap();
         catalog.upsert(replacement.clone()).unwrap();
-        assert_eq!(catalog.pending_len().unwrap(), 1);
-        let change = catalog
-            .take(replacement.identity(), |_| true)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(change, CatalogChange::Upsert(value) if value.object_version == 2));
-        assert_eq!(catalog.pending_len().unwrap(), 0);
+        let (_, _, bindings, recipes, contracts) = catalog.snapshot().unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].object_version, 2);
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(contracts.len(), 1);
     }
 
     #[test]
-    fn bounded_queue_rejects_extra_upserts_but_coalesces_same_identity_removal() {
-        let catalog = IndexCatalog::with_capacity(1);
+    fn active_catalog_does_not_have_a_logical_definition_capacity_gate() {
+        let catalog = IndexCatalog::default();
         let first = definition(1, 2, 9);
         let second = definition(3, 4, 10);
         catalog.upsert(first.clone()).unwrap();
-        assert_eq!(
-            catalog.upsert(second).unwrap_err().code(),
-            tonic::Code::ResourceExhausted
-        );
+        catalog.upsert(second).unwrap();
+        assert_eq!(catalog.snapshot().unwrap().2.len(), 2);
         catalog
             .remove(first.tenant_id, first.bucket_id, first.stored.index_id)
             .unwrap();
-        assert!(matches!(
-            catalog.take(first.identity(), |_| true).unwrap(),
-            Some(CatalogChange::Remove(_))
-        ));
-    }
-
-    #[test]
-    fn definition_delete_is_not_downgraded_to_assignment_removal() {
-        let catalog = IndexCatalog::with_capacity(1);
-        let definition = definition(1, 2, 9);
-        let identity = definition.identity();
-        catalog.upsert(definition).unwrap();
-        catalog
-            .enqueue(CatalogChange::Delete {
-                identity,
-                object_version: 2,
-            })
-            .unwrap();
-        catalog.remove(1, 2, 9).unwrap();
-        assert!(matches!(
-            catalog.take(identity, |_| true).unwrap(),
-            Some(CatalogChange::Delete {
-                object_version: 2,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn recreation_replaces_one_pending_tombstone_only_when_newer() {
-        let catalog = IndexCatalog::with_capacity(1);
-        let mut stale = definition(1, 2, 9);
-        stale.object_version = 2;
-        let identity = stale.identity();
-        catalog
-            .enqueue(CatalogChange::Delete {
-                identity,
-                object_version: 3,
-            })
-            .unwrap();
-        catalog.upsert(stale).unwrap();
-        assert!(matches!(
-            catalog.take(identity, |_| true).unwrap(),
-            Some(CatalogChange::Delete {
-                object_version: 3,
-                ..
-            })
-        ));
-
-        catalog
-            .enqueue(CatalogChange::Delete {
-                identity,
-                object_version: 3,
-            })
-            .unwrap();
-        let mut recreated = definition(1, 2, 9);
-        recreated.object_version = 4;
-        catalog.upsert(recreated).unwrap();
-        assert!(matches!(
-            catalog.take(identity, |_| true).unwrap(),
-            Some(CatalogChange::Upsert(CatalogDefinition {
-                object_version: 4,
-                ..
-            }))
-        ));
-    }
-
-    #[test]
-    fn upserts_remain_pending_while_builder_leases_are_full() {
-        let catalog = IndexCatalog::with_capacity(1);
-        catalog.upsert(definition(1, 2, 9)).unwrap();
-        assert!(catalog.take_page(1, |_| false).unwrap().is_empty());
-        assert_eq!(catalog.pending_len().unwrap(), 1);
-        assert_eq!(catalog.take_page(1, |_| true).unwrap().len(), 1);
+        assert_eq!(catalog.snapshot().unwrap().2.len(), 1);
     }
 
     #[tokio::test]
-    async fn affected_definition_waits_for_capacity_instead_of_losing_its_wake() {
-        let catalog = IndexCatalog::with_capacity(1);
-        let first = definition(1, 2, 9);
-        let second = definition(3, 4, 10);
-        let second_identity = second.identity();
-        catalog.upsert(first.clone()).unwrap();
+    async fn definition_delete_is_version_monotonic() {
+        let catalog = IndexCatalog::default();
+        let definition = definition(1, 2, 9);
+        let identity = definition.identity();
+        catalog.upsert(definition).unwrap();
+        catalog.delete_wait(identity, 2).await.unwrap();
+        catalog.remove(1, 2, 9).unwrap();
+        assert!(catalog.snapshot().unwrap().2.is_empty());
+    }
 
-        let waiting_catalog = catalog.clone();
-        let waiting = tokio::spawn(async move { waiting_catalog.upsert_wait(second).await });
-        tokio::task::yield_now().await;
-        assert!(!waiting.is_finished());
+    #[tokio::test]
+    async fn ordered_recreation_does_not_retain_a_tombstone() {
+        let catalog = IndexCatalog::default();
+        let original = definition(1, 2, 9);
+        let identity = original.identity();
+        catalog.upsert(original).unwrap();
+        catalog.delete_wait(identity, 3).await.unwrap();
+        assert!(catalog.snapshot().unwrap().2.is_empty());
 
-        assert!(catalog.take(first.identity(), |_| true).unwrap().is_some());
-        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
-            .await
-            .expect("affected wake did not resume after catalog capacity was released")
-            .unwrap()
-            .unwrap();
-        assert!(catalog.take(second_identity, |_| true).unwrap().is_some());
+        let mut recreated = definition(1, 2, 9);
+        recreated.object_version = 4;
+        catalog.upsert(recreated).unwrap();
+        assert_eq!(catalog.snapshot().unwrap().2[0].object_version, 4);
     }
 
     #[test]
-    fn ordinary_definition_compiles_one_bound_v4_schema_and_fingerprint() {
+    fn ordinary_definition_compiles_one_bound_typed_json_schema_and_fingerprint() {
         let definition = definition(1, 2, 9);
         assert_eq!(definition.schema.path_prefix, "");
         assert_eq!(definition.schema.fields[0].name, "path");
@@ -744,25 +1182,66 @@ mod tests {
 
     #[test]
     fn catalog_scale_collapses_two_hundred_fifty_thousand_equivalent_definitions() {
-        let base = definition(1, 2, 1);
-        let logical = (1..=250_000_u64)
-            .map(|index_id| {
-                (
-                    CatalogIdentity {
-                        tenant_id: 1,
-                        bucket_id: 2,
-                        index_id,
-                    },
-                    base.physical_identity(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let physical = logical
-            .values()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
+        let base = wide_typed_definition(1);
+        let catalog = IndexCatalog::default();
+        let mut first_physical_generation = None;
+        for index_id in 1..=250_000_u64 {
+            let mut logical = base.clone();
+            logical.stored.index_id = index_id;
+            logical.stored.name = format!("index-{index_id}");
+            catalog.upsert(logical).unwrap();
+            if index_id == 1 {
+                first_physical_generation = Some(catalog.snapshot().unwrap().1);
+            }
+        }
+        let (generation, physical_generation, logical, physical, contracts) =
+            catalog.snapshot().unwrap();
+        assert_eq!(generation, 250_001);
         assert_eq!(logical.len(), 250_000);
         assert_eq!(physical.len(), 1);
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(physical[0].fields.len(), 32);
+        assert_ne!(physical_generation, [0; 32]);
+        assert_eq!(Some(physical_generation), first_physical_generation);
+        // The active catalog retains compact logical bindings and one interned
+        // schema. It must not approach the footprint of 250K cloned schemas.
+        assert!(catalog.resident_bytes().unwrap() < 96 * 1024 * 1024);
+    }
+
+    #[test]
+    fn overlapping_field_subsets_compile_to_one_family_union() {
+        let catalog = IndexCatalog::default();
+        catalog
+            .upsert(typed_definition(
+                1,
+                vec![keyword_field("a", "/a"), keyword_field("b", "/b")],
+            ))
+            .unwrap();
+        let first_generation = catalog.snapshot().unwrap().1;
+        catalog
+            .upsert(typed_definition(
+                2,
+                vec![keyword_field("bee", "/b"), keyword_field("c", "/c")],
+            ))
+            .unwrap();
+        let (_, second_generation, bindings, families, contracts) = catalog.snapshot().unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(families.len(), 1);
+        assert_eq!(families[0].fields.len(), 3);
+        assert_eq!(contracts.len(), 2);
+        assert_ne!(first_generation, second_generation);
+
+        // An equivalent alias changes only the compact logical/query binding,
+        // never the physical family generation or recipe union.
+        catalog
+            .upsert(typed_definition(
+                3,
+                vec![keyword_field("aye", "/a"), keyword_field("bee", "/b")],
+            ))
+            .unwrap();
+        let (_, alias_generation, _, families, _) = catalog.snapshot().unwrap();
+        assert_eq!(alias_generation, second_generation);
+        assert_eq!(families[0].fields.len(), 3);
     }
 
     #[test]

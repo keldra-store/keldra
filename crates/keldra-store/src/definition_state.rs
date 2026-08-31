@@ -335,8 +335,9 @@ pub enum DefinitionConsumerKind {
     IndexAssignments = 1,
     /// Destination-local cursor paired atomically with assigned-state changes.
     AccountingAssignments = 2,
-    /// Source-local cursor advanced only after index assignment delivery.
-    IndexDelivery = 3,
+    /// All-source v6 catalog feed checkpoint. It advances only after the
+    /// baseline inventory and contiguous journal replay are durable.
+    V6IndexCatalog = 3,
     /// Source-local cursor advanced only after accounting assignment delivery.
     AccountingDelivery = 4,
     /// Consumer-local aggregate cursor advanced only by rank-zero index proof.
@@ -348,7 +349,7 @@ pub enum DefinitionConsumerKind {
 impl DefinitionConsumerKind {
     pub fn definition_kind(self) -> DefinitionKind {
         match self {
-            Self::IndexAssignments | Self::IndexDelivery => DefinitionKind::Index,
+            Self::IndexAssignments | Self::V6IndexCatalog => DefinitionKind::Index,
             Self::AccountingAssignments | Self::AccountingDelivery => DefinitionKind::Accounting,
             Self::IndexRetention => DefinitionKind::Index,
             Self::AccountingRetention => DefinitionKind::Accounting,
@@ -359,7 +360,7 @@ impl DefinitionConsumerKind {
         match value {
             1 => Ok(Self::IndexAssignments),
             2 => Ok(Self::AccountingAssignments),
-            3 => Ok(Self::IndexDelivery),
+            3 => Ok(Self::V6IndexCatalog),
             4 => Ok(Self::AccountingDelivery),
             5 => Ok(Self::IndexRetention),
             6 => Ok(Self::AccountingRetention),

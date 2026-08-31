@@ -1,6 +1,5 @@
-//! Construction of the shared index cache, source journals, builders and queries.
+//! Construction of the format-v6 index producer and query runtime.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -10,39 +9,31 @@ use crate::bucket_governance::BucketGovernance;
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::{ClusterPeerTransport, LocalIndexQueryExecutor};
 use crate::data_peer::DataPeerTransport;
-use crate::derived_consumer::{
-    DerivedCheckpointPublisher, DerivedConsumerRuntimeTask, DerivedEvidenceResolver,
-};
+use crate::derived_consumer::DerivedCheckpointPublisher;
 use crate::distributed_list::DistributedObjectLister;
 use crate::index_config::IndexRuntimeConfig;
 use crate::index_service::{
     DistributedIndexDefinitionLister, IndexDefinitionLister, IndexQueryExecutor,
 };
-use crate::logical_name_resolution::LogicalNameResolver;
 use crate::object_distribution::ObjectDistribution;
 use crate::startup_scan_evidence::StartupScanEvidence;
 use keldra_store::Store;
 
-use super::budget::IndexMemoryBudgets;
-use super::cache::{IndexCache, IndexCacheConfig};
 use super::catalog::IndexCatalog;
 use super::coordination::DefinitionCoordinationTask;
 use super::cpu::IndexCpuPool;
 use super::distributed_query::DistributedIndexQueryExecutor;
 use super::events::{ClusterIndexEventSources, DecisionIndexEventAuthority, IndexEventJournal};
-use super::local_query::{ClusterIndexSegmentFetcher, LocalRevisionQueryExecutor};
-use super::manager::publication_cohort::IndexPublicationCohorts;
-use super::manager::{
-    IndexBuilderDependencies, IndexBuilderManagerTask, IndexMaintenanceWorkSlots,
-    IndexPublicationSlots,
-};
-use super::projection_mapper::SharedProjectionMapper;
+use super::hot_ingress::HotProjectionIngress;
 use super::publication::{IndexArtifactCoordinator, IndexArtifactRouter};
-use super::publisher::IndexCommitPublisher;
 use super::query_budget::IndexQueryMemoryBudget;
-use super::retention::IndexCommitRetention;
 use super::scanner::ClusterIndexScanner;
-use super::working_memory::IndexWorkingMemory;
+use super::v6_catalog_lifecycle::V6CatalogLifecycleTask;
+use super::v6_consumer::V6IndexProducerTask;
+use super::v6_publication::V6ProjectionPublisher;
+use super::v6_query_runtime::V6LocalIndexQueryExecutor;
+use super::v6_retention::V6IndexRetentionTask;
+use super::working_memory::{IndexWorkingMemory, WorkingMemoryAccount, WorkingMemoryPermit};
 
 pub(crate) struct RunningIndexRuntime {
     pub(crate) definitions: Arc<dyn IndexDefinitionLister>,
@@ -51,22 +42,13 @@ pub(crate) struct RunningIndexRuntime {
     pub(crate) event_journal: Arc<IndexEventJournal>,
     pub(crate) scanner: ClusterIndexScanner,
     pub(crate) artifact_router: IndexArtifactRouter,
-    cache: IndexCache,
     _definition_coordination: DefinitionCoordinationTask,
-    _derived_retention: DerivedConsumerRuntimeTask,
-    _builders: IndexBuilderManagerTask,
-}
-
-impl RunningIndexRuntime {
-    /// Start disposable cache reconciliation only after the public listener is
-    /// accepting requests. Runtime construction performs no cache inventory.
-    pub(crate) fn start_cache_reconciler(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.cache.start_reconciler(),
-            "index cache reconciler was started more than once"
-        );
-        Ok(())
-    }
+    _pipeline_memory: WorkingMemoryPermit,
+    _producer: V6IndexProducerTask,
+    _v6_catalog_lifecycle: V6CatalogLifecycleTask,
+    _v6_retention: V6IndexRetentionTask,
+    _v6_telemetry_summary: tokio::task::JoinHandle<()>,
+    _catalog_router_sync: tokio::task::JoinHandle<()>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -80,13 +62,11 @@ pub(crate) async fn start(
     governance: BucketGovernance,
     reader: ClusterObjectReader,
     object_lister: DistributedObjectLister,
-    names: LogicalNameResolver,
-    cache_directory: &Path,
-    scratch_directory: &Path,
     config: IndexRuntimeConfig,
     derived_checkpoints: DerivedCheckpointPublisher,
     startup_scan_evidence: StartupScanEvidence,
 ) -> Result<RunningIndexRuntime> {
+    let v6_telemetry_summary = super::v6_telemetry::start_summary_task();
     tracing::info!("index runtime starts from sparse assigned-definition state");
     let scanner = ClusterIndexScanner::new(
         decisions.clone(),
@@ -101,7 +81,10 @@ pub(crate) async fn start(
             data_peers.clone(),
         )),
     ));
-    let catalog = IndexCatalog::default();
+    let pipeline_memory = config.pipeline_memory_bytes();
+    let catalog = IndexCatalog::with_memory_bytes(pipeline_memory / 4)
+        .map_err(anyhow::Error::msg)
+        .context("reserve bounded TypedJson ordering-catalog memory")?;
     let definition_coordination = DefinitionCoordinationTask::start(
         local_node,
         decisions.clone(),
@@ -110,19 +93,10 @@ pub(crate) async fn start(
         cluster_peers.clone(),
         reader.clone(),
         catalog.clone(),
+        journal.clone(),
     );
 
-    let memory_bytes = index_memory_budget(config.memory_percent())?;
-    let cache = IndexCache::new_with_directories_and_startup_scan_evidence(
-        cache_directory,
-        scratch_directory,
-        IndexCacheConfig::new(config.disk_cache_bytes(), memory_bytes)
-            .context("validate index cache budgets")?,
-        Arc::new(ClusterIndexSegmentFetcher::new(reader.clone())),
-        startup_scan_evidence,
-    )
-    .context("initialize disposable index cache")?;
-    let cpu = IndexCpuPool::new(config.rayon_workers())
+    let cpu = IndexCpuPool::new(config.indexing_cores())
         .context("initialize the fixed index Rayon pool")?;
     let coordinator = IndexArtifactCoordinator::new(
         store.clone(),
@@ -130,40 +104,58 @@ pub(crate) async fn start(
         governance,
         cluster_peers.clone(),
     );
-    let artifact_router =
-        IndexArtifactRouter::new(local_node, coordinator, objects, cluster_peers.clone());
-    let publication_slots = IndexPublicationSlots::default();
-    let publication_cohorts =
-        IndexPublicationCohorts::new(artifact_router.clone(), journal.clone(), publication_slots);
-    let publisher = IndexCommitPublisher::new(
-        store.clone(),
-        reader.clone(),
+    let artifact_router = IndexArtifactRouter::new(
+        local_node,
+        coordinator,
+        objects.clone(),
+        cluster_peers.clone(),
+    );
+    let v6_publisher =
+        V6ProjectionPublisher::new(store.clone(), reader.clone(), artifact_router.clone());
+    let v6_catalog_lifecycle = V6CatalogLifecycleTask::start(
+        catalog.clone(),
+        journal.clone(),
         artifact_router.clone(),
-        publication_cohorts,
-        config,
+        v6_publisher.clone(),
+    );
+    let v6_retention = V6IndexRetentionTask::start(
+        local_node,
+        store.clone(),
+        catalog.clone(),
+        journal.clone(),
+        derived_checkpoints.clone(),
+        v6_publisher.clone(),
     );
     let working_memory = IndexWorkingMemory::from_config(config)
         .context("validate aggregate index working-memory budget")?;
-    let projection_mapper = SharedProjectionMapper::new(
-        reader.clone(),
-        cpu.clone(),
-        working_memory.clone(),
-        config.shared_projection_memory_bytes(),
-    )
-    .await
-    .context("reserve shared index projection memory")?;
+    let pipeline_memory_permit = working_memory
+        .acquire_up_to(
+            WorkingMemoryAccount::IndexingPipeline,
+            pipeline_memory,
+            pipeline_memory,
+        )
+        .await
+        .context("reserve format-v6 indexing pipeline memory")?;
+    let hot_ingress = HotProjectionIngress::new(pipeline_memory / 4)
+        .map_err(anyhow::Error::msg)
+        .context("initialize bounded TypedJson hot ingress")?;
+    hot_ingress
+        .install_cpu(cpu.clone())
+        .map_err(anyhow::Error::msg)
+        .context("install hot indexing CPU pool")?;
+    let catalog_router_sync = start_catalog_router_sync(catalog.clone(), hot_ingress.clone());
+    objects
+        .install_hot_indexing(hot_ingress.clone())
+        .map_err(anyhow::Error::msg)
+        .context("install TypedJson hot ingress on object mutation coordinators")?;
     let query_budget = IndexQueryMemoryBudget::from_shared(working_memory.clone());
-    let local_queries: Arc<dyn LocalIndexQueryExecutor> =
-        Arc::new(LocalRevisionQueryExecutor::new(
-            reader.clone(),
-            cache.clone(),
-            publisher.clone(),
-            projection_mapper.clone(),
-            cpu.clone(),
-            query_budget,
-            config.query_max_concurrency(),
-            config.query_work_quantum_bytes(),
-        ));
+    let local_queries: Arc<dyn LocalIndexQueryExecutor> = Arc::new(V6LocalIndexQueryExecutor::new(
+        decisions.clone(),
+        reader.clone(),
+        catalog.clone(),
+        v6_publisher.clone(),
+        query_budget,
+    ));
     let queries: Arc<dyn IndexQueryExecutor> = Arc::new(DistributedIndexQueryExecutor::new(
         local_node,
         decisions.clone(),
@@ -171,59 +163,20 @@ pub(crate) async fn start(
         local_queries.clone(),
     ));
 
-    let (derived_progress, derived_retention) = DerivedConsumerRuntimeTask::start(
-        keldra_store::DerivedConsumerKind::Index,
+    let producer = V6IndexProducerTask::start(
         local_node,
         decisions.clone(),
-        store.clone(),
+        catalog.clone(),
         journal.clone(),
-        derived_checkpoints,
-        DerivedEvidenceResolver::index(
-            local_node,
-            decisions.clone(),
-            reader.clone(),
-            publisher.clone(),
-            catalog.clone(),
-        ),
-    );
-    let commit_retention = IndexCommitRetention::new(
-        store.clone(),
         scanner.clone(),
         reader.clone(),
-        artifact_router.clone(),
-        publisher.clone(),
-        cache.merge_scratch(),
-        names,
+        cpu,
+        hot_ingress,
+        v6_publisher,
         config,
-    );
-    let budgets = IndexMemoryBudgets::from_config(config, working_memory)
-        .context("validate per-kind index construction budgets")?;
-    let projection_family_writer =
-        super::projection_family_writer::SharedProjectionFamilyWriter::new(
-            projection_mapper.clone(),
-            publisher.clone(),
-        );
-    let builders = IndexBuilderManagerTask::start(
-        local_node,
-        decisions,
-        catalog.clone(),
-        IndexBuilderDependencies {
-            store,
-            journal: journal.clone(),
-            scanner: scanner.clone(),
-            reader,
-            publisher,
-            retention: commit_retention,
-            cache: cache.clone(),
-            budgets,
-            cpu,
-            projection_mapper,
-            projection_family_writer,
-            config,
-            derived_progress,
-            maintenance_work_slots: IndexMaintenanceWorkSlots::default(),
-        },
-    );
+    )
+    .map_err(anyhow::Error::msg)
+    .context("start format-v6 index producer")?;
 
     Ok(RunningIndexRuntime {
         definitions: Arc::new(DistributedIndexDefinitionLister::new(object_lister)),
@@ -232,97 +185,34 @@ pub(crate) async fn start(
         event_journal: journal,
         scanner,
         artifact_router,
-        cache,
         _definition_coordination: definition_coordination,
-        _derived_retention: derived_retention,
-        _builders: builders,
+        _pipeline_memory: pipeline_memory_permit,
+        _producer: producer,
+        _v6_catalog_lifecycle: v6_catalog_lifecycle,
+        _v6_retention: v6_retention,
+        _v6_telemetry_summary: v6_telemetry_summary,
+        _catalog_router_sync: catalog_router_sync,
     })
 }
 
-fn index_memory_budget(percent: u8) -> Result<u64> {
-    let total = cgroup_memory_limit()
-        .or_else(host_memory_bytes)
-        .context("determine physical memory for index materialization budget")?;
-    let bytes = (u128::from(total) * u128::from(percent) / 100)
-        .try_into()
-        .context("index materialization budget exceeds u64")?;
-    anyhow::ensure!(
-        bytes > 0,
-        "index materialization budget resolved to zero bytes"
-    );
-    Ok(bytes)
-}
-
-fn cgroup_memory_limit() -> Option<u64> {
-    let value = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
-    let parsed = value.trim().parse::<u64>().ok()?;
-    (parsed > 0).then_some(parsed)
-}
-
-#[cfg(target_os = "linux")]
-fn host_memory_bytes() -> Option<u64> {
-    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kilobytes = contents
-        .lines()
-        .find_map(|line| line.strip_prefix("MemTotal:"))?
-        .split_ascii_whitespace()
-        .next()?
-        .parse::<u64>()
-        .ok()?;
-    kilobytes.checked_mul(1_024)
-}
-
-#[cfg(target_os = "macos")]
-fn host_memory_bytes() -> Option<u64> {
-    unsafe extern "C" {
-        fn sysctlbyname(
-            name: *const std::ffi::c_char,
-            old_value: *mut std::ffi::c_void,
-            old_length: *mut usize,
-            new_value: *mut std::ffi::c_void,
-            new_length: usize,
-        ) -> std::ffi::c_int;
-    }
-
-    let mut bytes = 0_u64;
-    let mut length = std::mem::size_of::<u64>();
-    // SAFETY: the NUL-terminated name is static, `bytes` and `length` point to
-    // writable storage of the documented sizes, and this read-only query does
-    // not retain either pointer.
-    let result = unsafe {
-        sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&mut bytes as *mut u64).cast(),
-            &mut length,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (result == 0 && length == std::mem::size_of::<u64>() && bytes > 0).then_some(bytes)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn host_memory_bytes() -> Option<u64> {
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn configured_percentage_is_applied_without_float_rounding() {
-        let total = 1_000_u64;
-        let percent = 17_u8;
-        let bytes: u64 = (u128::from(total) * u128::from(percent) / 100)
-            .try_into()
-            .unwrap();
-        assert_eq!(bytes, 170);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn host_memory_is_available_on_supported_servers() {
-        assert!(host_memory_bytes().is_some_and(|bytes| bytes > 0));
-    }
+fn start_catalog_router_sync(
+    catalog: IndexCatalog,
+    ingress: HotProjectionIngress,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut changes = catalog.subscribe();
+        let refresh = || match catalog.hot_router_snapshot() {
+            Ok((generation, routes)) => ingress.replace_compiled_catalog(generation, routes),
+            Err(error) => tracing::error!(%error, "active physical catalog router refresh failed"),
+        };
+        refresh();
+        loop {
+            match changes.recv().await {
+                Ok(notice) if notice.physical_changed => refresh(),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => refresh(),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
 }

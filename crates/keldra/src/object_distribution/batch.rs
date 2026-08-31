@@ -14,6 +14,7 @@ use super::{
     mutation_status, operation_key, stage_distributed_put,
 };
 use crate::cluster_placement::ClusterPlacement;
+use crate::index_runtime::hot_ingress::PendingHotProjection;
 use crate::mutation_admission::{MutationAdmission, MutationPermit};
 use crate::payload_distribution::PreparedPayloadEvidence;
 
@@ -91,18 +92,37 @@ impl ObjectDistribution {
                 .iter()
                 .all(|(_, intent, governance)| intent.is_none() && governance.is_none())
             {
+                let mut pending_hot = BTreeMap::new();
                 let operations = operations
                     .into_iter()
-                    .map(|(operation, _, _)| operation)
+                    .enumerate()
+                    .map(|(index, (operation, _, _))| {
+                        let pending = self.hot_indexing.get().and_then(|ingress| {
+                            let key = operation_key(&operation);
+                            let (tenant_id, bucket_id) = self
+                                .store
+                                .resolve_bucket_ids(key.tenant(), key.bucket())
+                                .ok()?;
+                            ingress.pending(tenant_id, bucket_id, &operation)
+                        });
+                        if let Some(pending) = pending {
+                            pending_hot.insert(index, pending);
+                        }
+                        operation
+                    })
                     .collect();
                 return match self.mutation_admission.enter() {
-                    Ok(_permit) => self
-                        .store
-                        .bulk_write_with_backpressure(operations)
-                        .await
-                        .into_iter()
-                        .map(|outcome| outcome.result.map_err(mutation_status))
-                        .collect(),
+                    Ok(_permit) => {
+                        let results = self
+                            .store
+                            .bulk_write_with_backpressure(operations)
+                            .await
+                            .into_iter()
+                            .map(|outcome| outcome.result.map_err(mutation_status))
+                            .collect::<Vec<_>>();
+                        admit_aligned_hot_results(self.hot_indexing.get(), pending_hot, &results);
+                        results
+                    }
                     Err(error) => (0..count).map(|_| Err(error.clone())).collect(),
                 };
             }
@@ -133,6 +153,7 @@ impl ObjectDistribution {
         let mut governance_cache =
             BTreeMap::<(String, String), Result<ObjectMutationGovernance, Status>>::new();
         let mut grouped = BTreeMap::<Vec<u64>, Vec<BatchItem>>::new();
+        let mut pending_hot = BTreeMap::<usize, PendingHotProjection>::new();
         let mut outcomes = vec![None; count];
         for (index, (operation, definition_intent, supplied_governance)) in
             operations.into_iter().enumerate()
@@ -172,6 +193,11 @@ impl ObjectDistribution {
                 }
             };
             let group_key = group.replicas().iter().map(|node| node.0).collect();
+            if let Some(pending) = self.hot_indexing.get().and_then(|ingress| {
+                ingress.pending(governance.tenant_id, governance.bucket_id, &operation)
+            }) {
+                pending_hot.insert(index, pending);
+            }
             grouped.entry(group_key).or_default().push(BatchItem {
                 index,
                 operation,
@@ -201,7 +227,7 @@ impl ObjectDistribution {
                 }
             }
         }
-        outcomes
+        let outcomes = outcomes
             .into_iter()
             .map(|outcome| {
                 outcome.unwrap_or_else(|| {
@@ -210,7 +236,9 @@ impl ObjectDistribution {
                     ))
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        admit_aligned_hot_results(self.hot_indexing.get(), pending_hot, &outcomes);
+        outcomes
     }
 
     fn resolve_governance(
@@ -754,6 +782,21 @@ impl ObjectDistribution {
     }
 }
 
+fn admit_aligned_hot_results(
+    ingress: Option<&crate::index_runtime::hot_ingress::HotProjectionIngress>,
+    pending: BTreeMap<usize, PendingHotProjection>,
+    results: &[Result<MutationReceipt, Status>],
+) {
+    let Some(ingress) = ingress else {
+        return;
+    };
+    for (index, pending) in pending {
+        if let Some(Ok(receipt)) = results.get(index) {
+            ingress.admit_committed(Some(pending), receipt);
+        }
+    }
+}
+
 async fn begin_fenced_mutation_attempt<T, F, Fut>(
     admission: &MutationAdmission,
     prepare: F,
@@ -784,6 +827,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::mutation_admission::DrainIdentity;
+    use keldra_store::{Durability, ObjectKey, PutMode, PutRequest, VersionId};
 
     use super::*;
 
@@ -791,6 +835,63 @@ mod tests {
         DrainIdentity {
             joining_node_id: 9,
             started_log_index: 41,
+        }
+    }
+
+    fn inline_put(path: &str) -> BatchOperation {
+        BatchOperation::Put(PutRequest {
+            key: ObjectKey::new("tenant", "bucket", path).unwrap(),
+            bytes: br#"{"value":"hot"}"#.to_vec(),
+            content_type: Some("application/json".into()),
+            mode: PutMode::Put,
+            command_id: Some(format!("put-{path}")),
+            durability: Durability::Local,
+        })
+    }
+
+    fn receipt(version: u64) -> MutationReceipt {
+        MutationReceipt {
+            command_id: Some(format!("v-{version}")),
+            fingerprint: [version as u8; 32],
+            version: VersionId(version),
+            deleted: false,
+            replayed: false,
+            replay_guarantee_expires_at_unix_millis: 1,
+        }
+    }
+
+    #[test]
+    fn production_aligned_admission_handles_reordered_thousand_item_completion() {
+        let ingress =
+            crate::index_runtime::hot_ingress::HotProjectionIngress::new(4 * 1024 * 1024).unwrap();
+        ingress.activate_test_route(1, 2);
+        let mut pending = BTreeMap::new();
+        // Insert in reverse completion order; the production helper must bind
+        // by original result index, never task/group completion order.
+        for index in (0..1_000).rev() {
+            pending.insert(
+                index,
+                ingress
+                    .pending(1, 2, &inline_put(&format!("objects/{index}")))
+                    .unwrap(),
+            );
+        }
+        let mut results = (0..1_000)
+            .map(|index| Ok(receipt(20_000 + index as u64)))
+            .collect::<Vec<_>>();
+        results[111] = Err(Status::unavailable("injected failure"));
+        results[777].as_mut().unwrap().replayed = true;
+
+        admit_aligned_hot_results(Some(&ingress), pending, &results);
+
+        for index in 0..1_000 {
+            let payload = ingress.take_exact_selected(
+                1,
+                2,
+                &format!("objects/{index}"),
+                20_000 + index as u64,
+            );
+            assert_eq!(payload.is_some(), index != 111 && index != 777);
         }
     }
 

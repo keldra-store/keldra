@@ -7,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -35,6 +35,7 @@ pub struct Counters {
 #[derive(Serialize)]
 struct Snapshot {
     schema: &'static str,
+    timestamp_unix_milliseconds: u128,
     elapsed_seconds: f64,
     phase_elapsed_seconds: f64,
     phase: String,
@@ -89,6 +90,10 @@ impl Counters {
             .unwrap_or_default();
         Snapshot {
             schema: "keldra.index-contention.progress.v1",
+            timestamp_unix_milliseconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
             elapsed_seconds: started.elapsed().as_secs_f64(),
             phase_elapsed_seconds: phase_elapsed.as_secs_f64(),
             phase: self.phase.lock().await.clone(),

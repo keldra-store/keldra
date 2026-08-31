@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read};
 
 use keldra_index::IndexError;
-use keldra_index::v4::ScalarValue;
+use keldra_index::typed_json::ScalarValue;
 
 pub(crate) type SelectedScalarFields = BTreeMap<String, SelectedScalarField>;
 

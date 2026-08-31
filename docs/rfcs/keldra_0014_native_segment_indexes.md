@@ -2,14 +2,19 @@
 
 Status: Accepted
 
-KELDRA-0020 amends physical ownership and update granularity. Format v5 is now
-the canonical durable projection authority for Typed JSON. The mature format-v4
-postings/points/doc-values executor remains its disposable native query-cache
-implementation, keyed by stable document and material versions rather than by
-ordinary object versions. A logical definition is no longer the required owner
-of a complete independent segment tree. Canonically compatible definitions
-share document, membership, field, generation, and cache components, and
-projection-preserving source updates do not rewrite unchanged components.
+KELDRA-0020 and KELDRA-0016 amend physical ownership, production, publication,
+and update granularity. All advertised index kinds use the partition-owned,
+memory-first projection pipeline. A logical definition is catalog state, never
+a builder or independent segment tree. Canonically compatible definitions share
+document, membership, field, segment, and reader components, and
+projection-preserving source updates emit only head deltas.
+
+Typed JSON is the only supported native index kind for this milestone. Path,
+Metadata Filter, Full Text, Vector, Hybrid, Git Source, and Tensor definition
+admission is rejected until each kind is implemented on the partition-owned
+pipeline. This is a deliberate supported-surface reset, not a compatibility
+boundary. Keldra does not retain a per-definition or external builder for any
+of those kinds.
 
 Supersedes: KELDRA-0013 in full
 
@@ -17,11 +22,12 @@ Audience: Keldra implementors, operators, client authors, and reviewers
 
 ## 1. Decision
 
-Keldra will replace format-v3 indices with an Keldra-owned format-v4 segment
-engine. The engine adopts the proven execution contracts used by Lucene:
+Keldra uses a Keldra-owned native segment engine produced by the distributed
+partition pipeline. The engine adopts the proven execution contracts used by
+Lucene:
 
 - immutable segment cores with mutable behavior presented through new segments
-  and generation-bound live-document views;
+  and root-bound live-document/head views;
 - dense segment-local document identifiers;
 - seekable term dictionaries and blocked, advanceable postings;
 - cost-led Boolean iterator algebra instead of one-driver candidate scanning;
@@ -31,30 +37,32 @@ engine. The engine adopts the proven execution contracts used by Lucene:
   aggregation, and scoring;
 - optional definition-time physical ordering for workloads which repeatedly
   request the same leading order;
-- true generation-bound search-after pagination; and
+- true root-vector-bound search-after pagination; and
 - background segment merging which preserves exact match membership while a
-  newly published generation may recompute ranking statistics.
+  newly published root vector may recompute ranking statistics.
 
 Lucene is the reference for these contracts and their operational maturity. It
 is not Keldra's storage authority, file format, library dependency, or public
 API. Keldra owns every durable byte and keeps its existing distributed object,
 publication, authorization, and resource-control boundaries.
 
-Format v4 is a clean break. It has no format-v3 reader, converter, backfill,
-dual writer, query fallback, compatibility shim, or mixed-generation path. A
-format-v4 deployment builds indices from authoritative ordinary objects and
-their retained source journals.
+The current native projection format is a clean break. It has no older-format
+reader, converter, migration, dual writer, query fallback, compatibility shim,
+mixed-generation path, or fallback builder. A deployment builds derived
+indices from authoritative ordinary objects and retained source journals.
 
-Format-v4 postings, points, live masks, terms, doc values, vectors, generation
-manifests, and pack envelopes use explicit Keldra codecs matched to their native
-access patterns. An index never stores a second copy of an ordinary source field
+Format-v6 postings, points, live/head state, terms, doc values, vectors,
+partition roots, and pack envelopes use explicit Keldra codecs matched to their
+native access patterns. An index never stores a second copy of an ordinary source field
 merely to return it in a hit; a client retrieves the authoritative object
-through `GetObject` or `BatchGet`. The engine defines a generation-pinned scan
+through `GetObject` or `BatchGet`. The engine defines a root-vector-pinned scan
 contract so a future SQL gateway can push predicates, ordering, aggregation,
 and limits into the same authorized native planner rather than bypassing it.
 
-The release containing format v4 should be `0.9.0`, because the durable index
-format and execution engine are intentionally incompatible with `0.8.x`.
+All physical producers and readers use only format v6. It replaces v4/v5 index
+persistence in full; the older namespaces, codecs, manifests, component streams,
+and currents are never read, migrated, converted, dual-written, or used as
+fallback. Fresh clusters rebuild v6 from source authority.
 
 ## 2. Motivation
 
@@ -122,7 +130,7 @@ query engine must be designed together.
 
 ## 3. Goals
 
-Format v4 must:
+Format v6 must:
 
 - make conjunctions use every useful predicate rather than one chosen driver;
 - make iterator advancement and block skipping the normal execution path;
@@ -131,10 +139,11 @@ Format v4 must:
 - make continuation tokens seek before candidate decoding;
 - make result ordering use typed doc values or a declared physical order
   without loading ordinary payloads;
-- bound query, build, merge, cache, and authorization memory;
+- bound query, projection, merge, cache, and authorization memory;
 - retain complete source-journal, atomic-program, publication, durability,
   Zanzibar, and backpressure guarantees;
-- support all eight public index kinds through one common segment foundation;
+- support Typed JSON through the common partition segment foundation and admit
+  each other public kind only after it uses that same foundation;
 - keep authoritative artifacts in the ordinary inline or erasure-coded object
   path;
 - make every persistent codec portable across AMD64 and ARM64 and independent
@@ -155,14 +164,18 @@ This RFC does not add:
 - an approximate-nearest-neighbour graph;
 - mesh or cross-region coordination;
 - automatic inference of a permanent public SQL schema from arbitrary JSON;
-- a format-v3 compatibility path; or
+- an older-format compatibility path; or
 - changes to opaque object, S3, Git, PersonalDB, or atomic-program payloads.
 
 ## 5. Terms
 
-**Generation** is the immutable, source-complete view selected by one
-compare-and-swap current pointer. It pins a definition version, schema
-fingerprint, source barrier, segment set, and live-document view.
+**Partition root** is one immutable, source-complete view for an assigned source
+partition. One partition-local compare-and-swap pointer selects it and binds its
+placement epoch, catalog generation, source checkpoint, segment set, and
+head/live state.
+
+**Root vector** is the query-pinned set of compatible partition roots which
+satisfies one authorized logical definition.
 
 **Segment core** is an immutable collection of documents built or merged
 together. Its document identifiers, term ordinals, block locations, and
@@ -171,19 +184,22 @@ statistics are private to that segment.
 **DocId** is a dense `u32` ordinal local to one segment core. It is never an
 object identity and never appears in a public response or continuation token.
 
-**Stable object identity** is the exact `(path, object_version)` inside one
-stable numeric tenant and bucket scope.
+**Stable object identity** is the canonical path/record identity inside one
+stable numeric tenant, bucket, source scope, and partition. Its current object
+version is held in root-bound head state rather than embedded into reusable
+posting identity.
 
 **Stable document identity** is the total internal identity
-`(result_path, result_version, source_path, source_version, source_record)`.
+`(result_path, source_path, source_record)` within its physical source scope.
 Ordinary one-document objects normally have the same source and result
 identity with source record zero. Git Source and Tensor manifests may project
 several documents which intentionally share one result object; their source
 identity and deterministic `u32` record ordinal make those documents distinct.
-This identity survives compaction and is used only for total ordering and
-pagination. It is not a DocId and does not widen the public result identity.
+This identity survives updates and compaction. Root-bound head state maps it to
+the exact current result/source versions used for results and pagination. It is
+not a DocId and does not widen the public result identity.
 
-**Live-document view** is the generation-selected bitmap which says which
+**Live-document view** is the root-selected state which says which
 DocIds in one segment still represent current visible object heads.
 
 **Term dictionary** maps a canonical field/value term to posting metadata and
@@ -214,6 +230,11 @@ contiguous file; a query merges their ordered iterators.
 **Scan batch** is a bounded internal batch of selected logical columns and
 stable object identities. It is an Keldra-owned type.
 
+**Prepared row** is a disposable, byte-accounted in-memory projection of only
+the indexed fields needed by active physical recipes. It is normally derived
+from already resident committed request bytes and reconstructed from the source
+journal after overflow or restart.
+
 ## 6. Required invariants
 
 1. Ordinary objects remain the sole source of truth. Index artifacts are
@@ -223,27 +244,29 @@ stable object identities. It is an Keldra-owned type.
 3. Reaching a configured journal entry or byte capacity applies admission
    backpressure before a new source-producing mutation. Required index evidence
    is never truncated or sampled.
-4. Every published generation represents a complete membership, source, and
-   atomic-program barrier. A partially built segment is never queryable.
-5. One generation-pointer CAS is the only publication point. No segment or
-   live-mask block becomes visible independently.
+4. Every published partition root represents a complete membership, source,
+   and atomic-program barrier for that partition. A partially built segment is
+   never queryable.
+5. One partition-current CAS is the only publication point for that partition.
+   No segment or live/head block becomes visible independently, and no global
+   manifest CAS is required for a normal flush.
 6. Every durable index artifact is an ordinary Keldra object and reaches the
    required artifact durability before publication.
 7. Raft contains no definition, source event, segment, posting, point, doc
-   value, live mask, manifest, cursor, query state, or cache entry.
-8. Weighted HRW chooses up to three query owners. Rank zero builds and
-   publishes; any public node may proxy a query to an owner. Query execution
-   never scatters across owners.
+   value, live mask, partition root, cursor, query state, or cache entry.
+8. Placement assigns source partitions to producer nodes under an exact epoch.
+   Every data node can produce its assigned partitions. Query placement and
+   proxying remain independently authorized and may materialize a compatible
+   vector of partition roots.
 9. Query correctness is independent of cache contents. Cache data, mmap views,
-   decoded blocks, scratch files, assignment projections, and builders are
-   disposable.
-10. A segment DocId is meaningful only with its segment identity and generation
+   decoded blocks, scratch files, assignment projections, prepared rows, and
+   accumulators are disposable.
+10. A segment DocId is meaningful only with its segment identity and root
     schema. A merge assigns new DocIds.
 11. Every exact predicate is evaluated exactly. A cost estimate may change
     execution order but cannot remove a predicate or weaken it to sampling.
-12. Current-version and delete filtering uses the generation-pinned live view,
-    a disposable post-barrier invalidation overlay, and bounded-batch
-    exact-current validation. A physically ordered scan validates only
+12. Current-version and delete filtering uses root-pinned head/live state and
+    bounded-batch exact-current validation. A physically ordered scan validates only
     selected/refill hits; arbitrary top-K may have to validate every exact
     Boolean match before heap admission, but never as serialized point reads.
 13. A matching physical-order continuation seeks before predicate and doc-value
@@ -254,12 +277,14 @@ stable object identities. It is an Keldra-owned type.
     the ordinary object API when they require its payload.
 15. Authentication failure never degrades to anonymous access. Public reads
     still require the explicit Zanzibar public-read grant.
-16. CPU-heavy build, merge, decoding, scoring, and collection do not run on or
+16. CPU-heavy projection, merge, decoding, scoring, and collection do not run on or
     block the serving-fence and membership executor.
-17. Startup work is proportional to this node's assigned definitions and
-    retained cursors, never to all ordinary object heads, blobs, or cache files.
-18. Builder, compaction, and query working memory is charged before use to one
-    hard process-wide ceiling. Query and per-index-kind settings are fair-share
+17. Startup work is proportional to this node's assigned source partitions,
+    catalog pages, and uncheckpointed journal suffix, never to logical
+    definition count, all ordinary object heads, blobs, or cache files.
+18. Extraction, preparation, segment production, compaction, and query working
+    memory is charged before use to one
+    hard process-wide ceiling. Query and indexing-stage settings are fair-share
     planning targets: work may borrow currently idle capacity, but it cannot
     bypass queued mandatory work or exceed the aggregate ceiling. Parallelism
     cannot multiply the admitted grant silently.
@@ -271,6 +296,8 @@ stable object identities. It is an Keldra-owned type.
 21. Async lane orchestration never occupies a Rayon worker. Every Rayon task is
     a finite leaf CPU chunk and may not synchronously wait for another task,
     channel, future, or permit whose progress depends on the same pool.
+22. Every advertised index kind uses the partition-owned memory-first producer.
+    An unported kind is unsupported; no legacy builder is retained as fallback.
 
 ## 7. Retained coordination and authority
 
@@ -298,17 +325,32 @@ work.
 
 ### 7.2 Placement
 
-For stable `(tenant_id, bucket_id, definition_id)`, weighted HRW over committed
-ACTIVE membership chooses up to three owners:
+Placement assigns existing source partitions to ACTIVE data nodes. Every data
+node runs the same producer for its assigned partitions; no node is elected as
+a builder for a logical definition. A committed placement epoch fences
+publication, so a former owner cannot advance a partition root after handoff.
 
-- rank zero is the only builder and publisher;
-- ranks one and two materialize published artifacts for query service and are
-  candidates for builder failover; and
-- any public ingress node proxies a query to an available owner.
+An ACTIVE source produces its own immutable `SourceId { source_node,
+source_epoch }`. After source-node removal, rank ACTIVE nodes with the existing
+capacity-weighted `FutureIndex` HRW function over the domain-separated key
+`keldra/v6/source-producer/v1 || tenant_id || bucket_id || source_node ||
+source_epoch`; rank zero is the replacement producer. Definitions and families
+are excluded from that key, ensuring one locality-preserving source assignment
+and one deterministic handoff for all shared physical families.
 
-Assignments are disposable local projections and are not recorded in Raft. A
-membership fence prevents an old rank-zero builder from winning publication
-after ownership changes.
+Query ownership and proxying are separate from production ownership. A query
+node discovers and pins the authorized vector of current partition roots and
+may cache their immutable artifacts. Query placement cannot grant publication
+authority or make local cache state authoritative.
+
+A small durable family partition directory names active and retiring partition
+incarnations across membership changes. On handoff it retains the predecessor
+root until the replacement root proves equivalent-or-later coverage and one
+directory CAS records retirement. The directory changes only for partition
+creation, handoff, split/merge, or retirement; it is not on the segment-flush
+path. Its partition identity is family plus source-partition incarnation, never
+catalog generation. The root/current binds the catalog generation and placement
+epoch, so the directory remains at one stable family path across transitions.
 
 ### 7.3 Source journal, retention, and backpressure
 
@@ -329,29 +371,21 @@ receive `RESUME_EXPIRED` and recover through ordinary read/list APIs. This does
 not weaken internal index retention, which is released only by complete
 published barriers.
 
-The index manager on each builder node demultiplexes assigned work without
-multiplying a source scan by the number of buckets. For each retained source
-interval it chooses the cheaper bounded access plan: seek the sparse routes for
-the buckets for which this node owns rank-zero definitions, or read that source
-interval once and filter stable bucket IDs through a disposable assignment map.
-It never reads the same retained interval once per assigned bucket. Work is
-therefore bounded by the cheaper of assigned-bucket route probes and retained
-source records, plus the matching routed records themselves. A node with no
-rank-zero assignment for that source performs neither scan. Only a matched
-bucket causes definition resolution or payload projection.
+One ordered journal consumer per source partition remains the checkpoint
+authority. After commit, already-resident request bytes may enter a bounded FIFO
+cache keyed by exact source identity/version and CPU preparation may complete
+out of order. When the journal consumer reaches that mutation, it takes the
+prepared row or resident raw bytes; on cache miss or eviction it exact-loads the
+retained object version. The cache owns no cursor or checkpoint and is not a
+second authoritative work queue.
 
-The manager advances one aggregate index-consumer checkpoint per source only
-after every affected rank-zero definition has published a complete barrier.
-The durable checkpoint set is bounded by source, consumer kind, membership
-fence, and ACTIVE consumer node, not by definitions, buckets, or objects.
-Rank-one and rank-two query owners do not pin source history because they
-consume the rank-zero builder's published generation.
-
-A membership cutover fences the old checkpoint set. A new responsible builder
-recovers every assigned definition's published barrier before its aggregate
-checkpoint can release history; a removed node ceases to pin only after the
-committed cutover. Malformed, future-fence, future-offset, unavailable-epoch,
-or below-floor evidence fails closed and cannot authorize pruning.
+The producer advances one checkpoint per physical source partition only after
+the selected durable partition root represents every relevant mutation through
+that position. Checkpoints are bounded by physical source partitions and
+placement epochs, not definitions or query owners. A placement cutover fences
+the old owner; the new owner resumes from the selected root. Malformed,
+future-epoch, future-offset, unavailable-epoch, or below-floor evidence fails
+closed and cannot authorize pruning.
 
 Receipt retention duration and receipt/journal entry and logical-byte caps are
 non-zero startup configuration:
@@ -375,9 +409,9 @@ delta, journal event, or route. Unexpired receipt guarantees are never shortened
 to admit more work.
 
 Publication-progress debt is available only for the exact encoded entries and
-bytes needed to finish an already constructed, source-complete index generation
+bytes needed to finish an already constructed, source-complete partition root
 or a complete accounting rollup. Eligible writes are limited to the immutable
-packs, segments, manifest, current pointer, or rollup object which complete that
+packs, segments, root, current pointer, or rollup object which complete that
 specific publication. It excludes client writes, unrelated internal objects,
 source snapshots, rebuild initiation, compaction, cache population, and
 speculative work.
@@ -386,13 +420,13 @@ Every debt entry is appended through the normal journal path. Failed or
 incomplete publication leaves that evidence retained and cannot manufacture a
 prune proof; retry or recovery completes from ordinary artifacts and retained
 source evidence. While any debt is non-zero, ordinary source-producing writes
-remain backpressured. Only the successful generation-current or rollup CAS
+remain backpressured. Only the successful partition-current or rollup CAS
 advances the consumer cursor, permits safe pruning, and repays the debt. No
 event is dropped and the exception cannot become a general reserve capacity.
 
 Source lag never silently selects a rebuild. A missing required journal suffix
-fails that definition closed until an authorized principal requests a rebuild
-or repairs/deletes the definition.
+fails every affected binding closed until an authorized principal requests a
+physical rebuild or repairs/deletes the affected definitions.
 
 ### 7.4 Explicit rebuild
 
@@ -447,16 +481,12 @@ barrier. Keldra adds no global traffic log or per-bucket Raft record.
 ## 8. Public contract
 
 The public `IndexService` retains create, update, get, list, rebuild, delete,
-and query operations for these eight kinds:
-
-1. Path;
-2. Metadata Filter;
-3. Typed JSON;
-4. Full Text;
-5. Vector;
-6. Hybrid;
-7. Git Source; and
-8. Tensor.
+and query operations. In this clean-break milestone, definition admission and
+query execution support Typed JSON only. Requests for Path, Metadata Filter,
+Full Text, Vector, Hybrid, Git Source, or Tensor fail explicitly as unsupported
+before creating catalog, routing, checkpoint, or physical state. Each kind may
+return only after it uses the same partition-owned memory-first production,
+publication, recovery, and retention architecture.
 
 The plural noun in the public contract is **indices**. The list operation is
 `ListIndices(ListIndicesRequest) -> ListIndicesResponse`, and its repeated
@@ -712,7 +742,7 @@ raw gRPC clients are always possible.
 
 Query predicates remain equality, membership, prefix, less-than,
 less-than-or-equal, greater-than, greater-than-or-equal, existence, and the
-existing full-text operations. Query limits, generation freshness evidence,
+existing full-text operations. Query limits, root-vector freshness evidence,
 facets, aggregates, and opaque page tokens are public concepts. Query admission
 maps every requested operator to its required capability and rejects a mismatch
 before opening an artifact:
@@ -729,10 +759,11 @@ EXISTS       -> any declared capability
 ```
 
 Physical order is definition-versioned. Adding, removing, or changing it
-requires a new complete generation. Physical-order fields must be
-single-valued and have `ORDER`. A builder fails a candidate generation with a
-precise definition/data error if a field declared single-valued produces
-multiple values; the previous complete generation remains published.
+requires new complete partition roots. Physical-order fields must be
+single-valued and have `ORDER`. The partition producer fails the affected
+catalog generation with a precise definition/data error if a field declared
+single-valued produces multiple values; the previous complete roots remain
+published.
 
 A query matches the physical order only when its complete explicit field and
 direction list exactly equals the definition's declaration; both then append
@@ -743,7 +774,7 @@ the arbitrary top-K path.
 
 Each field has one declared logical type, so there is no cross-type tagged
 order. Numbers compare numerically, keywords use unsigned UTF-8 byte order, and
-locale collation is outside format v4. `NaN`, infinity, or an out-of-domain JSON
+locale collation is outside format v6. `NaN`, infinity, or an out-of-domain JSON
 number is a projection error. Missing and explicit JSON `null` remain distinct;
 missing sorts last ascending and first descending. The stable document identity
 is the final ascending tie-break in every physical or query order. Descending
@@ -758,7 +789,7 @@ definition for recurring sparse ordered queries.
 ### 8.5 Value-size contract
 
 The 512 KiB component ceiling is a block bound, not a scalar-size promise.
-Format v4 adopts Lucene's 32,766-byte maximum for one raw keyword term, one
+Format v6 adopts Lucene's 32,766-byte maximum for one raw keyword term, one
 sorted or sorted-set keyword doc value, and one analyzed token. This raises the
 current approximately 4 KiB raw term ceiling while deliberately lowering the
 accidental near-component-sized generic-column value ceiling. Numeric and Boolean
@@ -788,66 +819,73 @@ their explicit result structures; clients retrieve ordinary source data with
 No segment DocId, field ordinal, block address, or implementation structure is
 added to the public API.
 
-## 9. Format-v4 artifact envelope
+## 9. Format-v6 partition artifacts
 
 ### 9.1 Reserved namespace
 
-Format v4 uses only these canonical reserved object paths:
+Format v6 uses only these canonical reserved object path shapes:
 
 ```text
-_keldra/indices/v4/definitions/<index_name>
-_keldra/indices/v4/<index_id>/artifacts/<blake3_hex>
-_keldra/indices/v4/<index_id>/manifests/<blake3_hex>
-_keldra/indices/v4/<index_id>/current
+_keldra/index-projections/v6/<family>/artifacts/packs/<hash>
+_keldra/index-projections/v6/<family>/artifacts/stream-pages/<hash>
+_keldra/index-projections/v6/<family>/artifacts/component-pages/<hash>
+_keldra/index-projections/v6/<family>/artifacts/query-run-packs/<hash>
+_keldra/index-projections/v6/<family>/artifacts/query-run-stream-pages/<hash>
+_keldra/index-projections/v6/<family>/artifacts/generations/<hash>
+_keldra/index-projections/v6/<family>/partitions/<source_node>/<source_epoch>/<producer_node>/<term>/<index>/current
+_keldra/index-projections/v6/<family>/partitions
+_keldra/index-projections/v6/<family>/catalogs/<catalog>/activation
 ```
 
-Definition names remain one validated path segment. Numeric index IDs use their
-canonical decimal spelling without leading zeroes. Digests are exactly 64
-lower-case hexadecimal characters. Path parsers match the complete segment
-shape; textual prefix matching cannot widen retention, authorization, or delete
-scope.
+Family hashes are complete canonical 256-bit lower-case hexadecimal identities.
+The partition identity is the exact immutable source node and source epoch,
+current producer node, placement term, and placement index; it deliberately
+excludes catalog generation. `current` binds the selected root, its catalog
+generation, revision, and placement epoch.
+Catalog and content digests are exactly 64 lower-case hexadecimal characters.
+Numeric fields use canonical decimal spelling without leading zeroes. Path
+parsers match the complete shape; textual prefix matching cannot widen
+retention, authorization, or deletion.
 
-Component packs, segment roots, live-mask roots/blocks, locator roots/blocks,
-scoring-stat roots/blocks, and other immutable descendants use the `artifacts`
-form and their complete object payload digest. A generation manifest uses the
-`manifests` form. The mutable `current` object is the sole publication point.
+Packs and directory pages use their complete payload digest. The family-scoped
+`artifacts` classes store immutable content-addressed packs, pages, and
+partition projection roots; **partition root** is the architectural term even
+though the internal codec/path class retains the short `generations` noun. The
+partition-local `current` object is the sole publication point for that
+partition incarnation. A catalog transition therefore reuses compatible bytes
+without copying them merely to place them under a new generation.
 
-A format-v4 process discovers only v4 definitions. The release starts from new
-volumes and definitions are recreated through the public API. It does not scan,
-interpret, convert, delete, or treat `_keldra/indices/v3/` objects as definitions
-or artifacts.
+The stable family `partitions` object is the small exact-CAS lifecycle map
+described in Sections 7.2 and 9.5. The catalog-generation `activation` object
+makes that catalog generation queryable only after all required partition roots
+are ready.
+There is no separately mutable checkpoint object: the selected immutable
+partition root carries the only retention-authoritative source and atomic
+checkpoints. Segment artifacts are reachable only through a selected or
+retained root.
+
+A format-v6 process discovers only v6 catalog and projection state. The release
+starts from fresh volumes and definitions are recreated through the public API.
+It does not scan, interpret, convert, delete, or treat any v3/v4/v5 index object
+as a definition, artifact, root, or checkpoint.
 
 Every path segment exactly equal to `_keldra` is reserved. Source events for
 reserved objects continue to participate in ordinary durability, reference,
 retention, and accounting machinery, but no index definition may project them
 as user documents. This rule applies even to a whole-bucket definition and
-prevents definitions, artifacts, manifests, and current pointers from
+prevents definitions, artifacts, roots, and current pointers from
 recursively indexing themselves.
 
-### 9.2 Component envelope
+### 9.2 Portable codec envelopes
 
-Every format-v4 component uses an explicit portable envelope:
-
-```text
-magic              [8]byte = "ANVLIDX4"
-component_kind     u16 little-endian
-codec_version      u16 little-endian
-flags              u32 little-endian
-index_id           u64 little-endian
-definition_version u64 little-endian
-schema_fingerprint [32]byte
-segment_id         u64 little-endian
-logical_length     u64 little-endian
-encoded_length     u64 little-endian
-payload_checksum   [32]byte BLAKE3
-payload            [encoded_length]byte
-```
-
-The exact fixed header is shared by term, posting, point, doc-value, position,
-norm, vector, live-mask, and path-locator components. A
-component-specific payload has its own explicit bounds and codec version.
-Readers validate the fixed header, checked lengths, declared upper bounds, and
-checksum before allocating or decoding.
+Format v6 uses distinct explicit codecs for delta segments, stream pages,
+component directories, partition roots/currents, family directories, and
+catalog activation. Each codec starts with its own eight-byte v6 magic and
+version (`K6DELTA1`, `K6CSTR01`, `K6CDIR01`, `K6PGEN01`, `K6PCUR01`,
+`K6FDIR01`, or `K6CACT01`). Its checked body binds the applicable complete
+partition/catalog/recipe identities, lengths, counts, source barrier, hashes,
+and byte accounting. Readers validate identity, bounds, checked arithmetic,
+structural ordering, and checksums before allocating or exposing state.
 
 Logical components are packed into immutable ordinary Keldra objects. Packing is
 segment-scoped rather than component-stream-scoped: leaves, routing nodes, and
@@ -863,16 +901,17 @@ component locations before the enclosing packs are sealed and durably
 published; otherwise every stream tail would have to become a separate object
 before its routing parent could be encoded.
 
-After the complete segment or standalone locator tree is encoded, the builder
+After the complete segment or standalone locator tree is encoded, the partition
+producer
 seals its packs in ordinal order and publishes them through the ordinary
 grouped object-publication path. Its pack table then maps every ordinal to the
 canonical reserved object address, exact object version, content hash, and
 object length. The table is carried by the segment descriptor or standalone
-locator root in the generation manifest. Pack ordinals are meaningful only
+locator root in the partition root. Pack ordinals are meaningful only
 with that exact segment identity and table. They are never global identifiers,
 Raft state, mutable names, or another storage plane.
 
-Readers validate the ordinal and component range against the generation-bound
+Readers validate the ordinal and component range against the root-bound
 pack table before resolving the ordinary object. The address and version retain
 and resolve that object; the content hash provides integrity and ordinary
 payload deduplication but is not by itself an object reference. The existing
@@ -881,7 +920,7 @@ local cache files. A cache never changes authoritative bytes.
 
 ### 9.3 Fixed format bounds
 
-Format v4 retains these proven portable bounds:
+Format v6 retains these proven portable bounds:
 
 - one encoded logical component block, including its envelope, is at most
   512 KiB;
@@ -906,23 +945,20 @@ unvalidated value. These limits are format constants, not startup settings.
 
 ### 9.4 Schema fingerprint
 
-KELDRA-0020 supersedes the definition-local identity described below. In the
-shared-projection format, fields are ordered and assigned dense physical IDs by
+In format v6, fields are ordered and assigned dense physical IDs by
 canonical field-recipe identity; public names and declaration order belong to
 the logical binding and are not physical fingerprint inputs. Path/content-type
 membership, source selectors, value semantics, capabilities, physical order,
 and component codec versions remain fingerprint inputs. This preserves the
-fail-closed format-v4 validation contract while allowing differently named
+fail-closed validation contract while allowing differently named
 logical definitions to read the same compatible physical segment.
 
-The following list records the original definition-owned format-v4 contract.
-
 The schema fingerprint is BLAKE3 with domain separator
-`keldra.index.schema.v4`. Its input is one explicit length-prefixed canonical
+`keldra.index.recipe.v6`. Its input is one explicit length-prefixed canonical
 binary encoding in this order:
 
 1. index kind, path prefix, and content-type scope;
-2. every field in canonical definition order, including FieldId, public name,
+2. every physical field recipe in canonical recipe order, including FieldId,
    source selector, logical type, cardinality, null/missing policy, collation,
    declared capabilities, and compiled components;
 3. tokenizer/analyzer and full-text scoring semantics where applicable;
@@ -936,50 +972,29 @@ Integers use fixed-width little-endian encoding, enums use documented Keldra
 tags, strings and byte fields use a `u32` byte length followed by exact bytes,
 and lists use a `u32` count. Protobuf wire bytes, JSON serialization, map
 iteration order, and observed segment statistics are not fingerprint inputs.
-Any result-affecting definition or codec change therefore creates another
-fingerprint and cannot merge with old segments. A rebuild which changes only
-the definition object version may retain the same fingerprint; definition
-version remains a separate merge-identity field.
+Any result-affecting recipe or codec change therefore creates another
+fingerprint and cannot compact with incompatible segments. Public names and
+logical definition versions are binding state and are not fingerprint inputs.
 
-### 9.5 Generation manifest and durability
+### 9.5 Partition root and durability
 
-The generation manifest is one ordinary immutable Keldra object, not a logical
-index component. It therefore has no 512 KiB component-block ceiling. Small
-manifests use the ordinary inline path and larger manifests use the same
-complete-replica or erasure-coded payload placement as every other object. The
-manifest codec has its own magic, version, exact payload length, checked
-collection counts, and structural validation.
+KELDRA-0016 replaces definition-owned generation manifests with immutable
+partition projection roots. A root binds one physical family/source partition,
+placement epoch, catalog generation, complete source/atomic checkpoints,
+bounded segment and head-delta directories, statistics, and byte accounting.
+Directory pages are bounded fanout, so root size does not grow as one flat
+segment list.
 
-The ordinary object `BlobRef` is the manifest's sole content checksum. Keldra
-hashes the bytes when staging the content-addressed object and verifies that
-identity when reading a complete replica or reconstructing erasure shards. The
-manifest does not nest a second checksum over the same bytes, and callers do
-not rehash a payload already verified by the ordinary object reader. This does
-not weaken packed components: their individual checksums remain necessary
-because a query may range-read one component without reading its complete
-ordinary pack object.
+The ordinary object `BlobRef` is the root's content checksum. Component
+checksums remain necessary because readers may range-read one component without
+opening its complete pack.
 
-The generation manifest contains:
+Segment identity is allocated by the partition producer without a registry,
+Raft entry, or managed counter. Retention is represented by a bounded set of
+partition roots; roots do not form an unbounded history required by readers.
 
-- definition identity and version;
-- format version and schema fingerprint;
-- complete source and atomic-program barrier;
-- physical-order declaration, if any;
-- ordered segment descriptors;
-- each segment's canonical ordinal-to-ordinary-object pack table;
-- each segment's live-view root;
-- path-locator roots used by the builder, including a pack table when the root
-  is not owned by a segment descriptor;
-- per-segment statistics;
-- artifact encoded and logical byte totals.
-
-The segment ID is a normal cluster-unique Snowflake ID allocated by the builder.
-It needs no registry, Raft entry, or managed counter. Generation retention is
-represented by the bounded set of retained generation roots; manifests do not
-form an unbounded predecessor chain.
-
-The manifest and every referenced ordinary artifact request `REPLICATED`
-acknowledgement before the generation current pointer can advance whenever the
+The root and every referenced ordinary artifact request `REPLICATED`
+acknowledgement before the partition current pointer can advance whenever the
 ACTIVE topology has at least two nodes. On a one-node topology, publication
 uses the ordinary `LOCAL` acknowledgement threshold: the node durably stores a
 complete replica and the object remains subject to normal placement and online
@@ -990,72 +1005,71 @@ An undersized one- or two-node cluster stores complete object replicas; once
 the fixed cluster erasure profile is satisfiable, normal object placement uses
 that profile without changing the index format. Artifact publication cannot
 point at process staging bytes or a coordinator-only preparation file.
-The current-pointer CAS itself uses the same topology-aware acknowledgement
+The partition-current CAS itself uses the same topology-aware acknowledgement
 threshold as the immutable artifacts it publishes.
 
-All packs produced by one completed segment or standalone locator build are
+All packs produced by one completed segment are
 staged before their metadata publication and are submitted through the existing
 bounded grouped publication path. Grouping changes physical RocksDB and network
 work only: each pack remains an independently content-addressed ordinary object
 with its normal durability, reference counting, placement, and authorization
-semantics. The generation manifest is not published until every pack outcome
+semantics. The partition root is not published until every pack outcome
 has been resolved into its canonical pack table.
 
-### 9.6 Generation retention
+### 9.6 Partition-root retention
 
-The mutable current pointer contains the current manifest reference and a
-bounded ordered set of retained manifest references. Retained generation count
-has a format maximum of 64. The defaults retain at most three generations, at
-most 24 hours, and at most 50 GiB of authoritative generation bytes per index.
-The first exceeded count, age, or byte bound makes the oldest non-current
-generation eligible after the minimum in-flight query safety age.
+The mutable partition current pointer contains the current root reference and a
+bounded ordered set of retained root references. Retained root count has a
+format maximum of 64. Defaults retain at most three roots, at most 24 hours, and
+at most 50 GiB of authoritative derived bytes per physical partition family.
+The first exceeded count, age, or byte bound makes the oldest non-current root
+eligible after the minimum in-flight query safety age.
 
 The byte bound counts each distinct ordinary artifact object version once
-across the retained set, so immutable components shared by generations are not
+across the retained set, so immutable components shared by roots are not
 double charged.
 
-Dropping a retained reference makes that generation's manifest and
-generation-owned artifacts eligible for ordinary reference-counted deletion
-and GC. Maintenance is scoped to due v4 index paths and uses bounded record,
+Dropping a retained reference makes that root and its uniquely owned artifacts
+eligible for ordinary reference-counted deletion
+and GC. Maintenance is scoped to due v6 partition paths and uses bounded record,
 byte, and time budgets with a resumable local cursor; it never scans all object
-heads. Manifests do not form an unbounded predecessor chain. A continuation for
-a generation absent from the bounded current pointer fails with the existing
-generation-no-longer-available result.
+heads. Roots do not form an unbounded predecessor chain. A continuation for a
+root absent from the bounded current pointer fails with an explicit
+root-vector-no-longer-available result.
 
-Each builder node keeps a sparse durable due index in the existing definition
-state column family. One primary record per assigned index identifies the exact
-definition/current version and reason; one time-ordered secondary key makes the
-oldest due work seekable. Updating or completing work atomically replaces or
-removes both keys. Only the currently executing bounded job is resident in
-memory, and its due record remains until exact completion, so delayed work does
-not consume an active-job slot and a crash can resume it without an inventory.
+The bounded retained set is not merely a recency cache. It retains every exact
+predecessor root/page/pack required by an active catalog activation, handoff,
+pinned query/continuation, or an eligible common atomic cut. A query first
+chooses a common finalized `through_atomic_position` across partition roots and
+walks predecessor roots for partitions already ahead of that cut. GC may release
+only roots that cannot participate in any such vector.
 
-Deleting a definition installs a `deleted_definition` due record before its
-delivery checkpoint advances. Cleanup exact-validates the tombstone and HRW
-fence, then scans only `_keldra/indices/v4/<index_id>/` under the normal safety
-age and exact-version deletion rules. It never deletes the ordinary definition
-tombstone and never touches another index in the bucket.
+There is no durable builder due index, definition job, lease, or per-definition
+cleanup task. Partition producers resume from selected root checkpoints.
+Removing the last logical recipe reference records catalog retirement;
+partition-local maintenance releases unreachable recipe/root artifacts after
+query leases and safety age expire.
 
 ## 10. Schema and field identity
 
-KELDRA-0020 replaces the definition-local ownership in this section. Public
-field names and IDs remain definition-local query bindings. Physical FieldIds
-are dense IDs assigned from canonical field-recipe order within the exact
-physical schema, and the physical projection identity—not a logical index
-ID—owns segments and generations. Two logical definitions may therefore bind
-different public names to one physical field recipe. Component-level sharing
-between field subsets requires the projection-generation format described by
-KELDRA-0020 and is not implied merely by matching one FieldId.
+Public field names and IDs remain definition-local query bindings. Physical
+FieldIds are dense IDs assigned from canonical field-recipe order within a
+projection family; the family and source partition own segments and roots. Two
+logical definitions may bind different public names to one physical field
+recipe. No global field registry, managed counter, or mutable name-to-ID
+authority is introduced.
 
-The paragraphs below describe the superseded definition-owned identity model.
+A result-affecting semantic change creates a different physical recipe. A
+definition-only metadata change may reuse the same recipe. Segments compact
+only when their exact physical family, catalog generation, recipe identities,
+and codec semantics are compatible.
 
-Each definition version has one canonical field catalogue. A field receives a
-dense definition-local `u32 FieldId` from canonical specification order. There
-is no global field registry, managed counter, or mutable name-to-ID authority.
-A semantically changed definition has a new schema fingerprint and builds new
-segments. A rebuild may create a new definition version without changing that
-fingerprint. Segments merge only when the exact `(index_id,
-definition_version, schema_fingerprint)` tuple matches.
+Packs, immutable directory pages, segments, head deltas, and roots are
+family-scoped content-addressed artifacts. A catalog transition reuses every
+compatible old recipe root, backfills only genuinely new recipes, then performs
+exact-coverage activation. It never clones old physical bytes solely because a
+logical binding or catalog generation changed; only the partition `current`
+pointer is incarnation-scoped.
 
 For each field, the catalogue records:
 
@@ -1092,8 +1106,8 @@ counts are segment statistics. They never alter the definition schema or its
 fingerprint as new objects arrive.
 
 One complete segment-statistics record must fit one checked 512 KiB component.
-Definition admission computes its exact schema-weighted worst-case encoding
-before allocating builder state and rejects a larger definition with the
+Catalog admission computes its exact recipe-weighted worst-case encoding before
+allocating accumulator state and rejects a larger physical recipe set with the
 required and supported byte counts. The bound admits at least 1,702 fields with
 every currently supported field component and up to 5,088 minimal fields. A
 larger real requirement needs a separately designed routed statistics codec;
@@ -1104,10 +1118,31 @@ third-party enum discriminants.
 
 ## 11. Segment identity and liveness
 
+### 11.0 Query-ready projection runs
+
+The unit made visible by a partition flush is a `ProjectionQueryRun`, not a
+document-key field-state run. One immutable run belongs to exactly one physical
+family and source-partition and records one contiguous source/atomic cut. It
+contains the stable-key/material-version/live gate and, for every declared
+physical recipe, exactly the query structures that capability requires:
+
+- seekable exact/text term dictionaries, advanceable postings, and positions
+  where declared;
+- typed numeric/date point structures;
+- declared order, facet, and aggregate doc values; and
+- membership/existence and optional physical-order structures.
+
+Material changes create sparse L0 runs with removal or tombstone evidence for
+old material and additions for new material. Projection-preserving updates add
+only a head delta. Field-state deltas are preparation state used to compare and
+route projected values; they are never a reader input, are never broadly scanned
+to discover candidates, and cannot be retained as a fallback query format.
+Every run named by a root is durable at that root's exact source/atomic cut.
+
 ### 11.1 Segment-local DocIds
 
-A builder orders one segment's accepted projected documents deterministically
-and assigns dense DocIds from zero. All segment components use those DocIds:
+A partition producer orders one segment's accepted projected documents
+deterministically and assigns dense DocIds from zero. All segment components use those DocIds:
 postings, points, doc values, full-text positions and norms, vectors, and live
 masks.
 
@@ -1116,43 +1151,35 @@ public result's `(path, object_version)` is reconstructed from its result
 identity only for selected hits. Source identity and record ordinal remain
 internal cursor tie-break data.
 
-A segment core never changes. A merge writes a new core and new DocIds, then a
-new generation atomically replaces the old segment set.
+A segment core never changes. Compaction writes a new core and new DocIds, then
+one partition-root CAS atomically replaces the old segment set.
 
 ### 11.2 Path locator
 
-The builder maintains an immutable, seekable path-locator component mapping the
-current path to either live `(segment_id, DocId, object_version)` or deleted
-`(tombstone_version)`. New generations add locator deltas and bounded merging
-folds them by exact object version. Retaining tombstone version evidence prevents
-a stale or replayed delta from resurrecting an older object. This component lets
-the builder find the predecessor document affected by an update or delete.
+The partition pipeline maintains root-bound stable head state mapping canonical
+source path/record identity to stable document key, exact current source/result
+versions, material version, source position, and live/tombstone state. New roots
+append bounded head deltas and partition-local compaction folds them by source
+order. Retaining exact tombstone evidence prevents stale replay from
+resurrecting an older object.
 
-The ordinary query path does not consult the locator per candidate. It exists
-to construct the next live view and to support exact path-oriented index work.
+The ordinary query path resolves candidate stable keys through the pinned head
+state in bounded batches. That state also supports exact predecessor lookup for
+projection-preserving updates without scanning historical segment streams.
 
 ### 11.3 Live-document views
 
-Each generation references one materialized immutable live bitmap per segment.
-The bitmap is split into fixed DocId-range blocks. Publishing an update rewrites
-only blocks containing changed DocIds and reuses every unchanged block
-descriptor. A new segment begins with its exact initial bitmap; tombstones clear
-the predecessor and do not become query hits.
+Each partition root binds segment-local live views plus newest stable-key head
+state. A new segment begins with its exact initial bitmap. Updates and deletes
+append head/liveness deltas; they do not rewrite an old segment core. A
+projection-preserving update advances only the head's current version while
+retaining its material version, so existing postings remain valid.
 
-This is a mutable liveness API over immutable objects. It avoids both a
-generation-wide dense renumbering and an object-head point read for every
-candidate. Query workers cache live blocks with the same disposable index cache
-used for other components.
-
-Query owners also maintain a disposable post-generation invalidation overlay.
-They consume relevant settled journal routes after the generation barrier, use
-the path locator to map an overwritten or deleted predecessor to its segment
-DocId, and clear that DocId locally. The overlay never adds a new document and
-cannot claim index freshness; it only prevents avoidably stale candidates while
-the next complete generation is building. Losing it costs catch-up work, not
-correctness or source data. Its memory is charged to the query/cache budget; if
-that budget cannot retain it, Keldra drops or partially rebuilds the overlay and
-relies on the mandatory bounded exact-current result check.
+Query workers cache live/head blocks with the same disposable index cache used
+for other components. A candidate is admitted only when pinned head state is
+live and its material version matches the segment entry. A material-changing
+update therefore rejects old postings, while a head-only update substitutes the
+exact newer result identity through unchanged postings.
 
 Before returning results, Keldra exact-reads current heads in bounded multi-get
 batches and removes any object whose exact current version or delete state
@@ -1164,22 +1191,22 @@ exact Boolean match before heap admission because any match may outrank the
 current top K. It may therefore check all matches, but it does so in bounded
 batches and never as one serialized point read per candidate.
 
-This is read-committed index behavior, not snapshot isolation. The pinned
-generation fixes the candidate structures and their order. Exact-current
-validation may remove an object updated or deleted after that generation's
-barrier, while the replacement version does not become a candidate until a
-later complete generation. Freshness evidence tells the caller where that
+This is read-committed index behavior, not snapshot isolation. The pinned root
+vector fixes candidate structures and order. Exact-current validation may
+remove an object updated or deleted after those barriers, while replacement
+material does not become a candidate until a later complete root vector.
+Freshness evidence tells the caller where that
 candidate view ends.
 
-A merge resolves locator deltas and live masks, writes only current live
+A merge resolves head deltas and live masks, writes only current live
 documents into the replacement segment, and publishes a fresh all-live bitmap
-for it. Old cores and masks remain retained while any permitted generation can
+for it. Old cores and masks remain retained while any pinned root can
 reference them, then ordinary object reference counting and GC reclaim them.
 
-Atomic-program changes are projected as one source group. The generation CAS
-publishes all affected segment and live-mask changes together, so an index
-cannot expose only part of an atomic program whose ordinary results are not
-partially visible.
+Atomic-program changes are projected as one indivisible source group. Each
+affected partition root publishes its complete routed group before freshness
+can cover the atomic cursor, so an index cannot expose only part of an atomic
+program whose ordinary results are not partially visible.
 
 ## 12. Common segment components
 
@@ -1302,15 +1329,15 @@ Multi-valued text analyzes every value and inserts a position gap between
 values, so a phrase never matches across two array elements.
 
 At query admission, BM25 aggregates document, field-length, and term-frequency
-statistics from the bounded segment set of the pinned generation. Segment
+statistics from the bounded segment set of the pinned root vector. Segment
 statistics may conservatively include documents cleared by a later live mask
 until those segments merge, matching the practical immutable-segment tradeoff:
 exact match membership remains unchanged, while a newly published merged
-generation may have slightly different scores and score order. A page token
-continues on its retained generation, so ranking cannot change within one
+root vector may have slightly different scores and score order. A page token
+continues on its retained root vector, so ranking cannot change within one
 pagination sequence.
 
-Keldra does not add a generation-global term-stat registry, high-cardinality
+Keldra does not add a root-vector-global term-stat registry, high-cardinality
 delta dictionary, or per-document forward term list solely to freeze scores
 across compaction. Impact blocks persist raw frequency/norm maxima from which a
 conservative bound is computed using the pinned query statistics. An invalid
@@ -1320,7 +1347,7 @@ estimate allowed to skip possible hits.
 Impact-aware top-K skipping is part of the format contract even if its first
 implementation supports only the exact subset needed by current public query
 operators. It must be possible to add a newer posting codec without changing
-stable object identity, generation publication, or the public API.
+stable object identity, root publication, or the public API.
 
 ### 12.6 Vectors
 
@@ -1330,7 +1357,7 @@ all exact non-vector filters to obtain a DocId set, then scores only surviving
 vectors.
 
 A future approximate-nearest-neighbour sidecar may use the same DocIds and
-generation lifecycle. It requires a separate accepted design and cannot weaken
+root lifecycle. It requires a separate accepted design and cannot weaken
 filter or authorization correctness.
 
 ## 13. Planner and executor
@@ -1341,7 +1368,7 @@ The engine normalizes a query into:
 
 ```text
 ScanPlan {
-  generation
+  root_vector
   authorization_scope
   required_fields
   must
@@ -1403,13 +1430,13 @@ It may inspect all matching DocIds because an arbitrary exact order has no safe
 early-termination rule.
 
 The final stable document-identity tie-break makes ordering deterministic
-across segments and merges, including when one manifest projects multiple
+across segments and merges, including when one root vector projects multiple
 records which point at the same result object.
 
 ### 13.4 Pagination
 
 A page token remains opaque and is bound to caller, tenant, bucket, definition
-identity and version, canonical query fingerprint, physical order, generation,
+identity and version, canonical query fingerprint, physical order, root vector,
 and relevant Zanzibar revision.
 
 For physically ordered scans, search-after seeks each segment to the first key
@@ -1421,10 +1448,10 @@ path exists from which it could safely seek.
 
 A token never contains a DocId. Compaction can change DocIds without changing
 the token's stable sort values and stable document-identity tie-break. The token
-remains generation-bound so its candidate structures, scoring inputs, and
+remains root-vector-bound so its candidate structures, scoring inputs, and
 retained artifacts do not change during pagination. Exact-current validation is
 still read committed and can remove a result object changed after that
-generation's barrier.
+root vector's barriers.
 
 ### 13.5 Authorization and result refill
 
@@ -1451,21 +1478,18 @@ an unbounded denied set nor falls back to one serialized request per candidate.
 
 A first build or authorized explicit rebuild:
 
-1. pins the ordinary definition version, membership fence, finalized atomic
-   watermark, and settled source tails;
-2. opens bounded source snapshots and seeks only the stable numeric tenant,
-   bucket, and path scope;
-3. streams current heads and required payloads in byte-bounded waves;
-4. projects concurrently under the shared kind budget, with async orchestration
-   outside the process CPU pool and only finite leaf CPU chunks submitted to it;
-5. restores deterministic order;
-6. creates one or a bounded number of format-v4 segments directly;
-7. replays the routed journal suffix, preserving atomic groups;
-8. coalesces complete logical components across streams into segment-scoped
-   packs, publishes each completed pack set through the bounded grouped
-   ordinary-object path using the topology-aware acknowledgement threshold in
-   Section 9.5, then writes the manifest; and
-9. publishes one complete generation CAS.
+1. pins the physical catalog generation, family partition directory, finalized
+   atomic watermark, and source barrier for every directory partition;
+2. has each assigned owner open a bounded authoritative current-object snapshot
+   scoped to that partition and the physical recipes;
+3. streams current heads and required payloads in byte-bounded waves through
+   the same prepared-row pipeline as live ingestion;
+4. projects concurrently under stage-specific CPU and memory credits;
+5. creates bounded immutable segments directly;
+6. replays each routed journal suffix after the pinned barrier, preserving
+   atomic groups;
+7. publishes completed packs through integrated payload storage; and
+8. CAS-publishes one complete non-partial root per source partition.
 
 It does not simulate a rebuild by creating hundreds of tiny L0 segments and
 rewriting them through every level before first publication.
@@ -1475,18 +1499,22 @@ epoch, and canonical `(tenant_id, bucket_id, path)` ordering. A large build may
 run for hours while bounded frames continue to make progress; only per-frame
 inactivity is deadline-bound. A committed membership-fence change or any
 source-epoch change cancels the candidate before publication. It never converts
-a corpus-size-dependent wall-clock deadline into an index failure.
+a corpus-size-dependent wall-clock deadline into an index failure. Backfill is
+not a distinct builder subsystem and is lower priority than live catch-up. The
+journal cannot supply objects predating its retention floor, so baseline and
+new-recipe construction must perform the authoritative current-object scan.
 
 ### 14.2 Incremental catch-up
 
-Ordinary catch-up consumes routed journal records in source order, coalesces
-safe repeated mutations of one path, projects a bounded wave into a new
-immutable segment, updates affected locator and live-mask blocks, and publishes
-one complete generation.
+The ordered journal consumer normally finds prepared rows extracted from
+resident committed request bytes in its bounded exact-version cache. On a miss
+it loads the exact retained version named by the journal position. It coalesces
+only proven-safe repeated mutations and appends changed physical recipes or
+head-only deltas to bounded accumulators.
 
-The published generation may contain bounded merge debt but may not omit a
-settled relevant event. Journal capacity provides the required natural write
-backpressure when builders cannot keep up.
+The selected partition root may contain bounded compaction debt but may not
+omit a settled relevant event below its checkpoint. Journal capacity provides
+the required natural write backpressure when projection cannot keep up.
 
 ### 14.3 Merge
 
@@ -1494,51 +1522,33 @@ Merge selection uses deterministic size tiers and explicit per-kind segment and
 byte thresholds. A merge:
 
 - opens immutable inputs;
-- rejects any input whose exact `(index_id, definition_version,
-  schema_fingerprint)` differs;
-- applies their generation-pinned live masks;
-- merges term dictionaries, postings, point trees, doc values, positions,
-  vectors, and locator entries in deterministic key ranges;
+- rejects inputs whose physical family, source partition, catalog generation,
+  recipe identities, or codec semantics differ;
+- applies their root-pinned live masks and head state;
+- merges bounded whole `ProjectionQueryRun` inputs: term dictionaries, postings,
+  point trees, doc values, positions, vectors, and stable-key/material/live
+  gates in deterministic key ranges;
 - assigns new segment-local DocIds;
 - preserves the declared physical order;
 - writes a replacement segment and all-live bitmap;
 - verifies checksums, counts, ordering, exact match membership, and kind
   invariants; and
-- publishes a replacement generation CAS at the same or a newer complete
-  source barrier.
+- publishes a replacement partition-root CAS at the same complete source
+  barrier.
 
 Range-striped merge lanes share the per-kind byte budget. Effective lanes are
 the minimum of configured lanes, CPU workers, affordable workspaces, and
-available non-overlapping ranges. Publication remains single and atomic; no
-range is visible independently.
+available non-overlapping ranges. Publication remains atomic within one
+partition; no range is visible independently and independent partitions do not
+share a global CAS.
 
 Queued work holds no construction-memory permit until selected to run. A task
 cannot retain a partial permit while waiting for another task of the same kind
 to acquire the full budget.
 
-## 15. Index-kind dry runs
+## 15. Index-kind component requirements
 
-### 15.1 Path
-
-The term dictionary stores canonical paths and supports exact and prefix range
-seek. Postings identify the current segment documents for a path term; the
-common live masks remove overwritten or deleted versions. Prefix listing merges
-ordered path iterators and can seek a continuation before reading identities.
-
-No JSON, stored payload, vector, or full-text component is needed.
-
-### 15.2 Metadata Filter
-
-Fixed object-head fields receive stable definition-local FieldIds. Equality and
-membership use term postings or exact numeric points. Numeric and time ranges
-use point trees. Ordering, facets, and aggregates use only the doc values
-declared for those capabilities; path and object version come from the identity
-table.
-
-Known metadata types avoid dynamic JSON coercion. A query intersects all useful
-postings before reading required doc values.
-
-### 15.3 Typed JSON
+Typed JSON is the only admitted kind in the current clean-break milestone.
 
 The streaming projector extracts only JSON pointers named by typed field
 definitions. It validates the declared type and emits only the components
@@ -1556,67 +1566,21 @@ iterators. Arbitrary order uses doc-value top-K; a matching optional physical
 order permits early termination. Hits contain stable result identities, not
 copies of selected JSON.
 
-### 15.4 Full Text
-
-The projector tokenizes configured fields into term postings, frequencies,
-positions, field lengths, and norms. Boolean term queries use the common
-iterator algebra. Phrase queries use conjunction as their approximation and
-positions as exact verification. BM25 uses term statistics and norms; impact
-blocks permit safe top-K skipping.
-
-The source payload is not copied into the index or repeatedly decoded during
-scoring. A caller retrieves a selected hit through the ordinary object API.
-
-### 15.5 Vector
-
-Vectors are fixed-width blocks aligned with common DocIds. Metadata or Typed
-JSON indices have different definition-local DocIds and are not silently joined
-to this index. The current public Vector query therefore scores every present
-live vector in bounded blocks and keeps a bounded top-K heap. A future native or
-SQL planner may compose indices only through stable object identities under a
-separately specified plan; it cannot compare DocIds across definitions.
-
-### 15.6 Hybrid
-
-Lexical and vector components share the same segment DocIds, identity table,
-and live masks because both components belong to the same Hybrid definition.
-Lexical scoring produces bounded candidates; vector scoring reranks those
-candidates or participates in the publicly defined exact fusion. Weighting and
-normalization are generation metadata, not a second index. The public Hybrid
-query does not gain Metadata or Typed JSON predicates under this RFC.
-
-A future approximate vector sidecar can participate only through the same
-generation, liveness, and authorization boundary.
-
-### 15.7 Git Source
-
-Repository, commit, tree path, Git object ID, and source identity form sorted
-composite terms and capability-selected doc values. Exact repository/commit
-lookups seek directly; tree traversal uses prefix enumeration. Stable Git
-object and pack bytes remain ordinary Keldra payloads and are never copied into
-the index.
-
-### 15.8 Tensor
-
-The definition's model and the requested tensor name form the exact lookup key.
-Shape, element type, and source offset/length use typed components only if a
-declared query capability needs them; stable object identity identifies the
-result. Tensor payload bytes remain ordinary objects. Shape and type do not
-become new public query filters under this RFC.
-
-All eight kinds therefore use the same identity, liveness, publication, cache,
-budget, iterator, pagination, authorization, and scan foundations. A kind adds
-only the components its semantics require.
+Path, Metadata Filter, Full Text, Vector, Hybrid, Git Source, and Tensor are
+rejected at definition admission. A kind can return only after a later RFC
+defines its recipes on the same stable identity, head/liveness, partition-root,
+budget, iterator, pagination, authorization, and scan foundations. It cannot
+restore a definition-owned builder.
 
 ## 16. Future native scan boundary
 
-Format v4 defines the internal contract a future SQL capability must consume.
+Format v6 defines the internal contract a future SQL capability must consume.
 The contract is a design boundary in `0.9.0`, not a user-visible SQL API or an
 executable adapter added by this release:
 
 ```text
 ScanRequest {
-  generation
+  root_vector
   authorization_scope
   required_doc_value_field_ids
   predicate_expression
@@ -1656,7 +1620,7 @@ repeated for every DocId. Path and object version come from the segment identity
 component. A future native planner may compose two index scans only through
 that stable identity under an explicit plan; segment DocIds from separate
 definitions are never comparable. This common identity is enough to design a
-future join/intersection operator without adding one to the format-v4 release.
+future join/intersection operator without adding one to this release.
 
 The contract provides the information a future SQL planner and physical scan
 need:
@@ -1664,7 +1628,7 @@ need:
 - identity and declared-doc-value selection;
 - exact/inexact/unsupported filter pushdown;
 - limit and ordering pushdown;
-- a generation-pinned candidate view with read-committed exact-current
+- a root-vector-pinned candidate view with read-committed exact-current
   validation;
 - declared output ordering and partition count;
 - per-segment and per-block statistics;
@@ -1674,53 +1638,56 @@ need:
 
 Reported partitions are local execution partitions on the selected HRW owner,
 such as disjoint segment groups. They do not authorize a SQL engine to scatter
-a query across Keldra nodes or bypass the owner, generation, cache, and Zanzibar
+a query across Keldra nodes or bypass root-vector, cache, and Zanzibar
 boundaries. Ordering is reported per partition. A physically ordered
 multi-segment scan either adds one local k-way merge and returns one globally
 ordered stream or exposes the per-partition ordering and requires an explicit
 local merge operator; a future adapter may not treat several ordered partitions
 as one globally ordered result.
 
-Native query admission supplies an already selected generation. A future SQL
+Native query admission supplies an already selected root vector. A future SQL
 provider performs only metadata planning before execution; it does not fetch
-or repeatedly resolve a generation while constructing the logical plan. At
-execution admission, the selected HRW owner resolves one current complete
-generation if the request did not already pin one, then every batch in that
-execution remains pinned to it.
+or repeatedly resolve roots while constructing the logical plan. At execution
+admission, the selected query node resolves one current complete root vector if
+the request did not already pin one, then every batch remains pinned to it.
 
 The future SQL adapter inherits this read-committed contract. A row replaced
-after the generation barrier may be removed by exact-current validation before
-return, while its replacement waits for a later published generation. The scan
+after a root barrier may be removed by exact-current validation before return,
+while its replacement waits for a later published root. The scan
 does not claim SQL snapshot isolation, repeatable read, or time-travel
 semantics.
 
 The future adapter translates SQL expressions to `ScanRequest`, consumes
 bounded `ScanBatch` values, and evaluates any inexact residual from requested
 doc values. Source-field projection is a separate ordinary-object fetch stage;
-format v4 does not turn an index into another copy of the source. If Keldra
+format v6 does not turn an index into another copy of the source. If Keldra
 performs a bounded residual exactly, it advertises the predicate as `Exact`.
 The adapter remains outside the store, consensus, program, gateway, and native
 index crates.
 
 ## 17. Resource control and cache
 
-One hard aggregate working-memory ceiling covers query execution and all eight
-index kinds. The query setting and each kind's construction setting remain
-fair-share planning targets, not isolated heaps. Builders, projection waves,
-sorters, posting writers, live-mask writers, pack buffers, merge lanes, and
-queries acquire exact or conservative byte permits from the shared parent.
+One hard aggregate working-memory ceiling covers query execution and physical
+projection. The indexing budget is split into credits for extraction input,
+prepared rows/reordering, normalization/token/posting output, partition
+accumulators, encoding/compression, publication, and compaction. The default
+indexing plan is 256 MiB per configured indexing core under an explicit
+administrator-set process ceiling. Partition producers, sorters, posting
+writers, head/live writers, pack buffers, merge lanes, and queries acquire exact
+or conservative byte permits from the shared parent.
+
 The global FIFO admits mandatory work before optional borrowing. An active
-bounded loan is not revoked; it is returned at the existing query, build-turn,
+bounded loan is not revoked; it is returned at the existing query, partition-batch,
 or compaction boundary. Catch-up, rebuild, and segment compaction derive their
 actual workspace from the granted bytes. Locator-root compaction is globally
 charged but requests only its fixed fair-share workspace because a larger
 grant cannot accelerate that path. Segment compaction likewise requests only
 its per-kind fair share: the configured default lanes fit that share, and a
 non-preemptible merge must not borrow otherwise idle aggregate memory which a
-new source-writer turn may need. Optional borrowing remains available to
-bounded build turns whose own turn boundary returns the loan.
+new partition batch may need. Optional borrowing remains available to bounded
+projection batches whose own boundary returns the loan.
 
-Long-lived projection and merge lanes are async orchestration tasks outside the
+Long-lived partition and merge lanes are async orchestration tasks outside the
 Rayon pool. They acquire work and memory, submit one finite leaf CPU chunk, await
 its result without occupying a Rayon worker, and then schedule the next phase.
 A leaf performs an admitted in-memory sort itself or returns before the
@@ -1749,31 +1716,32 @@ Resource values are non-zero startup configuration, may change on restart, and
 are not Raft or durable-format state. Defaults are:
 
 - process Rayon workers: four;
-- construction memory: 256 MiB shared by all definitions of each index kind;
-- projection lanes per kind: four;
-- source quantum per kind: 16 MiB;
-- external-sort chunk per kind: 16 MiB when affordable;
-- merge lanes per kind: four;
-- merge debt per kind and size tier: 64 segments and 1 GiB encoded bytes;
+- indexing cores: four;
+- indexing pipeline memory: 256 MiB per indexing core;
+- hot prepared-row/reorder, accumulator, encoder, publication, and compaction
+  credits derived inside that hard total;
+- source quantum: 16 MiB;
+- external-sort chunk: 16 MiB when affordable;
+- merge lanes: four;
+- merge debt per partition and size tier: 64 segments and 1 GiB encoded bytes;
 - disposable index-cache disk: 10 GiB;
 - disposable index-cache memory: 10 percent of process memory;
 - concurrent queries: 64;
 - query CPU work quantum between cooperative yields: 4 MiB;
 - query working-memory fair share: 512 MiB;
-- aggregate query/build/compaction working-memory ceiling: the checked sum of
-  the query and eight per-kind fair shares, 2.5 GiB with defaults, unless the
+- aggregate query/projection/compaction working-memory ceiling: the checked sum
+  of query and indexing budgets unless the
   administrator explicitly sets `KELDRA_INDEX_WORKING_MEMORY_BYTES`;
-- retained generations: three, 24 hours, or 50 GiB, whichever bound is reached
+- retained partition roots: three, 24 hours, or 50 GiB, whichever bound is reached
   first; and
 - index-query server maximum: 300 seconds, clamped by a shorter valid client
   deadline; other bounded unary APIs retain 30 seconds.
 
-Each kind's memory, projection, sort, merge, and debt values can be overridden
-independently. Effective lanes are reduced to available workers, work, and
-affordable workspace; a smaller grant never permits hidden allocation. The
-aggregate override must admit the largest configured share. Without an
-override, the checked sum preserves the former maximum concurrent allowance
-while allowing idle shares to accelerate active work.
+Index core count, total memory, stage ratios, sort, merge, and debt values can
+be overridden. Effective lanes are reduced to available workers, work, and
+affordable workspace; a smaller grant never permits hidden allocation. Without
+an aggregate override, the checked sum of query and indexing budgets is the
+hard ceiling.
 
 Invalid zero values, a memory percentage outside 1..=100, a segment/debt count
 above a fixed format bound, or a budget which cannot fit one required workspace
@@ -1784,17 +1752,17 @@ local budgets without changing durable bytes or query results.
 
 | Failure | Required behavior |
 | --- | --- |
-| Crash during build or merge | Discard disposable scratch, keep serving the last complete generation, and resume/restart work for the same ordinary definition version |
+| Crash during preparation, sealing, or merge | Discard disposable memory/scratch, keep serving the last complete root vector, and replay each affected partition after its selected checkpoint |
 | Journal reaches its entry or byte cap | Prioritize consumers and hold new source-producing commits until published progress permits safe pruning; never truncate or switch to bulk rebuild |
 | Required index cursor is below the retained floor or has an unavailable epoch | Fail that definition closed until an authorized principal explicitly rebuilds, repairs, or deletes it |
 | Accounting cursor is below the retained floor or has an unavailable epoch | Build only that accounting definition's bounded scoped baseline; publish it before advancing retention |
-| Artifact upload or current-pointer CAS fails | Keep the prior complete generation; unreachable immutable artifacts become retention candidates after the 24-hour safety age |
-| A v4 component, pack, manifest, live mask, locator, or scoring-stat block is corrupt | Fail that definition closed and alert; never broaden into a corpus scan or an older format reader |
+| Artifact upload or partition-current CAS fails | Keep the prior complete root; unreachable immutable artifacts become retention candidates after the 24-hour safety age |
+| A component, pack, partition root, head/live block, or scoring-stat block is corrupt | Fail affected bindings closed and alert; never broaden into a corpus scan or an older format reader |
 | A disposable cache entry is missing or corrupt | Evict and refetch the exact ordinary object/version and checked range |
-| Membership fence changes before publication | Cancel the candidate, recompute weighted-HRW ownership, and resume on current rank zero |
+| Placement epoch changes before publication | Fence the old producer and resume on the newly assigned partition owner from the selected root |
 | Receipt capacity is exhausted | Prune expired receipts within a bounded budget and wait before commit; preserve the configured retry window |
 | Journal capacity blocks the complete publication which would release history | Admit only that exact trusted publication as progress debt, keep ordinary writes blocked, publish, then prune and repay |
-| Merge debt reaches its configured bound | Stop adding debt, merge under the kind budget, and allow the journal cap to backpressure writes if catch-up cannot progress |
+| Merge debt reaches its configured bound | Stop adding debt, merge under the indexing budget, and allow the journal cap to backpressure writes if catch-up cannot progress |
 
 Artifact retention, cache reconciliation, definition assignment reconciliation,
 source proof cleanup, receipt expiry, and journal pruning use bounded record,
@@ -1849,28 +1817,44 @@ semantics.
 
 ## 19. Freshness and query result evidence
 
-Queries use the latest complete generation available on the selected owner.
-They return the existing freshness structure containing definition version,
-generation identity, source checkpoint/barrier, publication time, and lag
-evidence. Lag does not convert a valid partial-history result into
+Queries use a compatible pinned vector of the latest complete partition roots.
+They return freshness evidence containing definition/catalog versions, root
+identities, source checkpoints/barriers, publication times, and lag evidence.
+Lag does not convert a valid partial-history result into
 `INDEX_LAGGING`; the client decides whether freshness meets its needs.
 
-The generation is the complete indexed candidate view through that barrier;
+The root vector is the complete indexed candidate view through its barriers;
 the exact-current result check is read committed. Consequently an update after
 the barrier may temporarily remove the old identity without adding the new one
-until the next generation. The returned freshness evidence makes that boundary
+until the next root. The returned freshness evidence makes that boundary
 explicit rather than claiming a database snapshot.
 
-Checkpoint-only progress is itself publishable generation evidence even when
+Checkpoint-only progress is itself publishable partition-root evidence even when
 no indexed document changes. Restart, reassignment, and compaction preserve that
 zero-lag proof.
 
+For each root in that vector, the planner opens only `ProjectionQueryRun`
+directories for the requested physical recipes. It seeks and intersects
+postings with membership/stable-key live gates, uses points for ranges, and
+reads declared doc values for ordering, facets, and aggregates. Candidate stable
+keys still pass bounded exact-current head/object validation before return. A
+planner must fail rather than broad-scan field-state preparation output; such a
+scan is not an allowed residual or recovery path.
+
 ## 20. Observability
 
-Low-cardinality metrics by index kind, phase, and size tier include:
+Low-cardinality metrics by physical recipe class, pipeline stage, and size tier
+include:
 
-- active, queued, waiting, completed, failed, and cancelled builds and merges;
+- active, queued, waiting, completed, failed, and cancelled partition batches
+  and merges;
+- stage-specific memory capacity, used, waiting, peak, and hot admission drops;
+- hot-path opportunities/admissions/discards and replay records/bytes;
+- indexing CPU time, documents, selected values, tokens, and postings per core;
 - source records/bytes read and projected;
+- query-run counts/bytes by level, sparse L0 old-material removals/new-material
+  additions, and postings/positions/points/doc-value/stable-key-live component
+  bytes;
 - posting blocks sought, advanced, decoded, skipped, and bytes read;
 - term seeks and enumerated terms;
 - candidate DocIds, conjunction advances, union heap operations, and two-phase
@@ -1885,26 +1869,28 @@ Low-cardinality metrics by index kind, phase, and size tier include:
 - cursor seeks and documents skipped before/after the cursor;
 - query phase time for planning, continuation seek, head initialization,
   physical merge/advance, candidate visibility, and response materialization;
+- recipe seeks/intersections, preparation-state broad-scan attempts (required
+  to remain zero), and exact-current candidate-validation batches;
 - desired and granted query memory, resident segment slots/current/peak,
   conservatively charged retained decoded bytes, evictions, and reloads;
 - authorization/exact-current batches, candidates checked, denied, stale, and
   refill work;
 - cache hits, misses, fetched bytes, evictions, and pinned bytes;
 - output hits, logical/physical read bytes, duration, timeout, and cancellation;
-- generation age, source lag, publication time, and current merge debt;
+- partition-root age, source lag, publication time, and current merge debt;
 - aggregate and per-class working-memory capacity, fair share, used, borrowed,
   waiting, desired, granted, peak, and permit duration; and
 - journal occupancy, limits, backpressure, publication debt, and last consumer
   progress.
 
-Stable tenant, bucket, definition, generation, and segment identities are trace
+Stable tenant, bucket, definition, root, and segment identities are trace
 fields, never metric labels. One query trace records the normalized plan,
 estimated costs, chosen iterator order, physical-order decision, residual
 verification, logical bytes by component, cancellation progress, and actual
 returned hits even when the caller deadline cancels the response.
 
 Logs record definition failure, corrupt artifact identity, rebuild admission,
-builder reassignment, generation publication, merge replacement, sustained
+partition reassignment, root publication, merge replacement, sustained
 backpressure, and a concise slow-query plan summary. They do not print payloads,
 credentials, private field values, or unbounded query text.
 
@@ -1960,20 +1946,21 @@ it behind a broad-scan fallback.
 - conjunction results equal a trusted in-memory evaluator for varied predicate
   selectivity and order;
 - updates and deletes clear old DocIds without per-candidate head reads;
-- post-generation overwrite/delete overlays suppress stale candidates, and a
+- post-root overwrite/delete overlays suppress stale candidates, and a
   missing/behind overlay still returns no stale version because the bounded
   exact-current result check refills correctly;
 - pre- and post-merge exact membership, doc values, facets, and aggregates are
   identical;
-  scores and score order may change only in the newly published generation as
-  documented, while an active cursor remains stable on its retained generation;
+  scores and score order may change only in the newly published root vector as
+  documented, while an active cursor remains stable on its retained roots;
 - physical and top-K order agree, including missing, null, direction, and stable
   document-identity tie-breaks;
 - second and later pages neither repeat nor omit results and seek before
   rejected-candidate doc-value work;
 - authorization denial refills from the same iterator without leakage;
 - checkpoint-only progress preserves freshness across restart; and
-- atomic-program paths become visible together at one generation CAS.
+- atomic-program paths become visible together under one complete covered
+  atomic checkpoint across the affected partition-root vector.
 
 ### 22.3 Production-shaped regression
 
@@ -1989,119 +1976,96 @@ same selectivity shape as the incident query:
 The verifier compares exact results and order with an independent evaluator.
 It records ingest and index rates separately and reports posting advances,
 candidate DocIds, liveness checks, point reads, doc-value reads,
-logical and physical bytes, cache state, CPU, memory, and elapsed time.
+logical and physical bytes, cache state, CPU, memory, elapsed time, query-run
+publication cuts, per-recipe seeks/intersections, and exact-current validation
+batches.
 
 Acceptance requires:
 
 - no 300-second timeout;
 - no ordinary source-payload read during a query;
+- every claimed source/atomic checkpoint names query-ready projection runs, and
+  preparation-state field/delta broad-scan attempts remain zero;
 - no logical-read amplification approaching one complete index per small page;
 - the regression definition declares its matching physical order, and page two
   performs a real cursor seek without repeating page one's complete candidate
   work;
 - compaction changes performance shape only within documented bounds, never
   changes exact match membership, and changes scoring only for a newly
-  published generation under the documented scoring semantics; and
+  published root vector under the documented scoring semantics; and
 - peak memory remains inside configured construction, query, and cache budgets.
 
 Tests must also include zero-hit sparse conjunctions, a deliberately unselective
 arbitrary sort, cold and warm cache, multiple segments, concurrent queries,
-restart, builder failover, and source-journal backpressure. A forced-spill build
-and merge with projection lanes exactly equal to Rayon workers proves that no
-nested same-pool starvation is possible.
+restart, partition handoff, and source-journal backpressure. A forced-spill
+backfill and merge with projection lanes exactly equal to Rayon workers proves
+that no nested same-pool starvation is possible.
 
-### 22.4 All-kind and distributed matrix
+### 22.4 Supported-kind and distributed matrix
 
-Each of the eight kinds is created, built, queried, updated, deleted, rebuilt,
-restarted, and merged through the public API on one node and a three-node Docker
-cluster. Tests use independent buckets in one cluster. They verify HRW proxying,
-artifact durability, owner failover, Zanzibar denial/public-read behavior,
-freshness evidence, pagination, and exact results.
+Typed JSON is created, projected, queried, updated, deleted, rebuilt, restarted,
+compacted, and reassigned through the public API on one node and a three-node
+Docker cluster. Tests use independent buckets in one cluster and verify root
+vector materialization, artifact durability, partition handoff, Zanzibar
+denial/public-read behavior, freshness evidence, pagination, and exact results.
+
+Admission tests prove the other seven kinds fail explicitly before durable
+catalog or physical state is created. When any kind returns, this full matrix is
+mandatory for it and its implementation must use the partition pipeline.
 
 ## 23. Clean-break removal list
 
-The format-v4 implementation deletes, rather than wraps:
+The implementation deletes, rather than wraps:
 
-- format-v3 component and manifest readers/writers;
+- every format-v3/v4 legacy publication reader and writer superseded by
+  partition roots;
+- external, elected, representative, and per-definition builders;
+- builder due queues, leases, failover records, scheduler turns, and cursors;
+- format-v5 historical projected-state streams and the separately scheduled
+  native assembler bridge;
+- global/per-definition/per-family manifest CAS on normal flushes;
 - range-local ordinal persistence and cross-run latest-live probing;
-- single-driver Typed JSON and Metadata query execution;
-- broad ordered-query fallback and post-scan continuation filtering;
-- automatic terms-plus-generic-column-plus-stored-field projection for every
-  selected Typed JSON field;
-- query paths whose pagination restarts from the beginning;
-- format-v3 merge and compaction code;
-- compatibility branches, feature flags, converters, and dual-write tests; and
-- known limitations which excuse the absence of posting intersection.
+- single-driver Typed JSON query execution and broad ordered-query fallbacks;
+- automatic stored-field projection and pagination which restarts from the
+  beginning;
+- compatibility branches, format converters, migrations, feature flags,
+  dual-write tests, and fallback paths; and
+- old-kind implementations which require the removed builder architecture.
 
-Retained source-journal, definition, HRW, authorization, object publication,
-cache, accounting, gateway, and Raft code is changed only where required to
-connect to the new format-v4 engine.
+Source journals, authoritative definitions, authorization, object publication,
+integrated payload storage, accounting, gateway, and Raft code remain only where
+they connect to the partition pipeline. The seven removed index kinds return
+only through new partition-owned implementations.
 
 ## 24. Known limitations
 
-- Vector search remains exact and linear in the live filtered vector set. ANN
-  requires a later accepted design.
-- One query executes on one HRW owner. Very large indices may fetch ordinary
-  artifact packs over the cluster, but Keldra does not scatter the query or merge
-  network result sets.
-- Arbitrary order without a matching physical order may inspect every exact
-  Boolean match on every page and may authorize and exact-current-check every
-  match and reread order doc values, but it never reads source payloads.
-- Full-text merge may slightly change scores and score order in the newly
-  published generation because BM25 statistics are aggregated from that
-  generation's immutable segment set. Exact Boolean membership is unchanged,
-  and an active page token remains on its retained generation.
+- Typed JSON is the only supported index kind in this milestone. Path, Metadata
+  Filter, Full Text, Vector, Hybrid, Git Source, and Tensor are rejected until
+  implemented on the partition pipeline; none falls back to legacy production.
+- Query nodes initially use the local native strategy over a partition-root
+  vector; distributed fanout is a later read optimization, not write authority.
+- Arbitrary unindexed order may inspect and authorize every exact Boolean match,
+  but does not read source payloads.
 - A keyword longer than 32,766 bytes supports only hashed `EXACT`; ordered,
   prefix, range, and facet capabilities reject it.
-- Public Typed JSON and Metadata Filter predicate expressions are bounded to 32
-  levels of depth and 256 total nodes. Empty Boolean operators are rejected;
-  negation is set complement over indexed live documents rather than SQL
-  three-valued logic.
-- Metadata Filter and the dedicated Full Text kind retain fixed built-in field
-  schemas and analysis rather than adding a second capability declaration API.
-- SQL is not a user-visible capability in this release.
-- A permanently failed definition may eventually hold journal capacity and
-  backpressure affected writes until an authorized principal repairs, rebuilds,
-  or deletes it. This preserves index visibility correctness.
-- Capacity and lane configuration changes on restart.
-- Mesh and regional coordination remain outside the single-cluster design.
+- Typed JSON expressions remain bounded to 32 levels and 256 nodes; negation is
+  complement over indexed live documents, not SQL three-valued logic.
+- SQL, mesh, and regional coordination are outside this release. Capacity and
+  lane changes require restart. A permanently failed definition can retain
+  journal capacity until an authorized repair, rebuild, or deletion.
 
 ## 25. Consequences
 
-The new engine is a major internal refactor, but it removes the architectural
-cause of multi-index-sized reads for sparse compound queries. Common DocIds,
-live masks, advanceable postings, points, typed doc values, and one planner
-serve every index kind instead of letting each rediscover filtering,
-pagination, authorization, and cache behavior.
-
-Keldra retains ownership of its durable format and can tune codecs, remote block
-layout, cache hints, compaction, and future ANN structures for its
-inline/erasure-coded object architecture. Following Lucene's stable execution
-contracts avoids inventing an unproven search model without binding Keldra to a
-foreign storage format.
-
-The native scan boundary prevents a future SQL gateway from bypassing the
-native planner or rebuilding authorization, liveness, and topology knowledge.
-Its executable adapter remains deferred until there is an actual SQL consumer.
-
-The clean break costs one rebuild from authoritative ordinary objects. It adds
-no migration subsystem and leaves existing source data, object durability,
-Zanzibar authority, journals, Raft state, gateways, and accounting semantics
-unchanged.
+Common DocIds, live masks, advanceable postings, points, typed doc values, and
+one planner remove duplicated query machinery while leaving Keldra free to tune
+its v6 codecs, layout, cache, compaction, and future ANN structures. The native
+scan boundary prevents a future SQL gateway from bypassing authorization,
+liveness, or topology. The clean break costs one rebuild from authoritative
+objects, adds no migration subsystem, and leaves source durability, Zanzibar,
+journals, Raft, gateways, and accounting unchanged.
 
 ## 26. References
 
 - Apache Lucene, [index package and segment model](https://lucene.apache.org/core/10_3_0/core/org/apache/lucene/index/package-summary.html).
 - Apache Lucene, [`DocIdSetIterator`](https://lucene.apache.org/core/10_3_2/core/org/apache/lucene/search/DocIdSetIterator.html).
-- Apache Lucene, [`DocValuesType`](https://lucene.apache.org/core/10_3_2/core/org/apache/lucene/index/DocValuesType.html).
-- Apache Lucene, [`TwoPhaseIterator`](https://lucene.apache.org/core/10_3_2/core/org/apache/lucene/search/TwoPhaseIterator.html).
-- Apache Lucene, [`IndexOrDocValuesQuery`](https://lucene.apache.org/core/10_3_2/core/org/apache/lucene/search/IndexOrDocValuesQuery.html).
-- Apache Lucene, [`IndexWriterConfig` index sorting](https://lucene.apache.org/core/10_1_0/core/org/apache/lucene/index/IndexWriterConfig.html).
-- Apache Lucene, [`IndexSearcher.searchAfter`](https://lucene.apache.org/core/10_3_2/core/org/apache/lucene/search/IndexSearcher.html).
-- Apache Lucene, [`Lucene103PostingsFormat`](https://lucene.apache.org/core/10_3_1/core/org/apache/lucene/codecs/lucene103/Lucene103PostingsFormat.html).
-- Apache Lucene, [`ImpactsEnum`](https://lucene.apache.org/core/10_3_2/core/org/apache/lucene/index/ImpactsEnum.html).
-- Apache Lucene, [`WANDScorer`](https://github.com/apache/lucene/blob/releases/lucene/10.3.2/lucene/core/src/java/org/apache/lucene/search/WANDScorer.java).
 - Apache DataFusion, [custom data sources and table providers](https://datafusion.apache.org/library-user-guide/custom-table-providers.html).
-- Gonzalo Navarro and Veli Mäkinen, [Compressed Full-Text Indexes](https://users.dcc.uchile.cl/~gnavarro/ps/acmcs06.pdf), ACM Computing Surveys 39(1), 2007.
-- Sebastiano Vigna, [Quasi-Succinct Indices](https://vigna.di.unimi.it/ftp/papers/QuasiSuccinctIndices.pdf), WSDM 2013.
-- Sebastiano Vigna et al., [`sux`](https://github.com/vigna/sux-rs).

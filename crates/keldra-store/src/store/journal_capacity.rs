@@ -349,7 +349,7 @@ mod tests {
         store
             .mutate_derived_progress_with_governance_and_backpressure(
                 PublishRequest {
-                    key: ObjectKey::new("tenant", "bucket", "_keldra/indices/v4/7/current")
+                    key: ObjectKey::new("tenant", "bucket", "_keldra/index-projections/v6/0000000000000000000000000000000000000000000000000000000000000001/partitions/7/0202020202020202020202020202020202020202020202020202020202020202/3/4/current")
                         .unwrap(),
                     blob,
                     content_type: Some("application/vnd.keldra.index-artifact".into()),
@@ -385,7 +385,7 @@ mod tests {
         // A user-selected reserved-looking path receives ordinary bounded
         // admission. No path string grants the trusted progress capability.
         let forged = store
-            .bulk_write(vec![put("_keldra/indices/v4/7/current", "forged-progress")])
+            .bulk_write(vec![put("_keldra/index-projections/v6/0000000000000000000000000000000000000000000000000000000000000001/partitions/7/0202020202020202020202020202020202020202020202020202020202020202/3/4/current", "forged-progress")])
             .await;
         assert_eq!(forged[0].result, Err(MutationError::SourceJournalCapacity));
 
@@ -394,7 +394,7 @@ mod tests {
         assert!(debt.progress_debt_entries() >= 1);
         assert!(
             store
-                .head(&ObjectKey::new("tenant", "bucket", "_keldra/indices/v4/7/current").unwrap())
+            .head(&ObjectKey::new("tenant", "bucket", "_keldra/index-projections/v6/0000000000000000000000000000000000000000000000000000000000000001/partitions/7/0202020202020202020202020202020202020202020202020202020202020202/3/4/current").unwrap())
                 .unwrap()
                 .is_some()
         );

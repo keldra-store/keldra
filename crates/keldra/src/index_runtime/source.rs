@@ -1,6 +1,6 @@
 //! Format-neutral ordinary-object input for index projection.
 
-use keldra_index::v4::ObjectIdentity;
+use keldra_index::v6::ObjectIdentity;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IndexBuildObject {

@@ -613,7 +613,7 @@ pub(crate) type PendingBlobReferences = BTreeMap<Vec<u8>, BlobReferenceState>;
 
 impl Store {
     /// Allocate one node-scoped Snowflake identity for an ordinary derived
-    /// object such as a format-v4 index segment. A durable publication made
+    /// object such as a v6 index artifact. A durable publication made
     /// afterward advances the same persisted high-water mark, so an identity
     /// lost before publication is harmless and a published identity cannot be
     /// reused after restart.

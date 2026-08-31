@@ -221,8 +221,6 @@ mod tests {
     use axum::Router;
     use axum::extract::{Request, State};
     use axum::http::StatusCode;
-    use keldra_index::IndexKind;
-    use keldra_index::compaction::{CompactionParallelism, CompactionProgress};
     use opentelemetry::Key;
     use opentelemetry::trace::{Span as _, Tracer as _};
     use opentelemetry_sdk::error::OTelSdkResult;
@@ -230,11 +228,6 @@ mod tests {
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
     use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
     use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
-
-    use crate::index_runtime::telemetry::{
-        BuilderProgress, BuilderProgressPhase, CompactionInputTotals, CompactionTelemetry,
-        IndexTelemetryIdentity,
-    };
 
     use super::*;
 
@@ -380,14 +373,14 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(target: "keldra::index_runtime::cpu", "normal CPU chunk");
             tracing::warn!(target: "keldra::index_runtime::cpu", "failed CPU chunk");
-            tracing::debug!(target: "keldra::index_runtime::manager", "builder progress");
+            tracing::debug!(target: "keldra::index_runtime::v6_consumer", "producer progress");
         });
 
         assert_eq!(
             *recorded.lock().unwrap(),
             vec![
                 ("keldra::index_runtime::cpu", tracing::Level::WARN),
-                ("keldra::index_runtime::manager", tracing::Level::DEBUG),
+                ("keldra::index_runtime::v6_consumer", tracing::Level::DEBUG),
             ]
         );
     }
@@ -404,32 +397,6 @@ mod tests {
             tracing_subscriber::registry().with(MetricsLayer::new(meter_provider.clone()));
 
         tracing::subscriber::with_default(subscriber, || {
-            let identity = IndexTelemetryIdentity {
-                index_id: 99,
-                tenant_id: 101,
-                bucket_id: 102,
-                kind: IndexKind::TypedJson,
-            };
-            for phase in [BuilderProgressPhase::Rebuild, BuilderProgressPhase::CatchUp] {
-                let progress = BuilderProgress::start(identity, phase);
-                progress.complete();
-            }
-            let telemetry = CompactionTelemetry::start(
-                identity,
-                0,
-                1,
-                CompactionInputTotals {
-                    segments: 2,
-                    documents: 10,
-                    bytes: 100,
-                },
-                CompactionParallelism::serial(),
-                1,
-                CompactionProgress::default(),
-            )
-            .unwrap();
-            telemetry.complete();
-
             tracing::info!(
                 index.kind = "typed_json",
                 index.id = 4_294_967_296_u64,
@@ -462,21 +429,6 @@ mod tests {
         meter_provider.force_flush().unwrap();
 
         let recorded = exporter.i64_sums.lock().unwrap();
-        for name in [
-            "keldra_index_rebuild_active",
-            "keldra_index_catch_up_active",
-            "keldra_index_compaction_active",
-        ] {
-            let active = recorded
-                .iter()
-                .rev()
-                .find(|sum| sum.name == name)
-                .unwrap_or_else(|| panic!("{name} metric was exported"));
-            assert_eq!(active.points.len(), 1, "{name}");
-            assert_eq!(active.points[0].value, 0, "{name}");
-            assert_eq!(active.points[0].attribute_keys, ["index.kind"], "{name}");
-        }
-
         let filtered = recorded
             .iter()
             .rev()

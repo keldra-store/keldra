@@ -10,6 +10,8 @@ work_root="${experiment_root}/work"
 definitions="${KELDRA_CATALOG_DEFINITIONS:-250000}"
 concurrency="${KELDRA_CATALOG_CONCURRENCY:-64}"
 port="${KELDRA_CATALOG_PORT:-50051}"
+indexing_cores="${KELDRA_CATALOG_INDEXING_CORES:-4}"
+pipeline_memory_bytes="${KELDRA_CATALOG_PIPELINE_MEMORY_BYTES:-1073741824}"
 # Per-request INFO emits several lines per definition and would both distort a
 # rotational-disk catalogue run and create multi-gigabyte evidence logs.
 server_rust_log="${KELDRA_CATALOG_RUST_LOG:-warn}"
@@ -20,7 +22,9 @@ case "${experiment_root}" in
   "${HOME}/keldra_experiments") ;;
   *) echo "experiment root escaped HOME/keldra_experiments" >&2; exit 2 ;;
 esac
-for value in "${definitions}" "${concurrency}" "${port}"; do
+for value in "${definitions}" "${concurrency}" "${port}" \
+  "${indexing_cores}" "${pipeline_memory_bytes}"
+do
   [[ "${value}" =~ ^[1-9][0-9]*$ ]] || {
     echo "catalog counts and port must be positive decimal integers" >&2
     exit 2
@@ -125,9 +129,8 @@ start_server() {
   KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=1000000 \
   KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100000 \
   KELDRA_INDEX_DISK_CACHE_BYTES=1073741824 \
-  KELDRA_INDEX_MEMORY_PERCENT=20 \
-  KELDRA_INDEX_BUILDER_MEMORY_BYTES_PER_KIND=268435456 \
-  KELDRA_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES=268435456 \
+  KELDRA_INDEX_PIPELINE_MEMORY_BYTES="${pipeline_memory_bytes}" \
+  KELDRA_INDEXING_CORES="${indexing_cores}" \
   KELDRA_SOURCE_JOURNAL_MAX_ENTRIES=1000000 \
     "${kit_root}/bin/keldra-server" >"${run_dir}/server-${suffix}.log" 2>&1 &
   server_pid=$!
@@ -161,6 +164,8 @@ run_catalog_phase() {
   echo "catalog_harness_commit=${catalog_harness_commit}"
   echo "definitions=${definitions}"
   echo "concurrency=${concurrency}"
+  echo "indexing_cores=${indexing_cores}"
+  echo "pipeline_memory_bytes=${pipeline_memory_bytes}"
   uname -srvmo; lscpu; free -h; df -hT "${experiment_root}"
   lsblk -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,ROTA,MODEL
 } >"${run_dir}/host-info.txt"

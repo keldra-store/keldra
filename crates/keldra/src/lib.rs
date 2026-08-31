@@ -468,9 +468,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         bucket_governance.clone(),
         object_reader.clone(),
         object_lister.clone(),
-        name_resolver.clone(),
-        &config.storage.cache,
-        &config.storage.scratch,
         index_runtime_config,
         derived_checkpoints.clone(),
         startup_scan_evidence.clone(),
@@ -768,9 +765,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         })
         .await
         .context("start public gRPC and HTTP gateway listener")?;
-    index_runtime
-        .start_cache_reconciler()
-        .context("start bounded index cache reconciliation")?;
     let payload_gc = payload_gc::PayloadGarbageCollector::new(
         local_node,
         store.clone(),

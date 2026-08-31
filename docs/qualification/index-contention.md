@@ -1,22 +1,35 @@
 # Index contention qualification
 
-`scripts/qualify-index-contention.sh` is the black-box acceptance workload for
-KELDRA-0016. It runs the packaged Linux Keldra server in fresh Docker state on
-the Debian controller and drives mutations and ordinary queries through a
-native macOS build of the public Rust client on the physical Mac. The default
-split is explicit: Docker publishes the single-node API through
+> Historical evidence note: the D1--D64 builder, format-v5, manifest, and
+> per-definition publication descriptions below explain the superseded runtime
+> measured during the KELDRA-0020 investigation. They are not production
+> guidance for v6. The current harness separates logical definitions with
+> `KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX` from physical recipes with
+> `KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT`, and controls the pipeline
+> through `KELDRA_INDEXING_CORES` and `KELDRA_INDEX_PIPELINE_MEMORY_BYTES`. It
+> admits only Typed JSON and
+> has no external-builder fallback.
+
+`scripts/qualify-index-contention.sh` is the retained black-box Docker
+comparison workload from the KELDRA-0016 investigation. It runs the packaged
+Linux Keldra server in fresh Docker state on the Debian controller and drives
+mutations and ordinary queries through a native macOS build of the public Rust
+client on the physical Mac. Its default split is explicit: Docker publishes
+the single-node API through
 `192.168.64.3`, while the driver is built and run over SSH on
 `zcourts@192.168.64.1` from `/Users/zcourts/projects/keldra/keldra`. Keldra is
-never run as a native macOS server. Each matrix cell
-starts with fresh durable state and creates the requested number of independent,
-simultaneously lagging index definitions; the matrix value is definition count,
-not projection-lane configuration. On one node, `1,4,16,64` is the normative
-legacy node-wide admitted-builder pressure matrix. The harness accepts values
-through 1,024 so replacement architectures can run the D640 active-fan-out
-gate defined in `index-scale-investigation.md`; raising the harness ceiling does
-not raise the production runtime's 64-builder lease bound. Three-node placement distributes
-definitions using HRW, so its definition count is cluster-wide and is
-supplementary evidence, not a claim that every node ran that many builders.
+never run as a native macOS server. The measured D/P details that follow are
+historical Docker evidence; current v6 release qualification is the direct SSD
+kit runner described below.
+
+## Historical Docker comparison evidence
+
+The Docker and split-topology commands in this section preserve evidence from
+the superseded external-builder architecture. They are not v6 release
+qualification and must not be used to set current throughput or correctness
+claims. The retained single-node and three-node wrappers now execute only their
+non-index release phases, so the command blocks below are archival evidence,
+not runnable index qualification.
 
 The smoke mode is deliberately small. It proves setup, cross-host connectivity,
 authentication, workload
@@ -29,6 +42,87 @@ KELDRA_INDEX_CONTENTION_TOPOLOGY=single \
   ./scripts/qualify-index-contention.sh
 ```
 
+## Current v6 SSD qualification
+
+For the v6 SSD matrix, use `scripts/qualify-index-v6-ssd-scale.sh` on the SSD
+host. It is a direct binary-kit runbook, not a Docker wrapper: install the
+attested `keldra-server`, `keldra`, and `index-contention-qualification`
+binaries, this runner, `SOURCE_COMMIT`, `HARNESS_COMMIT`, and
+`SHA256SUMS` in `~/keldra_experiments/kit/` first. The checksum manifest must
+cover the runner as well as `bin/*`. It verifies the kit before work begins and
+keeps every input, durable database, log, raw report, and result archive below
+`~/keldra_experiments`. Smoke defaults cover D64/P1,P4 with W1,W4 at 256 MiB
+per worker. Sustained defaults run three non-duplicating axes: the P1 logical
+ladder D1,D64,D1K,D10K,D250K at the largest resource cell; the D64 physical
+ladder P1,P4,P16,P64 at that same resource cell; and D64/P1 with W1,W2,W4,W8
+at 128/256 MiB per worker. The D250K catalog cell uses one configurable offered
+rate (`KELDRA_V6_SCALE_CATALOG_RATE`) rather than repeating the expensive
+admission step at every rate; `qualify-index-catalog.sh` provides the separate
+create/restart catalog qualification. This avoids an uninformative full
+Cartesian product while varying each independent cause:
+
+```text
+~/keldra_experiments/kit/
+  SOURCE_COMMIT                         # exact 40-hex server revision
+  HARNESS_COMMIT                        # exact 40-hex harness revision
+  SHA256SUMS                            # sha256sum --check manifest for this kit
+  qualify-index-v6-ssd-scale.sh         # this exact runner
+  bin/keldra-server
+  bin/keldra
+  bin/index-contention-qualification
+```
+
+The controller creates that kit from one validated revision, writes its hash
+manifest, and transfers it as a single artifact. The host does not build or
+fetch source during qualification.
+
+```bash
+cd ~/keldra_experiments/kit
+KELDRA_V6_SCALE_MODE=sustained ./qualify-index-v6-ssd-scale.sh
+```
+
+Each offered-rate cell starts with fresh durable state and walks the ascending
+open-loop rate ladder (smoke: 100, 1,000; sustained: 1,000, 5,000, 10,000,
+20,000, 40,000 operations/s by default). It stops an axis at the first
+capacity-limit result, but treats correctness/workload failure as a failed run,
+not a capacity figure. A sustainable cell requires the public correctness and
+responsiveness gates plus a concurrent-phase source-lag slope no greater than
+`KELDRA_V6_SCALE_MAX_LAG_SLOPE_RECORDS_PER_SECOND` (default 1). The small
+object floor uses at least 1 KiB payloads. Sustained mode additionally runs a
+96 KiB pathological source-object stream at D1/P1 and the largest resource
+cell; it deliberately does not multiply that payload into D/P scale. Configure
+both through `KELDRA_V6_SCALE_OBJECT_SIZE_MATRIX`.
+
+Before any performance cell, a separate fresh-state public-API preflight proves
+exact and range predicates, explicit ordering, facets, aggregates, and
+full-text search. Its state is destroyed before the D/P/W/memory matrix, so
+those extra capability recipes cannot contaminate the measured physical-work
+axis. Failure aborts the run and its report is embedded in the final evidence.
+
+Each summary reports offered, accepted, checkpointed-source, and end-to-end
+indexed operations/s; accepted source bytes/s; both accepted and checkpointed
+source rates per indexing core and per 256 MiB; lag
+slope; drain; concurrent query latency; publication visibility; sampled
+CPU/RSS; process write bytes (which cover WAL and RocksDB store writes); and
+final durable-store bytes. It separately records definition creation seconds,
+definitions created/s, and recipe-spanning qualified-activation seconds, so
+D250K catalog admission is never folded into steady ingestion. The runner never estimates projected-byte
+throughput from input payload size. A development record may explicitly mark
+that value `null`, with its missing telemetry provenance, but it is not
+qualification evidence. A final v6 qualification requires two
+concurrent-phase `keldra_index_v6_summary` samples and derives source,
+selected, prepared, projected, sealed, and checkpointed rows/bytes per second
+from their cumulative counters. Every required rate must be positive; missing,
+malformed, unchanged, or regressing summary evidence fails the cell. Raw driver
+progress, process samples, VM samples, server logs, and the complete public
+report remain beside the summary and are packaged as a SHA-256 sidecar archive.
+
+Catalog cardinality D250K is qualified separately with
+`scripts/qualify-index-catalog.sh`; the contention matrix does not conflate
+catalog admission/restart cost with sustained physical indexing throughput.
+
+## Historical Docker comparison evidence (continued)
+
 Run the sustained matrix through the same split topology:
 
 ```bash
@@ -38,7 +132,8 @@ KELDRA_INDEX_CONTENTION_TOPOLOGY=single \
 KELDRA_INDEX_CONTENTION_BASELINE_SECONDS=120 \
 KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS=600 \
 KELDRA_INDEX_CONTENTION_POST_SECONDS=120 \
-KELDRA_INDEX_CONTENTION_MATRIX=1,4,16,64 \
+KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX=1,64,1000 \
+KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT=1 \
   ./scripts/qualify-index-contention.sh
 ```
 
@@ -51,7 +146,7 @@ with a bounded load and increase it only after the prior run passes:
 KELDRA_IMAGE=keldra:qa-<commit> \
 KELDRA_INDEX_CONTENTION_MODE=sustained \
 KELDRA_INDEX_CONTENTION_TOPOLOGY=single \
-KELDRA_INDEX_CONTENTION_MATRIX=1 \
+KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX=1 \
 KELDRA_INDEX_CONTENTION_MUTATION_WORKERS=1 \
 KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=8 \
 KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=8 \
@@ -62,13 +157,13 @@ The evidence records all three settings. A result at one intensity must not be
 compared with another intensity as a before/after performance claim.
 
 The default mutation workload, `material-change`, changes an indexed generation
-on every update. The format-v5 projection-preserving path is qualified
+on every update. The v6 projection-preserving head-delta path is qualified
 separately with:
 
 ```bash
 KELDRA_IMAGE=keldra:qa-<commit> \
 KELDRA_INDEX_CONTENTION_MODE=sustained \
-KELDRA_INDEX_CONTENTION_MATRIX=1,4,16,64,256,640 \
+KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX=1,64,256,640 \
 KELDRA_INDEX_CONTENTION_MUTATION_WORKLOAD=projection-preserving \
 KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=100 \
   ./scripts/qualify-index-contention.sh
@@ -98,15 +193,16 @@ rate:
 ```bash
 KELDRA_IMAGE=keldra:qa-<commit> \
 KELDRA_INDEX_CONTENTION_MODE=sustained \
-KELDRA_INDEX_CONTENTION_MATRIX=1,4,16,64 \
+KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX=1,64,1000 \
 KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=1000 \
   ./scripts/qualify-index-contention.sh
 ```
 
 Omit the variable or set it to `disabled` for the saturated-queue workload.
-Matrix entries may be any unique integer from 1 through 1,024. `1,4,16,64`
-remains the legacy comparison matrix, while D640 is the required tenfold
-active-fan-out gate for the replacement design.
+Matrix entries may be any unique integer from 1 through 250,000. Physical
+recipes are independently bounded to 64. `1,4,16,64` remains the historical
+comparison matrix; v6 qualification separates D cardinality from P physical
+work rather than treating either as a proxy for the other.
 
 For supplementary three-node Docker evidence, use:
 
@@ -117,7 +213,7 @@ KELDRA_INDEX_CONTENTION_TOPOLOGY=three \
 KELDRA_INDEX_CONTENTION_BASELINE_SECONDS=120 \
 KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS=600 \
 KELDRA_INDEX_CONTENTION_POST_SECONDS=120 \
-KELDRA_INDEX_CONTENTION_MATRIX=1,4,16,64 \
+KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX=1,64,1000 \
   ./scripts/qualify-index-contention.sh
 ```
 
@@ -173,10 +269,11 @@ correctness, workload validity, and the configured responsiveness gate.
 
 ## Evidence and monitoring
 
-By default, evidence is written below the shared checkout root at
-`releases/keldra/index-contention/<run-id>`. Override this with
-`KELDRA_INDEX_CONTENTION_EVIDENCE_ROOT`. The stable `latest` symlink identifies
-the active or most recent run.
+The Docker contention wrapper defaults to the shared checkout release evidence
+directory and may be redirected with `KELDRA_INDEX_CONTENTION_EVIDENCE_ROOT`.
+For every remote v6 run, use the direct SSD runner above: it has no such
+override and writes only to `~/keldra_experiments/results/index-v6-scale/`.
+The stable `latest` symlink identifies the active or most recent run.
 
 Monitor an active run without reading credentials or attaching to the workload:
 
@@ -202,9 +299,9 @@ operation counters remain cumulative. `status.json` is replaced atomically
 after every lifecycle event. None of these files contains client credentials.
 
 The public API exposes definition IDs and freshness placement terms/indexes, but
-not the node currently executing each builder. The three-node report therefore
-records those public observations and the assignment-observability limitation;
-it must not infer per-node builder counts from total definitions.
+not each partition producer's current node assignment. The three-node report
+therefore records those public observations and the assignment-observability
+limitation; it must not infer per-node producer counts from cluster-wide D or P.
 
 When a baseline is supplied, `comparison.json` gives baseline, candidate, and
 candidate-minus-baseline p50/p95/p99/max values for concurrent ordinary-query

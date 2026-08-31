@@ -1,78 +1,29 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Single-node release qualification for non-index storage, authentication,
+# accounting, PersonalDB, S3, Git, and public-read behavior. Indexing is
+# qualified separately by scripts/qualify-index-v6-ssd-scale.sh.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
-source "${repo_root}/scripts/qualification-scale-evidence.sh"
 requested_image="${KELDRA_IMAGE:-keldra:0.15.0}"
 keep="${KELDRA_QUALIFICATION_KEEP:-0}"
 qualification_mode="${KELDRA_QUALIFICATION_MODE:-smoke}"
-index_disk_cache_bytes="${KELDRA_QUALIFICATION_INDEX_DISK_CACHE_BYTES:-1073741824}"
-index_memory_percent="${KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT:-20}"
-index_kind_budget_bytes="${KELDRA_QUALIFICATION_INDEX_KIND_BUDGET_BYTES:-268435456}"
-index_compaction_max_lanes="${KELDRA_QUALIFICATION_INDEX_COMPACTION_MAX_LANES:-4}"
-index_rayon_workers="${KELDRA_QUALIFICATION_INDEX_RAYON_WORKERS:-4}"
-index_projection_max_lanes="${KELDRA_QUALIFICATION_INDEX_PROJECTION_MAX_LANES:-${index_rayon_workers}}"
-# The default is a fast smoke. Set this to 839980 for the full
-# production-shaped, twelve-field corpus used by the resource qualification.
 case "${qualification_mode}" in
-  release)
-    index_resource_records="${KELDRA_QUALIFICATION_INDEX_RECORDS:-839980}"
-    require_performance_targets=1
-    ;;
-  smoke)
-    index_resource_records="${KELDRA_QUALIFICATION_INDEX_RECORDS:-16384}"
-    require_performance_targets=0
-    ;;
+  release|smoke) ;;
   *)
     echo "KELDRA_QUALIFICATION_MODE must be release or smoke" >&2
     exit 2
     ;;
 esac
-index_resource_mutations="${KELDRA_QUALIFICATION_INDEX_MUTATIONS:-512}"
-index_resource_max_anonymous_growth_bytes="${KELDRA_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES:-2147483648}"
-index_kinds=(Path MetadataFilter TypedJson FullText Vector Hybrid GitSource Tensor)
 qualification_examples=(
   accounting_qualification
-  atomic_index_qualification
-  cluster_index_qualification
+  atomic_program_qualification
   personaldb_qualification
   public_read_qualification
   s3_qualification
-  v06_index_resource_qualification
 )
 declare -A qualification_example_binaries=()
-
-for configured_limit in \
-  "${index_disk_cache_bytes}" \
-  "${index_memory_percent}" \
-  "${index_kind_budget_bytes}" \
-  "${index_compaction_max_lanes}" \
-  "${index_rayon_workers}" \
-  "${index_projection_max_lanes}" \
-  "${index_resource_records}" \
-  "${index_resource_mutations}" \
-  "${index_resource_max_anonymous_growth_bytes}"
-do
-  if [[ ! "${configured_limit}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "index qualification limits must be positive decimal integers" >&2
-    exit 2
-  fi
-done
-if ((index_memory_percent > 100)); then
-  echo "KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT must not exceed 100" >&2
-  exit 2
-fi
-case "${index_resource_records}" in
-  839980) index_resource_scope=release-corpus ;;
-  16384) index_resource_scope=smoke ;;
-  *) index_resource_scope=custom ;;
-esac
-if [[ "${qualification_mode}" == "release" \
-  && "${index_resource_scope}" != "release-corpus" ]]; then
-  echo "release qualification requires exactly 839980 resource records" >&2
-  exit 2
-fi
 
 case "${KELDRA_DOCKER_PLATFORM:-}" in
   "")
@@ -123,22 +74,6 @@ assert_source_tree_exact() {
   fi
 }
 assert_source_tree_exact
-native_architecture="$(uname -m)"
-hardware_logical_cpus="$(getconf _NPROCESSORS_ONLN)"
-hardware_memory_bytes="$({
-  awk '$1 == "MemTotal:" { printf "%.0f\n", $2 * 1024; found = 1 }
-       END { if (!found) exit 1 }' /proc/meminfo
-})"
-read -r qualification_filesystem_total_bytes qualification_filesystem_available_bytes \
-  < <(df -B1 --output=size,avail /var/tmp | awk 'NR == 2 { print $1, $2 }')
-if [[ ! "${hardware_logical_cpus}" =~ ^[1-9][0-9]*$ \
-  || ! "${hardware_memory_bytes}" =~ ^[1-9][0-9]*$ \
-  || ! "${qualification_filesystem_total_bytes}" =~ ^[1-9][0-9]*$ \
-  || ! "${qualification_filesystem_available_bytes}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "qualification could not derive the bounded host hardware summary" >&2
-  exit 2
-fi
-
 image_id="$("${repo_root}/scripts/resolve-docker-image-id.sh" "${requested_image}")"
 if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "qualification image did not resolve to an immutable sha256 digest" >&2
@@ -172,14 +107,6 @@ qualification_suffix="${qualification_dir##*.}"
 container_name="keldra-v090-single-${qualification_suffix}"
 data_dir="${qualification_dir}/data"
 signing_key="${qualification_dir}/token-signing-key"
-index_verification_state="${qualification_dir}/index-verification-state.json"
-index_qualification_log="${qualification_dir}/index-qualification.log"
-index_resource_qualification_log="${qualification_dir}/index-resource-qualification.log"
-index_resource_state="${qualification_dir}/index-resource-state.json"
-index_resource_bucket="index-resource-${qualification_suffix}"
-index_resource_report="/var/tmp/keldra-v090-single-index-resource-${qualification_suffix}.json"
-index_resource_observability_report="/var/tmp/keldra-v090-single-index-observability-${qualification_suffix}.json"
-index_resource_telemetry_prefix="/var/tmp/keldra-v090-single-index-telemetry-${qualification_suffix}"
 KELDRA_QUALIFICATION_STATE_DIR="${qualification_dir}"
 qualification_build_messages="${qualification_dir}/qualification-client-build.jsonl"
 container_started=0
@@ -306,24 +233,11 @@ docker run --rm --user 0 \
     /qualification/token-signing-key
 
 start_single_node() {
-  local profile="$1"
-  local -a profile_environment=()
-  case "${profile}" in
-    production-debt-default) ;;
-    four-segment-compaction)
-      profile_environment=(--env KELDRA_INDEX_MAX_SEGMENTS_PER_TIER=4)
-      ;;
-    *)
-      echo "unsupported single-node qualification profile ${profile}" >&2
-      return 1
-      ;;
-  esac
-
   docker run --detach \
     --name "${container_name}" \
     --platform "${platform}" \
     --publish 127.0.0.1::50051 \
-    --env RUST_LOG=info,keldra::index_runtime::cpu=warn,keldra::index_runtime::retention=debug,keldra::observability::runtime=debug \
+    --env RUST_LOG=info \
     --env KELDRA_LISTEN=0.0.0.0:50051 \
     --env KELDRA_PEER_LISTEN=127.0.0.1:50052 \
     --env KELDRA_DATA_DIR=/var/lib/keldra \
@@ -333,36 +247,6 @@ start_single_node() {
     --env KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=1000 \
     --env KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=600 \
     --env KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100 \
-    --env "KELDRA_INDEX_DISK_CACHE_BYTES=${index_disk_cache_bytes}" \
-    --env "KELDRA_INDEX_MEMORY_PERCENT=${index_memory_percent}" \
-    --env "KELDRA_INDEX_BUILDER_MEMORY_BYTES_PER_KIND=${index_kind_budget_bytes}" \
-    --env "KELDRA_INDEX_PATH_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "KELDRA_INDEX_PATH_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "KELDRA_INDEX_PATH_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "KELDRA_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "KELDRA_INDEX_METADATA_FILTER_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "KELDRA_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "KELDRA_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "KELDRA_INDEX_TYPED_JSON_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "KELDRA_INDEX_TYPED_JSON_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "KELDRA_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "KELDRA_INDEX_FULL_TEXT_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "KELDRA_INDEX_FULL_TEXT_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "KELDRA_INDEX_VECTOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "KELDRA_INDEX_VECTOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "KELDRA_INDEX_VECTOR_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "KELDRA_INDEX_HYBRID_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "KELDRA_INDEX_HYBRID_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "KELDRA_INDEX_HYBRID_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "KELDRA_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "KELDRA_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "KELDRA_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "KELDRA_INDEX_TENSOR_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-    --env "KELDRA_INDEX_TENSOR_COMPACTION_MAX_LANES=${index_compaction_max_lanes}" \
-    --env "KELDRA_INDEX_TENSOR_PROJECTION_MAX_LANES=${index_projection_max_lanes}" \
-    --env "KELDRA_INDEX_RAYON_WORKERS=${index_rayon_workers}" \
-    "${profile_environment[@]}" \
-    --env KELDRA_INDEX_MAX_RETAINED_COMMIT_REVISIONS=1 \
     --env KELDRA_RUN_SYSTEM_BOOTSTRAP=true \
     --volume "${data_dir}:/var/lib/keldra" \
     --volume "${signing_key}:/run/secrets/keldra-token-signing-key:ro" \
@@ -370,10 +254,7 @@ start_single_node() {
   container_started=1
 }
 
-# Scale and release-performance evidence is captured with the RFC's default
-# compaction-debt limits. The four-segment bound is installed only for the later
-# workload whose purpose is to force compaction for every public index kind.
-start_single_node production-debt-default
+start_single_node
 
 wait_for_bootstrap() {
   local attempt
@@ -452,119 +333,6 @@ container_logs_since() {
   fi
 }
 
-index_qualification_log_start=0
-
-capture_index_qualification_log_start() {
-  index_qualification_log_start="$(qualification_log_cursor)"
-}
-
-save_index_qualification_log() {
-  container_logs_since "${index_qualification_log_start}" \
-    >"${index_qualification_log}"
-  preserve_all_kind_telemetry "${index_qualification_log}" single "${qualification_suffix}"
-}
-
-assert_each_index_kind_published_and_compacted() {
-  local kind
-  local message
-  for kind in "${index_kinds[@]}"; do
-    for message in 'index commit published' 'format-v4 index segments compacted'; do
-      if ! awk -v kind="index.kind=${kind}" -v message="${message}" '
-          index($0, kind) && index($0, message) { found = 1 }
-          END { exit !found }
-        ' "${index_qualification_log}"
-      then
-        echo "${kind} emitted no public-API ${message} evidence" >&2
-        return 1
-      fi
-    done
-    if ! awk -v kind="index.kind=${kind}" '
-        index($0, kind) && index($0, "index compaction terminal metrics") &&
-        $0 ~ /histogram\.keldra_index_compaction_input_segments=([2-9]|[1-9][0-9]+)([[:space:]]|$)/ { found = 1 }
-        END { exit !found }
-      ' "${index_qualification_log}"
-    then
-      echo "${kind} emitted no terminal compaction evidence for at least two input segments" >&2
-      return 1
-    fi
-  done
-  echo "[keldra-single-qualification] all eight index kinds published and compacted from public mutations"
-}
-
-assert_index_compaction_observability() {
-  local -A observed_kinds=()
-  local budget_limit
-  local completed
-  local configured
-  local effective
-  local expected
-  local kind
-  local line
-  local peak_active
-  local range_limit
-  local ranges
-  local worker_limit
-  while IFS= read -r line; do
-    [[ "${line}" =~ index\.kind=(Path|MetadataFilter|TypedJson|FullText|Vector|Hybrid|GitSource|Tensor) ]] \
-      || continue
-    kind="${BASH_REMATCH[1]}"
-    configured="$(log_unsigned_field gauge.keldra_index_compaction_configured_lanes "${line}")" \
-      || continue
-    worker_limit="$(log_unsigned_field gauge.keldra_index_compaction_worker_limit "${line}")" \
-      || return 1
-    budget_limit="$(log_unsigned_field gauge.keldra_index_compaction_budget_limit "${line}")" \
-      || return 1
-    effective="$(log_unsigned_field compaction.effective_lanes "${line}")" \
-      || return 1
-    range_limit="$(log_unsigned_field gauge.keldra_index_compaction_range_limit "${line}")" \
-      || return 1
-    ranges="$(log_unsigned_field gauge.keldra_index_compaction_ranges_total "${line}")" \
-      || return 1
-    completed="$(log_unsigned_field gauge.keldra_index_compaction_ranges_completed "${line}")" \
-      || return 1
-    peak_active="$(log_unsigned_field gauge.keldra_index_compaction_peak_active_lanes "${line}")" \
-      || return 1
-    expected="${index_compaction_max_lanes}"
-    ((worker_limit < expected)) && expected="${worker_limit}"
-    ((budget_limit < expected)) && expected="${budget_limit}"
-    if unsigned_decimal_less_than "${range_limit}" "${expected}"; then
-      expected="${range_limit}"
-    fi
-    if ((configured != index_compaction_max_lanes \
-      || worker_limit != index_rayon_workers \
-      || budget_limit < 1 \
-      || ranges < 1 \
-      || effective != expected \
-      || peak_active < 1 \
-      || peak_active > effective \
-      || completed != ranges)) \
-      || ! unsigned_decimal_is_positive "${range_limit}" \
-      || [[ "${line}" != *"keldra.index.compaction"* ]]
-    then
-      echo "${kind} emitted inconsistent bounded compaction telemetry" >&2
-      printf '%s\n' "${line}" >&2
-      return 1
-    fi
-    if ((effective >= 2 && peak_active >= 2)); then observed_kinds["${kind}"]=1; fi
-  done < <(grep -F 'index compaction terminal metrics' "${index_qualification_log}" || true)
-  for kind in "${index_kinds[@]}"; do
-    if [[ -z "${observed_kinds[${kind}]:-}" ]]; then
-      echo "${kind} emitted no terminal compaction with at least two effective and concurrently active lanes" >&2
-      return 1
-    fi
-    if ! awk -v kind="index.kind=${kind}" '
-        index($0, kind) && index($0, "keldra.index.builder") &&
-        index($0, "index builder phase finished") { found = 1 }
-        END { exit !found }
-      ' "${index_qualification_log}"
-    then
-      echo "${kind} emitted no builder trace and completion log" >&2
-      return 1
-    fi
-  done
-  echo "[keldra-single-qualification] all eight index kinds emitted bounded range-compaction metrics and trace-backed completion logs"
-}
-
 run_public_read_qualification() {
   KELDRA_PUBLIC_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
   KELDRA_PUBLIC_QUALIFICATION_TENANT="${tenant}" \
@@ -575,669 +343,10 @@ run_public_read_qualification() {
   echo "[keldra-single-qualification] public-read qualification passed"
 }
 
-run_index_qualification() {
-  capture_index_qualification_log_start
-  KELDRA_INDEX_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
-  KELDRA_INDEX_QUALIFICATION_TENANT="${tenant}" \
-  KELDRA_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
-  KELDRA_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
-  KELDRA_INDEX_QUALIFICATION_REQUIRE_QUIESCENCE=1 \
-  KELDRA_INDEX_QUALIFICATION_STATE_OUTPUT="${index_verification_state}" \
-    "${qualification_example_binaries[cluster_index_qualification]}"
-  test -s "${index_verification_state}"
-  save_index_qualification_log
-  assert_each_index_kind_published_and_compacted
-  assert_index_compaction_observability
-  echo "[keldra-single-qualification] all-eight-index qualification passed"
-}
-
-verify_existing_indexes() {
-  KELDRA_INDEX_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
-  KELDRA_INDEX_QUALIFICATION_TENANT="${tenant}" \
-  KELDRA_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
-  KELDRA_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
-  KELDRA_INDEX_QUALIFICATION_STATE_INPUT="${index_verification_state}" \
-    "${qualification_example_binaries[cluster_index_qualification]}"
-  echo "[keldra-single-qualification] final committed views remained queryable after restart"
-}
-
-index_sparse_start_count() {
-  container_logs \
-    | grep -Fc 'index runtime starts from sparse assigned-definition state' \
-    || true
-}
-
-startup_scan_evidence_count() {
-  container_logs \
-    | grep -Fc 'keldra_startup_scan_evidence' \
-    || true
-}
-
-wait_for_sparse_index_startup() {
-  local minimum_count="$1"
-  local deadline=$((SECONDS + 90))
-  while (( $(index_sparse_start_count) < minimum_count \
-    || $(startup_scan_evidence_count) < minimum_count )); do
-    if ! docker inspect --format '{{.State.Running}}' "${container_name}" \
-      2>/dev/null | grep -Fxq true
-    then
-      echo "single-node qualification server exited during index startup" >&2
-      return 1
-    fi
-    if ((SECONDS >= deadline)); then
-      echo "single-node index runtime did not finish startup within 90 seconds" >&2
-      return 1
-    fi
-    sleep 1
-  done
-}
-
-assert_zero_global_startup_scan_evidence() {
-  local minimum_count="$1"
-  local count=0
-  local field
-  local line
-  local node_id
-  local value
-  while IFS= read -r line; do
-    node_id="$(log_unsigned_field node_id "${line}")" || {
-      echo "single-node startup scan evidence omitted node_id" >&2
-      return 1
-    }
-    if [[ "${node_id}" != "1" ]]; then
-      echo "single-node startup scan evidence reported node=${node_id}" >&2
-      return 1
-    fi
-    for field in \
-      global_object_head_scans_total \
-      global_index_artifact_scans_total \
-      global_blob_scans_total \
-      global_cache_scans_total
-    do
-      value="$(log_unsigned_field "${field}" "${line}")" || {
-        echo "single-node startup scan evidence omitted ${field}" >&2
-        return 1
-      }
-      if [[ "${value}" != "0" ]]; then
-        echo "single-node startup reported ${field}=${value}" >&2
-        return 1
-      fi
-    done
-    count=$((count + 1))
-  done < <(container_logs | grep -F 'keldra_startup_scan_evidence' || true)
-  if ((count < minimum_count)); then
-    echo "single-node startup emitted ${count} measured scan samples; expected at least ${minimum_count}" >&2
-    return 1
-  fi
-}
-
-assert_sparse_index_startup() {
-  local minimum_count="$1"
-  local observed
-  wait_for_sparse_index_startup "${minimum_count}"
-  observed="$(index_sparse_start_count)"
-  if ((observed < minimum_count)); then
-    echo "single-node startup omitted the sparse index-runtime marker" >&2
-    return 1
-  fi
-  if container_logs \
-    | grep -F 'index journals did not reach a clear initial definition barrier' \
-      >/dev/null
-  then
-    echo "single-node startup entered the removed global definition barrier" >&2
-    return 1
-  fi
-  assert_zero_global_startup_scan_evidence "${minimum_count}"
-}
-
-recreate_single_node() {
-  local next_profile="$1"
-  local completed_profile="$2"
-  local startup_evidence="/var/tmp/keldra-v090-single-startup-scans-${qualification_suffix}-${completed_profile}.log"
-
-  container_logs | preserve_startup_scan_evidence "${startup_evidence}"
-  docker stop --timeout 30 "${container_name}" >/dev/null
-  docker rm "${container_name}" >/dev/null
-  container_started=0
-  start_single_node "${next_profile}"
-  wait_for_bootstrap
-  assert_sparse_index_startup 1
-  public_endpoint="$(published_endpoint 50051 public)"
-  echo "[keldra-single-qualification] recreated persisted node profile=${next_profile} public=${public_endpoint}"
-}
-
-run_index_resource_qualification() {
-  local capture_cursor
-  local next_cursor
-  local resource_log_start
-  assert_source_tree_exact
-  resource_log_start="$(qualification_log_cursor)"
-  KELDRA_V06_RESOURCE_ENDPOINTS="${public_endpoint}" \
-  KELDRA_V06_RESOURCE_TENANT="${index_resource_tenant}" \
-  KELDRA_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
-  KELDRA_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
-  KELDRA_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
-  KELDRA_V06_RESOURCE_RECORDS="${index_resource_records}" \
-  KELDRA_V06_RESOURCE_MUTATIONS="${index_resource_mutations}" \
-  KELDRA_V06_RESOURCE_BATCH_SIZE=1000 \
-  KELDRA_V06_RESOURCE_WORKERS=4 \
-  KELDRA_V06_RESOURCE_VERIFICATION_WORKERS=8 \
-  KELDRA_V06_RESOURCE_CONTAINERS="${container_name}" \
-  KELDRA_V06_REQUIRE_RESOURCE_TARGETS=1 \
-  KELDRA_V06_KIND_BUDGET_BYTES="${index_kind_budget_bytes}" \
-  KELDRA_V06_INDEX_COMPACTION_MAX_LANES="${index_compaction_max_lanes}" \
-  KELDRA_V06_INDEX_PROJECTION_MAX_LANES="${index_projection_max_lanes}" \
-  KELDRA_V06_INDEX_RAYON_WORKERS="${index_rayon_workers}" \
-  KELDRA_V06_MAX_ANONYMOUS_GROWTH_BYTES="${index_resource_max_anonymous_growth_bytes}" \
-  KELDRA_V09_REQUIRE_PERFORMANCE_TARGETS="${require_performance_targets}" \
-  KELDRA_V09_EVIDENCE_SOURCE_COMMIT="${source_commit}" \
-  KELDRA_V09_EVIDENCE_CONTAINER_DIGEST="${image_id}" \
-  KELDRA_V09_EVIDENCE_NATIVE_ARCHITECTURE="${native_architecture}" \
-  KELDRA_V09_EVIDENCE_CONTAINER_PLATFORM="${container_platform}" \
-  KELDRA_V09_EVIDENCE_TOPOLOGY=single-node \
-  KELDRA_V09_EVIDENCE_NODE_COUNT=1 \
-  KELDRA_V09_EVIDENCE_HARDWARE_LOGICAL_CPUS="${hardware_logical_cpus}" \
-  KELDRA_V09_EVIDENCE_HARDWARE_MEMORY_BYTES="${hardware_memory_bytes}" \
-  KELDRA_V09_EVIDENCE_FILESYSTEM_TOTAL_BYTES="${qualification_filesystem_total_bytes}" \
-  KELDRA_V09_EVIDENCE_FILESYSTEM_AVAILABLE_BYTES="${qualification_filesystem_available_bytes}" \
-  KELDRA_V09_EVIDENCE_INDEX_DISK_CACHE_BYTES_PER_NODE="${index_disk_cache_bytes}" \
-  KELDRA_V09_EVIDENCE_INDEX_MEMORY_PERCENT_PER_NODE="${index_memory_percent}" \
-  KELDRA_V06_RESOURCE_OUTPUT="${index_resource_report}" \
-  KELDRA_V06_RESOURCE_STATE_OUTPUT="${index_resource_state}" \
-    "${qualification_example_binaries[v06_index_resource_qualification]}" \
-      >/dev/null
-  : >"${index_resource_qualification_log}"
-  capture_cursor="${resource_log_start}"
-  local attempt
-  for attempt in $(seq 1 12); do
-    next_cursor="$(qualification_log_cursor)"
-    container_logs_since "${capture_cursor}" "${next_cursor}" \
-      >>"${index_resource_qualification_log}"
-    capture_cursor="$(qualification_log_cursor_after "${next_cursor}")"
-    if grep -Fq 'sampled process resources' "${index_resource_qualification_log}" \
-      && grep -Fq 'sampled cgroup memory resources' "${index_resource_qualification_log}" \
-      && grep -Fq 'sampled RocksDB resources' "${index_resource_qualification_log}" \
-      && grep -Fq 'sampled source-journal safety and capacity' \
-        "${index_resource_qualification_log}" \
-      && grep -Fq 'sampled mutation receipt capacity' \
-        "${index_resource_qualification_log}"
-    then
-      break
-    fi
-    sleep 1
-  done
-  preserve_qualification_log \
-    "${index_resource_qualification_log}" "${index_resource_telemetry_prefix}.log"
-  test -s "${index_resource_report}"
-  test -s "${index_resource_state}"
-  grep -Eq "^[[:space:]]*\"records\":[[:space:]]*${index_resource_records},?[[:space:]]*$" \
-    "${index_resource_report}"
-  grep -Eq '^[[:space:]]*"indexed_fields":[[:space:]]*12,?[[:space:]]*$' \
-    "${index_resource_report}"
-  grep -Eq "^[[:space:]]*\"configured_compaction_max_lanes\":[[:space:]]*${index_compaction_max_lanes},?[[:space:]]*$" \
-    "${index_resource_report}"
-  jq -e \
-    --arg source_commit "${source_commit}" \
-    --arg container_digest "${image_id}" \
-    --arg native_architecture "${native_architecture}" \
-    --arg container_platform "${container_platform}" \
-    --argjson hardware_logical_cpus "${hardware_logical_cpus}" \
-    --argjson hardware_memory_bytes "${hardware_memory_bytes}" \
-    --argjson filesystem_total_bytes "${qualification_filesystem_total_bytes}" \
-    --argjson filesystem_available_bytes "${qualification_filesystem_available_bytes}" \
-    --argjson disk_cache_bytes "${index_disk_cache_bytes}" \
-    --argjson memory_percent "${index_memory_percent}" \
-    --argjson kind_budget_bytes "${index_kind_budget_bytes}" \
-    --argjson compaction_lanes "${index_compaction_max_lanes}" \
-    --argjson projection_lanes "${index_projection_max_lanes}" \
-    --argjson rayon_workers "${index_rayon_workers}" \
-    --argjson maximum_growth "${index_resource_max_anonymous_growth_bytes}" \
-    --argjson performance_targets_required "${require_performance_targets}" \
-    '
-      .schema == "keldra.index-resource-qualification.v2" and
-      .evidence.source_commit == $source_commit and
-      .evidence.resolved_container_digest == $container_digest and
-      .evidence.native_architecture == $native_architecture and
-      .evidence.container_platform == $container_platform and
-      .evidence.hardware.logical_cpus == $hardware_logical_cpus and
-      .evidence.hardware.memory_bytes == $hardware_memory_bytes and
-      .evidence.hardware.qualification_filesystem_total_bytes == $filesystem_total_bytes and
-      .evidence.hardware.qualification_filesystem_available_bytes_at_start == $filesystem_available_bytes and
-      .evidence.corpus.identity == "keldra.synthetic-index-resource.initial.v1" and
-      (.evidence.corpus.initial_corpus_sha256 | test("^sha256:[0-9a-f]{64}$")) and
-      .evidence.corpus.records == .records and
-      .evidence.corpus.indexed_fields == .indexed_fields and
-      .evidence.topology.kind == "single-node" and
-      .evidence.topology.node_count == 1 and
-      .evidence.topology.ingress_endpoint_count == 1 and
-      .evidence.durability.initial_writes == "LOCAL" and
-      .evidence.durability.updates == "LOCAL" and
-      .evidence.durability.deletes == "LOCAL" and
-      .evidence.execution.bulk_write_max_operations == .batch_size and
-      .evidence.execution.ingest_workers == .ingest_workers and
-      .evidence.execution.verification_workers == .verification_workers and
-      .evidence.resource_configuration.index_disk_cache_bytes_per_node == $disk_cache_bytes and
-      .evidence.resource_configuration.index_memory_percent_per_node == $memory_percent and
-      .evidence.resource_configuration.builder_memory_bytes_per_kind_per_node == $kind_budget_bytes and
-      .evidence.resource_configuration.compaction_max_lanes_per_kind == $compaction_lanes and
-      .evidence.resource_configuration.projection_max_lanes_per_kind == $projection_lanes and
-      .evidence.resource_configuration.projection_max_lanes_per_kind ==
-        .evidence.resource_configuration.rayon_workers_per_node and
-      .evidence.resource_configuration.rayon_workers_per_node == $rayon_workers and
-      .evidence.resource_configuration.maximum_anonymous_growth_bytes == $maximum_growth and
-      .evidence.resource_configuration.monitored_target_count == 1 and
-      .evidence.resource_configuration.resource_targets_required == true and
-      (.evidence.timer_boundaries | to_entries | all(.value | if type == "object" then (.starts | length > 0) and (.stops | length > 0) else length > 0 end)) and
-      .evidence.correctness.result == "pass" and
-      .evidence.correctness.source_complete_commit_revision_observed == true and
-      .evidence.correctness.source_complete_sources_observed == 1 and
-      .evidence.correctness.initial_exact_partition_verification == true and
-      .evidence.correctness.final_exact_partition_verification == true and
-      .evidence.correctness.update_and_delete_verification == true and
-      .evidence.correctness.resource_limits_passed == true and
-      .production_query_regression.schema == "keldra.index-production-query-regression.v2" and
-      .production_query_regression.corpus_records == .records and
-      .production_query_regression.index_id > 0 and
-      .production_query_regression.definition_version > 0 and
-      .production_query_regression.commit_revision > 0 and
-      .production_query_regression.physical_order == ["modified_day DESC", "record_id ASC"] and
-      .production_query_regression.incident_predicates == [
-        "withdrawn = false",
-        "active = true",
-        "ecosystem IN (cargo, npm, pypi)"
-      ] and
-      .production_query_regression.limit_four.returned_hits == 4 and
-      .production_query_regression.limit_four.exact_order == true and
-      .production_query_regression.consecutive_pages.requested_page_size == 999 and
-      .production_query_regression.consecutive_pages.page_one_hits == 999 and
-      .production_query_regression.consecutive_pages.page_two_hits == 999 and
-      .production_query_regression.consecutive_pages.continuation_token_bytes > 0 and
-      .production_query_regression.consecutive_pages.page_two_used_page_one_token == true and
-      .production_query_regression.consecutive_pages.exact_order == true and
-      .production_query_regression.consecutive_pages.overlap == 0 and
-      .production_query_regression.zero_hit_sparse_conjunction.returned_hits == 0 and
-      .production_query_regression.zero_hit_sparse_conjunction.exact_order == true and
-      .production_query_regression.unselective_arbitrary_sort.returned_hits == 4 and
-      .production_query_regression.unselective_arbitrary_sort.exact_order == true and
-      .evidence.correctness.performance_targets_required == ($performance_targets_required == 1) and
-      (if $performance_targets_required == 1
-       then .evidence.correctness.performance_targets_passed == true
-       else .evidence.correctness.performance_targets_passed == null
-       end)
-    ' "${index_resource_report}" >/dev/null
-  if ((require_performance_targets == 1)); then
-    jq -e '
-      .accepted_objects_per_second >= 3000 and
-      .source_complete_objects_per_second >= 1000
-    ' "${index_resource_report}" >/dev/null
-  fi
-  echo "[keldra-single-qualification] bounded index resource qualification passed scope=${index_resource_scope} records=${index_resource_records} kind_budget=${index_kind_budget_bytes} disk_cache=${index_disk_cache_bytes}"
-  echo "[keldra-single-qualification] preserved resource report ${index_resource_report}"
-}
-
-verify_index_resource_state() {
-  KELDRA_V06_RESOURCE_ENDPOINTS="${public_endpoint}" \
-  KELDRA_V06_RESOURCE_TENANT="${index_resource_tenant}" \
-  KELDRA_V06_RESOURCE_BUCKET="${index_resource_bucket}" \
-  KELDRA_V06_RESOURCE_CLIENT_ID="${index_resource_client}" \
-  KELDRA_V06_RESOURCE_CLIENT_SECRET="${index_resource_secret}" \
-  KELDRA_V06_RESOURCE_VERIFICATION_WORKERS=8 \
-  KELDRA_V06_RESOURCE_STATE_INPUT="${index_resource_state}" \
-    "${qualification_example_binaries[v06_index_resource_qualification]}"
-}
-
-assert_four_segment_typed_json_compaction_observability() {
-  local telemetry_log="$1"
-  local active
-  local budget_limit
-  local completed
-  local configured
-  local effective
-  local failures
-  local input_rate
-  local line
-  local output_rate
-  local peak_active
-  local range_limit
-  local ranges
-  local worker_limit
-  local terminal_found=0
-
-  production_compaction_peak_active_lanes=0
-  production_compaction_input_rate=0
-  production_compaction_output_rate=0
-
-  while IFS= read -r line; do
-    [[ "${line}" == *"index.kind=TypedJson"* ]] || continue
-    configured="$(log_unsigned_field gauge.keldra_index_compaction_configured_lanes "${line}")" \
-      || return 1
-    worker_limit="$(log_unsigned_field gauge.keldra_index_compaction_worker_limit "${line}")" \
-      || return 1
-    budget_limit="$(log_unsigned_field gauge.keldra_index_compaction_budget_limit "${line}")" \
-      || return 1
-    effective="$(log_unsigned_field compaction.effective_lanes "${line}")" \
-      || return 1
-    range_limit="$(log_unsigned_field gauge.keldra_index_compaction_range_limit "${line}")" \
-      || return 1
-    ranges="$(log_unsigned_field gauge.keldra_index_compaction_ranges_total "${line}")" \
-      || return 1
-    completed="$(log_unsigned_field gauge.keldra_index_compaction_ranges_completed "${line}")" \
-      || return 1
-    peak_active="$(log_unsigned_field gauge.keldra_index_compaction_peak_active_lanes "${line}")" \
-      || return 1
-    failures="$(log_unsigned_field monotonic_counter.keldra_index_compaction_failures_total "${line}")" \
-      || return 1
-    input_rate="$(log_number_field gauge.keldra_index_compaction_input_bytes_per_second "${line}")" \
-      || return 1
-    output_rate="$(log_number_field gauge.keldra_index_compaction_output_bytes_per_second "${line}")" \
-      || return 1
-    if ((configured != index_compaction_max_lanes \
-      || worker_limit != index_rayon_workers \
-      || budget_limit < index_compaction_max_lanes \
-      || effective > index_compaction_max_lanes \
-      || peak_active < 1 \
-      || peak_active > effective \
-      || ranges < 1 \
-      || completed != ranges \
-      || failures != 0)) \
-      || unsigned_decimal_less_than "${range_limit}" "${effective}"
-    then
-      echo "four-segment TypedJson compaction proof emitted inconsistent terminal telemetry" >&2
-      printf '%s\n' "${line}" >&2
-      return 1
-    fi
-    if ((effective == index_compaction_max_lanes \
-      && ranges >= index_compaction_max_lanes)) \
-      && ! unsigned_decimal_less_than \
-        "${range_limit}" "${index_compaction_max_lanes}"
-    then
-      production_compaction_configured_lanes="${configured}"
-      production_compaction_worker_limit="${worker_limit}"
-      production_compaction_budget_limit="${budget_limit}"
-      production_compaction_effective_lanes="${effective}"
-      production_compaction_range_limit="${range_limit}"
-      production_compaction_ranges_total="${ranges}"
-      production_compaction_ranges_completed="${completed}"
-      if ((peak_active > production_compaction_peak_active_lanes)); then
-        production_compaction_peak_active_lanes="${peak_active}"
-        production_compaction_input_rate="${input_rate}"
-        production_compaction_output_rate="${output_rate}"
-      fi
-      terminal_found=1
-    fi
-  done < <(
-    grep -F 'index compaction terminal metrics' \
-      "${telemetry_log}" || true
-  )
-  if ((terminal_found == 0)); then
-    echo "four-segment TypedJson compaction proof emitted no completed ${index_compaction_max_lanes}-lane compaction" >&2
-    return 1
-  fi
-
-  while IFS= read -r line; do
-    [[ "${line}" == *"index.kind=TypedJson"* ]] || continue
-    active="$(log_unsigned_field gauge.keldra_index_compaction_active_lanes "${line}")" \
-      || continue
-    effective="$(log_unsigned_field compaction.effective_lanes "${line}")" \
-      || continue
-    input_rate="$(log_number_field gauge.keldra_index_compaction_input_bytes_per_second "${line}")" \
-      || continue
-    output_rate="$(log_number_field gauge.keldra_index_compaction_output_bytes_per_second "${line}")" \
-      || continue
-    if ((active >= 2 && effective == index_compaction_max_lanes)) \
-      && { number_is_positive "${input_rate}" || number_is_positive "${output_rate}"; }
-    then
-      if ((active > production_compaction_peak_active_lanes)); then
-        production_compaction_peak_active_lanes="${active}"
-        production_compaction_input_rate="${input_rate}"
-        production_compaction_output_rate="${output_rate}"
-      fi
-    fi
-  done < <(
-    grep -F 'index compaction progress' "${telemetry_log}" || true
-  )
-  if ((production_compaction_peak_active_lanes < 2)); then
-    echo "four-segment TypedJson compaction proof showed no concurrent compaction" >&2
-    return 1
-  fi
-  echo "[keldra-single-qualification] four-segment TypedJson compaction used ${production_compaction_effective_lanes} effective lanes with ${production_compaction_peak_active_lanes} concurrently active"
-}
-
-assert_production_runtime_observability() {
-  local line
-
-  line="$(grep -F 'sampled process resources' "${index_resource_qualification_log}" | tail -n 1 || true)"
-  if [[ -z "${line}" ]] \
-    || [[ "$(log_unsigned_field gauge.keldra_process_memory_metrics_available "${line}" || true)" != "1" ]] \
-    || ! log_unsigned_field gauge.keldra_process_resident_memory_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_process_virtual_memory_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_process_threads "${line}" >/dev/null
-  then
-    echo "production qualification emitted no complete process resource sample" >&2
-    return 1
-  fi
-  production_process_samples="$(grep -Fc 'sampled process resources' "${index_resource_qualification_log}")"
-
-  line="$(grep -F 'sampled cgroup memory resources' "${index_resource_qualification_log}" | tail -n 1 || true)"
-  if [[ -z "${line}" ]] \
-    || [[ "$(log_unsigned_field gauge.keldra_cgroup_memory_metrics_available "${line}" || true)" != "1" ]] \
-    || ! log_unsigned_field gauge.keldra_cgroup_memory_current_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_cgroup_memory_limit_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_cgroup_memory_limited "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_cgroup_memory_peak_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_cgroup_memory_low_events "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_cgroup_memory_high_events "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_cgroup_memory_max_events "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_cgroup_memory_oom_events "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_cgroup_memory_oom_kill_events "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_cgroup_memory_oom_group_kill_events "${line}" >/dev/null
-  then
-    echo "production qualification emitted no complete cgroup resource sample" >&2
-    return 1
-  fi
-  production_cgroup_samples="$(grep -Fc 'sampled cgroup memory resources' "${index_resource_qualification_log}")"
-  assert_zero_cgroup_oom_samples \
-    "${index_resource_qualification_log}" "single-node production qualification"
-  assert_capacity_samples "${index_resource_qualification_log}" \
-    "single-node production qualification" 0
-  assert_zero_current_source_journal_progress_debt \
-    "${index_resource_qualification_log}" "single-node production qualification"
-
-  line="$(grep -F 'sampled RocksDB resources' "${index_resource_qualification_log}" | tail -n 1 || true)"
-  if [[ -z "${line}" ]] \
-    || ! log_unsigned_field gauge.keldra_rocksdb_block_cache_capacity_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_rocksdb_block_cache_usage_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_rocksdb_block_cache_pinned_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_rocksdb_write_buffer_capacity_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_rocksdb_write_buffer_usage_bytes "${line}" >/dev/null \
-    || ! log_unsigned_field gauge.keldra_rocksdb_unavailable_properties "${line}" >/dev/null
-  then
-    echo "production qualification emitted no complete RocksDB resource sample" >&2
-    return 1
-  fi
-  production_rocksdb_samples="$(grep -Fc 'sampled RocksDB resources' "${index_resource_qualification_log}")"
-  echo "[keldra-single-qualification] process, cgroup, and RocksDB operational signals were present during the production run"
-}
-
-write_index_resource_observability_report() {
-  printf '%s\n' \
-    '{' \
-    '  "schema": "keldra.index-resource-observability.v2",' \
-    '  "index_kind": "TypedJson",' \
-    '  "resource_profile": "production-compaction-debt-defaults",' \
-    '  "compaction_profile": "four-segment-compaction",' \
-    "  \"configured_lanes\": ${production_compaction_configured_lanes}," \
-    "  \"worker_limit\": ${production_compaction_worker_limit}," \
-    "  \"budget_limit\": ${production_compaction_budget_limit}," \
-    "  \"effective_lanes\": ${production_compaction_effective_lanes}," \
-    "  \"range_limit\": ${production_compaction_range_limit}," \
-    "  \"ranges_total\": ${production_compaction_ranges_total}," \
-    "  \"ranges_completed\": ${production_compaction_ranges_completed}," \
-    "  \"peak_active_lanes\": ${production_compaction_peak_active_lanes}," \
-    "  \"sample_input_bytes_per_second\": ${production_compaction_input_rate}," \
-    "  \"sample_output_bytes_per_second\": ${production_compaction_output_rate}," \
-    "  \"process_samples\": ${production_process_samples}," \
-    "  \"cgroup_samples\": ${production_cgroup_samples}," \
-    "  \"rocksdb_samples\": ${production_rocksdb_samples}" \
-    '}' >"${index_resource_observability_report}"
-  echo "[keldra-single-qualification] preserved observability report ${index_resource_observability_report}"
-}
-
-assert_all_kind_index_resource_bounds() {
-  local -A observed_kinds=()
-  local configured
-  local kind
-  local line
-  local observed=0
-  local leased
-  local peak_leased
-  while IFS= read -r line; do
-    if [[ "${line}" =~ index\.kind=(Path|MetadataFilter|TypedJson|FullText|Vector|Hybrid|GitSource|Tensor) ]]; then
-      kind="${BASH_REMATCH[1]}"
-    else
-      continue
-    fi
-    configured="$(log_unsigned_field gauge.keldra_index_construction_configured_bytes "${line}")" \
-      || continue
-    leased="$(log_unsigned_field gauge.keldra_index_construction_leased_bytes "${line}")" \
-      || return 1
-    peak_leased="$(log_unsigned_field gauge.keldra_index_construction_peak_leased_bytes "${line}")" \
-      || return 1
-    if ((configured != index_kind_budget_bytes \
-      || leased > configured \
-      || peak_leased > configured)); then
-      echo "single-node index construction exceeded or misstated its configured kind budget" >&2
-      printf '%s\n' "${line}" >&2
-      return 1
-    fi
-    observed_kinds["${kind}"]=1
-    observed=$((observed + 1))
-  done < <(
-    grep -F 'index construction budget state' "${index_qualification_log}" || true
-  )
-  if ((observed == 0)); then
-    echo "single-node index qualification emitted no construction budget evidence" >&2
-    return 1
-  fi
-  for kind in "${index_kinds[@]}"; do
-    if [[ -z "${observed_kinds[${kind}]:-}" ]]; then
-      echo "single-node qualification emitted no ${kind} construction budget evidence" >&2
-      return 1
-    fi
-  done
-
-  local -A resident_kinds=()
-  local resident
-  local workspace
-  while IFS= read -r line; do
-    [[ "${line}" =~ index\.kind=(Path|MetadataFilter|TypedJson|FullText|Vector|Hybrid|GitSource|Tensor) ]] \
-      || continue
-    kind="${BASH_REMATCH[1]}"
-    resident="$(log_unsigned_field gauge.keldra_index_construction_resident_bytes "${line}")" \
-      || return 1
-    workspace="$(log_unsigned_field gauge.keldra_index_construction_workspace_bytes "${line}")" \
-      || return 1
-    if ((resident == 0 || workspace == 0 || resident > workspace \
-      || workspace > index_kind_budget_bytes)); then
-      echo "${kind} emitted out-of-budget construction residency/workspace evidence" >&2
-      printf '%s\n' "${line}" >&2
-      return 1
-    fi
-    resident_kinds["${kind}"]=1
-  done < <(grep -F 'format-v4 index segment flushed' "${index_qualification_log}" || true)
-  for kind in "${index_kinds[@]}"; do
-    if [[ -z "${resident_kinds[${kind}]:-}" ]]; then
-      echo "single-node qualification emitted no ${kind} construction residency/workspace evidence" >&2
-      return 1
-    fi
-  done
-}
-
-assert_index_resource_bounds() {
-  local debt_byte_limit
-  local debt_evidence
-  local debt_segment_limit
-  local configured
-  local leased
-  local line
-  local peak_leased
-  local resident
-  local workspace
-  local resource_budget_evidence=0 resource_positive_peak_evidence=0
-  while IFS= read -r line; do
-    if [[ "${line}" != *"index.kind=TypedJson"* \
-      || "${line}" != *"index construction budget state"* ]]; then
-      continue
-    fi
-    configured="$(log_unsigned_field gauge.keldra_index_construction_configured_bytes "${line}")" \
-      || {
-      echo "production-shaped TypedJson build emitted malformed budget evidence" >&2
-      printf '%s\n' "${line}" >&2
-      return 1
-    }
-    leased="$(log_unsigned_field gauge.keldra_index_construction_leased_bytes "${line}")" \
-      || return 1
-    peak_leased="$(log_unsigned_field gauge.keldra_index_construction_peak_leased_bytes "${line}")" \
-      || return 1
-    if ((configured != index_kind_budget_bytes \
-      || leased > configured \
-      || peak_leased > configured)); then
-      echo "production-shaped TypedJson build exceeded or misstated its configured kind budget" >&2
-      printf '%s\n' "${line}" >&2
-      return 1
-    fi
-    if ((peak_leased > 0)); then resource_positive_peak_evidence=1; fi
-    resource_budget_evidence=$((resource_budget_evidence + 1))
-  done <"${index_resource_qualification_log}"
-  if ((resource_budget_evidence == 0 || resource_positive_peak_evidence == 0)); then
-    echo "production-shaped TypedJson build emitted no positive construction-budget evidence" >&2
-    return 1
-  fi
-
-  local resource_residency_evidence=0
-  while IFS= read -r line; do
-    [[ "${line}" == *"index.kind=TypedJson"* ]] || continue
-    resident="$(log_unsigned_field gauge.keldra_index_construction_resident_bytes "${line}")" \
-      || return 1
-    workspace="$(log_unsigned_field gauge.keldra_index_construction_workspace_bytes "${line}")" \
-      || return 1
-    if ((resident == 0 || workspace == 0 || resident > workspace \
-      || workspace > index_kind_budget_bytes)); then
-      echo "production-shaped TypedJson build exceeded its residency/workspace budget" >&2
-      printf '%s\n' "${line}" >&2
-      return 1
-    fi
-    resource_residency_evidence=$((resource_residency_evidence + 1))
-  done < <(grep -F 'format-v4 index segment flushed' "${index_resource_qualification_log}" || true)
-  if ((resource_residency_evidence == 0)); then
-    echo "production-shaped TypedJson build emitted no fresh residency/workspace evidence" >&2
-    return 1
-  fi
-  read -r debt_segment_limit debt_byte_limit debt_evidence \
-    < <(terminal_typed_json_debt "${index_resource_telemetry_prefix}")
-  if ((debt_segment_limit == 0 || debt_byte_limit == 0 || debt_evidence == 0)); then
-    echo "production-shaped TypedJson build emitted invalid terminal debt evidence" >&2
-    return 1
-  fi
-
-  local cache_bytes
-  cache_bytes="$(find "${data_dir}/index-cache" -type f -printf '%s\n' \
-    | awk '{ total += $1 } END { print total + 0 }')"
-  if ((cache_bytes > index_disk_cache_bytes)); then
-    echo "single-node disposable index cache exceeded its ${index_disk_cache_bytes}-byte budget: ${cache_bytes}" >&2
-    return 1
-  fi
-  assert_production_runtime_observability
-  echo "[keldra-single-qualification] preserved full production telemetry ${index_resource_telemetry_prefix}.log"
-  echo "[keldra-single-qualification] index construction and disk cache remained within configured bounds"
-}
-
 restart_populated_node() {
-  local before
   local deadline
   local elapsed
   local started
-  before="$(index_sparse_start_count)"
   started="${SECONDS}"
   docker restart "${container_name}" >/dev/null
   deadline=$((SECONDS + 30))
@@ -1246,7 +355,7 @@ restart_populated_node() {
     --env "KELDRA_CLIENT_SECRET=${owner_secret}" \
     "${container_name}" \
     keldra --endpoint http://127.0.0.1:50051 \
-      head "${tenant}" index-journal-events docs/a.json >/dev/null 2>&1
+      head "${tenant}" "${restart_probe_bucket}" fixtures/large.bin >/dev/null 2>&1
   do
     if ((SECONDS >= deadline)); then
       echo "populated single-node server did not resume public reads within 30 seconds" >&2
@@ -1256,67 +365,7 @@ restart_populated_node() {
   done
   public_endpoint="$(published_endpoint 50051 public)"
   elapsed=$((SECONDS - started))
-  container_logs | preserve_startup_scan_evidence \
-    "/var/tmp/keldra-v090-single-startup-scans-${qualification_suffix}.log"
-  assert_sparse_index_startup "$((before + 1))"
-  verify_existing_indexes
-  verify_index_resource_state
-  echo "[keldra-single-qualification] populated restart served in ${elapsed}s; sparse startup marker was present and no legacy definition barrier was reported"
-}
-
-assert_index_retention_converged() {
-  local deadline=$((SECONDS + 65))
-  local failed
-  local index_id
-  local pending
-  local -a index_ids=()
-  mapfile -t index_ids < <(
-    sed -n 's/^[[:space:]]*"index_id":[[:space:]]*\([1-9][0-9]*\),[[:space:]]*$/\1/p' \
-      "${index_verification_state}"
-  )
-  if ((${#index_ids[@]} != ${#index_kinds[@]})); then
-    echo "single-node verification state did not contain all eight index IDs" >&2
-    return 1
-  fi
-  while true; do
-    failed="$(
-      container_logs \
-        | grep -F 'bounded index retention work failed' \
-        | tail -n 1 || true
-    )"
-    if [[ -n "${failed}" ]]; then
-      echo "single-node index retention reported failed work" >&2
-      printf '%s\n' "${failed}" >&2
-      return 1
-    fi
-    pending=0
-    for index_id in "${index_ids[@]}"; do
-      if ! container_logs | awk -v marker="index.id=${index_id} " '
-          index($0, marker) && index($0, "bounded node-wide index retention tick completed") &&
-          $0 ~ /monotonic_counter.keldra_index_retention_artifacts_deleted_total=[1-9][0-9]*/ {
-            deleted = 1
-          }
-          deleted && index($0, marker) &&
-          index($0, "bounded node-wide index retention tick completed") &&
-          $0 ~ /gauge.keldra_index_retention_backlog=0/ {
-            converged = 1
-          }
-          END { exit !converged }
-        '
-      then
-        pending=$((pending + 1))
-      fi
-    done
-    if ((pending == 0)); then
-      echo "[keldra-single-qualification] bounded index retention deleted obsolete artifacts and drained its backlog"
-      return 0
-    fi
-    if ((SECONDS >= deadline)); then
-      echo "single-node index retention did not delete obsolete artifacts and drain its backlog within 65 seconds" >&2
-      return 1
-    fi
-    sleep 1
-  done
+  echo "[keldra-single-qualification] populated restart served ordinary reads in ${elapsed}s"
 }
 
 run_accounting_qualification() {
@@ -1329,14 +378,14 @@ run_accounting_qualification() {
   echo "[keldra-single-qualification] accounting qualification passed"
 }
 
-run_atomic_index_qualification() {
-  KELDRA_ATOMIC_INDEX_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
-  KELDRA_ATOMIC_INDEX_QUALIFICATION_TENANT="${tenant}" \
-  KELDRA_ATOMIC_INDEX_QUALIFICATION_BUCKET="atomic-index-single-${$}" \
-  KELDRA_ATOMIC_INDEX_QUALIFICATION_CLIENT_ID="${owner_client}" \
-  KELDRA_ATOMIC_INDEX_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
-    "${qualification_example_binaries[atomic_index_qualification]}"
-  echo "[keldra-single-qualification] atomic-program index visibility passed"
+run_atomic_program_qualification() {
+  KELDRA_ATOMIC_QUALIFICATION_ENDPOINTS="${public_endpoint}" \
+  KELDRA_ATOMIC_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_ATOMIC_QUALIFICATION_BUCKET="atomic-program-single-${$}" \
+  KELDRA_ATOMIC_QUALIFICATION_CLIENT_ID="${owner_client}" \
+  KELDRA_ATOMIC_QUALIFICATION_CLIENT_SECRET="${owner_secret}" \
+    "${qualification_example_binaries[atomic_program_qualification]}"
+  echo "[keldra-single-qualification] atomic multi-object program and replay passed"
 }
 
 assert_zero_accounting_traffic_drops() {
@@ -1383,7 +432,7 @@ run_personaldb_qualification() {
 }
 
 run_large_object_qualification() {
-  local bucket="large-single-${$}"
+  local bucket="${restart_probe_bucket}"
   local input="${qualification_dir}/large-input.bin"
   local before_restart="${qualification_dir}/large-before-restart.bin"
   local after_restart="${qualification_dir}/large-after-restart.bin"
@@ -1514,73 +563,36 @@ run_git_qualification() {
 }
 
 wait_for_bootstrap
-assert_sparse_index_startup 1
 
 tenant=qsingle
 owner_app=qsingle-owner
 owner_client=qsingle-client
 owner_secret=qualification-single-owner-secret-00000000000000000000
 provision_owner "${tenant}" "${owner_app}" "${owner_client}" "${owner_secret}"
-index_resource_tenant="${tenant}"
-index_resource_client="${owner_client}"
-index_resource_secret="${owner_secret}"
 s3_tenant=qsingle-s3
 s3_app=qsingle-s3-owner
 s3_client=qsingle-s3-client
 s3_secret=qualification-single-s3-secret-000000000000000000000
 
 public_endpoint="$(published_endpoint 50051 public)"
+restart_probe_bucket="large-single-${$}"
 
 echo "[keldra-single-qualification] node ready public=${public_endpoint}"
-case "${index_resource_scope}" in
-  release-corpus)
-    echo "[keldra-single-qualification] index resource scope=release-corpus records=839980 indexed_fields=12"
-    ;;
-  smoke)
-    echo "[keldra-single-qualification] index resource scope=smoke records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
-    ;;
-  custom)
-    echo "[keldra-single-qualification] index resource scope=custom records=${index_resource_records}; this does not satisfy the required 839980-record release-resource gate"
-    ;;
-esac
-
-# The exact release corpus is the first object workload on this fresh volume.
-# A smaller prior workload would retain objects, indexes, cache, and background
-# work and make the 839,980-record throughput evidence incomparable.
-run_exact_resource_scale_qualification single
-verify_index_resource_state
-
-# Four segments per tier is deliberately more aggressive than the production
-# default. Recreate the same persisted node with it only to force compaction in
-# the public all-eight-kind workload, then return to production defaults.
-recreate_single_node four-segment-compaction production-debt-default
-verify_index_resource_state
-run_index_qualification
-verify_index_resource_state
-assert_all_kind_index_resource_bounds
-if [[ "${qualification_mode}" == "release" ]]; then
-  assert_four_segment_typed_json_compaction_observability \
-    "${index_qualification_log}"
-  write_index_resource_observability_report
-fi
-recreate_single_node production-debt-default four-segment-compaction
-verify_index_resource_state
-verify_existing_indexes
+echo "[keldra-single-qualification] indexing is qualified separately by scripts/qualify-index-v6-ssd-scale.sh"
 
 run_large_object_qualification
 run_public_read_qualification
-run_atomic_index_qualification
+run_atomic_program_qualification
 restart_populated_node
 run_accounting_qualification
 run_personaldb_qualification
 provision_owner "${s3_tenant}" "${s3_app}" "${s3_client}" "${s3_secret}"
 run_s3_qualification
 run_git_qualification
-assert_index_retention_converged
 assert_zero_accounting_traffic_drops
 
 if [[ "${qualification_mode}" == "release" ]]; then
-  echo "[keldra-single-qualification] PASS scope=release-corpus records=${index_resource_records} image=${image_id} platform=${platform}"
+  echo "[keldra-single-qualification] PASS non-index release phases image=${image_id} platform=${platform}"
 else
-  echo "[keldra-single-qualification] SMOKE PASS records=${index_resource_records} image=${image_id} platform=${platform}"
+  echo "[keldra-single-qualification] SMOKE PASS non-index phases image=${image_id} platform=${platform}"
 fi

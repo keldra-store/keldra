@@ -2,7 +2,8 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{env, path::PathBuf, time::Duration};
 
-const MAX_QUALIFICATION_DEFINITIONS: usize = 1_024;
+const MAX_QUALIFICATION_DEFINITIONS: usize = 250_000;
+const MAX_QUALIFICATION_PHYSICAL_RECIPES: usize = 64;
 
 const PREFIX: &str = "KELDRA_INDEX_CONTENTION_";
 
@@ -40,6 +41,7 @@ pub struct Config {
     pub topology: String,
     pub durability: String,
     pub definition_count: usize,
+    pub physical_recipe_count: usize,
     pub stable_records: u64,
     pub mutable_records: u64,
     pub seed: u64,
@@ -75,6 +77,7 @@ pub struct PublicConfig {
     pub topology: String,
     pub durability: String,
     pub definition_count: usize,
+    pub physical_recipe_count: usize,
     pub stable_records: u64,
     pub mutable_records: u64,
     pub seed_hex: String,
@@ -107,6 +110,7 @@ impl Config {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let definition_count = number("DEFINITION_COUNT", 1)?;
+        let physical_recipe_count = number("PHYSICAL_RECIPE_COUNT", 1)?;
         let stable_records = number("STABLE_RECORDS", 64)?;
         let mutable_records = number("MUTABLE_RECORDS", 256)?;
         let mutation_workers = number("MUTATION_WORKERS", 4)?;
@@ -118,10 +122,7 @@ impl Config {
         let query_rate = number("QUERY_RATE", 20)?;
         let query_max_in_flight = number("QUERY_MAX_IN_FLIGHT", 64)?;
         ensure!(!endpoints.is_empty(), "at least one endpoint is required");
-        ensure!(
-            (1..=MAX_QUALIFICATION_DEFINITIONS).contains(&definition_count),
-            "definition count must be 1..={MAX_QUALIFICATION_DEFINITIONS}"
-        );
+        validate_scale(definition_count, physical_recipe_count)?;
         ensure!(
             (1..=1_000).contains(&stable_records),
             "stable records must be 1..=1000"
@@ -184,6 +185,7 @@ impl Config {
             topology,
             durability,
             definition_count,
+            physical_recipe_count,
             stable_records,
             mutable_records,
             seed: number("SEED", 0x6b65_6c64_7261_0016)?,
@@ -223,6 +225,7 @@ impl Config {
             topology: self.topology.clone(),
             durability: self.durability.clone(),
             definition_count: self.definition_count,
+            physical_recipe_count: self.physical_recipe_count,
             stable_records: self.stable_records,
             mutable_records: self.mutable_records,
             seed_hex: format!("0x{:016x}", self.seed),
@@ -246,6 +249,22 @@ impl Config {
             max_publication_visibility_p99_ms: self.max_publication_visibility_p99_ms,
         }
     }
+}
+
+fn validate_scale(definition_count: usize, physical_recipe_count: usize) -> Result<()> {
+    ensure!(
+        (1..=MAX_QUALIFICATION_DEFINITIONS).contains(&definition_count),
+        "definition count must be 1..={MAX_QUALIFICATION_DEFINITIONS}"
+    );
+    ensure!(
+        (1..=MAX_QUALIFICATION_PHYSICAL_RECIPES).contains(&physical_recipe_count),
+        "physical recipe count must be 1..={MAX_QUALIFICATION_PHYSICAL_RECIPES}"
+    );
+    ensure!(
+        physical_recipe_count <= definition_count,
+        "physical recipe count must not exceed definition count"
+    );
+    Ok(())
 }
 
 fn name(suffix: &str) -> String {
@@ -307,4 +326,19 @@ fn optional_positive(suffix: &str) -> Result<Option<f64>> {
         "{key} must be in 0..=1000000 or 'disabled'"
     );
     Ok(Some(parsed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_bounds_cover_catalog_and_physical_recipe_gates() {
+        assert!(validate_scale(250_000, 64).is_ok());
+        assert!(validate_scale(0, 1).is_err());
+        assert!(validate_scale(250_001, 1).is_err());
+        assert!(validate_scale(64, 0).is_err());
+        assert!(validate_scale(64, 65).is_err());
+        assert!(validate_scale(4, 16).is_err());
+    }
 }

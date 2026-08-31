@@ -10,7 +10,6 @@ use keldra::{
     ExplicitAuthoritativePaths, IndexRuntimeConfig, PluginGatewayConfig, ServerConfig,
     StoragePaths, serve,
 };
-use keldra_index::IndexKind;
 
 #[derive(Debug, Parser)]
 #[command(name = "keldra-server", version, about = "Keldra object server")]
@@ -186,205 +185,13 @@ struct Arguments {
     )]
     rate_limit_keyed_cleanup_interval: NonZeroU64,
 
-    /// Shared disposable index disk-cache budget in bytes (default: 10 GiB).
+    /// Bounded CPU workers in the partition-owned v6 index pipeline (default: 4).
     #[arg(
         long,
-        env = "KELDRA_INDEX_DISK_CACHE_BYTES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_DISK_CACHE_BYTES
+        env = "KELDRA_INDEXING_CORES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_INDEXING_CORES
     )]
-    index_disk_cache_bytes: u64,
-
-    /// Percentage of node memory bounding concurrent index block materialization (default: 10).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_MEMORY_PERCENT",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MEMORY_PERCENT
-    )]
-    index_memory_percent: u8,
-
-    /// Build/compaction fair share for each index kind (default: 256 MiB).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_BUILDER_MEMORY_BYTES_PER_KIND",
-        default_value_t = IndexRuntimeConfig::DEFAULT_BUILDER_MEMORY_BYTES_PER_KIND
-    )]
-    index_builder_memory_bytes_per_kind: u64,
-
-    /// Path builder-memory override; absent uses the common per-kind fallback.
-    #[arg(long, env = "KELDRA_INDEX_PATH_BUILDER_MEMORY_BYTES")]
-    index_path_builder_memory_bytes: Option<u64>,
-
-    /// Maximum parallel Path compaction lanes (default: 4).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_PATH_COMPACTION_MAX_LANES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
-    )]
-    index_path_compaction_max_lanes: u32,
-
-    #[arg(long, env = "KELDRA_INDEX_PATH_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
-    index_path_projection_max_lanes: u32,
-    #[arg(long, env = "KELDRA_INDEX_PATH_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
-    index_path_source_quantum_bytes: u64,
-    #[arg(long, env = "KELDRA_INDEX_PATH_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
-    index_path_external_sort_chunk_bytes: u64,
-
-    /// Metadata-filter builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_BUILDER_MEMORY_BYTES")]
-    index_metadata_filter_builder_memory_bytes: Option<u64>,
-
-    /// Maximum parallel Metadata-filter compaction lanes (default: 4).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_METADATA_FILTER_COMPACTION_MAX_LANES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
-    )]
-    index_metadata_filter_compaction_max_lanes: u32,
-
-    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
-    index_metadata_filter_projection_max_lanes: u32,
-    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
-    index_metadata_filter_source_quantum_bytes: u64,
-    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
-    index_metadata_filter_external_sort_chunk_bytes: u64,
-
-    /// Typed-JSON builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES")]
-    index_typed_json_builder_memory_bytes: Option<u64>,
-
-    /// Maximum parallel Typed-JSON compaction lanes (default: 4).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_TYPED_JSON_COMPACTION_MAX_LANES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
-    )]
-    index_typed_json_compaction_max_lanes: u32,
-
-    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
-    index_typed_json_projection_max_lanes: u32,
-    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
-    index_typed_json_source_quantum_bytes: u64,
-    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
-    index_typed_json_external_sort_chunk_bytes: u64,
-
-    /// Full-text builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_BUILDER_MEMORY_BYTES")]
-    index_full_text_builder_memory_bytes: Option<u64>,
-
-    /// Maximum parallel Full-text compaction lanes (default: 4).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_FULL_TEXT_COMPACTION_MAX_LANES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
-    )]
-    index_full_text_compaction_max_lanes: u32,
-
-    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
-    index_full_text_projection_max_lanes: u32,
-    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
-    index_full_text_source_quantum_bytes: u64,
-    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
-    index_full_text_external_sort_chunk_bytes: u64,
-
-    /// Vector builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "KELDRA_INDEX_VECTOR_BUILDER_MEMORY_BYTES")]
-    index_vector_builder_memory_bytes: Option<u64>,
-
-    /// Maximum parallel Vector compaction lanes (default: 4).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_VECTOR_COMPACTION_MAX_LANES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
-    )]
-    index_vector_compaction_max_lanes: u32,
-
-    #[arg(long, env = "KELDRA_INDEX_VECTOR_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
-    index_vector_projection_max_lanes: u32,
-    #[arg(long, env = "KELDRA_INDEX_VECTOR_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
-    index_vector_source_quantum_bytes: u64,
-    #[arg(long, env = "KELDRA_INDEX_VECTOR_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
-    index_vector_external_sort_chunk_bytes: u64,
-
-    /// Hybrid builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "KELDRA_INDEX_HYBRID_BUILDER_MEMORY_BYTES")]
-    index_hybrid_builder_memory_bytes: Option<u64>,
-
-    /// Maximum parallel Hybrid compaction lanes (default: 4).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_HYBRID_COMPACTION_MAX_LANES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
-    )]
-    index_hybrid_compaction_max_lanes: u32,
-
-    #[arg(long, env = "KELDRA_INDEX_HYBRID_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
-    index_hybrid_projection_max_lanes: u32,
-    #[arg(long, env = "KELDRA_INDEX_HYBRID_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
-    index_hybrid_source_quantum_bytes: u64,
-    #[arg(long, env = "KELDRA_INDEX_HYBRID_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
-    index_hybrid_external_sort_chunk_bytes: u64,
-
-    /// Git-source builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_BUILDER_MEMORY_BYTES")]
-    index_git_source_builder_memory_bytes: Option<u64>,
-
-    /// Maximum parallel Git-source compaction lanes (default: 4).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_GIT_SOURCE_COMPACTION_MAX_LANES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
-    )]
-    index_git_source_compaction_max_lanes: u32,
-
-    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
-    index_git_source_projection_max_lanes: u32,
-    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
-    index_git_source_source_quantum_bytes: u64,
-    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
-    index_git_source_external_sort_chunk_bytes: u64,
-
-    /// Tensor builder-memory override; absent uses the common fallback.
-    #[arg(long, env = "KELDRA_INDEX_TENSOR_BUILDER_MEMORY_BYTES")]
-    index_tensor_builder_memory_bytes: Option<u64>,
-
-    /// Maximum parallel Tensor compaction lanes (default: 4).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_TENSOR_COMPACTION_MAX_LANES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_COMPACTION_MAX_LANES
-    )]
-    index_tensor_compaction_max_lanes: u32,
-
-    #[arg(long, env = "KELDRA_INDEX_TENSOR_PROJECTION_MAX_LANES", default_value_t = IndexRuntimeConfig::DEFAULT_PROJECTION_MAX_LANES)]
-    index_tensor_projection_max_lanes: u32,
-    #[arg(long, env = "KELDRA_INDEX_TENSOR_SOURCE_QUANTUM_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_SOURCE_QUANTUM_BYTES)]
-    index_tensor_source_quantum_bytes: u64,
-    #[arg(long, env = "KELDRA_INDEX_TENSOR_EXTERNAL_SORT_CHUNK_BYTES", default_value_t = IndexRuntimeConfig::DEFAULT_EXTERNAL_SORT_CHUNK_BYTES)]
-    index_tensor_external_sort_chunk_bytes: u64,
-
-    /// Threads in Keldra's process-owned index CPU pool (default: 4).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_RAYON_WORKERS",
-        default_value_t = IndexRuntimeConfig::DEFAULT_RAYON_WORKERS
-    )]
-    index_rayon_workers: u32,
-
-    /// Maximum index queries executing concurrently on this node (default: 64).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_QUERY_MAX_CONCURRENCY",
-        default_value_t = IndexRuntimeConfig::DEFAULT_QUERY_MAX_CONCURRENCY
-    )]
-    index_query_max_concurrency: u32,
-
-    /// Cache-read bytes processed by one query before it cooperatively yields (default: 4 MiB).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_QUERY_WORK_QUANTUM_BYTES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_QUERY_WORK_QUANTUM_BYTES
-    )]
-    index_query_work_quantum_bytes: u64,
+    indexing_cores: u32,
 
     /// Query working-memory fair share (default: 512 MiB).
     #[arg(
@@ -394,115 +201,54 @@ struct Arguments {
     )]
     index_query_memory_bytes: u64,
 
-    /// Accounted cache and mapping workspace shared by index definitions.
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_SHARED_PROJECTION_MEMORY_BYTES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_SHARED_PROJECTION_MEMORY_BYTES
-    )]
-    index_shared_projection_memory_bytes: u64,
+    /// TypedJson memory-first indexing budget. Absent uses 256 MiB per indexing core.
+    #[arg(long, env = "KELDRA_INDEX_PIPELINE_MEMORY_BYTES")]
+    index_pipeline_memory_bytes: Option<u64>,
 
-    /// Hard aggregate heap ceiling shared by queries, projection, builders and compaction.
-    /// Absent uses the checked sum of every fair share.
+    /// Hard aggregate heap ceiling shared by queries and the v6 pipeline.
+    /// Absent uses their checked sum.
     #[arg(long, env = "KELDRA_INDEX_WORKING_MEMORY_BYTES")]
     index_working_memory_bytes: Option<u64>,
 
-    /// Fallback maximum segments retained in one size tier before builders compact (default: 64).
+    /// Maximum v6 LSM runs retained in one level before compaction (default: 64).
     #[arg(
         long,
-        env = "KELDRA_INDEX_MAX_SEGMENTS_PER_TIER",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_SEGMENTS_PER_TIER
+        env = "KELDRA_INDEX_LSM_MAX_RUNS_PER_LEVEL",
+        default_value_t = IndexRuntimeConfig::DEFAULT_LSM_MAX_RUNS_PER_LEVEL
     )]
-    index_max_segments_per_tier: u32,
+    index_lsm_max_runs_per_level: u32,
 
-    /// Fallback maximum encoded unmerged bytes in one size tier (default: 1 GiB).
+    /// Maximum v6 LSM unmerged bytes in one level (default: 1 GiB).
     #[arg(
         long,
-        env = "KELDRA_INDEX_MAX_UNMERGED_BYTES_PER_TIER",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_UNMERGED_BYTES_PER_TIER
+        env = "KELDRA_INDEX_LSM_MAX_UNMERGED_BYTES_PER_LEVEL",
+        default_value_t = IndexRuntimeConfig::DEFAULT_LSM_MAX_UNMERGED_BYTES_PER_LEVEL
     )]
-    index_max_unmerged_bytes_per_tier: u64,
+    index_lsm_max_unmerged_bytes_per_level: u64,
 
-    #[arg(long, env = "KELDRA_INDEX_PATH_MAX_SEGMENTS_PER_TIER")]
-    index_path_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "KELDRA_INDEX_PATH_MAX_UNMERGED_BYTES_PER_TIER")]
-    index_path_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_MAX_SEGMENTS_PER_TIER")]
-    index_metadata_filter_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "KELDRA_INDEX_METADATA_FILTER_MAX_UNMERGED_BYTES_PER_TIER")]
-    index_metadata_filter_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_MAX_SEGMENTS_PER_TIER")]
-    index_typed_json_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "KELDRA_INDEX_TYPED_JSON_MAX_UNMERGED_BYTES_PER_TIER")]
-    index_typed_json_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_MAX_SEGMENTS_PER_TIER")]
-    index_full_text_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "KELDRA_INDEX_FULL_TEXT_MAX_UNMERGED_BYTES_PER_TIER")]
-    index_full_text_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "KELDRA_INDEX_VECTOR_MAX_SEGMENTS_PER_TIER")]
-    index_vector_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "KELDRA_INDEX_VECTOR_MAX_UNMERGED_BYTES_PER_TIER")]
-    index_vector_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "KELDRA_INDEX_HYBRID_MAX_SEGMENTS_PER_TIER")]
-    index_hybrid_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "KELDRA_INDEX_HYBRID_MAX_UNMERGED_BYTES_PER_TIER")]
-    index_hybrid_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_MAX_SEGMENTS_PER_TIER")]
-    index_git_source_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "KELDRA_INDEX_GIT_SOURCE_MAX_UNMERGED_BYTES_PER_TIER")]
-    index_git_source_max_unmerged_bytes_per_tier: Option<u64>,
-    #[arg(long, env = "KELDRA_INDEX_TENSOR_MAX_SEGMENTS_PER_TIER")]
-    index_tensor_max_segments_per_tier: Option<u32>,
-    #[arg(long, env = "KELDRA_INDEX_TENSOR_MAX_UNMERGED_BYTES_PER_TIER")]
-    index_tensor_max_unmerged_bytes_per_tier: Option<u64>,
-
-    /// Accounted active-builder RAM which freezes a non-empty segment (default: 16 MiB).
+    /// Accounted v6 active-partition RAM which freezes a non-empty segment (default: 16 MiB).
     #[arg(
-        long,
-        env = "KELDRA_INDEX_SEGMENT_FLUSH_BYTES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_SEGMENT_FLUSH_BYTES
+        long = "index-flush-bytes",
+        env = "KELDRA_INDEX_FLUSH_BYTES",
+        default_value_t = IndexRuntimeConfig::DEFAULT_FLUSH_BYTES
     )]
     index_segment_flush_bytes: u64,
 
     /// Maximum age in milliseconds of a mutation in a non-empty active segment (default: 1000).
     #[arg(
-        long,
-        env = "KELDRA_INDEX_SEGMENT_FLUSH_MAX_AGE_MILLIS",
-        default_value_t = IndexRuntimeConfig::DEFAULT_SEGMENT_FLUSH_MAX_AGE_MILLIS
+        long = "index-flush-max-age-millis",
+        env = "KELDRA_INDEX_FLUSH_MAX_AGE_MILLIS",
+        default_value_t = IndexRuntimeConfig::DEFAULT_FLUSH_MAX_AGE_MILLIS
     )]
     index_segment_flush_max_age_millis: u64,
 
     /// Maximum complete mutation units accumulated in one segment (default: 65536).
     #[arg(
-        long,
-        env = "KELDRA_INDEX_SEGMENT_FLUSH_MAX_OPERATIONS",
-        default_value_t = IndexRuntimeConfig::DEFAULT_SEGMENT_FLUSH_MAX_OPERATIONS
+        long = "index-flush-max-operations",
+        env = "KELDRA_INDEX_FLUSH_MAX_OPERATIONS",
+        default_value_t = IndexRuntimeConfig::DEFAULT_FLUSH_MAX_OPERATIONS
     )]
     index_segment_flush_max_operations: u64,
-
-    /// Maximum committed revisions retained per index, including current (default: 3).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_MAX_RETAINED_COMMIT_REVISIONS",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_COMMIT_REVISIONS
-    )]
-    index_max_retained_commit_revisions: u32,
-
-    /// Maximum age of an obsolete committed revision in hours (default: 24).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_MAX_COMMIT_REVISION_AGE_HOURS",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_COMMIT_REVISION_AGE_HOURS
-    )]
-    index_max_commit_revision_age_hours: u64,
-
-    /// Maximum authoritative bytes retained across committed revisions per index (default: 50 GiB).
-    #[arg(
-        long,
-        env = "KELDRA_INDEX_MAX_RETAINED_COMMIT_BYTES",
-        default_value_t = IndexRuntimeConfig::DEFAULT_MAX_RETAINED_COMMIT_BYTES
-    )]
-    index_max_retained_commit_bytes: u64,
 
     #[arg(long, env = "KELDRA_MAX_BLOB_BYTES", default_value_t = 16 * 1024 * 1024 * 1024_u64)]
     max_blob_bytes: u64,
@@ -627,150 +373,36 @@ impl Arguments {
     }
 
     fn index_runtime_config(&self) -> Result<IndexRuntimeConfig> {
-        let config = IndexRuntimeConfig::new(
-            self.index_disk_cache_bytes,
-            self.index_memory_percent,
-            self.index_builder_memory_bytes_per_kind,
-            self.index_rayon_workers,
-            self.index_max_retained_commit_revisions,
-            self.index_max_commit_revision_age_hours,
-            self.index_max_retained_commit_bytes,
-        )
-        .context("validate index runtime configuration")?
-        .with_query_max_concurrency(self.index_query_max_concurrency)
-        .and_then(|config| {
-            config.with_query_work_quantum_bytes(self.index_query_work_quantum_bytes)
-        })
-        .and_then(|config| config.with_query_memory_bytes(self.index_query_memory_bytes))
-        .and_then(|config| {
-            config.with_shared_projection_memory_bytes(self.index_shared_projection_memory_bytes)
-        })
-        .and_then(|config| {
-            config.with_segment_flush_boundaries(
-                self.index_segment_flush_bytes,
-                self.index_segment_flush_max_age_millis,
-                self.index_segment_flush_max_operations,
-            )
-        })
-        .context("validate index runtime configuration")?;
-        let mut config = config;
-        for (
-            kind,
-            memory,
-            projection_lanes,
-            source_quantum,
-            sort_chunk,
-            compaction_lanes,
-            max_segments,
-            max_bytes,
-        ) in [
-            (
-                IndexKind::Path,
-                self.index_path_builder_memory_bytes,
-                self.index_path_projection_max_lanes,
-                self.index_path_source_quantum_bytes,
-                self.index_path_external_sort_chunk_bytes,
-                self.index_path_compaction_max_lanes,
-                self.index_path_max_segments_per_tier,
-                self.index_path_max_unmerged_bytes_per_tier,
-            ),
-            (
-                IndexKind::MetadataFilter,
-                self.index_metadata_filter_builder_memory_bytes,
-                self.index_metadata_filter_projection_max_lanes,
-                self.index_metadata_filter_source_quantum_bytes,
-                self.index_metadata_filter_external_sort_chunk_bytes,
-                self.index_metadata_filter_compaction_max_lanes,
-                self.index_metadata_filter_max_segments_per_tier,
-                self.index_metadata_filter_max_unmerged_bytes_per_tier,
-            ),
-            (
-                IndexKind::TypedJson,
-                self.index_typed_json_builder_memory_bytes,
-                self.index_typed_json_projection_max_lanes,
-                self.index_typed_json_source_quantum_bytes,
-                self.index_typed_json_external_sort_chunk_bytes,
-                self.index_typed_json_compaction_max_lanes,
-                self.index_typed_json_max_segments_per_tier,
-                self.index_typed_json_max_unmerged_bytes_per_tier,
-            ),
-            (
-                IndexKind::FullText,
-                self.index_full_text_builder_memory_bytes,
-                self.index_full_text_projection_max_lanes,
-                self.index_full_text_source_quantum_bytes,
-                self.index_full_text_external_sort_chunk_bytes,
-                self.index_full_text_compaction_max_lanes,
-                self.index_full_text_max_segments_per_tier,
-                self.index_full_text_max_unmerged_bytes_per_tier,
-            ),
-            (
-                IndexKind::Vector,
-                self.index_vector_builder_memory_bytes,
-                self.index_vector_projection_max_lanes,
-                self.index_vector_source_quantum_bytes,
-                self.index_vector_external_sort_chunk_bytes,
-                self.index_vector_compaction_max_lanes,
-                self.index_vector_max_segments_per_tier,
-                self.index_vector_max_unmerged_bytes_per_tier,
-            ),
-            (
-                IndexKind::Hybrid,
-                self.index_hybrid_builder_memory_bytes,
-                self.index_hybrid_projection_max_lanes,
-                self.index_hybrid_source_quantum_bytes,
-                self.index_hybrid_external_sort_chunk_bytes,
-                self.index_hybrid_compaction_max_lanes,
-                self.index_hybrid_max_segments_per_tier,
-                self.index_hybrid_max_unmerged_bytes_per_tier,
-            ),
-            (
-                IndexKind::GitSource,
-                self.index_git_source_builder_memory_bytes,
-                self.index_git_source_projection_max_lanes,
-                self.index_git_source_source_quantum_bytes,
-                self.index_git_source_external_sort_chunk_bytes,
-                self.index_git_source_compaction_max_lanes,
-                self.index_git_source_max_segments_per_tier,
-                self.index_git_source_max_unmerged_bytes_per_tier,
-            ),
-            (
-                IndexKind::Tensor,
-                self.index_tensor_builder_memory_bytes,
-                self.index_tensor_projection_max_lanes,
-                self.index_tensor_source_quantum_bytes,
-                self.index_tensor_external_sort_chunk_bytes,
-                self.index_tensor_compaction_max_lanes,
-                self.index_tensor_max_segments_per_tier,
-                self.index_tensor_max_unmerged_bytes_per_tier,
-            ),
-        ] {
-            config = config
-                .with_kind_limits(
-                    kind,
-                    memory.unwrap_or(self.index_builder_memory_bytes_per_kind),
-                    compaction_lanes,
+        let mut config = IndexRuntimeConfig::new(self.indexing_cores)
+            .context("validate v6 index runtime configuration")?
+            .with_query_memory_bytes(self.index_query_memory_bytes)
+            .and_then(|config| {
+                config.with_flush_boundaries(
+                    self.index_segment_flush_bytes,
+                    self.index_segment_flush_max_age_millis,
+                    self.index_segment_flush_max_operations,
                 )
-                .and_then(|config| config.with_kind_projection_max_lanes(kind, projection_lanes))
-                .and_then(|config| config.with_kind_source_quantum_bytes(kind, source_quantum))
-                .and_then(|config| config.with_kind_external_sort_chunk_bytes(kind, sort_chunk))
-                .and_then(|config| {
-                    config.with_kind_compaction_debt_limits(
-                        kind,
-                        max_segments.unwrap_or(self.index_max_segments_per_tier),
-                        max_bytes.unwrap_or(self.index_max_unmerged_bytes_per_tier),
-                    )
-                })
-                .context("validate index runtime configuration")?;
+            })
+            .and_then(|config| {
+                config.with_lsm_limits(
+                    self.index_lsm_max_runs_per_level,
+                    self.index_lsm_max_unmerged_bytes_per_level,
+                )
+            })
+            .context("validate v6 index runtime configuration")?;
+        if let Some(bytes) = self.index_pipeline_memory_bytes {
+            config = config
+                .with_pipeline_memory_bytes(bytes)
+                .context("validate v6 indexing pipeline memory configuration")?;
         }
         if let Some(bytes) = self.index_working_memory_bytes {
             config = config
                 .with_working_memory_bytes(bytes)
-                .context("validate aggregate index working-memory configuration")?;
+                .context("validate v6 aggregate index working-memory configuration")?;
         }
         config
             .working_memory_bytes()
-            .context("validate aggregate index working-memory configuration")?;
+            .context("validate v6 aggregate index working-memory configuration")?;
         Ok(config)
     }
 }
@@ -1032,195 +664,72 @@ mod tests {
     }
 
     #[test]
-    fn index_runtime_accepts_explicit_operator_limits() {
+    fn index_runtime_accepts_the_complete_v6_operator_matrix() {
         let config = parse(&[
-            "--index-disk-cache-bytes",
-            "1048576",
-            "--index-memory-percent",
-            "25",
-            "--index-builder-memory-bytes-per-kind",
-            "33554432",
-            "--index-path-builder-memory-bytes",
-            "67108864",
-            "--index-path-compaction-max-lanes",
-            "3",
-            "--index-path-projection-max-lanes",
-            "2",
-            "--index-path-source-quantum-bytes",
-            "8388608",
-            "--index-path-external-sort-chunk-bytes",
-            "4194304",
-            "--index-rayon-workers",
+            "--indexing-cores",
             "6",
-            "--index-query-max-concurrency",
-            "17",
-            "--index-query-work-quantum-bytes",
-            "1048576",
+            "--index-pipeline-memory-bytes",
+            "1610612736",
             "--index-query-memory-bytes",
             "268435456",
-            "--index-shared-projection-memory-bytes",
-            "134217728",
             "--index-working-memory-bytes",
-            "1073741824",
-            "--index-max-segments-per-tier",
+            "1879048192",
+            "--index-lsm-max-runs-per-level",
             "12",
-            "--index-max-unmerged-bytes-per-tier",
+            "--index-lsm-max-unmerged-bytes-per-level",
             "10485760",
-            "--index-segment-flush-bytes",
+            "--index-flush-bytes",
             "12582912",
-            "--index-segment-flush-max-age-millis",
+            "--index-flush-max-age-millis",
             "750",
-            "--index-segment-flush-max-operations",
+            "--index-flush-max-operations",
             "32768",
-            "--index-path-max-segments-per-tier",
-            "8",
-            "--index-path-max-unmerged-bytes-per-tier",
-            "5242880",
-            "--index-max-retained-commit-revisions",
-            "7",
-            "--index-max-commit-revision-age-hours",
-            "48",
-            "--index-max-retained-commit-bytes",
-            "2097152",
         ])
         .index_runtime_config()
         .unwrap();
-        assert_eq!(config.disk_cache_bytes(), 1_048_576);
-        assert_eq!(config.memory_percent(), 25);
-        assert_eq!(config.builder_memory_bytes_per_kind(), 33_554_432);
-        assert_eq!(config.builder_memory_bytes(IndexKind::Path), 67_108_864);
-        assert_eq!(config.compaction_max_lanes(IndexKind::Path), 3);
-        assert_eq!(config.projection_max_lanes(IndexKind::Path), 2);
-        assert_eq!(config.source_quantum_bytes(IndexKind::Path), 8_388_608);
-        assert_eq!(config.external_sort_chunk_bytes(IndexKind::Path), 4_194_304);
-        assert_eq!(
-            config.builder_memory_bytes(IndexKind::TypedJson),
-            33_554_432
-        );
-        assert_eq!(config.compaction_max_lanes(IndexKind::TypedJson), 4);
-        assert_eq!(config.rayon_workers(), 6);
-        assert_eq!(config.query_max_concurrency(), 17);
-        assert_eq!(config.query_work_quantum_bytes(), 1_048_576);
+        assert_eq!(config.indexing_cores(), 6);
+        assert_eq!(config.pipeline_memory_bytes(), 1_610_612_736);
         assert_eq!(config.query_memory_bytes(), 268_435_456);
-        assert_eq!(config.shared_projection_memory_bytes(), 134_217_728);
-        assert_eq!(config.working_memory_bytes().unwrap(), 1_073_741_824);
-        assert_eq!(config.max_segments_per_tier(IndexKind::Path), 8);
-        assert_eq!(
-            config.max_unmerged_bytes_per_tier(IndexKind::Path),
-            5_242_880
-        );
-        assert_eq!(config.max_segments_per_tier(IndexKind::TypedJson), 12);
-        assert_eq!(
-            config.max_unmerged_bytes_per_tier(IndexKind::TypedJson),
-            10_485_760
-        );
-        assert_eq!(config.segment_flush_bytes(IndexKind::Path), 12_582_912);
-        assert_eq!(config.segment_flush_max_age().as_millis(), 750);
-        assert_eq!(config.segment_flush_max_operations(IndexKind::Path), 32_768);
-        assert_eq!(config.max_retained_commit_revisions(), 7);
-        assert_eq!(config.max_commit_revision_age_hours(), 48);
-        assert_eq!(config.max_retained_commit_bytes(), 2_097_152);
+        assert_eq!(config.working_memory_bytes().unwrap(), 1_879_048_192);
+        assert_eq!(config.lsm_max_runs_per_level(), 12);
+        assert_eq!(config.lsm_max_unmerged_bytes_per_level(), 10_485_760);
+        assert_eq!(config.flush_bytes(), 12_582_912);
+        assert_eq!(config.flush_max_age().as_millis(), 750);
+        assert_eq!(config.flush_max_operations(), 32_768);
     }
 
     #[test]
-    fn index_runtime_rejects_zero_and_out_of_range_limits() {
+    fn index_runtime_rejects_zero_and_out_of_range_v6_limits() {
         for extra in [
-            vec!["--index-disk-cache-bytes", "0"],
-            vec!["--index-memory-percent", "0"],
-            vec!["--index-memory-percent", "101"],
-            vec!["--index-builder-memory-bytes-per-kind", "0"],
-            vec!["--index-vector-builder-memory-bytes", "0"],
-            vec!["--index-vector-projection-max-lanes", "0"],
-            vec!["--index-vector-source-quantum-bytes", "0"],
-            vec!["--index-vector-external-sort-chunk-bytes", "0"],
-            vec!["--index-vector-compaction-max-lanes", "0"],
-            vec!["--index-rayon-workers", "0"],
-            vec!["--index-query-max-concurrency", "0"],
-            vec!["--index-query-work-quantum-bytes", "0"],
+            vec!["--indexing-cores", "0"],
+            vec!["--index-pipeline-memory-bytes", "0"],
             vec!["--index-query-memory-bytes", "0"],
-            vec!["--index-max-segments-per-tier", "0"],
-            vec!["--index-max-unmerged-bytes-per-tier", "0"],
-            vec!["--index-segment-flush-bytes", "0"],
-            vec!["--index-segment-flush-max-age-millis", "0"],
-            vec!["--index-segment-flush-max-operations", "0"],
-            vec!["--index-vector-max-segments-per-tier", "0"],
-            vec!["--index-vector-max-unmerged-bytes-per-tier", "0"],
-            vec!["--index-max-retained-commit-revisions", "0"],
-            vec!["--index-max-commit-revision-age-hours", "0"],
-            vec!["--index-max-retained-commit-bytes", "0"],
+            vec!["--index-working-memory-bytes", "0"],
+            vec!["--index-lsm-max-runs-per-level", "0"],
+            vec!["--index-lsm-max-unmerged-bytes-per-level", "0"],
+            vec!["--index-flush-bytes", "0"],
+            vec!["--index-flush-max-age-millis", "0"],
+            vec!["--index-flush-max-operations", "0"],
         ] {
-            let error = parse(&extra).index_runtime_config().unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("validate index runtime configuration")
-            );
+            assert!(parse(&extra).index_runtime_config().is_err(), "{extra:?}");
         }
-
-        let error = parse(&["--index-working-memory-bytes", "0"])
-            .index_runtime_config()
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("validate aggregate index working-memory configuration")
-        );
     }
 
     #[test]
-    fn index_runtime_defaults_and_meaning_are_visible_in_help() {
+    fn help_exposes_only_the_v6_index_controls() {
         let help = Arguments::command().render_long_help().to_string();
-        for expected in [
-            "--index-disk-cache-bytes",
-            "default: 10 GiB",
-            "--index-memory-percent",
-            "default: 10",
-            "--index-builder-memory-bytes-per-kind",
-            "default: 256 MiB",
-            "--index-path-builder-memory-bytes",
-            "--index-path-compaction-max-lanes",
-            "--index-path-projection-max-lanes",
-            "--index-path-source-quantum-bytes",
-            "--index-path-external-sort-chunk-bytes",
-            "--index-tensor-builder-memory-bytes",
-            "--index-tensor-compaction-max-lanes",
-            "--index-tensor-projection-max-lanes",
-            "--index-tensor-source-quantum-bytes",
-            "--index-tensor-external-sort-chunk-bytes",
-            "--index-rayon-workers",
-            "--index-query-max-concurrency",
-            "--index-query-work-quantum-bytes",
+        for live in [
+            "--indexing-cores",
+            "--index-pipeline-memory-bytes",
             "--index-query-memory-bytes",
             "--index-working-memory-bytes",
-            "default: 512 MiB",
-            "default: 4",
-            "--index-max-segments-per-tier",
-            "default: 64",
-            "--index-max-unmerged-bytes-per-tier",
-            "default: 1 GiB",
-            "--index-segment-flush-bytes",
-            "default: 16 MiB",
-            "--index-segment-flush-max-age-millis",
-            "default: 1000",
-            "--index-segment-flush-max-operations",
-            "default: 65536",
-            "--index-path-max-segments-per-tier",
-            "--index-path-max-unmerged-bytes-per-tier",
-            "--index-tensor-max-segments-per-tier",
-            "--index-tensor-max-unmerged-bytes-per-tier",
-            "--source-journal-max-entries",
-            "--source-journal-max-bytes",
-            "--index-max-retained-commit-revisions",
-            "including current",
-            "--index-max-commit-revision-age-hours",
-            "default: 24",
-            "--index-max-retained-commit-bytes",
-            "default: 50 GiB",
+            "--index-lsm-max-runs-per-level",
+            "--index-lsm-max-unmerged-bytes-per-level",
+            "--index-flush-bytes",
+            "--index-flush-max-age-millis",
+            "--index-flush-max-operations",
         ] {
-            assert!(
-                help.contains(expected),
-                "help omitted `{expected}`:\n{help}"
-            );
+            assert!(help.contains(live), "help omitted {live}");
         }
     }
 }

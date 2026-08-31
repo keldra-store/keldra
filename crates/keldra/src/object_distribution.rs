@@ -25,6 +25,7 @@ use tonic::Status;
 
 use crate::cluster_placement::ClusterPlacement;
 use crate::data_peer::DataPeerTransport;
+use crate::index_runtime::hot_ingress::HotProjectionIngress;
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::payload_distribution::{
     PayloadDistribution, PayloadDistributionError, PayloadPeerTransport,
@@ -99,6 +100,7 @@ pub(crate) struct ObjectDistribution {
     references: ReferenceRuntimeHandle,
     reference_acknowledgement_timeout: Duration,
     mutation_admission: crate::mutation_admission::MutationAdmission,
+    hot_indexing: std::sync::Arc<std::sync::OnceLock<HotProjectionIngress>>,
 }
 
 impl ObjectDistribution {
@@ -132,6 +134,26 @@ impl ObjectDistribution {
             references,
             reference_acknowledgement_timeout,
             mutation_admission,
+            hot_indexing: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    pub(crate) fn install_hot_indexing(
+        &self,
+        ingress: HotProjectionIngress,
+    ) -> Result<(), &'static str> {
+        self.hot_indexing
+            .set(ingress)
+            .map_err(|_| "TypedJson hot indexing was installed more than once")
+    }
+
+    fn admit_hot_result(
+        &self,
+        pending: Option<crate::index_runtime::hot_ingress::PendingHotProjection>,
+        result: &Result<MutationReceipt, Status>,
+    ) {
+        if let (Some(ingress), Ok(receipt)) = (self.hot_indexing.get(), result) {
+            ingress.admit_committed(pending, receipt);
         }
     }
 
@@ -783,9 +805,12 @@ impl ObjectDistribution {
         governance: ObjectMutationGovernance,
         definition_intent: Option<DefinitionMutationIntent>,
     ) -> Result<MutationReceipt, Status> {
+        let hot = self.hot_indexing.get().and_then(|ingress| {
+            ingress.pending(governance.tenant_id, governance.bucket_id, &operation)
+        });
         if self.is_single_node()? {
             let _permit = self.mutation_admission.enter()?;
-            return match definition_intent {
+            let result = match definition_intent {
                 Some(intent) => {
                     self.store
                         .mutate_definition_with_governance_and_backpressure(
@@ -800,13 +825,15 @@ impl ObjectDistribution {
                 }
             }
             .map_err(mutation_status);
+            self.admit_hot_result(hot, &result);
+            return result;
         }
         // Seal a distributed inline payload once before any bounded-state
         // backpressure retries. Retries then copy only the compact descriptor.
         let operation = match operation {
             BatchOperation::Put(request) => {
                 let publish = stage_distributed_put(&self.store, request).await?;
-                return self
+                let result = self
                     .publish_from_source_with_governance_and_definition_intent(
                         publish,
                         self.local_node,
@@ -814,6 +841,8 @@ impl ObjectDistribution {
                         definition_intent,
                     )
                     .await;
+                self.admit_hot_result(hot, &result);
+                return result;
             }
             BatchOperation::Clone(_) => {
                 return Err(Status::unavailable(

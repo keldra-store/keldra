@@ -1,0 +1,4 @@
+[submodule "integrations/zanzibar"]
+	path = integrations/zanzibar
+	url = https://github.com/worka-ai/zanzibar.git
+	branch = main

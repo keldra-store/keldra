@@ -3,11 +3,18 @@
 Status: evidence-backed design investigation; replacement architecture approved
 by KELDRA-0020 and implementation in progress.
 
-This report explains why Keldra's current index runtime does not scale from one
-to many simultaneously affected logical definitions, and defines the minimum
-architecture and qualification needed for a tenfold scale increase. It is not
+> Historical evidence note: references below to v4/v5 artifacts, builders,
+> definition-local manifests, and their telemetry describe the superseded
+> system that established the redesign requirement. They are retained as
+> evidence, not supported v6 behavior or a fallback. The clean-break v6
+> architecture uses partition-owned memory-first pipelines, shared physical
+> recipes, partition roots/checkpoints, and no legacy reader or builder path.
+
+This report explains why the superseded index runtime did not scale from one
+to many simultaneously affected logical definitions, and records the minimum
+architecture and qualification adopted for a tenfold scale increase. It is not
 a claim that increasing a lane, lease, timeout, memory, or batch-size constant
-will solve the problem.
+would have solved that former design.
 
 ## Scope and target
 

@@ -4,6 +4,8 @@
 //! creates multiple definitions over one bucket so every definition consumes
 //! the same continuously mutating source journal.
 
+#[path = "index_contention_qualification/capabilities.rs"]
+mod capabilities;
 #[path = "index_contention_qualification/config.rs"]
 mod config;
 #[path = "index_contention_qualification/data.rs"]
@@ -28,8 +30,8 @@ use keldra_storage::v1::{
     QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
 };
 use keldra_storage::{
-    BearerToken, KeywordField, RawClient, TypedJsonIndexBuilder, UnsignedIntegerField,
-    administration_client, connect_channel, exchange_client_credentials, object_client,
+    BearerToken, KeywordField, RawClient, TypedJsonIndexBuilder, administration_client,
+    connect_channel, exchange_client_credentials, object_client,
 };
 use metrics::{Latencies, LatencyReport};
 use progress::Counters;
@@ -47,6 +49,7 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
+const MAX_ACTIVE_QUERY_DEFINITIONS: usize = 1_024;
 
 #[derive(Debug, Serialize)]
 struct Report {
@@ -57,7 +60,10 @@ struct Report {
     configuration: config::PublicConfig,
     corpus_sha256: String,
     index_definition_ids: Vec<u64>,
-    logical_schema_variants: usize,
+    definition_creation_seconds: f64,
+    qualified_definition_activation_seconds: f64,
+    qualified_definition_count: usize,
+    physical_recipe_count: usize,
     observed_source_node_ids: Vec<u64>,
     assignment_observability: &'static str,
     responsiveness_definition: &'static str,
@@ -144,17 +150,17 @@ struct MutationReport {
 struct CorrectnessReport {
     passed: bool,
     stable_oracle_checked_on_every_completed_query: bool,
-    final_canary_version_observed_by_every_definition: bool,
-    exact_mutable_versions_verified_by_every_definition: bool,
-    final_freshness_healthy_by_every_definition: bool,
-    advisory_zero_lag_verified_by_every_definition: Option<bool>,
+    final_canary_version_observed_by_every_qualified_definition: bool,
+    exact_mutable_versions_verified_by_every_qualified_definition: bool,
+    final_freshness_healthy_by_every_qualified_definition: bool,
+    advisory_zero_lag_verified_by_every_qualified_definition: Option<bool>,
     zero_query_correctness_errors: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct WorkloadValidityReport {
     passed: bool,
-    all_definitions_offered_in_every_phase: bool,
+    all_qualified_definitions_offered_in_every_phase: bool,
     sustained_nonempty_mutation_queue: bool,
     mutation_load_shape_valid: bool,
     mutation_requests_complete_and_successful: bool,
@@ -228,6 +234,11 @@ struct QueryOutcome {
 async fn main() -> Result<()> {
     let config = Arc::new(Config::from_env()?);
     let started_unix_milliseconds = unix_millis()?;
+    if std::env::var_os("KELDRA_INDEX_CONTENTION_CAPABILITY_ONLY").is_some() {
+        let report = capabilities::run(&config, started_unix_milliseconds).await?;
+        write_report(config.output.as_deref(), &report)?;
+        return Ok(());
+    }
     match run_qualification(config.clone(), started_unix_milliseconds).await {
         Ok(report) => {
             write_report(config.output.as_deref(), &report)?;
@@ -256,24 +267,48 @@ async fn main() -> Result<()> {
 }
 
 async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128) -> Result<Report> {
-    let corpus_sha256 =
-        data::corpus_digest(config.seed, config.stable_records, config.mutable_records);
+    let corpus_sha256 = data::corpus_digest(
+        config.seed,
+        config.stable_records,
+        config.mutable_records,
+        config.physical_recipe_count,
+    );
     let setup_channels = connect_all(&config.endpoints).await?;
     let token = fresh_token(&config, &setup_channels[0]).await?;
     setup(&config, &setup_channels[0], &token).await?;
 
+    let definition_creation_started = Instant::now();
     let definitions = create_definitions(&config, &setup_channels[0], &token).await?;
+    let definition_creation_seconds = definition_creation_started.elapsed().as_secs_f64();
+    let minimum_phase_schedules = config
+        .query_rate
+        .saturating_mul(
+            config
+                .baseline
+                .min(config.concurrent)
+                .min(config.post)
+                .as_secs(),
+        )
+        .max(config.physical_recipe_count as u64) as usize;
     let names = Arc::new(
-        (0..config.definition_count)
-            .map(data::index_name)
-            .collect::<Vec<_>>(),
+        qualification_definition_positions(
+            config.definition_count,
+            config.physical_recipe_count,
+            MAX_ACTIVE_QUERY_DEFINITIONS.min(minimum_phase_schedules),
+        )
+        .into_iter()
+        .map(data::index_name)
+        .collect::<Vec<_>>(),
     );
     let expected = Arc::new(
         (0..config.stable_records)
             .map(data::stable_path)
             .collect::<BTreeSet<_>>(),
     );
+    let definition_activation_started = Instant::now();
     wait_all_ready(&config, &names, &expected, &token).await?;
+    let qualified_definition_activation_seconds =
+        definition_activation_started.elapsed().as_secs_f64();
     let phase_token = fresh_token(&config, &setup_channels[0]).await?;
 
     // Query and mutation transports are separately established so client-side
@@ -385,9 +420,9 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     let publication_visibility_p99_passed = config
         .max_publication_visibility_p99_ms
         .is_none_or(|maximum| mutation_report.publication_visibility_lag.p99_ms <= maximum);
-    let all_definitions_offered = [&baseline, &concurrent, &post]
+    let all_qualified_definitions_offered = [&baseline, &concurrent, &post]
         .iter()
-        .all(|phase| phase.offered_definition_count == config.definition_count);
+        .all(|phase| phase.offered_definition_count == names.len());
     let sustained_nonempty_mutation_queue = mutation_report.queue_depth_samples > 0
         && mutation_report.minimum_sampled_queue_depth_while_producing > 0
         && mutation_report.queue_starvation_samples == 0;
@@ -398,7 +433,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         sustained_nonempty_mutation_queue
     };
     let correctness_passed = zero_query_correctness_errors && final_visible && final_state_verified;
-    let workload_passed = all_definitions_offered
+    let workload_passed = all_qualified_definitions_offered
         && mutation_load_shape_valid
         && mutation_requests_complete_and_successful;
     let responsiveness_passed = zero_query_request_errors_or_timeouts
@@ -407,7 +442,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         && publication_visibility_samples_complete
         && publication_visibility_p99_passed;
     let report = Report {
-        schema: "keldra.index-contention-qualification.v1",
+        schema: "keldra.index-contention-qualification.v2",
         started_unix_milliseconds,
         completed_unix_milliseconds: unix_millis()?,
         result: if correctness_passed && workload_passed && responsiveness_passed {
@@ -418,9 +453,12 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         configuration: config.public(),
         corpus_sha256,
         index_definition_ids: definitions,
-        logical_schema_variants: config.definition_count.min(2),
+        definition_creation_seconds,
+        qualified_definition_activation_seconds,
+        qualified_definition_count: names.len(),
+        physical_recipe_count: config.physical_recipe_count,
         observed_source_node_ids: observed.into_iter().collect(),
-        assignment_observability: "public APIs expose source node IDs and placement epochs, but not builder-to-node assignments; definition_count is cluster-wide work and is not labeled per-node concurrency",
+        assignment_observability: "public APIs expose source node IDs and placement epochs, but not partition-producer assignments; logical definition and physical recipe counts are cluster-wide and are not labeled as per-node concurrency",
         responsiveness_definition: "every offered open-loop schedule completes within request_timeout with no scheduler drop, request error, timeout, or oracle mismatch; visibility probes use request_timeout per query and a separate observation timeout; optional concurrent-query and publication-visibility p99 gates are applied when configured",
         baseline,
         concurrent,
@@ -430,15 +468,15 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         correctness: CorrectnessReport {
             passed: correctness_passed,
             stable_oracle_checked_on_every_completed_query: true,
-            final_canary_version_observed_by_every_definition: final_visible,
-            exact_mutable_versions_verified_by_every_definition: final_state_verified,
-            final_freshness_healthy_by_every_definition: final_state_verified,
-            advisory_zero_lag_verified_by_every_definition: advisory_zero_lag,
+            final_canary_version_observed_by_every_qualified_definition: final_visible,
+            exact_mutable_versions_verified_by_every_qualified_definition: final_state_verified,
+            final_freshness_healthy_by_every_qualified_definition: final_state_verified,
+            advisory_zero_lag_verified_by_every_qualified_definition: advisory_zero_lag,
             zero_query_correctness_errors,
         },
         workload_validity: WorkloadValidityReport {
             passed: workload_passed,
-            all_definitions_offered_in_every_phase: all_definitions_offered,
+            all_qualified_definitions_offered_in_every_phase: all_qualified_definitions_offered,
             sustained_nonempty_mutation_queue,
             mutation_load_shape_valid,
             mutation_requests_complete_and_successful,
@@ -479,7 +517,7 @@ async fn setup(config: &Config, channel: &Channel, token: &str) -> Result<()> {
         operations.push(put(
             config,
             data::stable_path(id),
-            data::payload(config.seed, id, "stable", 0),
+            data::payload(config.seed, id, "stable", 0, config.physical_recipe_count),
             format!("contention-initial-stable-{id}"),
         ));
     }
@@ -487,7 +525,7 @@ async fn setup(config: &Config, channel: &Channel, token: &str) -> Result<()> {
         operations.push(put(
             config,
             data::mutable_path(id),
-            data::payload(config.seed, id, "mutable", 0),
+            data::payload(config.seed, id, "mutable", 0, config.physical_recipe_count),
             format!("contention-initial-mutable-{id}"),
         ));
     }
@@ -497,7 +535,14 @@ async fn setup(config: &Config, channel: &Channel, token: &str) -> Result<()> {
             operations.push(put(
                 config,
                 data::marker_path(ordinal),
-                data::payload_with_generations(config.seed, id, "marker", 0, 0),
+                data::payload_with_generations(
+                    config.seed,
+                    id,
+                    "marker",
+                    0,
+                    0,
+                    config.physical_recipe_count,
+                ),
                 format!("contention-initial-marker-{ordinal}"),
             ));
         }
@@ -527,24 +572,15 @@ async fn create_definitions(config: &Config, channel: &Channel, token: &str) -> 
     let mut ids = Vec::with_capacity(config.definition_count);
     for position in 0..config.definition_count {
         let name = data::index_name(position);
-        let builder = TypedJsonIndexBuilder::new(&config.bucket, &name)
+        let recipe = physical_recipe(position, config.physical_recipe_count);
+        let request: CreateIndexRequest = TypedJsonIndexBuilder::new(&config.bucket, &name)
             .path_prefix("contention/")
-            .content_type(CONTENT_TYPE);
-        let request: CreateIndexRequest = if alternate_schema(position) {
-            builder
-                .field(KeywordField::single("category", "/class").exact())
-                .field(UnsignedIntegerField::single("document_id", "/record_id").exact())
-                .finish(format!("contention-create-{position}"))?
-        } else {
-            builder
-                .field(UnsignedIntegerField::single("record_id", "/record_id").exact())
-                .field(KeywordField::single("class", "/class").exact())
-                .field(UnsignedIntegerField::single("generation", "/generation").exact())
-                .finish(format!("contention-create-{position}"))?
-        };
-        let definition = client
-            .create_index(request)
+            .content_type(CONTENT_TYPE)
+            .field(KeywordField::multi("probe", recipe_probe_pointer(recipe)).exact())
+            .finish(format!("contention-create-{position}"))?;
+        let definition = tokio::time::timeout(config.request_timeout, client.create_index(request))
             .await
+            .with_context(|| format!("create index {name} exceeded request timeout"))?
             .with_context(|| format!("create index {name}"))?
             .into_inner();
         ensure!(definition.index_id != 0);
@@ -1044,6 +1080,7 @@ async fn execute_mutation(
                 "mutable",
                 job.sequence + 1,
                 config.mutation_record_bytes,
+                config.physical_recipe_count,
             ),
             MutationWorkload::ProjectionPreserving => data::payload_with_generations_at_least(
                 config.seed,
@@ -1052,6 +1089,7 @@ async fn execute_mutation(
                 0,
                 job.sequence + 1,
                 config.mutation_record_bytes,
+                config.physical_recipe_count,
             ),
         };
         bytes = bytes.saturating_add(payload.len() as u64);
@@ -1070,12 +1108,21 @@ async fn execute_mutation(
     };
     let marker_id = data::marker_id(marker_ordinal);
     let marker_payload = match config.mutation_workload {
-        MutationWorkload::MaterialChange => {
-            data::payload(config.seed, marker_id, "marker", job.sequence)
-        }
-        MutationWorkload::ProjectionPreserving => {
-            data::payload_with_generations(config.seed, marker_id, "marker", 0, job.sequence)
-        }
+        MutationWorkload::MaterialChange => data::payload(
+            config.seed,
+            marker_id,
+            "marker",
+            job.sequence,
+            config.physical_recipe_count,
+        ),
+        MutationWorkload::ProjectionPreserving => data::payload_with_generations(
+            config.seed,
+            marker_id,
+            "marker",
+            0,
+            job.sequence,
+            config.physical_recipe_count,
+        ),
     };
     bytes = bytes.saturating_add(marker_payload.len() as u64);
     operations.push(put(
@@ -1414,7 +1461,7 @@ async fn class_query(
         client,
         bucket,
         index_name,
-        query_field(index_name, "class", "category"),
+        "probe",
         serde_json::to_vec(class)?,
         limit,
     )
@@ -1427,13 +1474,13 @@ async fn marker_query(
     index_name: &str,
     sequence: u64,
 ) -> Result<QueryIndexResponse> {
-    let marker_id = (1u64 << 63) | sequence;
+    let marker_id = data::marker_id(sequence);
     query(
         client,
         bucket,
         index_name,
-        query_field(index_name, "record_id", "document_id"),
-        marker_id.to_string().into_bytes(),
+        "probe",
+        serde_json::to_vec(&data::marker_probe(marker_id))?,
         1,
     )
     .await
@@ -1530,19 +1577,39 @@ async fn fresh_token(config: &Config, channel: &Channel) -> Result<String> {
     .access_token)
 }
 
-fn alternate_schema(position: usize) -> bool {
-    position % 2 == 1
+fn physical_recipe(position: usize, physical_recipe_count: usize) -> usize {
+    position % physical_recipe_count
 }
 
-fn query_field<'a>(index_name: &str, regular: &'a str, alternate: &'a str) -> &'a str {
-    let position = index_name
-        .rsplit_once('-')
-        .and_then(|(_, suffix)| suffix.parse::<usize>().ok());
-    if position.is_some_and(alternate_schema) {
-        alternate
-    } else {
-        regular
+fn qualification_definition_positions(
+    definition_count: usize,
+    physical_recipe_count: usize,
+    maximum: usize,
+) -> Vec<usize> {
+    if definition_count <= maximum {
+        return (0..definition_count).collect();
     }
+    let mut positions = (0..physical_recipe_count).collect::<BTreeSet<_>>();
+    let remaining = maximum - physical_recipe_count;
+    if remaining == 0 {
+        return positions.into_iter().collect();
+    }
+    if remaining == 1 {
+        positions.insert(definition_count - 1);
+        return positions.into_iter().collect();
+    }
+    for ordinal in 0..remaining {
+        positions.insert(
+            physical_recipe_count
+                + ordinal.saturating_mul(definition_count - 1 - physical_recipe_count)
+                    / (remaining - 1),
+        );
+    }
+    positions.into_iter().collect()
+}
+
+fn recipe_probe_pointer(recipe: usize) -> String {
+    format!("/probes/{recipe:02}")
 }
 
 fn unix_millis() -> Result<u128> {
@@ -1560,22 +1627,35 @@ mod tests {
     }
 
     #[test]
-    fn queries_use_each_logical_schema_alias() {
-        assert_eq!(query_field("contention-000", "class", "category"), "class");
-        assert_eq!(
-            query_field("contention-001", "class", "category"),
-            "category"
-        );
+    fn recipes_use_one_public_multivalue_field_and_distinct_source_pointers() {
+        assert_eq!(recipe_probe_pointer(0), "/probes/00");
+        assert_eq!(recipe_probe_pointer(1), "/probes/01");
+        assert_eq!(recipe_probe_pointer(63), "/probes/63");
     }
 
     #[test]
-    fn alternate_schema_is_a_real_field_subset() {
-        assert!(!alternate_schema(0));
-        assert!(alternate_schema(1));
-        assert_eq!(
-            query_field("contention-001", "class", "category"),
-            "category"
-        );
+    fn p1_definitions_have_identical_physical_recipes() {
+        assert_eq!(physical_recipe(0, 1), 0);
+        assert_eq!(physical_recipe(249_999, 1), 0);
+    }
+
+    #[test]
+    fn recipe_identity_is_bounded_independently_of_definition_count() {
+        let recipes = (0..250_000)
+            .map(|position| physical_recipe(position, 64))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(recipes.len(), 64);
+        let pointers = (0..64).map(recipe_probe_pointer).collect::<BTreeSet<_>>();
+        assert_eq!(pointers.len(), 64);
+    }
+
+    #[test]
+    fn large_catalog_uses_a_bounded_spanning_query_sample() {
+        let positions = qualification_definition_positions(250_000, 64, 1_024);
+        assert_eq!(positions.len(), MAX_ACTIVE_QUERY_DEFINITIONS);
+        assert_eq!(positions[0], 0);
+        assert_eq!(*positions.last().unwrap(), 249_999);
+        assert!((0..64).all(|recipe| positions.contains(&recipe)));
     }
 
     #[test]

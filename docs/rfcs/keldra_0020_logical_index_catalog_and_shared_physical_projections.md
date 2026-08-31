@@ -1,126 +1,161 @@
-# KELDRA-0020: Logical Index Catalog and Shared Physical Projections
+# KELDRA-0020: Logical Index Catalog and Distributed Physical Projections
 
 Status: Accepted; implementation in progress
 
 Supersedes: KELDRA-0019 in full
 
-Amends: KELDRA-0013, KELDRA-0014, and KELDRA-0016 where they make one
-logical definition the unit of source consumption, physical segment ownership,
-manifest publication, checkpointing, scheduling, or rebuild
+Amends: KELDRA-0013, KELDRA-0014, and KELDRA-0016 wherever they make a
+logical definition, external builder, or global manifest the unit of source
+consumption, buffering, segment construction, publication, checkpointing,
+scheduling, rebuild, or retention
 
 Audience: Keldra implementors, operators, client authors, and reviewers
 
 ## 1. Decision
 
-Keldra separates a public logical index definition from the physical projection
-components which satisfy it. A logical definition is durable catalog metadata.
-It does not own an autonomous source-journal consumer, builder, mutable buffer,
-segment tree, manifest stream, checkpoint, or query cache.
+Keldra separates public logical index definitions from shared physical
+projections and builds those projections through a memory-first pipeline on
+every data node which owns an assigned source partition.
 
-Assigned source partitions consume their source journal once. A bounded writer
-projects each exact source version once, compares its canonical indexed state
-with the preceding projected state, and updates each distinct changed physical
-recipe once. Equivalent logical definitions reference the same physical state.
+A logical definition is durable catalog metadata. It owns no task, source
+cursor, mutable buffer, segment tree, publication timer, checkpoint, or query
+cache. Canonically equivalent definitions refer to the same physical recipes.
 
-The physical model has four layers:
+For each assigned source partition, the data node runs one bounded projection
+pipeline:
 
 ```text
-logical definition catalog
-        |
-        v
-canonical membership and field recipes
-        |
-        v
-source-partition writer and projected-document state
-        |
-        v
-immutable component segments + atomic projection generation
+committed object request bytes -> bounded FIFO/preparation cache ---+
+                                                                   |
+durable source journal -> one ordered checkpoint consumer ----------+
+                         |                                         |
+                         +-- cache miss -> exact storage load ------+
+                                                                   v
+                                                   prepared-row pipeline
+                                                                   |
+                                  normalize/tokenize/derive components once
+                                                                   |
+                                                partition accumulators
+                                                                   |
+                                      immutable segments/head deltas
+                                                                   |
+                                      partition root + checkpoint
 ```
 
-The public index-definition and query contracts remain logical. A query first
-resolves its authorized definition to an exact physical generation and field
-bindings. Shared bytes do not merge authorization domains or make another
-definition visible.
+Memory and CPU are the normal indexing path. The source journal and immutable
+ordinary source versions are the replay authority when memory is full or a
+process restarts. Keldra adds no mutation-by-mutation index WAL or durable queue.
 
-This is a clean derived-index format and ownership change. There is no dual
-writer, mixed physical generation, legacy physical reader, or artifact
-conversion path. Ordinary objects and retained source journals remain the
-rebuild authority. An upgrade discards incompatible derived index artifacts and
-rebuilds the new projections; it does not migrate them as authoritative data.
+There is no external index builder, elected definition builder, fallback
+builder, or central segment assembler. Every node can project the source
+partitions assigned to it. Publication changes only the assigned partition's
+root; normal flushes do not contend on a global manifest CAS.
 
-## 2. Why the previous unit is wrong
+Query nodes materialize a logical definition from a pinned vector of relevant
+partition roots. Initially they may use the existing native reader strategy,
+but write-path ownership and coordination do not depend on a future global
+query layout.
 
-KELDRA-0019 shared payload parsing but deliberately retained definition-local
-assembly and publication. Production-shaped D1, D16, and D64 profiling proved
-that parsing was not the dominant remaining cost. Equivalent definitions still
-independently read prior artifacts, update locators and live masks, seal
-segments, publish manifests, mutate references, materialize query cache files,
-and advance checkpoints.
+Typed JSON is the only admitted index kind for this milestone. Path, Metadata
+Filter, Full Text, Vector, Hybrid, Git Source, and Tensor fail definition
+admission before durable catalog or physical state is created. Each kind returns
+only after it implements this same partition-owned pipeline; none retains or
+falls back to the removed builder architecture.
 
-That makes work proportional to logical definition count even when additional
-definitions introduce no new indexed semantics. It also creates many short
-durable operations which queue behind the Store commit authority. The evidence
-and exact profiles are recorded in
-`../qualification/index-scale-investigation.md`.
+The canonical durable format and namespace are v6 partition roots, currents,
+segments, head deltas, and checkpoints. This is a clean break. There are no
+legacy readers, migrations, format converters, dual writers, compatibility
+shims, feature flags selecting the old builder path, or mixed old/new
+projection generations. Deployments start with fresh derived-index state and
+rebuild it from authoritative objects and retained journals.
 
-The corrected separation follows three proven lessons:
+## 2. Motivation and evidence
 
-1. PostgreSQL keeps index definitions and lifecycle state in catalogs. A
-   catalog row is not a permanent worker. A row update maintains only the
-   physical indexes it affects.
-2. PostgreSQL HOT avoids new index entries when indexed values did not change,
-   and follows a stable row indirection to the current tuple version.
-3. Lucene uses bounded writers, in-memory indexing buffers, immutable segments,
-   point-in-time reader generations, tombstones, and background merging.
+The previous architecture improved sharing but retained an independently
+scheduled builder lifecycle. Sustained SSD qualification failed even at an
+offered 100 mutations/s with one definition: exact visibility reached a
+24.445-second tail, concurrent-query p99 exceeded four seconds, and post-write
+query p99 exceeded six seconds. Correctness held, but service time grew as
+immutable projection history accumulated.
 
-Keldra adopts those ownership and lifecycle principles without adopting
-PostgreSQL's heap format, Lucene's file format, or Elasticsearch's
-logical-index-to-shard mapping.
+One defect reopened projection history once per source record. Batching reduced
+that multiplicative cost, but the architecture still rediscovered accepted
+mutations after commit, accumulated historical comparison streams, published
+many small boundaries, and made freshness depend on a scheduler revisiting a
+builder. Runtime compaction would bound one symptom without removing those
+costs.
+
+The replacement follows four principles:
+
+1. Logical definitions are catalog entries, not workers.
+2. Source bytes already resident at ingestion are the cheapest projection
+   input and should be reduced immediately to required typed fields.
+3. The existing durable journal is sufficient recovery authority; duplicating
+   it into an indexing WAL adds write amplification without adding correctness.
+4. Immutable segments and partition-local LSM compaction amortize persistence;
+   per-mutation physical publication does not.
+
+The target is work proportional to source bytes and distinct changed physical
+recipes, with throughput increasing as administrators allocate indexing CPU and
+memory. Logical-definition cardinality must not multiply physical work.
 
 ## 3. Vocabulary
 
-**Logical definition** is the public named index contract: source scope, public
-field names, query capabilities, authorization, definition version, and
-lifecycle state.
+**Logical definition** is the authorized public index contract: source scope,
+public field names, query capabilities, definition version, and lifecycle.
 
-**Source partition** is the existing authoritative journal and object-placement
-scope over which one assigned projection writer consumes ordered changes.
+**Physical recipe** is the canonical, complete semantic description of one
+membership or field representation, including selection, type, normalization,
+analysis, cardinality, collation, date handling, capabilities, and codec
+version.
 
-**Document universe** is the stable mapping between a source record identity
-and a physical document identity within one source partition.
+**Projection family** is the shared document universe and physical recipes for
+one tenant/bucket source scope.
 
-**Membership recipe** is the canonical semantic rule deciding whether a source
-record belongs to a logical view. Identical membership semantics share one
-physical membership component.
+**Source partition** is an existing object-placement and source-journal scope
+with one ordered authoritative mutation stream and one assigned projection
+owner at a placement epoch.
 
-**Field recipe** is the canonical semantic rule selecting, normalizing, and
-encoding one indexed value. Identical field semantics share one physical field
-component.
+**Prepared row** is the compact, byte-accounted, non-authoritative in-memory
+result of extracting only required physical values from an exact source
+mutation. It excludes unindexed payload bytes.
 
-**Projection family** is one source partition's document universe plus its set
-of referenced membership and field recipes.
+**Preparation cache** is a bounded FIFO keyed by exact source identity/version.
+It holds resident payload bytes or an asynchronously derived prepared row until
+the ordered journal consumer reaches that mutation. It is not a queue of
+authoritative work and owns no checkpoint.
 
-**Projected-document state** is disposable, rebuildable state containing the
-last exact canonical membership and field values for a stable source record.
-It is used to decide which physical recipes actually changed.
+**Replay path** reconstructs the same prepared row from the durable journal and
+exact retained ordinary object version.
 
-**Projection generation** is one immutable, query-visible root binding a
-complete source barrier to document-state, membership, and field component
-segments.
+**Partition projection root** is the immutable point-in-time directory of
+segments and head deltas for one source partition, selected by one small mutable
+partition pointer and carrying its contiguous source checkpoint.
 
-A source barrier binds the source node, the complete source-journal epoch, and
-the first unrepresented offset. A numeric offset from another epoch never
-covers prior history.
+**Partition identity** names only the physical family and source-partition
+incarnation. It deliberately excludes catalog generation. A root and its
+partition-scoped current pointer bind the catalog generation, placement epoch,
+revision, and checkpoints. This lets one stable family directory path describe
+handoff lineage without creating a new partition identity for every catalog
+transition.
 
-**Logical binding** maps one exact logical-definition version to a projection
-family, the first generation where all its recipes were ready, its membership
-and field recipes, and public field IDs. It follows later complete generations
-of that family without a catalog rewrite.
+**Head delta** advances current source/result identity for stable documents. A
+projection-preserving update needs no new membership, posting, point, doc-value,
+facet, order, text, or vector material.
 
-## 4. Durable logical catalog
+**Projection checkpoint** is the greatest contiguous source position fully
+represented by a durable published partition root.
 
-The ordinary index-definition object remains the public mutation and
-authorization authority. The runtime derives compact durable catalog records:
+**Family partition directory** is the small durable lineage map from one
+physical family to current and retiring source-partition incarnations. It
+changes only on partition creation, handoff, split/merge, or retirement, never
+on an ordinary segment flush.
+
+## 4. Logical catalog and physical identity
+
+The ordinary definition object remains the public mutation and authorization
+authority. Compact durable catalog records bind each exact logical version to
+canonical physical recipes:
 
 ```text
 LogicalDefinitionRecord {
@@ -131,881 +166,585 @@ LogicalDefinitionRecord {
     definition_version
     source_scope_id
     membership_recipe_id
-    field_bindings[]       // public field ID/name -> field recipe ID
+    field_bindings[]       // public field name/id -> physical recipe id
     query_contract_hash
-    physical_family_id
     state                  // building, ready, replacing, deleting, failed
 }
 ```
 
-Catalog records are stored in the existing Store/RocksDB authority and are read
-in bounded pages. Process memory holds compact immutable routing pages and
-point-lookup caches, not one complete builder object per catalog entry.
+Recipe sharing is permitted only when all result-affecting semantics match.
+Stored canonical specifications are authoritative; hashes are content addresses
+and lookup accelerators, never unchecked equality proofs. Sharing never crosses
+tenant/bucket authorization authority.
 
-Catalog cardinality must not create an equal number of:
+The compiled physical catalog contains a source router and the union of active
+recipes. It is immutable and replaced atomically. A source mutation performs
+bounded prefix/content-type routing and never scans logical definitions.
 
-- Tokio tasks;
-- journal cursors;
-- retained source pages;
-- mutable segment writers;
-- publication timers;
-- manifest/current objects; or
-- filesystem query-cache files.
+Immutable directory pages, packs, segments, head deltas, and roots are
+family-scoped content-addressed artifacts. They are reusable when a catalog
+transition retains a recipe and when a replacement partition inherits a
+predecessor's covered state. Only `current` is partition-incarnation scoped;
+the family directory has a stable path and names those partition identities.
 
-Creating a definition whose complete physical semantics already exist adds a
-logical binding with the existing ready revision. It performs no source rebuild.
-Creating a genuinely new recipe schedules only the new physical recipe's
-bounded backfill and publishes the binding after the first complete generation
-containing that recipe.
+Catalog cardinality must not create a corresponding number of tasks, journal
+cursors, buffers, segment streams, roots, checkpoint records, timers, files, or
+reader instances. An equivalent definition creates only a binding. A genuinely
+new recipe starts one physical backfill and joins live projection under an exact
+catalog-generation barrier.
 
-Catalog changes compile a new immutable routing snapshot. A source mutation
-never scans all logical definitions and never takes a process-wide mutable
-catalog lock.
+## 5. Ingestion-side hot extraction
 
-Replacing that snapshot also cancels every obsolete projection owned by the
-previous physical-family builder. Projection lane tasks are children of the
-builder turn for cancellation purposes, even when Tokio executes them on a
-separate task. CPU submissions which have not started are cancellation-aware:
-when their owning builder is replaced, they leave the bounded CPU queue without
-parsing or assembling their now-unpublishable result. A rapid sequence of
-catalog additions must therefore converge to the newest family plan; it must
-not leave one queued projection per intermediate catalog state. Work already
-executing remains a finite source unit and may finish, but its result cannot be
-published by the replacement builder.
+The object ingress path already owns validated request bytes. After a successful
+commit provides exact source identity/version, those bytes may enter the bounded
+FIFO preparation cache. CPU workers may transform cached bytes out of order
+against a pinned compiled catalog. The job:
 
-Process-local assignment notifications are wakeups, not a change journal. A
-receiver which falls behind must retain already completed physical progress and
-reconcile from an exact bounded-memory view of the durable catalog. It must not
-discard a partially or completely reconstructed projection inventory and
-restart from page one. The assignment scan and replacement receiver share the
-Store's assignment mutation fence, so no change can fall between the exact
-inventory and its catch-up stream. A dedicated lightweight collector drains
-that receiver independently of source/index work and coalesces only the newest
-committed mutation per definition. The pending map is bounded by catalog
-cardinality. Full durable replacement is reserved for startup and genuine
-collector lag; a long indexing turn cannot repeatedly trigger an `O(catalog)`
-rescan. A later catalog-page format may reduce the duration of the snapshot
-fence, but cannot weaken this boundary.
+1. parses the payload at most once;
+2. visits only the union of selected paths;
+3. validates and normalizes typed values;
+4. performs analyzer/token work which is safe before commit;
+5. discards every unindexed payload byte; and
+6. returns one compact prepared row charged to the indexing budget.
 
-## 5. Canonical physical identities
+Pre-commit speculative extraction is permitted, but a failed mutation discards
+its result. Only exact committed identity/version keys enter the cache. A cache
+entry carries its catalog generation and atomic identity when applicable, but
+it cannot advance or stand in for the journal consumer.
 
-Recipe sharing is allowed only when every result-affecting semantic input is
-identical. The stored canonical specification is authoritative; hashes are
-content addresses and lookup accelerators, not unchecked equality proofs.
+Extraction never runs on a serving-fence, Store commit, or async reactor thread.
+It uses finite CPU jobs. If CPU or memory credits are unavailable, ingress skips
+hot preparation and commits normally; the replay path later derives identical
+work. Index pressure therefore does not add an unbounded wait to object commit.
 
-A source-scope identity includes:
+The cache is an optimization over the one durable authority, not a second
+source of truth. Payloads and prepared rows may be evicted at any time before
+the journal consumer takes them.
 
-- tenant and bucket physical authority;
-- canonical path-prefix membership;
-- accepted content type;
-- source-record expansion rules; and
-- codec/result identity versions.
+## 6. Ordered partition pipeline
 
-A membership-recipe identity includes its source-scope identity and canonical
-membership predicate. A field-recipe identity includes:
+One journal consumer per assigned source partition is the sole ordering and
+checkpoint authority. Preparation may finish out of order, but it never creates
+a second work queue, replay cursor, or checkpoint.
 
-- source selector;
-- scalar/vector type and cardinality;
-- missing and null semantics;
-- analyzer, normalization, collation, and date format;
-- exact, prefix, range, full-text, order, facet, aggregate, vector, scoring,
-  positions, and norms capabilities; and
-- physical codec and query-semantic versions.
+The pipeline:
 
-Field IDs are logical binding IDs, not physical ownership. Two definitions can
-expose the same physical field recipe under different public names or IDs.
+1. starts at the durable partition checkpoint plus one;
+2. reads the next contiguous journal mutation;
+3. takes an exact-version prepared row or resident raw payload from the cache;
+4. on cache miss or eviction, exact-loads the retained source version;
+5. coalesces repeated mutations only where exact lifecycle and atomic semantics
+   prove it equivalent;
+6. routes one prepared value to every distinct physical recipe needing it;
+7. accumulates column/posting/head output in partition-local memory; and
+8. seals and publishes only contiguous represented source ranges.
 
-The format-v5 projection-family ID is the full domain-separated digest of the
-tenant ID, bucket ID, and canonical membership/source-scope recipe. It is not a
-truncated logical index ID. Definitions with the same source universe but
-different field subsets therefore share one family, while a tenant, bucket, or
-membership change necessarily selects another family.
+The consumer may wait only for a bounded already-running preparation, then use
+resident raw bytes or exact storage rather than stall behind speculative work.
+Publication and checkpoint advancement remain contiguous and exact under the
+placement fence.
 
-Sharing is limited to one tenant/bucket authority. Cross-authority sharing is
-not permitted by this RFC.
+Atomic-program batches remain indivisible publication units. The pipeline may
+cross a soft memory target to finish one admitted atomic batch, but the public
+hard operation limits remain enforced at ingress.
 
-## 6. Source-driven routing and projection
-
-For each assigned source partition, the runtime maintains an immutable compiled
-plan:
+The normal complexity of one mutation is:
 
 ```text
-path/content-type router
-    -> applicable source scopes
-    -> union selector trie
-    -> membership recipe ordinals
-    -> field recipe ordinals
+O(route lookup + selected payload bytes + produced terms + changed recipes)
 ```
 
-The plan is rebuilt from catalog deltas outside source processing and swapped
-atomically. The source hot path performs direct prefix/content-type routing. It
-does not enumerate unrelated definitions.
+It is never proportional to total logical definitions or accumulated
+projection history.
 
-For each source-journal mutation, the writer:
+## 7. Stage-specific memory and CPU control
 
-1. reads the journal evidence once;
-2. resolves the exact source version once;
-3. streams the payload once through the applicable union selector plan;
-4. produces exact canonical membership and field values;
-5. compares them with projected-document state;
-6. updates only distinct changed recipes;
-7. appends those deltas to bounded projection-family buffers; and
-8. advances the physical source barrier only when all routed work is represented.
-
-Predecessor resolution is frame-batched. The writer derives every distinct
-source-locator key in the bounded frame, opens the source-record component once,
-derives the union of stable document keys, and opens the projected-state
-component once. It must never reopen immutable stream directories separately
-for every source record: that makes one turn
-`O(frame records * accumulated history)` and causes indexing throughput to
-decay as versions accumulate even when logical-definition fan-out is constant.
-Multiple versions of one source path in a frame coalesce to its newest current
-version before projection.
-
-The complexity target for a mutation is:
+Each node has one hard indexing memory budget divided into credit pools:
 
 ```text
-O(route lookup + payload bytes + distinct changed recipes)
+extraction input
+resident payload/prepared-row FIFO
+token/posting worker output
+partition segment accumulators
+encoding/compression scratch
+publication descriptors
+compaction workspace
 ```
 
-It must not be `O(total definitions)`, `O(matching definitions squared)`, or
-`O(matching aliases)`.
+All resident and transient allocations are conservatively charged before use.
+One stage cannot consume the credits another stage needs to release memory.
+Credits may be dynamically rebalanced inside the hard ceiling, but mandatory
+publication/recovery work cannot be starved by speculative extraction or
+compaction.
 
-## 7. Keldra projection-preserving updates
+The default planning ratio is 256 MiB per configured indexing core, subject to
+an explicit administrator-set total ceiling. The ratio is a qualification and
+capacity-planning baseline, not a promise that every workload achieves the same
+documents/s. Large scalar or token expansion is charged by produced bytes, not
+source size. Streaming analyzers must not create an unbounded token vector.
 
-Keldra's HOT equivalent is called a **projection-preserving update**.
+CPU execution is batch oriented. Finite extraction, normalization, tokenization,
+sorting, and encoding jobs run in the bounded CPU pool; partition orchestration
+remains async and never occupies a CPU worker while awaiting I/O or another job.
+Additional cores should increase throughput until memory bandwidth, analyzer
+cost, durable segment bandwidth, or compaction becomes the measured limit.
 
-Every projected source record has a stable physical document key and exact
-projected state:
+When the FIFO is full, old cache entries are evicted and the journal consumer
+loads exact versions from storage. When sustained projection falls behind the
+journal, lag grows toward
+the configured journal capacity and ultimately applies authoritative write
+backpressure. Keldra never allocates beyond the memory limit or discards durable
+journal evidence.
+
+## 8. Physical output and HOT-equivalent updates
+
+Each partition accumulator produces reusable multi-field segment components:
 
 ```text
-ProjectedDocumentState {
-    stable_document_key
-    source_path
-    source_record
-    current_source_version
-    material_source_version
-    exact_result_identity
-    physical_order_key
-    live
-    membership_values[]
-    canonical_field_values[]
+PartitionSegment
+  document identity/material-version table
+  exact and text term dictionaries/postings
+  numeric/date point values
+  typed order/facet/aggregate columns
+  existence and membership structures
+  text statistics/positions/norms
+  vector blocks where declared
+  represented source range and catalog generation
+```
+
+Equivalent logical definitions select components through bindings. They do not
+cause duplicate extraction, tokenization, posting construction, or segment
+publication.
+
+A **projection-preserving update** changes an ordinary source/result version but
+not canonical indexed material. It emits only a compact head delta:
+
+```text
+stable_document_key
+current_source_version
+current_result_identity
+source_position
+material_source_version
+live state
+```
+
+It never enters field accumulators. A material change emits a head delta plus
+only the changed recipe components. Deletes emit head/membership tombstones.
+Old immutable material is not rewritten synchronously; newest authoritative
+head state wins and partition-local compaction later removes obsolete material.
+
+Canonical projected values are compared exactly. Digests may reject differences
+quickly but digest equality alone cannot authorize a projection-preserving
+decision.
+
+## 9. Segment flush and partition publication
+
+Accumulators seal on the first applicable boundary after finishing the current
+indivisible mutation unit:
+
+- target accumulated bytes;
+- maximum non-empty age;
+- document/operation safety bound;
+- memory pressure;
+- explicit freshness request; or
+- placement/catalog transition requiring a fence.
+
+Sealing writes relatively large immutable integrated-payload artifacts. It does
+not write one file or RocksDB value per term, document, logical definition, or
+component tail.
+
+### 9.1 Query-ready projection runs
+
+Every successful flush emits one immutable **`ProjectionQueryRun`** for exactly
+one `(projection_family, source_partition)` and exactly one contiguous
+`through_source_position` / `through_atomic_position` cut. It is query-ready
+at publication, not an intermediate field-state log:
+
+```text
+ProjectionQueryRun {
+    family, source_partition, level, source_through, atomic_through
+    stable_key_material_live_gate
+    recipe_directories {
+        exact/text terms, advanceable postings, and declared positions
+        typed numeric/date points
+        declared order/facet/aggregate doc values
+        membership/existence and optional physical-order structures
+    }
 }
 ```
 
-Canonical values are compared exactly. A bounded digest may reject obvious
-differences quickly, but digest equality cannot by itself authorize skipping a
-physical update.
+The stable-key/material/live gate binds every segment-local document to the
+material version represented by that run and makes an old material version
+ineligible before it can become a hit. A material-changing mutation emits a
+sparse L0 run with removal/tombstone evidence for the old material plus additions
+for the new material; unchanged recipes need no duplicate component. A
+projection-preserving mutation emits only the head delta described above.
 
-Four outcomes are defined:
+Field-state deltas, extracted values, and document-key comparison runs exist
+only to prepare this output and to decide whether a mutation is
+projection-preserving. They are never opened by a query reader, never scanned
+to discover matching documents, and never a fallback query representation. A
+root cannot claim its checkpoint until every run and head delta for that exact
+source/atomic cut is durable and referenced by the root.
 
-1. **No relevant change.** Only unindexed payload or source metadata changed.
-   Update the shared document-head/source-version state and source barrier. Do
-   not write postings, points, doc values, facets, order keys, vectors, or
-   membership data.
-2. **Field subset changed.** Update only those field recipes. Reuse every
-   unchanged field and membership component.
-3. **Membership only changed.** Update only the affected membership recipes.
-   Reuse unchanged field components.
-4. **Insert, delete, path, expansion, or material indexed change.** Append the
-   required document, component, and liveness deltas. Obsolete immutable data is
-   reclaimed by merge and reference GC.
-
-Queries use:
+One partition root contains:
 
 ```text
-physical field/membership entry -> stable document key
-stable document key -> generation-pinned live state and exact result identity
-```
-
-This is the analogue of an index entry continuing to reach a newer PostgreSQL
-tuple through HOT indirection. An unchanged indexed value remains valid when an
-ordinary object's version changes. `current_source_version` and the exact result
-identity always advance. `material_source_version` advances only when
-membership, an indexed field, physical order, expansion, or liveness changes.
-The disposable native cache identity is `(stable_document_key,
-material_source_version)`, never the ordinary object version.
-
-Projected-document state is not an object-data authority. Losing it causes
-replay or bounded rebuild from ordinary objects and source journals.
-
-## 8. Physical segments and generations
-
-One source-partition writer owns bounded RAM across all dirty projection
-families. Admission is byte based and shared; it does not reserve a fixed buffer
-per logical definition. Flush boundaries use accounted memory, maximum wall
-age, and explicit operation safety caps.
-
-A flush writes immutable integrated-payload packs containing the changed
-document, membership, and field components. It does not create a filesystem
-file per component or per logical definition.
-
-One projection generation contains:
-
-```text
-ProjectionGeneration {
-    family_id
+PartitionProjectionRoot {
+    tenant_bucket_family
+    source_partition
+    placement_epoch
+    catalog_generation
     revision
-    source_barrier
-    placement_fence
-    document_state_segments[]
-    membership_roots[]
-    field_roots[]
-    physical_order_roots[]
-    previous_generation_hash
-    encoded/logical byte accounting
+    through_source_position
+    through_atomic_position
+    segment_directory_root
+    head_delta_directory_root
+    previous_retained_root
+    byte_and_document_accounting
 }
 ```
 
-The component lists in that illustration are logical lists, not one unbounded
-manifest array. They are encoded as a content-addressed bounded-fanout Merkle
-directory. Leaf pages contain canonical sorted component roots; branch pages
-contain canonical key ranges and child hashes. The generation record contains
-only the directory root, root count, barrier, and predecessor. This keeps
-generation publication and point lookup bounded without creating one
-filesystem inode per component.
-
-An unchanged component root is referenced from the previous generation rather
-than rewritten. Publication atomically installs the complete generation and
-then makes eligible logical bindings visible. No query can combine component
-roots from different source barriers.
-
-Format-v5 immutable values use the canonical internal namespace
-`_keldra/index-projections/v5/<full-family-hash>/...`, with separate hashed
-classes for integrated delta packs, stream-directory pages,
-component-directory pages, and generation records. One small `current` object
-per physical family is the only mutable publication object. It contains the
-full family ID, exact generation content hash, and revision and is replaced by
-version CAS only after every immutable dependency is durable. Logical bindings
-name the family and their ready revision, so advancing `current` never rewrites
-one binding per logical definition.
-
-### 8.1 Format-v5 stable document keys
-
-Format v4 cannot be extended into the projection-preserving design by adding a
-comparison cache alone. Its postings use segment-local `DocId` values and its
-identity rows embed the source/result object version. Reusing those postings
-after a source-version change would either return the old version or cause the
-exact-current candidate gate to reject the result. Format v5 therefore makes a
-stable document key the join key shared by every independently reusable
-component.
-
-The key is derived from the source-scope identity, canonical source path, and
-deterministic expanded-record identity. The current expansion contract uses the
-record ordinal; a change which shifts ordinals is consequently a material
-delete/insert for those records. Hash collisions are never accepted as
-equality: every head entry retains and validates the complete source path and
-record identity.
-
-```text
-StableDocumentKey = H(
-    format/domain,
-    source_scope_id,
-    source_path,
-    source_record_identity
-)
-```
-
-Format-v5 immutable streams are separated by authority:
-
-```text
-document-head delta:
-    stable key -> source path, record identity, current source version,
-                  material source version, current result identity,
-                  physical order key, live/deleted state
-
-membership delta for recipe R:
-    stable key -> present/absent
-
-field delta for recipe R:
-    stable key -> exact canonical field state or tombstone
-
-order delta for order recipe R:
-    stable key -> canonical order tuple or tombstone
-
-source-record-set delta:
-    source scope + path -> exact sorted stable keys currently expanded
-```
-
-The newest entry at or below the pinned generation wins independently in each
-stream. These canonical stable-key records are the durable comparison and
-recovery form. They are not a scan-based query engine and are not represented
-as one tiny filesystem object per record.
-
-Each field or membership delta flush also feeds a disposable native query-cache
-assembler. The assembler groups a bounded generation range, constructs the
-recipe's postings, points, doc values, facet/order columns, text statistics, or
-vector structures once, and publishes a cache root keyed by the exact physical
-recipe and covered projection generation. A document-head-only update never
-enters that assembler. The assembled structures retain stable document keys,
-not source object versions or definition-local document IDs.
-
-The cache may lag the durable projection generation while assembly is in
-progress. A native candidate is admitted only when the pinned canonical head is
-live and its `material_source_version` exactly equals the version embedded in
-the cache identity. The gate then substitutes the head's exact current
-source/result identities before authorization and exact-current evaluation.
-Consequently a newer head-only generation immediately returns the newer public
-version through unchanged postings, while a material change immediately rejects
-the preceding cache entry until its bounded cache delta is published. The public
-freshness watermark reports the complete query-visible cache barrier rather
-than merely the writer's durable barrier.
-
-Query-cache segments are append-only immutable values. Cache compaction merges
-segments newest-by-stable-key in the background and atomically replaces only a
-disposable cache root. It never advances the durable projection barrier,
-rewrites logical bindings, or becomes recovery authority. Losing all query
-cache data causes deterministic reassembly from pinned format-v5 generations.
-The assembler must operate incrementally from its preceding cache root; a full
-corpus rebuild for every generation is forbidden.
-
-A query obtains stable keys from those postings/points/order structures,
-resolves pinned membership and the live head, then obtains the exact current
-result identity from that head. No query combines a cache component or field
-state from a generation newer than its pinned complete barrier.
-
-### 8.2 Exact projected-state comparison
-
-Projected-document state stores the complete canonical bytes for each recipe,
-not only a digest. A digest is kept as a bounded negative-comparison
-accelerator. Equality is authorized only after byte-for-byte comparison of the
-canonical recipe state and exact membership state.
-
-For one source mutation the writer constructs a sorted recipe-state vector and
-merge-compares it with the previous vector. It emits:
-
-- one document-head delta whenever the exact source/result version changes;
-- no membership or field delta when all canonical indexed state is equal;
-- a delta only for each added, removed, or byte-different recipe; and
-- tombstones for records or recipe values removed by the mutation.
-
-The head delta and every changed recipe delta are installed by one projection
-generation. A crash may leave unattached immutable packs, but cannot publish a
-head whose required changed recipe roots are absent. Recipe compaction folds
-newest-by-stable-key state and may rewrite physical keys without changing the
-generation barrier or logical result.
-
-Both authority and cache segments are immutable. Updates and deletes append
-deltas/tombstones; automatic tiered merges combine small segments, fold
-document-state chains, and reclaim obsolete entries. Merge concurrency and I/O
-are globally bounded and throttled. A merge changes physical shape without
-changing logical results or the represented source barrier. Format-v4
-definition-owned locator roots, live-mask rewrites, and mandatory whole-corpus
-segment merges are not used by this path.
-
-## 9. Query resolution
-
-A query follows this exact sequence:
-
-1. authorize and load the requested logical definition;
-2. resolve its exact logical binding;
-3. load and pin the family's current generation, requiring it to be at or
-   beyond the binding's ready revision;
-4. compile public field IDs through the binding to physical recipes;
-5. select the newest common query-cache barrier covered by every requested
-   recipe and open those shared physical readers;
-6. execute predicates, ordering, facets, aggregates, text, and vectors against
-   those cache roots;
-7. intersect candidates with the definition's membership component and the
-   generation's live-document state;
-8. map stable document keys to exact visible result identities; and
-9. perform the existing result-object authorization/refill behavior.
-
-Pagination binds logical definition version, projection generation, query
-shape, order, and search-after state. A definition replacement cannot continue
-an old cursor against a different binding.
-
-The query cache keys physical recipe identity and covered generation. Equivalent
-definitions reuse opened physical readers while retaining separate logical
-authorization and query contracts. Admission fails closed if a cache root is
-missing, corrupt, ahead of its durable generation, or assembled from mismatched
-barriers; it never falls back to scanning canonical state.
-
-## 10. Rebuild and definition changes
-
-A new source scope or recipe is built from a source snapshot plus its retained
-journal suffix. Work is scheduled by missing physical recipe/family, not by
-logical definition.
-
-Definition changes behave as follows:
-
-- an identical physical contract changes only logical metadata;
-- adding a field references an existing recipe when available, otherwise builds
-  that recipe once;
-- removing a field drops a logical reference without rewriting other fields;
-- changing source membership creates or reuses the new membership recipe;
-- changing incompatible analysis/type semantics creates a new field recipe;
-- deletion removes the logical binding and decrements physical references.
-
-A definition becomes ready only when every referenced physical component has an
-exact complete source barrier compatible with the binding. Rebuild publication
-is all-or-none at the logical binding.
-
-## 11. Distribution, durability, and recovery
-
-The source journal and ordinary objects remain input authority. Integrated
-payload storage remains immutable artifact authority. Existing placement,
-integrity, erasure/replication, reference delivery, and Store commit fencing
-apply to projection packs and generation roots.
-
-Assignment is by source partition/projection family rather than definition.
-Only the assigned writer may publish that family's next generation under the
-exact placement fence. Logical bindings are independently authorized catalog
-state and cannot grant publication authority.
-
-Crash points are recovered as follows:
-
-- a lost RAM buffer replays its unadvanced source window;
-- an uploaded but unattached pack is an ordinary bounded orphan and is reclaimed
-  by artifact GC;
-- a complete generation uploaded before current publication is unattached and
-  reclaimed unless retry attaches the exact content identity;
-- a published physical generation without a new logical binding remains valid
-  physical state and can satisfy that binding on retry;
-- a logical binding never becomes ready before a complete published generation
-  contains every recipe it names;
-- restart rebuilds immutable routing pages from the durable catalog in bounded
-  pages and resumes source partitions from physical barriers.
-
-Installing canonical family `current` precedes publishing the corresponding
-disposable cache current. If a process dies in that interval, startup compares
-the two exact barriers and discards/rebuilds the native cache from a fresh
-bounded source snapshot instead of treating the already-covered journal unit as
-having produced cache mutations. During that recovery, the material-version
-gate can reject an obsolete cache entry but can never return stale material.
-Crash replay may leave duplicate immutable v5 deltas; newest-by-stable-key
-resolution is idempotent and ordinary artifact GC reclaims unattached packs.
-
-GC deletes a pack only after no retained projection generation, logical
-binding, in-flight query lease, rebuild root, or publication attempt references
-it. Reference updates are batched per physical publication rather than repeated
-for every logical definition.
-
-## 12. Resource bounds and fairness
-
-The node enforces explicit bounds for:
-
-- catalog page and routing-snapshot residency;
-- source windows and exact payload bytes;
-- canonical projected-document state;
-- dirty recipe/component buffers;
-- immutable pack assembly;
-- merge input/output and scratch;
-- opened physical readers and query work;
-- concurrently active source partitions and backfills; and
-- queued catalog changes.
-
-Inactive logical definitions consume durable catalog bytes and bounded cache
-entries only. They do not reserve workers or construction memory.
-
-Fair scheduling rotates source windows and backfills by source partition and
-oldest wall-clock lag. A hot family cannot monopolize the writer, and a large
-catalog cannot dilute service for the bounded set of dirty families.
-
-Compaction is a non-preemptible maintenance turn. It may use the complete
-per-kind construction fair share, including every configured merge lane, but
-must not lease the idle aggregate working-memory parent merely because no
-writer happened to be queued at admission time. The unborrowed capacity keeps
-a later source-writer turn admissible while maintenance is running. This is a
-latency and liveness invariant, not an unaccounted memory reserve: compaction
-still charges its complete admitted workspace and the hard node ceiling remains
-unchanged.
-
-Format-v4 merge scratch traffic is not an acceptable implementation of this
-model. Qualification showed repeated page-cache reads and cancelled temporary
-writes many orders of magnitude larger than the changed source payload, even
-when RocksDB and the storage device were not stalled. The v5 writer must report
-logical bytes read and written separately from physical device bytes and must
-prove that a projection-preserving update creates no field or membership merge
-input. Raising merge concurrency, delaying merges, or suppressing scratch I/O
-is not a substitute for eliminating unchanged component work.
-
-## 13. Telemetry
-
-Required counters and histograms are labelled by physical family/recipe class,
-not by high-cardinality recipe IDs:
-
-- catalog definitions, source scopes, membership recipes, and field recipes;
-- resident routing pages and compiled-plan rebuild duration;
-- source records read, exact objects fetched, and payloads parsed;
-- projection-preserving updates;
-- membership-only, field-subset, insert, and delete updates;
-- distinct recipes considered and changed;
-- buffer bytes, flush reasons, packs, components, and fill ratio;
-- physical generations and logical bindings published;
-- physical bytes and Store/reference mutations per accepted source mutation;
-- source receipt-to-projection visibility lag;
-- merge debt, bytes, duration, throttling, and reclaimed tombstones;
-- opened physical readers, logical reader reuse, and cache bytes; and
-- source-partition runnable, wait, I/O, Store-lock, and publication phase time.
-
-Periodic INFO summaries provide qualification evidence without enabling
-per-object logs. DEBUG spans retain exact phase attribution.
-
-## 14. Required correctness tests
-
-The implementation must prove:
-
-1. equivalent definitions share one physical generation and return identical
-   authorized query results;
-2. different public field names can bind one physical recipe;
-3. field subsets and predicates share only compatible components;
-4. incompatible types, analyzers, formats, cardinality, or capabilities never
-   share;
-5. an unindexed payload update emits no field/membership physical mutation;
-6. one changed field updates only that recipe;
-7. membership-only changes preserve unchanged field components;
-8. insert, overwrite, delete, path reuse, arrays, expanded records, aliases,
-   dates, facets, aggregates, order, text, vectors, and pagination retain exact
-   released semantics;
-9. definition create/replace/delete racing source writes binds an exact complete
-   generation or retries without partial visibility;
-10. crash/restart at every publication boundary replays exactly and GC reclaims
-    unattached packs;
-11. catalog paging and restart do not create one task per definition; and
-12. physical work counters are independent of equivalent logical-definition
-    count.
-
-## 15. Scale qualification gates
-
-Qualification uses fresh volumes and the same exact candidate artifact on the
-8-core/32-GiB SSD and 16-core/64-GiB rotational hosts. All experiment files and
-Keldra data remain under `~/keldra_experiments`.
-
-### 15.1 Catalog-250K
-
-Create 250,000 live logical definitions, restart, point-read and page-list them,
-then mutate objects matching zero, one, and a bounded set of recipes. Record
-creation rate, restart time, RSS, task count, catalog lookup/list latency,
-mutation work, and query correctness.
-
-### 15.2 Equivalent D1 through D640
-
-Run D1, D4, D16, D64, D256, and D640 identical definitions over one hot source
-stream. Physical component items/bytes, payload parsing, Store/reference
-mutations, source work, and visibility lag must remain close to D1. Logical
-catalog/binding bytes may grow linearly.
-
-### 15.3 Heterogeneous recipes
-
-Vary source prefixes, predicates, field subsets, types, analyzers, dates,
-facets, aggregates, ordering, text, and vectors. Demonstrate that physical work
-tracks distinct matched changed recipes, not definitions, and verify every
-public query against an independent expected result.
-
-### 15.4 Projection-preserving update
-
-Continuously mutate large unindexed properties while indexed values remain
-constant, then change one indexed field and one membership predicate. Prove
-zero physical field work in the first phase and exact component-local work in
-the later phases. The black-box contention driver exposes this as
-`KELDRA_INDEX_CONTENTION_MUTATION_WORKLOAD=projection-preserving`: it pre-seeds
-a bounded marker pool, changes only unindexed bytes and source versions, and
-requires ordinary queries to return the newest exact source version through the
-unchanged material posting. The material-changing workload remains a distinct
-run so its physical work cannot mask the HOT-equivalent result.
-
-### 15.5 Sustained keep-up
-
-Offer a fixed realistic write rate for at least 30 minutes. Source-to-visible
-lag must reach a stationary bounded distribution during ingestion. A final
-drain is not evidence of keeping pace.
-
-### 15.6 Churn and recovery
-
-Create, replace, and delete definitions while ingesting; crash during routing
-swap, buffer flush, generation publication, binding publication, merge, and GC.
-Prove exact results, bounded replay, and eventual orphan reclamation.
-
-Each result records source commit, binary/image digest, host/topology, corpus
-hash, definitions and distinct recipes, offered/accepted rate, latency
-distributions, visibility lag, CPU profile, async waits, Store-lock ownership,
-RocksDB and artifact bytes, RSS, task/file counts, correctness, and end-to-end
-duration.
-
-## 16. Success criteria
-
-The architecture is complete only when:
-
-- 250,000 catalog definitions are operational without 250,000 runtime tasks or
-  physical copies;
-- equivalent D640 remains bounded near D1 physical work;
-- projection-preserving updates avoid all unchanged component writes;
-- heterogeneous work scales with distinct changed recipes;
-- sustained ingestion reaches a stationary visibility lag on both hosts;
-- crash/restart and churn preserve exact query/publication semantics; and
-- no resource bound, authorization check, placement fence, durability, or GC
-  guarantee is weakened to obtain the result.
-
-## 17. Non-goals
-
-This RFC does not:
-
-- make 250,000 genuinely distinct changed recipes free;
-- share physical bytes across tenant/bucket authorization authorities;
-- make derived indexes an object-data authority;
-- introduce synchronous index construction into ordinary object commits;
-- adopt Lucene as a dependency or use its file format;
-- create one Elasticsearch-style shard per logical definition;
-- weaken exact-version result reads, query authorization, or freshness
-  semantics; or
-- preserve legacy derived-index physical formats.
-
-## 18. Implementation milestones
-
-The physical-format replacement is delivered in measured milestones. Passing
-an earlier milestone does not weaken the completion criteria in section 16.
-
-### 18.1 Milestone A: equivalent complete projections
-
-Implemented on `feat/shared-index-projection`:
-
-- a logical definition has a deterministic tenant/bucket-scoped physical
-  projection identity derived from its complete canonical schema;
-- every equivalent definition maps to one scheduler representative, builder,
-  manifest/current stream, artifact owner, retention identity, and query reader;
-- queries authorize and paginate using the requested logical definition, then
-  resolve to the shared physical identity before execution;
-- source placement is by tenant/bucket projection partition rather than logical
-  definition ID;
-- catalog changes compile immutable path-prefix/content-type selector routes;
-  source processing performs direct route lookup and shares exact payload
-  projection results rather than scanning all logical definitions; and
-- the disposable projection cache has bounded logarithmic recency maintenance.
-
-This milestone is intended to prove that D640 equivalent definitions remain
-close to D1 physical work. It deliberately does not claim component sharing
-between different schemas or projection-preserving updates.
-
-Qualification of server commit `f3dc43afa795` with harness commit
-`f1aa37322283` established that intended bound. On the SSD host, saturated
-accepted throughput remained 1,000.13 operations/s at D1 and 973.84 at D640.
-On rotational storage it remained 90.49 operations/s at D1 and 114.71 at D640.
-Both D640 runs completed with zero mutation/query/correctness errors. The source
-projection summaries recorded one projection request and parse per source
-mutation rather than per logical definition.
-
-The first sustained keep-up gate also passed on rotational storage at D640: a
-fixed 40 operations/s for 30 minutes accepted 71,973 of 71,973 offered
-operations, publication visibility p99 was 26.69 seconds, concurrent-query p99
-was 401.92 milliseconds, and the final exact drain took 80.36 seconds. This is
-a bounded in-load visibility result, not a saturation result inferred from an
-eventual drain. A corresponding 180 operations/s SSD cell accepted all 323,994
-offered mutations and completed all 37,200 scheduled queries without an
-in-load error, but failed the keep-up gate: the target generation remained
-invisible after the full 1,800-second drain allowance. Its archive SHA-256 is
-`d761a73f78ad4b70af3d5c8558c9dd60fac85f8f7f1fe3fca8cfc86a3d314aca`.
-This is an overload bound, not a successful SSD service-rate result.
-
-A later SSD D640 cell at server commit `a5f3284cbf45` established a bounded
-100 operations/s service point: all 59,994 offered mutations and 12,800 queries
-completed, visibility p99 was 4.26 seconds, concurrent-query p99 was 200.19
-milliseconds, and exact correctness passed. The derived-progress race produced
-zero false inventory rebuilds after conservative proof deferral. The cell still
-wrote 92.43 GB and drained in 59.35 seconds, so it proves keep-up and recovery
-stability at that rate, not acceptable physical write efficiency. Its archive
-SHA-256 is
-`cfa78e3035034e3201c1b7904cf4311ad44b3aaba0214d94af9d37c8c052d817`.
-
-Catalog scale was qualified separately at server commit `ecab0a14b49f`. On the
-8-core SSD host, 250,000 definitions were created in 333.24 seconds at 750.21
-definitions/s. A clean restart recovered and listed all 250,000 definitions and
-served three exact sampled reads in 203.83 seconds. The independent assignment
-collector performed zero lag-triggered snapshots, its coalescing map peaked at
-1,905 pending definitions, and server residency peaked at 1,551,940 KiB RSS and
-91 threads during creation (568,628 KiB and 58 threads after restart). The
-archive SHA-256 is
-`a725cbb768a8f3e83d154bc67046adc85270a8611771d3d8772b77f4f8e072c6`.
-This proves the sparse logical-catalog requirement on SSD; it is not evidence
-that arbitrary distinct physical recipes have zero maintenance cost.
-
-Server commit `1ce4fa290d23` subsequently repeated the rotational gate with two
-alternating logical schema variants: reordered fields and different public
-aliases bound the same recipes. All 71,973 offered operations were accepted at
-40 operations/s; all 36,000 concurrent queries completed; there were zero
-mutation, query, timeout, scheduling, or correctness errors. Publication
-visibility was p50 3.50 seconds, p95 5.81 seconds, p99 10.32 seconds, maximum
-11.57 seconds; concurrent-query p99 was 346.62 milliseconds and exact drain was
-107.42 seconds. The evidence archive SHA-256 is
-`03cb408de54a2f1d9bcc848daa56ad93acf34c391eb13147480cf82707e29c3b`.
-
-### 18.2 Milestone B: recipe catalog and component generations
-
-Replace complete-schema physical ownership with canonical membership and field
-recipe records. A projection-family generation references independently reusable
-membership, field, document-head, and liveness components. Logical bindings map
-public field IDs and names to those physical recipes. Qualification must include
-different public names, field subsets, and incompatible-recipe isolation.
-
-Implemented groundwork on `feat/shared-index-projection`:
-
-- tenant/bucket-scoped membership and field recipe identities cover selectors,
-  value semantics, capabilities, formats, and component codec versions;
-- runtime catalog plans reference-count those recipes transactionally and emit
-  bounded aggregate telemetry. The catalog now also groups definitions by the
-  full projection-family identity and compiles one deterministic schema from
-  the distinct field-recipe union: adding another public alias or equivalent
-  definition increments only reference counts, while adding a genuinely new
-  recipe adds exactly one physical field. A focused three-definition
-  regression proves that two aliases plus one distinct selector produce one
-  family containing two, not three, physical fields; and
-- native field IDs are canonicalized by recipe identity while public names are
-  excluded from the segment schema fingerprint. Complete schemas which differ
-  only by field declaration order or public aliases now share the same actual
-  projection, segments, and query reader; query compilation and response labels
-  still use the authorized logical names;
-- format-v5 projected-state and generation records use integrity-checked,
-  bounded codecs; and
-- component roots are represented by a canonical bounded-fanout Merkle
-  directory rather than an unbounded manifest or one file per component. A
-  70,000-component regression keeps every encoded directory page below 32 KiB;
+Publication orders durability as follows:
+
+1. encode and verify the immutable segment/head-delta artifacts;
+2. store them through integrated payload storage with required durability;
+3. write the immutable partition root referencing those exact artifacts;
+4. exact-version CAS that partition's small current pointer; and
+5. only then release journal/source-version retention through the checkpoint.
+
+Each source partition incarnation has its own pointer and placement fence. A
+small family partition directory names active and retiring incarnations and
+their handoff lineage. It changes only when placement topology changes, never
+for segment publication. There is no global manifest CAS for normal flushes and
+no logical-definition pointer update. Independent partitions may publish
+concurrently.
+
+Unattached durable artifacts are safe orphans, but not leaks. Ordinary artifact
+reachability GC discovers and reclaims them after the publication safety age.
+GC retains every predecessor root/page/pack needed by a live activation,
+handoff lineage, pinned query/continuation, or an eligible atomic cut; it may
+not reclaim merely because a newer `current` exists.
+
+## 10. Query materialization
+
+A query:
+
+1. authenticates and authorizes the requested logical definition;
+2. loads its exact binding and catalog generation;
+3. resolves the durable family partition directory and obtains the newest
+   finalized root for every active or not-yet-covered retiring partition
+   incarnation;
+4. chooses one common finalized `through_atomic_position` across that vector;
+   when a partition is ahead of the common cut it walks exact retained
+   predecessor roots until it finds the newest root at or before that cut;
+5. pins that cut-consistent root vector before opening any reader;
+6. maps public field names to physical recipes;
+7. opens or reuses verified immutable segment readers;
+8. executes predicates, ordering, facets, aggregates, text, and vectors;
+9. applies newest head/liveness state and exact-current validation; and
+10. returns authorized exact result identities.
+
+For each pinned root, the reader seeks only the matching recipe directories in
+its `ProjectionQueryRun`s. It intersects advanceable postings and membership /
+stable-key live gates, uses points for ranges, and reads declared doc values only
+for order, facets, and aggregates. It may merge a bounded number of run-local
+iterators, but it never broad-scans document-key field-state output. Candidate
+stable keys then undergo the mandatory bounded exact-current object/head
+validation before a result is returned.
+
+The root vector, logical definition version, query shape, order, and
+search-after state are bound into continuation evidence. A later partition root
+does not mutate an already pinned view.
+
+During handoff, predecessor and replacement roots may cover an overlapping
+source range. The directory records that lineage and the query resolves a stable
+document exactly once: the highest covered authoritative source position wins,
+with exact identity comparison on ties. Overlap can increase bounded read work
+but cannot duplicate or resurrect a result.
+
+Query nodes may cache root vectors, open readers, decoded blocks, and later
+materialized cross-partition merges. These remain disposable. A future
+distributed query engine may fan out or place merged replicas, but neither is a
+condition of the write architecture.
+
+Authorization is never inherited merely because physical bytes are shared.
+Both definition admission and returned objects retain their existing checks.
+
+## 11. Backfill and catalog changes
+
+An equivalent definition binds immediately to ready recipes and performs no
+source work. A new physical recipe:
+
+1. installs a new immutable compiled catalog generation;
+2. pins one source barrier for every incarnation in the family partition
+   directory;
+3. has each partition owner scan its authoritative current-object subset through
+   the same bounded memory pipeline used by live projection;
+4. catches journal mutations after the pinned barrier through ordered replay;
+5. converges baseline and live checkpoints; and
+6. marks logical bindings ready only after every directory partition proves a
+   complete compatible barrier.
+
+A catalog transition reuses every old family-scoped recipe root that remains
+semantically identical. It backfills only genuinely new recipes, then performs
+one exact-coverage activation binding the new logical catalog generation to the
+reused and newly completed roots. It does not rewrite or clone retained recipe
+artifacts merely because a logical definition changed.
+
+Removing the last logical reference makes a recipe eligible for physical
+retirement after retained queries and roots release it. Definition deletion
+never directly deletes shared artifacts.
+
+Backfill uses the same bounded memory-first preparation and segment encoders as
+live projection. It is lower priority than journal catch-up and cannot create a
+separate builder architecture. A retained journal suffix cannot reconstruct
+objects which predate its retention floor; the authoritative partition-scoped
+current-object scan is mandatory for a new recipe or full rebuild.
+
+## 12. Distribution, recovery, and retention
+
+Placement assigns source partitions, not logical definitions. Only the owner at
+the current placement epoch may advance a partition pointer. Active membership
+alone is not root discovery authority: removing a node must not make its
+published segments disappear from queries.
+
+For immutable `SourceId { source_node, source_epoch }`, its ACTIVE source node
+is the producer, preserving normal payload locality. If that node has left the
+current placement, the producer is rank zero from the existing capacity-weighted
+`FutureIndex` HRW ranking over the domain-separated canonical key
+`keldra/v6/source-producer/v1 || tenant_id || bucket_id || source_node ||
+source_epoch`. Logical definitions and physical families are deliberately not
+inputs, so every family follows one source handoff. The partition identity
+records both immutable source identity and this fenced producer identity.
+
+On handoff, the family partition directory retains the predecessor incarnation
+as retiring. The replacement loads its selected root, inherits or references
+the exact predecessor segment/head lineage, and replays from its checkpoint.
+Only after the replacement root durably proves equivalent-or-later coverage may
+one directory CAS retire the predecessor incarnation. Until then, query root
+vectors include the predecessor root. The old producer is fenced immediately,
+but its committed data remains discoverable. Directory CAS occurs only for this
+placement lifecycle transition, never per segment flush.
+
+Crash recovery is exact:
+
+- lost prepared rows, reorder state, and accumulators replay from the journal;
+- partially encoded local output is disposable;
+- durable unattached artifacts are reclaimed by reachability GC;
+- a durable root not selected by the partition pointer is unattached;
+- a selected root is authoritative even if local checkpoint caches lag; and
+- query-node local loss refetches durable segments without source reindexing.
+
+Journal and source-version retention use the minimum durable projection
+checkpoint across assigned physical partition streams. Logical definitions do
+not own retention cursors. Required exact source versions remain reachable until
+the relevant partition root proves them represented. Artifact GC additionally
+retains predecessor chains required to reconstruct any live activation or
+eligible common atomic cut, not just the newest root of each partition.
+
+Irreparable loss of a published segment despite Keldra durability is a durable
+data failure. Repair runs first; an authorized explicit rebuild is the fallback,
+not silent query or builder compatibility behavior.
+
+## 13. Partition-local compaction
+
+Compaction is ordinary LSM maintenance over immutable segment and head-delta
+levels. It:
+
+- selects bounded inputs from one partition;
+- resolves newest state by stable document key and source order;
+- folds obsolete versions and tombstones when retention permits;
+- emits verified replacement artifacts;
+- atomically replaces only that partition's root; and
+- leaves its represented source checkpoint unchanged.
+
+It compacts bounded whole `ProjectionQueryRun` inputs for one family/partition,
+not independent per-field state streams. The replacement run merges each
+declared recipe's terms/postings/positions, points, doc values and
+stable-key/material/live gate together, preserving the source/atomic cut and
+exact query meaning. No compaction output may require a reader to reconstruct a
+queryable posting or value by scanning preparation state.
+
+Compaction is independently CPU-, memory-, and I/O-throttled. Journal catch-up
+and required flush publication take priority. A failed compaction CAS does not
+invalidate ingestion work or trigger source replay. Cross-partition compaction
+is deferred as an optional read optimization and is never write authority.
+
+## 14. Correctness invariants
+
+1. Ordinary objects remain application-data authority.
+2. Source journals plus retained exact object versions remain replay authority.
+3. Memory is never durability, checkpoint, publication, retention, or recovery
+   authority.
+4. A checkpoint advances only with a durable selected partition root proving
+   the complete contiguous source range.
+5. Every relevant atomic batch is represented all-or-none in a published view.
+6. Placement epochs fence former partition owners without hiding their
+   published roots before a replacement durably inherits their coverage.
+7. Equivalent logical definitions share physical work without sharing
+   authorization authority.
+8. Projection-preserving updates return the exact current result identity
+   through unchanged indexed material.
+9. Material changes cannot use stale postings to return an obsolete value.
+10. No query mixes incompatible catalog generations or unpinned partition
+    roots.
+11. Every admitted allocation is bounded and charged before use.
+12. Unpublished artifacts are not searchable and are eventually reclaimed.
+13. Replay is idempotent and an older source position cannot supersede a newer
+    one.
+14. Loss of local memory or query caches cannot lose acknowledged index state.
+15. Authorization and exact-current result validation remain fail closed.
+
+## 15. Telemetry
+
+Required low-cardinality telemetry includes:
+
+- logical definitions and distinct membership/field recipes;
+- assigned partitions and placement epochs;
+- bytes used, queued, and peak for every memory-credit stage;
+- indexing cores, CPU busy time, queue wait, and batch sizes by stage;
+- hot-path opportunities, admissions, drops, and admission percentage;
+- replay records, source payload reads, bytes, and reasons;
+- source bytes parsed versus selected prepared bytes;
+- documents, scalar values, tokens, terms, and postings per core-second;
+- projection-preserving, changed-field, membership, insert, and delete counts;
+- accumulator bytes/age, flush reason, fill ratio, and overshoot;
+- segment/head-delta counts, bytes, encode time, durability time, and
+  publication time;
+- query-run counts/bytes by LSM level; sparse-L0 removals/additions; recipe
+  component counts/bytes for postings, positions, points, doc values, and the
+  stable-key/material/live gate;
+- partition checkpoint lag in records, bytes, and wall time;
+- root-CAS attempts, losses, and placement-fence failures;
+- compaction debt, input/output bytes, CPU, duration, and write amplification;
+- orphan artifact count/bytes/age/reclamation; and
+- query root-vector size, segment readers, cache reuse, logical/physical bytes,
+  latency, iterator seeks/intersections, broad-scan fallback attempts (which
+  must remain zero), and exact-current candidate validation batches.
+
+Periodic summaries provide qualification evidence. Stable tenant, definition,
+partition, root, and segment identities are trace fields, not metric labels.
+Payloads, credentials, and field values are never logged.
+
+## 16. Qualification gates
+
+Qualification uses fresh volumes and the same candidate artifact on the
+8-core/32-GiB SSD and 16-core/64-GiB rotational hosts. All remote experiment
+files and Keldra data remain beneath `~/keldra_experiments`.
+
+### 16.1 Throughput scaling
+
+Measure indexing with 1, 2, 4, and 8 cores and 256 MiB per core. Report:
+
+- accepted object mutations/s;
+- indexed documents, source bytes, values, tokens, and postings/s;
+- each value normalized per core and per 256 MiB;
+- CPU utilization and memory by stage;
+- hot admission and replay percentages;
+- segment durability bandwidth and publication frequency; and
+- query-run publication rate, L0 removal/addition density, and query-side
+  seek/intersection evidence showing no preparation-state scan; and
+- lag slope during a sustained run.
+
+The qualification corpus has two independent object-size shapes: a small
+object floor of approximately 1 KiB and a pathological 96 KiB source-object
+cell reflecting the production large-object failure shape. The latter is D1/P1
+at the maximum resource cell, not a multiplier on logical catalog or physical
+recipe cardinality. Reports distinguish accepted source bytes/s from
+prepared/projected bytes/s; the latter is read only from a v6 runtime counter,
+never estimated from payload length.
+
+The first SSD floor for small-object projection is 10,000 accepted and indexed
+mutations/s with stationary lag. This is a qualification target, not a claim
+until measured.
+
+### 16.2 Logical and physical scale
+
+Create D1, D64, D1K, D10K, and D250K equivalent logical definitions. Physical
+work and source-to-visible lag must remain near D1. Separately test P1, P4, P16,
+and P64 genuinely distinct physical recipes so unavoidable recipe cost is not
+misreported as catalog cost.
+
+### 16.3 Workload shapes
+
+Run inserts, deletes, projection-preserving updates, material-changing updates,
+and a realistic mixture. Projection-preserving updates must produce head deltas
+and zero field-component work. Large fields and token expansion must remain
+inside charged bounds.
+
+### 16.4 Sustained and recovery runs
+
+Run the maximum stationary SSD cell for at least 30 minutes. Lag must converge
+to a bounded distribution while ingestion continues; a final drain is not
+keep-up evidence. Kill and restart producers at empty, partially filled,
+sealing, durable-unattached, root-publication, and compaction points. Verify
+exact results, replay bounds, and orphan reclamation.
+
+### 16.5 Query isolation evidence
+
+Record write-only qualification separately from concurrent-query cells. Write
+architecture is accepted on projection throughput and correctness, while query
+latency and root-vector materialization are measured independently so a read
+optimization cannot conceal or constrain a better write path.
+
+For each declared recipe capability, query a pinned multi-partition root vector
+through a selective term/text predicate, numeric range, order, facet, and
+aggregate as applicable. Evidence must bind every claimed root cut to its
+`ProjectionQueryRun`s, show recipe seeks/intersections and bounded
+exact-current candidate validation, and show zero field-state broad-scan or
+field-state fallback attempts. Exercise sparse L0 old-material removals plus
+new-material additions before and after bounded whole-run compaction.
+
+Every report binds commit and artifact digest, host/topology, corpus hash,
+durability, batch/concurrency, logical and physical recipe counts, offered and
+accepted rates, latency distributions, checkpoints, CPU profile, memory,
+RocksDB/artifact bytes, compaction, correctness, and duration.
+
+## 17. Clean-break removal requirements
+
+Implementation removes, rather than wraps:
+
+- external and per-definition builders;
+- elected representative builders and builder failover state;
+- builder scheduler queues, due records, leases, and per-definition turns;
+- per-definition or per-family journal rescans and checkpoints;
+- historical projected-state streams used to rediscover predecessor state;
+- global/per-family manifest CAS on the normal partition flush path;
+- the format-v4 assembler bridge as a separately scheduled indexing path;
+- dual writers, old-format readers, converters, migrations, feature flags, and
+  fallback query/index paths;
+- compatibility tests whose only purpose is preserving removed architecture;
   and
-- each component root can now name an ordered immutable delta stream through a
-  second bounded-fanout content-addressed directory. Readers verify every
-  segment identity and resolve newest-by-stable-key values; compaction folds
-  the stream into one exact self-contained segment while retaining tombstones
-  required by concurrently pinned older generations. A 70,000-segment
-  regression keeps directory pages below 32 KiB; and
-- component-stream append is a persistent path-copy operation rather than a
-  whole-directory rebuild. The generation retains only a small root identity;
-  that identity includes the stream root hash, segment count, delta bytes,
-  logical bytes, and directory bytes, so it can be reopened exactly without
-  loading or guessing the full directory;
-  immutable directory pages are loaded by hash and one append publishes only
-  the rightmost leaf plus its `O(log_256 segments)` parent path. A 65,536 to
-  65,537 segment boundary regression rewrites exactly three pages while
-  preserving an exact complete decode; unreachable proof pages are rejected;
-  and
-- changed deltas are integrated into shared payload packs at the existing
-  16 MiB physical bound. Stream descriptors bind pack hash, exact byte range,
-  segment hash, record count, and byte accounting, so many tiny recipe changes
-  do not become one payload object or filesystem inode each; and
-- one storage-neutral publication preparation produces the complete set of
-  delta packs, newly path-copied stream pages, component-directory pages, and
-  exact next generation. Runtime publication must make those immutable values
-  durable first and atomically install only the generation record last; and
-- an empty captured family is represented by a canonical empty component
-  directory and a complete source barrier, rather than fabricated records or
-  the absence of a checkpoint. Bounded rebuild frames become durable canonical
-  generations as they complete, but the logical definition's native cache root
-  is not published until the complete baseline is assembled. The candidate
-  gate therefore cannot expose a partial baseline; and
-- the production artifact boundary now admits those canonical format-v5 paths,
-  verifies every immutable path against its exact payload hash, stages and
-  publishes the complete immutable dependency set through ordinary integrated
-  payload storage, and installs the single family `current` object by
-  exact-version CAS. The full 256-bit family identity remains the persistence
-  authority; its derived 64-bit publication key is scheduling-only, so a
-  collision can at most serialize unrelated families. Reclamation remains
-  fail-closed until generation reachability is wired; and
-- the production reader can reopen the exact family `current` object after a
-  process restart, verify its referenced generation hash and revision, load the
-  bounded component-directory Merkle pages by content hash, and reject missing,
-  duplicated, cyclic, oversized, deleted, or identity-mismatched artifacts
-  before exposing the decoded generation;
-- the same reader reopens component-stream directories under their committed
-  page-count and byte bounds, verifies exact pack and segment identities, and
-  resolves stable keys newest-to-oldest while distinguishing an explicit
-  tombstone from a miss. Source-record locators are verified against the exact
-  source path and every derived stable-key ordinal before prior projected state
-  is admitted. Runtime generation advancement reuses the verified predecessor
-  pages, publishes all new immutable artifacts, and CAS-installs `current` last.
-  This is now the restart-safe storage seam used by source-journal projection
-  and public Typed JSON query admission.
+- stale documentation or configuration referring to those facilities.
 
-The runtime now also has a bounded family writer seam. It accepts the compiled
-distinct-recipe plan rather than a logical definition, preserves exact journal
-epochs in format-v5 barriers, loads prior projected state by source locator,
-and applies a complete source unit transactionally. Its rebuild mode durably
-appends bounded immutable frame generations while withholding the incomplete
-native cache root; its incremental mode serializes a family and installs one
-complete source unit directly.
-The production ordinary and atomic source-journal paths now call this seam.
-Ordinary microbatches install one complete canonical generation; an atomic batch
-stages every bounded source frame and installs exactly one family current only
-after all paths have been represented. Empty relevant units still advance the
-family barrier without fabricating document changes. The native assembler
-receives only material cache mutations returned by that same family pass.
+Existing public index and query semantics are retained unless this RFC
+explicitly changes their internal physical ownership. Fresh deployments rebuild
+derived state; no legacy derived artifact is imported.
 
-The in-memory catalog and projection pass now satisfy the field-subset grouping
-rule: one payload is parsed against the family's distinct-recipe union and is
-converted into canonical format-v5 projected-document state once. The
-production source-journal writer now calls that format-v5 family pass. Public
-Typed JSON queries load the exact family generation, require it to cover the
-selected native-cache barrier, resolve stable cache keys through canonical
-document heads, and apply the material-version gate described in section 8.1.
-Focused tests prove that 10,000 successive unindexed source versions create only
-head changes, retain one cache material identity, and emit no native cache
-mutation; a field change advances that identity and emits one stable upsert.
+## 18. Non-goals and consequences
 
-The existing native segment assembler and query engine currently provide a
-temporary production bridge. For Typed JSON, the runtime's compact
-physical routing key is derived from the complete membership-family identity,
-not the complete logical field schema. Every assigned field-subset definition
-is registered in the family's distinct-recipe union. The scheduler maintains
-one representative builder for that family, restarts or discards stale work
-when the union fingerprint changes, and promotes another logical member if the
-representative is removed. The assembler therefore parses and seals one union
-segment stream rather than one stream per logical subset.
+This RFC does not make genuinely different analysis free, make memory durable,
+introduce a second journal, share data across authorization authorities, adopt
+Lucene or RocksDB as the public index format, require query fanout, or promise
+that increasing CPU always helps after another measured resource saturates.
 
-At query admission, the authorized logical schema is compiled separately. Its
-field-recipe identities are matched to the union's canonical physical field
-IDs, and only then are its public names bound onto a complete union schema for
-the native query executor. Schema fingerprints intentionally exclude those
-public names, so the manifest remains the same physical generation. Unrequested
-union fields receive collision-free internal names and cannot be addressed by
-the logical query. The existing postings/points/doc-values executor is now the
-disposable native query cache while format v5 is its canonical durable
-projection authority. Cache and projection barriers are checked independently;
-disagreement is a recovery condition, not an implicit cache hit.
+It also does not preserve the seven v4-only index kinds in the current supported
+surface. Their component semantics remain design input, but availability waits
+for a partition-pipeline implementation and its full correctness qualification.
 
-The bridge is also the first production field-subset scale point: definitions
-with the same tenant, bucket, path/content scope and source semantics but
-different field subsets consume one active-builder lease. Adding a distinct
-recipe changes the union schema once and causes one family rebuild. Adding an
-alias or duplicate recipe changes only reference counts and logical bindings.
-The pending server qualification must prove that this behavior remains bounded
-for mixed subsets at D640 and under catalog churn; until then this is
-code-complete and compile-validated, not a scale claim.
+It deliberately accepts that:
 
-Milestone B is therefore production-integrated. Its release gate remains the
-full correctness, crash, heterogeneous-recipe, and D1-through-D640 scale
-qualification in sections 14 and 15.
+- a crash discards recent in-memory projection work and replays it;
+- a full hot buffer degrades into journal replay rather than blocking ingress
+  solely for indexing;
+- sustained inability to project eventually exhausts bounded journal capacity
+  and backpressures authoritative writes;
+- immutable segments still require durable writes, but those writes are large
+  and amortized rather than per object; and
+- partition-root vectors add query-planning work which read-side optimization
+  must address separately.
 
-### 18.3 Milestone C: projected-document state
-
-Persist the disposable exact projected state and stable document indirection
-described in section 7. The writer compares canonical prior/current state and
-emits no component mutation for an unindexed change, or only the changed recipe
-subset for a material change. This is the Keldra HOT-equivalent milestone.
-
-The native format-v5 writer core is implemented. One byte-accounted
-source-partition buffer admits a complete mutation across every dirty physical
-recipe or leaves the buffer unchanged, coalesces repeated stable-document-key
-updates, and seals canonical integrity-checked delta segments. Focused tests
-prove that an unindexed update writes only the disposable exact projected state
-and document head—no membership or query field—and that changing one indexed
-field adds only that field recipe. Durable generation publication and
-production source projection and query resolution consume these records. The
-remaining Milestone C gate is end-to-end qualification under sustained
-projection-preserving and material-changing workloads.
-
-The writer also maintains one source-record-set component. It lets overwrite,
-delete, and expansion shrink load exactly the prior stable keys for that source
-without scanning the family. A complete source update is admitted
-transactionally: all current records, removed-record tombstones, and the
-record-set replacement enter the shared buffer or none do. The current
-implementation reserves twice the buffer bound while cloning the affected
-buffer for rollback; this is an explicit temporary peak bound, not unaccounted
-memory or a per-definition reservation.
-
-Milestone C is therefore locally proven in the writer core, but not production
-complete until the format-v5 writer and stable-key query cache own the live
-source-to-query path.
-
-### 18.4 Milestone D: lifecycle and scale completion
-
-Complete last-reference physical GC, incremental recipe backfill, bounded
-catalog paging/restart, churn/crash recovery, and every scale gate in section
-15. Only this milestone changes this RFC's status from implementation in
-progress to implemented.
+In return, indexing capacity becomes a direct function of allocated CPU,
+memory, physical recipe complexity, and segment bandwidth—not logical builder
+count or accumulated projection history.

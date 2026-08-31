@@ -7,14 +7,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::IndexError;
-use crate::v4::{INDEX_ARTIFACT_PACK_BYTES, INDEX_DECODE_BYTES};
+
+/// Bounded decode workspace for one native projection component.
+const INDEX_DECODE_BYTES: usize = 4 * 1024 * 1024;
+/// Bounded immutable projection pack emitted by one sealing lane.
+const INDEX_ARTIFACT_PACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// A four-input range merge may retain twelve maximum decoded input leaves.
 /// Its four former output slots are one incremental 16 MiB artifact pack, so
 /// the complete lane remains exactly 64 MiB without hiding publication memory.
-const V4_DECODED_INPUT_COMPONENTS_PER_LANE: usize = 12;
+const DECODED_INPUT_COMPONENTS_PER_LANE: usize = 12;
 const COMPLETE_LANE_WORKSPACE_BYTES: usize =
-    V4_DECODED_INPUT_COMPONENTS_PER_LANE * INDEX_DECODE_BYTES + INDEX_ARTIFACT_PACK_BYTES;
+    DECODED_INPUT_COMPONENTS_PER_LANE * INDEX_DECODE_BYTES + INDEX_ARTIFACT_PACK_BYTES;
 
 /// Workspace charged before the first compaction lane starts.
 pub const COMPACTION_SHARED_WORKSPACE_BYTES: usize = COMPLETE_LANE_WORKSPACE_BYTES;
