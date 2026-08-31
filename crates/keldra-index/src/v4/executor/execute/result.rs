@@ -10,11 +10,20 @@ pub(super) fn validate_gate(
     let checked = u64::try_from(count).map_err(|_| IndexError::OffsetOverflow)?;
     statistics.candidate_gate_checked(checked);
     let rejected = evidence.denied.checked_add(evidence.stale);
-    let invisible = u64::try_from(evidence.visible.iter().filter(|visible| !**visible).count())
-        .map_err(|_| IndexError::OffsetOverflow)?;
-    if evidence.visible.len() != count
+    let invisible = u64::try_from(
+        evidence
+            .resolved
+            .iter()
+            .filter(|candidate| candidate.is_none())
+            .count(),
+    )
+    .map_err(|_| IndexError::OffsetOverflow)?;
+    if evidence.resolved.len() != count
         || evidence.authorization_revision != request.authorization_revision
         || rejected != Some(invisible)
+        || evidence.resolved.iter().flatten().any(|candidate| {
+            candidate.source.validate().is_err() || candidate.result.validate().is_err()
+        })
     {
         return Err(IndexError::InvalidQuery(
             "candidate gate returned incomplete or differently pinned evidence".into(),
@@ -56,8 +65,8 @@ pub(super) async fn materialize<D: ArtifactDirectoryRead>(
         }
         let cursor = NativeQueryCursor {
             sort_values: selected.sort_values,
-            result: selected.result.clone(),
-            source: selected.source.clone(),
+            result: selected.order_result,
+            source: selected.order_source,
             source_record: selected.source_record,
         };
         let hit = NativeQueryHit {

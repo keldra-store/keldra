@@ -63,7 +63,7 @@ impl CandidateGate for RankedAllowAll {
         candidates: &[CandidateReference],
     ) -> Result<CandidateGateEvidence, Self::Error> {
         Ok(CandidateGateEvidence {
-            visible: vec![true; candidates.len()],
+            resolved: candidates.iter().cloned().map(Some).collect(),
             authorization_revision: 7,
             denied: 0,
             stale: 0,

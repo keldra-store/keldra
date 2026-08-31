@@ -11,12 +11,12 @@ use crate::v4::{
 pub(super) fn compare_selected(left: &Selected, right: &Selected) -> Ordering {
     compare_parts(
         &left.sort_values,
-        &left.result,
-        &left.source,
+        &left.order_result,
+        &left.order_source,
         left.source_record,
         &right.sort_values,
-        &right.result,
-        &right.source,
+        &right.order_result,
+        &right.order_source,
         right.source_record,
         &left.directions,
     )
@@ -25,8 +25,8 @@ pub(super) fn compare_selected(left: &Selected, right: &Selected) -> Ordering {
 pub(super) fn compare_to_cursor(candidate: &Selected, cursor: &NativeQueryCursor) -> Ordering {
     compare_parts(
         &candidate.sort_values,
-        &candidate.result,
-        &candidate.source,
+        &candidate.order_result,
+        &candidate.order_source,
         candidate.source_record,
         &cursor.sort_values,
         &cursor.result,

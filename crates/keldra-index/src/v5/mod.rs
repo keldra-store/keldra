@@ -28,7 +28,9 @@ pub use projected_state::{
     CanonicalRecipeState, DocumentHead, ProjectedDocumentDelta, ProjectedDocumentState,
     RecipeDelta, RecipeIdentity, StableDocumentKey,
 };
-pub use projector::{merge_projected_document_states, projected_document_states};
+pub use projector::{
+    decode_canonical_field_state, merge_projected_document_states, projected_document_states,
+};
 pub use publication::{PreparedProjectionGeneration, prepare_projection_generation};
 pub use stream::{
     COMPONENT_STREAM_DIRECTORY_FANOUT, ComponentRecordLookup, ComponentSegmentDescriptor,
@@ -41,7 +43,8 @@ pub use stream::{
 pub const INDEX_FORMAT_VERSION: u16 = 5;
 pub use buffer::{
     ComponentDeltaRecord, DecodedComponentDelta, ProjectionMutationBuffer, SealedComponentDelta,
-    decode_component_delta, decode_component_delta_segment, decode_source_records,
+    decode_component_delta, decode_component_delta_segment, decode_document_head,
+    decode_source_records, encode_document_head,
 };
 pub use codec::{
     COMPONENT_DIRECTORY_FANOUT, ComponentDirectory, EncodedComponentDirectoryPage,

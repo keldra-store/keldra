@@ -1,6 +1,9 @@
 use crate::IndexError;
-use crate::v4::build::{ProjectedRecord, ProjectedSource};
-use crate::v4::{FieldId, ScalarValue, Schema};
+use crate::v4::build::{
+    ProjectedDocValue, ProjectedPoint, ProjectedRecord, ProjectedSource, ProjectedTerm,
+    ProjectedVector,
+};
+use crate::v4::{DocValueCell, FieldId, ScalarValue, Schema};
 
 use super::{CanonicalRecipeState, DocumentHead, ProjectedDocumentState, RecipeIdentity};
 
@@ -224,6 +227,231 @@ fn encode_field_state(record: &ProjectedRecord, field_id: FieldId) -> Result<Vec
     Ok(out)
 }
 
+/// Reconstruct one native query-cache field from its canonical format-v5
+/// recipe state.
+///
+/// The durable projection remains field-local and definition-neutral. The
+/// returned record deliberately has no result identity or physical order: the
+/// assembler obtains document identity from `DocumentHead` and combines the
+/// separately bound field recipes selected by the logical definition.
+pub fn decode_canonical_field_state(
+    field_id: FieldId,
+    bytes: &[u8],
+) -> Result<ProjectedRecord, IndexError> {
+    let mut decoder = FieldStateDecoder::new(bytes);
+    if decoder.u16()? != CANONICAL_FIELD_STATE_VERSION {
+        return Err(IndexError::InvalidFormat(
+            "unsupported canonical field-state version",
+        ));
+    }
+
+    let term_count = decoder.count(14)?;
+    let mut terms = Vec::with_capacity(term_count);
+    for _ in 0..term_count {
+        let term_type = decoder.u8()?;
+        let term = decoder.bytes()?.to_vec();
+        let frequency = decoder.u32()?;
+        let position_count = decoder.count(4)?;
+        let mut positions = Vec::with_capacity(position_count);
+        for _ in 0..position_count {
+            positions.push(decoder.u32()?);
+        }
+        terms.push(ProjectedTerm {
+            field_id,
+            term_type,
+            term,
+            frequency,
+            positions,
+        });
+    }
+
+    let point_count = decoder.count(7)?;
+    let mut points = Vec::with_capacity(point_count);
+    for _ in 0..point_count {
+        let present = decoder.boolean()?;
+        let null = decoder.boolean()?;
+        let value_count = decoder.count(1)?;
+        let mut values = Vec::with_capacity(value_count);
+        for _ in 0..value_count {
+            values.push(decoder.scalar()?);
+        }
+        points.push(ProjectedPoint {
+            field_id,
+            present,
+            null,
+            values,
+        });
+    }
+
+    let doc_value_count = decoder.count(8)?;
+    let mut doc_values = Vec::with_capacity(doc_value_count);
+    for _ in 0..doc_value_count {
+        let multi_valued = decoder.boolean()?;
+        let present = decoder.boolean()?;
+        let null = decoder.boolean()?;
+        let value_count = decoder.count(1)?;
+        let mut values = Vec::with_capacity(value_count);
+        for _ in 0..value_count {
+            values.push(decoder.scalar()?);
+        }
+        doc_values.push(ProjectedDocValue {
+            field_id,
+            multi_valued,
+            cell: DocValueCell {
+                present,
+                null,
+                values,
+            },
+        });
+    }
+
+    let vector_count = decoder.count(8)?;
+    let mut vectors = Vec::with_capacity(vector_count);
+    for _ in 0..vector_count {
+        let value_count = decoder.count(4)?;
+        let mut values = Vec::with_capacity(value_count);
+        for _ in 0..value_count {
+            let value = f32::from_bits(decoder.u32()?);
+            if !value.is_finite() {
+                return Err(IndexError::Integrity);
+            }
+            values.push(value);
+        }
+        vectors.push(ProjectedVector { field_id, values });
+    }
+
+    let field_length_count = decoder.count(4)?;
+    let mut field_lengths = Vec::with_capacity(field_length_count);
+    for _ in 0..field_length_count {
+        field_lengths.push((field_id, decoder.u32()?));
+    }
+    decoder.finish()?;
+
+    let record = ProjectedRecord {
+        result_identity: None,
+        order_key: Vec::new(),
+        terms,
+        points,
+        doc_values,
+        vectors,
+        field_lengths,
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+struct FieldStateDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> FieldStateDecoder<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], IndexError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(IndexError::OffsetOverflow)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(IndexError::Integrity)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, IndexError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn boolean(&mut self) -> Result<bool, IndexError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(IndexError::Integrity),
+        }
+    }
+
+    fn u16(&mut self) -> Result<u16, IndexError> {
+        Ok(u16::from_le_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| IndexError::Integrity)?,
+        ))
+    }
+
+    fn u32(&mut self) -> Result<u32, IndexError> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| IndexError::Integrity)?,
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, IndexError> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| IndexError::Integrity)?,
+        ))
+    }
+
+    fn count(&mut self, minimum_item_bytes: usize) -> Result<usize, IndexError> {
+        let count = usize::try_from(self.u32()?).map_err(|_| IndexError::OffsetOverflow)?;
+        if minimum_item_bytes == 0 || count > self.remaining() / minimum_item_bytes {
+            return Err(IndexError::Integrity);
+        }
+        Ok(count)
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8], IndexError> {
+        let length = usize::try_from(self.u32()?).map_err(|_| IndexError::OffsetOverflow)?;
+        self.take(length)
+    }
+
+    fn scalar(&mut self) -> Result<ScalarValue, IndexError> {
+        match self.u8()? {
+            0 => Ok(ScalarValue::Null),
+            1 => Ok(ScalarValue::Boolean(self.boolean()?)),
+            2 => Ok(ScalarValue::Signed(i64::from_le_bytes(
+                self.take(8)?
+                    .try_into()
+                    .map_err(|_| IndexError::Integrity)?,
+            ))),
+            3 => Ok(ScalarValue::Unsigned(self.u64()?)),
+            4 => {
+                let bits = self.u64()?;
+                let value = f64::from_bits(bits);
+                if !value.is_finite() || (value == 0.0 && bits != 0) {
+                    return Err(IndexError::Integrity);
+                }
+                Ok(ScalarValue::Number(bits))
+            }
+            5 => Ok(ScalarValue::String(
+                std::str::from_utf8(self.bytes()?)
+                    .map_err(|_| IndexError::Integrity)?
+                    .to_owned(),
+            )),
+            _ => Err(IndexError::Integrity),
+        }
+    }
+
+    fn finish(self) -> Result<(), IndexError> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(IndexError::Integrity)
+        }
+    }
+}
+
 fn put_scalar(out: &mut Vec<u8>, value: &ScalarValue) -> Result<(), IndexError> {
     match value {
         ScalarValue::Null => out.push(0),
@@ -275,11 +503,13 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 
 #[cfg(test)]
 mod tests {
-    use crate::v4::build::{ProjectedDocValue, ProjectedRecord};
+    use crate::v4::build::{
+        ProjectedDocValue, ProjectedPoint, ProjectedRecord, ProjectedTerm, ProjectedVector,
+    };
     use crate::v4::{
         Cardinality, Collation, ComponentKind, ComponentVersion, DocValueCell, FieldCapabilities,
         FieldComponents, FieldSchema, FieldType, IndexKind, IndexSemantics, ObjectIdentity,
-        ScalarValue,
+        ScalarValue, TERM_TYPE_STRING, TERM_TYPE_TEXT,
     };
 
     use super::*;
@@ -371,6 +601,75 @@ mod tests {
         let delta = new[0].delta_from(Some(&old[0])).unwrap();
         assert_eq!(delta.fields.len(), 1);
         assert_eq!(delta.fields[0].recipe, old[0].fields[0].recipe);
+    }
+
+    #[test]
+    fn canonical_field_state_round_trips_every_native_query_component() {
+        let field_id = FieldId::new(7);
+        let expected = ProjectedRecord {
+            result_identity: None,
+            order_key: Vec::new(),
+            terms: vec![
+                ProjectedTerm {
+                    field_id,
+                    term_type: TERM_TYPE_STRING,
+                    term: b"\0open".to_vec(),
+                    frequency: 1,
+                    positions: Vec::new(),
+                },
+                ProjectedTerm {
+                    field_id,
+                    term_type: TERM_TYPE_TEXT,
+                    term: b"token".to_vec(),
+                    frequency: 2,
+                    positions: vec![3, 9],
+                },
+            ],
+            points: vec![ProjectedPoint {
+                field_id,
+                present: true,
+                null: false,
+                values: vec![
+                    ScalarValue::Signed(-12),
+                    ScalarValue::Unsigned(19),
+                    ScalarValue::number(2.5).unwrap(),
+                ],
+            }],
+            doc_values: vec![ProjectedDocValue {
+                field_id,
+                multi_valued: true,
+                cell: DocValueCell {
+                    present: true,
+                    null: false,
+                    values: vec![
+                        ScalarValue::String("open".into()),
+                        ScalarValue::String("resolved".into()),
+                    ],
+                },
+            }],
+            vectors: vec![ProjectedVector {
+                field_id,
+                values: vec![0.25, -4.5],
+            }],
+            field_lengths: vec![(field_id, 17)],
+        };
+        expected.validate().unwrap();
+        let encoded = encode_field_state(&expected, field_id).unwrap();
+        assert_eq!(
+            decode_canonical_field_state(field_id, &encoded).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn canonical_field_state_decoder_rejects_truncation_and_trailing_bytes() {
+        let field_id = FieldId::new(0);
+        let record = &source(7, "open").records[0];
+        let encoded = encode_field_state(record, field_id).unwrap();
+        assert!(decode_canonical_field_state(field_id, &encoded[..encoded.len() - 1]).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_canonical_field_state(field_id, &trailing).is_err());
     }
 
     #[test]

@@ -255,6 +255,7 @@ impl CandidateGate for RuntimeCandidateGate {
         candidates: &[CandidateReference],
     ) -> impl std::future::Future<Output = Result<CandidateGateEvidence, Self::Error>> + Send {
         async move {
+            let references = candidates.to_vec();
             let candidates = candidates
                 .iter()
                 .map(|candidate| IndexCandidateIdentity {
@@ -281,8 +282,13 @@ impl CandidateGate for RuntimeCandidateGate {
                 denied,
                 stale,
             } = result?;
+            let resolved = references
+                .into_iter()
+                .zip(visible)
+                .map(|(candidate, visible)| visible.then_some(candidate))
+                .collect();
             Ok(CandidateGateEvidence {
-                visible,
+                resolved,
                 authorization_revision,
                 denied,
                 stale,

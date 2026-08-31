@@ -331,8 +331,8 @@ where
                         .await
                         .map_err(NativeQueryExecutionError::Gate)?;
                     result::validate_gate(request, references.len(), &evidence, statistics)?;
-                    for (candidate, visible) in pending.drain(..).zip(evidence.visible) {
-                        if visible {
+                    for (candidate, resolved) in pending.drain(..).zip(evidence.resolved) {
+                        if resolved.is_some() {
                             state
                                 .observe(&mut execution.values, candidate.doc_id, statistics)
                                 .await?;
@@ -542,10 +542,8 @@ where
             .await
             .map_err(NativeQueryExecutionError::Gate)?;
         result::validate_gate(request, references.len(), &evidence, statistics)?;
-        for (candidate, visible) in pending.drain(..).zip(evidence.visible) {
-            if !visible {
-                continue;
-            }
+        for (candidate, resolved) in pending.drain(..).zip(evidence.resolved) {
+            let Some(resolved) = resolved else { continue };
             let score = execution
                 .scorer
                 .score(
@@ -576,9 +574,11 @@ where
             let source_record = candidate.identity.source_record;
             let selected = Selected {
                 segment_index: execution.segment_index,
-                source: candidate.identity.source,
+                order_source: candidate.identity.source,
+                order_result: result,
+                source: resolved.source,
                 source_record,
-                result,
+                result: resolved.result,
                 score,
                 sort_values,
                 directions: directions.clone(),
@@ -694,8 +694,10 @@ where
                 .map_err(NativeQueryExecutionError::Gate)?;
             result::validate_gate(request, references.len(), &evidence, statistics)?;
             let rejected = evidence.denied.saturating_add(evidence.stale);
-            for (candidate, visible) in pending.into_iter().zip(evidence.visible) {
-                if visible {
+            for (mut candidate, resolved) in pending.into_iter().zip(evidence.resolved) {
+                if let Some(resolved) = resolved {
+                    candidate.source = resolved.source;
+                    candidate.result = resolved.result;
                     selected.push(candidate);
                     if selected.len() == request.limit as usize {
                         break;
@@ -945,6 +947,8 @@ impl<'a, D: ArtifactDirectoryRead> SegmentExecution<'a, D> {
             physical_values(request, &mut self.values, candidate.doc_id, &result, order).await?;
         let selected = Selected {
             segment_index: self.segment_index,
+            order_source: candidate.identity.source.clone(),
+            order_result: result.clone(),
             source: candidate.identity.source,
             source_record,
             result,
@@ -970,6 +974,8 @@ struct Unranked {
 
 struct Selected {
     segment_index: usize,
+    order_source: ObjectIdentity,
+    order_result: ObjectIdentity,
     source: ObjectIdentity,
     source_record: u32,
     result: ObjectIdentity,

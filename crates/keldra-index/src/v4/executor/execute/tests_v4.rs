@@ -105,7 +105,39 @@ impl CandidateGate for AllowAll {
         candidates: &[CandidateReference],
     ) -> Result<super::super::super::CandidateGateEvidence, Self::Error> {
         Ok(super::super::super::CandidateGateEvidence {
-            visible: vec![true; candidates.len()],
+            resolved: candidates.iter().cloned().map(Some).collect(),
+            authorization_revision: 7,
+            denied: 0,
+            stale: 0,
+        })
+    }
+}
+
+struct ResolveToCurrent;
+
+impl CandidateGate for ResolveToCurrent {
+    type Error = IndexError;
+
+    async fn evaluate(
+        &self,
+        candidates: &[CandidateReference],
+    ) -> Result<super::super::super::CandidateGateEvidence, Self::Error> {
+        Ok(super::super::super::CandidateGateEvidence {
+            resolved: candidates
+                .iter()
+                .map(|candidate| {
+                    Some(CandidateReference {
+                        source: ObjectIdentity {
+                            path: format!("current/{}", candidate.source.path),
+                            version: candidate.source.version + 10,
+                        },
+                        result: ObjectIdentity {
+                            path: format!("current/{}", candidate.result.path),
+                            version: candidate.result.version + 10,
+                        },
+                    })
+                })
+                .collect(),
             authorization_revision: 7,
             denied: 0,
             stale: 0,
@@ -131,7 +163,7 @@ impl CandidateGate for ConcurrentGate {
         tokio::task::yield_now().await;
         self.active.fetch_sub(1, AtomicOrdering::SeqCst);
         Ok(super::super::super::CandidateGateEvidence {
-            visible: vec![true; candidates.len()],
+            resolved: candidates.iter().cloned().map(Some).collect(),
             authorization_revision: 7,
             denied: 0,
             stale: 0,
@@ -152,15 +184,16 @@ impl CandidateGate for SelectiveGate {
         &self,
         candidates: &[CandidateReference],
     ) -> Result<super::super::super::CandidateGateEvidence, Self::Error> {
-        let visible = candidates
+        let resolved = candidates
             .iter()
             .map(|candidate| {
-                !self.denied.contains(&candidate.result.path)
-                    && !self.stale.contains(&candidate.result.path)
+                (!self.denied.contains(&candidate.result.path)
+                    && !self.stale.contains(&candidate.result.path))
+                .then(|| candidate.clone())
             })
             .collect::<Vec<_>>();
         Ok(super::super::super::CandidateGateEvidence {
-            visible,
+            resolved,
             authorization_revision: self.revision,
             denied: candidates
                 .iter()
@@ -644,6 +677,38 @@ async fn exact_prefix_range_and_exists_use_declared_native_components() {
         .await
         .unwrap();
     assert_eq!(paths(&exists), BTreeSet::from(["a", "b", "c"]));
+}
+
+#[tokio::test]
+async fn candidate_gate_resolves_current_result_without_changing_physical_cursor_identity() {
+    let (schema, segment, directory) = fixture().await;
+    let executor =
+        NativeQueryExecutor::new(&directory, &ResolveToCurrent, NativeQueryLimits::default())
+            .unwrap();
+    let page = executor
+        .execute(&request(
+            &schema,
+            &segment,
+            NativeQuery::Filter {
+                predicate: Some(Predicate::Equal {
+                    id: PredicateId::new(91),
+                    field_id: FieldId::new(0),
+                    value: ScalarValue::String("active".into()),
+                }),
+                order: Vec::new(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.hits
+            .iter()
+            .map(|hit| (hit.result.path.as_str(), hit.result.version))
+            .collect::<Vec<_>>(),
+        vec![("current/a", 11), ("current/c", 11)]
+    );
+    assert_eq!(page.hits[0].cursor.result.path, "a");
+    assert_eq!(page.hits[0].cursor.result.version, 1);
 }
 
 #[tokio::test]

@@ -545,7 +545,11 @@ pub struct CandidateReference {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateGateEvidence {
-    pub visible: Vec<bool>,
+    /// Exact generation-pinned identities for admitted candidates. `None`
+    /// rejects the candidate. Projection-preserving caches may resolve an
+    /// immutable posting to a newer source/result version without changing its
+    /// stable physical ordering identity.
+    pub resolved: Vec<Option<CandidateReference>>,
     pub authorization_revision: u64,
     /// Candidates rejected by authorization before exact-current evaluation.
     pub denied: u64,

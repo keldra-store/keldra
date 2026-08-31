@@ -4,6 +4,7 @@ use crate::IndexError;
 use crate::v4::{INDEX_ROUTING_KEY_BYTES, ObjectIdentity};
 
 const STABLE_DOCUMENT_KEY_DOMAIN: &[u8] = b"keldra.index.stable-document-key/v1";
+const QUERY_CACHE_IDENTITY_PREFIX: &str = "_keldra/index-cache/v5/";
 
 /// Definition-neutral identity of one canonical membership or field recipe.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -21,6 +22,16 @@ impl RecipeIdentity {
 
     pub const fn bytes(self) -> [u8; 32] {
         self.0
+    }
+}
+
+fn decode_hex(value: u8) -> Result<u8, IndexError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(IndexError::InvalidFormat(
+            "format-v5 query-cache identity hex",
+        )),
     }
 }
 
@@ -62,6 +73,43 @@ impl StableDocumentKey {
 
     pub const fn bytes(self) -> [u8; 32] {
         self.0
+    }
+
+    /// Stable synthetic identity embedded in disposable native query-cache
+    /// segments. Its version never tracks an ordinary object version; query
+    /// admission resolves it through the pinned format-v5 document-head root.
+    pub fn query_cache_identity(self) -> ObjectIdentity {
+        let mut path = String::with_capacity(QUERY_CACHE_IDENTITY_PREFIX.len() + 64);
+        path.push_str(QUERY_CACHE_IDENTITY_PREFIX);
+        for byte in self.0 {
+            use std::fmt::Write as _;
+            write!(&mut path, "{byte:02x}").expect("writing to a String is infallible");
+        }
+        ObjectIdentity { path, version: 1 }
+    }
+
+    pub fn from_query_cache_identity(identity: &ObjectIdentity) -> Result<Self, IndexError> {
+        let encoded = identity
+            .path
+            .strip_prefix(QUERY_CACHE_IDENTITY_PREFIX)
+            .ok_or(IndexError::InvalidFormat(
+                "format-v5 query-cache identity prefix",
+            ))?;
+        if identity.version != 1 || encoded.len() != 64 {
+            return Err(IndexError::InvalidFormat(
+                "format-v5 query-cache identity shape",
+            ));
+        }
+        let mut bytes = [0_u8; 32];
+        for (offset, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+            let high = decode_hex(pair[0])?;
+            let low = decode_hex(pair[1])?;
+            bytes[offset] = high
+                .checked_mul(16)
+                .and_then(|high| high.checked_add(low))
+                .ok_or(IndexError::Integrity)?;
+        }
+        Self::from_bytes(bytes)
     }
 }
 
@@ -432,5 +480,22 @@ mod tests {
             first,
             StableDocumentKey::derive([8; 32], "objects/a", 0).unwrap()
         );
+    }
+
+    #[test]
+    fn query_cache_identity_round_trips_and_rejects_noncanonical_aliases() {
+        let key = StableDocumentKey::derive([7; 32], "objects/a", 3).unwrap();
+        let identity = key.query_cache_identity();
+        assert_eq!(
+            StableDocumentKey::from_query_cache_identity(&identity).unwrap(),
+            key
+        );
+
+        let mut uppercase = identity.clone();
+        uppercase.path.make_ascii_uppercase();
+        assert!(StableDocumentKey::from_query_cache_identity(&uppercase).is_err());
+        let mut wrong_version = identity;
+        wrong_version.version = 2;
+        assert!(StableDocumentKey::from_query_cache_identity(&wrong_version).is_err());
     }
 }

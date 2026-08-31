@@ -352,7 +352,7 @@ fn encode_recipe_state(
     Ok(state.value)
 }
 
-fn encode_document_head(head: &DocumentHead) -> Result<Vec<u8>, IndexError> {
+pub fn encode_document_head(head: &DocumentHead) -> Result<Vec<u8>, IndexError> {
     let mut bytes = Vec::new();
     put_bytes(&mut bytes, head.source_path.as_bytes())?;
     put_u32(&mut bytes, head.source_record);
@@ -367,6 +367,53 @@ fn encode_document_head(head: &DocumentHead) -> Result<Vec<u8>, IndexError> {
         None => bytes.push(0),
     }
     Ok(bytes)
+}
+
+pub fn decode_document_head(
+    source_scope: [u8; 32],
+    stable_key: StableDocumentKey,
+    bytes: &[u8],
+) -> Result<DocumentHead, IndexError> {
+    let mut input = Decoder::new(bytes);
+    let source_path_length =
+        usize::try_from(input.u32()?).map_err(|_| IndexError::OffsetOverflow)?;
+    let source_path = std::str::from_utf8(input.take(source_path_length)?)
+        .map_err(|_| IndexError::Integrity)?
+        .to_owned();
+    let source_record = input.u32()?;
+    let source_version = input.u64()?;
+    let live = match input.byte()? {
+        0 => false,
+        1 => true,
+        _ => return Err(IndexError::Integrity),
+    };
+    let result = match input.byte()? {
+        0 => None,
+        1 => {
+            let path_length =
+                usize::try_from(input.u32()?).map_err(|_| IndexError::OffsetOverflow)?;
+            Some(crate::v4::ObjectIdentity {
+                path: std::str::from_utf8(input.take(path_length)?)
+                    .map_err(|_| IndexError::Integrity)?
+                    .to_owned(),
+                version: input.u64()?,
+            })
+        }
+        _ => return Err(IndexError::Integrity),
+    };
+    input.finish()?;
+    let head = DocumentHead::new(
+        source_scope,
+        source_path,
+        source_record,
+        source_version,
+        result,
+        live,
+    )?;
+    if head.stable_key != stable_key {
+        return Err(IndexError::Integrity);
+    }
+    Ok(head)
 }
 
 pub(super) fn seal_component(
@@ -684,6 +731,30 @@ mod tests {
                 < 1_024,
             "ten thousand source versions must collapse to one bounded head/state delta"
         );
+    }
+
+    #[test]
+    fn document_head_codec_binds_the_stable_key_and_exact_current_identity() {
+        let scope = [9; 32];
+        let head = DocumentHead::new(
+            scope,
+            "objects/a".into(),
+            3,
+            17,
+            Some(crate::v4::ObjectIdentity {
+                path: "results/a".into(),
+                version: 11,
+            }),
+            true,
+        )
+        .unwrap();
+        let encoded = encode_document_head(&head).unwrap();
+        assert_eq!(
+            decode_document_head(scope, head.stable_key, &encoded).unwrap(),
+            head
+        );
+        let other = StableDocumentKey::derive(scope, "objects/a", 4).unwrap();
+        assert!(decode_document_head(scope, other, &encoded).is_err());
     }
 
     #[test]

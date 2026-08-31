@@ -410,10 +410,38 @@ source-record-set delta:
 ```
 
 The newest entry at or below the pinned generation wins independently in each
-stream. A query obtains stable keys from postings/points/order, resolves the
-pinned membership and live head, then obtains the exact current result identity
-from that head. No query reads a field component from a generation newer than
-its pinned complete barrier.
+stream. These canonical stable-key records are the durable comparison and
+recovery form. They are not a scan-based query engine and are not represented
+as one tiny filesystem object per record.
+
+Each field or membership delta flush also feeds a disposable native query-cache
+assembler. The assembler groups a bounded generation range, constructs the
+recipe's postings, points, doc values, facet/order columns, text statistics, or
+vector structures once, and publishes a cache root keyed by the exact physical
+recipe and covered projection generation. A document-head-only update never
+enters that assembler. The assembled structures retain stable document keys,
+not source object versions or definition-local document IDs.
+
+The cache may lag the durable projection generation while assembly is in
+progress. A query pins the newest complete cache generation whose recipe roots
+all cover one common projection barrier. Newer head-only generations can be
+applied through the stable-key head map without rebuilding unchanged query
+components. Material recipe deltas become visible only when the corresponding
+bounded cache delta is complete; the public freshness watermark reports that
+complete query-visible barrier rather than merely the writer's durable barrier.
+
+Query-cache segments are append-only immutable values. Cache compaction merges
+segments newest-by-stable-key in the background and atomically replaces only a
+disposable cache root. It never advances the durable projection barrier,
+rewrites logical bindings, or becomes recovery authority. Losing all query
+cache data causes deterministic reassembly from pinned format-v5 generations.
+The assembler must operate incrementally from its preceding cache root; a full
+corpus rebuild for every generation is forbidden.
+
+A query obtains stable keys from those postings/points/order structures,
+resolves pinned membership and the live head, then obtains the exact current
+result identity from that head. No query combines a cache component or field
+state from a generation newer than its pinned complete barrier.
 
 ### 8.2 Exact projected-state comparison
 
@@ -436,11 +464,13 @@ head whose required changed recipe roots are absent. Recipe compaction folds
 newest-by-stable-key state and may rewrite physical keys without changing the
 generation barrier or logical result.
 
-Segments are immutable. Updates and deletes append deltas/tombstones; automatic
-tiered merges combine small segments, fold document-state chains, and reclaim
-obsolete entries. Merge concurrency and I/O are globally bounded and
-throttled. A merge changes physical shape without changing logical results or
-the represented source barrier.
+Both authority and cache segments are immutable. Updates and deletes append
+deltas/tombstones; automatic tiered merges combine small segments, fold
+document-state chains, and reclaim obsolete entries. Merge concurrency and I/O
+are globally bounded and throttled. A merge changes physical shape without
+changing logical results or the represented source barrier. Format-v4
+definition-owned locator roots, live-mask rewrites, and mandatory whole-corpus
+segment merges are not used by this path.
 
 ## 9. Query resolution
 
@@ -451,20 +481,24 @@ A query follows this exact sequence:
 3. load and pin the family's current generation, requiring it to be at or
    beyond the binding's ready revision;
 4. compile public field IDs through the binding to physical recipes;
-5. execute predicates, ordering, facets, aggregates, text, and vectors against
-   those component roots;
-6. intersect candidates with the definition's membership component and the
+5. select the newest common query-cache barrier covered by every requested
+   recipe and open those shared physical readers;
+6. execute predicates, ordering, facets, aggregates, text, and vectors against
+   those cache roots;
+7. intersect candidates with the definition's membership component and the
    generation's live-document state;
-7. map stable document keys to exact visible result identities; and
-8. perform the existing result-object authorization/refill behavior.
+8. map stable document keys to exact visible result identities; and
+9. perform the existing result-object authorization/refill behavior.
 
 Pagination binds logical definition version, projection generation, query
 shape, order, and search-after state. A definition replacement cannot continue
 an old cursor against a different binding.
 
-The query cache keys physical component identity and generation. Equivalent
+The query cache keys physical recipe identity and covered generation. Equivalent
 definitions reuse opened physical readers while retaining separate logical
-authorization and query contracts.
+authorization and query contracts. Admission fails closed if a cache root is
+missing, corrupt, ahead of its durable generation, or assembled from mismatched
+barriers; it never falls back to scanning canonical state.
 
 ## 10. Rebuild and definition changes
 
@@ -861,8 +895,8 @@ and public queries do not yet resolve logical bindings through independently
 reusable format-v5 component generations. Those two cutovers remain before
 Milestone B is complete.
 
-The existing native segment assembler and query engine now provide the
-production bridge for this cutover. For Typed JSON, the runtime's compact
+The existing native segment assembler and query engine currently provide a
+temporary production bridge. For Typed JSON, the runtime's compact
 physical routing key is derived from the complete membership-family identity,
 not the complete logical field schema. Every assigned field-subset definition
 is registered in the family's distinct-recipe union. The scheduler maintains
@@ -878,8 +912,9 @@ the native query executor. Schema fingerprints intentionally exclude those
 public names, so the manifest remains the same physical generation. Unrequested
 union fields receive collision-free internal names and cannot be addressed by
 the logical query. This bridge keeps the existing postings/points/doc-values
-query path efficient while format-v5 becomes the durable projection authority;
-it is a disposable query-cache assembler, not a second logical index owner.
+query path functional, but format v5 is not yet its durable projection
+authority. Calling the bridge a query-cache assembler before the source writer
+and query binding are cut over would hide the exact integration gap.
 
 The bridge is also the first production field-subset scale point: definitions
 with the same tenant, bucket, path/content scope and source semantics but
@@ -889,6 +924,9 @@ alias or duplicate recipe changes only reference counts and logical bindings.
 The pending server qualification must prove that this behavior remains bounded
 for mixed subsets at D640 and under catalog churn; until then this is
 code-complete and compile-validated, not a scale claim.
+
+Milestone B is therefore storage- and projection-core complete, but not
+production complete.
 
 ### 18.3 Milestone C: projected-document state
 
@@ -915,6 +953,10 @@ record-set replacement enter the shared buffer or none do. The current
 implementation reserves twice the buffer bound while cloning the affected
 buffer for rollback; this is an explicit temporary peak bound, not unaccounted
 memory or a per-definition reservation.
+
+Milestone C is therefore locally proven in the writer core, but not production
+complete until the format-v5 writer and stable-key query cache own the live
+source-to-query path.
 
 ### 18.4 Milestone D: lifecycle and scale completion
 

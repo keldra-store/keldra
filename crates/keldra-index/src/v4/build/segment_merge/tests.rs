@@ -545,7 +545,7 @@ impl CandidateGate for AllowAllCandidates {
         candidates: &[CandidateReference],
     ) -> impl Future<Output = Result<CandidateGateEvidence, Self::Error>> + Send {
         std::future::ready(Ok(CandidateGateEvidence {
-            visible: vec![true; candidates.len()],
+            resolved: candidates.iter().cloned().map(Some).collect(),
             authorization_revision: 1,
             denied: 0,
             stale: 0,
