@@ -179,6 +179,36 @@ async fn owned_background_task_is_aborted_when_dropped() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn cancelling_an_owned_join_aborts_instead_of_detaching_the_child() {
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (dropped, dropped_rx) = tokio::sync::oneshot::channel();
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self
+                .0
+                .take()
+                .expect("drop signal remains installed")
+                .send(());
+        }
+    }
+    let child = AbortOnDropTask::new(tokio::spawn(async move {
+        let _signal = DropSignal(Some(dropped));
+        let _ = started.send(());
+        std::future::pending::<()>().await;
+    }));
+    started_rx.await.unwrap();
+    let owner = tokio::spawn(child.join());
+    tokio::task::yield_now().await;
+    owner.abort();
+    let _ = owner.await;
+    tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+        .await
+        .expect("cancelling the join owner must abort its child")
+        .unwrap();
+}
+
 fn barrier(next_offset: u64) -> IndexBarrier {
     IndexBarrier {
         fence: PlacementLogId { term: 3, index: 7 },

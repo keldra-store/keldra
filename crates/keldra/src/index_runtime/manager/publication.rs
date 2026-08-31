@@ -107,10 +107,16 @@ impl<T> AbortOnDropTask<T> {
     }
 
     pub(super) async fn join(mut self) -> Result<T, tokio::task::JoinError> {
-        self.task
-            .take()
+        // Keep the handle installed while it is pending. If the caller that
+        // awaits `join` is itself cancelled, dropping this future then drops
+        // `self` and aborts the child instead of detaching it.
+        let result = self
+            .task
+            .as_mut()
             .expect("owned task remains installed")
-            .await
+            .await;
+        self.task.take();
+        result
     }
 }
 
