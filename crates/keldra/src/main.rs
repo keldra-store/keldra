@@ -343,6 +343,9 @@ struct Arguments {
     #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_PREPARATION_LANES")]
     single_node_group_commit_preparation_lanes: Option<usize>,
 
+    #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_PREPARED_GROUPS")]
+    single_node_group_commit_max_prepared_groups: Option<usize>,
+
     #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_REQUESTS")]
     single_node_group_commit_max_queued_requests: Option<usize>,
 
@@ -369,6 +372,7 @@ struct FileSingleNodeGroupCommitConfig {
     max_operations: Option<usize>,
     max_inline_bytes: Option<usize>,
     preparation_lanes: Option<usize>,
+    max_prepared_groups: Option<usize>,
     max_queued_requests: Option<usize>,
     max_queued_operations: Option<usize>,
     max_queued_inline_bytes: Option<usize>,
@@ -407,6 +411,9 @@ impl Arguments {
             self.single_node_group_commit_preparation_lanes
                 .or(file.preparation_lanes)
                 .unwrap_or(defaults.preparation_lanes()),
+            self.single_node_group_commit_max_prepared_groups
+                .or(file.max_prepared_groups)
+                .unwrap_or(defaults.max_prepared_groups()),
             self.single_node_group_commit_max_queued_requests
                 .or(file.max_queued_requests)
                 .unwrap_or(defaults.max_queued_requests()),
@@ -851,6 +858,8 @@ mod tests {
             "10",
             "--single-node-group-commit-preparation-lanes",
             "4",
+            "--single-node-group-commit-max-prepared-groups",
+            "3",
             "--single-node-group-commit-group-dwell-microseconds",
             "900",
         ]);
@@ -860,6 +869,7 @@ mod tests {
                     "max_requests": 7,
                     "max_operations": 7000,
                     "preparation_lanes": 2,
+                    "max_prepared_groups": 2,
                     "group_dwell_microseconds": 500
                 }
             }"#,
@@ -870,6 +880,7 @@ mod tests {
         assert_eq!(config.max_group_requests(), 10);
         assert_eq!(config.max_group_operations(), 7_000);
         assert_eq!(config.preparation_lanes(), 4);
+        assert_eq!(config.max_prepared_groups(), 3);
         assert_eq!(
             config.max_group_dwell(),
             std::time::Duration::from_micros(900)
@@ -879,12 +890,13 @@ mod tests {
     #[test]
     fn config_file_group_commit_preparation_lanes_override_default() {
         let file = serde_json::from_str::<FileConfig>(
-            r#"{"single_node_group_commit":{"preparation_lanes":3}}"#,
+            r#"{"single_node_group_commit":{"preparation_lanes":3,"max_prepared_groups":2}}"#,
         )
         .unwrap();
 
         let config = parse(&[]).single_node_group_commit_config(&file).unwrap();
         assert_eq!(config.preparation_lanes(), 3);
+        assert_eq!(config.max_prepared_groups(), 2);
     }
 
     #[test]

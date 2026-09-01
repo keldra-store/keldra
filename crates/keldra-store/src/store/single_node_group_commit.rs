@@ -16,6 +16,7 @@ const DEFAULT_MAX_GROUP_REQUESTS: usize = 5;
 const DEFAULT_MAX_GROUP_OPERATIONS: usize = 5_000;
 const DEFAULT_MAX_GROUP_INLINE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_PREPARATION_LANES: usize = 1;
+const DEFAULT_MAX_PREPARED_GROUPS: usize = 1;
 const DEFAULT_MAX_QUEUED_REQUESTS: usize = 64;
 const DEFAULT_MAX_QUEUED_OPERATIONS: usize = 8_000;
 const DEFAULT_MAX_QUEUED_INLINE_BYTES: usize = 128 * 1024 * 1024;
@@ -32,6 +33,7 @@ pub struct SingleNodeGroupCommitConfig {
     max_group_operations: usize,
     max_group_inline_bytes: usize,
     preparation_lanes: usize,
+    max_prepared_groups: usize,
     max_queued_requests: usize,
     max_queued_operations: usize,
     max_queued_inline_bytes: usize,
@@ -45,6 +47,7 @@ impl SingleNodeGroupCommitConfig {
         max_group_operations: usize,
         max_group_inline_bytes: usize,
         preparation_lanes: usize,
+        max_prepared_groups: usize,
         max_queued_requests: usize,
         max_queued_operations: usize,
         max_queued_inline_bytes: usize,
@@ -55,6 +58,7 @@ impl SingleNodeGroupCommitConfig {
             ("maximum group operations", max_group_operations),
             ("maximum group inline bytes", max_group_inline_bytes),
             ("preparation lanes", preparation_lanes),
+            ("maximum prepared groups", max_prepared_groups),
             ("maximum queued requests", max_queued_requests),
             ("maximum queued operations", max_queued_operations),
             ("maximum queued inline bytes", max_queued_inline_bytes),
@@ -72,6 +76,10 @@ impl SingleNodeGroupCommitConfig {
         anyhow::ensure!(
             max_group_requests <= max_queued_requests,
             "maximum group requests must not exceed maximum queued requests"
+        );
+        anyhow::ensure!(
+            max_prepared_groups <= max_queued_requests,
+            "maximum prepared groups must not exceed maximum queued requests"
         );
         anyhow::ensure!(
             max_group_operations <= max_queued_operations,
@@ -99,6 +107,7 @@ impl SingleNodeGroupCommitConfig {
             max_group_operations,
             max_group_inline_bytes,
             preparation_lanes,
+            max_prepared_groups,
             max_queued_requests,
             max_queued_operations,
             max_queued_inline_bytes,
@@ -120,6 +129,10 @@ impl SingleNodeGroupCommitConfig {
 
     pub fn preparation_lanes(&self) -> usize {
         self.preparation_lanes
+    }
+
+    pub fn max_prepared_groups(&self) -> usize {
+        self.max_prepared_groups
     }
 
     pub fn max_queued_requests(&self) -> usize {
@@ -146,6 +159,7 @@ impl Default for SingleNodeGroupCommitConfig {
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
             DEFAULT_PREPARATION_LANES,
+            DEFAULT_MAX_PREPARED_GROUPS,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -702,6 +716,7 @@ mod tests {
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
             2,
+            DEFAULT_MAX_PREPARED_GROUPS,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -781,6 +796,7 @@ mod tests {
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
             DEFAULT_PREPARATION_LANES,
+            DEFAULT_MAX_PREPARED_GROUPS,
             64,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -802,6 +818,7 @@ mod tests {
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
             DEFAULT_PREPARATION_LANES,
+            DEFAULT_MAX_PREPARED_GROUPS,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -815,6 +832,7 @@ mod tests {
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
             0,
+            DEFAULT_MAX_PREPARED_GROUPS,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -827,11 +845,48 @@ mod tests {
                 .contains("preparation lanes must be non-zero")
         );
 
+        let zero_prepared_groups = SingleNodeGroupCommitConfig::new(
+            DEFAULT_MAX_GROUP_REQUESTS,
+            DEFAULT_MAX_GROUP_OPERATIONS,
+            DEFAULT_MAX_GROUP_INLINE_BYTES,
+            DEFAULT_PREPARATION_LANES,
+            0,
+            DEFAULT_MAX_QUEUED_REQUESTS,
+            DEFAULT_MAX_QUEUED_OPERATIONS,
+            DEFAULT_MAX_QUEUED_INLINE_BYTES,
+            DEFAULT_MAX_GROUP_DWELL,
+        )
+        .unwrap_err();
+        assert!(
+            zero_prepared_groups
+                .to_string()
+                .contains("maximum prepared groups must be non-zero")
+        );
+
+        let excess_prepared_groups = SingleNodeGroupCommitConfig::new(
+            DEFAULT_MAX_GROUP_REQUESTS,
+            DEFAULT_MAX_GROUP_OPERATIONS,
+            DEFAULT_MAX_GROUP_INLINE_BYTES,
+            DEFAULT_PREPARATION_LANES,
+            DEFAULT_MAX_QUEUED_REQUESTS + 1,
+            DEFAULT_MAX_QUEUED_REQUESTS,
+            DEFAULT_MAX_QUEUED_OPERATIONS,
+            DEFAULT_MAX_QUEUED_INLINE_BYTES,
+            DEFAULT_MAX_GROUP_DWELL,
+        )
+        .unwrap_err();
+        assert!(
+            excess_prepared_groups
+                .to_string()
+                .contains("maximum prepared groups must not exceed maximum queued requests")
+        );
+
         let excess_lanes = SingleNodeGroupCommitConfig::new(
             DEFAULT_MAX_GROUP_REQUESTS,
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
             DEFAULT_MAX_GROUP_OPERATIONS + 1,
+            DEFAULT_MAX_PREPARED_GROUPS,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -849,6 +904,7 @@ mod tests {
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
             DEFAULT_PREPARATION_LANES,
+            DEFAULT_MAX_PREPARED_GROUPS,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,

@@ -23,6 +23,7 @@ fn store_options_default_to_the_existing_root_layout() {
         64 * 1024 * 1024
     );
     assert_eq!(options.single_node_group_commit.preparation_lanes(), 1);
+    assert_eq!(options.single_node_group_commit.max_prepared_groups(), 1);
     assert_eq!(options.single_node_group_commit.max_queued_requests(), 64);
     assert_eq!(
         options.single_node_group_commit.max_queued_operations(),

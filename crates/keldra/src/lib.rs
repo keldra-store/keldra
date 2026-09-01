@@ -885,6 +885,7 @@ fn log_single_node_group_commit_config(config: &SingleNodeGroupCommitConfig) {
         max_operations = config.max_group_operations(),
         max_inline_bytes = config.max_group_inline_bytes(),
         preparation_lanes = config.preparation_lanes(),
+        max_prepared_groups = config.max_prepared_groups(),
         max_queued_requests = config.max_queued_requests(),
         max_queued_operations = config.max_queued_operations(),
         max_queued_inline_bytes = config.max_queued_inline_bytes(),
