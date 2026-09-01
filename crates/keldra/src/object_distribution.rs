@@ -1265,21 +1265,18 @@ impl ObjectDistribution {
             // The local command receipt proved an exact idempotent replay.
             return Ok(None);
         };
-        let mut durable = Vec::with_capacity(group.replicas().len());
-        let mut failures = Vec::new();
-        match self.store.apply_object_mutation_replica(mutation).await {
-            Ok(applied) if applied.version == coordinated.receipt.version => {
-                durable.push(self.local_node);
-            }
-            Ok(_) => failures.push("local replica returned another version".into()),
-            Err(error) => failures.push(format!("local replica: {error}")),
+        if mutation.version.id != coordinated.receipt.version {
+            return Err(Status::data_loss(
+                "coordinator mutation and receipt name different versions",
+            ));
         }
-        for node in group
-            .replicas()
-            .iter()
-            .copied()
-            .filter(|node| *node != self.local_node)
-        {
+        // Coordinator evaluation has already sync-written the complete local
+        // object mutation, receipt, proof and source-journal change. Seed that
+        // durable acknowledgement exactly as grouped replication does; replaying
+        // the same mutation through the replica apply path adds no durability.
+        let mut durable = locally_durable_object_replicas(group.replicas(), self.local_node)?;
+        let mut failures = Vec::new();
+        for node in remote_object_replica_nodes(group.replicas(), self.local_node) {
             let address = placement.address(node).ok_or_else(|| {
                 Status::unavailable(format!("ACTIVE node {} has no peer address", node.0))
             })?;
@@ -1419,6 +1416,28 @@ fn operation_key(operation: &BatchOperation) -> &ObjectKey {
     }
 }
 
+fn remote_object_replica_nodes(
+    replicas: &[NodeId],
+    local_node: NodeId,
+) -> impl Iterator<Item = NodeId> + '_ {
+    replicas
+        .iter()
+        .copied()
+        .filter(move |node| *node != local_node)
+}
+
+fn locally_durable_object_replicas(
+    replicas: &[NodeId],
+    local_node: NodeId,
+) -> Result<Vec<NodeId>, Status> {
+    if !replicas.contains(&local_node) {
+        return Err(Status::failed_precondition(
+            "local object coordinator is absent from its selected replica group",
+        ));
+    }
+    Ok(vec![local_node])
+}
+
 pub(super) fn mutation_journal_positions(
     mutation: &keldra_store::ObjectMutation,
 ) -> Result<Vec<u64>, Status> {
@@ -1524,8 +1543,8 @@ fn payload_status(error: PayloadDistributionError) -> Status {
 mod tests {
     use super::*;
     use keldra_store::{
-        LogicalRecordMutationContext, LogicalRecordValue, PlacementLogId, StorageTenantId,
-        StoreOptions, VersionId,
+        LogicalRecordMutationContext, LogicalRecordValue, ObjectMutationContext, PlacementLogId,
+        StorageTenantId, StoreOptions, VersionId,
     };
     use tempfile::TempDir;
 
@@ -1590,6 +1609,83 @@ mod tests {
             MutationError::DurabilityUnavailable
         );
         assert!(store.get(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn locally_coordinated_publication_is_restart_durable_without_replica_replay() {
+        let (temporary, store) = store().await;
+        let key = ObjectKey::new("tenant", "bucket", "publication/restart-safe").unwrap();
+        let publish = stage_distributed_put(
+            &store,
+            PutRequest {
+                key: key.clone(),
+                bytes: b"coordinator durable payload".to_vec(),
+                content_type: Some("application/octet-stream".into()),
+                mode: keldra_store::PutMode::PutIfAbsent,
+                command_id: Some("coordinator-durable".into()),
+                durability: Durability::Local,
+            },
+        )
+        .await
+        .unwrap();
+        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: store.bucket_policy("tenant", "bucket").unwrap(),
+        };
+
+        let outcomes = store
+            .coordinate_distributed_publish_batch_with_governance(
+                vec![publish],
+                governance,
+                ObjectMutationContext {
+                    active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                    serving_fence_term: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].as_ref().unwrap().mutation.is_some());
+        assert_eq!(
+            store.get(&key).await.unwrap().unwrap().bytes,
+            b"coordinator durable payload"
+        );
+
+        drop(store);
+        let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.get(&key).await.unwrap().unwrap().bytes,
+            b"coordinator durable payload"
+        );
+    }
+
+    #[test]
+    fn replica_dispatch_skips_local_and_keeps_every_remote_owner() {
+        assert_eq!(
+            remote_object_replica_nodes(&[NodeId(7)], NodeId(7)).collect::<Vec<_>>(),
+            Vec::<NodeId>::new()
+        );
+        assert_eq!(
+            remote_object_replica_nodes(&[NodeId(7), NodeId(11), NodeId(13)], NodeId(7))
+                .collect::<Vec<_>>(),
+            vec![NodeId(11), NodeId(13)]
+        );
+    }
+
+    #[test]
+    fn local_durability_requires_membership_in_the_selected_replica_group() {
+        assert_eq!(
+            locally_durable_object_replicas(&[NodeId(7)], NodeId(7)).unwrap(),
+            vec![NodeId(7)]
+        );
+        let error =
+            locally_durable_object_replicas(&[NodeId(11), NodeId(13)], NodeId(7)).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
