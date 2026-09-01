@@ -55,7 +55,64 @@ pub(super) async fn resolve_current(
     service: &ObjectServiceImpl,
     key: ObjectKey,
 ) -> Result<ResolvedAddress, Status> {
-    let Some(current) = current_visible_snapshot(service, &key).await? else {
+    let (tenant_id, bucket_id) = service
+        .name_resolver
+        .resolve_bucket_ids(key.tenant(), key.bucket())
+        .await?;
+    resolve_current_with_ids(service, key, tenant_id, bucket_id).await
+}
+
+pub(super) async fn resolve_current_with_ids(
+    service: &ObjectServiceImpl,
+    key: ObjectKey,
+    tenant_id: u64,
+    bucket_id: u64,
+) -> Result<ResolvedAddress, Status> {
+    let mut current = service
+        .reader
+        .current_head_snapshots_stable(
+            std::slice::from_ref(&key),
+            tenant_id,
+            bucket_id,
+            service.atomic_program_timeout,
+        )
+        .await?;
+    let current = current
+        .pop()
+        .ok_or_else(|| Status::internal("current object batch omitted its requested path"))?;
+    resolve_current_snapshot(service, key, current, tenant_id, bucket_id).await
+}
+
+pub(super) async fn resolve_current_batch_with_ids(
+    service: &ObjectServiceImpl,
+    keys: &[ObjectKey],
+    tenant_id: u64,
+    bucket_id: u64,
+) -> Result<Vec<Result<ResolvedAddress, Status>>, Status> {
+    let current = service
+        .reader
+        .current_head_snapshots_stable(keys, tenant_id, bucket_id, service.atomic_program_timeout)
+        .await?;
+    if current.len() != keys.len() {
+        return Err(Status::data_loss(
+            "current object batch returned the wrong result count",
+        ));
+    }
+    let mut resolved = Vec::with_capacity(keys.len());
+    for (key, current) in keys.iter().cloned().zip(current) {
+        resolved.push(resolve_current_snapshot(service, key, current, tenant_id, bucket_id).await);
+    }
+    Ok(resolved)
+}
+
+async fn resolve_current_snapshot(
+    service: &ObjectServiceImpl,
+    key: ObjectKey,
+    current: Option<CurrentObjectSnapshot>,
+    tenant_id: u64,
+    bucket_id: u64,
+) -> Result<ResolvedAddress, Status> {
+    let Some(current) = current else {
         return Ok(ResolvedAddress::Ordinary(key));
     };
     let Some((descriptor_version, descriptor_blob)) = protected_descriptor(&current.version)?
@@ -65,14 +122,9 @@ pub(super) async fn resolve_current(
     let encoded = service.reader.read_blob_bytes(&descriptor_blob).await?;
     let resolved = decode_protected_descriptor(key, descriptor_version, &encoded)?;
 
-    // Both the sealed per-version origin and the target-local registry are
-    // required. Historical ordinary objects may share the MIME and bytes, but
-    // can never carry the protected origin marker.
-    let Some(target) = current_target(service, &resolved.target).await? else {
-        return Err(Status::data_loss(
-            "protected object-link descriptor has no live target",
-        ));
-    };
+    let target = current_target_with_ids(service, &resolved.target, tenant_id, bucket_id)
+        .await?
+        .ok_or_else(|| Status::data_loss("protected object-link descriptor has no live target"))?;
     validate_resolved_target(&resolved, &target)?;
     Ok(ResolvedAddress::Link(resolved))
 }
@@ -132,28 +184,6 @@ fn decode_protected_descriptor(
         .map_err(|error| Status::data_loss(error.to_string()))?;
     resolve_descriptor(key, descriptor_version, &descriptor)
         .map_err(|error| Status::data_loss(error.to_string()))
-}
-
-async fn current_visible_snapshot(
-    service: &ObjectServiceImpl,
-    key: &ObjectKey,
-) -> Result<Option<CurrentObjectSnapshot>, Status> {
-    let (tenant_id, bucket_id) = service
-        .name_resolver
-        .resolve_bucket_ids(key.tenant(), key.bucket())
-        .await?;
-    let mut current = service
-        .reader
-        .current_head_snapshots_stable(
-            std::slice::from_ref(key),
-            tenant_id,
-            bucket_id,
-            service.atomic_program_timeout,
-        )
-        .await?;
-    current
-        .pop()
-        .ok_or_else(|| Status::internal("current object batch omitted its requested path"))
 }
 
 fn require_ordinary_link_target(version: &Version) -> Result<(), Status> {
@@ -241,6 +271,15 @@ async fn current_target(
         .name_resolver
         .resolve_bucket_ids(target.tenant(), target.bucket())
         .await?;
+    current_target_with_ids(service, target, tenant_id, bucket_id).await
+}
+
+async fn current_target_with_ids(
+    service: &ObjectServiceImpl,
+    target: &ObjectKey,
+    tenant_id: u64,
+    bucket_id: u64,
+) -> Result<Option<keldra_store::CurrentObjectSnapshot>, Status> {
     service
         .reader
         .current_head_snapshot_stable(target, tenant_id, bucket_id)
@@ -1786,9 +1825,6 @@ pub(super) fn bulk_replay_result(
 }
 
 pub(super) fn linked_put_fingerprint(link: &ObjectKey, publish: &PublishRequest) -> [u8; 32] {
-    // The public command identity must survive the descriptor being removed.
-    // The sealed built-in plan binds the canonical target; the fingerprint
-    // deliberately binds only caller-visible request fields.
     let mut hasher = blake3::Hasher::new_derive_key("keldra.put-through-object-link/v2");
     for value in [link.tenant(), link.bucket(), link.path()] {
         hasher.update(&(value.len() as u64).to_be_bytes());
@@ -1830,9 +1866,7 @@ pub(super) fn linked_put_fingerprint(link: &ObjectKey, publish: &PublishRequest)
 
 #[cfg(test)]
 mod tests {
-    use keldra_store::VersionId;
-
-    use keldra_store::BlobRef;
+    use keldra_store::{BlobRef, VersionId};
 
     use super::*;
 

@@ -1,7 +1,6 @@
 //! Independent sealed dispatch for BulkWrite items addressed through links.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::sync::Arc;
 
 use keldra_api::v1::bulk_outcome::Outcome;
@@ -36,10 +35,13 @@ pub(super) struct PreparedBulkItem {
 pub(super) struct BulkPrepareResult {
     pub(super) items: Vec<PreparedBulkItem>,
     pub(super) outcomes: Vec<BulkOutcome>,
+    pub(super) stable_buckets: StableBucketIds,
     pub(super) validation_duration: std::time::Duration,
     pub(super) identity_resolution_duration: std::time::Duration,
     pub(super) authorization_duration: std::time::Duration,
 }
+
+pub(super) type StableBucketIds = BTreeMap<String, BTreeMap<String, (u64, u64)>>;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare_before_live_dispatch(
@@ -191,14 +193,61 @@ pub(super) async fn prepare_before_live_dispatch(
         }
     }
 
+    let resolution_groups = group_unique_keys(
+        pending
+            .iter()
+            .filter_map(|item| item.as_ref().map(|(_, _, key, _, _)| key.clone())),
+    );
+    let mut stable_buckets = StableBucketIds::new();
     let mut resolution_cache = BTreeMap::new();
+    for ((tenant, bucket), keys) in resolution_groups {
+        let ids = service
+            .name_resolver
+            .resolve_bucket_ids(&tenant, &bucket)
+            .await;
+        let (tenant_id, bucket_id) = match ids {
+            Ok(ids) => ids,
+            Err(error) => {
+                for key in keys {
+                    resolution_cache.insert(key, Err(error.clone()));
+                }
+                continue;
+            }
+        };
+        stable_buckets
+            .entry(tenant)
+            .or_default()
+            .insert(bucket, (tenant_id, bucket_id));
+
+        match object_link::resolve_current_batch_with_ids(service, &keys, tenant_id, bucket_id)
+            .await
+        {
+            Ok(resolved) if resolved.len() == keys.len() => {
+                resolution_cache.extend(keys.into_iter().zip(resolved));
+            }
+            _ => {
+                // Preserve BulkWrite's independent per-index outcomes when a
+                // batch-level transport or corruption error prevents aligned
+                // resolution. This bounded slow path retains the same stable
+                // IDs and authoritative read semantics as the happy path.
+                for key in keys {
+                    let resolved = object_link::resolve_current_with_ids(
+                        service,
+                        key.clone(),
+                        tenant_id,
+                        bucket_id,
+                    )
+                    .await;
+                    resolution_cache.insert(key, resolved);
+                }
+            }
+        }
+    }
     for item in pending.into_iter().flatten() {
         let (index, operation, key, permission, definition_intent) = item;
-        match resolve_cached(&mut resolution_cache, &key, |key| {
-            object_link::resolve_current(service, key)
-        })
-        .await
-        {
+        match resolution_cache.get(&key).cloned().ok_or_else(|| {
+            Status::internal("bulk current-object resolution omitted a requested path")
+        })? {
             Ok(resolution) => {
                 let canonical = resolution.canonical().clone();
                 match object_path_access::require_key(path_access, &canonical)
@@ -263,27 +312,27 @@ pub(super) async fn prepare_before_live_dispatch(
     Ok(BulkPrepareResult {
         items,
         outcomes,
+        stable_buckets,
         validation_duration,
         identity_resolution_duration,
         authorization_duration,
     })
 }
 
-async fn resolve_cached<F, Fut>(
-    cache: &mut BTreeMap<ObjectKey, Result<object_link::ResolvedAddress, Status>>,
-    key: &ObjectKey,
-    resolve: F,
-) -> Result<object_link::ResolvedAddress, Status>
-where
-    F: FnOnce(ObjectKey) -> Fut,
-    Fut: Future<Output = Result<object_link::ResolvedAddress, Status>>,
-{
-    if let Some(cached) = cache.get(key) {
-        return cached.clone();
+fn group_unique_keys(
+    keys: impl IntoIterator<Item = ObjectKey>,
+) -> BTreeMap<(String, String), Vec<ObjectKey>> {
+    let mut grouped = BTreeMap::<(String, String), BTreeMap<ObjectKey, ()>>::new();
+    for key in keys {
+        grouped
+            .entry((key.tenant().to_owned(), key.bucket().to_owned()))
+            .or_default()
+            .insert(key, ());
     }
-    let resolved = resolve(key.clone()).await;
-    cache.insert(key.clone(), resolved.clone());
-    resolved
+    grouped
+        .into_iter()
+        .map(|(bucket, keys)| (bucket, keys.into_keys().collect()))
+        .collect()
 }
 
 pub(super) fn replay_probe(
@@ -567,8 +616,6 @@ pub(super) fn authorization_key(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use keldra_api::v1::bulk_operation::Operation;
     use keldra_api::v1::{BulkPutRequest, Durability, ObjectAddress};
     use keldra_store::VersionId;
@@ -669,23 +716,22 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn duplicate_ordinary_paths_share_one_live_resolution() {
+    #[test]
+    fn duplicate_paths_share_one_bucket_batch_entry() {
         let requested = key("ordinary");
-        let calls = AtomicUsize::new(0);
-        let mut cache = BTreeMap::new();
+        let other_bucket = ObjectKey::new("tenant", "other", "ordinary").unwrap();
+        let grouped =
+            group_unique_keys([requested.clone(), requested.clone(), other_bucket.clone()]);
 
-        for _ in 0..3 {
-            let resolved = resolve_cached(&mut cache, &requested, |key| async {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(object_link::ResolvedAddress::Ordinary(key))
-            })
-            .await
-            .unwrap();
-            assert_eq!(resolved.canonical(), &requested);
-        }
-
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(
+            grouped.get(&("tenant".into(), "bucket".into())),
+            Some(&vec![requested]),
+        );
+        assert_eq!(
+            grouped.get(&("tenant".into(), "other".into())),
+            Some(&vec![other_bucket]),
+        );
     }
 
     #[test]
