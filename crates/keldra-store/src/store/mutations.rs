@@ -1,4 +1,5 @@
 use super::bulk_phases::{BulkStorePhase, BulkStorePhaseTracker};
+use super::evaluation_telemetry::{EvaluationSubphase, EvaluationSubphaseMetrics};
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_helpers::{
     definition_mutation_error, definition_receipt_matches_intent, exact_version_key,
@@ -305,6 +306,7 @@ impl Store {
                         now,
                         None,
                         definition_intent,
+                        &mut EvaluationSubphaseMetrics::default(),
                     )
                     .await;
                 if backpressure
@@ -446,7 +448,6 @@ impl Store {
         self.wait_for_mutation_capacity().await;
         wait.complete();
     }
-
     /// Evaluates and durably applies one exact-path mutation on its current
     /// coordinator, returning the complete bounded result peers must apply.
     /// Network routing, replica selection, and acknowledgement policy remain
@@ -480,7 +481,6 @@ impl Store {
         self.coordinate_object_mutation_with_governance(operation, governance, context)
             .await
     }
-
     pub async fn coordinate_object_mutation_with_governance(
         &self,
         operation: BatchOperation,
@@ -512,7 +512,6 @@ impl Store {
         )
         .await
     }
-
     pub async fn coordinate_definition_object_mutation_with_governance(
         &self,
         operation: BatchOperation,
@@ -546,7 +545,6 @@ impl Store {
         )
         .await
     }
-
     pub async fn coordinate_distributed_definition_publish_with_governance(
         &self,
         request: PublishRequest,
@@ -575,7 +573,6 @@ impl Store {
         )
         .await
     }
-
     pub(super) async fn coordinate_prepared_object_mutation(
         &self,
         prepared: PreparedOperation,
@@ -588,7 +585,6 @@ impl Store {
             return Err(MutationError::InvalidCommandId);
         }
         let identity = prepared.identity();
-
         let _path_guard = self.ordinary_locks.acquire(&prepared.lock_paths()).await;
         let _commit_guard = self.lock_commit("coordinated_object_mutation").await;
         for path in prepared.lock_paths() {
@@ -638,9 +634,9 @@ impl Store {
                     materialize_inline_payload: false,
                 }),
                 definition_intent,
+                &mut EvaluationSubphaseMetrics::default(),
             )
             .await?;
-
         let created = !evaluated.receipt.replayed;
         if created {
             let mutation = evaluated.mutation.as_ref().ok_or_else(|| {
@@ -685,7 +681,6 @@ impl Store {
             mutation: evaluated.mutation,
         })
     }
-
     /// Applies one coordinator-produced exact-path result to a complete
     /// metadata replica. Content reference counts are deliberately not
     /// changed here; their actual owners consume the ordered source journal.
@@ -705,7 +700,6 @@ impl Store {
         let _commit_guard = self.lock_commit("object_mutation_replica").await;
         self.require_unreserved_object_locked(identity, &mutation.exact_path, None)?;
         let now = now_unix_millis()?;
-
         let retained_identical_receipt = if let Some(existing) =
             self.read_stored_receipt(&primary_receipt_key)?
             && existing.expires_at_unix_millis > now
@@ -722,7 +716,6 @@ impl Store {
         } else {
             false
         };
-
         let mut batch = WriteBatch::default();
         let proof_staged = self.stage_object_mutation_reference_proof(&mut batch, mutation)?;
         let current = self.head_by_storage_key(&encoded_head_key)?;
@@ -802,7 +795,6 @@ impl Store {
                 });
             }
         }
-
         if !already_applied {
             let predecessor = match mutation.stamp.predecessor_version {
                 Some(version) => Some(
@@ -1436,6 +1428,7 @@ impl Store {
         now_unix_millis: u64,
         distributed: Option<DistributedEvaluationContext>,
         definition_intent: Option<DefinitionMutationIntent>,
+        evaluation_subphases: &mut EvaluationSubphaseMetrics,
     ) -> Result<EvaluatedOperation, MutationError> {
         let key = operation.key();
         let encoded_key = operation.encoded_head_key();
@@ -1780,44 +1773,52 @@ impl Store {
         } else {
             0
         };
-        let object_mutation = distributed
-            .map(|distributed| {
-                let command_id = operation
-                    .command_id()
-                    .ok_or(MutationError::InvalidCommandId)?;
-                let mut mutation = ObjectMutation {
-                    format: if alias_snapshot.is_some() {
-                        OBJECT_MUTATION_FORMAT
-                    } else {
-                        crate::LEGACY_OBJECT_MUTATION_FORMAT
-                    },
-                    tenant_id: operation.identity().tenant_id.0,
-                    bucket_id: operation.identity().bucket_id.0,
-                    exact_path: key.path().to_owned(),
-                    command_id: command_id.to_owned(),
-                    input_fingerprint: fingerprint,
-                    version: version.clone(),
-                    receipt_expires_at_unix_millis,
-                    stamp: MutationStamp {
-                        format: MUTATION_STAMP_FORMAT,
-                        predecessor_version: current.as_ref().map(|head| head.version),
-                        program_commit_cursor: None,
-                        mutation_fingerprint: [0; 32],
-                        active_placement_log_id: distributed.mutation.active_placement_log_id,
-                        serving_fence_term: distributed.mutation.serving_fence_term,
-                        source_id: distributed.source_id,
-                        source_journal_position: distributed.source_journal_position,
-                    },
-                    reference_deltas: reference_deltas.clone(),
-                    accounting_transition: Some(accounting_transition),
-                    definition_transition: definition_transition.clone(),
-                    alias_snapshot: alias_snapshot.clone(),
-                };
-                mutation.set_computed_fingerprint();
-                mutation.validate()?;
-                Ok(mutation)
-            })
-            .transpose()?;
+        evaluation_subphases.count_mutation_construction_validation();
+        let object_mutation = evaluation_subphases.measure(
+            EvaluationSubphase::MutationConstructionValidation,
+            || {
+                distributed
+                    .map(|distributed| {
+                        let command_id = operation
+                            .command_id()
+                            .ok_or(MutationError::InvalidCommandId)?;
+                        let mut mutation = ObjectMutation {
+                            format: if alias_snapshot.is_some() {
+                                OBJECT_MUTATION_FORMAT
+                            } else {
+                                crate::LEGACY_OBJECT_MUTATION_FORMAT
+                            },
+                            tenant_id: operation.identity().tenant_id.0,
+                            bucket_id: operation.identity().bucket_id.0,
+                            exact_path: key.path().to_owned(),
+                            command_id: command_id.to_owned(),
+                            input_fingerprint: fingerprint,
+                            version: version.clone(),
+                            receipt_expires_at_unix_millis,
+                            stamp: MutationStamp {
+                                format: MUTATION_STAMP_FORMAT,
+                                predecessor_version: current.as_ref().map(|head| head.version),
+                                program_commit_cursor: None,
+                                mutation_fingerprint: [0; 32],
+                                active_placement_log_id: distributed
+                                    .mutation
+                                    .active_placement_log_id,
+                                serving_fence_term: distributed.mutation.serving_fence_term,
+                                source_id: distributed.source_id,
+                                source_journal_position: distributed.source_journal_position,
+                            },
+                            reference_deltas: reference_deltas.clone(),
+                            accounting_transition: Some(accounting_transition),
+                            definition_transition: definition_transition.clone(),
+                            alias_snapshot: alias_snapshot.clone(),
+                        };
+                        mutation.set_computed_fingerprint();
+                        mutation.validate()?;
+                        Ok(mutation)
+                    })
+                    .transpose()
+            },
+        )?;
         let head = Head {
             version: id,
             deleted,
@@ -1836,15 +1837,19 @@ impl Store {
         let mut blob_reference_updates = Vec::with_capacity(2);
         let materialize_inline =
             distributed.is_some_and(|distributed| distributed.materialize_inline_payload);
-        let (inline_payload_value, reservation) = self.prepare_coordinated_inline_payload(
-            operation,
-            apply_content_lifecycle || materialize_inline,
-            materialize_inline && !apply_content_lifecycle,
-            pending_inline_payloads,
-            pending_blob_references,
-            read_cache,
-            now_unix_millis,
-        )?;
+        evaluation_subphases.count_inline_payload_receipt_stage();
+        let (inline_payload_value, reservation) =
+            evaluation_subphases.measure(EvaluationSubphase::InlinePayloadReceiptStage, || {
+                self.prepare_coordinated_inline_payload(
+                    operation,
+                    apply_content_lifecycle || materialize_inline,
+                    materialize_inline && !apply_content_lifecycle,
+                    pending_inline_payloads,
+                    pending_blob_references,
+                    read_cache,
+                    now_unix_millis,
+                )
+            })?;
         blob_reference_updates.extend(reservation);
         if apply_content_lifecycle
             && !released_same_as_new
@@ -1874,24 +1879,29 @@ impl Store {
             };
             blob_reference_updates.push(update);
         }
-        let expires_at = self.stage_mutation_receipt(
-            batch,
-            receipt_key,
-            fingerprint,
-            id,
-            deleted,
-            object_mutation.clone(),
-            definition_transition.clone(),
-            now_unix_millis,
-            receipt_status,
-            pending_receipts,
-        )?;
+        let expires_at =
+            evaluation_subphases.measure(EvaluationSubphase::InlinePayloadReceiptStage, || {
+                self.stage_mutation_receipt(
+                    batch,
+                    receipt_key,
+                    fingerprint,
+                    id,
+                    deleted,
+                    object_mutation.clone(),
+                    definition_transition.clone(),
+                    now_unix_millis,
+                    receipt_status,
+                    pending_receipts,
+                )
+            })?;
         if let Some((key, bytes)) = inline_payload_value {
             let reference = match operation {
                 PreparedOperation::Put { payload, .. } => payload.reference(),
                 _ => unreachable!("only a put materializes inline payload bytes"),
             };
-            self.stage_inline_complete_artifact(batch, reference, &bytes)?;
+            evaluation_subphases.measure(EvaluationSubphase::InlinePayloadReceiptStage, || {
+                self.stage_inline_complete_artifact(batch, reference, &bytes)
+            })?;
             pending_inline_payloads.insert(key);
         }
         for (key, state) in blob_reference_updates {

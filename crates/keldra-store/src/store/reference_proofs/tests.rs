@@ -685,7 +685,11 @@ async fn batched_proof_staging_preserves_idempotency_and_conflict_atomicity() {
 
     let mut initial = WriteBatch::default();
     replica
-        .stage_object_mutation_reference_proofs(&mut initial, &mutations[..2])
+        .stage_object_mutation_reference_proofs(
+            &mut initial,
+            &mutations[..2],
+            &mut EvaluationSubphaseMetrics::default(),
+        )
         .unwrap();
     replica.db.write(initial).unwrap();
     for proof in &proofs[..2] {
@@ -699,7 +703,11 @@ async fn batched_proof_staging_preserves_idempotency_and_conflict_atomicity() {
 
     let mut replay = WriteBatch::default();
     replica
-        .stage_object_mutation_reference_proofs(&mut replay, &mutations[..2])
+        .stage_object_mutation_reference_proofs(
+            &mut replay,
+            &mutations[..2],
+            &mut EvaluationSubphaseMetrics::default(),
+        )
         .unwrap();
     assert!(replay.is_empty());
 
@@ -716,7 +724,11 @@ async fn batched_proof_staging_preserves_idempotency_and_conflict_atomicity() {
 
     let mut rejected = WriteBatch::default();
     assert_eq!(
-        replica.stage_object_mutation_reference_proofs(&mut rejected, &mutations[2..]),
+        replica.stage_object_mutation_reference_proofs(
+            &mut rejected,
+            &mutations[2..],
+            &mut EvaluationSubphaseMetrics::default(),
+        ),
         Err(MutationError::ObjectMutationConflict)
     );
     assert!(!rejected.is_empty());

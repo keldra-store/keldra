@@ -1,5 +1,6 @@
 //! One physical coordinator batch for independently receipted distributed publishes.
 
+use super::evaluation_telemetry::EvaluationSubphaseMetrics;
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::DistributedEvaluationContext;
@@ -29,6 +30,7 @@ pub(super) struct CoordinatorBatchMetrics {
     pub(super) locked_setup: std::time::Duration,
     pub(super) locked_prefetch: std::time::Duration,
     pub(super) evaluate: std::time::Duration,
+    pub(super) evaluation_subphases: EvaluationSubphaseMetrics,
     pub(super) stage: std::time::Duration,
     pub(super) persist: std::time::Duration,
     pub(super) settle: std::time::Duration,
@@ -338,6 +340,12 @@ impl Store {
         let mut evaluated = BTreeMap::new();
         let mut receipt_capacity_exhausted = false;
         let mut receipt_capacity_at = None;
+        let mut evaluation_subphases = match payload_preparation {
+            CoordinatorBatchPayloadPreparation::SingleNode => {
+                EvaluationSubphaseMetrics::single_node_group()
+            }
+            CoordinatorBatchPayloadPreparation::Distributed => EvaluationSubphaseMetrics::default(),
+        };
 
         let evaluate_started = std::time::Instant::now();
         for item in &prepared {
@@ -367,6 +375,7 @@ impl Store {
                         ),
                     }),
                     item.definition_intent,
+                    &mut evaluation_subphases,
                 )
                 .await;
             if outcome
@@ -422,7 +431,11 @@ impl Store {
             .values()
             .filter_map(|outcome| outcome.as_ref().ok()?.mutation.as_ref())
             .collect::<Vec<_>>();
-        self.stage_object_mutation_reference_proofs(&mut batch, &proof_mutations)?;
+        self.stage_object_mutation_reference_proofs(
+            &mut batch,
+            &proof_mutations,
+            &mut evaluation_subphases,
+        )?;
         let evaluate_duration = evaluate_started.elapsed();
 
         let stage_started = std::time::Instant::now();
@@ -485,6 +498,7 @@ impl Store {
                 locked_setup: locked_setup_duration,
                 locked_prefetch: locked_prefetch_duration,
                 evaluate: evaluate_duration,
+                evaluation_subphases,
                 stage: stage_duration,
                 persist: persist_duration,
                 settle: settle_duration,
@@ -678,6 +692,7 @@ impl Store {
                         materialize_inline_payload: false,
                     }),
                     None,
+                    &mut EvaluationSubphaseMetrics::default(),
                 )
                 .await;
             if outcome

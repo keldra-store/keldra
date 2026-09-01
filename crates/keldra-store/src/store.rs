@@ -1450,6 +1450,7 @@ pub(crate) mod definition_state;
 mod delete_version;
 mod derived_consumers;
 mod distributed_publish_batch;
+mod evaluation_telemetry;
 mod index_orphan_scrub_due;
 mod index_retention_due;
 mod journal_capacity;

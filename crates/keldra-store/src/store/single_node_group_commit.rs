@@ -264,6 +264,9 @@ impl SingleNodeGroupCommit {
             let execute_duration = execute_started.elapsed();
             let failed_requests = results.iter().filter(|result| result.is_err()).count();
             let metrics = metrics.unwrap_or_default();
+            let evaluation_uncategorized = metrics
+                .evaluate
+                .saturating_sub(metrics.evaluation_subphases.categorized());
             tracing::info!(
                 target: "keldra_store::single_node_group_commit_phases",
                 attempts = 1_u64,
@@ -281,6 +284,40 @@ impl SingleNodeGroupCommit {
                 locked_setup_seconds = metrics.locked_setup.as_secs_f64(),
                 locked_prefetch_seconds = metrics.locked_prefetch.as_secs_f64(),
                 evaluate_seconds = metrics.evaluate.as_secs_f64(),
+                evaluation_mutation_construction_validation_seconds = metrics
+                    .evaluation_subphases
+                    .mutation_construction_validation
+                    .as_secs_f64(),
+                evaluation_mutation_construction_validation_operations = metrics
+                    .evaluation_subphases
+                    .mutation_construction_validation_operations,
+                evaluation_inline_payload_receipt_stage_seconds = metrics
+                    .evaluation_subphases
+                    .inline_payload_receipt_stage
+                    .as_secs_f64(),
+                evaluation_inline_payload_receipt_stage_operations = metrics
+                    .evaluation_subphases
+                    .inline_payload_receipt_stage_operations,
+                evaluation_proof_construction_seconds = metrics
+                    .evaluation_subphases
+                    .proof_construction
+                    .as_secs_f64(),
+                evaluation_proof_construction_proofs =
+                    metrics.evaluation_subphases.proof_construction_proofs,
+                evaluation_proof_multi_get_lookup_seconds = metrics
+                    .evaluation_subphases
+                    .proof_multi_get_lookup
+                    .as_secs_f64(),
+                evaluation_proof_multi_get_lookup_proofs =
+                    metrics.evaluation_subphases.proof_multi_get_lookup_proofs,
+                evaluation_proof_validate_encode_stage_seconds = metrics
+                    .evaluation_subphases
+                    .proof_validate_encode_stage
+                    .as_secs_f64(),
+                evaluation_proof_validate_encode_stage_proofs = metrics
+                    .evaluation_subphases
+                    .proof_validate_encode_stage_proofs,
+                evaluation_uncategorized_seconds = evaluation_uncategorized.as_secs_f64(),
                 stage_seconds = metrics.stage.as_secs_f64(),
                 db_write_sync_seconds = metrics.persist.as_secs_f64(),
                 settle_seconds = metrics.settle.as_secs_f64(),

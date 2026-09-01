@@ -1,3 +1,4 @@
+use super::evaluation_telemetry::{EvaluationSubphase, EvaluationSubphaseMetrics};
 use super::*;
 use crate::model::MAX_OBJECT_MUTATION_REFERENCE_DELTAS;
 use crate::watch::{
@@ -490,40 +491,56 @@ impl Store {
         &self,
         batch: &mut WriteBatch,
         mutations: &[&ObjectMutation],
+        evaluation_subphases: &mut EvaluationSubphaseMetrics,
     ) -> Result<(), MutationError> {
-        let proofs = mutations
-            .iter()
-            .map(|mutation| proof_for_mutation(mutation))
-            .collect::<Result<Vec<_>, _>>()?;
+        let proofs = evaluation_subphases.measure(EvaluationSubphase::ProofConstruction, || {
+            mutations
+                .iter()
+                .map(|mutation| proof_for_mutation(mutation))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        evaluation_subphases.count_proofs(proofs.len());
         let cf = self.cf(CF_LOCAL_INVALIDATIONS)?;
         for chunk in proofs.chunks(REFERENCE_PROOF_KEYS_PER_MULTI_GET) {
             let keys = chunk
                 .iter()
                 .map(|proof| reference_proof_key(proof.source_id, proof.offset()))
                 .collect::<Vec<_>>();
-            let fetched = self
-                .db
-                .multi_get_cf(keys.iter().map(|key| (cf, key.as_slice())));
+            let fetched =
+                evaluation_subphases.measure(EvaluationSubphase::ProofMultiGetLookup, || {
+                    self.db
+                        .multi_get_cf(keys.iter().map(|key| (cf, key.as_slice())))
+                });
             if fetched.len() != chunk.len() {
                 return Err(MutationError::Storage(
                     "reference-proof bulk lookup returned the wrong result count".into(),
                 ));
             }
             for ((proof, key), existing) in chunk.iter().zip(keys).zip(fetched) {
-                validate_stored_proof(proof).map_err(MutationError::InvalidObjectMutation)?;
-                match existing.map_err(storage_error)? {
-                    Some(encoded) => {
-                        let existing = decode_reference_proof(&encoded).map_err(storage_error)?;
-                        if existing != *proof {
-                            return Err(MutationError::ObjectMutationConflict);
+                evaluation_subphases
+                    .measure(EvaluationSubphase::ProofValidateEncodeStage, || {
+                        validate_stored_proof(proof).map_err(MutationError::InvalidObjectMutation)
+                    })?;
+                evaluation_subphases.measure(
+                    EvaluationSubphase::ProofValidateEncodeStage,
+                    || {
+                        match existing.map_err(storage_error)? {
+                            Some(encoded) => {
+                                let existing =
+                                    decode_reference_proof(&encoded).map_err(storage_error)?;
+                                if existing != *proof {
+                                    return Err(MutationError::ObjectMutationConflict);
+                                }
+                            }
+                            None => batch.put_cf(
+                                cf,
+                                key,
+                                encode_reference_proof(proof).map_err(storage_error)?,
+                            ),
                         }
-                    }
-                    None => batch.put_cf(
-                        cf,
-                        key,
-                        encode_reference_proof(proof).map_err(storage_error)?,
-                    ),
-                }
+                        Ok(())
+                    },
+                )?;
             }
         }
         Ok(())
