@@ -239,23 +239,6 @@ impl Store {
                         return fail_prepared_operations(completed, early, prepared, error);
                     }
                 };
-            let read_cache = match MutationReadCache::load(
-                self,
-                &prepared
-                    .iter()
-                    .map(|(_, operation)| operation)
-                    .collect::<Vec<_>>(),
-            ) {
-                Ok(read_cache) => read_cache,
-                Err(error) => {
-                    return fail_prepared_operations(completed, early, prepared, error);
-                }
-            };
-            let mut pending_heads = BTreeMap::<Vec<u8>, Head>::new();
-            let mut pending_versions = BTreeMap::<Vec<u8>, Version>::new();
-            let mut pending_receipts = BTreeMap::<Vec<u8>, StoredReceipt>::new();
-            let mut pending_blob_references = PendingBlobReferences::new();
-            let mut pending_inline_payloads = BTreeSet::<Vec<u8>>::new();
             let mut policy_cache = BTreeMap::<Vec<u8>, Result<BucketPolicy, MutationError>>::new();
             let mut versioning_cache =
                 BTreeMap::<Vec<u8>, Result<ObjectVersioning, MutationError>>::new();
@@ -269,6 +252,30 @@ impl Store {
                 policy_cache.insert(identity.clone(), Ok(governance.policy.clone()));
                 versioning_cache.insert(identity, Ok(governance.versioning));
             }
+            let operations = prepared
+                .iter()
+                .map(|(_, operation)| operation)
+                .collect::<Vec<_>>();
+            let read_cache = match governance.as_ref() {
+                Some(_) => MutationReadCache::load_with_governance(
+                    self,
+                    &operations,
+                    &policy_cache,
+                    &versioning_cache,
+                ),
+                None => MutationReadCache::load(self, &operations),
+            };
+            let read_cache = match read_cache {
+                Ok(read_cache) => read_cache,
+                Err(error) => {
+                    return fail_prepared_operations(completed, early, prepared, error);
+                }
+            };
+            let mut pending_heads = BTreeMap::<Vec<u8>, Head>::new();
+            let mut pending_versions = BTreeMap::<Vec<u8>, Version>::new();
+            let mut pending_receipts = BTreeMap::<Vec<u8>, StoredReceipt>::new();
+            let mut pending_blob_references = PendingBlobReferences::new();
+            let mut pending_inline_payloads = BTreeSet::<Vec<u8>>::new();
             read_cache.seed_bucket_settings(&mut policy_cache, &mut versioning_cache);
             let mut results = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
             let mut batch_high_watermark = None;
@@ -582,9 +589,8 @@ impl Store {
         for path in prepared.lock_paths() {
             self.require_unreserved_object_locked(identity, &path.path, None)?;
         }
-        let source = self
-            .local_watch_status()
-            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let journal_state = self.fenced_local_journal_state(&_commit_guard)?;
+        let source = journal_state.status();
         let source_journal_position = source.tail.checked_add(1).ok_or_else(|| {
             MutationError::Storage("local invalidation offset is exhausted".into())
         })?;
@@ -630,7 +636,7 @@ impl Store {
             )
             .await?;
         let created = !evaluated.receipt.replayed;
-        if created {
+        let journal_transition = if created {
             let mutation = evaluated.mutation.as_ref().ok_or_else(|| {
                 MutationError::Storage("distributed mutation result is missing".into())
             })?;
@@ -639,28 +645,40 @@ impl Store {
                     "distributed mutation source position changed during evaluation".into(),
                 ));
             }
-            self.stage_local_changes_with_admission(
+            let transition = self.stage_fenced_local_changes(
+                &_commit_guard,
                 &mut batch,
                 &evaluated.pending_head_changes(identity, prepared.key().path()),
                 LocalReferenceEffects::Deferred,
                 source_journal_admission,
+                journal_state,
             )?;
             batch.put_cf(
                 self.cf(CF_METADATA)?,
                 VERSION_HIGH_WATERMARK_KEY,
                 serde_json::to_vec(&evaluated.receipt.version).map_err(storage_error)?,
             );
-        }
+            Some(transition)
+        } else {
+            None
+        };
         if let Some(mutation) = evaluated.mutation.as_ref() {
             self.stage_object_mutation_reference_proof(&mut batch, mutation)?;
         }
         if receipt_status != initial_receipt_status {
             self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
         }
-        if !batch.is_empty() {
+        let write_result = if !batch.is_empty() {
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
-            self.db.write_opt(batch, &options).map_err(storage_error)?;
+            self.db.write_opt(batch, &options).map_err(storage_error)
+        } else {
+            Ok(())
+        };
+        if let Some(transition) = journal_transition {
+            self.finish_fenced_local_changes_after_write(&_commit_guard, transition, write_result)?;
+        } else {
+            write_result?;
         }
         if !pruned_receipts.is_empty() {
             self.mutation_capacity_notify.notify_waiters();
@@ -948,171 +966,6 @@ impl Store {
             version: mutation.version.id,
             replayed: already_applied,
         })
-    }
-
-    pub(crate) fn stage_local_changes(
-        &self,
-        batch: &mut WriteBatch,
-        changes: &[PendingLocalChange],
-        reference_effects: LocalReferenceEffects,
-    ) -> Result<(), MutationError> {
-        self.stage_local_changes_with_admission(
-            batch,
-            changes,
-            reference_effects,
-            SourceJournalAdmission::Bounded,
-        )
-    }
-
-    pub(super) fn stage_local_changes_with_admission(
-        &self,
-        batch: &mut WriteBatch,
-        changes: &[PendingLocalChange],
-        reference_effects: LocalReferenceEffects,
-        admission: SourceJournalAdmission,
-    ) -> Result<(), MutationError> {
-        if changes.is_empty() {
-            return Ok(());
-        }
-
-        let journal = self.cf(CF_LOCAL_INVALIDATIONS)?;
-        let metadata = self.cf(CF_METADATA)?;
-        let mut status = self
-            .local_watch_status()
-            .map_err(|error| MutationError::Storage(error.to_string()))?;
-        let retained_entries_before = status.retained_entries;
-        let retained_bytes_before = status.retained_bytes;
-        if admission == SourceJournalAdmission::Bounded
-            && (status.retained_entries > self.watch_retention.max_entries
-                || status.retained_bytes > self.watch_retention.max_bytes)
-        {
-            // Repay publication debt before an ordinary append retries.
-            return Err(MutationError::SourceJournalCapacity);
-        }
-        let old_tail = status.tail;
-        let cursor = self
-            .reference_delta_cursor(status.source_id)
-            .map_err(|error| {
-                MutationError::Storage(format!(
-                    "cannot read local reference cursor before source-journal append: {error}"
-                ))
-            })?;
-        if cursor > old_tail {
-            return Err(MutationError::Storage(format!(
-                "local reference cursor {cursor} is ahead of source-journal tail {old_tail}"
-            )));
-        }
-        let local_reference_cursor = match reference_effects {
-            LocalReferenceEffects::AppliedInline => {
-                if cursor != old_tail {
-                    return Err(MutationError::Storage(format!(
-                        "local reference cursor {cursor} does not match source-journal tail {old_tail}"
-                    )));
-                }
-                Some(status.source_id)
-            }
-            LocalReferenceEffects::NoReferenceEffects => {
-                if changes
-                    .iter()
-                    .any(PendingLocalChange::has_reference_effects)
-                {
-                    return Err(MutationError::Storage(
-                        "source-journal append declared no reference effects but carried a reference delta"
-                            .into(),
-                    ));
-                }
-                (cursor == old_tail).then_some(status.source_id)
-            }
-            LocalReferenceEffects::Deferred => None,
-        };
-        let mut appended = VecDeque::new();
-        for pending in changes {
-            status.tail = status.tail.checked_add(1).ok_or_else(|| {
-                MutationError::Storage("local invalidation offset is exhausted".into())
-            })?;
-            let change = pending.at_offset(status.tail);
-            let encoded = encode_local_change(&change).map_err(storage_error)?;
-            let logical_bytes = invalidation_record_bytes(encoded.len())
-                .saturating_add(super::journal_routes::journal_route_logical_bytes(&change));
-            if admission == SourceJournalAdmission::Bounded
-                && logical_bytes > self.watch_retention.max_bytes
-            {
-                return Err(MutationError::SourceJournalRecordTooLarge {
-                    bytes: logical_bytes,
-                    maximum: self.watch_retention.max_bytes,
-                });
-            }
-            self.stage_journal_routes(batch, status.source_id.source_epoch, &change)?;
-            status.retained_entries = status.retained_entries.checked_add(1).ok_or_else(|| {
-                MutationError::Storage("local invalidation entry count is exhausted".into())
-            })?;
-            status.retained_bytes = status
-                .retained_bytes
-                .checked_add(logical_bytes)
-                .ok_or_else(|| {
-                    MutationError::Storage("local invalidation byte count is exhausted".into())
-                })?;
-            appended.push_back((status.tail, encoded));
-        }
-
-        if admission == SourceJournalAdmission::Bounded {
-            let appended_entries = status
-                .retained_entries
-                .saturating_sub(retained_entries_before);
-            let appended_bytes = status.retained_bytes.saturating_sub(retained_bytes_before);
-            if appended_entries > self.watch_retention.max_entries
-                || appended_bytes > self.watch_retention.max_bytes
-            {
-                return Err(MutationError::SourceJournalTransitionTooLarge {
-                    entries: appended_entries,
-                    bytes: appended_bytes,
-                    maximum_entries: self.watch_retention.max_entries,
-                    maximum_bytes: self.watch_retention.max_bytes,
-                });
-            }
-            if status.retained_entries > self.watch_retention.max_entries
-                || status.retained_bytes > self.watch_retention.max_bytes
-            {
-                // Keep capacity retirement in a separate committed prune.
-                return Err(MutationError::SourceJournalCapacity);
-            }
-        }
-        for (offset, encoded) in appended {
-            batch.put_cf(journal, invalidation_key(offset), encoded);
-        }
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_OFFSET_KEY,
-            status.tail.to_be_bytes(),
-        );
-        if reference_effects != LocalReferenceEffects::Deferred
-            && status.settled_through == old_tail
-        {
-            batch.put_cf(
-                metadata,
-                LOCAL_INVALIDATION_SETTLED_KEY,
-                status.tail.to_be_bytes(),
-            );
-        }
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_FLOOR_KEY,
-            status.retention_floor.to_be_bytes(),
-        );
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_COUNT_KEY,
-            status.retained_entries.to_be_bytes(),
-        );
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_BYTES_KEY,
-            status.retained_bytes.to_be_bytes(),
-        );
-        if let Some(source) = local_reference_cursor {
-            self.stage_reference_delta_cursor(batch, source, status.tail)?;
-        }
-        Ok(())
     }
 
     pub(crate) fn notify_local_invalidations(&self) {
