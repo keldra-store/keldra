@@ -117,6 +117,24 @@ enum CoordinatorBatchPayloadPreparation {
     SingleNode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpeculativePrefetchDisposition {
+    Accept,
+    Retry,
+    LockedFallback,
+}
+
+fn speculative_prefetch_disposition(
+    attempt: u8,
+    unchanged: Option<bool>,
+) -> SpeculativePrefetchDisposition {
+    match unchanged {
+        Some(true) => SpeculativePrefetchDisposition::Accept,
+        Some(false) | None if attempt == 1 => SpeculativePrefetchDisposition::Retry,
+        Some(false) | None => SpeculativePrefetchDisposition::LockedFallback,
+    }
+}
+
 impl Store {
     /// Evaluate independently receipted operations for one metadata replica
     /// group in request order and commit their successful coordinator state
@@ -384,9 +402,80 @@ impl Store {
             )
             .await;
         let path_wait_duration = path_wait_started.elapsed();
+        let operation_refs = prepared
+            .iter()
+            .map(|item| &item.operation)
+            .collect::<Vec<_>>();
+        let mut speculative_cache = None;
+        let mut speculative_prefetch_duration = std::time::Duration::ZERO;
+        let mut speculative_revalidation_duration = std::time::Duration::ZERO;
+        let mut speculative_revalidation_keys = 0_u64;
+        let mut speculative_retries = 0_u64;
+        let mut speculative_fallbacks = 0_u64;
         let commit_wait_started = std::time::Instant::now();
-        let _commit_guard = self.lock_commit("distributed_publish").await;
-        let commit_wait_duration = commit_wait_started.elapsed();
+        let _commit_guard = match payload_preparation {
+            CoordinatorBatchPayloadPreparation::Distributed => {
+                self.lock_commit("distributed_publish").await
+            }
+            CoordinatorBatchPayloadPreparation::SingleNode => {
+                let mut attempt = 0_u8;
+                loop {
+                    attempt += 1;
+                    let prefetch_started = std::time::Instant::now();
+                    let speculative = MutationReadCache::load_snapshot(self, &operation_refs);
+                    speculative_prefetch_duration =
+                        speculative_prefetch_duration.saturating_add(prefetch_started.elapsed());
+                    let Ok((cache, token)) = speculative else {
+                        match speculative_prefetch_disposition(attempt, None) {
+                            SpeculativePrefetchDisposition::Retry => {
+                                speculative_retries += 1;
+                                continue;
+                            }
+                            SpeculativePrefetchDisposition::LockedFallback => {
+                                speculative_fallbacks += 1;
+                                break self.lock_commit("distributed_publish").await;
+                            }
+                            SpeculativePrefetchDisposition::Accept => unreachable!(),
+                        }
+                    };
+                    let guard = self.lock_commit("distributed_publish").await;
+                    let revalidation_started = std::time::Instant::now();
+                    let revalidated = token.revalidate(self);
+                    speculative_revalidation_duration = speculative_revalidation_duration
+                        .saturating_add(revalidation_started.elapsed());
+                    let unchanged = match revalidated {
+                        Ok(revalidated) => {
+                            speculative_revalidation_keys = speculative_revalidation_keys
+                                .saturating_add(
+                                    u64::try_from(revalidated.checked_keys).unwrap_or(u64::MAX),
+                                );
+                            debug_assert_eq!(revalidated.checked_keys, token.len());
+                            Some(revalidated.unchanged)
+                        }
+                        Err(_) => None,
+                    };
+                    match speculative_prefetch_disposition(attempt, unchanged) {
+                        SpeculativePrefetchDisposition::Accept => {
+                            speculative_cache = Some(cache);
+                            break guard;
+                        }
+                        SpeculativePrefetchDisposition::Retry => {
+                            speculative_retries += 1;
+                            drop(guard);
+                            continue;
+                        }
+                        SpeculativePrefetchDisposition::LockedFallback => {
+                            speculative_fallbacks += 1;
+                            break guard;
+                        }
+                    }
+                }
+            }
+        };
+        let commit_wait_duration = commit_wait_started
+            .elapsed()
+            .saturating_sub(speculative_prefetch_duration)
+            .saturating_sub(speculative_revalidation_duration);
         let commit_hold_started = std::time::Instant::now();
         let locked_setup_started = std::time::Instant::now();
         let mut reserved = BTreeMap::new();
@@ -443,13 +532,16 @@ impl Store {
             self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
         let locked_setup_duration = locked_setup_started.elapsed();
         let locked_prefetch_started = std::time::Instant::now();
-        let read_cache = MutationReadCache::load(
-            self,
-            &prepared
-                .iter()
-                .map(|item| &item.operation)
-                .collect::<Vec<_>>(),
-        )?;
+        let read_cache = match speculative_cache {
+            Some(cache) => cache,
+            None => MutationReadCache::load(
+                self,
+                &prepared
+                    .iter()
+                    .map(|item| &item.operation)
+                    .collect::<Vec<_>>(),
+            )?,
+        };
         let locked_prefetch_duration = locked_prefetch_started.elapsed();
         let mut pending_heads = BTreeMap::new();
         let mut pending_versions = BTreeMap::new();
@@ -626,6 +718,21 @@ impl Store {
             });
         }
         let commit_hold_duration = commit_hold_started.elapsed();
+        if matches!(
+            payload_preparation,
+            CoordinatorBatchPayloadPreparation::SingleNode
+        ) {
+            tracing::info!(
+                target: "keldra_store::single_node_speculative_prefetch",
+                speculative_prefetch_seconds = speculative_prefetch_duration.as_secs_f64(),
+                speculative_revalidation_seconds =
+                    speculative_revalidation_duration.as_secs_f64(),
+                speculative_revalidation_keys,
+                speculative_retries,
+                speculative_fallbacks,
+                "single-node speculative mutation prefetch completed"
+            );
+        }
         let outcome = CoordinatedBatchEvaluation {
             outcomes,
             receipt_capacity_at,
@@ -937,6 +1044,24 @@ mod tests {
     use crate::{
         OBJECT_ALIAS_REGISTRY_FORMAT, ObjectAliasRegistry, ObjectAliasSnapshot, PlacementLogId,
     };
+
+    #[test]
+    fn speculative_prefetch_retries_once_then_uses_locked_fallback() {
+        assert_eq!(
+            speculative_prefetch_disposition(1, Some(true)),
+            SpeculativePrefetchDisposition::Accept
+        );
+        for failure in [Some(false), None] {
+            assert_eq!(
+                speculative_prefetch_disposition(1, failure),
+                SpeculativePrefetchDisposition::Retry
+            );
+            assert_eq!(
+                speculative_prefetch_disposition(2, failure),
+                SpeculativePrefetchDisposition::LockedFallback
+            );
+        }
+    }
 
     fn request(path: &str, command: &str, blob: BlobRef) -> PublishRequest {
         PublishRequest {
