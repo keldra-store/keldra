@@ -592,6 +592,41 @@ async fn current_only_definition_open_never_requests_retained_history() {
 }
 
 #[tokio::test]
+async fn current_head_fails_closed_for_each_cross_object_identity_dimension() {
+    let mutations: [fn(&mut CurrentObjectSnapshot); 3] = [
+        |snapshot: &mut CurrentObjectSnapshot| snapshot.tenant_id += 1,
+        |snapshot: &mut CurrentObjectSnapshot| snapshot.bucket_id += 1,
+        |snapshot: &mut CurrentObjectSnapshot| snapshot.exact_path = "definitions/other".into(),
+    ];
+    for mutate in mutations {
+        let topology = TestTopology::three_nodes();
+        let fence_index = Arc::new(AtomicU64::new(8));
+        let mut current_snapshot = current_at(definition_key().path(), 1, None);
+        mutate(&mut current_snapshot);
+        let reader = ClusterObjectReader::with_components(
+            Arc::new(FakeMetadata {
+                topology,
+                fence_index,
+                snapshot: None,
+                current_snapshot: Some(current_snapshot),
+                full_snapshot_reads: Arc::new(AtomicU64::new(0)),
+                change_fence_after_current_batch: AtomicBool::new(false),
+            }),
+            ErasureProfile::default(),
+            Arc::new(FakePayloadTransport::default()),
+            Arc::new(RejectSpools),
+        )
+        .unwrap();
+
+        let error = reader
+            .current_head_snapshot_stable(&definition_key(), 11, 12)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::DataLoss);
+    }
+}
+
+#[tokio::test]
 async fn current_head_batch_fails_closed_when_the_placement_fence_changes() {
     let topology = TestTopology::three_nodes();
     let fence_index = Arc::new(AtomicU64::new(41));

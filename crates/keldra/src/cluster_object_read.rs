@@ -290,9 +290,12 @@ impl ClusterObjectReader {
             snapshot
                 .validate()
                 .map_err(|error| Status::data_loss(error.to_string()))?;
-            if snapshot.exact_path != key.path() {
+            if snapshot.tenant_id != tenant_id
+                || snapshot.bucket_id != bucket_id
+                || snapshot.exact_path != key.path()
+            {
                 return Err(Status::data_loss(
-                    "current object quorum returned another exact path",
+                    "current object quorum returned another object identity",
                 ));
             }
         }

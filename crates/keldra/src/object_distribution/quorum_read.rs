@@ -513,7 +513,15 @@ impl ObjectDistribution {
                     .store
                     .export_current_object_snapshot(tenant_id, bucket_id, key.path())
                 {
-                    Ok(snapshot) => observations.push(snapshot),
+                    Ok(snapshot) => {
+                        validate_current_object_observation_identity(
+                            snapshot.as_ref(),
+                            tenant_id,
+                            bucket_id,
+                            key.path(),
+                        )?;
+                        observations.push(snapshot);
+                    }
                     Err(error) => tracing::warn!(
                         node_id = node.0,
                         %error,
@@ -543,7 +551,15 @@ impl ObjectDistribution {
         }
         while let Some(result) = reads.join_next().await {
             match result {
-                Ok((_node, Ok(snapshot))) => observations.push(snapshot),
+                Ok((_node, Ok(snapshot))) => {
+                    validate_current_object_observation_identity(
+                        snapshot.as_ref(),
+                        tenant_id,
+                        bucket_id,
+                        key.path(),
+                    )?;
+                    observations.push(snapshot);
+                }
                 Ok((node, Err(error))) => tracing::warn!(
                     node_id = node.0,
                     %error,
@@ -722,6 +738,27 @@ fn select_current_object_snapshot_quorum(
     Err(Status::unavailable(
         "current object replicas have neither an exact quorum nor one direct predecessor-linked successor",
     ))
+}
+
+fn validate_current_object_observation_identity(
+    snapshot: Option<&CurrentObjectSnapshot>,
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_path: &str,
+) -> Result<(), Status> {
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    snapshot.validate().map_err(snapshot_status)?;
+    if snapshot.tenant_id != tenant_id
+        || snapshot.bucket_id != bucket_id
+        || snapshot.exact_path != exact_path
+    {
+        return Err(Status::data_loss(
+            "current object replica returned another object identity",
+        ));
+    }
+    Ok(())
 }
 
 fn select_current_object_snapshot_batch_quorum(

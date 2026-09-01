@@ -145,6 +145,33 @@ fn current_only_selector_requires_the_same_quorum_without_history() {
 }
 
 #[test]
+fn current_observation_identity_rejects_each_cross_object_dimension_before_selection() {
+    let expected = current_snapshot(9, Some(8), 9);
+    validate_current_object_observation_identity(
+        Some(&expected),
+        expected.tenant_id,
+        expected.bucket_id,
+        &expected.exact_path,
+    )
+    .unwrap();
+    validate_current_object_observation_identity(None, 11, 22, "ledger/entry").unwrap();
+
+    let mut wrong_tenant = expected.clone();
+    wrong_tenant.tenant_id += 1;
+    let mut wrong_bucket = expected.clone();
+    wrong_bucket.bucket_id += 1;
+    let mut wrong_path = expected;
+    wrong_path.exact_path = "ledger/other".into();
+
+    for observation in [&wrong_tenant, &wrong_bucket, &wrong_path] {
+        let error =
+            validate_current_object_observation_identity(Some(observation), 11, 22, "ledger/entry")
+                .unwrap_err();
+        assert_eq!(error.code(), Code::DataLoss);
+    }
+}
+
+#[test]
 fn current_only_batch_selector_preserves_input_order_and_selects_each_exact_quorum() {
     let mut a_current = current_snapshot(9, Some(8), 9);
     a_current.exact_path = "docs/a".into();
