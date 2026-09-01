@@ -20,6 +20,10 @@ const DEFAULT_MAX_QUEUED_OPERATIONS: usize = 8_000;
 const DEFAULT_MAX_QUEUED_INLINE_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_GROUP_DWELL: Duration = Duration::from_micros(250);
 
+fn requires_arrival_dwell(queue_depth: usize, max_group_requests: usize) -> bool {
+    queue_depth < max_group_requests
+}
+
 /// Validated bounds and dwell time for single-node mutation group commit.
 ///
 /// Queue capacities must cover the largest admitted group. Construction also
@@ -299,9 +303,16 @@ impl SingleNodeGroupCommit {
 
     async fn run(self, store: Store) {
         loop {
-            let dwell_started = std::time::Instant::now();
-            tokio::time::sleep(self.config.max_group_dwell).await;
-            let dwell_duration = dwell_started.elapsed();
+            let queue_depth_before_dwell = self.state.lock().await.requests.len();
+            let dwell_skipped =
+                !requires_arrival_dwell(queue_depth_before_dwell, self.config.max_group_requests);
+            let dwell_duration = if dwell_skipped {
+                Duration::ZERO
+            } else {
+                let dwell_started = std::time::Instant::now();
+                tokio::time::sleep(self.config.max_group_dwell).await;
+                dwell_started.elapsed()
+            };
             let (requests, queued_requests, stop_reason) = {
                 let mut state = self.state.lock().await;
                 let Some(first) = state.requests.pop_front() else {
@@ -402,6 +413,8 @@ impl SingleNodeGroupCommit {
                 operation_count,
                 inline_bytes,
                 failed_requests,
+                queue_depth_before_dwell,
+                dwell_skipped,
                 dwell_seconds = dwell_duration.as_secs_f64(),
                 execute_seconds = execute_duration.as_secs_f64(),
                 prepare_seconds = metrics.prepare.as_secs_f64(),
@@ -666,6 +679,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(zero_dwell.to_string().contains("dwell must be non-zero"));
+    }
+
+    #[test]
+    fn a_full_waiting_group_does_not_need_an_arrival_dwell() {
+        let config = SingleNodeGroupCommitConfig::default();
+        assert!(config.max_group_requests() > 1);
+
+        assert!(requires_arrival_dwell(
+            config.max_group_requests() - 1,
+            config.max_group_requests()
+        ));
+        assert!(!requires_arrival_dwell(
+            config.max_group_requests(),
+            config.max_group_requests()
+        ));
+        assert!(!requires_arrival_dwell(
+            config.max_group_requests() + 1,
+            config.max_group_requests()
+        ));
     }
 
     #[tokio::test]
