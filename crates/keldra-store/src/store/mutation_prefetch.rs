@@ -515,19 +515,15 @@ impl MutationReadSpeculation {
             Arc::new(move |lane_components: Vec<Vec<usize>>| {
                 let active = worker_active_lanes.fetch_add(1, Ordering::SeqCst) + 1;
                 worker_peak_active_lanes.fetch_max(active, Ordering::SeqCst);
-                let view = MutationReadView::snapshot(&store);
-                let result = lane_components
-                    .into_iter()
-                    .map(|component| {
-                        let refs = component
-                            .iter()
-                            .map(|index| owned[*index].as_ref())
-                            .collect::<Vec<_>>();
-                        validate_governed_coverage(&refs, &governed_buckets)?;
-                        let cache = MutationReadCache::load_from(&view, &refs, false)?;
-                        Ok::<_, MutationError>((cache, view.take_token()))
-                    })
-                    .collect::<Result<Vec<_>, _>>();
+                let mut indices = lane_components.into_iter().flatten().collect::<Vec<_>>();
+                indices.sort_unstable();
+                let refs = indices
+                    .iter()
+                    .map(|index| owned[*index].as_ref())
+                    .collect::<Vec<_>>();
+                let result =
+                    MutationReadCache::load_governed_snapshot(&store, &refs, &governed_buckets)
+                        .map(|loaded| vec![loaded]);
                 worker_active_lanes.fetch_sub(1, Ordering::SeqCst);
                 result
             }),
@@ -552,9 +548,16 @@ impl MutationReadSpeculation {
                 tokens.push(token);
             }
         }
+        let mut combined_token = MutationReadToken::default();
+        for token in tokens {
+            combined_token.cells.extend(token.cells);
+        }
+        combined_token
+            .cells
+            .sort_by(|left, right| (left.cf_name, &left.key).cmp(&(right.cf_name, &right.key)));
         Ok(Self {
             cache,
-            tokens,
+            tokens: vec![combined_token],
             metrics: MutationPreparationMetrics {
                 configured_lanes,
                 effective_lanes,
