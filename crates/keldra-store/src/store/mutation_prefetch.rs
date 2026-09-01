@@ -51,26 +51,6 @@ impl MutationReadCache {
         store: &Store,
         operations: &[&PreparedOperation],
     ) -> Result<Self, MutationError> {
-        Self::load_inner(store, operations, None)
-    }
-
-    pub(super) fn load_with_governance(
-        store: &Store,
-        operations: &[&PreparedOperation],
-        policies: &BTreeMap<Vec<u8>, Result<BucketPolicy, MutationError>>,
-        versioning: &BTreeMap<Vec<u8>, Result<ObjectVersioning, MutationError>>,
-    ) -> Result<Self, MutationError> {
-        Self::load_inner(store, operations, Some((policies, versioning)))
-    }
-
-    fn load_inner(
-        store: &Store,
-        operations: &[&PreparedOperation],
-        governed: Option<(
-            &BTreeMap<Vec<u8>, Result<BucketPolicy, MutationError>>,
-            &BTreeMap<Vec<u8>, Result<ObjectVersioning, MutationError>>,
-        )>,
-    ) -> Result<Self, MutationError> {
         let mut metrics = PrefetchMetrics::default();
         let head_keys = operations
             .iter()
@@ -88,25 +68,6 @@ impl MutationReadCache {
             .iter()
             .map(|operation| operation.identity().encode().to_vec())
             .collect::<BTreeSet<_>>();
-        if let Some((policies, versioning)) = governed {
-            let uncovered = bucket_keys.iter().find(|key| {
-                !policies.get(*key).is_some_and(|value| value.is_ok())
-                    || !versioning.get(*key).is_some_and(|value| value.is_ok())
-            });
-            if uncovered.is_some() {
-                return Err(MutationError::Storage(
-                    "governed mutation prefetch is missing validated bucket settings".into(),
-                ));
-            }
-        }
-        let policy_keys = governed
-            .is_none()
-            .then(|| bucket_keys.clone())
-            .unwrap_or_default();
-        let versioning_keys = governed
-            .is_none()
-            .then(|| bucket_keys.clone())
-            .unwrap_or_default();
 
         let (heads, elapsed) = multi_get_json::<Head>(store, CF_HEADS, &head_keys)?;
         metrics.head_keys = head_keys.len() as u64;
@@ -175,24 +136,24 @@ impl MutationReadCache {
         metrics.receipt_seconds = elapsed;
 
         let started = std::time::Instant::now();
-        let policies = multi_get_raw(store, CF_POLICIES, &policy_keys)?
+        let policies = multi_get_raw(store, CF_POLICIES, &bucket_keys)?
             .into_iter()
             .map(|(key, cached)| {
                 let decoded = decode_bucket_policy(&key, cached);
                 (key, decoded)
             })
             .collect();
-        metrics.policy_keys = policy_keys.len() as u64;
+        metrics.policy_keys = bucket_keys.len() as u64;
         metrics.policy_seconds = started.elapsed().as_secs_f64();
         let started = std::time::Instant::now();
-        let versioning = multi_get_raw(store, CF_BUCKET_OPTIONS, &versioning_keys)?
+        let versioning = multi_get_raw(store, CF_BUCKET_OPTIONS, &bucket_keys)?
             .into_iter()
             .map(|(key, cached)| {
                 let decoded = decode_bucket_versioning(&key, cached);
                 (key, decoded)
             })
             .collect();
-        metrics.versioning_keys = versioning_keys.len() as u64;
+        metrics.versioning_keys = bucket_keys.len() as u64;
         metrics.versioning_seconds = started.elapsed().as_secs_f64();
 
         let mut blob_reference_keys = BTreeSet::new();
@@ -446,57 +407,4 @@ fn exact_version_key(head_key: &[u8], version: VersionId) -> Vec<u8> {
     encoded.push(0);
     encoded.extend_from_slice(&version.0.to_be_bytes());
     encoded
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn governed_prefetch_fails_closed_without_every_bucket_identity() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
-            .unwrap();
-        let prepare = |tenant_id, bucket_id, bucket: &str| {
-            let identity = BucketIdentity {
-                tenant_id: TenantId(tenant_id),
-                bucket_id: BucketId(bucket_id),
-            };
-            store
-                .prepare_verified_distributed_publish(
-                    PublishRequest {
-                        key: ObjectKey::new("tenant", bucket, "artifact").unwrap(),
-                        blob: blob_reference_for_bytes(bucket.as_bytes()),
-                        content_type: None,
-                        mode: PutMode::PutIfAbsent,
-                        command_id: Some(format!("publish-{bucket}")),
-                        durability: Durability::Local,
-                    },
-                    identity,
-                )
-                .unwrap()
-        };
-        let first = prepare(1, 1, "first");
-        let second = prepare(1, 2, "second");
-        let operations = [&first, &second];
-        let first_key = first.identity().encode().to_vec();
-        let second_key = second.identity().encode().to_vec();
-        let policies = BTreeMap::from([(first_key.clone(), Ok(BucketPolicy::default()))]);
-        let versioning = BTreeMap::from([
-            (first_key, Ok(ObjectVersioning::default())),
-            (second_key, Ok(ObjectVersioning::default())),
-        ]);
-
-        assert!(matches!(
-            MutationReadCache::load_with_governance(
-                &store,
-                &operations,
-                &policies,
-                &versioning,
-            ),
-            Err(MutationError::Storage(message))
-                if message.contains("missing validated bucket settings")
-        ));
-    }
 }

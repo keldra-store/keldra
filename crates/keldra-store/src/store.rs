@@ -1464,7 +1464,6 @@ mod index_orphan_scrub_due;
 mod index_retention_due;
 mod journal_capacity;
 mod journal_routes;
-mod journal_transition;
 mod memory;
 mod mutation_fingerprint;
 mod mutation_helpers;

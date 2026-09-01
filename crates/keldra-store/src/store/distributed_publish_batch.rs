@@ -274,12 +274,23 @@ impl Store {
             prepared.retain(|item| !reserved.contains_key(&item.index));
             early.extend(reserved);
         }
-        let journal_state = self.fenced_local_journal_state(&_commit_guard)?;
-        let source = journal_state.status();
+        let source = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
         let reference_effects = match payload_preparation {
             CoordinatorBatchPayloadPreparation::Distributed => LocalReferenceEffects::Deferred,
             CoordinatorBatchPayloadPreparation::SingleNode => {
-                let cursor = journal_state.reference_cursor();
+                let cursor = self.reference_delta_cursor(source.source_id).map_err(|error| {
+                    MutationError::Storage(format!(
+                        "cannot read local reference cursor before single-node coordination: {error}"
+                    ))
+                })?;
+                if cursor > source.tail {
+                    return Err(MutationError::Storage(format!(
+                        "local reference cursor {cursor} is ahead of source-journal tail {}",
+                        source.tail
+                    )));
+                }
                 if cursor == source.tail {
                     LocalReferenceEffects::AppliedInline
                 } else {
@@ -302,6 +313,20 @@ impl Store {
         let pruned_receipts =
             self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
         let locked_setup_duration = locked_setup_started.elapsed();
+        let locked_prefetch_started = std::time::Instant::now();
+        let read_cache = MutationReadCache::load(
+            self,
+            &prepared
+                .iter()
+                .map(|item| &item.operation)
+                .collect::<Vec<_>>(),
+        )?;
+        let locked_prefetch_duration = locked_prefetch_started.elapsed();
+        let mut pending_heads = BTreeMap::new();
+        let mut pending_versions = BTreeMap::new();
+        let mut pending_receipts = BTreeMap::new();
+        let mut pending_blob_references = PendingBlobReferences::new();
+        let mut pending_inline_payloads = BTreeSet::new();
         let mut policy_cache = bucket_governance
             .iter()
             .map(|(identity, governance)| (identity.clone(), Ok(governance.policy.clone())))
@@ -310,22 +335,6 @@ impl Store {
             .iter()
             .map(|(identity, governance)| (identity.clone(), Ok(governance.versioning)))
             .collect();
-        let locked_prefetch_started = std::time::Instant::now();
-        let read_cache = MutationReadCache::load_with_governance(
-            self,
-            &prepared
-                .iter()
-                .map(|item| &item.operation)
-                .collect::<Vec<_>>(),
-            &policy_cache,
-            &versioning_cache,
-        )?;
-        let locked_prefetch_duration = locked_prefetch_started.elapsed();
-        let mut pending_heads = BTreeMap::new();
-        let mut pending_versions = BTreeMap::new();
-        let mut pending_receipts = BTreeMap::new();
-        let mut pending_blob_references = PendingBlobReferences::new();
-        let mut pending_inline_payloads = BTreeSet::new();
         let mut pending_changes = Vec::new();
         let mut high_watermark = None;
         let mut evaluated = BTreeMap::new();
@@ -443,14 +452,7 @@ impl Store {
         if receipt_status != initial_receipt_status {
             self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
         }
-        let journal_transition = self.stage_fenced_local_changes(
-            &_commit_guard,
-            &mut batch,
-            &pending_changes,
-            reference_effects,
-            SourceJournalAdmission::Bounded,
-            journal_state,
-        )?;
+        self.stage_local_changes(&mut batch, &pending_changes, reference_effects)?;
         if let Some(high_watermark) = high_watermark {
             batch.put_cf(
                 self.cf(CF_METADATA)?,
@@ -463,24 +465,20 @@ impl Store {
         let physical_commit = !batch.is_empty();
         let write_batch_entries = u64::try_from(batch.len()).unwrap_or(u64::MAX);
         let write_batch_bytes = u64::try_from(batch.size_in_bytes()).unwrap_or(u64::MAX);
-        let write_result = if physical_commit {
+        if physical_commit {
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
-            self.db.write_opt(batch, &options).map_err(storage_error)
-        } else {
-            Ok(())
-        };
+            self.db.write_opt(batch, &options).map_err(storage_error)?;
+        }
         let persist_duration = persist_started.elapsed();
         let settle_started = std::time::Instant::now();
-        self.finish_fenced_local_changes_after_write(
-            &_commit_guard,
-            journal_transition,
-            write_result,
-        )?;
         if !pruned_receipts.is_empty() {
             self.mutation_capacity_notify.notify_waiters();
         }
         if !pending_changes.is_empty() {
+            if reference_effects == LocalReferenceEffects::AppliedInline {
+                self.settle_inline_source_changes()?;
+            }
             self.notify_local_invalidations();
         }
         let settle_duration = settle_started.elapsed();
@@ -647,8 +645,9 @@ impl Store {
             )
             .await;
         let _commit_guard = self.lock_commit("distributed_publish").await;
-        let journal_state = self.fenced_local_journal_state(&_commit_guard)?;
-        let source = journal_state.status();
+        let source = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
         let mut next_source_position = source.tail.checked_add(1).ok_or_else(|| {
             MutationError::Storage("local invalidation offset is exhausted".into())
         })?;
@@ -658,24 +657,22 @@ impl Store {
         let initial_receipt_status = receipt_status;
         let pruned_receipts =
             self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
-        let encoded_bucket = identity.encode().to_vec();
-        let mut policy_cache =
-            BTreeMap::from([(encoded_bucket.clone(), Ok(governance.policy.clone()))]);
-        let mut versioning_cache = BTreeMap::from([(encoded_bucket, Ok(governance.versioning))]);
-        let read_cache = MutationReadCache::load_with_governance(
+        let read_cache = MutationReadCache::load(
             self,
             &prepared
                 .iter()
                 .map(|(_, operation)| operation)
                 .collect::<Vec<_>>(),
-            &policy_cache,
-            &versioning_cache,
         )?;
         let mut pending_heads = BTreeMap::new();
         let mut pending_versions = BTreeMap::new();
         let mut pending_receipts = BTreeMap::new();
         let mut pending_blob_references = PendingBlobReferences::new();
         let mut pending_inline_payloads = BTreeSet::new();
+        let encoded_bucket = identity.encode().to_vec();
+        let mut policy_cache =
+            BTreeMap::from([(encoded_bucket.clone(), Ok(governance.policy.clone()))]);
+        let mut versioning_cache = BTreeMap::from([(encoded_bucket, Ok(governance.versioning))]);
         let mut pending_changes = Vec::new();
         let mut high_watermark = None;
         let mut evaluated = BTreeMap::new();
@@ -764,13 +761,11 @@ impl Store {
         if receipt_status != initial_receipt_status {
             self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
         }
-        let journal_transition = self.stage_fenced_local_changes(
-            &_commit_guard,
+        self.stage_local_changes_with_admission(
             &mut batch,
             &pending_changes,
             LocalReferenceEffects::Deferred,
             source_journal_admission,
-            journal_state,
         )?;
         if let Some(high_watermark) = high_watermark {
             batch.put_cf(
@@ -779,18 +774,11 @@ impl Store {
                 serde_json::to_vec(&high_watermark).map_err(storage_error)?,
             );
         }
-        let write_result = if !batch.is_empty() {
+        if !batch.is_empty() {
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
-            self.db.write_opt(batch, &options).map_err(storage_error)
-        } else {
-            Ok(())
-        };
-        self.finish_fenced_local_changes_after_write(
-            &_commit_guard,
-            journal_transition,
-            write_result,
-        )?;
+            self.db.write_opt(batch, &options).map_err(storage_error)?;
+        }
         if !pruned_receipts.is_empty() {
             self.mutation_capacity_notify.notify_waiters();
         }
@@ -937,12 +925,6 @@ mod tests {
             journal.tail
         );
         assert_eq!(source_positions.last().copied(), Some(journal.tail));
-        assert_eq!(
-            store
-                .source_journal_reference_safe_through
-                .load(std::sync::atomic::Ordering::Acquire),
-            journal.tail
-        );
         assert!(
             store
                 .settle_source_journal_positions_if_contiguous(
@@ -990,19 +972,6 @@ mod tests {
             store.db.latest_sequence_number(),
             sequence_before_replicated
         );
-
-        let durable_status = store.local_watch_status().unwrap();
-        drop(store);
-        let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
-            .unwrap();
-        assert_eq!(reopened.local_watch_status().unwrap(), durable_status);
-        assert_eq!(
-            reopened
-                .reference_delta_cursor(durable_status.source_id)
-                .unwrap(),
-            durable_status.tail
-        );
     }
 
     #[tokio::test]
@@ -1020,10 +989,6 @@ mod tests {
             versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
             policy: store.bucket_policy("tenant", "bucket").unwrap(),
         };
-        let initial_journal = store.local_watch_status().unwrap();
-        let initial_reference_safe = store
-            .source_journal_reference_safe_through
-            .load(std::sync::atomic::Ordering::Acquire);
         let before = store.db.latest_sequence_number();
         let outcomes = store
             .coordinate_distributed_publish_batch_with_governance(
@@ -1064,97 +1029,6 @@ mod tests {
                 .len(),
             1
         );
-        let durable_status = store.local_watch_status().unwrap();
-        assert_eq!(durable_status.tail, initial_journal.tail + 2);
-        assert_eq!(
-            durable_status.settled_through,
-            initial_journal.settled_through
-        );
-        assert_eq!(
-            store
-                .reference_delta_cursor(durable_status.source_id)
-                .unwrap(),
-            initial_journal.tail
-        );
-        assert_eq!(
-            store
-                .source_journal_reference_safe_through
-                .load(std::sync::atomic::Ordering::Acquire),
-            initial_reference_safe
-        );
-
-        drop(store);
-        let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
-            .unwrap();
-        assert_eq!(reopened.local_watch_status().unwrap(), durable_status);
-        assert_eq!(
-            reopened
-                .reference_delta_cursor(durable_status.source_id)
-                .unwrap(),
-            initial_journal.tail
-        );
-    }
-
-    #[tokio::test]
-    async fn governed_prefetch_ignores_only_its_supplied_bucket_settings() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
-            .unwrap();
-        let blob = store.stage_blob(b"governed artifact").await.unwrap();
-        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
-        let governance = ObjectMutationGovernance {
-            tenant_id,
-            bucket_id,
-            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
-            policy: store.bucket_policy("tenant", "bucket").unwrap(),
-        };
-        let identity = BucketIdentity {
-            tenant_id: TenantId(tenant_id),
-            bucket_id: BucketId(bucket_id),
-        };
-        let mut corrupt = WriteBatch::default();
-        corrupt.put_cf(
-            store.cf(CF_POLICIES).unwrap(),
-            identity.encode(),
-            b"invalid",
-        );
-        corrupt.put_cf(
-            store.cf(CF_BUCKET_OPTIONS).unwrap(),
-            identity.encode(),
-            b"invalid",
-        );
-        store.db.write(corrupt).unwrap();
-
-        let governed = store
-            .coordinate_distributed_publish_batch_with_governance(
-                vec![request("packs/governed", "governed", blob)],
-                governance,
-                ObjectMutationContext {
-                    active_placement_log_id: PlacementLogId { term: 1, index: 1 },
-                    serving_fence_term: 1,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(governed[0].is_ok());
-
-        let ordinary = store
-            .bulk_write(vec![BatchOperation::Put(put_request(
-                "objects/ordinary",
-                "ordinary",
-                b"ordinary",
-                Durability::Local,
-            ))])
-            .await;
-        assert!(matches!(
-            ordinary.as_slice(),
-            [BatchOutcome {
-                result: Err(MutationError::Storage(_)),
-                ..
-            }]
-        ));
     }
 
     #[tokio::test]
@@ -1176,10 +1050,6 @@ mod tests {
             versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
             policy: store.bucket_policy("tenant", "bucket").unwrap(),
         };
-        let initial_journal = store.local_watch_status().unwrap();
-        let initial_reference_safe = store
-            .source_journal_reference_safe_through
-            .load(std::sync::atomic::Ordering::Acquire);
         let before = store.db.latest_sequence_number();
 
         let error = store
@@ -1211,19 +1081,6 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.mutation_receipt_status().unwrap().entries, 1);
-        let status = store.local_watch_status().unwrap();
-        assert_eq!(status.tail, initial_journal.tail + 1);
-        assert_eq!(status.settled_through, initial_journal.settled_through);
-        assert_eq!(
-            store.reference_delta_cursor(status.source_id).unwrap(),
-            initial_journal.tail
-        );
-        assert_eq!(
-            store
-                .source_journal_reference_safe_through
-                .load(std::sync::atomic::Ordering::Acquire),
-            initial_reference_safe
-        );
         assert_eq!(
             store
                 .db
