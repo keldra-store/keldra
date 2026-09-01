@@ -85,7 +85,7 @@ mod tests {
         for mutation in output {
             assert_eq!(
                 (mutation.offset - 1) % 256,
-                mutation.path[8..].parse().unwrap()
+                mutation.path[8..].parse::<u64>().unwrap()
             );
             assert_eq!(mutation.version, mutation.offset + 6);
             assert!(mutation.offset > 9_744);

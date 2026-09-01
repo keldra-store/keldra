@@ -1,6 +1,7 @@
 //! Independent sealed dispatch for BulkWrite items addressed through links.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use keldra_api::v1::bulk_outcome::Outcome;
@@ -190,9 +191,14 @@ pub(super) async fn prepare_before_live_dispatch(
         }
     }
 
+    let mut resolution_cache = BTreeMap::new();
     for item in pending.into_iter().flatten() {
         let (index, operation, key, permission, definition_intent) = item;
-        match object_link::resolve_current(service, key.clone()).await {
+        match resolve_cached(&mut resolution_cache, &key, |key| {
+            object_link::resolve_current(service, key)
+        })
+        .await
+        {
             Ok(resolution) => {
                 let canonical = resolution.canonical().clone();
                 match object_path_access::require_key(path_access, &canonical)
@@ -261,6 +267,23 @@ pub(super) async fn prepare_before_live_dispatch(
         identity_resolution_duration,
         authorization_duration,
     })
+}
+
+async fn resolve_cached<F, Fut>(
+    cache: &mut BTreeMap<ObjectKey, Result<object_link::ResolvedAddress, Status>>,
+    key: &ObjectKey,
+    resolve: F,
+) -> Result<object_link::ResolvedAddress, Status>
+where
+    F: FnOnce(ObjectKey) -> Fut,
+    Fut: Future<Output = Result<object_link::ResolvedAddress, Status>>,
+{
+    if let Some(cached) = cache.get(key) {
+        return cached.clone();
+    }
+    let resolved = resolve(key.clone()).await;
+    cache.insert(key.clone(), resolved.clone());
+    resolved
 }
 
 pub(super) fn replay_probe(
@@ -544,6 +567,8 @@ pub(super) fn authorization_key(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use keldra_api::v1::bulk_operation::Operation;
     use keldra_api::v1::{BulkPutRequest, Durability, ObjectAddress};
     use keldra_store::VersionId;
@@ -642,6 +667,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![8, 2],
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_ordinary_paths_share_one_live_resolution() {
+        let requested = key("ordinary");
+        let calls = AtomicUsize::new(0);
+        let mut cache = BTreeMap::new();
+
+        for _ in 0..3 {
+            let resolved = resolve_cached(&mut cache, &requested, |key| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(object_link::ResolvedAddress::Ordinary(key))
+            })
+            .await
+            .unwrap();
+            assert_eq!(resolved.canonical(), &requested);
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

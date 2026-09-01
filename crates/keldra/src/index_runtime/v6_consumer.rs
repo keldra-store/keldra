@@ -76,7 +76,7 @@ struct Writer {
     _pending_mutation_permit: IndexingMemoryPermit,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Mutation {
     offset: u64,
     ordinal: u32,

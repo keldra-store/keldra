@@ -1,6 +1,3 @@
-use std::collections::BTreeMap;
-use std::io::Read;
-
 use crate::cluster_object_read::ClusterOpenedObject;
 use keldra_api::v1::{
     DeleteIfVersionRequest, DeleteRequest as ApiDeleteRequest, LinkObjectRequest, MutationReceipt,
@@ -8,14 +5,16 @@ use keldra_api::v1::{
 };
 use keldra_atomic_program::{CommandReceipt, HeadPrecondition, ObjectPath, ObservedHead};
 use keldra_store::{
-    BuiltInAliasObservation, BuiltInAliasRegistryAccess, BuiltInObjectTransactionPlan,
+    BlobRef, BuiltInAliasObservation, BuiltInAliasRegistryAccess, BuiltInObjectTransactionPlan,
     BuiltInReadProof, BuiltInTransactionAssertion, BuiltInVersionWrite, BuiltInWritePayload,
-    OBJECT_LINK_CONTENT_TYPE, ObjectAliasRegistry, ObjectKey, ObjectLinkDescriptor,
-    ObjectMutationGovernance, PROGRAM_PARTICIPANT_MANIFEST_FORMAT, Precondition,
-    ProgramAliasRegistryCondition, ProgramGovernanceParticipant, ProgramObjectParticipant,
-    ProgramParticipantIntent, ProgramParticipantManifest, ProgramPathCondition, PublishRequest,
-    PutMode, ResolvedObjectLink, Version, object_link_command_fingerprint, resolve_descriptor,
+    CurrentObjectSnapshot, OBJECT_LINK_CONTENT_TYPE, ObjectAliasRegistry, ObjectKey,
+    ObjectLinkDescriptor, ObjectMutationGovernance, PROGRAM_PARTICIPANT_MANIFEST_FORMAT,
+    Precondition, ProgramAliasRegistryCondition, ProgramGovernanceParticipant,
+    ProgramObjectParticipant, ProgramParticipantIntent, ProgramParticipantManifest,
+    ProgramPathCondition, PublishRequest, PutMode, ResolvedObjectLink, Version,
+    object_link_command_fingerprint, resolve_descriptor,
 };
+use std::collections::BTreeMap;
 use tonic::{Request, Response, Status};
 
 use super::{
@@ -56,30 +55,15 @@ pub(super) async fn resolve_current(
     service: &ObjectServiceImpl,
     key: ObjectKey,
 ) -> Result<ResolvedAddress, Status> {
-    let Some(opened) = open_visible(service, &key).await? else {
+    let Some(current) = current_visible_snapshot(service, &key).await? else {
         return Ok(ResolvedAddress::Ordinary(key));
     };
-    if !opened.version.protected_link_descriptor {
+    let Some((descriptor_version, descriptor_blob)) = protected_descriptor(&current.version)?
+    else {
         return Ok(ResolvedAddress::Ordinary(key));
-    }
-    if opened.version.content_type.as_deref() != Some(OBJECT_LINK_CONTENT_TYPE) {
-        return Err(Status::data_loss(
-            "protected object-link descriptor has the wrong content type",
-        ));
-    }
-    let descriptor_version = opened.version.id;
-    let mut payload = opened
-        .payload
-        .ok_or_else(|| Status::data_loss("object-link descriptor has no payload"))?
-        .into_spool();
-    let mut encoded = Vec::new();
-    payload
-        .read_to_end(&mut encoded)
-        .map_err(|error| Status::internal(format!("read object-link descriptor: {error}")))?;
-    let descriptor = ObjectLinkDescriptor::decode(&encoded)
-        .map_err(|error| Status::data_loss(error.to_string()))?;
-    let resolved = resolve_descriptor(key, descriptor_version, &descriptor)
-        .map_err(|error| Status::data_loss(error.to_string()))?;
+    };
+    let encoded = service.reader.read_blob_bytes(&descriptor_blob).await?;
+    let resolved = decode_protected_descriptor(key, descriptor_version, &encoded)?;
 
     // Both the sealed per-version origin and the target-local registry are
     // required. Historical ordinary objects may share the MIME and bytes, but
@@ -89,6 +73,14 @@ pub(super) async fn resolve_current(
             "protected object-link descriptor has no live target",
         ));
     };
+    validate_resolved_target(&resolved, &target)?;
+    Ok(ResolvedAddress::Link(resolved))
+}
+
+fn validate_resolved_target(
+    resolved: &ResolvedObjectLink,
+    target: &CurrentObjectSnapshot,
+) -> Result<(), Status> {
     if target
         .alias_registry
         .as_ref()
@@ -110,7 +102,58 @@ pub(super) async fn resolve_current(
         ));
     }
     require_ordinary_link_target(&target.version)?;
-    Ok(ResolvedAddress::Link(resolved))
+    Ok(())
+}
+
+fn protected_descriptor(
+    version: &Version,
+) -> Result<Option<(keldra_store::VersionId, BlobRef)>, Status> {
+    if !version.protected_link_descriptor {
+        return Ok(None);
+    }
+    if version.content_type.as_deref() != Some(OBJECT_LINK_CONTENT_TYPE) {
+        return Err(Status::data_loss(
+            "protected object-link descriptor has the wrong content type",
+        ));
+    }
+    let blob = version
+        .blob
+        .clone()
+        .ok_or_else(|| Status::data_loss("object-link descriptor has no payload"))?;
+    Ok(Some((version.id, blob)))
+}
+
+fn decode_protected_descriptor(
+    key: ObjectKey,
+    descriptor_version: keldra_store::VersionId,
+    encoded: &[u8],
+) -> Result<ResolvedObjectLink, Status> {
+    let descriptor = ObjectLinkDescriptor::decode(encoded)
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+    resolve_descriptor(key, descriptor_version, &descriptor)
+        .map_err(|error| Status::data_loss(error.to_string()))
+}
+
+async fn current_visible_snapshot(
+    service: &ObjectServiceImpl,
+    key: &ObjectKey,
+) -> Result<Option<CurrentObjectSnapshot>, Status> {
+    let (tenant_id, bucket_id) = service
+        .name_resolver
+        .resolve_bucket_ids(key.tenant(), key.bucket())
+        .await?;
+    let mut current = service
+        .reader
+        .current_head_snapshots_stable(
+            std::slice::from_ref(key),
+            tenant_id,
+            bucket_id,
+            service.atomic_program_timeout,
+        )
+        .await?;
+    current
+        .pop()
+        .ok_or_else(|| Status::internal("current object batch omitted its requested path"))
 }
 
 fn require_ordinary_link_target(version: &Version) -> Result<(), Status> {
@@ -1787,6 +1830,8 @@ pub(super) fn linked_put_fingerprint(link: &ObjectKey, publish: &PublishRequest)
 
 #[cfg(test)]
 mod tests {
+    use keldra_store::VersionId;
+
     use keldra_store::BlobRef;
 
     use super::*;
@@ -1818,6 +1863,99 @@ mod tests {
         );
         assert_eq!(
             require_ordinary_link_target(&version(true))
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+    }
+
+    #[test]
+    fn ordinary_versions_do_not_request_descriptor_payloads() {
+        assert!(protected_descriptor(&version(false)).unwrap().is_none());
+    }
+
+    #[test]
+    fn protected_descriptor_keeps_its_exact_version_binding() {
+        let link = ObjectKey::new("tenant", "bucket", "aliases/current").unwrap();
+        let encoded = ObjectLinkDescriptor::new("objects/target")
+            .unwrap()
+            .encode();
+        let resolved = decode_protected_descriptor(link.clone(), VersionId(41), &encoded).unwrap();
+
+        assert_eq!(resolved.link, link);
+        assert_eq!(resolved.descriptor_version, VersionId(41));
+        assert_eq!(resolved.target.path(), "objects/target");
+    }
+
+    #[test]
+    fn protected_descriptor_corruption_fails_closed_before_dispatch() {
+        let mut wrong_type = version(true);
+        wrong_type.content_type = Some("application/octet-stream".into());
+        assert_eq!(
+            protected_descriptor(&wrong_type).unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+
+        let mut missing_payload = version(true);
+        missing_payload.blob = None;
+        assert_eq!(
+            protected_descriptor(&missing_payload).unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+
+        let link = ObjectKey::new("tenant", "bucket", "aliases/current").unwrap();
+        assert_eq!(
+            decode_protected_descriptor(link, VersionId(41), b"not-a-descriptor")
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+    }
+
+    #[test]
+    fn protected_link_requires_target_registry_membership_and_an_ordinary_live_target() {
+        let link = ObjectKey::new("tenant", "bucket", "aliases/current").unwrap();
+        let target_key = ObjectKey::new("tenant", "bucket", "objects/target").unwrap();
+        let resolved = ResolvedObjectLink {
+            link: link.clone(),
+            descriptor_version: VersionId(41),
+            target: target_key,
+        };
+        let target_version = Version {
+            content_type: Some("application/octet-stream".into()),
+            ..version(false)
+        };
+        let mut target = CurrentObjectSnapshot {
+            tenant_id: 1,
+            bucket_id: 1,
+            exact_path: "objects/target".into(),
+            head: keldra_store::Head {
+                version: target_version.id,
+                deleted: false,
+                mutation_stamp: None,
+            },
+            version: target_version,
+            alias_registry: Some(ObjectAliasRegistry {
+                format: keldra_store::OBJECT_ALIAS_REGISTRY_FORMAT,
+                revision: 1,
+                aliases: vec![link.path().into()],
+                program_commit_cursor: Some(1),
+            }),
+        };
+        assert!(validate_resolved_target(&resolved, &target).is_ok());
+
+        target.alias_registry.as_mut().unwrap().aliases = vec!["aliases/other".into()];
+        assert_eq!(
+            validate_resolved_target(&resolved, &target)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+
+        target.alias_registry.as_mut().unwrap().aliases = vec![link.path().into()];
+        target.version.protected_link_descriptor = true;
+        assert_eq!(
+            validate_resolved_target(&resolved, &target)
                 .unwrap_err()
                 .code(),
             tonic::Code::DataLoss
