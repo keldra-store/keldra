@@ -6,6 +6,7 @@
 //! maps in input order and share the existing final `WriteBatch`.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rocksdb::{DB, SnapshotWithThreadMode};
 
@@ -29,6 +30,31 @@ struct ObservedMutationCell {
 #[derive(Clone, Debug, Default)]
 pub(super) struct MutationReadToken {
     cells: Vec<ObservedMutationCell>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum MutationConflictResource {
+    Object(ObjectPath),
+    Receipt(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct MutationPreparationMetrics {
+    pub(super) configured_lanes: usize,
+    pub(super) effective_lanes: usize,
+    pub(super) lane_jobs: usize,
+    pub(super) components: usize,
+    pub(super) largest_component_operations: usize,
+    pub(super) peak_active_lanes: usize,
+    pub(super) summed_lane_queue_wait: std::time::Duration,
+    pub(super) summed_lane_service: std::time::Duration,
+}
+
+pub(super) struct MutationReadSpeculation {
+    pub(super) cache: MutationReadCache,
+    tokens: Vec<MutationReadToken>,
+    pub(super) metrics: MutationPreparationMetrics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,16 +92,14 @@ impl<'a> MutationReadView<'a> {
         }
     }
 
-    fn token(&self) -> MutationReadToken {
+    fn take_token(&self) -> MutationReadToken {
         MutationReadToken {
-            cells: self
-                .observations
-                .borrow()
-                .iter()
+            cells: std::mem::take(&mut *self.observations.borrow_mut())
+                .into_iter()
                 .map(|((cf_name, key), value)| ObservedMutationCell {
                     cf_name,
-                    key: key.clone(),
-                    value: value.clone(),
+                    key,
+                    value,
                 })
                 .collect(),
         }
@@ -157,21 +181,49 @@ impl MutationReadCache {
         store: &Store,
         operations: &[&PreparedOperation],
     ) -> Result<Self, MutationError> {
-        Self::load_from(&MutationReadView::current(store), operations)
+        Self::load_from(&MutationReadView::current(store), operations, true)
     }
 
-    pub(super) fn load_snapshot(
+    pub(super) fn load_governed(
         store: &Store,
         operations: &[&PreparedOperation],
+        governed_buckets: &BTreeSet<Vec<u8>>,
+    ) -> Result<Self, MutationError> {
+        validate_governed_coverage(operations, governed_buckets)?;
+        Self::load_from(&MutationReadView::current(store), operations, false)
+    }
+
+    fn load_governed_snapshot(
+        store: &Store,
+        operations: &[&PreparedOperation],
+        governed_buckets: &BTreeSet<Vec<u8>>,
     ) -> Result<(Self, MutationReadToken), MutationError> {
+        validate_governed_coverage(operations, governed_buckets)?;
         let view = MutationReadView::snapshot(store);
-        let cache = Self::load_from(&view, operations)?;
-        Ok((cache, view.token()))
+        let cache = Self::load_from(&view, operations, false)?;
+        Ok((cache, view.take_token()))
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        // Read-only namespaces such as validated governance may overlap across
+        // component snapshots. Deterministic last-component selection is safe
+        // only because every component's raw token is retained: differing
+        // observations cannot both revalidate under the commit guard, so the
+        // merged cache is never evaluated in that case.
+        self.heads.append(&mut other.heads);
+        self.stored_versions.append(&mut other.stored_versions);
+        self.receipts.append(&mut other.receipts);
+        self.blob_references.append(&mut other.blob_references);
+        self.inline_payloads.append(&mut other.inline_payloads);
+        self.alias_registries.append(&mut other.alias_registries);
+        self.policies.append(&mut other.policies);
+        self.versioning.append(&mut other.versioning);
     }
 
     fn load_from(
         view: &MutationReadView<'_>,
         operations: &[&PreparedOperation],
+        load_bucket_settings: bool,
     ) -> Result<Self, MutationError> {
         let mut metrics = PrefetchMetrics::default();
         let head_keys = operations
@@ -186,10 +238,14 @@ impl MutationReadCache {
                     .map(|command_id| receipt_key(operation.identity(), command_id))
             })
             .collect::<BTreeSet<_>>();
-        let bucket_keys = operations
-            .iter()
-            .map(|operation| operation.identity().encode().to_vec())
-            .collect::<BTreeSet<_>>();
+        let bucket_keys = if load_bucket_settings {
+            operations
+                .iter()
+                .map(|operation| operation.identity().encode().to_vec())
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
 
         let (heads, elapsed) = multi_get_json::<Head>(view, CF_HEADS, &head_keys)?;
         metrics.head_keys = head_keys.len() as u64;
@@ -395,6 +451,307 @@ impl MutationReadCache {
     }
 }
 
+impl MutationReadSpeculation {
+    /// Snapshot-prefetch independent conflict components on at most the
+    /// configured number of blocking lanes. Components, rather than individual
+    /// operations, own snapshots so every dependent read starts from one
+    /// coherent RocksDB view. The lane-one path deliberately retains the
+    /// original single-snapshot baseline.
+    pub(super) async fn load(
+        store: &Store,
+        operations: &[Arc<PreparedOperation>],
+        configured_lanes: usize,
+        governed_buckets: &BTreeSet<Vec<u8>>,
+    ) -> Result<Self, MutationError> {
+        debug_assert!(configured_lanes > 0);
+        validate_governed_coverage(
+            &operations.iter().map(Arc::as_ref).collect::<Vec<_>>(),
+            governed_buckets,
+        )?;
+        if operations.is_empty() {
+            return Ok(Self {
+                cache: MutationReadCache::default(),
+                tokens: Vec::new(),
+                metrics: MutationPreparationMetrics {
+                    configured_lanes,
+                    ..MutationPreparationMetrics::default()
+                },
+            });
+        }
+
+        let refs = operations.iter().map(Arc::as_ref).collect::<Vec<_>>();
+        if configured_lanes == 1 {
+            let service_started = std::time::Instant::now();
+            let (cache, token) =
+                MutationReadCache::load_governed_snapshot(store, &refs, governed_buckets)?;
+            return Ok(Self {
+                cache,
+                tokens: vec![token],
+                metrics: MutationPreparationMetrics {
+                    configured_lanes,
+                    effective_lanes: 1,
+                    lane_jobs: 1,
+                    components: 1,
+                    largest_component_operations: operations.len(),
+                    peak_active_lanes: 1,
+                    summed_lane_service: service_started.elapsed(),
+                    ..MutationPreparationMetrics::default()
+                },
+            });
+        }
+        let components = mutation_conflict_components(&refs);
+        let effective_lanes = configured_lanes.min(components.len());
+        let largest_component_operations = components.iter().map(Vec::len).max().unwrap_or(0);
+        let assignments = assign_components_to_lanes(&components, effective_lanes);
+        let owned = Arc::new(operations.to_vec());
+        let store = store.clone();
+        let governed_buckets = Arc::new(governed_buckets.clone());
+        let active_lanes = Arc::new(AtomicUsize::new(0));
+        let peak_active_lanes = Arc::new(AtomicUsize::new(0));
+        let worker_active_lanes = Arc::clone(&active_lanes);
+        let worker_peak_active_lanes = Arc::clone(&peak_active_lanes);
+        let loaded = run_preparation_lanes(
+            assignments,
+            Arc::new(move |lane_components: Vec<Vec<usize>>| {
+                let active = worker_active_lanes.fetch_add(1, Ordering::SeqCst) + 1;
+                worker_peak_active_lanes.fetch_max(active, Ordering::SeqCst);
+                let view = MutationReadView::snapshot(&store);
+                let result = lane_components
+                    .into_iter()
+                    .map(|component| {
+                        let refs = component
+                            .iter()
+                            .map(|index| owned[*index].as_ref())
+                            .collect::<Vec<_>>();
+                        validate_governed_coverage(&refs, &governed_buckets)?;
+                        let cache = MutationReadCache::load_from(&view, &refs, false)?;
+                        Ok::<_, MutationError>((cache, view.take_token()))
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                worker_active_lanes.fetch_sub(1, Ordering::SeqCst);
+                result
+            }),
+        )
+        .await?;
+
+        let summed_lane_queue_wait = loaded
+            .iter()
+            .fold(std::time::Duration::ZERO, |total, lane| {
+                total.saturating_add(lane.queue_wait)
+            });
+        let summed_lane_service = loaded
+            .iter()
+            .fold(std::time::Duration::ZERO, |total, lane| {
+                total.saturating_add(lane.service)
+            });
+        let mut cache = MutationReadCache::default();
+        let mut tokens = Vec::with_capacity(components.len());
+        for lane in loaded {
+            for (component_cache, token) in lane.value {
+                cache.merge(component_cache);
+                tokens.push(token);
+            }
+        }
+        Ok(Self {
+            cache,
+            tokens,
+            metrics: MutationPreparationMetrics {
+                configured_lanes,
+                effective_lanes,
+                lane_jobs: effective_lanes,
+                components: components.len(),
+                largest_component_operations,
+                peak_active_lanes: peak_active_lanes.load(Ordering::SeqCst),
+                summed_lane_queue_wait,
+                summed_lane_service,
+            },
+        })
+    }
+
+    pub(super) fn revalidate(
+        &self,
+        store: &Store,
+    ) -> Result<MutationReadRevalidation, MutationError> {
+        let mut unchanged = true;
+        let mut checked_keys = 0;
+        let mut first_error = None;
+        for token in &self.tokens {
+            match token.revalidate(store) {
+                Ok(result) => {
+                    unchanged &= result.unchanged;
+                    checked_keys += result.checked_keys;
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(MutationReadRevalidation {
+                unchanged,
+                checked_keys,
+            })
+        }
+    }
+
+    pub(super) fn token_len(&self) -> usize {
+        self.tokens.iter().map(MutationReadToken::len).sum()
+    }
+}
+
+fn validate_governed_coverage(
+    operations: &[&PreparedOperation],
+    governed_buckets: &BTreeSet<Vec<u8>>,
+) -> Result<(), MutationError> {
+    if operations
+        .iter()
+        .any(|operation| !governed_buckets.contains(&operation.identity().encode().to_vec()))
+    {
+        Err(MutationError::InvalidPolicy(
+            "single-node speculative preparation lacks validated governance".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+struct PreparationLaneResult<T> {
+    value: T,
+    queue_wait: std::time::Duration,
+    service: std::time::Duration,
+}
+
+async fn run_preparation_lanes<T, F>(
+    assignments: Vec<Vec<Vec<usize>>>,
+    work: Arc<F>,
+) -> Result<Vec<PreparationLaneResult<T>>, MutationError>
+where
+    T: Send + 'static,
+    F: Fn(Vec<Vec<usize>>) -> Result<T, MutationError> + Send + Sync + 'static,
+{
+    let mut jobs = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let work = Arc::clone(&work);
+        let queued_at = std::time::Instant::now();
+        jobs.push(tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let queue_wait = started.duration_since(queued_at);
+            let value = work(assignment)?;
+            Ok(PreparationLaneResult {
+                value,
+                queue_wait,
+                service: started.elapsed(),
+            })
+        }));
+    }
+    let mut results = Vec::with_capacity(jobs.len());
+    let mut first_error = None;
+    for job in jobs {
+        match job.await {
+            Ok(Ok(result)) => results.push(result),
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    MutationError::Storage(format!("mutation preparation lane failed: {error}"))
+                });
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(results)
+    }
+}
+
+fn mutation_conflict_components(operations: &[&PreparedOperation]) -> Vec<Vec<usize>> {
+    // This graph is the exact conservative boundary for Stage 2's read-only
+    // prefetch. Snapshot-derived predecessor blobs, aliases and definition
+    // transitions must extend/merge these components before a later stage is
+    // allowed to plan mutations concurrently.
+    let mut parents = (0..operations.len()).collect::<Vec<_>>();
+    let mut owners = BTreeMap::<MutationConflictResource, usize>::new();
+    for (index, operation) in operations.iter().enumerate() {
+        for resource in mutation_conflict_resources(operation) {
+            if let Some(previous) = owners.insert(resource, index) {
+                union_components(&mut parents, previous, index);
+            }
+        }
+    }
+    let mut components = BTreeMap::<usize, Vec<usize>>::new();
+    for index in 0..operations.len() {
+        let root = find_component(&mut parents, index);
+        components.entry(root).or_default().push(index);
+    }
+    let mut components = components.into_values().collect::<Vec<_>>();
+    components.sort_by_key(|component| component[0]);
+    components
+}
+
+fn mutation_conflict_resources(operation: &PreparedOperation) -> Vec<MutationConflictResource> {
+    // A full ObjectPath covers the head/current-version/alias registry and any
+    // definition locator staged for that target; Clone contributes its exact
+    // source path too. Receipt and Blob use their real durable key encodings,
+    // with the latter also covering the derived inline-artifact identity.
+    // Validated governance is read-only under policy_gate and intentionally is
+    // not an edge: joining a whole bucket would erase useful parallelism.
+    let mut resources = operation
+        .lock_paths()
+        .into_iter()
+        .map(MutationConflictResource::Object)
+        .collect::<Vec<_>>();
+    if let Some(command_id) = operation.command_id() {
+        resources.push(MutationConflictResource::Receipt(receipt_key(
+            operation.identity(),
+            command_id,
+        )));
+    }
+    if let Some(reference) = operation.payload_reference() {
+        resources.push(MutationConflictResource::Blob(blob_reference_key(
+            reference,
+        )));
+    }
+    resources
+}
+
+fn find_component(parents: &mut [usize], index: usize) -> usize {
+    if parents[index] != index {
+        parents[index] = find_component(parents, parents[index]);
+    }
+    parents[index]
+}
+
+fn union_components(parents: &mut [usize], left: usize, right: usize) {
+    let left = find_component(parents, left);
+    let right = find_component(parents, right);
+    let root = left.min(right);
+    parents[left] = root;
+    parents[right] = root;
+}
+
+fn assign_components_to_lanes(
+    components: &[Vec<usize>],
+    lane_count: usize,
+) -> Vec<Vec<Vec<usize>>> {
+    let mut lanes = vec![Vec::new(); lane_count];
+    let mut loads = vec![0_usize; lane_count];
+    for component in components {
+        let lane = loads
+            .iter()
+            .enumerate()
+            .min_by_key(|(lane, load)| (**load, *lane))
+            .map(|(lane, _)| lane)
+            .expect("non-empty lane set");
+        loads[lane] += component.len();
+        lanes[lane].push(component.clone());
+    }
+    lanes
+}
+
 impl MutationReadToken {
     pub(super) fn len(&self) -> usize {
         self.cells.len()
@@ -562,6 +919,8 @@ fn exact_version_key(head_key: &[u8], version: VersionId) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::StoreOptions;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn store() -> (tempfile::TempDir, Store) {
         let temporary = tempfile::tempdir().unwrap();
@@ -644,8 +1003,155 @@ mod tests {
             selected.get(&key).unwrap().as_ref().unwrap().as_deref(),
             Some(b"before".as_slice())
         );
-        let revalidated = view.token().revalidate(&store).unwrap();
+        let revalidated = view.take_token().revalidate(&store).unwrap();
         assert!(!revalidated.unchanged);
         assert_eq!(revalidated.checked_keys, 1);
+    }
+
+    #[tokio::test]
+    async fn conflicting_component_observations_cannot_be_accepted() {
+        let (_temporary, store) = store().await;
+        let key = b"component-overlap".to_vec();
+        store
+            .db
+            .put_cf(store.cf(CF_METADATA).unwrap(), &key, b"current")
+            .unwrap();
+        let speculation = MutationReadSpeculation {
+            cache: MutationReadCache::default(),
+            tokens: vec![
+                MutationReadToken {
+                    cells: vec![ObservedMutationCell {
+                        cf_name: CF_METADATA,
+                        key: key.clone(),
+                        value: Some(b"current".to_vec()),
+                    }],
+                },
+                MutationReadToken {
+                    cells: vec![ObservedMutationCell {
+                        cf_name: CF_METADATA,
+                        key,
+                        value: Some(b"older".to_vec()),
+                    }],
+                },
+            ],
+            metrics: MutationPreparationMetrics::default(),
+        };
+
+        let result = speculation.revalidate(&store).unwrap();
+        assert!(!result.unchanged);
+        assert_eq!(result.checked_keys, 2);
+    }
+
+    fn publish(path: &str, command: &str, hash: u8) -> PreparedOperation {
+        PreparedOperation::Publish {
+            request: PublishRequest {
+                key: ObjectKey::new("tenant", "bucket", path).unwrap(),
+                blob: BlobRef {
+                    hash: [hash; 32],
+                    length: 10,
+                },
+                content_type: None,
+                mode: PutMode::PutIfAbsent,
+                command_id: Some(command.into()),
+                durability: Durability::Local,
+            },
+            identity: BucketIdentity {
+                tenant_id: TenantId(1),
+                bucket_id: BucketId(2),
+            },
+            fingerprint: [0; 32],
+        }
+    }
+
+    #[test]
+    fn conflict_components_close_transitively_and_keep_independent_order() {
+        let first = publish("a", "shared-command", 1);
+        let second = publish("b", "shared-command", 2);
+        let third = publish("c", "third", 2);
+        let independent = publish("d", "fourth", 4);
+        let operations = [&first, &second, &third, &independent];
+
+        assert_eq!(
+            mutation_conflict_components(&operations),
+            vec![vec![0, 1, 2], vec![3]]
+        );
+        assert_eq!(
+            assign_components_to_lanes(&mutation_conflict_components(&operations), 2),
+            vec![vec![vec![0, 1, 2]], vec![vec![3]]]
+        );
+    }
+
+    #[test]
+    fn clone_source_and_writer_are_co_partitioned() {
+        let writer = publish("source", "writer", 1);
+        let clone = PreparedOperation::Clone {
+            request: CloneRequest {
+                source: ObjectKey::new("tenant", "bucket", "source").unwrap(),
+                source_version: VersionId(7),
+                destination: ObjectKey::new("tenant", "bucket", "destination").unwrap(),
+                blob: BlobRef {
+                    hash: [2; 32],
+                    length: 10,
+                },
+                content_type: None,
+                mode: PutMode::PutIfAbsent,
+                command_id: Some("clone".into()),
+                durability: Durability::Local,
+            },
+            identity: BucketIdentity {
+                tenant_id: TenantId(1),
+                bucket_id: BucketId(2),
+            },
+            fingerprint: [0; 32],
+        };
+
+        assert_eq!(
+            mutation_conflict_components(&[&writer, &clone]),
+            vec![vec![0, 1]]
+        );
+    }
+
+    #[tokio::test]
+    async fn governed_prefetch_fails_closed_without_complete_bucket_coverage() {
+        let (_temporary, store) = store().await;
+        let operation = Arc::new(publish("object", "command", 1));
+        let error = MutationReadSpeculation::load(&store, &[operation], 1, &BTreeSet::new())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, MutationError::InvalidPolicy(_)));
+    }
+
+    #[tokio::test]
+    async fn preparation_lanes_enter_blocking_work_in_parallel_and_return_lane_order() {
+        let barrier = Arc::new(Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let results = run_preparation_lanes(
+            vec![vec![vec![0]], vec![vec![1]]],
+            Arc::new({
+                let barrier = Arc::clone(&barrier);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                move |components: Vec<Vec<usize>>| {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    barrier.wait();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(components[0][0])
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            results
+                .into_iter()
+                .map(|result| result.value)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 }

@@ -465,7 +465,12 @@ impl SingleNodeGroupCommit {
             let operation_count = operations.len();
             let execute_started = std::time::Instant::now();
             let (results, metrics) = store
-                .coordinate_single_node_mutation_group(operations, context, &operation_counts)
+                .coordinate_single_node_mutation_group(
+                    operations,
+                    context,
+                    &operation_counts,
+                    self.config.preparation_lanes(),
+                )
                 .await;
             let execute_duration = execute_started.elapsed();
             let failed_requests = results.iter().filter(|result| result.is_err()).count();
@@ -484,6 +489,25 @@ impl SingleNodeGroupCommit {
                 dwell_seconds = dwell_duration.as_secs_f64(),
                 execute_seconds = execute_duration.as_secs_f64(),
                 prepare_seconds = metrics.prepare.as_secs_f64(),
+                preparation_configured_lanes = metrics.preparation.configured_lanes,
+                preparation_effective_lanes = metrics.preparation.effective_lanes,
+                preparation_peak_active_lanes = metrics.preparation.peak_active_lanes,
+                preparation_lane_jobs = metrics.preparation.lane_jobs,
+                preparation_summed_lane_queue_wait_seconds =
+                    metrics.preparation.summed_lane_queue_wait.as_secs_f64(),
+                preparation_summed_lane_service_seconds =
+                    metrics.preparation.summed_lane_service.as_secs_f64(),
+                preparation_components = metrics.preparation.components,
+                preparation_largest_component_operations =
+                    metrics.preparation.largest_component_operations,
+                preparation_speculative_prefetch_seconds =
+                    metrics.speculative_prefetch.as_secs_f64(),
+                preparation_speculative_revalidation_seconds =
+                    metrics.speculative_revalidation.as_secs_f64(),
+                preparation_speculative_revalidation_keys =
+                    metrics.speculative_revalidation_keys,
+                preparation_speculative_retries = metrics.speculative_retries,
+                preparation_speculative_fallbacks = metrics.speculative_fallbacks,
                 policy_wait_seconds = metrics.policy_wait.as_secs_f64(),
                 path_wait_seconds = metrics.path_wait.as_secs_f64(),
                 commit_wait_seconds = metrics.commit_wait.as_secs_f64(),
@@ -671,13 +695,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ten_compatible_requests_share_one_physical_commit() {
+    async fn ten_compatible_requests_use_two_preparation_lanes_and_one_physical_commit() {
         let temporary = tempfile::tempdir().unwrap();
         let config = SingleNodeGroupCommitConfig::new(
             10,
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
-            DEFAULT_PREPARATION_LANES,
+            2,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
