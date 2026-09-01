@@ -2,7 +2,7 @@
 
 ## Current v6 index boundary
 
-Keldra 0.15 starts on fresh authoritative and derived-index volumes. The
+Keldra 0.16 starts on fresh authoritative and derived-index volumes. The
 partition-owned Typed JSON pipeline, logical catalog, recovery, root-vector
 query cut, retention, and materialization contracts are specified by
 [KELDRA-0020](rfcs/keldra_0020_logical_index_catalog_and_shared_physical_projections.md).

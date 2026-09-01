@@ -10,7 +10,7 @@ source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-three-node-phases.sh"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${KELDRA_IMAGE:-keldra:0.15.0}"
+requested_image="${KELDRA_IMAGE:-keldra:0.16.0}"
 qualification_mode="${KELDRA_QUALIFICATION_MODE:-smoke}"
 case "${qualification_mode}" in
   release|smoke) ;;
@@ -128,9 +128,9 @@ client_version="$(
   docker run --rm --platform "${KELDRA_DOCKER_PLATFORM}" \
     "${image_id}" keldra --version
 )"
-if [[ "${server_version}" != "keldra-server 0.15.0" \
-  || "${client_version}" != "keldra 0.15.0" ]]; then
-  echo "qualification requires the exact Keldra 0.15.0 image" >&2
+if [[ "${server_version}" != "keldra-server 0.16.0" \
+  || "${client_version}" != "keldra 0.16.0" ]]; then
+  echo "qualification requires the exact Keldra 0.16.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2

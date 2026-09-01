@@ -10,5 +10,5 @@ export KELDRA_IMAGE="${KELDRA_IMAGE:-keldra:local}"
 ./scripts/build-image.sh
 docker compose -f crates/keldra/docker-compose.yml up --detach
 
-echo "Keldra 0.15 is starting on ${KELDRA_LISTEN:-0.0.0.0:50051}."
+echo "Keldra 0.16 is starting on ${KELDRA_LISTEN:-0.0.0.0:50051}."
 echo "Use 'docker compose -f crates/keldra/docker-compose.yml logs --follow' to inspect it."

@@ -19,12 +19,12 @@ rendezvous hashing.
 | Authorization | 0.10.0 | Application credentials, short-lived JWTs, protected administration, Zanzibar schemas, tuples, roles, and checks |
 | Atomic programs | 0.10.0 | Explicitly selected, deterministic multi-path state transitions without routing ordinary uploads through a transaction system |
 | Distributed clusters | 0.10.0 | Any-node ingress, peer mTLS, replicated metadata, weighted placement, and 2+1 erasure-coded payload durability |
-| Materialized Typed JSON indices | 0.15.0 | Memory-first partition-owned projection, logical catalog sharing, immutable segment/root publication, and bounded query materialization |
+| Materialized Typed JSON indices | 0.16.0 | Memory-first partition-owned projection, logical catalog sharing, immutable segment/root publication, and bounded query materialization |
 | Rust client | 0.10.0 | Credential exchange, authenticated clients, streaming upload helpers, and the complete generated gRPC API |
 | PersonalDB, public reads, accounting, S3 and Git | 0.10.0 | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
 | Online cluster growth | 0.10.0 | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
 | Shared public listener | 0.10.0 | Native gRPC, S3, Git, administrative APIs and configured HTTP plugins share one authorized public endpoint; peer mTLS remains isolated |
-| Memory-first index pipeline | 0.15.0 | Bounded hot ingress, shared physical recipe routing, partition-local segment/root publication, journal recovery, and CPU/memory-first catch-up |
+| Memory-first index pipeline | 0.16.0 | Bounded hot ingress, shared physical recipe routing, partition-local segment/root publication, journal recovery, and CPU/memory-first catch-up |
 | Dates, zero-copy clones, and protected links | 0.15.0 | ISO 8601 or configured date parsing, independent clones sharing immutable payload bytes, and transparent mutable aliases with deletion fencing |
 | General atomic paths | 0.15.0 | Durable path reservations let authorized ordinary paths participate in bounded atomic programs without requiring `PROGRAM_ONLY` policy |
 | Java client | — | TODO |
@@ -46,7 +46,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.15.0
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.16.0
 export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
@@ -158,7 +158,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add keldra@0.15.0
+cargo add keldra@0.16.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -234,7 +234,7 @@ it, and the target cannot be deleted until every inbound link is removed.
 The complete Rust example is in
 [clients/rust/README.md](clients/rust/README.md#clone-bytes-or-link-a-mutable-name).
 Clone and link require cluster protocol/storage capability `2/2`; complete the
-0.15 activation runbook below before using them.
+0.16 activation runbook below before using them.
 
 ## Create a PersonalDB group
 
@@ -246,7 +246,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add keldra@0.15.0 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.16.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -724,7 +724,7 @@ and performs a rolling restart. Index qualification is a separate SSD-kit
 phase:
 
 ```sh
-KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.15.0 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.16.0 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -743,13 +743,14 @@ Production formation uses the same sequence:
 The public gRPC endpoint may sit behind an ordinary TLS terminator. Peer traffic
 uses mandatory certificates created and rotated by the cluster.
 
-### Start 0.15 on fresh volumes and activate its capabilities
+### Start 0.16 on fresh volumes and activate its capabilities
 
-Keldra 0.15 is a clean storage-format break. Start every 0.15 node with fresh
-authoritative volumes; it does not open, migrate, or reuse a 0.14 data volume.
-Mixed 0.14/0.15 clusters are unsupported. If application data must move from an
-older cluster, keep that cluster separate and import the data through the public
-API as new writes.
+Keldra 0.16 is a clean storage-format and index-architecture break. Start every
+0.16 node with fresh authoritative and derived-index volumes; it does not open,
+migrate, or reuse a volume from an earlier Keldra release. Mixed 0.15/0.16
+clusters are unsupported. If application data must move from an older cluster,
+keep that cluster separate and import the data through the public API as new
+writes.
 
 Inspect cluster capabilities. Activation is safe only when it reports active
 protocol/storage `1/1`, target `2/2`, no blocking ACTIVE node IDs,
@@ -773,8 +774,8 @@ administration commands. The status command prints the exact activation command
 when the cluster is ready.
 
 Before admitting production traffic, smoke clone independence, link
-write-through, target-delete fencing, unlink, and date queries. Never start a
-0.14 binary against a volume initialized or touched by 0.15.
+write-through, target-delete fencing, unlink, and date queries. Never start an
+earlier Keldra binary against a volume initialized or touched by 0.16.
 
 ### Place storage by workload
 
@@ -843,8 +844,9 @@ The architecture contracts live in
 [KELDRA-0010](docs/rfcs/keldra_0010_cluster_distribution.md). The current
 clean-break native-segment index architecture is specified by
 [KELDRA-0014](docs/rfcs/keldra_0014_native_segment_indexes.md). The approved
-clean-break 0.15 payload layout, lifecycle, GC, replication boundary, and WAL
-contract is specified by
+integrated payload layout, lifecycle, GC, replication boundary, and WAL
+contract—introduced in 0.15 and retained within 0.16's fresh-volume
+requirement—is specified by
 [KELDRA-0018](docs/rfcs/keldra_0018_integrated_payload_storage.md).
 
 ## Build and qualify
@@ -873,7 +875,7 @@ CPU, RSS, WAL/store-write evidence under `~/keldra_experiments`. The
 single-node and three-node wrappers qualify non-index storage, authorization,
 and cluster behavior only.
 
-Keldra 0.15 deployments start on fresh authoritative and derived-index volumes.
+Keldra 0.16 deployments start on fresh authoritative and derived-index volumes.
 Current operational boundaries are collected in the [known
 limitations](docs/known-limitations.md).
 

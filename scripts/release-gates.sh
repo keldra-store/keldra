@@ -84,7 +84,7 @@ image_gates() (
   docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
     chown 10001:10001 /smoke/signing-key
   printf 'keldra-0.1-smoke\n' >"${scratch}/payload"
-  printf 'keldra-0.15-linked-update\n' >"${scratch}/replacement"
+  printf 'keldra-0.16-linked-update\n' >"${scratch}/replacement"
   chmod 0444 "${scratch}/payload"
   chmod 0444 "${scratch}/replacement"
   docker run --detach --name "${container}" \
@@ -283,7 +283,7 @@ image_gates() (
       --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
       "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects cloned
   )"
-  if [[ "${canonical_value}" != 'keldra-0.15-linked-update' \
+  if [[ "${canonical_value}" != 'keldra-0.16-linked-update' \
     || "${linked_value}" != "${canonical_value}" \
     || "${clone_value}" != 'keldra-0.1-smoke' ]]; then
     echo "clone independence or link write-through changed" >&2

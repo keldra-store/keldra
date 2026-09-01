@@ -1,6 +1,6 @@
 # Historical Keldra 0.9 index dependency record
 
-> Superseded by the format-v6 memory-first index architecture. Keldra 0.15 no
+> Superseded by the format-v6 memory-first index architecture. Keldra 0.16 no
 > longer depends on `sux`; this file is retained only as the audit record for
 > the removed format-v4 implementation.
 

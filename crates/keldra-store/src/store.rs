@@ -945,9 +945,7 @@ impl Store {
                 .chain(COLUMN_FAMILIES.iter().map(|name| (*name).to_owned()))
                 .collect::<BTreeSet<_>>();
             if actual != expected {
-                anyhow::bail!(
-                    "existing Keldra volume does not use the exact 0.15 integrated payload layout"
-                );
+                anyhow::bail!("existing Keldra volume does not use the exact 0.16 storage layout");
             }
         }
         let metadata_memory = Arc::new(MetadataMemoryResources::new());
