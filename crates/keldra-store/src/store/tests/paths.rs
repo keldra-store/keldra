@@ -13,6 +13,28 @@ fn store_options_default_to_the_existing_root_layout() {
     assert_eq!(options.payload_directory, root.join("blobs"));
     assert_eq!(options.max_total_wal_bytes, 50 * 1024 * 1024 * 1024);
     assert_eq!(options.pending_upload_max_bytes, 16 * 1024 * 1024 * 1024);
+    assert_eq!(options.single_node_group_commit.max_group_requests(), 5);
+    assert_eq!(
+        options.single_node_group_commit.max_group_operations(),
+        5_000
+    );
+    assert_eq!(
+        options.single_node_group_commit.max_group_inline_bytes(),
+        64 * 1024 * 1024
+    );
+    assert_eq!(options.single_node_group_commit.max_queued_requests(), 64);
+    assert_eq!(
+        options.single_node_group_commit.max_queued_operations(),
+        8_000
+    );
+    assert_eq!(
+        options.single_node_group_commit.max_queued_inline_bytes(),
+        128 * 1024 * 1024
+    );
+    assert_eq!(
+        options.single_node_group_commit.max_group_dwell(),
+        std::time::Duration::from_micros(250)
+    );
 }
 
 #[tokio::test]

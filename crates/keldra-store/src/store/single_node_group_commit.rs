@@ -12,13 +12,134 @@ use crate::{
     ObjectMutationContext, ObjectMutationGovernance,
 };
 
-const MAX_GROUP_REQUESTS: usize = 5;
-const MAX_GROUP_OPERATIONS: usize = 5_000;
-const MAX_GROUP_INLINE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_QUEUED_REQUESTS: usize = 64;
-const MAX_QUEUED_OPERATIONS: usize = 8_000;
-const MAX_QUEUED_INLINE_BYTES: usize = 128 * 1024 * 1024;
-const MAX_GROUP_DWELL: Duration = Duration::from_micros(250);
+const DEFAULT_MAX_GROUP_REQUESTS: usize = 5;
+const DEFAULT_MAX_GROUP_OPERATIONS: usize = 5_000;
+const DEFAULT_MAX_GROUP_INLINE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_QUEUED_REQUESTS: usize = 64;
+const DEFAULT_MAX_QUEUED_OPERATIONS: usize = 8_000;
+const DEFAULT_MAX_QUEUED_INLINE_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_MAX_GROUP_DWELL: Duration = Duration::from_micros(250);
+
+/// Validated bounds and dwell time for single-node mutation group commit.
+///
+/// Queue capacities must cover the largest admitted group. Construction also
+/// rejects values that Tokio's semaphores cannot represent, so a successfully
+/// constructed configuration is safe to install directly in a [`Store`](super::Store).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SingleNodeGroupCommitConfig {
+    max_group_requests: usize,
+    max_group_operations: usize,
+    max_group_inline_bytes: usize,
+    max_queued_requests: usize,
+    max_queued_operations: usize,
+    max_queued_inline_bytes: usize,
+    max_group_dwell: Duration,
+}
+
+impl SingleNodeGroupCommitConfig {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        max_group_requests: usize,
+        max_group_operations: usize,
+        max_group_inline_bytes: usize,
+        max_queued_requests: usize,
+        max_queued_operations: usize,
+        max_queued_inline_bytes: usize,
+        max_group_dwell: Duration,
+    ) -> anyhow::Result<Self> {
+        for (name, value) in [
+            ("maximum group requests", max_group_requests),
+            ("maximum group operations", max_group_operations),
+            ("maximum group inline bytes", max_group_inline_bytes),
+            ("maximum queued requests", max_queued_requests),
+            ("maximum queued operations", max_queued_operations),
+            ("maximum queued inline bytes", max_queued_inline_bytes),
+        ] {
+            anyhow::ensure!(value != 0, "{name} must be non-zero");
+        }
+        anyhow::ensure!(
+            !max_group_dwell.is_zero(),
+            "maximum group dwell must be non-zero"
+        );
+        anyhow::ensure!(
+            max_group_requests <= max_queued_requests,
+            "maximum group requests must not exceed maximum queued requests"
+        );
+        anyhow::ensure!(
+            max_group_operations <= max_queued_operations,
+            "maximum group operations must not exceed maximum queued operations"
+        );
+        anyhow::ensure!(
+            max_group_inline_bytes <= max_queued_inline_bytes,
+            "maximum group inline bytes must not exceed maximum queued inline bytes"
+        );
+        anyhow::ensure!(
+            max_queued_requests <= Semaphore::MAX_PERMITS,
+            "maximum queued requests exceeds the runtime semaphore limit"
+        );
+        for (name, value) in [
+            ("maximum queued operations", max_queued_operations),
+            ("maximum queued inline bytes", max_queued_inline_bytes),
+        ] {
+            anyhow::ensure!(
+                value <= Semaphore::MAX_PERMITS && u32::try_from(value).is_ok(),
+                "{name} exceeds the runtime weighted semaphore limit"
+            );
+        }
+        Ok(Self {
+            max_group_requests,
+            max_group_operations,
+            max_group_inline_bytes,
+            max_queued_requests,
+            max_queued_operations,
+            max_queued_inline_bytes,
+            max_group_dwell,
+        })
+    }
+
+    pub fn max_group_requests(&self) -> usize {
+        self.max_group_requests
+    }
+
+    pub fn max_group_operations(&self) -> usize {
+        self.max_group_operations
+    }
+
+    pub fn max_group_inline_bytes(&self) -> usize {
+        self.max_group_inline_bytes
+    }
+
+    pub fn max_queued_requests(&self) -> usize {
+        self.max_queued_requests
+    }
+
+    pub fn max_queued_operations(&self) -> usize {
+        self.max_queued_operations
+    }
+
+    pub fn max_queued_inline_bytes(&self) -> usize {
+        self.max_queued_inline_bytes
+    }
+
+    pub fn max_group_dwell(&self) -> Duration {
+        self.max_group_dwell
+    }
+}
+
+impl Default for SingleNodeGroupCommitConfig {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_GROUP_REQUESTS,
+            DEFAULT_MAX_GROUP_OPERATIONS,
+            DEFAULT_MAX_GROUP_INLINE_BYTES,
+            DEFAULT_MAX_QUEUED_REQUESTS,
+            DEFAULT_MAX_QUEUED_OPERATIONS,
+            DEFAULT_MAX_QUEUED_INLINE_BYTES,
+            DEFAULT_MAX_GROUP_DWELL,
+        )
+        .expect("default single-node group commit configuration is valid")
+    }
+}
 
 pub(super) type SingleNodeOperations = Vec<(
     BatchOperation,
@@ -85,24 +206,24 @@ struct QueueState {
 
 #[derive(Clone)]
 pub(super) struct SingleNodeGroupCommit {
+    config: SingleNodeGroupCommitConfig,
     state: Arc<Mutex<QueueState>>,
     queue_slots: Arc<Semaphore>,
     operation_slots: Arc<Semaphore>,
     inline_byte_slots: Arc<Semaphore>,
 }
 
-impl Default for SingleNodeGroupCommit {
-    fn default() -> Self {
+impl SingleNodeGroupCommit {
+    pub(super) fn new(config: SingleNodeGroupCommitConfig) -> Self {
         Self {
+            queue_slots: Arc::new(Semaphore::new(config.max_queued_requests)),
+            operation_slots: Arc::new(Semaphore::new(config.max_queued_operations)),
+            inline_byte_slots: Arc::new(Semaphore::new(config.max_queued_inline_bytes)),
+            config,
             state: Arc::new(Mutex::new(QueueState::default())),
-            queue_slots: Arc::new(Semaphore::new(MAX_QUEUED_REQUESTS)),
-            operation_slots: Arc::new(Semaphore::new(MAX_QUEUED_OPERATIONS)),
-            inline_byte_slots: Arc::new(Semaphore::new(MAX_QUEUED_INLINE_BYTES)),
         }
     }
-}
 
-impl SingleNodeGroupCommit {
     pub(super) async fn submit(
         &self,
         store: Store,
@@ -118,7 +239,9 @@ impl SingleNodeGroupCommit {
                 | BatchOperation::Delete(_) => 0,
             })
         });
-        if operation_count > MAX_GROUP_OPERATIONS || inline_bytes > MAX_GROUP_INLINE_BYTES {
+        if operation_count > self.config.max_group_operations
+            || inline_bytes > self.config.max_group_inline_bytes
+        {
             return Err(MutationError::InvalidObjectMutation(
                 "single-node commit request exceeds its bounded group admission".into(),
             ));
@@ -177,7 +300,7 @@ impl SingleNodeGroupCommit {
     async fn run(self, store: Store) {
         loop {
             let dwell_started = std::time::Instant::now();
-            tokio::time::sleep(MAX_GROUP_DWELL).await;
+            tokio::time::sleep(self.config.max_group_dwell).await;
             let dwell_duration = dwell_started.elapsed();
             let (requests, queued_requests, stop_reason) = {
                 let mut state = self.state.lock().await;
@@ -191,7 +314,7 @@ impl SingleNodeGroupCommit {
                 let context = group[0].context;
                 let mut governance = group[0].consistent_governance();
                 let mut stop_reason = "max_requests";
-                while group.len() < MAX_GROUP_REQUESTS {
+                while group.len() < self.config.max_group_requests {
                     let Some(candidate) = state.requests.front() else {
                         stop_reason = "queue_empty";
                         break;
@@ -218,11 +341,15 @@ impl SingleNodeGroupCommit {
                         stop_reason = "governance";
                         break;
                     }
-                    if operations.saturating_add(candidate_operations) > MAX_GROUP_OPERATIONS {
+                    if operations.saturating_add(candidate_operations)
+                        > self.config.max_group_operations
+                    {
                         stop_reason = "operations";
                         break;
                     }
-                    if inline_bytes.saturating_add(candidate_bytes) > MAX_GROUP_INLINE_BYTES {
+                    if inline_bytes.saturating_add(candidate_bytes)
+                        > self.config.max_group_inline_bytes
+                    {
                         stop_reason = "inline_bytes";
                         break;
                     }
@@ -421,14 +548,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn five_compatible_requests_share_one_physical_commit() {
+    async fn ten_compatible_requests_share_one_physical_commit() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
-            .unwrap();
+        let config = SingleNodeGroupCommitConfig::new(
+            10,
+            DEFAULT_MAX_GROUP_OPERATIONS,
+            DEFAULT_MAX_GROUP_INLINE_BYTES,
+            DEFAULT_MAX_QUEUED_REQUESTS,
+            DEFAULT_MAX_QUEUED_OPERATIONS,
+            DEFAULT_MAX_QUEUED_INLINE_BYTES,
+            DEFAULT_MAX_GROUP_DWELL,
+        )
+        .unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
+        )
+        .await
+        .unwrap();
         let governance = governance(&store);
         let before = store.db.latest_sequence_number();
-        let (a, b, c, d, e) = tokio::join!(
+        let (a, b, c, d, e, f, g, h, i, j) = tokio::join!(
             store.coordinate_single_node_mutation_batch(
                 request("objects/a", "a", governance.clone()),
                 context(1),
@@ -446,12 +585,32 @@ mod tests {
                 context(1),
             ),
             store.coordinate_single_node_mutation_batch(
-                request("objects/e", "e", governance),
+                request("objects/e", "e", governance.clone()),
+                context(1),
+            ),
+            store.coordinate_single_node_mutation_batch(
+                request("objects/f", "f", governance.clone()),
+                context(1),
+            ),
+            store.coordinate_single_node_mutation_batch(
+                request("objects/g", "g", governance.clone()),
+                context(1),
+            ),
+            store.coordinate_single_node_mutation_batch(
+                request("objects/h", "h", governance.clone()),
+                context(1),
+            ),
+            store.coordinate_single_node_mutation_batch(
+                request("objects/i", "i", governance.clone()),
+                context(1),
+            ),
+            store.coordinate_single_node_mutation_batch(
+                request("objects/j", "j", governance),
                 context(1),
             ),
         );
 
-        for result in [a, b, c, d, e] {
+        for result in [a, b, c, d, e, f, g, h, i, j] {
             assert!(matches!(result.as_deref(), Ok([Ok(_)])));
         }
         assert_eq!(physical_commits_since(&store, before), 1);
@@ -460,6 +619,53 @@ mod tests {
             store.reference_delta_cursor(status.source_id).unwrap(),
             status.tail
         );
+    }
+
+    #[test]
+    fn group_commit_config_rejects_limits_not_covered_by_the_queue() {
+        let error = SingleNodeGroupCommitConfig::new(
+            65,
+            DEFAULT_MAX_GROUP_OPERATIONS,
+            DEFAULT_MAX_GROUP_INLINE_BYTES,
+            64,
+            DEFAULT_MAX_QUEUED_OPERATIONS,
+            DEFAULT_MAX_QUEUED_INLINE_BYTES,
+            DEFAULT_MAX_GROUP_DWELL,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("maximum group requests must not exceed maximum queued requests")
+        );
+    }
+
+    #[test]
+    fn group_commit_config_rejects_zero_limits_and_dwell() {
+        let zero_requests = SingleNodeGroupCommitConfig::new(
+            0,
+            DEFAULT_MAX_GROUP_OPERATIONS,
+            DEFAULT_MAX_GROUP_INLINE_BYTES,
+            DEFAULT_MAX_QUEUED_REQUESTS,
+            DEFAULT_MAX_QUEUED_OPERATIONS,
+            DEFAULT_MAX_QUEUED_INLINE_BYTES,
+            DEFAULT_MAX_GROUP_DWELL,
+        )
+        .unwrap_err();
+        assert!(zero_requests.to_string().contains("must be non-zero"));
+
+        let zero_dwell = SingleNodeGroupCommitConfig::new(
+            DEFAULT_MAX_GROUP_REQUESTS,
+            DEFAULT_MAX_GROUP_OPERATIONS,
+            DEFAULT_MAX_GROUP_INLINE_BYTES,
+            DEFAULT_MAX_QUEUED_REQUESTS,
+            DEFAULT_MAX_QUEUED_OPERATIONS,
+            DEFAULT_MAX_QUEUED_INLINE_BYTES,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(zero_dwell.to_string().contains("dwell must be non-zero"));
     }
 
     #[tokio::test]

@@ -355,6 +355,7 @@ pub struct StoreOptions {
     pub sync_writes: bool,
     pub watch_retention: WatchRetention,
     pub mutation_receipt_retention: MutationReceiptRetention,
+    pub single_node_group_commit: SingleNodeGroupCommitConfig,
     /// Blob inactivity grace. The production server requires this to cover
     /// its fixed 24-hour atomic-replay window; short values are only useful to
     /// embedded callers such as focused garbage-collection tests.
@@ -1019,7 +1020,9 @@ impl Store {
             ordinary_locks: LocalLockManager::default(),
             program_locks: LocalLockManager::default(),
             commit_lock: Arc::new(tokio::sync::Mutex::new(())),
-            single_node_group_commit: single_node_group_commit::SingleNodeGroupCommit::default(),
+            single_node_group_commit: single_node_group_commit::SingleNodeGroupCommit::new(
+                options.single_node_group_commit.clone(),
+            ),
             policy_gate: Arc::new(tokio::sync::RwLock::new(())),
             authz_write_lock: Arc::new(std::sync::Mutex::new(())),
             bucket_options_lock: Arc::new(std::sync::Mutex::new(())),
@@ -1465,6 +1468,7 @@ mod mutations;
 mod options;
 mod single_node_group_commit;
 use mutation_fingerprint::*;
+pub use single_node_group_commit::SingleNodeGroupCommitConfig;
 mod object_alias_registry;
 mod object_mutation_codec;
 mod object_mutation_replica_batch;

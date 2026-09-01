@@ -153,8 +153,8 @@ pub use store::{
     ReferenceProofCursor, ReferenceProofExportError, ReferenceProofPage, ReferenceProofPruneError,
     ReferenceProofPruneResult, RetainedHeadState, RetainedObjectCursor, RetainedObjectSnapshot,
     RetainedObjectSnapshotFrame, RetainedObjectSnapshotPage, RetainedObjectSnapshotScan,
-    RetainedVersionCursor, ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError, Store,
-    StoreOptions,
+    RetainedVersionCursor, ShardIdentity, ShardReader, ShardSealOutcome, ShardStoreError,
+    SingleNodeGroupCommitConfig, Store, StoreOptions,
 };
 pub use watch::{
     AccountingHeadTransition, AggregateChanged, AggregateKind, AtomicBatchMutation,
