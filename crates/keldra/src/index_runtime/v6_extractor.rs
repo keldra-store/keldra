@@ -101,7 +101,8 @@ impl V6ProjectionExtractor {
         let pointers = Arc::new(pointers.into_iter().collect::<Vec<_>>());
         let maximum = self.maximum_projection_bytes;
         let queued_at = Instant::now();
-        let (selected, cpu, wait) = self
+        let submit_started = Instant::now();
+        let submitted = self
             .cpu
             .submit(move || {
                 let started = Instant::now();
@@ -109,7 +110,13 @@ impl V6ProjectionExtractor {
                 let selected = project_scalar_pointers(&mut payload, &pointers, maximum)?;
                 Ok::<_, keldra_index::IndexError>((selected, started.elapsed(), wait))
             })
-            .await
+            .await;
+        let submit_wall = submit_started.elapsed();
+        super::v6_telemetry::V6PipelineTelemetry::add(
+            &super::v6_telemetry::global().stage_submit_wall_nanos,
+            submit_wall.as_nanos().min(u128::from(u64::MAX)) as u64,
+        );
+        let (selected, cpu, wait) = submitted
             .map_err(|error| Status::internal(error.to_string()))?
             .map_err(index_status)?;
         let telemetry = super::v6_telemetry::global();
