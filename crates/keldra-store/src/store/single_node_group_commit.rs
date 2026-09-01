@@ -146,8 +146,26 @@ pub(super) type SingleNodeOperations = Vec<(
     ObjectMutationGovernance,
     Option<DefinitionMutationIntent>,
 )>;
-pub(super) type SingleNodeOutcomes =
-    Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError>;
+
+/// States whether the one-node coordinator has already attempted settlement
+/// for every newly committed source-journal position in this physical group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum SourceJournalSettlement {
+    CompletedByCoordinator,
+    RequiredAfterQuorum,
+}
+
+/// Independently receipted results from one logical one-node request, together
+/// with the settlement responsibility required of the distribution layer.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct SingleNodeMutationBatch {
+    pub outcomes: Vec<Result<CoordinatedObjectMutation, MutationError>>,
+    pub source_journal_settlement: SourceJournalSettlement,
+}
+
+pub(super) type SingleNodeOutcomes = Result<SingleNodeMutationBatch, MutationError>;
 
 pub(super) struct SingleNodeCommitRequest {
     pub(super) operations: SingleNodeOperations,
@@ -211,6 +229,10 @@ pub(super) struct SingleNodeGroupCommit {
     queue_slots: Arc<Semaphore>,
     operation_slots: Arc<Semaphore>,
     inline_byte_slots: Arc<Semaphore>,
+    #[cfg(test)]
+    settlement_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    fail_next_settlement: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SingleNodeGroupCommit {
@@ -221,7 +243,50 @@ impl SingleNodeGroupCommit {
             inline_byte_slots: Arc::new(Semaphore::new(config.max_queued_inline_bytes)),
             config,
             state: Arc::new(Mutex::new(QueueState::default())),
+            #[cfg(test)]
+            settlement_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_next_settlement: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_settlement_attempt(&self) {
+        self.settlement_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn settlement_attempts(&self) -> usize {
+        self.settlement_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    async fn wait_until_idle(&self) {
+        loop {
+            if !self.state.lock().await.worker_running {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_next_settlement(&self) {
+        self.fail_next_settlement
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_injected_settlement_failure(&self) -> bool {
+        self.fail_next_settlement
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn take_injected_settlement_failure(&self) -> bool {
+        false
     }
 
     pub(super) async fn submit(
@@ -548,6 +613,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn five_requests_share_one_commit_and_one_group_settlement_attempt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let governance = governance(&store);
+        let before = store.db.latest_sequence_number();
+        let settlements_before = store.single_node_group_commit.settlement_attempts();
+        let (a, b, c, d, e) = tokio::join!(
+            store.coordinate_single_node_mutation_batch(
+                request("objects/five-a", "five-a", governance.clone()),
+                context(1),
+            ),
+            store.coordinate_single_node_mutation_batch(
+                request("objects/five-b", "five-b", governance.clone()),
+                context(1),
+            ),
+            store.coordinate_single_node_mutation_batch(
+                request("objects/five-c", "five-c", governance.clone()),
+                context(1),
+            ),
+            store.coordinate_single_node_mutation_batch(
+                request("objects/five-d", "five-d", governance.clone()),
+                context(1),
+            ),
+            store.coordinate_single_node_mutation_batch(
+                request("objects/five-e", "five-e", governance),
+                context(1),
+            ),
+        );
+
+        for result in [a, b, c, d, e] {
+            assert!(matches!(result.as_deref(), Ok([Ok(_)])));
+        }
+        assert_eq!(physical_commits_since(&store, before), 1);
+        assert_eq!(
+            store.single_node_group_commit.settlement_attempts() - settlements_before,
+            1
+        );
+        let status = store.local_watch_status().unwrap();
+        assert_eq!(status.settled_through, status.tail);
+    }
+
+    #[tokio::test]
     async fn ten_compatible_requests_share_one_physical_commit() {
         let temporary = tempfile::tempdir().unwrap();
         let config = SingleNodeGroupCommitConfig::new(
@@ -567,6 +676,7 @@ mod tests {
         .unwrap();
         let governance = governance(&store);
         let before = store.db.latest_sequence_number();
+        let settlements_before = store.single_node_group_commit.settlement_attempts();
         let (a, b, c, d, e, f, g, h, i, j) = tokio::join!(
             store.coordinate_single_node_mutation_batch(
                 request("objects/a", "a", governance.clone()),
@@ -614,6 +724,10 @@ mod tests {
             assert!(matches!(result.as_deref(), Ok([Ok(_)])));
         }
         assert_eq!(physical_commits_since(&store, before), 1);
+        assert_eq!(
+            store.single_node_group_commit.settlement_attempts() - settlements_before,
+            1
+        );
         let status = store.local_watch_status().unwrap();
         assert_eq!(
             store.reference_delta_cursor(status.source_id).unwrap(),
@@ -683,10 +797,25 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(deferred.as_slice(), [Ok(_)]));
+        let deferred_mutation = deferred[0]
+            .as_ref()
+            .unwrap()
+            .mutation
+            .as_ref()
+            .expect("new deferred operation must carry its mutation");
+        store
+            .settle_source_journal_positions_if_contiguous(
+                deferred_mutation.stamp.source_id,
+                &[deferred_mutation.stamp.source_journal_position],
+            )
+            .await
+            .unwrap();
         let before = store.local_watch_status().unwrap();
         let cursor = store.reference_delta_cursor(before.source_id).unwrap();
         assert!(cursor < before.tail);
+        assert_eq!(before.settled_through, before.tail);
         let before_sequence = store.db.latest_sequence_number();
+        let settlements_before = store.single_node_group_commit.settlement_attempts();
 
         let (first, second) = tokio::join!(
             store.coordinate_single_node_mutation_batch(
@@ -708,7 +837,11 @@ mod tests {
             matches!(second.as_deref(), Ok([Ok(_)])),
             "second={second:?}"
         );
-        assert_eq!(physical_commits_since(&store, before_sequence), 1);
+        assert_eq!(physical_commits_since(&store, before_sequence), 2);
+        assert_eq!(
+            store.single_node_group_commit.settlement_attempts() - settlements_before,
+            1
+        );
         for (path, expected) in [
             ("objects/first-after-gap", b"first-after-gap".as_slice()),
             ("objects/second-after-gap", b"second-after-gap".as_slice()),
@@ -735,10 +868,86 @@ mod tests {
         }
         let after = store.local_watch_status().unwrap();
         assert!(after.tail > before.tail);
+        assert_eq!(after.settled_through, after.tail);
         assert_eq!(
             store.reference_delta_cursor(after.source_id).unwrap(),
             cursor
         );
+        store.single_node_group_commit.wait_until_idle().await;
+        drop(store);
+        let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let reopened_status = reopened.local_watch_status().unwrap();
+        assert_eq!(reopened_status.source_id, after.source_id);
+        assert_eq!(reopened_status.tail, after.tail);
+        assert_eq!(reopened_status.settled_through, after.settled_through);
+    }
+
+    #[tokio::test]
+    async fn settlement_failure_preserves_receipt_and_requires_quorum_fallback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let governance = governance(&store);
+        let deferred = store
+            .coordinate_distributed_mutation_batch(
+                request(
+                    "objects/unsettled-prefix",
+                    "unsettled-prefix",
+                    governance.clone(),
+                ),
+                context(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(deferred.as_slice(), [Ok(_)]));
+        let before = store.local_watch_status().unwrap();
+        assert!(before.settled_through < before.tail);
+
+        let operation = request("objects/settlement-retry", "settlement-retry", governance);
+        store.single_node_group_commit.fail_next_settlement();
+        let committed = store
+            .coordinate_single_node_mutation_batch_with_settlement(operation.clone(), context(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.source_journal_settlement,
+            SourceJournalSettlement::RequiredAfterQuorum
+        );
+        let receipt = committed.outcomes[0].as_ref().unwrap();
+        assert!(!receipt.receipt.replayed);
+        let committed_tail = store.local_watch_status().unwrap().tail;
+        assert!(committed_tail > before.tail);
+
+        let replay = store
+            .coordinate_single_node_mutation_batch_with_settlement(operation, context(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.source_journal_settlement,
+            SourceJournalSettlement::CompletedByCoordinator
+        );
+        assert!(replay.outcomes[0].as_ref().unwrap().receipt.replayed);
+        let unsettled = store.local_watch_status().unwrap();
+        assert_eq!(unsettled.settled_through, before.settled_through);
+
+        let positions = (unsettled.settled_through + 1..=unsettled.tail).collect::<Vec<_>>();
+        store
+            .settle_source_journal_positions_if_contiguous(unsettled.source_id, &positions)
+            .await
+            .unwrap();
+        let recovered = store.local_watch_status().unwrap();
+        assert_eq!(recovered.settled_through, recovered.tail);
+        drop(store);
+
+        let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let reopened_status = reopened.local_watch_status().unwrap();
+        assert_eq!(reopened_status.tail, recovered.tail);
+        assert_eq!(reopened_status.settled_through, recovered.tail);
     }
 
     #[tokio::test]
@@ -748,6 +957,7 @@ mod tests {
             .await
             .unwrap();
         let governance = governance(&store);
+        let settlements_before = store.single_node_group_commit.settlement_attempts();
         let (first, second) = tokio::join!(
             store.coordinate_single_node_mutation_batch(
                 request("objects/same", "first", governance.clone()),
@@ -773,6 +983,12 @@ mod tests {
                 .bytes,
             b"first"
         );
+        assert_eq!(
+            store.single_node_group_commit.settlement_attempts() - settlements_before,
+            1
+        );
+        let status = store.local_watch_status().unwrap();
+        assert_eq!(status.settled_through, status.tail);
     }
 
     #[tokio::test]
@@ -838,6 +1054,7 @@ mod tests {
             .await
             .unwrap();
         let queue = store.single_node_group_commit.clone();
+        let settlements_before = queue.settlement_attempts();
         let operations = request("objects/detached", "detached", governance(&store));
         let request_permit = queue.queue_slots.clone().acquire_owned().await.unwrap();
         let operation_permit = queue
@@ -869,7 +1086,7 @@ mod tests {
             state.worker_running = true;
         }
 
-        queue.run(store.clone()).await;
+        queue.clone().run(store.clone()).await;
 
         assert!(
             store
@@ -878,5 +1095,8 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert_eq!(queue.settlement_attempts() - settlements_before, 1);
+        let status = store.local_watch_status().unwrap();
+        assert_eq!(status.settled_through, status.tail);
     }
 }

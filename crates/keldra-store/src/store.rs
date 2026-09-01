@@ -1474,7 +1474,9 @@ mod mutations;
 mod options;
 mod single_node_group_commit;
 use mutation_fingerprint::*;
-pub use single_node_group_commit::SingleNodeGroupCommitConfig;
+pub use single_node_group_commit::{
+    SingleNodeGroupCommitConfig, SingleNodeMutationBatch, SourceJournalSettlement,
+};
 mod object_alias_registry;
 mod object_mutation_codec;
 mod object_mutation_replica_batch;

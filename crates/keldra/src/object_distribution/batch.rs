@@ -5,7 +5,7 @@ use std::future::Future;
 
 use keldra_store::{
     BatchOperation, CoordinatedObjectMutation, DefinitionMutationIntent, Durability,
-    MutationReceipt, ObjectMutationGovernance,
+    MutationReceipt, ObjectMutationGovernance, SourceJournalSettlement,
 };
 use tonic::Status;
 
@@ -342,23 +342,32 @@ impl ObjectDistribution {
                 .collect();
             let completed = complete_metadata(async move {
                 let _permit = permit;
-                let coordinated = if single_node {
-                    completion
+                let (coordinated, settlement) = if single_node {
+                    let batch = completion
                         .store
-                        .coordinate_single_node_mutation_batch(store_operations, context)
+                        .coordinate_single_node_mutation_batch_with_settlement(
+                            store_operations,
+                            context,
+                        )
                         .await
+                        .map_err(mutation_status)?;
+                    (batch.outcomes, batch.source_journal_settlement)
                 } else {
-                    completion
-                        .store
-                        .coordinate_distributed_mutation_batch(store_operations, context)
-                        .await
-                }
-                .map_err(mutation_status)?;
+                    (
+                        completion
+                            .store
+                            .coordinate_distributed_mutation_batch(store_operations, context)
+                            .await
+                            .map_err(mutation_status)?,
+                        SourceJournalSettlement::RequiredAfterQuorum,
+                    )
+                };
                 let durable = completion
                     .replicate_mutation_group_batch(
                         &completion_placement,
                         &completion_group,
                         &coordinated,
+                        settlement,
                     )
                     .await;
                 Ok::<_, Status>((coordinated, durable))
@@ -620,6 +629,7 @@ impl ObjectDistribution {
         placement: &ClusterPlacement,
         group: &MutableRecordReplicaGroup,
         coordinated: &[Result<CoordinatedObjectMutation, keldra_store::MutationError>],
+        settlement: SourceJournalSettlement,
     ) -> Vec<Result<(), Status>> {
         let mut results = vec![Ok(()); coordinated.len()];
         for (index, outcome) in coordinated.iter().enumerate() {
@@ -719,7 +729,8 @@ impl ObjectDistribution {
                 )));
             }
         }
-        if let Some((source, _)) = quorum_positions.first().copied()
+        if matches!(settlement, SourceJournalSettlement::RequiredAfterQuorum)
+            && let Some((source, _)) = quorum_positions.first().copied()
             && let Err(error) = self
                 .store
                 .settle_source_journal_positions_if_contiguous(
