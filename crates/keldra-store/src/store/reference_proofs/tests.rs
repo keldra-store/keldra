@@ -539,12 +539,28 @@ async fn malformed_mismatched_and_changed_proofs_fail_closed() {
     };
     delta_change.reference_deltas[0].change = -1;
     for mismatch in [changed, wrong_path, wrong_version, wrong_deltas] {
+        assert!(
+            encode_reference_proof(&mismatch).is_err(),
+            "the durable encoder must reject contradictory typed evidence"
+        );
+    }
+
+    let valid = encode_reference_proof(&proof).unwrap();
+    let mut bad_magic = valid.clone();
+    bad_magic[0] ^= 1;
+    let mut bad_kind = valid.clone();
+    bad_kind[6] = 99;
+    let mut bad_reserved = valid.clone();
+    bad_reserved[7] = 1;
+    let mut truncated = valid;
+    truncated.pop();
+    for malformed in [bad_magic, bad_kind, bad_reserved, truncated] {
         replica
             .db
             .put_cf(
                 replica.cf(CF_LOCAL_INVALIDATIONS).unwrap(),
                 reference_proof_key(proof.source_id, proof.offset()),
-                encode_reference_proof(&mismatch).unwrap(),
+                malformed,
             )
             .unwrap();
         assert!(
@@ -598,6 +614,56 @@ async fn coordinated_proof(store: &Store, path: &str, command: &str) -> Referenc
         )
         .unwrap()
         .unwrap()
+}
+
+#[tokio::test]
+async fn object_proof_value_has_a_versioned_binary_envelope_and_round_trips() {
+    let (_temporary, source, _replica) = stores().await;
+    let proof = coordinated_proof(&source, "codec/object", "codec-object").await;
+    let encoded = encode_reference_proof(&proof).unwrap();
+
+    assert_eq!(&encoded[..4], REFERENCE_PROOF_MAGIC);
+    assert_eq!(
+        u16::from_be_bytes(encoded[4..6].try_into().unwrap()),
+        REFERENCE_PROOF_VALUE_FORMAT
+    );
+    assert_eq!(encoded[6], OBJECT_MUTATION_PROOF);
+    assert_eq!(encoded[7], 0);
+    assert_eq!(
+        usize::try_from(u32::from_be_bytes(encoded[8..12].try_into().unwrap())).unwrap(),
+        encoded.len() - REFERENCE_PROOF_HEADER_BYTES
+    );
+    assert_eq!(&encoded[REFERENCE_PROOF_HEADER_BYTES..][..4], b"KOMU");
+    assert_eq!(decode_reference_proof(&encoded).unwrap(), proof);
+
+    let legacy_json = serde_json::to_vec(&proof).unwrap();
+    assert!(encoded.len() < legacy_json.len());
+    assert!(decode_reference_proof(&legacy_json).is_err());
+}
+
+#[tokio::test]
+async fn malformed_proof_envelopes_fail_closed() {
+    let (_temporary, source, _replica) = stores().await;
+    let proof = coordinated_proof(&source, "codec/reject", "codec-reject").await;
+    let encoded = encode_reference_proof(&proof).unwrap();
+
+    let mutations: [fn(&mut Vec<u8>); 5] = [
+        |bytes| bytes[0] ^= 1,
+        |bytes| bytes[5] = bytes[5].wrapping_add(1),
+        |bytes| bytes[6] = 99,
+        |bytes| bytes[7] = 1,
+        |bytes| bytes[11] = bytes[11].wrapping_add(1),
+    ];
+    for mutation in mutations {
+        let mut corrupt = encoded.clone();
+        mutation(&mut corrupt);
+        assert!(decode_reference_proof(&corrupt).is_err());
+    }
+
+    let mut truncated = encoded.clone();
+    truncated.pop();
+    assert!(decode_reference_proof(&truncated).is_err());
+    assert!(decode_reference_proof(&[]).is_err());
 }
 
 #[tokio::test]

@@ -50,7 +50,7 @@ impl Store {
             let retained_receipt = match pending_receipts.get(&primary_receipt_key) {
                 Some(receipt) => Some(receipt.clone()),
                 None if pruned.contains(&primary_receipt_key) => None,
-                None => self.read_json::<StoredReceipt>(CF_RECEIPTS, &primary_receipt_key)?,
+                None => self.read_stored_receipt(&primary_receipt_key)?,
             }
             .filter(|receipt| receipt.expires_at_unix_millis > now);
             let retained_identical_receipt = if let Some(existing) = retained_receipt.as_ref() {

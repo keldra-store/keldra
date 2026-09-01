@@ -286,6 +286,8 @@ impl SingleNodeGroupCommit {
                 settle_seconds = metrics.settle.as_secs_f64(),
                 commit_hold_seconds = metrics.commit_hold.as_secs_f64(),
                 store_seconds = metrics.total.as_secs_f64(),
+                write_batch_entries = metrics.write_batch_entries,
+                write_batch_bytes = metrics.write_batch_bytes,
                 total_seconds = dwell_duration.saturating_add(execute_duration).as_secs_f64(),
                 queued_requests,
                 stop_reason,

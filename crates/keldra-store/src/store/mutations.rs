@@ -6,6 +6,7 @@ use super::mutation_helpers::{
 };
 use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::{DistributedEvaluationContext, EvaluatedOperation};
+use super::receipt_codec::{decode_stored_receipt, encode_stored_receipt};
 use super::*;
 use crate::model::{
     CoordinatedObjectMutation, MUTATION_STAMP_FORMAT, MutationStamp, OBJECT_MUTATION_FORMAT,
@@ -706,7 +707,7 @@ impl Store {
         let now = now_unix_millis()?;
 
         let retained_identical_receipt = if let Some(existing) =
-            self.read_json::<StoredReceipt>(CF_RECEIPTS, &primary_receipt_key)?
+            self.read_stored_receipt(&primary_receipt_key)?
             && existing.expires_at_unix_millis > now
         {
             if existing.fingerprint != mutation.input_fingerprint
@@ -854,9 +855,7 @@ impl Store {
         let pruned = self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
         if !retained_identical_receipt
             && !pruned.contains(&primary_receipt_key)
-            && self
-                .read_json::<StoredReceipt>(CF_RECEIPTS, &primary_receipt_key)?
-                .is_some()
+            && self.read_stored_receipt(&primary_receipt_key)?.is_some()
         {
             return Err(MutationError::ObjectMutationConflict);
         }
@@ -1277,8 +1276,7 @@ impl Store {
                         "mutation receipt expiry index references a missing receipt".into(),
                     )
                 })?;
-            let receipt =
-                serde_json::from_slice::<StoredReceipt>(&encoded).map_err(storage_error)?;
+            let receipt = decode_stored_receipt(&encoded)?;
             if receipt.expires_at_unix_millis != expires_at {
                 return Err(MutationError::Storage(
                     "mutation receipt expiry index disagrees with its receipt".into(),
@@ -1371,7 +1369,7 @@ impl Store {
         status: &mut MutationReceiptStatus,
         pending_receipts: &mut BTreeMap<Vec<u8>, StoredReceipt>,
     ) -> Result<(), MutationError> {
-        let encoded = serde_json::to_vec(&stored).map_err(storage_error)?;
+        let encoded = encode_stored_receipt(&stored)?;
         let expiry_key = receipt_expiry_key(stored.expires_at_unix_millis, &primary_key)?;
         let logical_bytes =
             mutation_receipt_logical_bytes(primary_key.len(), encoded.len(), expiry_key.len());
@@ -1450,7 +1448,7 @@ impl Store {
                 None if pruned_receipts.contains(receipt_key) => None,
                 None => match read_cache.receipt(receipt_key) {
                     Some(cached) => cached?,
-                    None => self.read_json(CF_RECEIPTS, receipt_key)?,
+                    None => self.read_stored_receipt(receipt_key)?,
                 },
             };
             if let Some(existing) = existing {

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::object_alias_registry::{applied_key as alias_applied_key, decode_registry};
+use super::receipt_codec::decode_stored_receipt;
 use super::{
     CF_DEFINITION_STATE, CF_HEADS, CF_METADATA, CF_OBJECT_ALIAS_REGISTRIES, CF_RECEIPTS,
     CF_VERSIONS, RECEIPT_RECORD_PREFIX, STORAGE_KEY_FORMAT_VERSION, StoredReceipt,
@@ -497,7 +498,7 @@ impl Store {
             }) {
                 continue;
             }
-            let stored: StoredReceipt = serde_json::from_slice(&encoded).map_err(object_storage)?;
+            let stored = decode_stored_receipt(&encoded).map_err(object_storage)?;
             if stored.expires_at_unix_millis <= now {
                 continue;
             }
@@ -717,7 +718,7 @@ impl Store {
         let primary_key = receipt_key(identity, &mutation.command_id);
         let stored = stored_receipt(mutation);
         if let Some(existing) = self
-            .read_json::<StoredReceipt>(CF_RECEIPTS, &primary_key)
+            .read_stored_receipt(&primary_key)
             .map_err(object_storage)?
         {
             if existing.expires_at_unix_millis <= now {

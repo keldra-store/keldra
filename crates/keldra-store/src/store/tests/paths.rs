@@ -112,6 +112,32 @@ async fn existing_store_without_the_integrated_format_marker_is_rejected() {
 }
 
 #[tokio::test]
+async fn existing_store_without_the_durable_mutation_record_marker_is_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let options = StoreOptions::new(temporary.path(), 1);
+    let store = Store::open(options.clone()).await.unwrap();
+    store
+        .db
+        .delete_cf(
+            store.cf(CF_METADATA).unwrap(),
+            DURABLE_MUTATION_RECORD_FORMAT_KEY,
+        )
+        .unwrap();
+    drop(store);
+
+    let error = Store::open(options)
+        .await
+        .err()
+        .expect("missing durable mutation record marker must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("has no durable mutation record format marker")
+    );
+}
+
+#[tokio::test]
 async fn pre_integrated_column_family_layout_is_rejected_without_migration() {
     let temporary = tempfile::tempdir().unwrap();
     let metadata = temporary.path().join("metadata");

@@ -6,6 +6,7 @@
 //! `WriteBatch`.
 
 use super::object_alias_registry::decode_registry;
+use super::receipt_codec::decode_stored_receipt;
 use super::*;
 use crate::ObjectAliasRegistry;
 
@@ -118,8 +119,19 @@ impl MutationReadCache {
             })
             .collect();
 
-        let (receipts, elapsed) =
-            multi_get_json::<StoredReceipt>(store, CF_RECEIPTS, &receipt_keys)?;
+        let started = std::time::Instant::now();
+        let receipts = multi_get_raw(store, CF_RECEIPTS, &receipt_keys)?
+            .into_iter()
+            .map(|(key, cached)| {
+                let decoded = cached.and_then(|value| {
+                    value
+                        .map(|encoded| decode_stored_receipt(&encoded))
+                        .transpose()
+                });
+                (key, decoded)
+            })
+            .collect();
+        let elapsed = started.elapsed().as_secs_f64();
         metrics.receipt_keys = receipt_keys.len() as u64;
         metrics.receipt_seconds = elapsed;
 

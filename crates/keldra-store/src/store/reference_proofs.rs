@@ -1,10 +1,120 @@
 use super::*;
 use crate::model::MAX_OBJECT_MUTATION_REFERENCE_DELTAS;
 use crate::watch::{
-    REFERENCE_PROOF_KEY_BYTES, ReferenceProof, ReferenceProofMutation, decode_reference_proof,
-    encode_reference_proof, reference_proof_key,
+    REFERENCE_PROOF_KEY_BYTES, ReferenceProof, ReferenceProofMutation, reference_proof_key,
 };
 use crate::{ObjectMutation, RetainedVersionDeleteMutation};
+
+const REFERENCE_PROOF_MAGIC: &[u8; 4] = b"KDRP";
+const REFERENCE_PROOF_VALUE_FORMAT: u16 = 1;
+const REFERENCE_PROOF_HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 4;
+const MAX_REFERENCE_PROOF_VALUE_BYTES: usize = 16 * 1024 * 1024;
+const OBJECT_MUTATION_PROOF: u8 = 1;
+const RETAINED_VERSION_DELETE_PROOF: u8 = 2;
+const PROGRAM_PATH_PROOF: u8 = 3;
+
+#[derive(Debug, thiserror::Error)]
+enum ReferenceProofCodecError {
+    #[error("reference proof is malformed: {0}")]
+    Malformed(String),
+    #[error("unsupported reference proof value format {0}")]
+    UnsupportedFormat(u16),
+}
+
+fn encode_reference_proof(proof: &ReferenceProof) -> Result<Vec<u8>, ReferenceProofCodecError> {
+    validate_stored_proof(proof).map_err(proof_malformed)?;
+    let (kind, payload) = match &proof.mutation {
+        ReferenceProofMutation::Object(mutation) => (
+            OBJECT_MUTATION_PROOF,
+            crate::store::object_mutation_codec::encode_object_mutation(mutation)
+                .map_err(proof_malformed)?,
+        ),
+        ReferenceProofMutation::RetainedVersionDelete(mutation) => (
+            RETAINED_VERSION_DELETE_PROOF,
+            serde_json::to_vec(mutation).map_err(proof_malformed)?,
+        ),
+        ReferenceProofMutation::ProgramPath(mutation) => (
+            PROGRAM_PATH_PROOF,
+            serde_json::to_vec(mutation).map_err(proof_malformed)?,
+        ),
+    };
+    if payload.len() > MAX_REFERENCE_PROOF_VALUE_BYTES {
+        return Err(proof_malformed("payload exceeds the format bound"));
+    }
+    let payload_bytes =
+        u32::try_from(payload.len()).map_err(|_| proof_malformed("payload length is exhausted"))?;
+    let capacity = REFERENCE_PROOF_HEADER_BYTES
+        .checked_add(payload.len())
+        .ok_or_else(|| proof_malformed("record length is exhausted"))?;
+    let mut encoded = Vec::with_capacity(capacity);
+    encoded.extend_from_slice(REFERENCE_PROOF_MAGIC);
+    encoded.extend_from_slice(&REFERENCE_PROOF_VALUE_FORMAT.to_be_bytes());
+    encoded.push(kind);
+    encoded.push(0);
+    encoded.extend_from_slice(&payload_bytes.to_be_bytes());
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+fn decode_reference_proof(encoded: &[u8]) -> Result<ReferenceProof, ReferenceProofCodecError> {
+    if encoded.len() < REFERENCE_PROOF_HEADER_BYTES
+        || encoded.len() > REFERENCE_PROOF_HEADER_BYTES + MAX_REFERENCE_PROOF_VALUE_BYTES
+    {
+        return Err(proof_malformed("record length is outside the format bound"));
+    }
+    if encoded[..4] != *REFERENCE_PROOF_MAGIC {
+        return Err(proof_malformed("magic is invalid"));
+    }
+    let format = u16::from_be_bytes(
+        encoded[4..6]
+            .try_into()
+            .expect("reference-proof format has a fixed width"),
+    );
+    if format != REFERENCE_PROOF_VALUE_FORMAT {
+        return Err(ReferenceProofCodecError::UnsupportedFormat(format));
+    }
+    if encoded[7] != 0 {
+        return Err(proof_malformed("reserved header byte is non-zero"));
+    }
+    let payload_bytes = usize::try_from(u32::from_be_bytes(
+        encoded[8..12]
+            .try_into()
+            .expect("reference-proof length has a fixed width"),
+    ))
+    .map_err(|_| proof_malformed("payload length does not fit this platform"))?;
+    let payload = encoded
+        .get(REFERENCE_PROOF_HEADER_BYTES..)
+        .ok_or_else(|| proof_malformed("record is truncated"))?;
+    if payload_bytes != payload.len() {
+        return Err(proof_malformed(
+            "payload length disagrees with the record length",
+        ));
+    }
+    let proof = match encoded[6] {
+        OBJECT_MUTATION_PROOF => {
+            let mutation = crate::store::object_mutation_codec::decode_object_mutation(payload)
+                .map_err(proof_malformed)?;
+            proof_for_mutation(&mutation).map_err(proof_malformed)?
+        }
+        RETAINED_VERSION_DELETE_PROOF => {
+            let mutation = serde_json::from_slice::<RetainedVersionDeleteMutation>(payload)
+                .map_err(proof_malformed)?;
+            proof_for_retained_delete(&mutation).map_err(proof_malformed)?
+        }
+        PROGRAM_PATH_PROOF => {
+            let mutation = serde_json::from_slice::<crate::ProgramPathMutation>(payload)
+                .map_err(proof_malformed)?;
+            proof_for_program_path(&mutation).map_err(proof_malformed)?
+        }
+        _ => return Err(proof_malformed("proof mutation kind is unknown")),
+    };
+    validate_stored_proof(&proof).map_err(proof_malformed)?;
+    Ok(proof)
+}
+
+fn proof_malformed(message: impl std::fmt::Display) -> ReferenceProofCodecError {
+    ReferenceProofCodecError::Malformed(message.to_string())
+}
 
 pub const MAX_REFERENCE_PROOF_EXPORT_RECORDS: u32 = 1_000;
 pub const MAX_REFERENCE_PROOF_EXPORT_BYTES: u64 = 64 * 1024 * 1024;
@@ -494,6 +604,36 @@ fn proof_for_retained_delete(
         ReferenceProofMutation::RetainedVersionDelete(mutation.clone()),
     );
     validate_stored_proof(&proof).map_err(MutationError::InvalidObjectMutation)?;
+    Ok(proof)
+}
+
+fn proof_for_program_path(mutation: &crate::ProgramPathMutation) -> Result<ReferenceProof, String> {
+    mutation.validate().map_err(|error| error.to_string())?;
+    let proof = ReferenceProof::new(
+        mutation.stamp.source_id,
+        mutation.stamp.mutation_fingerprint,
+        LocalChange::object_head_with_program_cursor(
+            mutation.stamp.source_journal_position,
+            mutation.stage.tenant_id,
+            mutation.stage.bucket_id,
+            mutation.stage.path.path.clone(),
+            mutation.stage.version.id,
+            mutation.stage.version.deleted,
+            Some(mutation.commit_cursor),
+            mutation.reference_deltas.clone(),
+            Some(AccountingHeadTransition::new(
+                mutation
+                    .stage
+                    .previous_version
+                    .as_ref()
+                    .and_then(|version| version.blob.as_ref().map(|blob| blob.length)),
+                mutation.stage.version.blob.as_ref().map(|blob| blob.length),
+            )),
+            None,
+        ),
+        ReferenceProofMutation::ProgramPath(mutation.clone()),
+    );
+    validate_stored_proof(&proof)?;
     Ok(proof)
 }
 

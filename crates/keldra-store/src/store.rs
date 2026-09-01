@@ -124,6 +124,8 @@ pub(crate) const CF_OBJECT_ALIAS_REGISTRIES: &str = "object_alias_registries";
 pub(crate) const VERSION_HIGH_WATERMARK_KEY: &[u8] = b"version_high_watermark";
 const INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY: &[u8] = b"integrated_payload_storage_format";
 const INTEGRATED_PAYLOAD_STORAGE_FORMAT: u8 = 1;
+const DURABLE_MUTATION_RECORD_FORMAT_KEY: &[u8] = b"durable_mutation_record_format";
+const DURABLE_MUTATION_RECORD_FORMAT: u8 = 1;
 const MUTATION_RECEIPT_COUNT_KEY: &[u8] = b"mutation_receipt_count";
 const MUTATION_RECEIPT_BYTES_KEY: &[u8] = b"mutation_receipt_bytes";
 const RECEIPT_RECORD_PREFIX: u8 = 0;
@@ -980,6 +982,23 @@ impl Store {
                 )?;
             }
         }
+        match db.get_cf(metadata_cf, DURABLE_MUTATION_RECORD_FORMAT_KEY)? {
+            Some(encoded) if encoded.as_ref() == [DURABLE_MUTATION_RECORD_FORMAT] => {}
+            Some(_) => anyhow::bail!("durable mutation record format marker is unsupported"),
+            None if existing_database => {
+                anyhow::bail!("existing Keldra volume has no durable mutation record format marker")
+            }
+            None => {
+                let mut write = WriteOptions::default();
+                write.set_sync(options.sync_writes);
+                db.put_cf_opt(
+                    metadata_cf,
+                    DURABLE_MUTATION_RECORD_FORMAT_KEY,
+                    [DURABLE_MUTATION_RECORD_FORMAT],
+                    &write,
+                )?;
+            }
+        }
         let high_watermark = db
             .get_cf(metadata_cf, VERSION_HIGH_WATERMARK_KEY)?
             .map(|encoded| serde_json::from_slice::<VersionId>(&encoded))
@@ -1446,6 +1465,7 @@ mod options;
 mod single_node_group_commit;
 use mutation_fingerprint::*;
 mod object_alias_registry;
+mod object_mutation_codec;
 mod object_mutation_replica_batch;
 mod object_snapshot;
 mod object_snapshot_scan;
@@ -1455,6 +1475,7 @@ mod payload_handoff;
 mod pending_local_change;
 mod program_reservations;
 mod reads;
+mod receipt_codec;
 mod reference_deltas;
 mod reference_proofs;
 mod retained_snapshot_scan;

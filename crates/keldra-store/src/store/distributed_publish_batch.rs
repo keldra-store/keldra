@@ -34,6 +34,8 @@ pub(super) struct CoordinatorBatchMetrics {
     pub(super) settle: std::time::Duration,
     pub(super) commit_hold: std::time::Duration,
     pub(super) total: std::time::Duration,
+    pub(super) write_batch_entries: u64,
+    pub(super) write_batch_bytes: u64,
     pub(super) physical_commit: bool,
 }
 
@@ -438,6 +440,8 @@ impl Store {
         let stage_duration = stage_started.elapsed();
         let persist_started = std::time::Instant::now();
         let physical_commit = !batch.is_empty();
+        let write_batch_entries = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+        let write_batch_bytes = u64::try_from(batch.size_in_bytes()).unwrap_or(u64::MAX);
         if physical_commit {
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
@@ -486,6 +490,8 @@ impl Store {
                 settle: settle_duration,
                 commit_hold: commit_hold_duration,
                 total: total_started.elapsed(),
+                write_batch_entries,
+                write_batch_bytes,
                 physical_commit,
             },
         };
