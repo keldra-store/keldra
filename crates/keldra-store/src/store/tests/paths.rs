@@ -22,6 +22,7 @@ fn store_options_default_to_the_existing_root_layout() {
         options.single_node_group_commit.max_group_inline_bytes(),
         64 * 1024 * 1024
     );
+    assert_eq!(options.single_node_group_commit.preparation_lanes(), 1);
     assert_eq!(options.single_node_group_commit.max_queued_requests(), 64);
     assert_eq!(
         options.single_node_group_commit.max_queued_operations(),

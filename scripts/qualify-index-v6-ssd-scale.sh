@@ -23,6 +23,7 @@ catalog_only_at_or_above="${KELDRA_V6_SCALE_CATALOG_ONLY_AT_OR_ABOVE_DEFINITIONS
 group_max_requests="${KELDRA_V6_SCALE_GROUP_MAX_REQUESTS:-}"
 group_max_operations="${KELDRA_V6_SCALE_GROUP_MAX_OPERATIONS:-}"
 group_max_inline_bytes="${KELDRA_V6_SCALE_GROUP_MAX_INLINE_BYTES:-}"
+group_preparation_lanes="${KELDRA_V6_SCALE_GROUP_PREPARATION_LANES:-}"
 group_max_queued_requests="${KELDRA_V6_SCALE_GROUP_MAX_QUEUED_REQUESTS:-}"
 group_max_queued_operations="${KELDRA_V6_SCALE_GROUP_MAX_QUEUED_OPERATIONS:-}"
 group_max_queued_inline_bytes="${KELDRA_V6_SCALE_GROUP_MAX_QUEUED_INLINE_BYTES:-}"
@@ -127,6 +128,7 @@ do
 done
 positive_number "${lag_slope_limit}" || { echo "lag-slope limit must be positive" >&2; exit 2; }
 for value in "${group_max_requests}" "${group_max_operations}" "${group_max_inline_bytes}" \
+  "${group_preparation_lanes}" \
   "${group_max_queued_requests}" "${group_max_queued_operations}" \
   "${group_max_queued_inline_bytes}" "${group_dwell_microseconds}"
 do
@@ -140,6 +142,7 @@ group_server_env=()
 [[ -z "${group_max_requests}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_REQUESTS=${group_max_requests}")
 [[ -z "${group_max_operations}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_OPERATIONS=${group_max_operations}")
 [[ -z "${group_max_inline_bytes}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_INLINE_BYTES=${group_max_inline_bytes}")
+[[ -z "${group_preparation_lanes}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_PREPARATION_LANES=${group_preparation_lanes}")
 [[ -z "${group_max_queued_requests}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_REQUESTS=${group_max_queued_requests}")
 [[ -z "${group_max_queued_operations}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_OPERATIONS=${group_max_queued_operations}")
 [[ -z "${group_max_queued_inline_bytes}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_INLINE_BYTES=${group_max_queued_inline_bytes}")
@@ -175,6 +178,7 @@ summary_rows="${run_dir}/cells.jsonl"
   echo "group_max_requests=${group_max_requests:-server-default}"
   echo "group_max_operations=${group_max_operations:-server-default}"
   echo "group_max_inline_bytes=${group_max_inline_bytes:-server-default}"
+  echo "group_preparation_lanes=${group_preparation_lanes:-server-default}"
   echo "group_max_queued_requests=${group_max_queued_requests:-server-default}"
   echo "group_max_queued_operations=${group_max_queued_operations:-server-default}"
   echo "group_max_queued_inline_bytes=${group_max_queued_inline_bytes:-server-default}"
