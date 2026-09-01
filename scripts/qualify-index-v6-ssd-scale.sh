@@ -16,6 +16,7 @@ base_port="${KELDRA_V6_SCALE_PORT:-51051}"
 server_rust_log="${KELDRA_V6_SCALE_RUST_LOG:-warn,keldra::index_runtime::v6_summary=info}"
 query_rate="${KELDRA_V6_SCALE_QUERY_RATE:-20}"
 query_max_in_flight="${KELDRA_V6_SCALE_QUERY_MAX_IN_FLIGHT:-32}"
+mutation_workers_override="${KELDRA_V6_SCALE_MUTATION_WORKERS:-}"
 lag_slope_limit="${KELDRA_V6_SCALE_MAX_LAG_SLOPE_RECORDS_PER_SECOND:-1}"
 source_journal_entries="${KELDRA_V6_SCALE_SOURCE_JOURNAL_MAX_ENTRIES:-10000000}"
 catalog_only_at_or_above="${KELDRA_V6_SCALE_CATALOG_ONLY_AT_OR_ABOVE_DEFINITIONS:-250000}"
@@ -106,6 +107,12 @@ parse_integer_matrix worker-matrix 256 "${worker_matrix}"
 parse_integer_matrix memory-per-worker-matrix 68719476736 "${memory_per_worker_matrix}"
 parse_integer_matrix object-size-matrix 67108864 "${object_size_matrix}"
 parse_rate_ladder
+if [[ -n "${mutation_workers_override}" ]]; then
+  positive_integer "${mutation_workers_override}" && ((mutation_workers_override <= 256)) || {
+    echo "KELDRA_V6_SCALE_MUTATION_WORKERS must be a positive integer no greater than 256" >&2
+    exit 2
+  }
+fi
 for value in "${base_port}" "${query_rate}" "${query_max_in_flight}" "${source_journal_entries}" \
   "${baseline_seconds}" "${concurrent_seconds}" "${post_seconds}" "${catalog_only_at_or_above}"
 do
@@ -133,6 +140,7 @@ summary_rows="${run_dir}/cells.jsonl"
   echo "definition_matrix=${definition_matrix}"
   echo "physical_recipe_matrix=${recipe_matrix}"
   echo "indexing_worker_matrix=${worker_matrix}"
+  echo "mutation_workers_override=${mutation_workers_override:-cell-indexing-workers}"
   echo "memory_per_worker_matrix=${memory_per_worker_matrix}"
   echo "offered_rate_ladder=${rate_ladder}"
   echo "mutation_object_size_matrix=${object_size_matrix}"
@@ -398,6 +406,7 @@ for definitions in "${definitions_values[@]}"; do
       for memory_per_worker in "${memory_values[@]}"; do
         if ! { ((recipes == 1 && workers == maximum_workers && memory_per_worker == maximum_memory_per_worker)) || ((definitions == physical_axis_definitions && workers == maximum_workers && memory_per_worker == maximum_memory_per_worker)) || ((definitions == resource_axis_definitions && recipes == 1)); }; then continue; fi
         pipeline_memory_bytes=$((workers * memory_per_worker))
+        mutation_workers="${mutation_workers_override:-${workers}}"
         for object_bytes in "${object_sizes[@]}"; do
           # The pathological object is a D1/P1 cell. It measures the known
           # large-object ingestion shape without multiplying catalog or recipe
@@ -414,6 +423,9 @@ for definitions in "${definitions_values[@]}"; do
           fi
           ((reached_limit == 0)) || break
           cell="d${definitions}-p${recipes}-w${workers}-m${memory_per_worker}-b${object_bytes}-r${offered_rate//./_}"
+          if [[ -n "${mutation_workers_override}" ]]; then
+            cell="${cell}-cw${mutation_workers}"
+          fi
           active_cell="${run_dir}/${cell}"; active_work="${work_root}/${run_id}/${cell}"
           mkdir -p "${active_cell}" "${active_work}"/{state,metadata,wal,payload,scratch,cache,tmp}; chmod -R 0700 "${active_cell}" "${active_work}"
           credential_file="${active_work}/system-bootstrap-credential.json"; token_key="${active_work}/token-signing-key"
@@ -429,7 +441,7 @@ for definitions in "${definitions_values[@]}"; do
           KELDRA_CLIENT_ID="${client_id}" KELDRA_CLIENT_SECRET="${client_secret}" "${kit_root}/bin/keldra" --endpoint "http://127.0.0.1:${port}" create-bucket "${bucket}" >"${active_cell}/bucket.stdout.log" 2>"${active_cell}/bucket.stderr.log"
           report="${active_cell}/report.json"; progress="${active_cell}/driver-progress.jsonl"
           set +e
-          KELDRA_INDEX_CONTENTION_ENDPOINTS="http://127.0.0.1:${port}" KELDRA_INDEX_CONTENTION_TENANT="${tenant}" KELDRA_INDEX_CONTENTION_BUCKET="${bucket}" KELDRA_INDEX_CONTENTION_CLIENT_ID="${client_id}" KELDRA_INDEX_CONTENTION_CLIENT_SECRET="${client_secret}" KELDRA_INDEX_CONTENTION_SERVER_SOURCE_COMMIT="${source_commit}" KELDRA_INDEX_CONTENTION_IMAGE="qualification-kit:${source_commit}" KELDRA_INDEX_CONTENTION_TOPOLOGY=single-node KELDRA_INDEX_CONTENTION_DURABILITY=LOCAL KELDRA_INDEX_CONTENTION_DEFINITION_COUNT="${definitions}" KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT="${recipes}" KELDRA_INDEX_CONTENTION_BASELINE_SECONDS="${baseline_seconds}" KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS="${concurrent_seconds}" KELDRA_INDEX_CONTENTION_POST_SECONDS="${post_seconds}" KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND="${offered_rate}" KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES="${object_bytes}" KELDRA_INDEX_CONTENTION_MUTATION_WORKERS="${workers}" KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=32 KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH="$((workers * 8))" KELDRA_INDEX_CONTENTION_QUERY_RATE="${query_rate}" KELDRA_INDEX_CONTENTION_QUERY_MAX_IN_FLIGHT="${query_max_in_flight}" KELDRA_INDEX_CONTENTION_REQUEST_TIMEOUT_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_DRAIN_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=2000 KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_OUTPUT="${report}" KELDRA_INDEX_CONTENTION_PROGRESS_JSONL="${progress}" "${kit_root}/bin/index-contention-qualification" >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log"
+          KELDRA_INDEX_CONTENTION_ENDPOINTS="http://127.0.0.1:${port}" KELDRA_INDEX_CONTENTION_TENANT="${tenant}" KELDRA_INDEX_CONTENTION_BUCKET="${bucket}" KELDRA_INDEX_CONTENTION_CLIENT_ID="${client_id}" KELDRA_INDEX_CONTENTION_CLIENT_SECRET="${client_secret}" KELDRA_INDEX_CONTENTION_SERVER_SOURCE_COMMIT="${source_commit}" KELDRA_INDEX_CONTENTION_IMAGE="qualification-kit:${source_commit}" KELDRA_INDEX_CONTENTION_TOPOLOGY=single-node KELDRA_INDEX_CONTENTION_DURABILITY=LOCAL KELDRA_INDEX_CONTENTION_DEFINITION_COUNT="${definitions}" KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT="${recipes}" KELDRA_INDEX_CONTENTION_BASELINE_SECONDS="${baseline_seconds}" KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS="${concurrent_seconds}" KELDRA_INDEX_CONTENTION_POST_SECONDS="${post_seconds}" KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND="${offered_rate}" KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES="${object_bytes}" KELDRA_INDEX_CONTENTION_MUTATION_WORKERS="${mutation_workers}" KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=32 KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH="$((mutation_workers * 8))" KELDRA_INDEX_CONTENTION_QUERY_RATE="${query_rate}" KELDRA_INDEX_CONTENTION_QUERY_MAX_IN_FLIGHT="${query_max_in_flight}" KELDRA_INDEX_CONTENTION_REQUEST_TIMEOUT_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_DRAIN_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=2000 KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_OUTPUT="${report}" KELDRA_INDEX_CONTENTION_PROGRESS_JSONL="${progress}" "${kit_root}/bin/index-contention-qualification" >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log"
           driver_status=$?
           set -e
           store_bytes="$(du -sb "${active_work}/metadata" "${active_work}/payload" "${active_work}/wal" 2>/dev/null | awk '{total += $1} END {print total + 0}')"
