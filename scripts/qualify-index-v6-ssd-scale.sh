@@ -13,7 +13,7 @@ work_root="${experiment_root}/work/index-v6-scale"
 mode="${KELDRA_V6_SCALE_MODE:-smoke}"
 keep_work="${KELDRA_V6_SCALE_KEEP_WORK:-0}"
 base_port="${KELDRA_V6_SCALE_PORT:-51051}"
-server_rust_log="${KELDRA_V6_SCALE_RUST_LOG:-warn,keldra::index_runtime::v6_summary=info,keldra::single_node_group_commit_config=info}"
+server_rust_log="${KELDRA_V6_SCALE_RUST_LOG:-warn,keldra::index_runtime::v6_summary=info,keldra::single_node_group_commit_config=info,keldra_store::single_node_prepared_group_pipeline=info}"
 query_rate="${KELDRA_V6_SCALE_QUERY_RATE:-20}"
 query_max_in_flight="${KELDRA_V6_SCALE_QUERY_MAX_IN_FLIGHT:-32}"
 mutation_workers_override="${KELDRA_V6_SCALE_MUTATION_WORKERS:-}"
@@ -302,6 +302,51 @@ extract_v6_telemetry() {
   ' >"${output}"
 }
 
+extract_prepared_group_pipeline_telemetry() {
+  local server_log="$1" output="$2"
+  awk '
+    /single-node prepared group finalized/ {
+      printf "{\"timestamp_utc\":\"%s\"", $1
+      printf ",\"sequence\":%s", numeric($0, "sequence")
+      printf ",\"configured_prepared_groups\":%s", numeric($0, "configured_prepared_groups")
+      printf ",\"effective_prepared_groups\":%s", numeric($0, "effective_prepared_groups")
+      printf ",\"peak_prepared_groups\":%s", numeric($0, "peak_prepared_groups")
+      printf ",\"preparation_seconds\":%s", numeric($0, "preparation_seconds")
+      printf ",\"ready_wait_seconds\":%s", numeric($0, "ready_wait_seconds")
+      printf ",\"snapshot_age_seconds\":%s", numeric($0, "snapshot_age_seconds")
+      printf ",\"speculative_stale_components\":%s", numeric($0, "speculative_stale_components")
+      printf ",\"speculative_retries\":%s", numeric($0, "speculative_retries")
+      printf ",\"speculative_fallbacks\":%s", numeric($0, "speculative_fallbacks")
+      printf ",\"overlap_seconds\":%s", numeric($0, "overlap_seconds")
+      printf ",\"preparation_succeeded\":%s", boolean($0, "preparation_succeeded")
+      printf ",\"phase_complete\":%s}\n", boolean($0, "phase_complete")
+    }
+    function token(line, key, fragment, position) {
+      position = index(line, key "=")
+      if (position == 0) return ""
+      fragment = substr(line, position + length(key) + 1)
+      sub(/[[:space:]].*$/, "", fragment)
+      return fragment
+    }
+    function numeric(line, key, value) {
+      value = token(line, key)
+      return value ~ /^[-+]?[0-9]+([.][0-9]*)?([eE][-+]?[0-9]+)?$/ ? value : "null"
+    }
+    function boolean(line, key, value) {
+      value = token(line, key)
+      return value == "true" || value == "false" ? value : "null"
+    }
+  ' "${server_log}" | jq -c '
+    (.timestamp_utc
+      | capture("^(?<whole>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<fraction>[0-9]+))?Z$")) as $timestamp
+    | .timestamp_unix_milliseconds = (
+        ($timestamp.whole + "Z" | fromdateiso8601) * 1000
+        + ((((($timestamp.fraction // "0") + "000")[0:3])) | tonumber)
+      )
+    | del(.timestamp_utc)
+  ' >"${output}"
+}
+
 remove_cell_work() {
   local candidate="$1" expected_root canonical_root canonical_candidate
   [[ -n "${candidate}" && -d "${candidate}" ]] || {
@@ -322,8 +367,8 @@ remove_cell_work() {
 }
 
 summarize_cell() {
-  local cell="$1" report="$2" progress="$3" resource_samples="$4" telemetry_samples="$5" definitions="$6" recipes="$7" workers="$8" memory_per_worker="$9" offered_rate="${10}" object_bytes="${11}" driver_status="${12}" store_bytes="${13}"
-  local resources lag throughput quality
+  local cell="$1" report="$2" progress="$3" resource_samples="$4" telemetry_samples="$5" definitions="$6" recipes="$7" workers="$8" memory_per_worker="$9" offered_rate="${10}" object_bytes="${11}" driver_status="${12}" store_bytes="${13}" pipeline_samples="${14}"
+  local resources lag throughput prepared_group_pipeline quality
   resources="$(awk -F '\t' '
     NR == 1 { next }
     { cpu += $3; if ($4 > rss) rss = $4; if (NR == 2) first_write = $7; last_write = $7; samples++ }
@@ -393,6 +438,61 @@ summarize_cell() {
         end
       end
   ' 2>/dev/null || printf '{"measurement":"unparseable-v6-summary","samples":0}')"
+  prepared_group_pipeline="$(jq -n --slurpfile progress "${progress}" --slurpfile telemetry "${pipeline_samples}" '
+    def total($samples; $key):
+      ([ $samples[][$key] | select(. != null) ]) as $values
+      | if ($values | length) == 0 then null else ($values | add) end;
+    def present($samples; $key): ([ $samples[] | select(.[$key] != null) ] | length);
+    def percentile($samples; $key; $fraction):
+      ([ $samples[][$key] | select(. != null) ] | sort) as $values
+      | if ($values | length) == 0 then null
+        else $values[((($values | length) * $fraction | ceil) - 1)]
+        end;
+    ($progress | map(select(.phase == "concurrent" and (.timestamp_unix_milliseconds? != null)))
+      | if length == 0 then null
+        else {start:(map(.timestamp_unix_milliseconds) | min),end:(map(.timestamp_unix_milliseconds) | max)}
+        end) as $window
+    | if $window == null then {measurement:"missing-driver-phase-wall-clock",samples:0}
+      else ($telemetry
+        | map(select(.timestamp_unix_milliseconds >= $window.start and .timestamp_unix_milliseconds <= $window.end))
+        | sort_by(.timestamp_unix_milliseconds)) as $samples
+      | if ($samples | length) == 0 then {measurement:"no-prepared-group-pipeline-events",samples:0,window:$window}
+        else (total($samples; "preparation_seconds")) as $preparation
+        | (total($samples; "overlap_seconds")) as $overlap
+        | {
+            measurement:"prepared-group-pipeline-events",
+            samples:($samples | length),
+            window:$window,
+            first_sequence:($samples | map(.sequence) | map(select(. != null)) | min // null),
+            last_sequence:($samples | map(.sequence) | map(select(. != null)) | max // null),
+            configured_prepared_groups:($samples | map(.configured_prepared_groups) | map(select(. != null)) | unique),
+            effective_prepared_groups:($samples | map(.effective_prepared_groups) | map(select(. != null)) | unique),
+            peak_prepared_groups:($samples | map(.peak_prepared_groups) | map(select(. != null)) | max // null),
+            preparation_succeeded_samples:present($samples; "preparation_succeeded"),
+            preparation_succeeded:([$samples[] | select(.preparation_succeeded == true)] | length),
+            phase_complete_samples:present($samples; "phase_complete"),
+            phase_complete:([$samples[] | select(.phase_complete == true)] | length),
+            preparation_seconds:$preparation,
+            ready_commit_order_wait_seconds:total($samples; "ready_wait_seconds"),
+            snapshot_age_seconds:total($samples; "snapshot_age_seconds"),
+            speculative_stale_components:total($samples; "speculative_stale_components"),
+            speculative_retries:total($samples; "speculative_retries"),
+            speculative_fallbacks:total($samples; "speculative_fallbacks"),
+            overlap_seconds:$overlap,
+            overlap_ratio:(if $preparation != null and $preparation > 0 and $overlap != null then ($overlap / $preparation) else null end),
+            preparation_seconds_per_group:($preparation / ($samples | length)),
+            ready_commit_order_wait_seconds_per_group:(total($samples; "ready_wait_seconds") / ($samples | length)),
+            snapshot_age_seconds_per_group:(total($samples; "snapshot_age_seconds") / ($samples | length)),
+            preparation_seconds_p50:percentile($samples; "preparation_seconds"; 0.50),
+            preparation_seconds_p95:percentile($samples; "preparation_seconds"; 0.95),
+            ready_commit_order_wait_seconds_p50:percentile($samples; "ready_wait_seconds"; 0.50),
+            ready_commit_order_wait_seconds_p95:percentile($samples; "ready_wait_seconds"; 0.95),
+            snapshot_age_seconds_p50:percentile($samples; "snapshot_age_seconds"; 0.50),
+            snapshot_age_seconds_p95:percentile($samples; "snapshot_age_seconds"; 0.95)
+          }
+        end
+      end
+  ' 2>/dev/null || printf '{"measurement":"unparseable-prepared-group-pipeline-events","samples":0}')"
   quality="$(jq -cn --argjson status "${driver_status}" --argjson lag "${lag}" --argjson throughput "${throughput}" --argjson limit "${lag_slope_limit}" --slurpfile report "${report}" '
     ($report[0] // {}) as $r | ($lag.lag_slope_records_per_second) as $slope
     | (($throughput.measurement == "v6-summary-counter-delta")
@@ -406,13 +506,13 @@ summarize_cell() {
         and (($throughput.checkpointed_source_bytes_per_second // 0) > 0)) as $telemetry_complete
     | {driver_exit:$status,result:($r.result // "missing-report"),correctness:($r.correctness.passed // false),workload:($r.workload_validity.passed // false),responsiveness:($r.responsiveness.passed // false),telemetry_complete:$telemetry_complete,lag_stationary:($slope != null and $slope <= $limit),classification:(if $status == 0 and ($r.result // "") == "pass" and $telemetry_complete and $slope != null and $slope <= $limit then "sustained" elif $telemetry_complete and (($r.correctness.passed // false) and ($r.workload_validity.passed // false)) then "capacity-limit" else "failure" end)}
   ' 2>/dev/null || printf '{"classification":"failure","result":"unparseable-report"}')"
-  jq -cn --arg cell "${cell}" --arg report_path "${report}" --arg progress_path "${progress}" --arg telemetry_path "${telemetry_samples}" \
+  jq -cn --arg cell "${cell}" --arg report_path "${report}" --arg progress_path "${progress}" --arg telemetry_path "${telemetry_samples}" --arg prepared_group_pipeline_telemetry_path "${pipeline_samples}" \
     --argjson definitions "${definitions}" --argjson recipes "${recipes}" --argjson workers "${workers}" \
     --argjson memory_per_worker "${memory_per_worker}" --argjson offered_rate "${offered_rate}" --argjson object_bytes "${object_bytes}" \
-    --argjson store_bytes "${store_bytes}" --argjson resources "${resources}" --argjson lag "${lag}" --argjson throughput "${throughput}" \
+    --argjson store_bytes "${store_bytes}" --argjson resources "${resources}" --argjson lag "${lag}" --argjson throughput "${throughput}" --argjson prepared_group_pipeline "${prepared_group_pipeline}" \
     --argjson quality "${quality}" --slurpfile report "${report}" '
       ($report[0] // {}) as $r | ($workers * $memory_per_worker) as $pipeline_memory_bytes | ($pipeline_memory_bytes / 268435456) as $memory_256_mib_units | ($r.mutations // {}) as $m
-      | {cell:$cell,logical_definitions:$definitions,qualified_definitions:($r.qualified_definition_count // 0),physical_recipes:$recipes,definition_creation_seconds:($r.definition_creation_seconds // null),definition_creation_per_second:(if ($r.definition_creation_seconds // 0) > 0 then ($definitions / $r.definition_creation_seconds) else null end),qualified_definition_activation_seconds:($r.qualified_definition_activation_seconds // null),indexing_cores:$workers,memory_per_core_bytes:$memory_per_worker,pipeline_memory_bytes:$pipeline_memory_bytes,mutation_record_minimum_bytes:$object_bytes,offered_operations_per_second:$offered_rate,offered_operations:($m.offered_operations // 0),accepted_operations:($m.accepted_operations // 0),accepted_operations_per_second:($m.accepted_operations_per_second // 0),accepted_source_bytes:($m.accepted_bytes // 0),accepted_source_bytes_per_second:($m.accepted_bytes_per_second // 0),runtime_throughput:$throughput,indexed_source_rows_per_second:($throughput.checkpointed_source_rows_per_second // null),indexed_source_rows_per_second_per_core:(($throughput.checkpointed_source_rows_per_second // 0) / $workers),indexed_source_rows_per_second_per_256_mib:(($throughput.checkpointed_source_rows_per_second // 0) / $memory_256_mib_units),accepted_operations_per_second_per_core:(($m.accepted_operations_per_second // 0) / $workers),accepted_operations_per_second_per_256_mib:(($m.accepted_operations_per_second // 0) / $memory_256_mib_units),indexed_end_to_end_operations_per_second:(if (($m.elapsed_seconds // 0) + ($r.drain_seconds // 0)) > 0 then (($m.accepted_operations // 0) / (($m.elapsed_seconds // 0) + ($r.drain_seconds // 0))) else 0 end),drain_seconds:($r.drain_seconds // null),concurrent_query_schedule_to_response:($r.concurrent.schedule_to_response // null),concurrent_query_dispatch_to_response:($r.concurrent.dispatch_to_response // null),publication_visibility_lag:($m.publication_visibility_lag // null),lag:$lag,resources:$resources,durable_store_bytes:$store_bytes,report_path:$report_path,progress_path:$progress_path,telemetry_path:$telemetry_path,quality:$quality,raw_report:$r}
+      | {cell:$cell,logical_definitions:$definitions,qualified_definitions:($r.qualified_definition_count // 0),physical_recipes:$recipes,definition_creation_seconds:($r.definition_creation_seconds // null),definition_creation_per_second:(if ($r.definition_creation_seconds // 0) > 0 then ($definitions / $r.definition_creation_seconds) else null end),qualified_definition_activation_seconds:($r.qualified_definition_activation_seconds // null),indexing_cores:$workers,memory_per_core_bytes:$memory_per_worker,pipeline_memory_bytes:$pipeline_memory_bytes,mutation_record_minimum_bytes:$object_bytes,offered_operations_per_second:$offered_rate,offered_operations:($m.offered_operations // 0),accepted_operations:($m.accepted_operations // 0),accepted_operations_per_second:($m.accepted_operations_per_second // 0),accepted_source_bytes:($m.accepted_bytes // 0),accepted_source_bytes_per_second:($m.accepted_bytes_per_second // 0),runtime_throughput:$throughput,prepared_group_pipeline:$prepared_group_pipeline,indexed_source_rows_per_second:($throughput.checkpointed_source_rows_per_second // null),indexed_source_rows_per_second_per_core:(($throughput.checkpointed_source_rows_per_second // 0) / $workers),indexed_source_rows_per_second_per_256_mib:(($throughput.checkpointed_source_rows_per_second // 0) / $memory_256_mib_units),accepted_operations_per_second_per_core:(($m.accepted_operations_per_second // 0) / $workers),accepted_operations_per_second_per_256_mib:(($m.accepted_operations_per_second // 0) / $memory_256_mib_units),indexed_end_to_end_operations_per_second:(if (($m.elapsed_seconds // 0) + ($r.drain_seconds // 0)) > 0 then (($m.accepted_operations // 0) / (($m.elapsed_seconds // 0) + ($r.drain_seconds // 0))) else 0 end),drain_seconds:($r.drain_seconds // null),concurrent_query_schedule_to_response:($r.concurrent.schedule_to_response // null),concurrent_query_dispatch_to_response:($r.concurrent.dispatch_to_response // null),publication_visibility_lag:($m.publication_visibility_lag // null),lag:$lag,resources:$resources,durable_store_bytes:$store_bytes,report_path:$report_path,progress_path:$progress_path,telemetry_path:$telemetry_path,prepared_group_pipeline_telemetry_path:$prepared_group_pipeline_telemetry_path,quality:$quality,raw_report:$r}
     ' >>"${summary_rows}"
   jq -r '.classification' <<<"${quality}"
 }
@@ -539,8 +639,10 @@ for definitions in "${definitions_values[@]}"; do
           stop_server
           telemetry_samples="${active_cell}/v6-summary.jsonl"
           extract_v6_telemetry "${active_cell}/server.log" "${telemetry_samples}"
+          pipeline_samples="${active_cell}/prepared-group-pipeline.jsonl"
+          extract_prepared_group_pipeline_telemetry "${active_cell}/server.log" "${pipeline_samples}"
           [[ -s "${report}" ]] || printf '{"result":"missing-report"}\n' >"${report}"
-          classification="$(summarize_cell "${cell}" "${report}" "${progress}" "${active_cell}/server-resources.tsv" "${telemetry_samples}" "${definitions}" "${recipes}" "${workers}" "${memory_per_worker}" "${offered_rate}" "${object_bytes}" "${driver_status}" "${store_bytes}")"
+          classification="$(summarize_cell "${cell}" "${report}" "${progress}" "${active_cell}/server-resources.tsv" "${telemetry_samples}" "${definitions}" "${recipes}" "${workers}" "${memory_per_worker}" "${offered_rate}" "${object_bytes}" "${driver_status}" "${store_bytes}" "${pipeline_samples}")"
           printf '%s\n' "${classification}" >"${active_cell}/status.txt"
           case "${classification}" in sustained) ;; capacity-limit) reached_limit=1 ;; *) fatal_cells=$((fatal_cells + 1)); reached_limit=1 ;; esac
           if [[ "${keep_work}" == 0 ]]; then remove_cell_work "${active_work}"; fi
