@@ -137,6 +137,12 @@ pub const DEFAULT_MUTATION_RECEIPT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_AWAITING_PUBLISH_TTL_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_MAX_TOTAL_WAL_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 pub const PAYLOAD_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum item count in one trusted derived-progress inline staging commit.
+#[doc(hidden)]
+pub const MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS: usize = 1_000;
+/// Maximum logical payload bytes in one trusted derived-progress inline staging commit.
+#[doc(hidden)]
+pub const MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 pub const PAYLOAD_BLOB_MIN_BYTES: u64 = 64 * 1024;
 pub const MAX_LIST_OBJECTS: usize = 1_000;
 pub const MAX_LIST_OBJECT_VERSIONS: usize = 1_000;

@@ -26,7 +26,10 @@ use keldra_index::v6::{
     projection_query_run_pack_path, projection_query_run_stream_page_path, projection_routing_id,
     projection_stream_page_path,
 };
-use keldra_store::{BlobRef, MutationError, ObjectKey, Store, VersionId};
+use keldra_store::{
+    BlobRef, MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES, MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS,
+    MutationError, ObjectKey, PAYLOAD_ARTIFACT_CHUNK_BYTES, Store, VersionId,
+};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
@@ -60,6 +63,26 @@ struct ArtifactBytes {
     kind: keldra_index::v6::ProjectionArtifactKind,
     hash: [u8; 32],
     bytes: Vec<u8>,
+}
+
+struct StagedArtifact {
+    path: String,
+    kind: keldra_index::v6::ProjectionArtifactKind,
+    hash: [u8; 32],
+    blob: BlobRef,
+}
+
+struct InlineArtifactIdentity {
+    path: String,
+    kind: keldra_index::v6::ProjectionArtifactKind,
+    hash: [u8; 32],
+    length: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ImmutableStageWindow {
+    Inline { items: usize, bytes: usize },
+    Unary { bytes: usize },
 }
 
 #[derive(Debug)]
@@ -496,13 +519,7 @@ impl V6ProjectionPublisher {
         let next_offset = plan.current.next_offset;
         let generation_hash = plan.current.generation_hash;
         let mut publications = Vec::with_capacity(plan.immutable.len());
-        for artifact in plan.immutable {
-            let blob = self.stage(&artifact.bytes).await?;
-            if blob.hash != artifact.hash || blob.length != artifact.bytes.len() as u64 {
-                return Err(Status::data_loss(
-                    "staged v6 immutable artifact changed its exact bytes",
-                ));
-            }
+        for artifact in self.stage_immutable_artifacts(plan.immutable).await? {
             let routing_id =
                 projection_artifact_routing_id(partition.family_id, artifact.kind, artifact.hash)
                     .map_err(index_status)?;
@@ -513,7 +530,7 @@ impl V6ProjectionPublisher {
                 bucket_id,
                 routing_id,
                 artifact.path,
-                blob,
+                artifact.blob,
                 None,
             ));
         }
@@ -663,13 +680,10 @@ impl V6ProjectionPublisher {
             }
         }
         let mut publications = Vec::with_capacity(artifacts.len());
-        for artifact in artifacts.into_values() {
-            let blob = self.stage(&artifact.bytes).await?;
-            if blob.hash != artifact.hash || blob.length != artifact.bytes.len() as u64 {
-                return Err(Status::data_loss(
-                    "staged v6 compaction artifact changed its exact bytes",
-                ));
-            }
+        for artifact in self
+            .stage_immutable_artifacts(artifacts.into_values().collect())
+            .await?
+        {
             let routing_id =
                 projection_artifact_routing_id(partition.family_id, artifact.kind, artifact.hash)
                     .map_err(index_status)?;
@@ -680,7 +694,7 @@ impl V6ProjectionPublisher {
                 bucket_id,
                 routing_id,
                 artifact.path,
-                blob,
+                artifact.blob,
                 None,
             ));
         }
@@ -1103,6 +1117,112 @@ impl V6ProjectionPublisher {
         }
     }
 
+    async fn stage_immutable_artifacts(
+        &self,
+        artifacts: Vec<ArtifactBytes>,
+    ) -> Result<Vec<StagedArtifact>, Status> {
+        let mut staged = Vec::with_capacity(artifacts.len());
+        let windows =
+            immutable_stage_windows(artifacts.iter().map(|artifact| artifact.bytes.len()))?;
+        let mut artifacts = VecDeque::from(artifacts);
+        for window in windows {
+            match window {
+                ImmutableStageWindow::Unary { bytes } => {
+                    let artifact = artifacts.pop_front().ok_or_else(|| {
+                        Status::internal("v6 immutable staging plan omitted its unary artifact")
+                    })?;
+                    if artifact.bytes.len() != bytes {
+                        return Err(Status::internal(
+                            "v6 immutable unary staging plan changed its byte association",
+                        ));
+                    }
+                    let blob = self.stage(&artifact.bytes).await?;
+                    staged.push(staged_artifact(artifact, blob)?);
+                }
+                ImmutableStageWindow::Inline { items, bytes } => {
+                    let mut inline_identities = Vec::with_capacity(items);
+                    let mut inline_blobs = Vec::with_capacity(items);
+                    let mut observed_bytes = 0_usize;
+                    for _ in 0..items {
+                        let artifact = artifacts.pop_front().ok_or_else(|| {
+                            Status::internal("v6 immutable staging plan omitted an inline artifact")
+                        })?;
+                        let ArtifactBytes {
+                            path,
+                            kind,
+                            hash,
+                            bytes,
+                        } = artifact;
+                        observed_bytes =
+                            observed_bytes.checked_add(bytes.len()).ok_or_else(|| {
+                                Status::resource_exhausted("v6 inline artifact byte count overflow")
+                            })?;
+                        inline_identities.push(InlineArtifactIdentity {
+                            path,
+                            kind,
+                            hash,
+                            length: bytes.len(),
+                        });
+                        inline_blobs.push(bytes);
+                    }
+                    if observed_bytes != bytes {
+                        return Err(Status::internal(
+                            "v6 immutable inline staging plan changed its byte association",
+                        ));
+                    }
+                    self.flush_inline_artifacts(
+                        &mut inline_identities,
+                        &mut inline_blobs,
+                        &mut staged,
+                    )
+                    .await?;
+                }
+            }
+        }
+        if !artifacts.is_empty() {
+            return Err(Status::internal(
+                "v6 immutable staging plan left artifacts unassociated",
+            ));
+        }
+        Ok(staged)
+    }
+
+    async fn flush_inline_artifacts(
+        &self,
+        identities: &mut Vec<InlineArtifactIdentity>,
+        bytes: &mut Vec<Vec<u8>>,
+        staged: &mut Vec<StagedArtifact>,
+    ) -> Result<(), Status> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let blobs = self
+            .store
+            .stage_derived_progress_inline_blobs(bytes)
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        if blobs.len() != identities.len() || blobs.len() != bytes.len() {
+            return Err(Status::data_loss(
+                "staged v6 inline artifact result count differs from its input",
+            ));
+        }
+        for (identity, blob) in std::mem::take(identities).into_iter().zip(blobs) {
+            if blob.hash != identity.hash || blob.length != identity.length as u64 {
+                return Err(Status::data_loss(
+                    "staged v6 immutable artifact changed its exact bytes",
+                ));
+            }
+            staged.push(StagedArtifact {
+                path: identity.path,
+                kind: identity.kind,
+                hash: identity.hash,
+                blob,
+            });
+        }
+        bytes.clear();
+        Ok(())
+    }
+
     async fn stage(&self, bytes: &[u8]) -> Result<BlobRef, Status> {
         self.store
             .stage_derived_progress_blob(bytes)
@@ -1202,6 +1322,68 @@ impl V6ProjectionPublisher {
         }
         Ok(bytes)
     }
+}
+
+fn immutable_stage_windows(
+    lengths: impl IntoIterator<Item = usize>,
+) -> Result<Vec<ImmutableStageWindow>, Status> {
+    let mut windows = Vec::new();
+    let mut inline_items = 0_usize;
+    let mut inline_bytes = 0_usize;
+    for bytes in lengths {
+        if bytes > PAYLOAD_ARTIFACT_CHUNK_BYTES {
+            push_inline_stage_window(&mut windows, &mut inline_items, &mut inline_bytes);
+            windows.push(ImmutableStageWindow::Unary { bytes });
+            continue;
+        }
+        if !inline_window_fits(inline_items, inline_bytes, bytes) {
+            push_inline_stage_window(&mut windows, &mut inline_items, &mut inline_bytes);
+        }
+        inline_items += 1;
+        inline_bytes = inline_bytes.checked_add(bytes).ok_or_else(|| {
+            Status::resource_exhausted("v6 inline staging window byte count overflow")
+        })?;
+    }
+    push_inline_stage_window(&mut windows, &mut inline_items, &mut inline_bytes);
+    Ok(windows)
+}
+
+fn push_inline_stage_window(
+    windows: &mut Vec<ImmutableStageWindow>,
+    items: &mut usize,
+    bytes: &mut usize,
+) {
+    if *items != 0 {
+        windows.push(ImmutableStageWindow::Inline {
+            items: *items,
+            bytes: *bytes,
+        });
+        *items = 0;
+        *bytes = 0;
+    }
+}
+
+fn inline_window_fits(item_count: usize, byte_count: usize, next_bytes: usize) -> bool {
+    next_bytes <= PAYLOAD_ARTIFACT_CHUNK_BYTES
+        && item_count < MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS
+        && byte_count
+            .checked_add(next_bytes)
+            .and_then(|total| u64::try_from(total).ok())
+            .is_some_and(|total| total <= MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES)
+}
+
+fn staged_artifact(artifact: ArtifactBytes, blob: BlobRef) -> Result<StagedArtifact, Status> {
+    if blob.hash != artifact.hash || blob.length != artifact.bytes.len() as u64 {
+        return Err(Status::data_loss(
+            "staged v6 immutable artifact changed its exact bytes",
+        ));
+    }
+    Ok(StagedArtifact {
+        path: artifact.path,
+        kind: artifact.kind,
+        hash: artifact.hash,
+        blob,
+    })
 }
 
 fn plan_atomic_publication(
@@ -1660,8 +1842,90 @@ mod tests {
     }
 
     #[test]
-    fn immutable_failure_cannot_reach_the_current_phase() {
-        let outcomes = vec![
+    fn inline_staging_windows_enforce_every_store_bound() {
+        let maximum_batch_bytes = usize::try_from(MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES).unwrap();
+        assert!(inline_window_fits(0, 0, 0));
+        assert!(inline_window_fits(
+            MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS - 1,
+            0,
+            PAYLOAD_ARTIFACT_CHUNK_BYTES,
+        ));
+        assert!(!inline_window_fits(
+            MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS,
+            0,
+            1,
+        ));
+        assert!(inline_window_fits(
+            7,
+            7 * PAYLOAD_ARTIFACT_CHUNK_BYTES,
+            PAYLOAD_ARTIFACT_CHUNK_BYTES,
+        ));
+        assert!(!inline_window_fits(8, maximum_batch_bytes, 1));
+        assert!(!inline_window_fits(0, 0, PAYLOAD_ARTIFACT_CHUNK_BYTES + 1));
+    }
+
+    #[test]
+    fn mixed_inline_and_chunked_artifacts_keep_stage_order() {
+        let chunked = PAYLOAD_ARTIFACT_CHUNK_BYTES + 1;
+        assert_eq!(
+            immutable_stage_windows([1, 2, chunked, 3, chunked + 1, 4]).unwrap(),
+            vec![
+                ImmutableStageWindow::Inline { items: 2, bytes: 3 },
+                ImmutableStageWindow::Unary { bytes: chunked },
+                ImmutableStageWindow::Inline { items: 1, bytes: 3 },
+                ImmutableStageWindow::Unary { bytes: chunked + 1 },
+                ImmutableStageWindow::Inline { items: 1, bytes: 4 },
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_artifacts_partition_at_byte_and_item_limits() {
+        let maximum_batch_bytes = usize::try_from(MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES).unwrap();
+        assert_eq!(
+            immutable_stage_windows(std::iter::repeat_n(PAYLOAD_ARTIFACT_CHUNK_BYTES, 9)).unwrap(),
+            vec![
+                ImmutableStageWindow::Inline {
+                    items: 8,
+                    bytes: maximum_batch_bytes,
+                },
+                ImmutableStageWindow::Inline {
+                    items: 1,
+                    bytes: PAYLOAD_ARTIFACT_CHUNK_BYTES,
+                },
+            ]
+        );
+        assert_eq!(
+            immutable_stage_windows(std::iter::repeat_n(
+                1,
+                MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS + 1,
+            ))
+            .unwrap(),
+            vec![
+                ImmutableStageWindow::Inline {
+                    items: MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS,
+                    bytes: MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS,
+                },
+                ImmutableStageWindow::Inline { items: 1, bytes: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn current_phase_requires_every_immutable_publication() {
+        let successful = vec![
+            Ok(IndexArtifactOutcome {
+                version: VersionId(1),
+                replayed: false,
+            }),
+            Ok(IndexArtifactOutcome {
+                version: VersionId(2),
+                replayed: true,
+            }),
+        ];
+        assert!(require_all_immutable_publications(successful).is_ok());
+
+        let failed = vec![
             Ok(IndexArtifactOutcome {
                 version: VersionId(1),
                 replayed: false,
@@ -1669,7 +1933,7 @@ mod tests {
             Err(Status::unavailable("injected immutable failure")),
         ];
         let mut current_attempted = false;
-        if require_all_immutable_publications(outcomes).is_ok() {
+        if require_all_immutable_publications(failed).is_ok() {
             current_attempted = true;
         }
 

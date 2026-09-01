@@ -61,6 +61,18 @@ impl Store {
             .await
     }
 
+    /// Atomically stages one bounded set of trusted inline derived artifacts.
+    /// Every returned reference remains aligned with its input position. This
+    /// deliberately excludes chunked uploads, whose streaming lifecycle stays
+    /// on [`Store::stage_derived_progress_blob`].
+    #[doc(hidden)]
+    pub async fn stage_derived_progress_inline_blobs(
+        &self,
+        blobs: &[Vec<u8>],
+    ) -> Result<Vec<BlobRef>, MutationError> {
+        self.stage_derived_progress_inline_blob_batch(blobs).await
+    }
+
     /// Streaming counterpart to [`Store::stage_derived_progress_blob`].
     #[doc(hidden)]
     pub async fn seal_derived_progress_blob_upload(
