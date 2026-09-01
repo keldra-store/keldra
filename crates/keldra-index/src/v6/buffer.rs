@@ -41,6 +41,7 @@ pub struct BorrowedComponentDeltaRecord<'a> {
 pub struct ComponentDeltaCursor<'a> {
     component: ComponentIdentity,
     input: Decoder<'a>,
+    records: u64,
     remaining: usize,
     previous: Option<StableDocumentKey>,
 }
@@ -601,7 +602,8 @@ impl<'a> ComponentDeltaCursor<'a> {
             ));
         }
         let component = input.component()?;
-        let remaining = usize::try_from(input.u64()?).map_err(|_| IndexError::OffsetOverflow)?;
+        let records = input.u64()?;
+        let remaining = usize::try_from(records).map_err(|_| IndexError::OffsetOverflow)?;
         if remaining == 0 || remaining > input.remaining() / 33 {
             return Err(IndexError::InvalidFormat(
                 "projection delta record count is unbounded",
@@ -610,6 +612,7 @@ impl<'a> ComponentDeltaCursor<'a> {
         Ok(Self {
             component,
             input,
+            records,
             remaining,
             previous: None,
         })
@@ -617,6 +620,10 @@ impl<'a> ComponentDeltaCursor<'a> {
 
     pub const fn component(&self) -> ComponentIdentity {
         self.component
+    }
+
+    pub const fn record_count(&self) -> u64 {
+        self.records
     }
 
     pub fn next_record(&mut self) -> Result<Option<BorrowedComponentDeltaRecord<'a>>, IndexError> {

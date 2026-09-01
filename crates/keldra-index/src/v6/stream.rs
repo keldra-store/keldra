@@ -3,7 +3,7 @@ use super::buffer::{ComponentDeltaCursor, seal_component};
 use super::pack_component_deltas;
 use super::{
     ComponentIdentity, ComponentRoot, PackedComponentDelta, RecipeIdentity, SealedComponentDelta,
-    StableDocumentKey, decode_component_delta_segment,
+    StableDocumentKey,
 };
 use crate::IndexError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -538,17 +538,33 @@ pub fn lookup_component_record_in_pack(
     pack: &[u8],
     stable_key: StableDocumentKey,
 ) -> Result<ComponentRecordLookup, IndexError> {
-    let bytes = validate_artifact(component, descriptor, pack)?;
-    let decoded = decode_component_delta_segment(bytes)?;
-    let Ok(index) = decoded
-        .records
-        .binary_search_by_key(&stable_key, |record| record.stable_key)
-    else {
-        return Ok(ComponentRecordLookup::Missing);
-    };
-    Ok(match decoded.records[index].replacement.clone() {
-        Some(value) => ComponentRecordLookup::Value(value),
-        None => ComponentRecordLookup::Tombstone,
+    if *blake3::hash(pack).as_bytes() != descriptor.pack_hash {
+        return Err(IndexError::Integrity);
+    }
+    let start = usize::try_from(descriptor.pack_offset).map_err(|_| IndexError::OffsetOverflow)?;
+    let length =
+        usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::OffsetOverflow)?;
+    let end = start
+        .checked_add(length)
+        .ok_or(IndexError::OffsetOverflow)?;
+    let bytes = pack.get(start..end).ok_or(IndexError::Integrity)?;
+    if *blake3::hash(bytes).as_bytes() != descriptor.segment_hash {
+        return Err(IndexError::Integrity);
+    }
+    let mut cursor = ComponentDeltaCursor::new(bytes)?;
+    if cursor.component() != component || cursor.record_count() != descriptor.records {
+        return Err(IndexError::Integrity);
+    }
+    let mut selected = None;
+    while let Some(record) = cursor.next_record()? {
+        if record.stable_key == stable_key {
+            selected = Some(record.replacement);
+        }
+    }
+    Ok(match selected {
+        None => ComponentRecordLookup::Missing,
+        Some(None) => ComponentRecordLookup::Tombstone,
+        Some(Some(value)) => ComponentRecordLookup::Value(value.to_vec()),
     })
 }
 
@@ -1173,31 +1189,6 @@ fn append_subtree(
     }
 }
 
-fn validate_artifact<'a>(
-    component: ComponentIdentity,
-    descriptor: &ComponentSegmentDescriptor,
-    pack: &'a [u8],
-) -> Result<&'a [u8], IndexError> {
-    if *blake3::hash(pack).as_bytes() != descriptor.pack_hash {
-        return Err(IndexError::Integrity);
-    }
-    let start = usize::try_from(descriptor.pack_offset).map_err(|_| IndexError::OffsetOverflow)?;
-    let length =
-        usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::OffsetOverflow)?;
-    let end = start
-        .checked_add(length)
-        .ok_or(IndexError::OffsetOverflow)?;
-    let bytes = pack.get(start..end).ok_or(IndexError::Integrity)?;
-    if *blake3::hash(bytes).as_bytes() != descriptor.segment_hash {
-        return Err(IndexError::Integrity);
-    }
-    let decoded = decode_component_delta_segment(bytes)?;
-    if decoded.component != component || decoded.records.len() as u64 != descriptor.records {
-        return Err(IndexError::Integrity);
-    }
-    Ok(bytes)
-}
-
 fn validate_segments(segments: &[ComponentSegmentDescriptor]) -> Result<(), IndexError> {
     if segments.is_empty()
         || segments.len() > MAX_COMPONENT_STREAM_SEGMENTS
@@ -1640,6 +1631,10 @@ impl<'a> Decoder<'a> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "stream_lookup_tests.rs"]
+mod lookup_tests;
 
 #[cfg(test)]
 mod tests {
