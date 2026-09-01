@@ -43,11 +43,11 @@ use super::v6_query_compile::compile_v6_query;
 const _: [(); MAX_OBJECT_PATH_BYTES] = [(); keldra_index::v6::MAX_QUERY_DOCUMENT_PATH_BYTES];
 
 const CONTROL_OBJECT_MAX_BYTES: usize = 256 * 1024;
-// A D1 query retains slightly more than 2 MiB once its authorized candidates
-// and decoded run state overlap. Keep the mandatory grant above that measured
-// floor so fair-share contention cannot admit a query that is guaranteed to
-// fail after doing the artifact work.
-const MIN_QUERY_MEMORY_BYTES: u64 = 4 * 1024 * 1024;
+// D1 visibility queries have been measured retaining up to 4 MiB plus 980
+// bytes once authorized candidates and decoded run state overlap. Keep the
+// mandatory grant at the next power-of-two bound so fair-share contention
+// cannot admit a query that is guaranteed to fail after doing artifact work.
+const MIN_QUERY_MEMORY_BYTES: u64 = 8 * 1024 * 1024;
 const PREFERRED_QUERY_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const FRESHNESS_POLL: Duration = Duration::from_millis(25);
 
@@ -1037,6 +1037,18 @@ mod tests {
     use super::*;
     use keldra_index::v6::{ProjectionQueryStreamRoot, QueryAdmissionCandidate, StableDocumentKey};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn measured_query_floor_covers_qualification_concurrency() {
+        const QUALIFICATION_QUERY_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+        const QUALIFICATION_MAX_IN_FLIGHT: u64 = 32;
+
+        assert_eq!(MIN_QUERY_MEMORY_BYTES, 8 * 1024 * 1024);
+        assert!(
+            MIN_QUERY_MEMORY_BYTES * QUALIFICATION_MAX_IN_FLIGHT
+                <= QUALIFICATION_QUERY_MEMORY_BYTES
+        );
+    }
 
     fn partition(producer: u64, placement_index: u64) -> ProjectionPartitionIdentity {
         ProjectionPartitionIdentity::new([1; 32], 7, [2; 32], producer, 3, placement_index).unwrap()
