@@ -13,13 +13,20 @@ work_root="${experiment_root}/work/index-v6-scale"
 mode="${KELDRA_V6_SCALE_MODE:-smoke}"
 keep_work="${KELDRA_V6_SCALE_KEEP_WORK:-0}"
 base_port="${KELDRA_V6_SCALE_PORT:-51051}"
-server_rust_log="${KELDRA_V6_SCALE_RUST_LOG:-warn,keldra::index_runtime::v6_summary=info}"
+server_rust_log="${KELDRA_V6_SCALE_RUST_LOG:-warn,keldra::index_runtime::v6_summary=info,keldra::single_node_group_commit_config=info}"
 query_rate="${KELDRA_V6_SCALE_QUERY_RATE:-20}"
 query_max_in_flight="${KELDRA_V6_SCALE_QUERY_MAX_IN_FLIGHT:-32}"
 mutation_workers_override="${KELDRA_V6_SCALE_MUTATION_WORKERS:-}"
 lag_slope_limit="${KELDRA_V6_SCALE_MAX_LAG_SLOPE_RECORDS_PER_SECOND:-1}"
 source_journal_entries="${KELDRA_V6_SCALE_SOURCE_JOURNAL_MAX_ENTRIES:-10000000}"
 catalog_only_at_or_above="${KELDRA_V6_SCALE_CATALOG_ONLY_AT_OR_ABOVE_DEFINITIONS:-250000}"
+group_max_requests="${KELDRA_V6_SCALE_GROUP_MAX_REQUESTS:-}"
+group_max_operations="${KELDRA_V6_SCALE_GROUP_MAX_OPERATIONS:-}"
+group_max_inline_bytes="${KELDRA_V6_SCALE_GROUP_MAX_INLINE_BYTES:-}"
+group_max_queued_requests="${KELDRA_V6_SCALE_GROUP_MAX_QUEUED_REQUESTS:-}"
+group_max_queued_operations="${KELDRA_V6_SCALE_GROUP_MAX_QUEUED_OPERATIONS:-}"
+group_max_queued_inline_bytes="${KELDRA_V6_SCALE_GROUP_MAX_QUEUED_INLINE_BYTES:-}"
+group_dwell_microseconds="${KELDRA_V6_SCALE_GROUP_DWELL_MICROSECONDS:-}"
 
 case "${mode}" in
   smoke)
@@ -119,6 +126,24 @@ do
   positive_integer "${value}" || { echo "server, query, journal, and duration settings must be positive integers" >&2; exit 2; }
 done
 positive_number "${lag_slope_limit}" || { echo "lag-slope limit must be positive" >&2; exit 2; }
+for value in "${group_max_requests}" "${group_max_operations}" "${group_max_inline_bytes}" \
+  "${group_max_queued_requests}" "${group_max_queued_operations}" \
+  "${group_max_queued_inline_bytes}" "${group_dwell_microseconds}"
+do
+  [[ -z "${value}" ]] || positive_integer "${value}" || {
+    echo "KELDRA_V6_SCALE_GROUP_* overrides must be positive integers" >&2
+    exit 2
+  }
+done
+
+group_server_env=()
+[[ -z "${group_max_requests}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_REQUESTS=${group_max_requests}")
+[[ -z "${group_max_operations}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_OPERATIONS=${group_max_operations}")
+[[ -z "${group_max_inline_bytes}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_INLINE_BYTES=${group_max_inline_bytes}")
+[[ -z "${group_max_queued_requests}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_REQUESTS=${group_max_queued_requests}")
+[[ -z "${group_max_queued_operations}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_OPERATIONS=${group_max_queued_operations}")
+[[ -z "${group_max_queued_inline_bytes}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_INLINE_BYTES=${group_max_queued_inline_bytes}")
+[[ -z "${group_dwell_microseconds}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_GROUP_DWELL_MICROSECONDS=${group_dwell_microseconds}")
 
 mkdir -p "${results_root}" "${work_root}"
 chmod 0700 "${experiment_root}" "${results_root}" "${work_root}"
@@ -147,6 +172,13 @@ summary_rows="${run_dir}/cells.jsonl"
   echo "query_rate=${query_rate}"
   echo "query_max_in_flight=${query_max_in_flight}"
   echo "max_lag_slope_records_per_second=${lag_slope_limit}"
+  echo "group_max_requests=${group_max_requests:-server-default}"
+  echo "group_max_operations=${group_max_operations:-server-default}"
+  echo "group_max_inline_bytes=${group_max_inline_bytes:-server-default}"
+  echo "group_max_queued_requests=${group_max_queued_requests:-server-default}"
+  echo "group_max_queued_operations=${group_max_queued_operations:-server-default}"
+  echo "group_max_queued_inline_bytes=${group_max_queued_inline_bytes:-server-default}"
+  echo "group_dwell_microseconds=${group_dwell_microseconds:-server-default}"
   sha256sum "${kit_root}/bin/keldra-server" "${kit_root}/bin/keldra" \
     "${kit_root}/bin/index-contention-qualification"
   uname -srvmo; lscpu; free -h; df -hT "${experiment_root}"
@@ -201,7 +233,7 @@ sample_process() {
 
 start_server() {
   local port="$1" cell_work="$2" cell_root="$3" credential_file="$4" pipeline_memory_bytes="$5" workers="$6"
-  TMPDIR="${cell_work}/tmp" RUST_LOG="${server_rust_log}" \
+  env "${group_server_env[@]}" TMPDIR="${cell_work}/tmp" RUST_LOG="${server_rust_log}" \
   KELDRA_LISTEN="127.0.0.1:${port}" KELDRA_PEER_LISTEN="127.0.0.1:$((port + 1))" \
   KELDRA_DATA_DIR="${cell_work}" KELDRA_STATE_DIR="${cell_work}/state" \
   KELDRA_METADATA_DIR="${cell_work}/metadata" KELDRA_METADATA_WAL_DIR="${cell_work}/wal" \

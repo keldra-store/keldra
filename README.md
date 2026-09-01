@@ -594,6 +594,29 @@ the pipeline plus `KELDRA_INDEX_QUERY_MEMORY_BYTES`. Segment formation uses
 `KELDRA_INDEX_LSM_MAX_RUNS_PER_LEVEL` and
 `KELDRA_INDEX_LSM_MAX_UNMERGED_BYTES_PER_LEVEL`. These are node-wide controls.
 
+Single-node mutation group commit can be tuned without rebuilding the server.
+Pass a strict JSON file with `--config-file` or `KELDRA_CONFIG_FILE`:
+
+```json
+{
+  "single_node_group_commit": {
+    "max_requests": 10,
+    "max_operations": 5000,
+    "max_inline_bytes": 67108864,
+    "max_queued_requests": 64,
+    "max_queued_operations": 8000,
+    "max_queued_inline_bytes": 134217728,
+    "group_dwell_microseconds": 250
+  }
+}
+```
+
+Each field also has a `KELDRA_SINGLE_NODE_GROUP_COMMIT_*` environment variable
+and a matching `--single-node-group-commit-*` argument. Precedence is command
+line, then environment, then JSON file, then the compiled default. The server
+rejects zero or contradictory bounds and logs the complete effective group
+configuration at startup.
+
 `BulkWrite` accepts at most 1,000 operations and 64 MiB of encoded protobuf.
 Its independent server deadline defaults to ten minutes and is configured with
 `KELDRA_BULK_WRITE_TIMEOUT_SECONDS`; a shorter client `grpc-timeout` still wins.

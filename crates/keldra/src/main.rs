@@ -10,10 +10,16 @@ use keldra::{
     ExplicitAuthoritativePaths, IndexRuntimeConfig, PluginGatewayConfig, ServerConfig,
     StoragePaths, serve,
 };
+use keldra_store::SingleNodeGroupCommitConfig;
+use serde::Deserialize;
 
 #[derive(Debug, Parser)]
 #[command(name = "keldra-server", version, about = "Keldra object server")]
 struct Arguments {
+    /// JSON server configuration. Command-line and environment values take precedence.
+    #[arg(long, env = "KELDRA_CONFIG_FILE")]
+    config_file: Option<PathBuf>,
+
     #[arg(long, env = "KELDRA_LISTEN", default_value = "127.0.0.1:50051")]
     listen: SocketAddr,
 
@@ -324,9 +330,94 @@ struct Arguments {
         default_value_t = keldra_store::DEFAULT_WATCH_MAX_BYTES
     )]
     source_journal_max_bytes: u64,
+
+    #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_REQUESTS")]
+    single_node_group_commit_max_requests: Option<usize>,
+
+    #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_OPERATIONS")]
+    single_node_group_commit_max_operations: Option<usize>,
+
+    #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_INLINE_BYTES")]
+    single_node_group_commit_max_inline_bytes: Option<usize>,
+
+    #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_REQUESTS")]
+    single_node_group_commit_max_queued_requests: Option<usize>,
+
+    #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_OPERATIONS")]
+    single_node_group_commit_max_queued_operations: Option<usize>,
+
+    #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_INLINE_BYTES")]
+    single_node_group_commit_max_queued_inline_bytes: Option<usize>,
+
+    #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_GROUP_DWELL_MICROSECONDS")]
+    single_node_group_commit_group_dwell_microseconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileConfig {
+    single_node_group_commit: FileSingleNodeGroupCommitConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileSingleNodeGroupCommitConfig {
+    max_requests: Option<usize>,
+    max_operations: Option<usize>,
+    max_inline_bytes: Option<usize>,
+    max_queued_requests: Option<usize>,
+    max_queued_operations: Option<usize>,
+    max_queued_inline_bytes: Option<usize>,
+    group_dwell_microseconds: Option<u64>,
 }
 
 impl Arguments {
+    fn file_config(&self) -> Result<FileConfig> {
+        let Some(path) = &self.config_file else {
+            return Ok(FileConfig::default());
+        };
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read server configuration from {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse server configuration from {}", path.display()))
+    }
+
+    fn single_node_group_commit_config(
+        &self,
+        file: &FileConfig,
+    ) -> Result<SingleNodeGroupCommitConfig> {
+        let defaults = SingleNodeGroupCommitConfig::default();
+        let file = &file.single_node_group_commit;
+        let default_dwell_microseconds = u64::try_from(defaults.max_group_dwell().as_micros())
+            .expect("default group dwell fits in u64 microseconds");
+        SingleNodeGroupCommitConfig::new(
+            self.single_node_group_commit_max_requests
+                .or(file.max_requests)
+                .unwrap_or(defaults.max_group_requests()),
+            self.single_node_group_commit_max_operations
+                .or(file.max_operations)
+                .unwrap_or(defaults.max_group_operations()),
+            self.single_node_group_commit_max_inline_bytes
+                .or(file.max_inline_bytes)
+                .unwrap_or(defaults.max_group_inline_bytes()),
+            self.single_node_group_commit_max_queued_requests
+                .or(file.max_queued_requests)
+                .unwrap_or(defaults.max_queued_requests()),
+            self.single_node_group_commit_max_queued_operations
+                .or(file.max_queued_operations)
+                .unwrap_or(defaults.max_queued_operations()),
+            self.single_node_group_commit_max_queued_inline_bytes
+                .or(file.max_queued_inline_bytes)
+                .unwrap_or(defaults.max_queued_inline_bytes()),
+            std::time::Duration::from_micros(
+                self.single_node_group_commit_group_dwell_microseconds
+                    .or(file.group_dwell_microseconds)
+                    .unwrap_or(default_dwell_microseconds),
+            ),
+        )
+        .context("validate single-node group commit configuration")
+    }
+
     fn storage_paths(&self) -> (StoragePaths, ExplicitAuthoritativePaths) {
         let explicit = ExplicitAuthoritativePaths {
             state: self.state_dir.is_some(),
@@ -410,6 +501,8 @@ impl Arguments {
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    let file_config = arguments.file_config()?;
+    let single_node_group_commit = arguments.single_node_group_commit_config(&file_config)?;
     let (storage, explicit_authoritative_paths) = arguments.storage_paths();
     let erasure_profile = arguments.erasure_profile()?;
     let index_runtime = arguments.index_runtime_config()?;
@@ -474,6 +567,7 @@ async fn main() -> Result<()> {
         max_mutation_receipt_bytes: arguments.max_mutation_receipt_bytes,
         source_journal_max_entries: arguments.source_journal_max_entries,
         source_journal_max_bytes: arguments.source_journal_max_bytes,
+        single_node_group_commit,
     })
     .await;
     let observability_result = observability.shutdown().await;
@@ -731,5 +825,59 @@ mod tests {
         ] {
             assert!(help.contains(live), "help omitted {live}");
         }
+    }
+
+    #[test]
+    fn group_commit_defaults_remain_store_defaults() {
+        assert_eq!(
+            parse(&[])
+                .single_node_group_commit_config(&FileConfig::default())
+                .unwrap(),
+            SingleNodeGroupCommitConfig::default()
+        );
+    }
+
+    #[test]
+    fn command_line_or_environment_group_commit_values_override_file() {
+        let arguments = parse(&[
+            "--single-node-group-commit-max-requests",
+            "10",
+            "--single-node-group-commit-group-dwell-microseconds",
+            "900",
+        ]);
+        let file = serde_json::from_str::<FileConfig>(
+            r#"{
+                "single_node_group_commit": {
+                    "max_requests": 7,
+                    "max_operations": 7000,
+                    "group_dwell_microseconds": 500
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = arguments.single_node_group_commit_config(&file).unwrap();
+        assert_eq!(config.max_group_requests(), 10);
+        assert_eq!(config.max_group_operations(), 7_000);
+        assert_eq!(
+            config.max_group_dwell(),
+            std::time::Duration::from_micros(900)
+        );
+    }
+
+    #[test]
+    fn config_file_schema_rejects_unknown_fields() {
+        let root_error = serde_json::from_str::<FileConfig>(r#"{"other": {}}"#).unwrap_err();
+        assert!(root_error.to_string().contains("unknown field `other`"));
+
+        let nested_error = serde_json::from_str::<FileConfig>(
+            r#"{"single_node_group_commit":{"maximum_requests":10}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            nested_error
+                .to_string()
+                .contains("unknown field `maximum_requests`")
+        );
     }
 }
