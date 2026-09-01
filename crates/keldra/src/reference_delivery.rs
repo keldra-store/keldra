@@ -16,9 +16,9 @@ use std::sync::Arc;
 use keldra_consensus::{ClusterId, NodeId};
 use keldra_store::{
     BlobRef, DestinationReferenceArtifact, DestinationReferenceDelta, ErasureProfile, LocalChange,
-    MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectMutation, PlacementLogId, ReferenceDeltaApplied,
-    ReferenceDeltaBatch, ReferenceProof, ReferenceProofMutation, RetainedVersionDeleteMutation,
-    ShardIdentity, SourceId, Store,
+    MAX_INBOUND_OBJECT_LINKS, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChangeKind,
+    ObjectMutation, PlacementLogId, ReferenceDeltaApplied, ReferenceDeltaBatch, ReferenceProof,
+    ReferenceProofMutation, RetainedVersionDeleteMutation, ShardIdentity, SourceId, Store,
 };
 use thiserror::Error;
 
@@ -179,6 +179,93 @@ impl QuorumReferenceCommitAuthority {
         }
     }
 
+    fn source_proof_for_change(
+        &self,
+        source: SourceId,
+        change: &LocalChange,
+    ) -> Result<Option<SourceReferenceProof>, String> {
+        let exact = self
+            .source
+            .read_reference_proof(source, change.offset())
+            .map_err(|error| format!("source reference proof is unavailable: {error}"))?;
+        if let Some(expected) = exact {
+            if expected.source_id != source
+                || expected.offset() != change.offset()
+                || expected.change != *change
+            {
+                return Err("source reference proof does not match its journal event".into());
+            }
+            let path = reference_object_path(change)?;
+            return Ok(Some(SourceReferenceProof {
+                expected,
+                tenant_id: path.tenant_id,
+                bucket_id: path.bucket_id,
+                exact_path: path.exact_path.to_owned(),
+            }));
+        }
+
+        let LocalChange::ObjectHead(alias) = change else {
+            return Ok(None);
+        };
+        let Some(canonical_path) = alias.canonical_path.as_deref() else {
+            return Ok(None);
+        };
+        // One validated object mutation owns the canonical event followed by
+        // its sorted, bounded alias expansion. The primary proof retains that
+        // exact snapshot, so recovery can derive an alias without creating a
+        // second proof format or treating the alias as self-authoritative.
+        let maximum_distance = alias
+            .offset
+            .saturating_sub(1)
+            .min(MAX_INBOUND_OBJECT_LINKS as u64);
+        for distance in 1..=maximum_distance {
+            let primary_offset = alias.offset - distance;
+            let Some(expected) = self
+                .source
+                .read_reference_proof(source, primary_offset)
+                .map_err(|error| format!("source reference proof is unavailable: {error}"))?
+            else {
+                continue;
+            };
+            let ReferenceProofMutation::Object(mutation) = &expected.mutation else {
+                continue;
+            };
+            let Some(snapshot) = mutation.alias_snapshot.as_ref() else {
+                continue;
+            };
+            let Ok(alias_index) = usize::try_from(distance - 1) else {
+                continue;
+            };
+            let deleted = matches!(alias.kind, ObjectHeadChangeKind::Delete);
+            if expected.source_id == source
+                && expected.offset() == primary_offset
+                && mutation.tenant_id == alias.tenant_id
+                && mutation.bucket_id == alias.bucket_id
+                && mutation.exact_path == canonical_path
+                && mutation.version.id == alias.path_version
+                && mutation.version.deleted == deleted
+                && alias.program_commit_cursor.is_none()
+                && alias.reference_deltas.is_empty()
+                && alias.accounting_transition.is_none()
+                && alias.definition_transition.is_none()
+                && snapshot
+                    .registry
+                    .aliases
+                    .get(alias_index)
+                    .map(String::as_str)
+                    == Some(alias.exact_path.as_str())
+            {
+                return Ok(Some(SourceReferenceProof {
+                    expected,
+                    tenant_id: alias.tenant_id,
+                    bucket_id: alias.bucket_id,
+                    exact_path: canonical_path.to_owned(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     pub(crate) fn with_redrive(
         mut self,
         peers: Arc<dyn ReferenceMutationPeers>,
@@ -278,8 +365,23 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
             .placement
             .current()
             .map_err(|error| format!("current placement is unavailable: {error}"))?;
-        let path = reference_object_path(change)?;
-        let placement_key = object_placement_key(path.tenant_id, path.bucket_id, path.exact_path);
+        let source_proof = self.source_proof_for_change(source, change)?;
+        let fallback_path = reference_object_path(change)?;
+        let (expected, tenant_id, bucket_id, exact_path) = match source_proof {
+            Some(proof) => (
+                Some(proof.expected),
+                proof.tenant_id,
+                proof.bucket_id,
+                proof.exact_path,
+            ),
+            None => (
+                None,
+                fallback_path.tenant_id,
+                fallback_path.bucket_id,
+                fallback_path.exact_path.to_owned(),
+            ),
+        };
+        let placement_key = object_placement_key(tenant_id, bucket_id, &exact_path);
         let group = MutableRecordReplicaGroup::select(
             PlacementKind::Object,
             started.cluster_id(),
@@ -295,10 +397,6 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
                 group.coordinator().0
             ));
         }
-        let expected = self
-            .source
-            .read_reference_proof(source, change.offset())
-            .map_err(|error| format!("source reference proof is unavailable: {error}"))?;
         let Some(expected) = expected else {
             let local_source = self
                 .source
@@ -318,20 +416,14 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
             }
             return Err("source reference proof is missing".to_owned());
         };
-        if expected.source_id != source
-            || expected.offset() != change.offset()
-            || expected.change != *change
-        {
-            return Err("source reference proof does not match its journal event".into());
-        }
 
         let request = ReferenceProofRead {
             placement_fence: started.fence(),
             source,
-            offset: change.offset(),
-            tenant_id: path.tenant_id,
-            bucket_id: path.bucket_id,
-            exact_path: path.exact_path.to_owned(),
+            offset: expected.offset(),
+            tenant_id,
+            bucket_id,
+            exact_path,
         };
         let mut exact = 0_usize;
         let mut absent = 0_usize;
@@ -341,7 +433,7 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
         for replica in group.replicas() {
             let observed = if *replica == local_node {
                 self.source
-                    .read_reference_proof(source, change.offset())
+                    .read_reference_proof(source, expected.offset())
                     .map_err(|error| error.to_string())
             } else if let Some(address) = started.address(*replica) {
                 self.peers
@@ -387,7 +479,7 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
             for replica in group.replicas() {
                 let observed = if *replica == local_node {
                     self.source
-                        .read_reference_proof(source, change.offset())
+                        .read_reference_proof(source, expected.offset())
                         .map_err(|error| error.to_string())
                 } else if let Some(address) = started.address(*replica) {
                     self.peers
@@ -436,6 +528,13 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
             "reference-proof quorum is unresolved between {exact} exact and {absent} absent replicas"
         ))
     }
+}
+
+struct SourceReferenceProof {
+    expected: ReferenceProof,
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_path: String,
 }
 
 struct ReferenceObjectPath<'a> {
