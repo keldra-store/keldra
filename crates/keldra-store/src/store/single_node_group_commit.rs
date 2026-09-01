@@ -284,6 +284,14 @@ impl SingleNodeGroupCommit {
                 locked_setup_seconds = metrics.locked_setup.as_secs_f64(),
                 locked_prefetch_seconds = metrics.locked_prefetch.as_secs_f64(),
                 evaluate_seconds = metrics.evaluate.as_secs_f64(),
+                evaluation_current_precondition_governance_seconds = metrics
+                    .evaluation_subphases
+                    .current_precondition_governance
+                    .as_secs_f64(),
+                evaluation_mutation_planning_seconds = metrics
+                    .evaluation_subphases
+                    .mutation_planning
+                    .as_secs_f64(),
                 evaluation_mutation_construction_validation_seconds = metrics
                     .evaluation_subphases
                     .mutation_construction_validation
@@ -291,6 +299,10 @@ impl SingleNodeGroupCommit {
                 evaluation_mutation_construction_validation_operations = metrics
                     .evaluation_subphases
                     .mutation_construction_validation_operations,
+                evaluation_durable_record_encoding_seconds = metrics
+                    .evaluation_subphases
+                    .durable_record_encoding
+                    .as_secs_f64(),
                 evaluation_inline_payload_receipt_stage_seconds = metrics
                     .evaluation_subphases
                     .inline_payload_receipt_stage
@@ -298,6 +310,18 @@ impl SingleNodeGroupCommit {
                 evaluation_inline_payload_receipt_stage_operations = metrics
                     .evaluation_subphases
                     .inline_payload_receipt_stage_operations,
+                evaluation_blob_lifecycle_stage_seconds = metrics
+                    .evaluation_subphases
+                    .blob_lifecycle_stage
+                    .as_secs_f64(),
+                evaluation_object_state_stage_seconds = metrics
+                    .evaluation_subphases
+                    .object_state_stage
+                    .as_secs_f64(),
+                evaluation_coordinator_bookkeeping_seconds = metrics
+                    .evaluation_subphases
+                    .coordinator_bookkeeping
+                    .as_secs_f64(),
                 evaluation_proof_construction_seconds = metrics
                     .evaluation_subphases
                     .proof_construction
@@ -317,6 +341,10 @@ impl SingleNodeGroupCommit {
                 evaluation_proof_validate_encode_stage_proofs = metrics
                     .evaluation_subphases
                     .proof_validate_encode_stage_proofs,
+                evaluation_proof_bookkeeping_seconds = metrics
+                    .evaluation_subphases
+                    .proof_bookkeeping
+                    .as_secs_f64(),
                 evaluation_uncategorized_seconds = evaluation_uncategorized.as_secs_f64(),
                 stage_seconds = metrics.stage.as_secs_f64(),
                 db_write_sync_seconds = metrics.persist.as_secs_f64(),

@@ -19,8 +19,7 @@ const MAX_EXPIRED_RECEIPTS_PRUNED_PER_PASS: usize = 1_024;
 const MAX_EXPIRED_RECEIPT_BYTES_PRUNED_PER_PASS: u64 = 4 * 1024 * 1024;
 
 impl Store {
-    /// Preserve the one-node physical WriteBatch path while evaluating the
-    /// coordinator-reconciled bucket options supplied by the cluster layer.
+    /// One-node WriteBatch request with coordinator-reconciled bucket options.
     pub async fn mutate_with_governance(
         &self,
         operation: BatchOperation,
@@ -59,8 +58,7 @@ impl Store {
         .result
     }
 
-    /// Trusted single-node definition mutation. The typed intent is converted
-    /// to a version-bound transition inside the same commit batch.
+    /// Trusted definition mutation converted to a transition in the same batch.
     pub async fn mutate_definition_with_governance(
         &self,
         operation: BatchOperation,
@@ -103,9 +101,7 @@ impl Store {
         .result
     }
 
-    /// Evaluates independent operations in request order and persists all
-    /// successful outcomes with one physical RocksDB write. A failed
-    /// precondition is an item result, not a reason to retry the whole bulk.
+    /// Evaluates operations in order and persists successful outcomes in one write.
     pub async fn bulk_write(&self, operations: Vec<BatchOperation>) -> Vec<BatchOutcome> {
         self.bulk_write_inner(
             operations,
@@ -117,8 +113,7 @@ impl Store {
         .await
     }
 
-    /// Applies one coordinator batch with capacity backpressure while retaining
-    /// the original payloads and command replay contract across retries.
+    /// Applies a coordinator batch while preserving payloads and replay semantics.
     pub async fn bulk_write_with_backpressure(
         &self,
         operations: Vec<BatchOperation>,
@@ -448,10 +443,7 @@ impl Store {
         self.wait_for_mutation_capacity().await;
         wait.complete();
     }
-    /// Evaluates and durably applies one exact-path mutation on its current
-    /// coordinator, returning the complete bounded result peers must apply.
-    /// Network routing, replica selection, and acknowledgement policy remain
-    /// outside the storage kernel.
+    /// Applies one exact-path mutation; routing and acknowledgement remain outside storage.
     pub async fn coordinate_object_mutation(
         &self,
         operation: BatchOperation,
@@ -681,9 +673,7 @@ impl Store {
             mutation: evaluated.mutation,
         })
     }
-    /// Applies one coordinator-produced exact-path result to a complete
-    /// metadata replica. Content reference counts are deliberately not
-    /// changed here; their actual owners consume the ordered source journal.
+    /// Applies a coordinator result; reference owners consume the source journal.
     pub async fn apply_object_mutation_replica(
         &self,
         mutation: &ObjectMutation,
@@ -1297,10 +1287,7 @@ impl Store {
         Ok(pruned)
     }
 
-    /// Persist one bounded receipt-expiry maintenance pass while a writer is
-    /// waiting for capacity. Keeping this separate from the rejected mutation
-    /// guarantees progress even when that mutation's WriteBatch must be
-    /// discarded atomically.
+    /// Persists receipt expiry separately so a rejected WriteBatch stays atomic.
     pub(super) async fn prune_expired_receipts_for_capacity(&self) -> Result<bool, MutationError> {
         let _commit_guard = self.lock_commit("receipt_pruning").await;
         let now = now_unix_millis()?;
@@ -1430,6 +1417,7 @@ impl Store {
         definition_intent: Option<DefinitionMutationIntent>,
         evaluation_subphases: &mut EvaluationSubphaseMetrics,
     ) -> Result<EvaluatedOperation, MutationError> {
+        let mut timing = evaluation_subphases.start();
         let key = operation.key();
         let encoded_key = operation.encoded_head_key();
         let receipt_key = operation
@@ -1464,6 +1452,7 @@ impl Store {
                     .object_mutation
                     .as_ref()
                     .and_then(|mutation| mutation.alias_snapshot.clone());
+                evaluation_subphases.record_since(EvaluationSubphase::CurrentGovernance, timing);
                 return Ok(EvaluatedOperation {
                     receipt: MutationReceipt {
                         command_id: operation.command_id().map(str::to_owned),
@@ -1508,10 +1497,7 @@ impl Store {
                 None => self.head_by_storage_key(&encoded_key)?,
             },
         };
-        // Keep the complete durable predecessor record for the rest of this
-        // evaluation. Its retention state drives both reference retirement
-        // and descriptor transition below; re-reading the same key would add
-        // two point gets while the commit fence is held.
+        // Retain the durable predecessor: re-reading it adds two fenced point gets.
         let current_stored_version = match current.as_ref() {
             Some(head) if !pending_versions.contains_key(&encoded_key) => Some(
                 match read_cache.stored_version(&encoded_key) {
@@ -1611,8 +1597,7 @@ impl Store {
                 return Err(MutationError::ImmutablePolicyRequired);
             }
             Some(PutMode::PutImmutable) => {
-                // Handled below: publish once or return an identical-content
-                // semantic replay without advancing the path version.
+                // Publish once or replay identical content without a new version.
             }
             Some(_) | None if immutable_path => {
                 return Err(MutationError::Immutable);
@@ -1667,6 +1652,7 @@ impl Store {
                     self.stage_definition_transition(batch, transition)
                         .map_err(definition_mutation_error)?;
                 }
+                evaluation_subphases.record_since(EvaluationSubphase::CurrentGovernance, timing);
                 return Ok(EvaluatedOperation {
                     receipt: MutationReceipt {
                         command_id: operation.command_id().map(str::to_owned),
@@ -1687,6 +1673,8 @@ impl Store {
         }
         check_precondition(operation.precondition(), current.as_ref())?;
 
+        evaluation_subphases.record_since(EvaluationSubphase::CurrentGovernance, timing);
+        timing = evaluation_subphases.start();
         let id = self.clock.next().map_err(storage_error)?;
         let deleted = matches!(operation, PreparedOperation::Delete { .. });
         let new_blob = match operation {
@@ -1773,6 +1761,7 @@ impl Store {
         } else {
             0
         };
+        evaluation_subphases.record_since(EvaluationSubphase::Planning, timing);
         evaluation_subphases.count_mutation_construction_validation();
         let object_mutation = evaluation_subphases.measure(
             EvaluationSubphase::MutationConstructionValidation,
@@ -1819,6 +1808,7 @@ impl Store {
                     .transpose()
             },
         )?;
+        timing = evaluation_subphases.start();
         let head = Head {
             version: id,
             deleted,
@@ -1837,6 +1827,7 @@ impl Store {
         let mut blob_reference_updates = Vec::with_capacity(2);
         let materialize_inline =
             distributed.is_some_and(|distributed| distributed.materialize_inline_payload);
+        evaluation_subphases.record_since(EvaluationSubphase::DurableEncoding, timing);
         evaluation_subphases.count_inline_payload_receipt_stage();
         let (inline_payload_value, reservation) =
             evaluation_subphases.measure(EvaluationSubphase::InlinePayloadReceiptStage, || {
@@ -1850,6 +1841,7 @@ impl Store {
                     now_unix_millis,
                 )
             })?;
+        timing = evaluation_subphases.start();
         blob_reference_updates.extend(reservation);
         if apply_content_lifecycle
             && !released_same_as_new
@@ -1879,6 +1871,7 @@ impl Store {
             };
             blob_reference_updates.push(update);
         }
+        evaluation_subphases.record_since(EvaluationSubphase::BlobLifecycle, timing);
         let expires_at =
             evaluation_subphases.measure(EvaluationSubphase::InlinePayloadReceiptStage, || {
                 self.stage_mutation_receipt(
@@ -1902,8 +1895,11 @@ impl Store {
             evaluation_subphases.measure(EvaluationSubphase::InlinePayloadReceiptStage, || {
                 self.stage_inline_complete_artifact(batch, reference, &bytes)
             })?;
+            timing = evaluation_subphases.start();
             pending_inline_payloads.insert(key);
+            evaluation_subphases.record_since(EvaluationSubphase::BlobLifecycle, timing);
         }
+        timing = evaluation_subphases.start();
         for (key, state) in blob_reference_updates {
             let prefetched = read_cache.blob_reference_by_key(&key);
             self.stage_blob_reference_update_cached(
@@ -1973,6 +1969,8 @@ impl Store {
                 ));
             }
         }
+        evaluation_subphases.record_since(EvaluationSubphase::BlobLifecycle, timing);
+        timing = evaluation_subphases.start();
         batch.put_cf(versions, encoded_version_key, encoded_version);
         batch.put_cf(heads, &encoded_key, encoded_head);
         if let Some(transition) = definition_transition.as_ref() {
@@ -1981,7 +1979,7 @@ impl Store {
         }
         pending_heads.insert(encoded_key.clone(), head);
         pending_versions.insert(encoded_key, version);
-        Ok(EvaluatedOperation {
+        let evaluated = EvaluatedOperation {
             receipt: MutationReceipt {
                 command_id: operation.command_id().map(str::to_owned),
                 fingerprint,
@@ -1995,6 +1993,8 @@ impl Store {
             accounting_transition: Some(accounting_transition),
             definition_transition,
             alias_snapshot,
-        })
+        };
+        evaluation_subphases.record_since(EvaluationSubphase::ObjectState, timing);
+        Ok(evaluated)
     }
 }

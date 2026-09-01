@@ -500,17 +500,21 @@ impl Store {
                 .collect::<Result<Vec<_>, _>>()
         })?;
         evaluation_subphases.count_proofs(proofs.len());
+        let mut bookkeeping_started = evaluation_subphases.start();
         let cf = self.cf(CF_LOCAL_INVALIDATIONS)?;
         for chunk in proofs.chunks(REFERENCE_PROOF_KEYS_PER_MULTI_GET) {
             let keys = chunk
                 .iter()
                 .map(|proof| reference_proof_key(proof.source_id, proof.offset()))
                 .collect::<Vec<_>>();
+            evaluation_subphases
+                .record_since(EvaluationSubphase::ProofBookkeeping, bookkeeping_started);
             let fetched =
                 evaluation_subphases.measure(EvaluationSubphase::ProofMultiGetLookup, || {
                     self.db
                         .multi_get_cf(keys.iter().map(|key| (cf, key.as_slice())))
                 });
+            bookkeeping_started = evaluation_subphases.start();
             if fetched.len() != chunk.len() {
                 return Err(MutationError::Storage(
                     "reference-proof bulk lookup returned the wrong result count".into(),
@@ -518,9 +522,14 @@ impl Store {
             }
             for ((proof, key), existing) in chunk.iter().zip(keys).zip(fetched) {
                 evaluation_subphases
+                    .record_since(EvaluationSubphase::ProofBookkeeping, bookkeeping_started);
+                evaluation_subphases
                     .measure(EvaluationSubphase::ProofValidateEncodeStage, || {
                         validate_stored_proof(proof).map_err(MutationError::InvalidObjectMutation)
                     })?;
+                bookkeeping_started = evaluation_subphases.start();
+                evaluation_subphases
+                    .record_since(EvaluationSubphase::ProofBookkeeping, bookkeeping_started);
                 evaluation_subphases.measure(
                     EvaluationSubphase::ProofValidateEncodeStage,
                     || {
@@ -541,8 +550,11 @@ impl Store {
                         Ok(())
                     },
                 )?;
+                bookkeeping_started = evaluation_subphases.start();
             }
         }
+        evaluation_subphases
+            .record_since(EvaluationSubphase::ProofBookkeeping, bookkeeping_started);
         Ok(())
     }
 }

@@ -378,6 +378,7 @@ impl Store {
                     &mut evaluation_subphases,
                 )
                 .await;
+            let coordinator_bookkeeping_started = evaluation_subphases.start();
             if outcome
                 .as_ref()
                 .is_err_and(|error| matches!(error, MutationError::ReceiptCapacity))
@@ -426,11 +427,20 @@ impl Store {
                     mutation: value.mutation,
                 }),
             );
+            evaluation_subphases.record_since(
+                super::evaluation_telemetry::EvaluationSubphase::Coordinator,
+                coordinator_bookkeeping_started,
+            );
         }
-        let proof_mutations = evaluated
-            .values()
-            .filter_map(|outcome| outcome.as_ref().ok()?.mutation.as_ref())
-            .collect::<Vec<_>>();
+        let proof_mutations = evaluation_subphases.measure(
+            super::evaluation_telemetry::EvaluationSubphase::Coordinator,
+            || {
+                evaluated
+                    .values()
+                    .filter_map(|outcome| outcome.as_ref().ok()?.mutation.as_ref())
+                    .collect::<Vec<_>>()
+            },
+        );
         self.stage_object_mutation_reference_proofs(
             &mut batch,
             &proof_mutations,
