@@ -32,6 +32,5 @@ pub(crate) mod v6_query_compile;
 pub(crate) mod v6_query_runtime;
 pub(crate) mod v6_removal_quiescence;
 pub(crate) mod v6_retention;
-pub(crate) mod v6_reuse_shadow;
 pub(crate) mod v6_telemetry;
 pub(crate) mod working_memory;

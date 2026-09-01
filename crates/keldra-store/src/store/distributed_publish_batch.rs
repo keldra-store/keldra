@@ -2,9 +2,7 @@
 
 use super::evaluation_telemetry::EvaluationSubphaseMetrics;
 use super::journal_capacity::SourceJournalAdmission;
-use super::mutation_prefetch::{
-    MutationPreparationMetrics, MutationReadCache, MutationReadSpeculation,
-};
+use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::DistributedEvaluationContext;
 use super::single_node_group_commit::{SingleNodeOperations, SingleNodeOutcomes};
 use super::*;
@@ -13,25 +11,8 @@ use crate::{BatchOperation, DefinitionMutationIntent};
 
 struct PreparedDistributedMutation {
     index: usize,
-    operation: Arc<PreparedOperation>,
+    operation: PreparedOperation,
     definition_intent: Option<DefinitionMutationIntent>,
-}
-
-pub(super) struct PreparedSingleNodeMutationGroup {
-    inputs: PreparedMutationInputs,
-    speculative: Result<MutationReadSpeculation, MutationError>,
-    speculative_duration: std::time::Duration,
-    pub(super) snapshot_completed: std::time::Instant,
-    context: ObjectMutationContext,
-    preparation_lanes: usize,
-}
-
-struct PreparedMutationInputs {
-    total: usize,
-    prepared: Vec<PreparedDistributedMutation>,
-    early: BTreeMap<usize, MutationError>,
-    bucket_governance: BTreeMap<Vec<u8>, ObjectMutationGovernance>,
-    prepare_duration: std::time::Duration,
 }
 
 struct CoordinatedBatchEvaluation {
@@ -128,37 +109,12 @@ pub(super) struct CoordinatorBatchMetrics {
     pub(super) write_batch_entries: u64,
     pub(super) write_batch_bytes: u64,
     pub(super) physical_commit: bool,
-    pub(super) preparation: MutationPreparationMetrics,
-    pub(super) speculative_prefetch: std::time::Duration,
-    pub(super) speculative_revalidation: std::time::Duration,
-    pub(super) speculative_revalidation_keys: u64,
-    pub(super) speculative_retries: u64,
-    pub(super) speculative_fallbacks: u64,
-    pub(super) snapshot_age: std::time::Duration,
 }
 
 #[derive(Clone, Copy)]
 enum CoordinatorBatchPayloadPreparation {
     Distributed,
-    SingleNode { preparation_lanes: usize },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SpeculativePrefetchDisposition {
-    Accept,
-    Retry,
-    LockedFallback,
-}
-
-fn speculative_prefetch_disposition(
-    attempt: u8,
-    unchanged: Option<bool>,
-) -> SpeculativePrefetchDisposition {
-    match unchanged {
-        Some(true) => SpeculativePrefetchDisposition::Accept,
-        Some(false) | None if attempt == 1 => SpeculativePrefetchDisposition::Retry,
-        Some(false) | None => SpeculativePrefetchDisposition::LockedFallback,
-    }
+    SingleNode,
 }
 
 impl Store {
@@ -179,7 +135,6 @@ impl Store {
                 operations,
                 context,
                 CoordinatorBatchPayloadPreparation::Distributed,
-                None,
             )
             .await?;
         if evaluated.receipt_capacity_at.is_some() {
@@ -232,92 +187,15 @@ impl Store {
         operations: SingleNodeOperations,
         context: ObjectMutationContext,
         request_operation_counts: &[usize],
-        preparation_lanes: usize,
     ) -> (Vec<SingleNodeOutcomes>, Option<CoordinatorBatchMetrics>) {
         let total = operations.len();
         let evaluated = self
             .coordinate_mutation_batch(
                 operations,
                 context,
-                CoordinatorBatchPayloadPreparation::SingleNode { preparation_lanes },
-                None,
+                CoordinatorBatchPayloadPreparation::SingleNode,
             )
             .await;
-        self.finish_single_node_mutation_group(total, request_operation_counts, evaluated)
-            .await
-    }
-
-    pub(super) async fn prepare_single_node_mutation_group_ahead(
-        &self,
-        operations: SingleNodeOperations,
-        context: ObjectMutationContext,
-        preparation_lanes: usize,
-    ) -> Result<PreparedSingleNodeMutationGroup, MutationError> {
-        if context.serving_fence_term == 0 {
-            return Err(MutationError::InvalidObjectMutation(
-                "serving-fence term must be non-zero".into(),
-            ));
-        }
-        let inputs = self
-            .prepare_mutation_inputs(
-                operations,
-                CoordinatorBatchPayloadPreparation::SingleNode { preparation_lanes },
-            )
-            .await;
-        let operation_refs = inputs
-            .prepared
-            .iter()
-            .map(|item| Arc::clone(&item.operation))
-            .collect::<Vec<_>>();
-        let governed_buckets = inputs
-            .bucket_governance
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let started = std::time::Instant::now();
-        let speculative = MutationReadSpeculation::load(
-            self,
-            &operation_refs,
-            preparation_lanes,
-            &governed_buckets,
-        )
-        .await;
-        Ok(PreparedSingleNodeMutationGroup {
-            inputs,
-            speculative,
-            speculative_duration: started.elapsed(),
-            snapshot_completed: std::time::Instant::now(),
-            context,
-            preparation_lanes,
-        })
-    }
-
-    pub(super) async fn finalize_prepared_single_node_mutation_group(
-        &self,
-        prepared: PreparedSingleNodeMutationGroup,
-        request_operation_counts: &[usize],
-    ) -> (Vec<SingleNodeOutcomes>, Option<CoordinatorBatchMetrics>) {
-        let total = prepared.inputs.total;
-        let context = prepared.context;
-        let preparation_lanes = prepared.preparation_lanes;
-        let evaluated = self
-            .coordinate_mutation_batch(
-                Vec::new(),
-                context,
-                CoordinatorBatchPayloadPreparation::SingleNode { preparation_lanes },
-                Some(prepared),
-            )
-            .await;
-        self.finish_single_node_mutation_group(total, request_operation_counts, evaluated)
-            .await
-    }
-
-    async fn finish_single_node_mutation_group(
-        &self,
-        total: usize,
-        request_operation_counts: &[usize],
-        evaluated: Result<CoordinatedBatchEvaluation, MutationError>,
-    ) -> (Vec<SingleNodeOutcomes>, Option<CoordinatorBatchMetrics>) {
         let mut evaluated = match evaluated {
             Ok(evaluated) => evaluated,
             Err(error) => {
@@ -404,15 +282,30 @@ impl Store {
         (responses, Some(evaluated.metrics))
     }
 
-    async fn prepare_mutation_inputs(
+    async fn coordinate_mutation_batch(
         &self,
         operations: Vec<(
             BatchOperation,
             ObjectMutationGovernance,
             Option<DefinitionMutationIntent>,
         )>,
+        context: ObjectMutationContext,
         payload_preparation: CoordinatorBatchPayloadPreparation,
-    ) -> PreparedMutationInputs {
+    ) -> Result<CoordinatedBatchEvaluation, MutationError> {
+        let total_started = std::time::Instant::now();
+        if context.serving_fence_term == 0 {
+            return Err(MutationError::InvalidObjectMutation(
+                "serving-fence term must be non-zero".into(),
+            ));
+        }
+        if operations.is_empty() {
+            return Ok(CoordinatedBatchEvaluation {
+                outcomes: Vec::new(),
+                receipt_capacity_at: None,
+                metrics: CoordinatorBatchMetrics::default(),
+            });
+        }
+
         let total = operations.len();
         let mut prepared = Vec::with_capacity(total);
         let mut early = BTreeMap::new();
@@ -459,7 +352,7 @@ impl Store {
                 CoordinatorBatchPayloadPreparation::Distributed => {
                     self.prepare(operation, identity, true).await
                 }
-                CoordinatorBatchPayloadPreparation::SingleNode { .. } => {
+                CoordinatorBatchPayloadPreparation::SingleNode => {
                     self.prepare_single_node_coordinated(operation, identity)
                         .await
                 }
@@ -467,7 +360,7 @@ impl Store {
             match operation {
                 Ok(operation) => prepared.push(PreparedDistributedMutation {
                     index,
-                    operation: Arc::new(operation),
+                    operation,
                     definition_intent,
                 }),
                 Err(error) => {
@@ -475,63 +368,7 @@ impl Store {
                 }
             }
         }
-        PreparedMutationInputs {
-            total,
-            prepared,
-            early,
-            bucket_governance,
-            prepare_duration: prepare_started.elapsed(),
-        }
-    }
-
-    async fn coordinate_mutation_batch(
-        &self,
-        operations: Vec<(
-            BatchOperation,
-            ObjectMutationGovernance,
-            Option<DefinitionMutationIntent>,
-        )>,
-        context: ObjectMutationContext,
-        payload_preparation: CoordinatorBatchPayloadPreparation,
-        prepared_ahead: Option<PreparedSingleNodeMutationGroup>,
-    ) -> Result<CoordinatedBatchEvaluation, MutationError> {
-        let total_started = std::time::Instant::now();
-        if context.serving_fence_term == 0 {
-            return Err(MutationError::InvalidObjectMutation(
-                "serving-fence term must be non-zero".into(),
-            ));
-        }
-        if prepared_ahead.is_none() && operations.is_empty() {
-            return Ok(CoordinatedBatchEvaluation {
-                outcomes: Vec::new(),
-                receipt_capacity_at: None,
-                metrics: CoordinatorBatchMetrics::default(),
-            });
-        }
-
-        let (inputs, mut initial_speculation, initial_speculative_duration, snapshot_completed) =
-            match prepared_ahead {
-                Some(prepared) => (
-                    prepared.inputs,
-                    Some(prepared.speculative),
-                    prepared.speculative_duration,
-                    Some(prepared.snapshot_completed),
-                ),
-                None => (
-                    self.prepare_mutation_inputs(operations, payload_preparation)
-                        .await,
-                    None,
-                    std::time::Duration::ZERO,
-                    None,
-                ),
-            };
-        let PreparedMutationInputs {
-            total,
-            mut prepared,
-            mut early,
-            bucket_governance,
-            prepare_duration,
-        } = inputs;
+        let prepare_duration = prepare_started.elapsed();
 
         let policy_wait_started = std::time::Instant::now();
         let _policy_guard = self.policy_gate.read().await;
@@ -547,134 +384,9 @@ impl Store {
             )
             .await;
         let path_wait_duration = path_wait_started.elapsed();
-        let operation_refs = prepared
-            .iter()
-            .map(|item| Arc::clone(&item.operation))
-            .collect::<Vec<_>>();
-        let governed_buckets = bucket_governance.keys().cloned().collect::<BTreeSet<_>>();
-        let mut speculative_cache = None;
-        let mut speculative_prefetch_duration = initial_speculative_duration;
-        let mut speculative_revalidation_duration = std::time::Duration::ZERO;
-        let mut speculative_revalidation_keys = 0_u64;
-        let mut speculative_retries = 0_u64;
-        let mut speculative_fallbacks = 0_u64;
-        let mut snapshot_age = std::time::Duration::ZERO;
-        let mut preparation_metrics = match payload_preparation {
-            CoordinatorBatchPayloadPreparation::Distributed => {
-                MutationPreparationMetrics::default()
-            }
-            CoordinatorBatchPayloadPreparation::SingleNode { preparation_lanes } => {
-                MutationPreparationMetrics {
-                    configured_lanes: preparation_lanes,
-                    ..MutationPreparationMetrics::default()
-                }
-            }
-        };
         let commit_wait_started = std::time::Instant::now();
-        let _commit_guard = match payload_preparation {
-            CoordinatorBatchPayloadPreparation::Distributed => {
-                self.lock_commit("distributed_publish").await
-            }
-            CoordinatorBatchPayloadPreparation::SingleNode { preparation_lanes } => {
-                let mut attempt = 0_u8;
-                loop {
-                    attempt += 1;
-                    let speculative = if attempt == 1 {
-                        match initial_speculation.take() {
-                            Some(speculative) => speculative,
-                            None => {
-                                let prefetch_started = std::time::Instant::now();
-                                let speculative = MutationReadSpeculation::load(
-                                    self,
-                                    &operation_refs,
-                                    preparation_lanes,
-                                    &governed_buckets,
-                                )
-                                .await;
-                                speculative_prefetch_duration = speculative_prefetch_duration
-                                    .saturating_add(prefetch_started.elapsed());
-                                speculative
-                            }
-                        }
-                    } else {
-                        let prefetch_started = std::time::Instant::now();
-                        let speculative = MutationReadSpeculation::load(
-                            self,
-                            &operation_refs,
-                            preparation_lanes,
-                            &governed_buckets,
-                        )
-                        .await;
-                        speculative_prefetch_duration = speculative_prefetch_duration
-                            .saturating_add(prefetch_started.elapsed());
-                        speculative
-                    };
-                    let Ok(speculative) = speculative else {
-                        match speculative_prefetch_disposition(attempt, None) {
-                            SpeculativePrefetchDisposition::Retry => {
-                                speculative_retries += 1;
-                                continue;
-                            }
-                            SpeculativePrefetchDisposition::LockedFallback => {
-                                speculative_fallbacks += 1;
-                                break self.lock_commit("distributed_publish").await;
-                            }
-                            SpeculativePrefetchDisposition::Accept => unreachable!(),
-                        }
-                    };
-                    preparation_metrics = speculative.metrics;
-                    let guard = self.lock_commit("distributed_publish").await;
-                    if attempt == 1 {
-                        snapshot_age = snapshot_completed
-                            .map_or(std::time::Duration::ZERO, |completed| completed.elapsed());
-                    }
-                    let revalidation_started = std::time::Instant::now();
-                    let revalidated = speculative.revalidate(self);
-                    speculative_revalidation_duration = speculative_revalidation_duration
-                        .saturating_add(revalidation_started.elapsed());
-                    let unchanged = match revalidated {
-                        Ok(revalidated) => {
-                            speculative_revalidation_keys = speculative_revalidation_keys
-                                .saturating_add(
-                                    u64::try_from(revalidated.checked_keys).unwrap_or(u64::MAX),
-                                );
-                            debug_assert_eq!(revalidated.checked_keys, speculative.token_len());
-                            Some(revalidated.unchanged)
-                        }
-                        Err(_) => None,
-                    };
-                    match speculative_prefetch_disposition(attempt, unchanged) {
-                        SpeculativePrefetchDisposition::Accept => {
-                            tracing::info!(
-                                target: "keldra_store::single_node_preparation_lanes",
-                                configured_lanes = speculative.metrics.configured_lanes,
-                                effective_lanes = speculative.metrics.effective_lanes,
-                                components = speculative.metrics.components,
-                                largest_component_operations =
-                                    speculative.metrics.largest_component_operations,
-                                peak_active_lanes = speculative.metrics.peak_active_lanes,
-                                "single-node mutation preparation lanes completed"
-                            );
-                            speculative_cache = Some(speculative.cache);
-                            break guard;
-                        }
-                        SpeculativePrefetchDisposition::Retry => {
-                            speculative_retries += 1;
-                            drop(guard);
-                            continue;
-                        }
-                        SpeculativePrefetchDisposition::LockedFallback => {
-                            speculative_fallbacks += 1;
-                            break guard;
-                        }
-                    }
-                }
-            }
-        };
-        let commit_wait_duration = commit_wait_started
-            .elapsed()
-            .saturating_sub(speculative_prefetch_duration)
-            .saturating_sub(speculative_revalidation_duration);
+        let _commit_guard = self.lock_commit("distributed_publish").await;
+        let commit_wait_duration = commit_wait_started.elapsed();
         let commit_hold_started = std::time::Instant::now();
         let locked_setup_started = std::time::Instant::now();
         let mut reserved = BTreeMap::new();
@@ -696,7 +408,7 @@ impl Store {
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         let reference_effects = match payload_preparation {
             CoordinatorBatchPayloadPreparation::Distributed => LocalReferenceEffects::Deferred,
-            CoordinatorBatchPayloadPreparation::SingleNode { .. } => {
+            CoordinatorBatchPayloadPreparation::SingleNode => {
                 let cursor = self.reference_delta_cursor(source.source_id).map_err(|error| {
                     MutationError::Storage(format!(
                         "cannot read local reference cursor before single-node coordination: {error}"
@@ -731,23 +443,13 @@ impl Store {
             self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
         let locked_setup_duration = locked_setup_started.elapsed();
         let locked_prefetch_started = std::time::Instant::now();
-        let read_cache = match speculative_cache {
-            Some(cache) => cache,
-            None => {
-                let operations = prepared
-                    .iter()
-                    .map(|item| item.operation.as_ref())
-                    .collect::<Vec<_>>();
-                match payload_preparation {
-                    CoordinatorBatchPayloadPreparation::Distributed => {
-                        MutationReadCache::load(self, &operations)?
-                    }
-                    CoordinatorBatchPayloadPreparation::SingleNode { .. } => {
-                        MutationReadCache::load_governed(self, &operations, &governed_buckets)?
-                    }
-                }
-            }
-        };
+        let read_cache = MutationReadCache::load(
+            self,
+            &prepared
+                .iter()
+                .map(|item| &item.operation)
+                .collect::<Vec<_>>(),
+        )?;
         let locked_prefetch_duration = locked_prefetch_started.elapsed();
         let mut pending_heads = BTreeMap::new();
         let mut pending_versions = BTreeMap::new();
@@ -768,7 +470,7 @@ impl Store {
         let mut receipt_capacity_exhausted = false;
         let mut receipt_capacity_at = None;
         let mut evaluation_subphases = match payload_preparation {
-            CoordinatorBatchPayloadPreparation::SingleNode { .. } => {
+            CoordinatorBatchPayloadPreparation::SingleNode => {
                 EvaluationSubphaseMetrics::single_node_group()
             }
             CoordinatorBatchPayloadPreparation::Distributed => EvaluationSubphaseMetrics::default(),
@@ -798,7 +500,7 @@ impl Store {
                         reference_effects,
                         materialize_inline_payload: matches!(
                             payload_preparation,
-                            CoordinatorBatchPayloadPreparation::SingleNode { .. }
+                            CoordinatorBatchPayloadPreparation::SingleNode
                         ),
                     }),
                     item.definition_intent,
@@ -924,22 +626,6 @@ impl Store {
             });
         }
         let commit_hold_duration = commit_hold_started.elapsed();
-        if matches!(
-            payload_preparation,
-            CoordinatorBatchPayloadPreparation::SingleNode { .. }
-        ) {
-            tracing::info!(
-                target: "keldra_store::single_node_speculative_prefetch",
-                speculative_prefetch_seconds = speculative_prefetch_duration.as_secs_f64(),
-                speculative_revalidation_seconds =
-                    speculative_revalidation_duration.as_secs_f64(),
-                speculative_revalidation_keys,
-                speculative_retries,
-                speculative_fallbacks,
-                snapshot_age_seconds = snapshot_age.as_secs_f64(),
-                "single-node speculative mutation prefetch completed"
-            );
-        }
         let outcome = CoordinatedBatchEvaluation {
             outcomes,
             receipt_capacity_at,
@@ -960,13 +646,6 @@ impl Store {
                 write_batch_entries,
                 write_batch_bytes,
                 physical_commit,
-                preparation: preparation_metrics,
-                speculative_prefetch: speculative_prefetch_duration,
-                speculative_revalidation: speculative_revalidation_duration,
-                speculative_revalidation_keys,
-                speculative_retries,
-                speculative_fallbacks,
-                snapshot_age,
             },
         };
         Ok(outcome)
@@ -1258,24 +937,6 @@ mod tests {
     use crate::{
         OBJECT_ALIAS_REGISTRY_FORMAT, ObjectAliasRegistry, ObjectAliasSnapshot, PlacementLogId,
     };
-
-    #[test]
-    fn speculative_prefetch_retries_once_then_uses_locked_fallback() {
-        assert_eq!(
-            speculative_prefetch_disposition(1, Some(true)),
-            SpeculativePrefetchDisposition::Accept
-        );
-        for failure in [Some(false), None] {
-            assert_eq!(
-                speculative_prefetch_disposition(1, failure),
-                SpeculativePrefetchDisposition::Retry
-            );
-            assert_eq!(
-                speculative_prefetch_disposition(2, failure),
-                SpeculativePrefetchDisposition::LockedFallback
-            );
-        }
-    }
 
     fn request(path: &str, command: &str, blob: BlobRef) -> PublishRequest {
         PublishRequest {

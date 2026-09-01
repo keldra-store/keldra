@@ -733,7 +733,6 @@ async fn select_mutation(
                     &current.generation,
                     scope,
                     &mutation.path,
-                    input.bytes(),
                 )
                 .await?
         }

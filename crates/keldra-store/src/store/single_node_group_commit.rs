@@ -7,7 +7,6 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 
 use super::Store;
-use super::distributed_publish_batch::PreparedSingleNodeMutationGroup;
 use crate::{
     BatchOperation, CoordinatedObjectMutation, DefinitionMutationIntent, MutationError,
     ObjectMutationContext, ObjectMutationGovernance,
@@ -16,8 +15,6 @@ use crate::{
 const DEFAULT_MAX_GROUP_REQUESTS: usize = 5;
 const DEFAULT_MAX_GROUP_OPERATIONS: usize = 5_000;
 const DEFAULT_MAX_GROUP_INLINE_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_PREPARATION_LANES: usize = 1;
-const DEFAULT_MAX_PREPARED_GROUPS: usize = 1;
 const DEFAULT_MAX_QUEUED_REQUESTS: usize = 64;
 const DEFAULT_MAX_QUEUED_OPERATIONS: usize = 8_000;
 const DEFAULT_MAX_QUEUED_INLINE_BYTES: usize = 128 * 1024 * 1024;
@@ -33,8 +30,6 @@ pub struct SingleNodeGroupCommitConfig {
     max_group_requests: usize,
     max_group_operations: usize,
     max_group_inline_bytes: usize,
-    preparation_lanes: usize,
-    max_prepared_groups: usize,
     max_queued_requests: usize,
     max_queued_operations: usize,
     max_queued_inline_bytes: usize,
@@ -47,8 +42,6 @@ impl SingleNodeGroupCommitConfig {
         max_group_requests: usize,
         max_group_operations: usize,
         max_group_inline_bytes: usize,
-        preparation_lanes: usize,
-        max_prepared_groups: usize,
         max_queued_requests: usize,
         max_queued_operations: usize,
         max_queued_inline_bytes: usize,
@@ -58,8 +51,6 @@ impl SingleNodeGroupCommitConfig {
             ("maximum group requests", max_group_requests),
             ("maximum group operations", max_group_operations),
             ("maximum group inline bytes", max_group_inline_bytes),
-            ("preparation lanes", preparation_lanes),
-            ("maximum prepared groups", max_prepared_groups),
             ("maximum queued requests", max_queued_requests),
             ("maximum queued operations", max_queued_operations),
             ("maximum queued inline bytes", max_queued_inline_bytes),
@@ -71,16 +62,8 @@ impl SingleNodeGroupCommitConfig {
             "maximum group dwell must be non-zero"
         );
         anyhow::ensure!(
-            preparation_lanes <= max_group_operations,
-            "preparation lanes must not exceed maximum group operations"
-        );
-        anyhow::ensure!(
             max_group_requests <= max_queued_requests,
             "maximum group requests must not exceed maximum queued requests"
-        );
-        anyhow::ensure!(
-            max_prepared_groups <= max_queued_requests,
-            "maximum prepared groups must not exceed maximum queued requests"
         );
         anyhow::ensure!(
             max_group_operations <= max_queued_operations,
@@ -107,8 +90,6 @@ impl SingleNodeGroupCommitConfig {
             max_group_requests,
             max_group_operations,
             max_group_inline_bytes,
-            preparation_lanes,
-            max_prepared_groups,
             max_queued_requests,
             max_queued_operations,
             max_queued_inline_bytes,
@@ -126,14 +107,6 @@ impl SingleNodeGroupCommitConfig {
 
     pub fn max_group_inline_bytes(&self) -> usize {
         self.max_group_inline_bytes
-    }
-
-    pub fn preparation_lanes(&self) -> usize {
-        self.preparation_lanes
-    }
-
-    pub fn max_prepared_groups(&self) -> usize {
-        self.max_prepared_groups
     }
 
     pub fn max_queued_requests(&self) -> usize {
@@ -159,8 +132,6 @@ impl Default for SingleNodeGroupCommitConfig {
             DEFAULT_MAX_GROUP_REQUESTS,
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
-            DEFAULT_PREPARATION_LANES,
-            DEFAULT_MAX_PREPARED_GROUPS,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -207,29 +178,6 @@ struct QueuePermits {
     _request: tokio::sync::OwnedSemaphorePermit,
     _operations: tokio::sync::OwnedSemaphorePermit,
     _inline_bytes: tokio::sync::OwnedSemaphorePermit,
-}
-
-struct PreparedPipelineGroup {
-    sequence: u64,
-    operation_counts: Vec<usize>,
-    replies: Vec<(oneshot::Sender<SingleNodeOutcomes>, QueuePermits)>,
-    request_count: usize,
-    operation_count: usize,
-    inline_bytes: usize,
-    queued_requests: usize,
-    stop_reason: &'static str,
-    dwell_duration: Duration,
-    preparation_started: std::time::Instant,
-    handle: tokio::task::JoinHandle<PipelinePreparation>,
-}
-
-enum PipelinePreparation {
-    Ahead(Result<PreparedSingleNodeMutationGroup, MutationError>),
-    Ordered {
-        operations: SingleNodeOperations,
-        context: ObjectMutationContext,
-        reason: &'static str,
-    },
 }
 
 impl SingleNodeCommitRequest {
@@ -285,10 +233,6 @@ pub(super) struct SingleNodeGroupCommit {
     settlement_attempts: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     fail_next_settlement: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(test)]
-    preparation_delays: Arc<Mutex<VecDeque<Duration>>>,
-    #[cfg(test)]
-    preparation_completions: Arc<Mutex<Vec<u64>>>,
 }
 
 impl SingleNodeGroupCommit {
@@ -303,10 +247,6 @@ impl SingleNodeGroupCommit {
             settlement_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             fail_next_settlement: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            #[cfg(test)]
-            preparation_delays: Arc::new(Mutex::new(VecDeque::new())),
-            #[cfg(test)]
-            preparation_completions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -336,16 +276,6 @@ impl SingleNodeGroupCommit {
     fn fail_next_settlement(&self) {
         self.fail_next_settlement
             .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    async fn inject_preparation_delays(&self, delays: impl IntoIterator<Item = Duration>) {
-        self.preparation_delays.lock().await.extend(delays);
-    }
-
-    #[cfg(test)]
-    async fn preparation_completions(&self) -> Vec<u64> {
-        self.preparation_completions.lock().await.clone()
     }
 
     #[cfg(test)]
@@ -433,14 +363,6 @@ impl SingleNodeGroupCommit {
     }
 
     async fn run(self, store: Store) {
-        if self.config.max_prepared_groups() == 1 {
-            self.run_direct(store).await;
-        } else {
-            self.run_pipelined(store).await;
-        }
-    }
-
-    async fn run_direct(self, store: Store) {
         loop {
             let dwell_started = std::time::Instant::now();
             tokio::time::sleep(self.config.max_group_dwell).await;
@@ -529,12 +451,7 @@ impl SingleNodeGroupCommit {
             let operation_count = operations.len();
             let execute_started = std::time::Instant::now();
             let (results, metrics) = store
-                .coordinate_single_node_mutation_group(
-                    operations,
-                    context,
-                    &operation_counts,
-                    self.config.preparation_lanes(),
-                )
+                .coordinate_single_node_mutation_group(operations, context, &operation_counts)
                 .await;
             let execute_duration = execute_started.elapsed();
             let failed_requests = results.iter().filter(|result| result.is_err()).count();
@@ -553,25 +470,6 @@ impl SingleNodeGroupCommit {
                 dwell_seconds = dwell_duration.as_secs_f64(),
                 execute_seconds = execute_duration.as_secs_f64(),
                 prepare_seconds = metrics.prepare.as_secs_f64(),
-                preparation_configured_lanes = metrics.preparation.configured_lanes,
-                preparation_effective_lanes = metrics.preparation.effective_lanes,
-                preparation_peak_active_lanes = metrics.preparation.peak_active_lanes,
-                preparation_lane_jobs = metrics.preparation.lane_jobs,
-                preparation_summed_lane_queue_wait_seconds =
-                    metrics.preparation.summed_lane_queue_wait.as_secs_f64(),
-                preparation_summed_lane_service_seconds =
-                    metrics.preparation.summed_lane_service.as_secs_f64(),
-                preparation_components = metrics.preparation.components,
-                preparation_largest_component_operations =
-                    metrics.preparation.largest_component_operations,
-                preparation_speculative_prefetch_seconds =
-                    metrics.speculative_prefetch.as_secs_f64(),
-                preparation_speculative_revalidation_seconds =
-                    metrics.speculative_revalidation.as_secs_f64(),
-                preparation_speculative_revalidation_keys =
-                    metrics.speculative_revalidation_keys,
-                preparation_speculative_retries = metrics.speculative_retries,
-                preparation_speculative_fallbacks = metrics.speculative_fallbacks,
                 policy_wait_seconds = metrics.policy_wait.as_secs_f64(),
                 path_wait_seconds = metrics.path_wait.as_secs_f64(),
                 commit_wait_seconds = metrics.commit_wait.as_secs_f64(),
@@ -659,396 +557,13 @@ impl SingleNodeGroupCommit {
             }
         }
     }
-
-    async fn run_pipelined(self, store: Store) {
-        let configured_depth = self.config.max_prepared_groups();
-        let mut pipeline = VecDeque::<PreparedPipelineGroup>::new();
-        let mut sequence = 0_u64;
-        let mut peak_prepared_groups = 0_usize;
-        let mut previous_finalize = None::<(std::time::Instant, std::time::Instant)>;
-        loop {
-            while pipeline.len() < configured_depth {
-                let dwell_started = std::time::Instant::now();
-                tokio::time::sleep(self.config.max_group_dwell()).await;
-                let dwell_duration = dwell_started.elapsed();
-                let Some((requests, queued_requests, stop_reason)) = self.take_next_group().await
-                else {
-                    break;
-                };
-                let request_count = requests.len();
-                let operation_counts = requests
-                    .iter()
-                    .map(SingleNodeCommitRequest::operation_count)
-                    .collect::<Vec<_>>();
-                let context = requests[0].context;
-                let inline_bytes = requests.iter().fold(0_usize, |total, request| {
-                    total.saturating_add(request.inline_bytes())
-                });
-                let mut operations = Vec::with_capacity(operation_counts.iter().sum());
-                let mut replies = Vec::with_capacity(request_count);
-                for request in requests {
-                    operations.extend(request.operations);
-                    replies.push((request.response, request._queue_permits));
-                }
-                let operation_count = operations.len();
-                let ordered_reason =
-                    operations
-                        .iter()
-                        .find_map(|(operation, _, _)| match operation {
-                            BatchOperation::Publish(_) => Some("publish_authority"),
-                            BatchOperation::Put(request)
-                                if request.bytes.len() > super::PAYLOAD_ARTIFACT_CHUNK_BYTES =>
-                            {
-                                Some("large_put_side_effect")
-                            }
-                            BatchOperation::Put(_)
-                            | BatchOperation::Clone(_)
-                            | BatchOperation::Delete(_) => None,
-                        });
-                let preparation_started = std::time::Instant::now();
-                let preparation_store = store.clone();
-                let preparation_lanes = self.config.preparation_lanes();
-                #[cfg(test)]
-                let preparation_delay = self
-                    .preparation_delays
-                    .lock()
-                    .await
-                    .pop_front()
-                    .unwrap_or(Duration::ZERO);
-                #[cfg(test)]
-                let preparation_completions = Arc::clone(&self.preparation_completions);
-                #[cfg(test)]
-                let group_sequence = sequence;
-                let handle = tokio::spawn(async move {
-                    if let Some(reason) = ordered_reason {
-                        return PipelinePreparation::Ordered {
-                            operations,
-                            context,
-                            reason,
-                        };
-                    }
-                    #[cfg(test)]
-                    tokio::time::sleep(preparation_delay).await;
-                    let result = preparation_store
-                        .prepare_single_node_mutation_group_ahead(
-                            operations,
-                            context,
-                            preparation_lanes,
-                        )
-                        .await;
-                    #[cfg(test)]
-                    preparation_completions.lock().await.push(group_sequence);
-                    PipelinePreparation::Ahead(result)
-                });
-                pipeline.push_back(PreparedPipelineGroup {
-                    sequence,
-                    operation_counts,
-                    replies,
-                    request_count,
-                    operation_count,
-                    inline_bytes,
-                    queued_requests,
-                    stop_reason,
-                    dwell_duration,
-                    preparation_started,
-                    handle,
-                });
-                sequence = sequence.saturating_add(1);
-                peak_prepared_groups = peak_prepared_groups.max(pipeline.len());
-            }
-
-            let Some(group) = pipeline.pop_front() else {
-                let mut state = self.state.lock().await;
-                if state.requests.is_empty() {
-                    state.worker_running = false;
-                    return;
-                }
-                continue;
-            };
-            let effective_prepared_groups = usize::from(group.handle.is_finished()).saturating_add(
-                pipeline
-                    .iter()
-                    .filter(|prepared| prepared.handle.is_finished())
-                    .count(),
-            );
-            let order_wait_started = std::time::Instant::now();
-            let prepared = match group.handle.await {
-                Ok(result) => result,
-                Err(error) => PipelinePreparation::Ahead(Err(MutationError::Storage(format!(
-                    "single-node prepared-group task failed: {error}"
-                )))),
-            };
-            let finalize_started = std::time::Instant::now();
-            let (results, metrics, snapshot_completed, preparation_succeeded) = match prepared {
-                PipelinePreparation::Ahead(Ok(prepared)) => {
-                    let snapshot_completed = prepared.snapshot_completed;
-                    let (results, metrics) = store
-                        .finalize_prepared_single_node_mutation_group(
-                            prepared,
-                            &group.operation_counts,
-                        )
-                        .await;
-                    (results, metrics, Some(snapshot_completed), true)
-                }
-                PipelinePreparation::Ahead(Err(error)) => (
-                    group
-                        .operation_counts
-                        .iter()
-                        .map(|_| Err(error.clone()))
-                        .collect(),
-                    None,
-                    None,
-                    false,
-                ),
-                PipelinePreparation::Ordered {
-                    operations,
-                    context,
-                    reason,
-                } => {
-                    tracing::info!(
-                        target: "keldra_store::single_node_prepared_group_pipeline",
-                        sequence = group.sequence,
-                        reason,
-                        monotonic_counter.keldra_store_prepared_group_ordered_fallbacks_total = 1_u64,
-                        "single-node prepared group requires ordered preparation"
-                    );
-                    let (results, metrics) = store
-                        .coordinate_single_node_mutation_group(
-                            operations,
-                            context,
-                            &group.operation_counts,
-                            self.config.preparation_lanes(),
-                        )
-                        .await;
-                    (results, metrics, None, false)
-                }
-            };
-            let finalize_completed = std::time::Instant::now();
-            let metrics = metrics.unwrap_or_default();
-            let preparation_duration = snapshot_completed.map_or(
-                order_wait_started.duration_since(group.preparation_started),
-                |completed| completed.duration_since(group.preparation_started),
-            );
-            let ready_wait = snapshot_completed.map_or(Duration::ZERO, |completed| {
-                finalize_started.saturating_duration_since(completed)
-            });
-            let overlap = previous_finalize.map_or(Duration::ZERO, |(started, completed)| {
-                let overlap_start = group.preparation_started.max(started);
-                let overlap_end = snapshot_completed
-                    .unwrap_or(order_wait_started)
-                    .min(completed);
-                overlap_end.saturating_duration_since(overlap_start)
-            });
-            tracing::info!(
-                target: "keldra_store::single_node_prepared_group_pipeline",
-                sequence = group.sequence,
-                configured_prepared_groups = configured_depth,
-                effective_prepared_groups,
-                peak_prepared_groups,
-                preparation_seconds = preparation_duration.as_secs_f64(),
-                ready_wait_seconds = ready_wait.as_secs_f64(),
-                snapshot_age_seconds = metrics.snapshot_age.as_secs_f64(),
-                speculative_stale_components = metrics.speculative_retries,
-                speculative_retries = metrics.speculative_retries,
-                speculative_fallbacks = metrics.speculative_fallbacks,
-                overlap_seconds = overlap.as_secs_f64(),
-                preparation_succeeded,
-                phase_complete = metrics.total != Duration::ZERO,
-                "single-node prepared group finalized"
-            );
-            let failed_requests = results.iter().filter(|result| result.is_err()).count();
-            tracing::info!(
-                target: "keldra_store::single_node_group_commit_phases",
-                attempts = 1_u64,
-                physical_commits = metrics.physical_commit as u64,
-                request_count = group.request_count,
-                operation_count = group.operation_count,
-                inline_bytes = group.inline_bytes,
-                failed_requests,
-                dwell_seconds = group.dwell_duration.as_secs_f64(),
-                execute_seconds = finalize_completed
-                    .duration_since(group.preparation_started)
-                    .as_secs_f64(),
-                prepare_seconds = metrics.prepare.as_secs_f64(),
-                preparation_configured_lanes = metrics.preparation.configured_lanes,
-                preparation_effective_lanes = metrics.preparation.effective_lanes,
-                preparation_peak_active_lanes = metrics.preparation.peak_active_lanes,
-                preparation_lane_jobs = metrics.preparation.lane_jobs,
-                preparation_summed_lane_queue_wait_seconds =
-                    metrics.preparation.summed_lane_queue_wait.as_secs_f64(),
-                preparation_summed_lane_service_seconds =
-                    metrics.preparation.summed_lane_service.as_secs_f64(),
-                preparation_components = metrics.preparation.components,
-                preparation_largest_component_operations =
-                    metrics.preparation.largest_component_operations,
-                preparation_speculative_prefetch_seconds =
-                    metrics.speculative_prefetch.as_secs_f64(),
-                preparation_speculative_revalidation_seconds =
-                    metrics.speculative_revalidation.as_secs_f64(),
-                preparation_speculative_revalidation_keys =
-                    metrics.speculative_revalidation_keys,
-                preparation_speculative_retries = metrics.speculative_retries,
-                preparation_speculative_fallbacks = metrics.speculative_fallbacks,
-                policy_wait_seconds = metrics.policy_wait.as_secs_f64(),
-                path_wait_seconds = metrics.path_wait.as_secs_f64(),
-                commit_wait_seconds = metrics.commit_wait.as_secs_f64(),
-                locked_setup_seconds = metrics.locked_setup.as_secs_f64(),
-                locked_prefetch_seconds = metrics.locked_prefetch.as_secs_f64(),
-                evaluate_seconds = metrics.evaluate.as_secs_f64(),
-                evaluation_current_precondition_governance_seconds = metrics
-                    .evaluation_subphases
-                    .current_precondition_governance
-                    .as_secs_f64(),
-                evaluation_mutation_planning_seconds = metrics
-                    .evaluation_subphases
-                    .mutation_planning
-                    .as_secs_f64(),
-                evaluation_mutation_construction_validation_seconds = metrics
-                    .evaluation_subphases
-                    .mutation_construction_validation
-                    .as_secs_f64(),
-                evaluation_mutation_construction_validation_operations = metrics
-                    .evaluation_subphases
-                    .mutation_construction_validation_operations,
-                evaluation_durable_record_encoding_seconds = metrics
-                    .evaluation_subphases
-                    .durable_record_encoding
-                    .as_secs_f64(),
-                evaluation_inline_payload_receipt_stage_seconds = metrics
-                    .evaluation_subphases
-                    .inline_payload_receipt_stage
-                    .as_secs_f64(),
-                evaluation_inline_payload_receipt_stage_operations = metrics
-                    .evaluation_subphases
-                    .inline_payload_receipt_stage_operations,
-                evaluation_blob_lifecycle_stage_seconds = metrics
-                    .evaluation_subphases
-                    .blob_lifecycle_stage
-                    .as_secs_f64(),
-                evaluation_object_state_stage_seconds = metrics
-                    .evaluation_subphases
-                    .object_state_stage
-                    .as_secs_f64(),
-                evaluation_coordinator_bookkeeping_seconds = metrics
-                    .evaluation_subphases
-                    .coordinator_bookkeeping
-                    .as_secs_f64(),
-                evaluation_proof_construction_seconds = metrics
-                    .evaluation_subphases
-                    .proof_construction
-                    .as_secs_f64(),
-                evaluation_proof_construction_proofs =
-                    metrics.evaluation_subphases.proof_construction_proofs,
-                evaluation_proof_multi_get_lookup_seconds = metrics
-                    .evaluation_subphases
-                    .proof_multi_get_lookup
-                    .as_secs_f64(),
-                evaluation_proof_multi_get_lookup_proofs =
-                    metrics.evaluation_subphases.proof_multi_get_lookup_proofs,
-                evaluation_proof_validate_encode_stage_seconds = metrics
-                    .evaluation_subphases
-                    .proof_validate_encode_stage
-                    .as_secs_f64(),
-                evaluation_proof_validate_encode_stage_proofs = metrics
-                    .evaluation_subphases
-                    .proof_validate_encode_stage_proofs,
-                evaluation_proof_bookkeeping_seconds = metrics
-                    .evaluation_subphases
-                    .proof_bookkeeping
-                    .as_secs_f64(),
-                evaluation_uncategorized_seconds = metrics
-                    .evaluate
-                    .saturating_sub(metrics.evaluation_subphases.categorized())
-                    .as_secs_f64(),
-                stage_seconds = metrics.stage.as_secs_f64(),
-                db_write_sync_seconds = metrics.persist.as_secs_f64(),
-                settle_seconds = metrics.settle.as_secs_f64(),
-                commit_hold_seconds = metrics.commit_hold.as_secs_f64(),
-                store_seconds = metrics.total.as_secs_f64(),
-                write_batch_entries = metrics.write_batch_entries,
-                write_batch_bytes = metrics.write_batch_bytes,
-                total_seconds = group
-                    .dwell_duration
-                    .saturating_add(finalize_completed.duration_since(group.preparation_started))
-                    .as_secs_f64(),
-                queued_requests = group.queued_requests,
-                stop_reason = group.stop_reason,
-                phase_complete = metrics.total != Duration::ZERO,
-                physical_commit = metrics.physical_commit,
-                "single-node mutation group completed"
-            );
-            for ((response, _permits), result) in group.replies.into_iter().zip(results) {
-                let _ = response.send(result);
-            }
-            previous_finalize = Some((finalize_started, finalize_completed));
-        }
-    }
-
-    async fn take_next_group(&self) -> Option<(Vec<SingleNodeCommitRequest>, usize, &'static str)> {
-        let mut state = self.state.lock().await;
-        let first = state.requests.pop_front()?;
-        let mut group = vec![first];
-        let mut operations = group[0].operation_count();
-        let mut inline_bytes = group[0].inline_bytes();
-        let context = group[0].context;
-        let mut governance = group[0].consistent_governance();
-        let mut stop_reason = "max_requests";
-        while group.len() < self.config.max_group_requests() {
-            let Some(candidate) = state.requests.front() else {
-                stop_reason = "queue_empty";
-                break;
-            };
-            let (Some(group_governance), Some(candidate_governance)) =
-                (governance.as_ref(), candidate.consistent_governance())
-            else {
-                stop_reason = "inconsistent_governance";
-                break;
-            };
-            let candidate_operations = candidate.operation_count();
-            let candidate_bytes = candidate.inline_bytes();
-            if candidate.context != context {
-                stop_reason = "context";
-                break;
-            }
-            if !candidate_governance.iter().all(|(identity, value)| {
-                group_governance
-                    .get(&identity)
-                    .is_none_or(|existing| existing == value)
-            }) {
-                stop_reason = "governance";
-                break;
-            }
-            if operations.saturating_add(candidate_operations) > self.config.max_group_operations()
-            {
-                stop_reason = "operations";
-                break;
-            }
-            if inline_bytes.saturating_add(candidate_bytes) > self.config.max_group_inline_bytes() {
-                stop_reason = "inline_bytes";
-                break;
-            }
-            let candidate = state.requests.pop_front().expect("front exists");
-            operations = operations.saturating_add(candidate_operations);
-            inline_bytes = inline_bytes.saturating_add(candidate_bytes);
-            for (identity, value) in candidate_governance {
-                governance
-                    .as_mut()
-                    .expect("compatible group governance exists")
-                    .entry(identity)
-                    .or_insert(value);
-            }
-            group.push(candidate);
-        }
-        Some((group, state.requests.len(), stop_reason))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        BucketPolicy, Durability, ObjectKey, PlacementLogId, PublishRequest, PutMode, PutRequest,
-        StoreOptions,
+        BucketPolicy, Durability, ObjectKey, PlacementLogId, PutMode, PutRequest, StoreOptions,
     };
 
     fn context(term: u64) -> ObjectMutationContext {
@@ -1066,21 +581,6 @@ mod tests {
             versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
             policy: store.bucket_policy("tenant", "bucket").unwrap(),
         }
-    }
-
-    fn pipelined_config() -> SingleNodeGroupCommitConfig {
-        SingleNodeGroupCommitConfig::new(
-            1,
-            DEFAULT_MAX_GROUP_OPERATIONS,
-            DEFAULT_MAX_GROUP_INLINE_BYTES,
-            DEFAULT_PREPARATION_LANES,
-            2,
-            DEFAULT_MAX_QUEUED_REQUESTS,
-            DEFAULT_MAX_QUEUED_OPERATIONS,
-            DEFAULT_MAX_QUEUED_INLINE_BYTES,
-            DEFAULT_MAX_GROUP_DWELL,
-        )
-        .unwrap()
     }
 
     fn request(
@@ -1157,14 +657,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ten_compatible_requests_use_two_preparation_lanes_and_one_physical_commit() {
+    async fn ten_compatible_requests_share_one_physical_commit() {
         let temporary = tempfile::tempdir().unwrap();
         let config = SingleNodeGroupCommitConfig::new(
             10,
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
-            2,
-            DEFAULT_MAX_PREPARED_GROUPS,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -1243,8 +741,6 @@ mod tests {
             65,
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
-            DEFAULT_PREPARATION_LANES,
-            DEFAULT_MAX_PREPARED_GROUPS,
             64,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -1265,8 +761,6 @@ mod tests {
             0,
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
-            DEFAULT_PREPARATION_LANES,
-            DEFAULT_MAX_PREPARED_GROUPS,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -1275,84 +769,10 @@ mod tests {
         .unwrap_err();
         assert!(zero_requests.to_string().contains("must be non-zero"));
 
-        let zero_lanes = SingleNodeGroupCommitConfig::new(
-            DEFAULT_MAX_GROUP_REQUESTS,
-            DEFAULT_MAX_GROUP_OPERATIONS,
-            DEFAULT_MAX_GROUP_INLINE_BYTES,
-            0,
-            DEFAULT_MAX_PREPARED_GROUPS,
-            DEFAULT_MAX_QUEUED_REQUESTS,
-            DEFAULT_MAX_QUEUED_OPERATIONS,
-            DEFAULT_MAX_QUEUED_INLINE_BYTES,
-            DEFAULT_MAX_GROUP_DWELL,
-        )
-        .unwrap_err();
-        assert!(
-            zero_lanes
-                .to_string()
-                .contains("preparation lanes must be non-zero")
-        );
-
-        let zero_prepared_groups = SingleNodeGroupCommitConfig::new(
-            DEFAULT_MAX_GROUP_REQUESTS,
-            DEFAULT_MAX_GROUP_OPERATIONS,
-            DEFAULT_MAX_GROUP_INLINE_BYTES,
-            DEFAULT_PREPARATION_LANES,
-            0,
-            DEFAULT_MAX_QUEUED_REQUESTS,
-            DEFAULT_MAX_QUEUED_OPERATIONS,
-            DEFAULT_MAX_QUEUED_INLINE_BYTES,
-            DEFAULT_MAX_GROUP_DWELL,
-        )
-        .unwrap_err();
-        assert!(
-            zero_prepared_groups
-                .to_string()
-                .contains("maximum prepared groups must be non-zero")
-        );
-
-        let excess_prepared_groups = SingleNodeGroupCommitConfig::new(
-            DEFAULT_MAX_GROUP_REQUESTS,
-            DEFAULT_MAX_GROUP_OPERATIONS,
-            DEFAULT_MAX_GROUP_INLINE_BYTES,
-            DEFAULT_PREPARATION_LANES,
-            DEFAULT_MAX_QUEUED_REQUESTS + 1,
-            DEFAULT_MAX_QUEUED_REQUESTS,
-            DEFAULT_MAX_QUEUED_OPERATIONS,
-            DEFAULT_MAX_QUEUED_INLINE_BYTES,
-            DEFAULT_MAX_GROUP_DWELL,
-        )
-        .unwrap_err();
-        assert!(
-            excess_prepared_groups
-                .to_string()
-                .contains("maximum prepared groups must not exceed maximum queued requests")
-        );
-
-        let excess_lanes = SingleNodeGroupCommitConfig::new(
-            DEFAULT_MAX_GROUP_REQUESTS,
-            DEFAULT_MAX_GROUP_OPERATIONS,
-            DEFAULT_MAX_GROUP_INLINE_BYTES,
-            DEFAULT_MAX_GROUP_OPERATIONS + 1,
-            DEFAULT_MAX_PREPARED_GROUPS,
-            DEFAULT_MAX_QUEUED_REQUESTS,
-            DEFAULT_MAX_QUEUED_OPERATIONS,
-            DEFAULT_MAX_QUEUED_INLINE_BYTES,
-            DEFAULT_MAX_GROUP_DWELL,
-        )
-        .unwrap_err();
-        assert!(
-            excess_lanes
-                .to_string()
-                .contains("preparation lanes must not exceed maximum group operations")
-        );
-
         let zero_dwell = SingleNodeGroupCommitConfig::new(
             DEFAULT_MAX_GROUP_REQUESTS,
             DEFAULT_MAX_GROUP_OPERATIONS,
             DEFAULT_MAX_GROUP_INLINE_BYTES,
-            DEFAULT_PREPARATION_LANES,
-            DEFAULT_MAX_PREPARED_GROUPS,
             DEFAULT_MAX_QUEUED_REQUESTS,
             DEFAULT_MAX_QUEUED_OPERATIONS,
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
@@ -1630,12 +1050,9 @@ mod tests {
     #[tokio::test]
     async fn dropped_receiver_does_not_cancel_an_admitted_commit() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(
-            StoreOptions::new(temporary.path(), 1)
-                .with_single_node_group_commit(pipelined_config()),
-        )
-        .await
-        .unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
         let queue = store.single_node_group_commit.clone();
         let settlements_before = queue.settlement_attempts();
         let operations = request("objects/detached", "detached", governance(&store));
@@ -1681,176 +1098,5 @@ mod tests {
         assert_eq!(queue.settlement_attempts() - settlements_before, 1);
         let status = store.local_watch_status().unwrap();
         assert_eq!(status.settled_through, status.tail);
-        assert_eq!(
-            queue.queue_slots.available_permits(),
-            queue.config.max_queued_requests()
-        );
-        assert_eq!(
-            queue.operation_slots.available_permits(),
-            queue.config.max_queued_operations()
-        );
-        assert!(!queue.state.lock().await.worker_running);
-
-        let restarted = store
-            .coordinate_single_node_mutation_batch(
-                request("objects/after-idle", "after-idle", governance(&store)),
-                context(1),
-            )
-            .await;
-        assert!(matches!(restarted.as_deref(), Ok([Ok(_)])));
-    }
-
-    #[tokio::test]
-    async fn prepared_groups_finalize_fifo_without_same_path_deadlock() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(
-            StoreOptions::new(temporary.path(), 1)
-                .with_single_node_group_commit(pipelined_config()),
-        )
-        .await
-        .unwrap();
-        let governance = governance(&store);
-        store
-            .single_node_group_commit
-            .inject_preparation_delays([Duration::from_millis(50), Duration::ZERO])
-            .await;
-        let settlements_before = store.single_node_group_commit.settlement_attempts();
-        let completed = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(
-                store.coordinate_single_node_mutation_batch(
-                    request("objects/same", "first", governance.clone()),
-                    context(1),
-                ),
-                store.coordinate_single_node_mutation_batch(
-                    request("objects/same", "second", governance),
-                    context(1),
-                )
-            )
-        })
-        .await
-        .expect("same-path prepared groups must not deadlock");
-
-        assert!(matches!(completed.0.as_deref(), Ok([Ok(_)])));
-        assert!(matches!(
-            completed.1.as_deref(),
-            Ok([Err(MutationError::PreconditionFailed { .. })])
-        ));
-        assert_eq!(
-            store
-                .single_node_group_commit
-                .preparation_completions()
-                .await,
-            vec![1, 0]
-        );
-        let object = store
-            .get(&ObjectKey::new("tenant", "bucket", "objects/same").unwrap())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(object.bytes, b"first");
-        let status = store.local_watch_status().unwrap();
-        assert_eq!(status.settled_through, status.tail);
-        assert_eq!(
-            store.single_node_group_commit.settlement_attempts() - settlements_before,
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn ordered_publish_observes_blob_created_by_prior_fifo_group() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(
-            StoreOptions::new(temporary.path(), 1)
-                .with_single_node_group_commit(pipelined_config()),
-        )
-        .await
-        .unwrap();
-        let governance = governance(&store);
-        let bytes = b"created-by-prior-group";
-        let reference = super::super::blob_reference_for_bytes(bytes);
-        let publish = vec![(
-            BatchOperation::Publish(PublishRequest {
-                key: ObjectKey::new("tenant", "bucket", "objects/published").unwrap(),
-                blob: reference,
-                content_type: Some("application/octet-stream".into()),
-                mode: PutMode::PutIfAbsent,
-                command_id: Some("publish-after-put".into()),
-                durability: Durability::Local,
-            }),
-            governance.clone(),
-            None,
-        )];
-
-        let (put, publish) = tokio::join!(
-            store.coordinate_single_node_mutation_batch(
-                request("objects/source", "created-by-prior-group", governance),
-                context(1),
-            ),
-            store.coordinate_single_node_mutation_batch(publish, context(1)),
-        );
-        assert!(matches!(put.as_deref(), Ok([Ok(_)])), "put={put:?}");
-        assert!(
-            matches!(publish.as_deref(), Ok([Ok(_)])),
-            "publish={publish:?}"
-        );
-        let published = store
-            .get(&ObjectKey::new("tenant", "bucket", "objects/published").unwrap())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(published.bytes, bytes);
-        let status = store.local_watch_status().unwrap();
-        assert_eq!(status.settled_through, status.tail);
-        store.single_node_group_commit.wait_until_idle().await;
-        drop(published);
-        drop(store);
-        let reopened = Store::open(
-            StoreOptions::new(temporary.path(), 1)
-                .with_single_node_group_commit(pipelined_config()),
-        )
-        .await
-        .unwrap();
-        let published = reopened
-            .get(&ObjectKey::new("tenant", "bucket", "objects/published").unwrap())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(published.bytes, bytes);
-    }
-
-    #[tokio::test]
-    async fn same_group_put_does_not_satisfy_publish_preparation_authority() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(
-            StoreOptions::new(temporary.path(), 1)
-                .with_single_node_group_commit(pipelined_config()),
-        )
-        .await
-        .unwrap();
-        let governance = governance(&store);
-        let bytes = b"same-group-bytes";
-        let reference = super::super::blob_reference_for_bytes(bytes);
-        let mut operations = request("objects/source", "same-group-bytes", governance.clone());
-        operations.push((
-            BatchOperation::Publish(PublishRequest {
-                key: ObjectKey::new("tenant", "bucket", "objects/published-same-group").unwrap(),
-                blob: reference,
-                content_type: Some("application/octet-stream".into()),
-                mode: PutMode::PutIfAbsent,
-                command_id: Some("same-group-publish".into()),
-                durability: Durability::Local,
-            }),
-            governance,
-            None,
-        ));
-
-        let result = store
-            .coordinate_single_node_mutation_batch(operations, context(1))
-            .await
-            .unwrap();
-        assert!(matches!(
-            result.as_slice(),
-            [Ok(_), Err(MutationError::BlobNotFound)]
-        ));
     }
 }

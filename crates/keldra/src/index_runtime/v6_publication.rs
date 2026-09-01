@@ -36,7 +36,6 @@ use crate::cluster_object_read::ClusterObjectReader;
 
 use super::publication::{DerivedArtifactAdmission, IndexArtifactPublish, IndexArtifactRouter};
 use super::v6_compaction::{V6CompactionArtifacts, V6CompactionBase};
-use super::v6_reuse_shadow::{SelectionArtifactReuseShadow, ShadowArtifactKind};
 
 const MAX_STREAM_DIRECTORY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STREAM_PAGE_BYTES: usize = 32 * 1024;
@@ -767,7 +766,6 @@ impl V6ProjectionPublisher {
         generation: &ProjectionGeneration,
         component: ComponentIdentity,
         key: StableDocumentKey,
-        reuse: &mut SelectionArtifactReuseShadow,
     ) -> Result<Option<Vec<u8>>, Status> {
         let Some(root) = generation.root(component) else {
             return Ok(None);
@@ -780,17 +778,15 @@ impl V6ProjectionPublisher {
             match cursor.next().map_err(index_status)? {
                 ComponentStreamReverseStep::LoadPage { hash } => {
                     let path = projection_stream_page_path(generation.partition, hash);
-                    let (bytes, _) = reuse
-                        .read(
-                            self,
+                    let (bytes, _) = self
+                        .read_object(
                             storage_tenant,
                             bucket,
                             tenant_id,
                             bucket_id,
                             &path,
-                            hash,
+                            Some(hash),
                             MAX_STREAM_PAGE_BYTES,
-                            ShadowArtifactKind::Page,
                         )
                         .await?
                         .ok_or_else(|| Status::data_loss("v6 stream page is absent"))?;
@@ -802,17 +798,15 @@ impl V6ProjectionPublisher {
                     }
                     let path = projection_pack_path(generation.partition, descriptor.pack_hash);
                     let maximum = 64 * 1024 * 1024;
-                    let (bytes, _) = reuse
-                        .read(
-                            self,
+                    let (bytes, _) = self
+                        .read_object(
                             storage_tenant,
                             bucket,
                             tenant_id,
                             bucket_id,
                             &path,
-                            descriptor.pack_hash,
+                            Some(descriptor.pack_hash),
                             maximum,
-                            ShadowArtifactKind::Pack,
                         )
                         .await?
                         .ok_or_else(|| Status::data_loss("v6 projection pack is absent"))?;
@@ -843,9 +837,7 @@ impl V6ProjectionPublisher {
         generation: &ProjectionGeneration,
         source_scope: [u8; 32],
         source_path: &str,
-        replay_input_capacity: usize,
     ) -> Result<Vec<ProjectedDocumentState>, Status> {
-        let mut reuse = SelectionArtifactReuseShadow::new(replay_input_capacity);
         let locator =
             StableDocumentKey::derive(source_scope, source_path, 0).map_err(index_status)?;
         let Some(encoded_records) = self
@@ -857,7 +849,6 @@ impl V6ProjectionPublisher {
                 generation,
                 ComponentIdentity::SourceRecords,
                 locator,
-                &mut reuse,
             )
             .await?
         else {
@@ -887,7 +878,6 @@ impl V6ProjectionPublisher {
                     generation,
                     ComponentIdentity::DocumentHead,
                     key,
-                    &mut reuse,
                 )
                 .await?
                 .ok_or_else(|| {
@@ -917,7 +907,6 @@ impl V6ProjectionPublisher {
                         generation,
                         component,
                         key,
-                        &mut reuse,
                     )
                     .await?
                 else {

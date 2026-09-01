@@ -49,20 +49,6 @@ counters!(
     catalog_activations,
     stage_cpu_nanos,
     stage_queue_wait_nanos,
-    stage_submit_wall_nanos,
-    artifact_shadow_requests,
-    artifact_shadow_requested_bytes,
-    artifact_shadow_unique_identities,
-    artifact_shadow_unique_bytes,
-    artifact_shadow_pack_requests,
-    artifact_shadow_pack_requested_bytes,
-    artifact_shadow_unique_pack_identities,
-    artifact_shadow_unique_pack_bytes,
-    artifact_shadow_oversize_bypasses,
-    artifact_shadow_oversize_bypass_bytes,
-    artifact_shadow_metadata_limit_bypasses,
-    artifact_shadow_metadata_limit_bypass_bytes,
-    artifact_shadow_peak_resident_bytes,
     stage_resident_bytes,
     stage_limit_bytes,
     local_next_offset,
@@ -132,20 +118,6 @@ impl V6PipelineTelemetry {
             keldra_index_v6_catalog_activations_total = Self::load(&self.catalog_activations),
             keldra_index_v6_stage_cpu_nanoseconds_total = Self::load(&self.stage_cpu_nanos),
             keldra_index_v6_stage_queue_wait_nanoseconds_total = Self::load(&self.stage_queue_wait_nanos),
-            keldra_index_v6_stage_submit_wall_nanoseconds_total = Self::load(&self.stage_submit_wall_nanos),
-            keldra_index_v6_artifact_shadow_requests_total = Self::load(&self.artifact_shadow_requests),
-            keldra_index_v6_artifact_shadow_requested_bytes_total = Self::load(&self.artifact_shadow_requested_bytes),
-            keldra_index_v6_artifact_shadow_unique_identities_total = Self::load(&self.artifact_shadow_unique_identities),
-            keldra_index_v6_artifact_shadow_unique_bytes_total = Self::load(&self.artifact_shadow_unique_bytes),
-            keldra_index_v6_artifact_shadow_pack_requests_total = Self::load(&self.artifact_shadow_pack_requests),
-            keldra_index_v6_artifact_shadow_pack_requested_bytes_total = Self::load(&self.artifact_shadow_pack_requested_bytes),
-            keldra_index_v6_artifact_shadow_unique_pack_identities_total = Self::load(&self.artifact_shadow_unique_pack_identities),
-            keldra_index_v6_artifact_shadow_unique_pack_bytes_total = Self::load(&self.artifact_shadow_unique_pack_bytes),
-            keldra_index_v6_artifact_shadow_oversize_bypasses_total = Self::load(&self.artifact_shadow_oversize_bypasses),
-            keldra_index_v6_artifact_shadow_oversize_bypass_bytes_total = Self::load(&self.artifact_shadow_oversize_bypass_bytes),
-            keldra_index_v6_artifact_shadow_metadata_limit_bypasses_total = Self::load(&self.artifact_shadow_metadata_limit_bypasses),
-            keldra_index_v6_artifact_shadow_metadata_limit_bypass_bytes_total = Self::load(&self.artifact_shadow_metadata_limit_bypass_bytes),
-            keldra_index_v6_artifact_shadow_peak_simulated_resident_bytes = Self::load(&self.artifact_shadow_peak_resident_bytes),
             keldra_index_v6_stage_resident_bytes = Self::load(&self.stage_resident_bytes),
             keldra_index_v6_stage_limit_bytes = Self::load(&self.stage_limit_bytes),
             keldra_index_v6_local_next_offset = Self::load(&self.local_next_offset),
@@ -161,53 +133,6 @@ impl V6PipelineTelemetry {
         Self::add(&self.catalog_source_bytes, bytes);
         Self::add(&self.catalog_checkpointed_source_rows, rows);
         Self::add(&self.catalog_checkpointed_source_bytes, bytes);
-    }
-
-    pub(crate) fn record_reuse_shadow(
-        &self,
-        counters: super::v6_reuse_shadow::ReuseShadowCounters,
-    ) {
-        Self::add(&self.artifact_shadow_requests, counters.requests);
-        Self::add(
-            &self.artifact_shadow_requested_bytes,
-            counters.requested_bytes,
-        );
-        Self::add(
-            &self.artifact_shadow_unique_identities,
-            counters.unique_identities,
-        );
-        Self::add(&self.artifact_shadow_unique_bytes, counters.unique_bytes);
-        Self::add(&self.artifact_shadow_pack_requests, counters.pack_requests);
-        Self::add(
-            &self.artifact_shadow_pack_requested_bytes,
-            counters.pack_requested_bytes,
-        );
-        Self::add(
-            &self.artifact_shadow_unique_pack_identities,
-            counters.unique_pack_identities,
-        );
-        Self::add(
-            &self.artifact_shadow_unique_pack_bytes,
-            counters.unique_pack_bytes,
-        );
-        Self::add(
-            &self.artifact_shadow_oversize_bypasses,
-            counters.oversize_bypasses,
-        );
-        Self::add(
-            &self.artifact_shadow_oversize_bypass_bytes,
-            counters.oversize_bypass_bytes,
-        );
-        Self::add(
-            &self.artifact_shadow_metadata_limit_bypasses,
-            counters.metadata_limit_bypasses,
-        );
-        Self::add(
-            &self.artifact_shadow_metadata_limit_bypass_bytes,
-            counters.metadata_limit_bypass_bytes,
-        );
-        self.artifact_shadow_peak_resident_bytes
-            .fetch_max(counters.peak_simulated_resident_bytes, Ordering::Relaxed);
     }
 
     /// An empty cursor-advance batch retains control metadata but prepares no
@@ -255,39 +180,5 @@ mod tests {
     fn empty_control_batch_has_no_indexed_prepared_bytes() {
         assert_eq!(V6PipelineTelemetry::indexed_prepared_bytes(0, 6096), 0);
         assert_eq!(V6PipelineTelemetry::indexed_prepared_bytes(1, 6096), 6096);
-    }
-
-    #[test]
-    fn reuse_shadow_totals_accumulate_while_peak_takes_the_maximum() {
-        let telemetry = V6PipelineTelemetry::default();
-        telemetry.record_reuse_shadow(super::super::v6_reuse_shadow::ReuseShadowCounters {
-            requests: 2,
-            requested_bytes: 200,
-            unique_identities: 1,
-            unique_bytes: 100,
-            peak_simulated_resident_bytes: 300,
-            ..Default::default()
-        });
-        telemetry.record_reuse_shadow(super::super::v6_reuse_shadow::ReuseShadowCounters {
-            requests: 3,
-            requested_bytes: 600,
-            unique_identities: 2,
-            unique_bytes: 400,
-            peak_simulated_resident_bytes: 250,
-            ..Default::default()
-        });
-
-        assert_eq!(
-            V6PipelineTelemetry::load(&telemetry.artifact_shadow_requests),
-            5
-        );
-        assert_eq!(
-            V6PipelineTelemetry::load(&telemetry.artifact_shadow_requested_bytes),
-            800
-        );
-        assert_eq!(
-            V6PipelineTelemetry::load(&telemetry.artifact_shadow_peak_resident_bytes),
-            300
-        );
     }
 }
