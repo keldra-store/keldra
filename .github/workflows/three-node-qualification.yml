@@ -1,0 +1,106 @@
+name: Keldra Three-Node Qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable Keldra release tag to qualify
+        required: true
+        default: 0.16.0
+        type: string
+      image:
+        description: Published Keldra image matching the release tag
+        required: true
+        default: ghcr.io/keldra-store/keldra:0.16.0
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: three-node-qualification-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Qualify ${{ inputs.release_tag }} across three nodes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "2"
+      KELDRA_DOCKER_PLATFORM: linux/amd64
+      KELDRA_IMAGE: ${{ inputs.image }}
+      KELDRA_QUALIFICATION_MODE: release
+      KELDRA_QUALIFICATION_KEEP: "0"
+    steps:
+      - name: Validate requested release
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release_tag must be an exact stable semantic version" >&2
+            exit 2
+          fi
+          expected_image="ghcr.io/keldra-store/keldra:${RELEASE_TAG}"
+          if [[ "$RELEASE_IMAGE" != "$expected_image" ]]; then
+            echo "image must be the exact release image ${expected_image}" >&2
+            exit 2
+          fi
+
+      - name: Checkout requested release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          submodules: recursive
+
+      - name: Verify immutable release identity
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_commit="$(git rev-parse --verify HEAD^{commit})"
+          if [[ "$head_commit" != "$tag_commit" ]]; then
+            echo "checkout ${head_commit} does not match tag ${RELEASE_TAG} at ${tag_commit}" >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain=v1 --untracked-files=normal)" ]]; then
+            echo "qualification checkout is not clean" >&2
+            exit 1
+          fi
+          echo "Qualifying ${RELEASE_TAG} at ${head_commit}"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install qualification dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            jq \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler
+          docker compose version
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-three-node-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-three-node-cargo-
+
+      - name: Pull exact published release image
+        run: docker pull --platform "$KELDRA_DOCKER_PLATFORM" "$KELDRA_IMAGE"
+
+      - name: Run three-node release qualification
+        run: ./scripts/qualify-three-node.sh
