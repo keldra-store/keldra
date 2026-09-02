@@ -4,7 +4,7 @@ use jiff::fmt::strtime;
 use jiff::fmt::strtime::BrokenDownTime;
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, civil::Date, civil::DateTime};
-use keldra_index::v4::DateFormat;
+use keldra_index::typed_json::DateFormat;
 
 const MAX_DATE_PATTERN_BYTES: usize = 256;
 

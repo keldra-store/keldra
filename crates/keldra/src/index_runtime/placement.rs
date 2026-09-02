@@ -1,10 +1,13 @@
 use keldra_consensus::NodeId;
+use keldra_store::SourceId;
 use thiserror::Error;
 
 use crate::cluster_placement::ClusterPlacement;
 use crate::placement::PlacementKind;
 
 const QUERY_REPLICA_LIMIT: usize = 3;
+const PROJECTION_PARTITION_ID: u64 = 1;
+const SOURCE_PRODUCER_DOMAIN: &[u8] = b"keldra/v6/source-producer/v1\0";
 
 /// Stable identity used for index placement. Mutable names never participate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -28,6 +31,16 @@ impl IndexIdentity {
             bucket_id,
             index_id,
         })
+    }
+
+    /// Placement authority for all physical projections over one source
+    /// bucket. Logical and physical index IDs deliberately do not participate:
+    /// one assigned source-partition writer must see every shareable recipe.
+    pub(crate) fn projection_partition(
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<Self, IndexPlacementError> {
+        Self::new(tenant_id, bucket_id, PROJECTION_PARTITION_ID)
     }
 
     fn placement_key(self) -> [u8; 24] {
@@ -103,6 +116,50 @@ impl IndexPlacement {
     }
 }
 
+/// Deterministic v6 producer authority for one immutable source incarnation.
+/// While the originating source remains ACTIVE it produces locally. Once it
+/// leaves placement, capacity-weighted HRW elects one successor from a key
+/// that deliberately excludes logical definitions and physical families, so
+/// every shared family follows the same source handoff.
+pub(crate) fn source_projection_producer(
+    tenant_id: u64,
+    bucket_id: u64,
+    source: SourceId,
+    placement: &ClusterPlacement,
+) -> Result<NodeId, IndexPlacementError> {
+    let source_node = NodeId(u64::from(source.node_id));
+    let active = placement.active_node_ids();
+    let ranked = placement.rank(
+        PlacementKind::FutureIndex,
+        &source_producer_key(tenant_id, bucket_id, source),
+    );
+    select_source_producer(source_node, &active, ranked)
+}
+
+fn select_source_producer(
+    source_node: NodeId,
+    active: &[NodeId],
+    ranked_successors: Vec<NodeId>,
+) -> Result<NodeId, IndexPlacementError> {
+    if active.contains(&source_node) {
+        return Ok(source_node);
+    }
+    ranked_successors
+        .into_iter()
+        .next()
+        .ok_or(IndexPlacementError::NoActiveNode)
+}
+
+fn source_producer_key(tenant_id: u64, bucket_id: u64, source: SourceId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SOURCE_PRODUCER_DOMAIN.len() + 8 + 8 + 2 + 32);
+    key.extend_from_slice(SOURCE_PRODUCER_DOMAIN);
+    key.extend_from_slice(&tenant_id.to_be_bytes());
+    key.extend_from_slice(&bucket_id.to_be_bytes());
+    key.extend_from_slice(&source.node_id.to_be_bytes());
+    key.extend_from_slice(&source.source_epoch);
+    key
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub(crate) enum IndexPlacementError {
     #[error("index stable identities must be non-zero")]
@@ -137,6 +194,50 @@ mod tests {
         assert_eq!(
             IndexIdentity::new(0, 1, 1),
             Err(IndexPlacementError::ZeroIdentity)
+        );
+    }
+
+    #[test]
+    fn source_producer_key_is_stable_and_domain_separated() {
+        let source = SourceId {
+            node_id: 7,
+            source_epoch: [3; 32],
+        };
+        let first = source_producer_key(4, 5, source);
+        assert_eq!(first, source_producer_key(4, 5, source));
+        assert_ne!(first, source_producer_key(4, 6, source));
+        assert_ne!(
+            first,
+            IndexIdentity::projection_partition(4, 5)
+                .unwrap()
+                .placement_key()
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn active_source_is_local_regardless_of_active_membership_iteration_order() {
+        let source = NodeId(7);
+        assert_eq!(
+            select_source_producer(source, &[NodeId(2), source, NodeId(9)], vec![NodeId(2)]),
+            Ok(source)
+        );
+        assert_eq!(
+            select_source_producer(source, &[NodeId(9), NodeId(2), source], vec![NodeId(9)]),
+            Ok(source)
+        );
+    }
+
+    #[test]
+    fn removed_source_hands_off_to_the_ranked_successor() {
+        let source = NodeId(7);
+        assert_eq!(
+            select_source_producer(source, &[NodeId(2), NodeId(9)], vec![NodeId(9), NodeId(2)]),
+            Ok(NodeId(9))
+        );
+        assert_eq!(
+            select_source_producer(source, &[NodeId(2)], Vec::new()),
+            Err(IndexPlacementError::NoActiveNode)
         );
     }
 }

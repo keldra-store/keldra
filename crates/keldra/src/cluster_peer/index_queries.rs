@@ -738,17 +738,7 @@ fn validate_query_kind(definition: &IndexDefinition, query: &IndexQuery) -> Resu
         .map_err(|_| Status::invalid_argument("routed index kind is unknown"))?;
     let matches = matches!(
         (kind, query.query.as_ref()),
-        (IndexKind::Path, Some(IndexQueryValue::Path(_)))
-            | (
-                IndexKind::MetadataFilter,
-                Some(IndexQueryValue::MetadataFilter(_))
-            )
-            | (IndexKind::TypedJson, Some(IndexQueryValue::TypedJson(_)))
-            | (IndexKind::FullText, Some(IndexQueryValue::FullText(_)))
-            | (IndexKind::Vector, Some(IndexQueryValue::Vector(_)))
-            | (IndexKind::Hybrid, Some(IndexQueryValue::Hybrid(_)))
-            | (IndexKind::GitSource, Some(IndexQueryValue::GitSource(_)))
-            | (IndexKind::Tensor, Some(IndexQueryValue::Tensor(_)))
+        (IndexKind::TypedJson, Some(IndexQueryValue::TypedJson(_)))
     );
     if matches {
         Ok(())
@@ -764,9 +754,9 @@ fn require_query_replica(
     placement: &ClusterPlacement,
     tenant_id: u64,
     bucket_id: u64,
-    index_id: u64,
+    _index_id: u64,
 ) -> Result<(), Status> {
-    let identity = IndexIdentity::new(tenant_id, bucket_id, index_id)
+    let identity = IndexIdentity::projection_partition(tenant_id, bucket_id)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let indices = IndexPlacement::derive(identity, placement)
         .map_err(|error| Status::unavailable(error.to_string()))?;
@@ -822,20 +812,19 @@ mod tests {
             definition: IndexDefinition {
                 index_id: 11,
                 bucket: "objects".into(),
-                name: "by-path".into(),
+                name: "typed-json".into(),
                 path_prefix: "docs/".into(),
                 content_type: String::new(),
-                kind: IndexKind::Path as i32,
+                kind: IndexKind::TypedJson as i32,
                 specification: Some(IndexSpecification {
-                    specification: Some(index_specification::Specification::Path(PathIndexSpec {})),
+                    specification: Some(index_specification::Specification::TypedJson(
+                        Default::default(),
+                    )),
                 }),
                 version: 13,
             },
             query: IndexQuery {
-                query: Some(index_query::Query::Path(PathIndexQuery {
-                    prefix: "docs/".into(),
-                    start_after: None,
-                })),
+                query: Some(index_query::Query::TypedJson(Default::default())),
             },
             limit: 100,
             resume: Some(IndexPageCursor {

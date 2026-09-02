@@ -51,7 +51,7 @@ fn keys_are_versioned_fixed_width_and_big_endian() {
         [STORAGE_KEY_FORMAT_VERSION, b'C', 1, 0x12, 0x34]
     );
     assert_eq!(
-        checkpoint_key(DefinitionConsumerKind::IndexDelivery, 0x1234).unwrap(),
+        checkpoint_key(DefinitionConsumerKind::V6IndexCatalog, 0x1234).unwrap(),
         [STORAGE_KEY_FORMAT_VERSION, b'C', 3, 0x12, 0x34]
     );
     assert_eq!(
@@ -150,7 +150,7 @@ fn value_codecs_reject_unknown_versions_and_identity_mismatches() {
     );
 
     let checkpoint = DefinitionCheckpoint {
-        consumer_kind: DefinitionConsumerKind::IndexDelivery,
+        consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
         source_id: SourceId {
             node_id: 4,
             source_epoch: [8; 32],
@@ -284,6 +284,36 @@ async fn assignment_page_and_checkpoint_commit_and_page_together() {
 }
 
 #[tokio::test]
+async fn identical_empty_checkpoint_page_is_a_storage_no_op() {
+    let (_temporary, store) = store().await;
+    let checkpoint = DefinitionCheckpoint {
+        consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
+        source_id: SourceId {
+            node_id: 4,
+            source_epoch: [8; 32],
+        },
+        next_offset: 21,
+        observed_fence: fence(19),
+    };
+    store
+        .apply_definition_assignment_page(&[], &checkpoint)
+        .unwrap();
+    let sequence = store.db.latest_sequence_number();
+
+    store
+        .apply_definition_assignment_page(&[], &checkpoint)
+        .unwrap();
+
+    assert_eq!(store.db.latest_sequence_number(), sequence);
+    assert_eq!(
+        store
+            .definition_checkpoint(checkpoint.consumer_kind, checkpoint.source_id.node_id)
+            .unwrap(),
+        Some(checkpoint)
+    );
+}
+
+#[tokio::test]
 async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() {
     let (_temporary, store) = store().await;
     let mut changes = store.subscribe_definition_assignment_changes();
@@ -292,7 +322,7 @@ async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() 
         tenant_id: 7,
         bucket_id: 9,
         definition_id: 11,
-        definition_path: "_keldra/indices/v4/definitions/example".into(),
+        definition_path: "_keldra/indices/v6/definitions/example".into(),
         object_version: VersionId(13),
         observed_fence: fence(17),
         rank: 0,
@@ -352,7 +382,7 @@ async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() 
     assert_eq!(due.definition_object_version, VersionId(14));
     assert_eq!(
         due.definition_path,
-        "_keldra/indices/v4/definitions/example"
+        "_keldra/indices/v6/definitions/example"
     );
     assert!(due.due_at_unix_millis > 0);
     assert_eq!(
@@ -764,4 +794,47 @@ async fn direct_assignment_transfer_is_idempotent_stale_safe_and_notifies_change
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn exact_assignment_snapshot_receiver_starts_after_the_visited_state() {
+    let (_temporary, store) = store().await;
+    let first = DefinitionAssignment {
+        kind: DefinitionKind::Index,
+        tenant_id: 7,
+        bucket_id: 9,
+        definition_id: 11,
+        definition_path: "indexes/a".into(),
+        object_version: VersionId(21),
+        observed_fence: fence(30),
+        rank: 0,
+    };
+    store
+        .apply_definition_assignment_mutations(&[DefinitionAssignmentMutation::Upsert(
+            first.clone(),
+        )])
+        .unwrap();
+
+    let mut visited = Vec::new();
+    let mut changes = store
+        .visit_definition_assignment_snapshot(DefinitionKind::Index, |assignment| {
+            visited.push(assignment);
+        })
+        .unwrap();
+    assert_eq!(visited, [first.clone()]);
+    assert!(matches!(
+        changes.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    let second = DefinitionAssignment {
+        definition_id: 12,
+        definition_path: "indexes/b".into(),
+        ..first
+    };
+    let mutation = DefinitionAssignmentMutation::Upsert(second);
+    store
+        .apply_definition_assignment_mutations(std::slice::from_ref(&mutation))
+        .unwrap();
+    assert_eq!(changes.recv().await.unwrap(), [mutation]);
 }

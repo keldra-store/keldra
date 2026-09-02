@@ -1,132 +1,6 @@
 #!/usr/bin/env bash
 
-# Three-node qualification phase transitions. The caller provides compose,
-# readiness, image, startup-evidence, and log helpers in its shell.
-
-assert_compaction_telemetry_for_kind() {
-  local kind="$1"
-  local log="$2"
-  local budget_limit
-  local completed
-  local configured
-  local effective
-  local expected
-  local input_segments
-  local line
-  local observed=0
-  local peak_active
-  local range_limit
-  local ranges
-  local worker_limit
-  while IFS= read -r line; do
-    configured="$(log_unsigned_field gauge.keldra_index_compaction_configured_lanes "${line}")" \
-      || continue
-    worker_limit="$(log_unsigned_field gauge.keldra_index_compaction_worker_limit "${line}")" \
-      || return 1
-    budget_limit="$(log_unsigned_field gauge.keldra_index_compaction_budget_limit "${line}")" \
-      || return 1
-    effective="$(log_unsigned_field compaction.effective_lanes "${line}")" \
-      || return 1
-    range_limit="$(log_unsigned_field gauge.keldra_index_compaction_range_limit "${line}")" \
-      || return 1
-    ranges="$(log_unsigned_field gauge.keldra_index_compaction_ranges_total "${line}")" \
-      || return 1
-    completed="$(log_unsigned_field gauge.keldra_index_compaction_ranges_completed "${line}")" \
-      || return 1
-    peak_active="$(log_unsigned_field gauge.keldra_index_compaction_peak_active_lanes "${line}")" \
-      || return 1
-    input_segments="$(log_unsigned_field histogram.keldra_index_compaction_input_segments "${line}")" \
-      || return 1
-    expected="${index_compaction_max_lanes}"
-    ((worker_limit < expected)) && expected="${worker_limit}"
-    ((budget_limit < expected)) && expected="${budget_limit}"
-    if unsigned_decimal_less_than "${range_limit}" "${expected}"; then
-      expected="${range_limit}"
-    fi
-    if ((configured != index_compaction_max_lanes \
-      || worker_limit != index_rayon_workers \
-      || budget_limit < 1 \
-      || input_segments < 2 \
-      || ranges < 1 \
-      || effective != expected \
-      || peak_active < 1 \
-      || peak_active > effective \
-      || completed != ranges)) \
-      || ! unsigned_decimal_is_positive "${range_limit}" \
-      || [[ "${line}" != *"keldra.index.compaction"* ]]
-    then
-      echo "${kind} emitted inconsistent bounded distributed compaction telemetry" >&2
-      printf '%s\n' "${line}" >&2
-      return 1
-    fi
-    observed=$((observed + (effective >= 2 && peak_active >= 2)))
-  done < <(
-    awk -v kind="index.kind=${kind}" '
-      index($0, kind) && index($0, "index compaction terminal metrics")
-    ' "${log}"
-  )
-  if ((observed == 0)); then
-    echo "${kind} emitted no terminal compaction with at least two effective and concurrently active lanes" >&2
-    return 1
-  fi
-  if ! awk -v kind="index.kind=${kind}" '
-      index($0, kind) && index($0, "keldra.index.builder") &&
-      index($0, "index builder phase finished") { found = 1 }
-      END { exit !found }
-    ' "${log}"
-  then
-    echo "${kind} emitted no distributed builder trace and completion log" >&2
-    return 1
-  fi
-  if ! awk -v kind="index.kind=${kind}" '
-      index($0, kind) && index($0, "format-v4 index segments compacted") { found = 1 }
-      END { exit !found }
-    ' "${log}"
-  then
-    echo "${kind} emitted no successful format-v4 segment-compaction event" >&2
-    return 1
-  fi
-}
-
-preserve_journal_pressure_evidence() {
-  local destination_prefix="$1"
-  local node
-  for node in keldra-1 keldra-2 keldra-3; do
-    preserve_qualification_log \
-      "${KELDRA_QUALIFICATION_DIR}/artifacts/index-gap-recovery-${node}.log" \
-      "${destination_prefix}-${node}.log"
-  done
-  echo "[keldra-qualification] preserved journal-pressure evidence ${destination_prefix}-keldra-{1,2,3}.log"
-}
-
-capture_three_node_resource_evidence() {
-  local node="$1"
-  local start_cursor="$2"
-  local log="${KELDRA_QUALIFICATION_DIR}/artifacts/index-resource-${node}.log"
-  local capture_cursor="${start_cursor}"
-  local next_cursor
-  local attempt
-  : >"${log}"
-  for attempt in $(seq 1 12); do
-    next_cursor="$(qualification_log_cursor)"
-    service_logs_since "${node}" "${capture_cursor}" "${next_cursor}" \
-      >>"${log}"
-    capture_cursor="$(qualification_log_cursor_after "${next_cursor}")"
-    if grep -Fq 'sampled process resources' "${log}" \
-      && grep -Fq 'sampled cgroup memory resources' "${log}" \
-      && grep -Fq 'sampled RocksDB resources' "${log}" \
-      && grep -Fq 'sampled source-journal safety and capacity' "${log}" \
-      && grep -Fq 'sampled mutation receipt capacity' "${log}"
-    then
-      break
-    fi
-    sleep 1
-  done
-  preserve_qualification_log "${log}" "${index_resource_telemetry_prefix}-${node}.log"
-  assert_zero_cgroup_oom_samples "${log}" "${node} production qualification"
-  assert_capacity_samples "${log}" "${node} production qualification" \
-    "${KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES}"
-}
+# Shared three-node membership and source-journal qualification helpers.
 
 wait_for_source_journal_entry_bound() {
   local node="$1"
@@ -159,7 +33,6 @@ start_source_journal_phase() {
     compose up --detach --no-deps --force-recreate "${node}"
     wait_for_node "${node}"
     require_service_image "${node}" "${image_id}" qualification
-    assert_sparse_index_startup "${node}" 1
     wait_for_source_journal_entry_bound "${node}" "${bound}"
   done
 }
@@ -214,7 +87,6 @@ start_prepared_node() {
   local service="keldra-${node_id}"
   compose up --detach "${service}"
   wait_for_node "${service}"
-  assert_sparse_index_startup "${service}" 1
   if [[ -e "${KELDRA_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
     echo "${service} became ready without consuming and deleting its join bundle" >&2
     return 1
@@ -226,28 +98,6 @@ prepare_and_start_node() {
   start_prepared_node "$1"
 }
 
-start_prepared_node_during_indexed_cutover() {
-  local node_id="$1"
-  local service="keldra-${node_id}"
-  if [[ -z "${paused_container}" ]]; then
-    echo "indexed membership cutover has no paused pre-cutover builder" >&2
-    return 1
-  fi
-  compose up --detach "${service}"
-  # Let the joining node reach its existing peers while the old-fence index
-  # builder remains unable to publish. Resuming the builder and quorum voter
-  # then races real pending index work against the ACTIVE membership cutover.
-  sleep 1
-  docker unpause "${paused_container}" >/dev/null
-  paused_container=""
-  wait_for_node "${service}"
-  assert_sparse_index_startup "${service}" 1
-  if [[ -e "${KELDRA_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
-    echo "${service} became ready without consuming and deleting its join bundle" >&2
-    return 1
-  fi
-}
-
 # State captured immediately before the two-to-three membership cutover. Node 2
 # is deliberately used because node 1 is the stable lowest-ID membership
 # reconciliation coordinator.
@@ -255,17 +105,6 @@ membership_cutover_source_tail=
 membership_cutover_source_fence_term=
 membership_cutover_source_fence_index=
 membership_cutover_source_log_start=
-membership_cutover_index_id=
-membership_cutover_index_bucket=
-membership_cutover_index_path=
-membership_cutover_index_version=
-membership_cutover_index_commit_revision_before=
-membership_cutover_index_commit_revision_after=
-membership_cutover_index_attempts=
-membership_cutover_index_burst=
-membership_cutover_index_token=
-membership_cutover_index_source_node_id=
-membership_cutover_index_source_tail=
 
 latest_source_journal_sample() {
   service_logs "$1" \
@@ -435,313 +274,6 @@ new_cutover_fence_line() {
   return 1
 }
 
-grpcurl_public() {
-  local endpoint="${1#http://}"
-  shift
-  command -v grpcurl >/dev/null 2>&1 || {
-    echo "grpcurl is required for the public indexed-cutover proof" >&2
-    return 2
-  }
-  grpcurl -plaintext -max-time 35 \
-    -import-path "${repo_root}/crates/keldra-api/proto" \
-    -import-path /usr/include -proto keldra.proto "$@" "${endpoint}"
-}
-
-cutover_access_token() {
-  local endpoint="$1"
-  local client_id="$2"
-  local client_secret="$3"
-  local response
-  response="$(
-    jq -nc --arg client_id "${client_id}" --arg client_secret "${client_secret}" \
-      '{clientId:$client_id,clientSecret:$client_secret}' \
-      | grpcurl_public "${endpoint}" -d @ \
-          keldra.v1.CredentialService/ExchangeClientCredentials
-  )"
-  jq -er '.accessToken | select(type == "string" and length > 0)' <<<"${response}"
-}
-
-latest_index_commit_revision_from_log() {
-  local log="$1"
-  local index_id="$2"
-  local line
-  line="$(awk -v marker="index.id=${index_id} " '
-      index($0, marker) && index($0, "index.kind=Path") &&
-      index($0, "index commit published") { line = $0 }
-      END { if (line != "") print line }
-    ' "${log}")"
-  log_unsigned_field revision "${line}"
-}
-
-select_indexed_cutover_fixture() {
-  local state="$1"
-  local builder="$2"
-  local reassignment_log="${KELDRA_QUALIFICATION_DIR}/artifacts/index-reassignment-2-${builder}.log"
-  local line
-  while IFS= read -r line; do
-    membership_cutover_index_id="$(log_unsigned_field index.id "${line}" || true)"
-    [[ -n "${membership_cutover_index_id}" ]] && break
-  done < <(awk '
-      index($0, "index.kind=Path") && index($0, "index commit published")
-    ' "${reassignment_log}")
-  if [[ ! "${membership_cutover_index_id}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "${builder} published no selectable pre-cutover Path index" >&2
-    return 1
-  fi
-  membership_cutover_index_bucket="$(
-    jq -er --argjson index_id "${membership_cutover_index_id}" \
-      '.fixtures[] | select(.index_id == $index_id) | .bucket' "${state}" \
-      | head -n 1
-  )"
-  membership_cutover_index_commit_revision_before="$(
-    latest_index_commit_revision_from_log "${reassignment_log}" \
-      "${membership_cutover_index_id}"
-  )"
-  if [[ -z "${membership_cutover_index_bucket}" \
-    || ! "${membership_cutover_index_commit_revision_before}" =~ ^[1-9][0-9]*$ ]]
-  then
-    echo "selected cutover index omitted its bucket or published commit_revision" >&2
-    return 1
-  fi
-}
-
-indexed_cutover_bulk_request() {
-  local tenant="$1"
-  local bucket="$2"
-  local first="$3"
-  local count="$4"
-  jq -nc \
-    --arg tenant "${tenant}" --arg bucket "${bucket}" \
-    --argjson first "${first}" --argjson count "${count}" '
-      {operations: [range($first; $first + $count) as $position |
-        {put: {
-          address: {
-            tenant: $tenant,
-            bucket: $bucket,
-            path: ("membership-cutover/pending-" + ($position | tostring) + ".json")
-          },
-          bytes: "eA==",
-          contentType: "application/json",
-          commandId: ("membership-cutover-indexed-" + ($position | tostring)),
-          durability: "DURABILITY_LOCAL"
-        }}]}'
-}
-
-prepare_indexed_membership_cutover_qualification() {
-  local source_node="$1"
-  local source_node_id="$2"
-  local builder="$3"
-  local tenant="$4"
-  local client_id="$5"
-  local client_secret="$6"
-  local state="$7"
-  local bound="$8"
-  local endpoint
-  local response="${KELDRA_QUALIFICATION_DIR}/artifacts/membership-indexed-bulk.json"
-  local builder_log="${KELDRA_QUALIFICATION_DIR}/artifacts/membership-indexed-pending-${builder}.log"
-  local builder_log_start
-  local before_line
-  local before_tail
-  local index_safe
-  local line
-  local tail
-  local first
-  local last_index
-  local attempt
-  local sample_attempt
-
-  select_indexed_cutover_fixture "${state}" "${builder}"
-  membership_cutover_index_source_node_id="${source_node_id}"
-  endpoint="$(public_endpoint_for "${source_node}")"
-  membership_cutover_index_token="$(
-    cutover_access_token "${endpoint}" "${client_id}" "${client_secret}"
-  )"
-  membership_cutover_index_burst=$((bound / 2))
-  if ((membership_cutover_index_burst > 32)); then
-    membership_cutover_index_burst=32
-  elif ((membership_cutover_index_burst < 1)); then
-    membership_cutover_index_burst=1
-  fi
-  chmod 0600 "${response}" 2>/dev/null || true
-
-  for attempt in $(seq 1 8); do
-    membership_cutover_index_attempts="${attempt}"
-    first=$(((attempt - 1) * membership_cutover_index_burst))
-    last_index=$((membership_cutover_index_burst - 1))
-    before_line="$(latest_source_journal_sample "${source_node}")"
-    before_tail="$(
-      log_unsigned_field gauge.keldra_source_journal_tail "${before_line}" || true
-    )"
-    if [[ -z "${before_tail}" ]]; then
-      sleep 1
-      continue
-    fi
-    builder_log_start="$(log_cursor)"
-    : >"${response}"
-    chmod 0600 "${response}"
-    if ! indexed_cutover_bulk_request \
-        "${tenant}" "${membership_cutover_index_bucket}" \
-        "${first}" "${membership_cutover_index_burst}" \
-      | grpcurl_public "${endpoint}" \
-          -H "authorization: Bearer ${membership_cutover_index_token}" -d @ \
-          keldra.v1.ObjectService/BulkWrite >"${response}"
-    then
-      sleep 1
-      continue
-    fi
-    paused_container="$(service_container "${builder}")"
-    docker pause "${paused_container}" >/dev/null
-    if ! jq -e --argjson count "${membership_cutover_index_burst}" '
-        (.outcomes | length) == $count and
-        all(.outcomes[]; (.receipt.version | tonumber) > 0)
-      ' "${response}" >/dev/null
-    then
-      docker unpause "${paused_container}" >/dev/null
-      paused_container=""
-      sleep 1
-      continue
-    fi
-    save_log_suffix "${builder}" "${builder_log_start}" "${builder_log}"
-    if log_has_index_event \
-      "${builder_log}" "${membership_cutover_index_id}" \
-      "index commit published"
-    then
-      docker unpause "${paused_container}" >/dev/null
-      paused_container=""
-      sleep 1
-      continue
-    fi
-    membership_cutover_index_path="membership-cutover/pending-$((first + last_index)).json"
-    membership_cutover_index_version="$(
-      jq -er --argjson index "${last_index}" '
-        .outcomes[] |
-        select(((.index // 0) | tonumber) == $index) |
-        .receipt.version
-      ' "${response}"
-    )"
-    for sample_attempt in $(seq 1 15); do
-      line="$(latest_source_journal_sample "${source_node}")"
-      tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}" || true)"
-      index_safe="$(
-        log_unsigned_field gauge.keldra_source_journal_index_safe_through "${line}" || true
-      )"
-      if [[ -n "${tail}" && -n "${index_safe}" ]] \
-        && ((tail > before_tail && index_safe < tail))
-      then
-        membership_cutover_index_source_tail="${tail}"
-        preserve_qualification_log \
-          "${builder_log}" \
-          "/var/tmp/keldra-v090-three-membership-indexed-pending-${qualification_suffix}-${builder}.log"
-        echo "[keldra-qualification] Path index ${membership_cutover_index_id} has accepted effect ${membership_cutover_index_path}@${membership_cutover_index_version} pending at source ${source_node_id} tail ${tail}; old-fence builder ${builder} is paused with no later publication"
-        return 0
-      fi
-      sleep 1
-    done
-    docker unpause "${paused_container}" >/dev/null
-    paused_container=""
-  done
-  echo "could not establish a measured pending indexed effect before membership cutover" >&2
-  return 1
-}
-
-indexed_cutover_query_request() {
-  local tenant="$1"
-  jq -nc \
-    --arg tenant "${tenant}" \
-    --arg bucket "${membership_cutover_index_bucket}" \
-    --arg path "${membership_cutover_index_path}" '
-      {
-        tenant: $tenant,
-        bucket: $bucket,
-        indexName: "paths",
-        query: {path: {prefix: $path}},
-        limit: 2
-      }'
-}
-
-indexed_cutover_response_matches() {
-  local response="$1"
-  local tenant="$2"
-  local fence_term="$3"
-  local fence_index="$4"
-  jq -e \
-    --arg tenant "${tenant}" \
-    --arg bucket "${membership_cutover_index_bucket}" \
-    --arg path "${membership_cutover_index_path}" \
-    --arg version "${membership_cutover_index_version}" \
-    --argjson index_id "${membership_cutover_index_id}" \
-    --argjson commit_revision_before "${membership_cutover_index_commit_revision_before}" \
-    --argjson pending_source_node "${membership_cutover_index_source_node_id}" \
-    --argjson pending_tail "${membership_cutover_index_source_tail}" \
-    --argjson fence_term "${fence_term}" \
-    --argjson fence_index "${fence_index}" '
-      (.hits | length) == 1 and
-      .hits[0].address.tenant == $tenant and
-      .hits[0].address.bucket == $bucket and
-      .hits[0].address.path == $path and
-      (.hits[0].objectVersion | tonumber) == ($version | tonumber) and
-      .freshness.initialBuildComplete == true and
-      ((.freshness.rebuilding // false) == false) and
-      (.freshness.indexId | tonumber) == $index_id and
-      (.freshness.commitRevision | tonumber) > $commit_revision_before and
-      (.freshness.placementTerm | tonumber) == $fence_term and
-      (.freshness.placementIndex | tonumber) == $fence_index and
-      (.freshness.sources | length) == 3 and
-      ([.freshness.sources[].nodeId | tonumber] | sort) == [1, 2, 3] and
-      all(.freshness.sources[];
-        (.sourceEpoch | length) > 0 and
-        ((.lagHint // "0") | tonumber) == 0 and
-        ((.observedTail | tonumber) + 1) == (.indexedNextOffset | tonumber)) and
-      any(.freshness.sources[];
-        (.nodeId | tonumber) == $pending_source_node and
-        (.indexedNextOffset | tonumber) > $pending_tail)
-    ' "${response}" >/dev/null
-}
-
-wait_for_indexed_cutover_effect() {
-  local tenant="$1"
-  local fence_term="$2"
-  local fence_index="$3"
-  local attempt
-  local endpoint
-  local node
-  local response
-  local commit_revision=""
-  local all_ready
-  for attempt in $(seq 1 90); do
-    all_ready=1
-    for node in keldra-1 keldra-2 keldra-3; do
-      endpoint="$(public_endpoint_for "${node}")"
-      response="${KELDRA_QUALIFICATION_DIR}/artifacts/membership-indexed-query-${node}.json"
-      : >"${response}"
-      chmod 0600 "${response}"
-      if ! indexed_cutover_query_request "${tenant}" \
-        | grpcurl_public "${endpoint}" \
-            -H "authorization: Bearer ${membership_cutover_index_token}" -d @ \
-            keldra.v1.IndexService/QueryIndex >"${response}" 2>/dev/null \
-        || ! indexed_cutover_response_matches \
-          "${response}" "${tenant}" "${fence_term}" "${fence_index}"
-      then
-        all_ready=0
-        break
-      fi
-      commit_revision="$(jq -er '.freshness.commitRevision' "${response}")"
-    done
-    if ((all_ready == 1)); then
-      membership_cutover_index_commit_revision_after="${commit_revision}"
-      for node in keldra-1 keldra-2 keldra-3; do
-        preserve_qualification_log \
-          "${KELDRA_QUALIFICATION_DIR}/artifacts/membership-indexed-query-${node}.json" \
-          "/var/tmp/keldra-v090-three-membership-indexed-query-${qualification_suffix}-${node}.json"
-      done
-      return 0
-    fi
-    sleep 1
-  done
-  echo "indexed cutover effect did not become exactly query-visible under the three-ACTIVE-node fence" >&2
-  return 1
-}
-
 sample_after_log_line() {
   local log="$1"
   local preceding="$2"
@@ -762,10 +294,6 @@ qualify_no_event_membership_cutover() {
   local bound="$7"
   local evidence="${KELDRA_QUALIFICATION_DIR}/artifacts/membership-no-event-${node}.log"
   local fence=
-  local fence_index=
-  local fence_term=
-  local indexed_line
-  local indexed_proof_complete=0
   local line=
   local tail
   local attempt
@@ -776,22 +304,6 @@ qualify_no_event_membership_cutover() {
       "${membership_cutover_source_fence_term}" \
       "${membership_cutover_source_fence_index}" 3 || true)"
     [[ -n "${fence}" ]] && line="$(sample_after_log_line "${evidence}" "${fence}")"
-    if [[ -n "${membership_cutover_index_id}" ]]; then
-      fence_term="$(log_unsigned_field membership.term "${fence}" || true)"
-      fence_index="$(log_unsigned_field membership.index "${fence}" || true)"
-      indexed_line="$(latest_source_journal_sample keldra-1)"
-      if [[ -n "${fence_term}" && -n "${fence_index}" ]] \
-        && [[ "$(log_unsigned_field gauge.keldra_source_journal_index_safe_through "${indexed_line}" || true)" \
-          == "${membership_cutover_index_source_tail}" ]]
-      then
-        wait_for_indexed_cutover_effect \
-          "qindex-membership" \
-          "${fence_term}" "${fence_index}"
-        indexed_proof_complete=1
-      else
-        indexed_line=""
-      fi
-    fi
     if source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
       tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
       if [[ "${tail}" != "${membership_cutover_source_tail}" ]]; then
@@ -799,18 +311,12 @@ qualify_no_event_membership_cutover() {
         echo "pre-cutover tail: ${membership_cutover_source_tail}; post-cutover tail: ${tail}" >&2
         return 1
       fi
-      [[ -z "${membership_cutover_index_id}" || "${indexed_proof_complete}" == "1" ]] && break
+      break
     fi
     sleep 1
   done
   if ! source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
-    echo "${node} did not prove index/accounting convergence at its unchanged tail under the new membership fence" >&2
-    return 1
-  fi
-  if [[ -n "${membership_cutover_index_id}" \
-    && "${indexed_proof_complete}" != "1" ]]
-  then
-    echo "indexed cutover proof did not complete under the selected three-node fence" >&2
+    echo "${node} did not prove derived-consumer convergence at its unchanged tail under the new membership fence" >&2
     return 1
   fi
 
@@ -833,8 +339,5 @@ qualify_no_event_membership_cutover() {
   preserve_qualification_log \
     "${evidence}" \
     "/var/tmp/keldra-v090-three-membership-no-event-${qualification_suffix}-${node}.log"
-  if [[ -n "${membership_cutover_index_id}" ]]; then
-    echo "[keldra-qualification] indexed cutover preserved Path index ${membership_cutover_index_id}, made ${membership_cutover_index_path}@${membership_cutover_index_version} visible in commit revision ${membership_cutover_index_commit_revision_after}, and proved three-source zero-lag freshness under the exact three-ACTIVE-node fence"
-  fi
-  echo "[keldra-qualification] cutover advanced index/accounting through source ${node_id} tail ${membership_cutover_source_tail} under the new fence; the next ordinary write advanced it to ${tail}"
+  echo "[keldra-qualification] cutover advanced derived consumers through source ${node_id} tail ${membership_cutover_source_tail} under the new fence; the next ordinary write advanced it to ${tail}"
 }

@@ -4,6 +4,8 @@
 //! creates multiple definitions over one bucket so every definition consumes
 //! the same continuously mutating source journal.
 
+#[path = "index_contention_qualification/capabilities.rs"]
+mod capabilities;
 #[path = "index_contention_qualification/config.rs"]
 mod config;
 #[path = "index_contention_qualification/data.rs"]
@@ -14,7 +16,7 @@ mod metrics;
 mod progress;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use config::Config;
+use config::{Config, MutationWorkload};
 use data::CONTENT_TYPE;
 use keldra_storage::v1::bulk_operation::Operation as BulkOperationValue;
 use keldra_storage::v1::bulk_outcome::Outcome as BulkOutcomeValue;
@@ -28,8 +30,8 @@ use keldra_storage::v1::{
     QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
 };
 use keldra_storage::{
-    BearerToken, KeywordField, RawClient, TypedJsonIndexBuilder, UnsignedIntegerField,
-    administration_client, connect_channel, exchange_client_credentials, object_client,
+    BearerToken, KeywordField, RawClient, TypedJsonIndexBuilder, administration_client,
+    connect_channel, exchange_client_credentials, object_client,
 };
 use metrics::{Latencies, LatencyReport};
 use progress::Counters;
@@ -47,6 +49,7 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
+const MAX_ACTIVE_QUERY_DEFINITIONS: usize = 1_024;
 
 #[derive(Debug, Serialize)]
 struct Report {
@@ -57,6 +60,10 @@ struct Report {
     configuration: config::PublicConfig,
     corpus_sha256: String,
     index_definition_ids: Vec<u64>,
+    definition_creation_seconds: f64,
+    qualified_definition_activation_seconds: f64,
+    qualified_definition_count: usize,
+    physical_recipe_count: usize,
     observed_source_node_ids: Vec<u64>,
     assignment_observability: &'static str,
     responsiveness_definition: &'static str,
@@ -123,6 +130,9 @@ struct MutationReport {
     accepted_operations_per_second: f64,
     accepted_bytes_per_second: f64,
     request_errors: u64,
+    failure_classes: Vec<MutationFailureClass>,
+    failure_occurrences_omitted: u64,
+    failure_diagnostics_definition: &'static str,
     queue_capacity: usize,
     minimum_sampled_queue_depth_while_producing: usize,
     queue_depth_samples: u64,
@@ -143,17 +153,17 @@ struct MutationReport {
 struct CorrectnessReport {
     passed: bool,
     stable_oracle_checked_on_every_completed_query: bool,
-    final_canary_version_observed_by_every_definition: bool,
-    exact_mutable_versions_verified_by_every_definition: bool,
-    final_freshness_healthy_by_every_definition: bool,
-    advisory_zero_lag_verified_by_every_definition: Option<bool>,
+    final_canary_version_observed_by_every_qualified_definition: bool,
+    exact_mutable_versions_verified_by_every_qualified_definition: bool,
+    final_freshness_healthy_by_every_qualified_definition: bool,
+    advisory_zero_lag_verified_by_every_qualified_definition: Option<bool>,
     zero_query_correctness_errors: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct WorkloadValidityReport {
     passed: bool,
-    all_definitions_offered_in_every_phase: bool,
+    all_qualified_definitions_offered_in_every_phase: bool,
     sustained_nonempty_mutation_queue: bool,
     mutation_load_shape_valid: bool,
     mutation_requests_complete_and_successful: bool,
@@ -178,6 +188,34 @@ struct VisibilitySampleFailure {
     error: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct MutationFailureClass {
+    source: &'static str,
+    code: i32,
+    code_name: String,
+    message: String,
+    count: u64,
+}
+
+#[derive(Debug)]
+struct MutationRequestFailure {
+    classes: Vec<MutationFailureClass>,
+}
+
+impl MutationRequestFailure {
+    fn one(source: &'static str, code: i32, code_name: String, message: String) -> Self {
+        Self {
+            classes: vec![MutationFailureClass {
+                source,
+                code,
+                code_name,
+                message: bounded_mutation_failure_message(&message),
+                count: 1,
+            }],
+        }
+    }
+}
+
 struct VisibilitySampleOutcome {
     canary: Canary,
     definition_position: usize,
@@ -187,6 +225,8 @@ struct VisibilitySampleOutcome {
 
 const MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS: usize = 16;
 const MAX_VISIBILITY_SAMPLE_ERROR_CHARS: usize = 512;
+const MAX_MUTATION_FAILURE_CLASSES: usize = 8;
+const MAX_MUTATION_FAILURE_MESSAGE_CHARS: usize = 512;
 
 #[derive(Clone, Copy)]
 struct MutationJob {
@@ -227,6 +267,11 @@ struct QueryOutcome {
 async fn main() -> Result<()> {
     let config = Arc::new(Config::from_env()?);
     let started_unix_milliseconds = unix_millis()?;
+    if std::env::var_os("KELDRA_INDEX_CONTENTION_CAPABILITY_ONLY").is_some() {
+        let report = capabilities::run(&config, started_unix_milliseconds).await?;
+        write_report(config.output.as_deref(), &report)?;
+        return Ok(());
+    }
     match run_qualification(config.clone(), started_unix_milliseconds).await {
         Ok(report) => {
             write_report(config.output.as_deref(), &report)?;
@@ -255,30 +300,49 @@ async fn main() -> Result<()> {
 }
 
 async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128) -> Result<Report> {
-    let corpus_sha256 =
-        data::corpus_digest(config.seed, config.stable_records, config.mutable_records);
+    let corpus_sha256 = data::corpus_digest(
+        config.seed,
+        config.stable_records,
+        config.mutable_records,
+        config.physical_recipe_count,
+    );
     let setup_channels = connect_all(&config.endpoints).await?;
-    let token = exchange_client_credentials(
-        setup_channels[0].clone(),
-        config.client_id.clone(),
-        config.client_secret.clone(),
-    )
-    .await?
-    .access_token;
+    let token = fresh_token(&config, &setup_channels[0]).await?;
     setup(&config, &setup_channels[0], &token).await?;
 
+    let definition_creation_started = Instant::now();
     let definitions = create_definitions(&config, &setup_channels[0], &token).await?;
+    let definition_creation_seconds = definition_creation_started.elapsed().as_secs_f64();
+    let minimum_phase_schedules = config
+        .query_rate
+        .saturating_mul(
+            config
+                .baseline
+                .min(config.concurrent)
+                .min(config.post)
+                .as_secs(),
+        )
+        .max(config.physical_recipe_count as u64) as usize;
     let names = Arc::new(
-        (0..config.definition_count)
-            .map(data::index_name)
-            .collect::<Vec<_>>(),
+        qualification_definition_positions(
+            config.definition_count,
+            config.physical_recipe_count,
+            MAX_ACTIVE_QUERY_DEFINITIONS.min(minimum_phase_schedules),
+        )
+        .into_iter()
+        .map(data::index_name)
+        .collect::<Vec<_>>(),
     );
     let expected = Arc::new(
         (0..config.stable_records)
             .map(data::stable_path)
             .collect::<BTreeSet<_>>(),
     );
+    let definition_activation_started = Instant::now();
     wait_all_ready(&config, &names, &expected, &token).await?;
+    let qualified_definition_activation_seconds =
+        definition_activation_started.elapsed().as_secs_f64();
+    let phase_token = fresh_token(&config, &setup_channels[0]).await?;
 
     // Query and mutation transports are separately established so client-side
     // HTTP/2 flow control cannot manufacture server contention evidence.
@@ -295,7 +359,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         &names,
         &expected,
         &query_channels,
-        &token,
+        &phase_token,
         config.baseline,
         counters.clone(),
     )
@@ -305,7 +369,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         config.clone(),
         mutation_channels,
         visibility_channels,
-        token.clone(),
+        phase_token.clone(),
         counters.clone(),
     ));
     let concurrent = run_query_phase(
@@ -313,7 +377,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         &names,
         &expected,
         &query_channels,
-        &token,
+        &phase_token,
         config.concurrent,
         counters.clone(),
     )
@@ -325,10 +389,17 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         .context("mutation drain exceeded timeout")???;
     let final_canary = mutations.1;
     let mutation_report = mutations.0;
+    let verification_token = fresh_token(&config, &setup_channels[0]).await?;
     let (final_visible, mut observed) = if let Some(canary) = final_canary {
         tokio::time::timeout(
             config.drain_timeout,
-            wait_canary_on_all(&config, &names, &query_channels, &token, canary),
+            wait_canary_on_all(
+                &config,
+                &names,
+                &query_channels,
+                &verification_token,
+                canary,
+            ),
         )
         .await
         .context("final canary verification exceeded drain timeout")??
@@ -337,7 +408,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     };
     let (final_state_verified, advisory_zero_lag, final_sources) = tokio::time::timeout(
         config.drain_timeout,
-        verify_final_mutable_state(&config, &names, &query_channels, &token),
+        verify_final_mutable_state(&config, &names, &query_channels, &verification_token),
     )
     .await
     .context("final mutable verification exceeded drain timeout")??;
@@ -349,7 +420,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         &names,
         &expected,
         &query_channels,
-        &token,
+        &verification_token,
         config.post,
         counters.clone(),
     )
@@ -382,9 +453,9 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     let publication_visibility_p99_passed = config
         .max_publication_visibility_p99_ms
         .is_none_or(|maximum| mutation_report.publication_visibility_lag.p99_ms <= maximum);
-    let all_definitions_offered = [&baseline, &concurrent, &post]
+    let all_qualified_definitions_offered = [&baseline, &concurrent, &post]
         .iter()
-        .all(|phase| phase.offered_definition_count == config.definition_count);
+        .all(|phase| phase.offered_definition_count == names.len());
     let sustained_nonempty_mutation_queue = mutation_report.queue_depth_samples > 0
         && mutation_report.minimum_sampled_queue_depth_while_producing > 0
         && mutation_report.queue_starvation_samples == 0;
@@ -395,7 +466,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         sustained_nonempty_mutation_queue
     };
     let correctness_passed = zero_query_correctness_errors && final_visible && final_state_verified;
-    let workload_passed = all_definitions_offered
+    let workload_passed = all_qualified_definitions_offered
         && mutation_load_shape_valid
         && mutation_requests_complete_and_successful;
     let responsiveness_passed = zero_query_request_errors_or_timeouts
@@ -404,7 +475,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         && publication_visibility_samples_complete
         && publication_visibility_p99_passed;
     let report = Report {
-        schema: "keldra.index-contention-qualification.v1",
+        schema: "keldra.index-contention-qualification.v2",
         started_unix_milliseconds,
         completed_unix_milliseconds: unix_millis()?,
         result: if correctness_passed && workload_passed && responsiveness_passed {
@@ -415,8 +486,12 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         configuration: config.public(),
         corpus_sha256,
         index_definition_ids: definitions,
+        definition_creation_seconds,
+        qualified_definition_activation_seconds,
+        qualified_definition_count: names.len(),
+        physical_recipe_count: config.physical_recipe_count,
         observed_source_node_ids: observed.into_iter().collect(),
-        assignment_observability: "public APIs expose source node IDs and placement epochs, but not builder-to-node assignments; definition_count is cluster-wide work and is not labeled per-node concurrency",
+        assignment_observability: "public APIs expose source node IDs and placement epochs, but not partition-producer assignments; logical definition and physical recipe counts are cluster-wide and are not labeled as per-node concurrency",
         responsiveness_definition: "every offered open-loop schedule completes within request_timeout with no scheduler drop, request error, timeout, or oracle mismatch; visibility probes use request_timeout per query and a separate observation timeout; optional concurrent-query and publication-visibility p99 gates are applied when configured",
         baseline,
         concurrent,
@@ -426,15 +501,15 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         correctness: CorrectnessReport {
             passed: correctness_passed,
             stable_oracle_checked_on_every_completed_query: true,
-            final_canary_version_observed_by_every_definition: final_visible,
-            exact_mutable_versions_verified_by_every_definition: final_state_verified,
-            final_freshness_healthy_by_every_definition: final_state_verified,
-            advisory_zero_lag_verified_by_every_definition: advisory_zero_lag,
+            final_canary_version_observed_by_every_qualified_definition: final_visible,
+            exact_mutable_versions_verified_by_every_qualified_definition: final_state_verified,
+            final_freshness_healthy_by_every_qualified_definition: final_state_verified,
+            advisory_zero_lag_verified_by_every_qualified_definition: advisory_zero_lag,
             zero_query_correctness_errors,
         },
         workload_validity: WorkloadValidityReport {
             passed: workload_passed,
-            all_definitions_offered_in_every_phase: all_definitions_offered,
+            all_qualified_definitions_offered_in_every_phase: all_qualified_definitions_offered,
             sustained_nonempty_mutation_queue,
             mutation_load_shape_valid,
             mutation_requests_complete_and_successful,
@@ -475,7 +550,7 @@ async fn setup(config: &Config, channel: &Channel, token: &str) -> Result<()> {
         operations.push(put(
             config,
             data::stable_path(id),
-            data::payload(config.seed, id, "stable", 0),
+            data::payload(config.seed, id, "stable", 0, config.physical_recipe_count),
             format!("contention-initial-stable-{id}"),
         ));
     }
@@ -483,9 +558,27 @@ async fn setup(config: &Config, channel: &Channel, token: &str) -> Result<()> {
         operations.push(put(
             config,
             data::mutable_path(id),
-            data::payload(config.seed, id, "mutable", 0),
+            data::payload(config.seed, id, "mutable", 0, config.physical_recipe_count),
             format!("contention-initial-mutable-{id}"),
         ));
+    }
+    if config.mutation_workload == MutationWorkload::ProjectionPreserving {
+        for ordinal in 0..data::PROJECTION_PRESERVING_MARKERS {
+            let id = data::marker_id(ordinal);
+            operations.push(put(
+                config,
+                data::marker_path(ordinal),
+                data::payload_with_generations(
+                    config.seed,
+                    id,
+                    "marker",
+                    0,
+                    0,
+                    config.physical_recipe_count,
+                ),
+                format!("contention-initial-marker-{ordinal}"),
+            ));
+        }
     }
     for (batch, chunk) in operations.chunks(1_000).enumerate() {
         let outcomes = client
@@ -512,16 +605,15 @@ async fn create_definitions(config: &Config, channel: &Channel, token: &str) -> 
     let mut ids = Vec::with_capacity(config.definition_count);
     for position in 0..config.definition_count {
         let name = data::index_name(position);
+        let recipe = physical_recipe(position, config.physical_recipe_count);
         let request: CreateIndexRequest = TypedJsonIndexBuilder::new(&config.bucket, &name)
             .path_prefix("contention/")
             .content_type(CONTENT_TYPE)
-            .field(UnsignedIntegerField::single("record_id", "/record_id").exact())
-            .field(KeywordField::single("class", "/class").exact())
-            .field(UnsignedIntegerField::single("generation", "/generation").exact())
+            .field(KeywordField::multi("probe", recipe_probe_pointer(recipe)).exact())
             .finish(format!("contention-create-{position}"))?;
-        let definition = client
-            .create_index(request)
+        let definition = tokio::time::timeout(config.request_timeout, client.create_index(request))
             .await
+            .with_context(|| format!("create index {name} exceeded request timeout"))?
             .with_context(|| format!("create index {name}"))?
             .into_inner();
         ensure!(definition.index_id != 0);
@@ -801,9 +893,10 @@ async fn run_mutations(
     let mut final_canary: Option<Canary> = None;
     while let Some(event) = result_rx.recv().await {
         match event {
-            Err(_) => {
+            Err(failure) => {
                 report.request_errors += 1;
                 counters.mutation_errors.fetch_add(1, Ordering::Relaxed);
+                record_mutation_failure(&mut report, failure);
             }
             Ok(result) => {
                 report.accepted_batches += 1;
@@ -916,6 +1009,7 @@ async fn run_mutations(
     report.accepted_operations_per_second =
         report.accepted_operations as f64 / report.elapsed_seconds;
     report.accepted_bytes_per_second = report.accepted_bytes as f64 / report.elapsed_seconds;
+    report.failure_diagnostics_definition = "request_errors counts failed BulkWrite requests; failure_classes counts RPC statuses, per-outcome failures, or driver response-validation failures by bounded code and message; at most eight distinct classes are retained and failure_occurrences_omitted counts occurrences from additional classes";
     report.publication_visibility_lag = visibility_latency.report();
     report.visibility_definition = "publication_visibility_lag: receipt acceptance to first ordinary query hit with the exact canary object_version; samples rotate by sample ordinal across definitions, use a separate total observation timeout, and include polling-resolution delay";
     Ok((report, final_canary))
@@ -1004,7 +1098,7 @@ async fn execute_mutation(
     config: &Config,
     client: &mut RawClient,
     job: MutationJob,
-) -> Result<MutationResult> {
+) -> std::result::Result<MutationResult, MutationRequestFailure> {
     let started = Instant::now();
     let mut operations = Vec::with_capacity(config.mutation_batch_size + 1);
     let mut bytes = 0u64;
@@ -1014,13 +1108,25 @@ async fn execute_mutation(
             .saturating_mul(config.mutation_batch_size as u64)
             .saturating_add(offset as u64);
         let id = ordinal % config.mutable_records;
-        let payload = data::payload_at_least(
-            config.seed,
-            id,
-            "mutable",
-            job.sequence + 1,
-            config.mutation_record_bytes,
-        );
+        let payload = match config.mutation_workload {
+            MutationWorkload::MaterialChange => data::payload_at_least(
+                config.seed,
+                id,
+                "mutable",
+                job.sequence + 1,
+                config.mutation_record_bytes,
+                config.physical_recipe_count,
+            ),
+            MutationWorkload::ProjectionPreserving => data::payload_with_generations_at_least(
+                config.seed,
+                id,
+                "mutable",
+                0,
+                job.sequence + 1,
+                config.mutation_record_bytes,
+                config.physical_recipe_count,
+            ),
+        };
         bytes = bytes.saturating_add(payload.len() as u64);
         operations.push(put(
             config,
@@ -1029,49 +1135,117 @@ async fn execute_mutation(
             format!("contention-mutation-{}-{offset}", job.sequence),
         ));
     }
-    let marker_id = (1u64 << 63) | job.sequence;
-    let marker_payload = data::payload(config.seed, marker_id, "marker", job.sequence);
+    let marker_ordinal = match config.mutation_workload {
+        MutationWorkload::MaterialChange => job.sequence,
+        MutationWorkload::ProjectionPreserving => {
+            job.sequence % data::PROJECTION_PRESERVING_MARKERS
+        }
+    };
+    let marker_id = data::marker_id(marker_ordinal);
+    let marker_payload = match config.mutation_workload {
+        MutationWorkload::MaterialChange => data::payload(
+            config.seed,
+            marker_id,
+            "marker",
+            job.sequence,
+            config.physical_recipe_count,
+        ),
+        MutationWorkload::ProjectionPreserving => data::payload_with_generations(
+            config.seed,
+            marker_id,
+            "marker",
+            0,
+            job.sequence,
+            config.physical_recipe_count,
+        ),
+    };
     bytes = bytes.saturating_add(marker_payload.len() as u64);
     operations.push(put(
         config,
-        data::marker_path(job.sequence),
+        data::marker_path(marker_ordinal),
         marker_payload,
         format!("contention-marker-{}", job.sequence),
     ));
-    let response = client
-        .bulk_write(BulkWriteRequest { operations })
-        .await
-        .context("mutation BulkWrite")?
-        .into_inner();
-    ensure!(
-        response.outcomes.len() == config.mutation_batch_size + 1,
-        "mutation outcome count mismatch"
-    );
+    let response = match client.bulk_write(BulkWriteRequest { operations }).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            return Err(MutationRequestFailure::one(
+                "rpc-status",
+                status.code() as i32,
+                format!("{:?}", status.code()),
+                status.message().to_owned(),
+            ));
+        }
+    };
+    if response.outcomes.len() != config.mutation_batch_size + 1 {
+        return Err(driver_mutation_failure(
+            "outcome-count-mismatch",
+            format!(
+                "BulkWrite returned {} outcomes for {} operations",
+                response.outcomes.len(),
+                config.mutation_batch_size + 1
+            ),
+        ));
+    }
     let mut marker_version = None;
+    let mut failures = Vec::new();
     for outcome in response.outcomes {
-        let index = usize::try_from(outcome.index)?;
-        match outcome.outcome.context("missing mutation outcome")? {
+        let index = match usize::try_from(outcome.index) {
+            Ok(index) => index,
+            Err(error) => {
+                return Err(driver_mutation_failure(
+                    "invalid-outcome-index",
+                    format!("BulkWrite outcome index is invalid: {error}"),
+                ));
+            }
+        };
+        let Some(outcome) = outcome.outcome else {
+            return Err(driver_mutation_failure(
+                "missing-outcome",
+                format!("BulkWrite outcome {index} omitted its result"),
+            ));
+        };
+        match outcome {
             BulkOutcomeValue::Receipt(receipt) => {
-                ensure!(!receipt.deleted && receipt.version != 0);
+                if receipt.deleted || receipt.version == 0 {
+                    return Err(driver_mutation_failure(
+                        "invalid-receipt",
+                        format!(
+                            "BulkWrite outcome {index} returned deleted={} version={}",
+                            receipt.deleted, receipt.version
+                        ),
+                    ));
+                }
                 if index == config.mutation_batch_size {
                     marker_version = Some(receipt.version);
                 }
             }
-            BulkOutcomeValue::Failure(failure) => bail!(
-                "mutation failed with code {}: {}",
-                failure.code,
-                failure.message
-            ),
+            BulkOutcomeValue::Failure(failure) => failures.push(MutationFailureClass {
+                source: "outcome",
+                code: failure.code,
+                code_name: format!("{:?}", tonic::Code::from_i32(failure.code)),
+                message: bounded_mutation_failure_message(&failure.message),
+                count: 1,
+            }),
         }
     }
+    if !failures.is_empty() {
+        return Err(MutationRequestFailure { classes: failures });
+    }
+    let Some(marker_version) = marker_version else {
+        return Err(driver_mutation_failure(
+            "missing-marker-receipt",
+            "BulkWrite response omitted the marker receipt".into(),
+        ));
+    };
     let accepted_at = Instant::now();
     Ok(MutationResult {
         operations: (config.mutation_batch_size + 1) as u64,
         bytes,
         elapsed: accepted_at.saturating_duration_since(started),
         canary: Some(Canary {
-            id: job.sequence,
-            version: marker_version.context("marker receipt missing")?,
+            id: marker_ordinal,
+            version: marker_version,
             accepted_at,
         }),
     })
@@ -1128,21 +1302,43 @@ async fn wait_canary_on_all(
     canary: Canary,
 ) -> Result<(bool, BTreeSet<u64>)> {
     let mut source_nodes = BTreeSet::new();
-    for (position, name) in names.iter().enumerate() {
-        wait_canary(
-            &channels[position % channels.len()],
-            token,
-            &config.bucket,
-            name,
-            canary,
-            config.visibility_poll,
-            config.request_timeout,
-            config.drain_timeout,
-        )
-        .await?;
-        let mut client = index_client(channels[position % channels.len()].clone(), token)?;
-        let response = marker_query(&mut client, &config.bucket, name, canary.id).await?;
-        if let Some(freshness) = response.freshness {
+    let mut next = names.iter().cloned().enumerate();
+    let mut tasks = JoinSet::new();
+    loop {
+        while tasks.len() < config.query_max_in_flight {
+            let Some((position, name)) = next.next() else {
+                break;
+            };
+            let channel = channels[position % channels.len()].clone();
+            let token = token.to_owned();
+            let bucket = config.bucket.clone();
+            let visibility_poll = config.visibility_poll;
+            let request_timeout = config.request_timeout;
+            let drain_timeout = config.drain_timeout;
+            tasks.spawn(async move {
+                wait_canary(
+                    &channel,
+                    &token,
+                    &bucket,
+                    &name,
+                    canary,
+                    visibility_poll,
+                    request_timeout,
+                    drain_timeout,
+                )
+                .await?;
+                let mut client = index_client(channel, &token)?;
+                Ok::<_, anyhow::Error>(
+                    marker_query(&mut client, &bucket, &name, canary.id)
+                        .await?
+                        .freshness,
+                )
+            });
+        }
+        let Some(completed) = tasks.join_next().await else {
+            break;
+        };
+        if let Some(freshness) = completed.context("final canary task panicked")?? {
             source_nodes.extend(
                 freshness
                     .sources
@@ -1164,6 +1360,36 @@ fn bounded_error(error: &str) -> String {
         .chars()
         .take(MAX_VISIBILITY_SAMPLE_ERROR_CHARS)
         .collect()
+}
+
+fn bounded_mutation_failure_message(message: &str) -> String {
+    message
+        .chars()
+        .take(MAX_MUTATION_FAILURE_MESSAGE_CHARS)
+        .collect()
+}
+
+fn driver_mutation_failure(code_name: &'static str, message: String) -> MutationRequestFailure {
+    MutationRequestFailure::one("driver-validation", -1, code_name.to_owned(), message)
+}
+
+fn record_mutation_failure(report: &mut MutationReport, failure: MutationRequestFailure) {
+    for class in failure.classes {
+        if let Some(existing) = report.failure_classes.iter_mut().find(|existing| {
+            existing.source == class.source
+                && existing.code == class.code
+                && existing.code_name == class.code_name
+                && existing.message == class.message
+        }) {
+            existing.count = existing.count.saturating_add(class.count);
+        } else if report.failure_classes.len() < MAX_MUTATION_FAILURE_CLASSES {
+            report.failure_classes.push(class);
+        } else {
+            report.failure_occurrences_omitted = report
+                .failure_occurrences_omitted
+                .saturating_add(class.count);
+        }
+    }
 }
 
 async fn verify_final_mutable_state(
@@ -1193,73 +1419,115 @@ async fn verify_final_mutable_state(
         };
         authority.insert(path, version);
     }
+    let authority = Arc::new(authority);
     let mut nodes = BTreeSet::new();
     let mut all_observed_tails_available = true;
-    for (position, name) in names.iter().enumerate() {
-        let mut client = index_client(channels[position % channels.len()].clone(), token)?;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            ensure!(
-                !remaining.is_zero(),
-                "index {name} did not converge to authoritative mutable state and zero lag"
-            );
-            let response = tokio::time::timeout(
-                remaining.min(config.request_timeout),
-                class_query(&mut client, &config.bucket, name, "mutable", 1_000),
-            )
-            .await;
-            if let Ok(Ok(response)) = response {
-                let indexed = response
-                    .hits
-                    .iter()
-                    .map(|hit| {
-                        Ok((
-                            hit.address
-                                .as_ref()
-                                .context("mutable query hit omitted address")?
-                                .path
-                                .clone(),
-                            hit.object_version,
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>>>()?;
-                let exact = indexed.len() == response.hits.len() && indexed == authority;
-                if let Some(freshness) = response.freshness {
-                    let source_ids = freshness
-                        .sources
-                        .iter()
-                        .map(|source| source.node_id)
-                        .collect::<BTreeSet<_>>();
-                    let healthy = freshness.initial_build_complete
-                        && !freshness.rebuilding
-                        && freshness.sources.len() == config.endpoints.len()
-                        && source_ids.len() == config.endpoints.len()
-                        && freshness
-                            .sources
-                            .iter()
-                            .all(|source| source.node_id != 0 && source.source_epoch.len() == 32);
-                    let observed_tails_available = freshness
-                        .sources
-                        .iter()
-                        .all(|source| source.observed_tail.is_some());
-                    let no_observed_lag = freshness.sources.iter().all(source_has_no_observed_lag);
-                    if exact && healthy && no_observed_lag {
-                        all_observed_tails_available &= observed_tails_available;
-                        nodes.extend(
-                            freshness
-                                .sources
-                                .into_iter()
-                                .map(|source| source.node_id)
-                                .filter(|id| *id != 0),
-                        );
-                        break;
-                    }
-                }
-            }
-            tokio::time::sleep(config.visibility_poll).await;
+    let mut next = names.iter().cloned().enumerate();
+    let mut tasks = JoinSet::new();
+    loop {
+        while tasks.len() < config.query_max_in_flight {
+            let Some((position, name)) = next.next() else {
+                break;
+            };
+            let channel = channels[position % channels.len()].clone();
+            let token = token.to_owned();
+            let bucket = config.bucket.clone();
+            let visibility_poll = config.visibility_poll;
+            let request_timeout = config.request_timeout;
+            let expected_source_count = config.endpoints.len();
+            let authority = authority.clone();
+            tasks.spawn(async move {
+                verify_one_final_definition(
+                    channel,
+                    token,
+                    bucket,
+                    name,
+                    authority,
+                    deadline,
+                    visibility_poll,
+                    request_timeout,
+                    expected_source_count,
+                )
+                .await
+            });
         }
+        let Some(completed) = tasks.join_next().await else {
+            break;
+        };
+        let (observed_tails_available, source_nodes) =
+            completed.context("final mutable verification task panicked")??;
+        all_observed_tails_available &= observed_tails_available;
+        nodes.extend(source_nodes);
     }
     Ok((true, all_observed_tails_available.then_some(true), nodes))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_one_final_definition(
+    channel: Channel,
+    token: String,
+    bucket: String,
+    name: String,
+    authority: Arc<BTreeMap<String, u64>>,
+    deadline: Instant,
+    visibility_poll: Duration,
+    request_timeout: Duration,
+    expected_source_count: usize,
+) -> Result<(bool, BTreeSet<u64>)> {
+    let mut client = index_client(channel, &token)?;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "index {name} did not converge to authoritative mutable state and zero lag"
+        );
+        let response = tokio::time::timeout(
+            remaining.min(request_timeout),
+            class_query(&mut client, &bucket, &name, "mutable", 1_000),
+        )
+        .await;
+        if let Ok(Ok(response)) = response {
+            let indexed = response
+                .hits
+                .iter()
+                .map(|hit| {
+                    Ok((
+                        hit.address
+                            .as_ref()
+                            .context("mutable query hit omitted address")?
+                            .path
+                            .clone(),
+                        hit.object_version,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let exact = indexed.len() == response.hits.len() && indexed == *authority;
+            if let Some(freshness) = response.freshness {
+                let source_ids = freshness
+                    .sources
+                    .iter()
+                    .map(|source| source.node_id)
+                    .collect::<BTreeSet<_>>();
+                let healthy = freshness.initial_build_complete
+                    && !freshness.rebuilding
+                    && freshness.sources.len() == expected_source_count
+                    && source_ids.len() == expected_source_count
+                    && freshness
+                        .sources
+                        .iter()
+                        .all(|source| source.node_id != 0 && source.source_epoch.len() == 32);
+                let observed_tails_available = freshness
+                    .sources
+                    .iter()
+                    .all(|source| source.observed_tail.is_some());
+                let no_observed_lag = freshness.sources.iter().all(source_has_no_observed_lag);
+                if exact && healthy && no_observed_lag {
+                    return Ok((observed_tails_available, source_ids));
+                }
+            }
+        }
+        tokio::time::sleep(visibility_poll).await;
+    }
 }
 
 fn source_has_no_observed_lag(source: &IndexSourceFreshness) -> bool {
@@ -1304,7 +1572,7 @@ async fn class_query(
         client,
         bucket,
         index_name,
-        "class",
+        "probe",
         serde_json::to_vec(class)?,
         limit,
     )
@@ -1317,13 +1585,13 @@ async fn marker_query(
     index_name: &str,
     sequence: u64,
 ) -> Result<QueryIndexResponse> {
-    let marker_id = (1u64 << 63) | sequence;
+    let marker_id = data::marker_id(sequence);
     query(
         client,
         bucket,
         index_name,
-        "record_id",
-        marker_id.to_string().into_bytes(),
+        "probe",
+        serde_json::to_vec(&data::marker_probe(marker_id))?,
         1,
     )
     .await
@@ -1410,6 +1678,51 @@ async fn connect_all(endpoints: &[String]) -> Result<Vec<Channel>> {
     Ok(channels)
 }
 
+async fn fresh_token(config: &Config, channel: &Channel) -> Result<String> {
+    Ok(exchange_client_credentials(
+        channel.clone(),
+        config.client_id.clone(),
+        config.client_secret.clone(),
+    )
+    .await?
+    .access_token)
+}
+
+fn physical_recipe(position: usize, physical_recipe_count: usize) -> usize {
+    position % physical_recipe_count
+}
+
+fn qualification_definition_positions(
+    definition_count: usize,
+    physical_recipe_count: usize,
+    maximum: usize,
+) -> Vec<usize> {
+    if definition_count <= maximum {
+        return (0..definition_count).collect();
+    }
+    let mut positions = (0..physical_recipe_count).collect::<BTreeSet<_>>();
+    let remaining = maximum - physical_recipe_count;
+    if remaining == 0 {
+        return positions.into_iter().collect();
+    }
+    if remaining == 1 {
+        positions.insert(definition_count - 1);
+        return positions.into_iter().collect();
+    }
+    for ordinal in 0..remaining {
+        positions.insert(
+            physical_recipe_count
+                + ordinal.saturating_mul(definition_count - 1 - physical_recipe_count)
+                    / (remaining - 1),
+        );
+    }
+    positions.into_iter().collect()
+}
+
+fn recipe_probe_pointer(recipe: usize) -> String {
+    format!("/probes/{recipe:02}")
+}
+
 fn unix_millis() -> Result<u128> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
 }
@@ -1422,6 +1735,38 @@ mod tests {
     fn marker_ids_do_not_overlap_small_corpus_ids() {
         assert_eq!((1u64 << 63) | 7, 9_223_372_036_854_775_815);
         assert!(data::marker_path(7).contains("0000000000000007"));
+    }
+
+    #[test]
+    fn recipes_use_one_public_multivalue_field_and_distinct_source_pointers() {
+        assert_eq!(recipe_probe_pointer(0), "/probes/00");
+        assert_eq!(recipe_probe_pointer(1), "/probes/01");
+        assert_eq!(recipe_probe_pointer(63), "/probes/63");
+    }
+
+    #[test]
+    fn p1_definitions_have_identical_physical_recipes() {
+        assert_eq!(physical_recipe(0, 1), 0);
+        assert_eq!(physical_recipe(249_999, 1), 0);
+    }
+
+    #[test]
+    fn recipe_identity_is_bounded_independently_of_definition_count() {
+        let recipes = (0..250_000)
+            .map(|position| physical_recipe(position, 64))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(recipes.len(), 64);
+        let pointers = (0..64).map(recipe_probe_pointer).collect::<BTreeSet<_>>();
+        assert_eq!(pointers.len(), 64);
+    }
+
+    #[test]
+    fn large_catalog_uses_a_bounded_spanning_query_sample() {
+        let positions = qualification_definition_positions(250_000, 64, 1_024);
+        assert_eq!(positions.len(), MAX_ACTIVE_QUERY_DEFINITIONS);
+        assert_eq!(positions[0], 0);
+        assert_eq!(*positions.last().unwrap(), 249_999);
+        assert!((0..64).all(|recipe| positions.contains(&recipe)));
     }
 
     #[test]
@@ -1464,6 +1809,47 @@ mod tests {
         let bounded = bounded_error(&error);
         assert_eq!(bounded.chars().count(), MAX_VISIBILITY_SAMPLE_ERROR_CHARS);
         assert!(error.starts_with(&bounded));
+    }
+
+    #[test]
+    fn mutation_failure_messages_are_bounded_on_character_boundaries() {
+        let message = "é".repeat(MAX_MUTATION_FAILURE_MESSAGE_CHARS + 10);
+        let bounded = bounded_mutation_failure_message(&message);
+        assert_eq!(bounded.chars().count(), MAX_MUTATION_FAILURE_MESSAGE_CHARS);
+        assert!(message.starts_with(&bounded));
+    }
+
+    #[test]
+    fn mutation_failure_classes_are_counted_and_bounded() {
+        let mut report = MutationReport::default();
+        for ordinal in 0..MAX_MUTATION_FAILURE_CLASSES {
+            record_mutation_failure(
+                &mut report,
+                MutationRequestFailure::one(
+                    "outcome",
+                    ordinal as i32,
+                    format!("Code{ordinal}"),
+                    format!("failure-{ordinal}"),
+                ),
+            );
+        }
+        record_mutation_failure(
+            &mut report,
+            MutationRequestFailure::one("outcome", 0, "Code0".into(), "failure-0".into()),
+        );
+        record_mutation_failure(
+            &mut report,
+            MutationRequestFailure::one(
+                "rpc-status",
+                tonic::Code::Unavailable as i32,
+                "Unavailable".into(),
+                "queue closed".into(),
+            ),
+        );
+
+        assert_eq!(report.failure_classes.len(), MAX_MUTATION_FAILURE_CLASSES);
+        assert_eq!(report.failure_classes[0].count, 2);
+        assert_eq!(report.failure_occurrences_omitted, 1);
     }
 
     #[tokio::test]

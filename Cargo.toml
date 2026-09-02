@@ -12,10 +12,11 @@ members = [
     "crates/keldra-index",
     "crates/keldra-osv-qualification",
     "crates/keldra-store",
+    "integrations/zanzibar",
 ]
 
 [workspace.package]
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 readme = "README.md"
 description = "Opaque versioned object storage with bounded atomic programs"
@@ -27,6 +28,12 @@ homepage = "https://keldra.store"
 documentation = "https://keldra.store"
 repository = "https://github.com/keldra-store/keldra"
 rust-version = "1.96.0"
+
+[patch.crates-io]
+# The integrated Zanzibar workspace validates against the candidate Keldra
+# client. Zanzibar's own manifest remains an exact crates.io dependency when
+# checked out and released on its own.
+keldra = { path = "clients/rust" }
 
 [profile.ci]
 inherits = "dev"

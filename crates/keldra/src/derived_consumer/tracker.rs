@@ -172,10 +172,17 @@ impl SourceProgress {
                 settled_next,
             });
         }
-        if proof_next > settled_next {
-            return Err(SparseTrackerError::EvidenceOffset);
-        }
-        let proof_next = proof_next.max(self.baseline_next);
+        // Publication can race ahead of this tracker's captured demultiplexing
+        // barrier. Do not reject and rebuild, but do not trust the future proof
+        // for retention either. The normal scan will apply it once the source
+        // barrier catches up.
+        let proof_ahead = proof_next > settled_next;
+        let proof_next = if proof_ahead {
+            self.baseline_next
+        } else {
+            proof_next.max(self.baseline_next)
+        };
+        let proof_atomic_through = (!proof_ahead).then_some(proof_atomic_through).flatten();
         let previous = self.pending.remove(&identity);
         if let Some(previous) = previous {
             self.remove_minimum(previous.retention_next())?;
@@ -216,7 +223,7 @@ impl SourceProgress {
             .checked_add(1)
             .ok_or(SparseTrackerError::OffsetOverflow)?;
         if proof_next > settled_next {
-            return Err(SparseTrackerError::EvidenceOffset);
+            return Ok(());
         }
         let Some(previous) = self.pending.remove(&identity) else {
             return Ok(());
@@ -652,8 +659,6 @@ pub(crate) enum SparseTrackerError {
     EvidenceSourceMissing,
     #[error("derived proof names another source incarnation")]
     EvidenceSourceChanged,
-    #[error("derived proof is beyond the settled source tail")]
-    EvidenceOffset,
     #[error(
         "derived routed offset is outside retained settled history: source={source_id:?} definition={identity:?} required_next={required_next} floor_next={floor_next} settled_next={settled_next}"
     )]

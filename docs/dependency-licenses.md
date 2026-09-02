@@ -1,4 +1,8 @@
-# Keldra 0.9 index dependency record
+# Historical Keldra 0.9 index dependency record
+
+> Superseded by the format-v6 memory-first index architecture. Keldra 0.16 no
+> longer depends on `sux`; this file is retained only as the audit record for
+> the removed format-v4 implementation.
 
 This record covers the two dependencies deliberately adopted for the Keldra
 0.9 native-segment index implementation. `Cargo.lock` remains the authoritative

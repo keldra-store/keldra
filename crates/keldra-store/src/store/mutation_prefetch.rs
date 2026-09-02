@@ -5,7 +5,10 @@
 //! enter the existing pending maps in input order and share the existing final
 //! `WriteBatch`.
 
+use super::object_alias_registry::decode_registry;
+use super::receipt_codec::decode_stored_receipt;
 use super::*;
+use crate::ObjectAliasRegistry;
 
 const PREFETCH_KEYS_PER_MULTI_GET: usize = 256;
 
@@ -14,10 +17,11 @@ type Cached<T> = Result<Option<T>, MutationError>;
 #[derive(Default)]
 pub(super) struct MutationReadCache {
     heads: BTreeMap<Vec<u8>, Cached<Head>>,
-    versions: BTreeMap<Vec<u8>, Cached<Version>>,
+    stored_versions: BTreeMap<Vec<u8>, Cached<StoredVersion>>,
     receipts: BTreeMap<Vec<u8>, Cached<StoredReceipt>>,
     blob_references: BTreeMap<Vec<u8>, Cached<BlobReferenceState>>,
     inline_payloads: BTreeMap<Vec<u8>, Cached<Vec<u8>>>,
+    alias_registries: BTreeMap<Vec<u8>, Cached<ObjectAliasRegistry>>,
     policies: BTreeMap<Vec<u8>, Result<BucketPolicy, MutationError>>,
     versioning: BTreeMap<Vec<u8>, Result<ObjectVersioning, MutationError>>,
 }
@@ -29,6 +33,7 @@ struct PrefetchMetrics {
     receipt_keys: u64,
     blob_reference_keys: u64,
     inline_payload_keys: u64,
+    alias_registry_keys: u64,
     policy_keys: u64,
     versioning_keys: u64,
     head_seconds: f64,
@@ -36,6 +41,7 @@ struct PrefetchMetrics {
     receipt_seconds: f64,
     blob_reference_seconds: f64,
     inline_payload_seconds: f64,
+    alias_registry_seconds: f64,
     policy_seconds: f64,
     versioning_seconds: f64,
 }
@@ -67,6 +73,18 @@ impl MutationReadCache {
         metrics.head_keys = head_keys.len() as u64;
         metrics.head_seconds = elapsed;
 
+        let started = std::time::Instant::now();
+        let alias_registries = multi_get_raw(store, CF_OBJECT_ALIAS_REGISTRIES, &head_keys)?
+            .into_iter()
+            .map(|(key, cached)| {
+                let decoded = cached
+                    .and_then(|value| value.map(|encoded| decode_registry(&encoded)).transpose());
+                (key, decoded)
+            })
+            .collect();
+        metrics.alias_registry_keys = head_keys.len() as u64;
+        metrics.alias_registry_seconds = started.elapsed().as_secs_f64();
+
         let mut version_key_by_head = BTreeMap::new();
         let mut version_keys = BTreeSet::new();
         for (head_key, cached) in &heads {
@@ -82,7 +100,7 @@ impl MutationReadCache {
             .map(|(key, cached)| {
                 let decoded = cached.and_then(|value| {
                     value
-                        .map(|encoded| StoredVersion::decode(&encoded).map(|stored| stored.version))
+                        .map(|encoded| StoredVersion::decode(&encoded))
                         .transpose()
                 });
                 (key, decoded)
@@ -91,7 +109,7 @@ impl MutationReadCache {
         let elapsed = started.elapsed();
         metrics.version_keys = version_keys.len() as u64;
         metrics.version_seconds = elapsed.as_secs_f64();
-        let versions: BTreeMap<Vec<u8>, Cached<Version>> = version_key_by_head
+        let stored_versions: BTreeMap<Vec<u8>, Cached<StoredVersion>> = version_key_by_head
             .into_iter()
             .map(|(head_key, version_key)| {
                 let cached = versions_by_key.get(&version_key).cloned().ok_or_else(|| {
@@ -101,8 +119,19 @@ impl MutationReadCache {
             })
             .collect();
 
-        let (receipts, elapsed) =
-            multi_get_json::<StoredReceipt>(store, CF_RECEIPTS, &receipt_keys)?;
+        let started = std::time::Instant::now();
+        let receipts = multi_get_raw(store, CF_RECEIPTS, &receipt_keys)?
+            .into_iter()
+            .map(|(key, cached)| {
+                let decoded = cached.and_then(|value| {
+                    value
+                        .map(|encoded| decode_stored_receipt(&encoded))
+                        .transpose()
+                });
+                (key, decoded)
+            })
+            .collect();
+        let elapsed = started.elapsed().as_secs_f64();
         metrics.receipt_keys = receipt_keys.len() as u64;
         metrics.receipt_seconds = elapsed;
 
@@ -138,9 +167,9 @@ impl MutationReadCache {
                 }
             }
         }
-        for cached in versions.values() {
-            if let Ok(Some(version)) = cached
-                && let Some(reference) = version.blob.as_ref()
+        for cached in stored_versions.values() {
+            if let Ok(Some(stored)) = cached
+                && let Some(reference) = stored.version.blob.as_ref()
             {
                 blob_reference_keys.insert(blob_reference_key(reference));
             }
@@ -169,10 +198,11 @@ impl MutationReadCache {
 
         Ok(Self {
             heads,
-            versions,
+            stored_versions,
             receipts,
             blob_references,
             inline_payloads,
+            alias_registries,
             policies,
             versioning,
         })
@@ -182,8 +212,8 @@ impl MutationReadCache {
         self.heads.get(key).cloned()
     }
 
-    pub(super) fn version(&self, head_key: &[u8]) -> Option<Cached<Version>> {
-        self.versions.get(head_key).cloned()
+    pub(super) fn stored_version(&self, head_key: &[u8]) -> Option<Cached<StoredVersion>> {
+        self.stored_versions.get(head_key).cloned()
     }
 
     pub(super) fn receipt(&self, key: &[u8]) -> Option<Cached<StoredReceipt>> {
@@ -204,6 +234,21 @@ impl MutationReadCache {
         self.inline_payloads
             .get(&complete_artifact_key(reference))
             .cloned()
+    }
+
+    pub(super) fn alias_registry(
+        &self,
+        head_key: &[u8],
+        canonical_path: &str,
+    ) -> Option<Cached<ObjectAliasRegistry>> {
+        self.alias_registries.get(head_key).cloned().map(|cached| {
+            cached.and_then(|registry| {
+                if let Some(registry) = registry.as_ref() {
+                    registry.validate(canonical_path)?;
+                }
+                Ok(registry)
+            })
+        })
     }
 
     pub(super) fn seed_bucket_settings(
@@ -232,6 +277,8 @@ impl PrefetchMetrics {
                 self.blob_reference_keys,
             monotonic_counter.keldra_store_bulk_prefetch_inline_payload_keys_total =
                 self.inline_payload_keys,
+            monotonic_counter.keldra_store_bulk_prefetch_alias_registry_keys_total =
+                self.alias_registry_keys,
             monotonic_counter.keldra_store_bulk_prefetch_policy_keys_total = self.policy_keys,
             monotonic_counter.keldra_store_bulk_prefetch_versioning_keys_total =
                 self.versioning_keys,
@@ -242,6 +289,8 @@ impl PrefetchMetrics {
                 self.blob_reference_seconds,
             histogram.keldra_store_bulk_prefetch_inline_payloads_duration_seconds =
                 self.inline_payload_seconds,
+            histogram.keldra_store_bulk_prefetch_alias_registries_duration_seconds =
+                self.alias_registry_seconds,
             histogram.keldra_store_bulk_prefetch_policies_duration_seconds = self.policy_seconds,
             histogram.keldra_store_bulk_prefetch_versioning_duration_seconds =
                 self.versioning_seconds,

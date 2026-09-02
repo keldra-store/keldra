@@ -171,6 +171,17 @@ pub(crate) trait IndexEventSources: Send + Sync + 'static {
         limit: usize,
         max_bytes: u64,
     ) -> Result<IndexSourcePage, IndexEventError>;
+
+    async fn read_definition_page(
+        &self,
+        source: &IndexSource,
+        expected_source: SourceId,
+        after_offset: u64,
+        target_offset: u64,
+        kind: keldra_store::DefinitionKind,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<IndexSourcePage, IndexEventError>;
 }
 
 #[derive(Clone)]
@@ -512,6 +523,56 @@ impl IndexEventSources for ClusterIndexEventSources {
             .insert(key, target_offset, max_bytes, page.clone());
         trim_cached_page(&page, after_offset, target_offset, max_bytes)
     }
+
+    async fn read_definition_page(
+        &self,
+        source: &IndexSource,
+        expected_source: SourceId,
+        after_offset: u64,
+        target_offset: u64,
+        kind: keldra_store::DefinitionKind,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<IndexSourcePage, IndexEventError> {
+        let route = JournalRoute::Definition(kind);
+        let page = if source.node == self.local_node {
+            let store = self.store.clone();
+            tokio::task::spawn_blocking(move || {
+                store.scan_routed_local_changes(
+                    route,
+                    expected_source,
+                    after_offset,
+                    target_offset,
+                    limit,
+                    max_bytes,
+                )
+            })
+            .await
+            .map_err(|error| source_error(source.node, error))?
+            .map_err(|error| local_routed_source_error(source.node, error))?
+        } else {
+            self.peers
+                .read_routed_source_journal(
+                    source.node,
+                    &source.address,
+                    route,
+                    expected_source,
+                    after_offset,
+                    target_offset,
+                    limit,
+                    max_bytes,
+                )
+                .await
+                .map_err(|error| remote_routed_source_error(source.node, error))?
+        };
+        Ok(IndexSourcePage {
+            source_id: page.source_id,
+            changes: page.changes,
+            encoded_bytes: page.encoded_bytes,
+            through_offset: page.through_offset,
+            oversize: page.oversize,
+        })
+    }
 }
 
 fn source_error(node: NodeId, error: impl std::fmt::Display) -> IndexEventError {
@@ -835,8 +896,30 @@ impl IndexEventJournal {
         max_bytes: u64,
     ) -> Result<Option<IndexJournalPage>, IndexEventError> {
         self.next_page_limited(
-            tenant_id,
-            bucket_id,
+            JournalRoute::Bucket {
+                tenant_id,
+                bucket_id,
+            },
+            from,
+            target,
+            self.page_size,
+            max_bytes,
+        )
+        .await
+    }
+
+    /// Pull only definition transitions while retaining exact all-source
+    /// cursor coverage through the captured target. An empty sparse page can
+    /// therefore advance across arbitrary ordinary object traffic.
+    pub(crate) async fn next_definition_page(
+        &self,
+        kind: keldra_store::DefinitionKind,
+        from: &IndexBarrier,
+        target: &IndexBarrier,
+        max_bytes: u64,
+    ) -> Result<Option<IndexJournalPage>, IndexEventError> {
+        self.next_page_limited(
+            JournalRoute::Definition(kind),
             from,
             target,
             self.page_size,
@@ -930,8 +1013,10 @@ impl IndexEventJournal {
         let mut affected = BTreeMap::<SourceId, RoutedSourceEffect>::new();
         while let Some(page) = self
             .next_page_limited(
-                tenant_id,
-                bucket_id,
+                JournalRoute::Bucket {
+                    tenant_id,
+                    bucket_id,
+                },
                 &through,
                 target,
                 self.page_size,
@@ -1119,8 +1204,7 @@ impl IndexEventJournal {
 
     async fn next_page_limited(
         &self,
-        tenant_id: u64,
-        bucket_id: u64,
+        route: JournalRoute,
         from: &IndexBarrier,
         target: &IndexBarrier,
         page_size: usize,
@@ -1160,19 +1244,38 @@ impl IndexEventJournal {
             .next_offset
             .checked_sub(1)
             .ok_or(IndexEventError::CheckpointMismatch(source.node))?;
-        let page = self
-            .sources
-            .read_page(
-                source,
-                start.source,
-                after,
-                target_offset,
+        let page = match route {
+            JournalRoute::Bucket {
                 tenant_id,
                 bucket_id,
-                page_size,
-                max_bytes,
-            )
-            .await?;
+            } => {
+                self.sources
+                    .read_page(
+                        source,
+                        start.source,
+                        after,
+                        target_offset,
+                        tenant_id,
+                        bucket_id,
+                        page_size,
+                        max_bytes,
+                    )
+                    .await?
+            }
+            JournalRoute::Definition(kind) => {
+                self.sources
+                    .read_definition_page(
+                        source,
+                        start.source,
+                        after,
+                        target_offset,
+                        kind,
+                        page_size,
+                        max_bytes,
+                    )
+                    .await?
+            }
+        };
         if page.source_id != start.source {
             return Err(IndexEventError::SourceEpochChanged(source.node));
         }

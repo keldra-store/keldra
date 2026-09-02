@@ -4,7 +4,7 @@ package keldra.v1;
 
 import "google/protobuf/timestamp.proto";
 
-// The public Keldra 0.15 network contract. Peer and storage-coordination services
+// The public Keldra 0.16 network contract. Peer and storage-coordination services
 // remain private. Ordinary object calls are independent. Only InvokeProgram
 // requests atomic multi-path visibility; indices are asynchronous derived views
 // over the same visible object state.

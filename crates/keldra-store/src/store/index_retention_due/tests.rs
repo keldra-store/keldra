@@ -13,7 +13,7 @@ fn commit_revision(
         tenant_id,
         bucket_id,
         index_id,
-        definition_path: format!("_keldra/indices/v4/definitions/index-{index_id}"),
+        definition_path: format!("_keldra/indices/v6/definitions/index-{index_id}"),
         definition_object_version: VersionId(definition_version),
         commit_revision,
         due_at_unix_millis: due_at,
@@ -25,7 +25,7 @@ fn deleted(index_id: u64, definition_version: u64, due_at: u64) -> DeletedDefini
         tenant_id: 1,
         bucket_id: 2,
         index_id,
-        definition_path: format!("_keldra/indices/v4/definitions/index-{index_id}"),
+        definition_path: format!("_keldra/indices/v6/definitions/index-{index_id}"),
         definition_object_version: VersionId(definition_version),
         due_at_unix_millis: due_at,
     }

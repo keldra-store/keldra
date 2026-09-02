@@ -1,6 +1,13 @@
 # KELDRA-0013: Scalable Bulk and Incremental Indexes in Keldra 0.8.0
 
-Status: Accepted architecture for Keldra 0.8.0
+Status: Superseded by KELDRA-0014 and KELDRA-0020
+
+Historical note: KELDRA-0020 replaces the definition-owned construction and
+catch-up unit with source-partition writers and shared physical projection
+recipes. This RFC remains the format-v3 record and is already superseded by
+KELDRA-0014 for current component/query behavior. It is historical evidence,
+not an implementation option: v6 has no bulk-builder fallback, legacy reader,
+migration, dual writer, or format-selection compatibility mode.
 
 Supersedes: KELDRA-0012 in full
 

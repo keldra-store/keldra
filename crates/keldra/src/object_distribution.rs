@@ -25,6 +25,7 @@ use tonic::Status;
 
 use crate::cluster_placement::ClusterPlacement;
 use crate::data_peer::DataPeerTransport;
+use crate::index_runtime::hot_ingress::HotProjectionIngress;
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::payload_distribution::{
     PayloadDistribution, PayloadDistributionError, PayloadPeerTransport,
@@ -99,6 +100,7 @@ pub(crate) struct ObjectDistribution {
     references: ReferenceRuntimeHandle,
     reference_acknowledgement_timeout: Duration,
     mutation_admission: crate::mutation_admission::MutationAdmission,
+    hot_indexing: std::sync::Arc<std::sync::OnceLock<HotProjectionIngress>>,
 }
 
 impl ObjectDistribution {
@@ -132,6 +134,26 @@ impl ObjectDistribution {
             references,
             reference_acknowledgement_timeout,
             mutation_admission,
+            hot_indexing: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    pub(crate) fn install_hot_indexing(
+        &self,
+        ingress: HotProjectionIngress,
+    ) -> Result<(), &'static str> {
+        self.hot_indexing
+            .set(ingress)
+            .map_err(|_| "TypedJson hot indexing was installed more than once")
+    }
+
+    fn admit_hot_result(
+        &self,
+        pending: Option<crate::index_runtime::hot_ingress::PendingHotProjection>,
+        result: &Result<MutationReceipt, Status>,
+    ) {
+        if let (Some(ingress), Ok(receipt)) = (self.hot_indexing.get(), result) {
+            ingress.admit_committed(pending, receipt);
         }
     }
 
@@ -293,29 +315,6 @@ impl ObjectDistribution {
             }
         }
 
-        if placement.active_node_ids().len() == 1 {
-            if upload_source != self.local_node {
-                return Err(Status::failed_precondition(
-                    "the ready capability names another upload source",
-                ));
-            }
-            let _permit = self.mutation_admission.enter()?;
-            let outcomes = if derived_progress {
-                self.store
-                    .bulk_write_derived_progress_with_backpressure(requests)
-                    .await
-            } else {
-                self.store
-                    .bulk_write_with_backpressure(
-                        requests.into_iter().map(BatchOperation::Publish).collect(),
-                    )
-                    .await
-            };
-            return Ok(outcomes
-                .into_iter()
-                .map(|outcome| outcome.result.map_err(mutation_status))
-                .collect());
-        }
         if !placement.active_node_ids().contains(&upload_source) {
             return Err(Status::failed_precondition(
                 "the upload source is not ACTIVE in the current placement",
@@ -449,7 +448,12 @@ impl ObjectDistribution {
                     Ok(coordinated) => {
                         match request.durability {
                             Durability::Local => {
-                                self.continue_payload_placement(upload_source, request.blob.clone())
+                                if placement.active_node_ids().len() > 1 {
+                                    self.continue_payload_placement(
+                                        upload_source,
+                                        request.blob.clone(),
+                                    );
+                                }
                             }
                             Durability::Replicated => {
                                 self.wait_for_replicated_reference(
@@ -516,44 +520,6 @@ impl ObjectDistribution {
         definition_intent: Option<DefinitionMutationIntent>,
         derived_progress: bool,
     ) -> Result<MutationReceipt, Status> {
-        if self.is_single_node()? {
-            if upload_source != self.local_node {
-                return Err(Status::failed_precondition(
-                    "the ready capability names another upload source",
-                ));
-            }
-            let _permit = self.mutation_admission.enter()?;
-            return match (definition_intent, derived_progress) {
-                (Some(intent), false) => {
-                    self.store
-                        .mutate_definition_with_governance_and_backpressure(
-                            BatchOperation::Publish(request),
-                            governance,
-                            intent,
-                        )
-                        .await
-                }
-                (None, false) => {
-                    self.store
-                        .mutate_with_governance_and_backpressure(
-                            BatchOperation::Publish(request),
-                            governance,
-                        )
-                        .await
-                }
-                (None, true) => {
-                    self.store
-                        .mutate_derived_progress_with_governance_and_backpressure(
-                            request, governance,
-                        )
-                        .await
-                }
-                (Some(_), true) => Err(MutationError::InvalidObjectMutation(
-                    "definition publication cannot claim derived progress admission".into(),
-                )),
-            }
-            .map_err(mutation_status);
-        }
         loop {
             let result = self
                 .publish_from_source_with_governance_and_definition_intent_once(
@@ -584,42 +550,6 @@ impl ObjectDistribution {
     ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
-        if placement.active_node_ids().len() == 1 {
-            if upload_source != self.local_node {
-                return Err(Status::failed_precondition(
-                    "the ready capability names another upload source",
-                ));
-            }
-            let _permit = self.mutation_admission.enter()?;
-            return match (definition_intent, derived_progress) {
-                (Some(intent), false) => {
-                    self.store
-                        .mutate_definition_with_governance(
-                            BatchOperation::Publish(request),
-                            governance,
-                            intent,
-                        )
-                        .await
-                }
-                (None, false) => {
-                    self.store
-                        .mutate_with_governance(BatchOperation::Publish(request), governance)
-                        .await
-                }
-                (None, true) => {
-                    self.store
-                        .mutate_derived_progress_with_governance_and_backpressure(
-                            request, governance,
-                        )
-                        .await
-                }
-                (Some(_), true) => Err(MutationError::InvalidObjectMutation(
-                    "definition publication cannot claim derived progress admission".into(),
-                )),
-            }
-            .map_err(mutation_status);
-        }
-
         let group = self.replica_group_stable(
             &placement,
             governance.tenant_id,
@@ -705,7 +635,11 @@ impl ObjectDistribution {
         .await?;
 
         match durability {
-            Durability::Local => self.continue_payload_placement(upload_source, reference),
+            Durability::Local => {
+                if placement.active_node_ids().len() > 1 {
+                    self.continue_payload_placement(upload_source, reference);
+                }
+            }
             Durability::Replicated => {
                 self.wait_for_replicated_reference(&placement, &reference, &evidence, &coordinated)
                     .await?;
@@ -714,9 +648,8 @@ impl ObjectDistribution {
         Ok(coordinated.receipt)
     }
 
-    /// Apply one operation locally when this is the released one-node shape,
-    /// otherwise require this node to be the current exact-path coordinator
-    /// and durably replicate the resulting typed mutation to its quorum.
+    /// Coordinate one exact-path operation and durably apply its typed mutation
+    /// to the current metadata replica group.
     pub(crate) async fn mutate(
         &self,
         operation: BatchOperation,
@@ -783,9 +716,12 @@ impl ObjectDistribution {
         governance: ObjectMutationGovernance,
         definition_intent: Option<DefinitionMutationIntent>,
     ) -> Result<MutationReceipt, Status> {
-        if self.is_single_node()? {
+        let hot = self.hot_indexing.get().and_then(|ingress| {
+            ingress.pending(governance.tenant_id, governance.bucket_id, &operation)
+        });
+        if matches!(&operation, BatchOperation::Clone(_)) && self.is_single_node()? {
             let _permit = self.mutation_admission.enter()?;
-            return match definition_intent {
+            let result = match definition_intent {
                 Some(intent) => {
                     self.store
                         .mutate_definition_with_governance_and_backpressure(
@@ -800,28 +736,9 @@ impl ObjectDistribution {
                 }
             }
             .map_err(mutation_status);
+            self.admit_hot_result(hot, &result);
+            return result;
         }
-        // Seal a distributed inline payload once before any bounded-state
-        // backpressure retries. Retries then copy only the compact descriptor.
-        let operation = match operation {
-            BatchOperation::Put(request) => {
-                let publish = stage_distributed_put(&self.store, request).await?;
-                return self
-                    .publish_from_source_with_governance_and_definition_intent(
-                        publish,
-                        self.local_node,
-                        governance,
-                        definition_intent,
-                    )
-                    .await;
-            }
-            BatchOperation::Clone(_) => {
-                return Err(Status::unavailable(
-                    "distributed CloneObject requires an exact retained-version atomic precondition and is not enabled",
-                ));
-            }
-            operation => operation,
-        };
         loop {
             let result = self
                 .mutate_with_governance_and_definition_intent_once(
@@ -836,6 +753,7 @@ impl ObjectDistribution {
                 self.wait_for_mutation_capacity(capacity).await;
                 continue;
             }
+            self.admit_hot_result(hot, &result);
             return result;
         }
     }
@@ -848,29 +766,13 @@ impl ObjectDistribution {
     ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
-        if placement.active_node_ids().len() == 1 {
-            let _permit = self.mutation_admission.enter()?;
-            return match definition_intent {
-                Some(intent) => {
-                    self.store
-                        .mutate_definition_with_governance(operation, governance, intent)
-                        .await
-                }
-                None => {
-                    self.store
-                        .mutate_with_governance(operation, governance)
-                        .await
-                }
-            }
-            .map_err(mutation_status);
-        }
-
         // A unary bulk put arrives with inline bytes rather than a previously
         // sealed upload token. Seal those bytes on this path coordinator, then
         // use the same payload preparation and verified Publish path as PutEnd.
         // Metadata is not evaluated until the requested payload durability has
         // been proved.
         let operation = match operation {
+            operation if placement.active_node_ids().len() == 1 => operation,
             BatchOperation::Put(request) => {
                 let publish = stage_distributed_put(&self.store, request).await?;
                 return self
@@ -1363,21 +1265,18 @@ impl ObjectDistribution {
             // The local command receipt proved an exact idempotent replay.
             return Ok(None);
         };
-        let mut durable = Vec::with_capacity(group.replicas().len());
-        let mut failures = Vec::new();
-        match self.store.apply_object_mutation_replica(mutation).await {
-            Ok(applied) if applied.version == coordinated.receipt.version => {
-                durable.push(self.local_node);
-            }
-            Ok(_) => failures.push("local replica returned another version".into()),
-            Err(error) => failures.push(format!("local replica: {error}")),
+        if mutation.version.id != coordinated.receipt.version {
+            return Err(Status::data_loss(
+                "coordinator mutation and receipt name different versions",
+            ));
         }
-        for node in group
-            .replicas()
-            .iter()
-            .copied()
-            .filter(|node| *node != self.local_node)
-        {
+        // Coordinator evaluation has already sync-written the complete local
+        // object mutation, receipt, proof and source-journal change. Seed that
+        // durable acknowledgement exactly as grouped replication does; replaying
+        // the same mutation through the replica apply path adds no durability.
+        let mut durable = locally_durable_object_replicas(group.replicas(), self.local_node)?;
+        let mut failures = Vec::new();
+        for node in remote_object_replica_nodes(group.replicas(), self.local_node) {
             let address = placement.address(node).ok_or_else(|| {
                 Status::unavailable(format!("ACTIVE node {} has no peer address", node.0))
             })?;
@@ -1517,6 +1416,28 @@ fn operation_key(operation: &BatchOperation) -> &ObjectKey {
     }
 }
 
+fn remote_object_replica_nodes(
+    replicas: &[NodeId],
+    local_node: NodeId,
+) -> impl Iterator<Item = NodeId> + '_ {
+    replicas
+        .iter()
+        .copied()
+        .filter(move |node| *node != local_node)
+}
+
+fn locally_durable_object_replicas(
+    replicas: &[NodeId],
+    local_node: NodeId,
+) -> Result<Vec<NodeId>, Status> {
+    if !replicas.contains(&local_node) {
+        return Err(Status::failed_precondition(
+            "local object coordinator is absent from its selected replica group",
+        ));
+    }
+    Ok(vec![local_node])
+}
+
 pub(super) fn mutation_journal_positions(
     mutation: &keldra_store::ObjectMutation,
 ) -> Result<Vec<u64>, Status> {
@@ -1622,8 +1543,8 @@ fn payload_status(error: PayloadDistributionError) -> Status {
 mod tests {
     use super::*;
     use keldra_store::{
-        LogicalRecordMutationContext, LogicalRecordValue, PlacementLogId, StorageTenantId,
-        StoreOptions, VersionId,
+        LogicalRecordMutationContext, LogicalRecordValue, ObjectMutationContext, PlacementLogId,
+        StorageTenantId, StoreOptions, VersionId,
     };
     use tempfile::TempDir;
 
@@ -1688,6 +1609,83 @@ mod tests {
             MutationError::DurabilityUnavailable
         );
         assert!(store.get(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn locally_coordinated_publication_is_restart_durable_without_replica_replay() {
+        let (temporary, store) = store().await;
+        let key = ObjectKey::new("tenant", "bucket", "publication/restart-safe").unwrap();
+        let publish = stage_distributed_put(
+            &store,
+            PutRequest {
+                key: key.clone(),
+                bytes: b"coordinator durable payload".to_vec(),
+                content_type: Some("application/octet-stream".into()),
+                mode: keldra_store::PutMode::PutIfAbsent,
+                command_id: Some("coordinator-durable".into()),
+                durability: Durability::Local,
+            },
+        )
+        .await
+        .unwrap();
+        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: store.bucket_policy("tenant", "bucket").unwrap(),
+        };
+
+        let outcomes = store
+            .coordinate_distributed_publish_batch_with_governance(
+                vec![publish],
+                governance,
+                ObjectMutationContext {
+                    active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                    serving_fence_term: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].as_ref().unwrap().mutation.is_some());
+        assert_eq!(
+            store.get(&key).await.unwrap().unwrap().bytes,
+            b"coordinator durable payload"
+        );
+
+        drop(store);
+        let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.get(&key).await.unwrap().unwrap().bytes,
+            b"coordinator durable payload"
+        );
+    }
+
+    #[test]
+    fn replica_dispatch_skips_local_and_keeps_every_remote_owner() {
+        assert_eq!(
+            remote_object_replica_nodes(&[NodeId(7)], NodeId(7)).collect::<Vec<_>>(),
+            Vec::<NodeId>::new()
+        );
+        assert_eq!(
+            remote_object_replica_nodes(&[NodeId(7), NodeId(11), NodeId(13)], NodeId(7))
+                .collect::<Vec<_>>(),
+            vec![NodeId(11), NodeId(13)]
+        );
+    }
+
+    #[test]
+    fn local_durability_requires_membership_in_the_selected_replica_group() {
+        assert_eq!(
+            locally_durable_object_replicas(&[NodeId(7)], NodeId(7)).unwrap(),
+            vec![NodeId(7)]
+        );
+        let error =
+            locally_durable_object_replicas(&[NodeId(11), NodeId(13)], NodeId(7)).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]

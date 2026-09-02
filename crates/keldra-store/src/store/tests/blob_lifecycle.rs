@@ -1,6 +1,9 @@
 use super::super::blob_references::blob_gc_due_key;
 use super::*;
-use crate::{BlobGcBudget, BlobGcCursor};
+use crate::{
+    BlobGcBudget, BlobGcCursor, DerivedConsumerCheckpoint, DerivedConsumerKind, PlacementLogId,
+    WatchRetention,
+};
 
 fn deliver_retirement_effects(store: &Store, blob: &BlobRef, count: usize) {
     let mut batch = WriteBatch::default();
@@ -608,4 +611,218 @@ async fn identical_seals_share_one_reservation_and_zero_count_content_can_be_reu
     let published_again = store.blob_reference_state(&reused).unwrap().unwrap();
     assert_eq!(published_again.ref_count, 1);
     assert_eq!(published_again.flags, 0);
+}
+
+#[tokio::test]
+async fn derived_progress_inline_batch_uses_one_write_and_preserves_input_order() {
+    let (_temporary, store) = store().await;
+    let blobs = vec![
+        b"first derived artifact".to_vec(),
+        b"shared derived artifact".to_vec(),
+        b"shared derived artifact".to_vec(),
+    ];
+    let before = store.db.latest_sequence_number();
+    let journal_before = store.local_watch_status().unwrap();
+
+    let references = store
+        .stage_derived_progress_inline_blobs(&blobs)
+        .await
+        .unwrap();
+
+    assert_eq!(references.len(), blobs.len());
+    assert_eq!(references[0], blob_reference_for_bytes(&blobs[0]));
+    assert_eq!(references[1], blob_reference_for_bytes(&blobs[1]));
+    assert_eq!(references[2], references[1]);
+    for reference in &references {
+        assert_eq!(
+            store.complete_copy_state(reference).await.unwrap(),
+            PayloadArtifactState::Valid
+        );
+        let lifecycle = store.blob_reference_state(reference).unwrap().unwrap();
+        assert_eq!(lifecycle.ref_count, 1);
+        assert_eq!(lifecycle.flags, AWAITING_PUBLISH);
+    }
+    assert_eq!(
+        store.local_watch_status().unwrap().tail,
+        journal_before.tail + blobs.len() as u64
+    );
+    assert_eq!(
+        store
+            .db
+            .get_updates_since(before)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn invalid_derived_progress_inline_batch_is_rejected_before_writing() {
+    let (_temporary, store) = store().await;
+    let before = store.db.latest_sequence_number();
+    let journal_before = store.local_watch_status().unwrap();
+    let oversized = vec![vec![0x51; PAYLOAD_ARTIFACT_CHUNK_BYTES + 1]];
+
+    let error = store
+        .stage_derived_progress_inline_blobs(&oversized)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, MutationError::Storage(_)));
+    assert_eq!(store.db.latest_sequence_number(), before);
+    assert_eq!(store.local_watch_status().unwrap(), journal_before);
+
+    let too_many = vec![Vec::new(); MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS + 1];
+    let error = store
+        .stage_derived_progress_inline_blobs(&too_many)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MutationError::Storage(_)));
+    assert_eq!(store.db.latest_sequence_number(), before);
+    assert_eq!(store.local_watch_status().unwrap(), journal_before);
+}
+
+#[tokio::test]
+async fn retrying_a_derived_progress_inline_batch_does_not_multiply_reservations() {
+    let (_temporary, store) = store().await;
+    let blobs = vec![
+        b"retry artifact one".to_vec(),
+        b"retry artifact two".to_vec(),
+        b"retry artifact one".to_vec(),
+    ];
+
+    let first = store
+        .stage_derived_progress_inline_blobs(&blobs)
+        .await
+        .unwrap();
+    let first_states = first
+        .iter()
+        .map(|reference| store.blob_reference_state(reference).unwrap().unwrap())
+        .collect::<Vec<_>>();
+    let retry = store
+        .stage_derived_progress_inline_blobs(&blobs)
+        .await
+        .unwrap();
+
+    assert_eq!(retry, first);
+    assert_eq!(first[0], first[2]);
+    for (reference, first_state) in first.iter().zip(first_states) {
+        let retried = store.blob_reference_state(reference).unwrap().unwrap();
+        assert_eq!(retried.ref_count, 1);
+        assert_eq!(retried.flags, AWAITING_PUBLISH);
+        assert_eq!(retried.created_at, first_state.created_at);
+        assert!(retried.updated_at >= first_state.updated_at);
+    }
+    let changes = store.scan_local_changes(0, 16).unwrap();
+    assert_eq!(changes.len(), blobs.len() * 2);
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|change| {
+                matches!(
+                    change,
+                    LocalChange::ContentLifecycleChanged(change)
+                        if change.blob_identity == blob_reference_key(&first[0])
+                )
+            })
+            .count(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn derived_progress_inline_batch_survives_reopen_before_publication() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("store");
+    let options = StoreOptions::new(&root, 1);
+    let blobs = vec![
+        b"reopen artifact one".to_vec(),
+        b"reopen artifact two".to_vec(),
+    ];
+    let store = Store::open(options.clone()).await.unwrap();
+    let references = store
+        .stage_derived_progress_inline_blobs(&blobs)
+        .await
+        .unwrap();
+    let staged_status = store.local_watch_status().unwrap();
+    let staged_changes = store.scan_local_changes(0, 16).unwrap();
+    let staged_states = references
+        .iter()
+        .map(|reference| store.blob_reference_state(reference).unwrap().unwrap())
+        .collect::<Vec<_>>();
+    drop(store);
+
+    let reopened = Store::open(options).await.unwrap();
+    assert_eq!(reopened.local_watch_status().unwrap(), staged_status);
+    assert_eq!(reopened.scan_local_changes(0, 16).unwrap(), staged_changes);
+    for ((reference, bytes), staged_state) in references.iter().zip(&blobs).zip(staged_states) {
+        assert_eq!(reopened.read_small_copy(reference).unwrap(), *bytes);
+        assert_eq!(
+            reopened.blob_reference_state(reference).unwrap().unwrap(),
+            staged_state
+        );
+        assert_eq!(staged_state.ref_count, 1);
+        assert_eq!(staged_state.flags, AWAITING_PUBLISH);
+    }
+}
+
+#[tokio::test]
+async fn derived_progress_inline_batch_journal_can_be_consumed_and_pruned() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreOptions::new(temporary.path(), 1)
+            .with_watch_retention(WatchRetention::new(1, 1024 * 1024).unwrap()),
+    )
+    .await
+    .unwrap();
+    let fence = PlacementLogId { term: 1, index: 1 };
+    store
+        .ensure_derived_consumer_membership(fence, &[1])
+        .await
+        .unwrap();
+    store
+        .stage_derived_progress_inline_blobs(&[
+            b"drain artifact one".to_vec(),
+            b"drain artifact two".to_vec(),
+        ])
+        .await
+        .unwrap();
+    let staged = store.local_watch_status().unwrap();
+    assert_eq!(staged.tail, 2);
+    assert_eq!(staged.settled_through, staged.tail);
+    assert_eq!(store.scan_local_changes(0, 16).unwrap().len(), 2);
+
+    store
+        .advance_source_journal_reference_safe_through(staged.tail)
+        .await
+        .unwrap();
+    for consumer_kind in DerivedConsumerKind::ALL {
+        store
+            .apply_derived_consumer_checkpoint(
+                DerivedConsumerCheckpoint {
+                    consumer_kind,
+                    source_id: staged.source_id,
+                    consumer_node_id: 1,
+                    next_offset: staged.tail + 1,
+                    observed_fence: fence,
+                },
+                &[1],
+            )
+            .await
+            .unwrap();
+    }
+    while store.prune_source_journal_for_capacity().await.unwrap() {}
+
+    let drained = store.local_watch_status().unwrap();
+    assert_eq!(drained.retention_floor, staged.tail);
+    assert_eq!(drained.retained_entries, 0);
+    assert_eq!(drained.retained_bytes, 0);
+    assert!(
+        store
+            .scan_local_changes(drained.retention_floor, 16)
+            .unwrap()
+            .is_empty()
+    );
 }

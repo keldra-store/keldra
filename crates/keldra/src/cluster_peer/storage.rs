@@ -104,25 +104,11 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         self.publish_index_artifacts_call(request).await
     }
 
-    async fn publish_guarded_index_artifacts(
-        &self,
-        request: Request<wire::PublishGuardedIndexArtifactsRequest>,
-    ) -> Result<Response<wire::IndexArtifactsPublished>, Status> {
-        self.publish_guarded_index_artifacts_call(request).await
-    }
-
     async fn commit_guarded_index_artifact(
         &self,
         request: Request<wire::CommitGuardedIndexArtifactRequest>,
     ) -> Result<Response<wire::IndexArtifactPublished>, Status> {
         self.commit_guarded_index_artifact_call(request).await
-    }
-
-    async fn commit_guarded_index_artifacts(
-        &self,
-        request: Request<wire::CommitGuardedIndexArtifactsRequest>,
-    ) -> Result<Response<wire::IndexArtifactsPublished>, Status> {
-        self.commit_guarded_index_artifacts_call(request).await
     }
 
     async fn delete_index_artifact(

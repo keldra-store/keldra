@@ -19,7 +19,7 @@ impl IndexQueryMemoryBudget {
         if limit_bytes == 0 {
             return Err(QueryBudgetError::ZeroLimit);
         }
-        let memory = IndexWorkingMemory::new(limit_bytes, [limit_bytes; 9])
+        let memory = IndexWorkingMemory::new(limit_bytes, [limit_bytes; 2])
             .map_err(QueryBudgetError::WorkingMemory)?;
         Ok(Self::from_shared(memory))
     }

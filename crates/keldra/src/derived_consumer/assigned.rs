@@ -93,6 +93,30 @@ impl AssignedBucketInventory {
         self.buckets.get(&(tenant_id, bucket_id))
     }
 
+    /// Replaces this disposable inventory with one exact Store snapshot and
+    /// returns every prior exact identity whose pending tracker evidence must
+    /// be discarded. New assignments need no synthetic source effect: the next
+    /// source interval observes them normally.
+    pub(super) fn replace_with(&mut self, replacement: Self) -> Vec<DerivedDefinitionIdentity> {
+        debug_assert_eq!(self.kind, replacement.kind);
+        debug_assert_eq!(self.fence, replacement.fence);
+        let mut removed = Vec::new();
+        for definitions in self.buckets.values() {
+            for assignment in definitions.values() {
+                let still_exact = replacement
+                    .buckets
+                    .get(&(assignment.tenant_id, assignment.bucket_id))
+                    .and_then(|values| values.get(&assignment.definition_id))
+                    == Some(assignment);
+                if !still_exact {
+                    removed.push(DerivedDefinitionIdentity::from_assignment(assignment));
+                }
+            }
+        }
+        *self = replacement;
+        removed
+    }
+
     fn apply_upsert(
         &mut self,
         assignment: DefinitionAssignment,
@@ -226,5 +250,29 @@ mod tests {
             inventory.buckets().next().unwrap().1[&1].object_version,
             VersionId(2)
         );
+    }
+
+    #[test]
+    fn exact_snapshot_replacement_reports_only_changed_prior_identities() {
+        let fence = PlacementLogId { term: 1, index: 2 };
+        let mut old = AssignedBucketInventory::new(DefinitionKind::Index, fence);
+        old.insert_scanned(assignment(10, 1, 1));
+        old.insert_scanned(assignment(10, 2, 1));
+        let mut replacement = AssignedBucketInventory::new(DefinitionKind::Index, fence);
+        replacement.insert_scanned(assignment(10, 1, 1));
+        replacement.insert_scanned(assignment(10, 2, 2));
+        replacement.insert_scanned(assignment(10, 3, 1));
+
+        assert_eq!(
+            old.replace_with(replacement),
+            [DerivedDefinitionIdentity {
+                kind: DefinitionKind::Index,
+                tenant_id: 1,
+                bucket_id: 10,
+                definition_id: 2,
+                object_version: VersionId(1),
+            }]
+        );
+        assert_eq!(old.definitions(1, 10).unwrap().len(), 3);
     }
 }

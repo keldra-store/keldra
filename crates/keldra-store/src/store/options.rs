@@ -41,6 +41,7 @@ impl StoreOptions {
             sync_writes: true,
             watch_retention: WatchRetention::default(),
             mutation_receipt_retention: MutationReceiptRetention::default(),
+            single_node_group_commit: SingleNodeGroupCommitConfig::default(),
             awaiting_publish_ttl_seconds: DEFAULT_AWAITING_PUBLISH_TTL_SECONDS,
         }
     }
@@ -80,6 +81,11 @@ impl StoreOptions {
         mutation_receipt_retention: MutationReceiptRetention,
     ) -> Self {
         self.mutation_receipt_retention = mutation_receipt_retention;
+        self
+    }
+
+    pub fn with_single_node_group_commit(mut self, config: SingleNodeGroupCommitConfig) -> Self {
+        self.single_node_group_commit = config;
         self
     }
 

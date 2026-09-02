@@ -1002,12 +1002,8 @@ fn assert_same_mutation_metadata(coordinator: &Store, replica: &Store, mutation:
             .unwrap()
     );
     assert_eq!(
-        coordinator
-            .read_json::<StoredReceipt>(CF_RECEIPTS, &receipt_key)
-            .unwrap(),
-        replica
-            .read_json::<StoredReceipt>(CF_RECEIPTS, &receipt_key)
-            .unwrap()
+        coordinator.read_stored_receipt(&receipt_key).unwrap(),
+        replica.read_stored_receipt(&receipt_key).unwrap()
     );
 }
 

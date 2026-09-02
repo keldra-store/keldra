@@ -314,10 +314,31 @@ impl PositiveReferencePreparation for StorePositiveReferencePreparation {
     async fn prepare(&self, placement: &ReferencePlacement, blob: &BlobRef) -> Result<(), String> {
         self.ensure_complete_source(placement, blob).await?;
         self.distribution
-            .prepare_on_upload_source(placement, blob, Durability::Replicated)
+            .prepare_on_upload_source(
+                placement,
+                blob,
+                reference_delivery_durability(placement.active_node_ids().len()),
+            )
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+}
+
+/// Select the preparation strength needed to populate every current payload
+/// destination before delivering a positive reference.
+///
+/// `REPLICATED` is a client acknowledgement threshold, so it deliberately
+/// requires two complete copies even when only one ACTIVE node exists. Ordered
+/// reference delivery is background placement convergence instead: in a
+/// one-node placement the upload source is also the sole final destination and
+/// its valid complete copy is sufficient. With multiple ACTIVE nodes the
+/// normal replicated preparation populates the selected copies or shards.
+fn reference_delivery_durability(active_node_count: usize) -> Durability {
+    if active_node_count == 1 {
+        Durability::Local
+    } else {
+        Durability::Replicated
     }
 }
 

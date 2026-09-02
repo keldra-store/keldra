@@ -72,7 +72,10 @@ use keldra_api::v1::index_service_server::IndexServiceServer;
 use keldra_api::v1::object_service_server::ObjectServiceServer;
 use keldra_api::v1::personal_db_service_server::PersonalDbServiceServer;
 use keldra_consensus::{ATOMIC_REPLAY_RETENTION_MILLIS, NodeId};
-use keldra_store::{ErasureProfile, MutationReceiptRetention, Store, StoreOptions, WatchRetention};
+use keldra_store::{
+    ErasureProfile, MutationReceiptRetention, SingleNodeGroupCommitConfig, Store, StoreOptions,
+    WatchRetention,
+};
 
 use authentication::{JwtManager, RateLimitConfig, RequestRateLimits};
 use mutation_admission::{AdmissionSurface, MutationAdmissionService};
@@ -129,6 +132,7 @@ pub struct ServerConfig {
     pub max_mutation_receipt_bytes: u64,
     pub source_journal_max_entries: u64,
     pub source_journal_max_bytes: u64,
+    pub single_node_group_commit: SingleNodeGroupCommitConfig,
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
@@ -178,6 +182,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let storage_binding = storage_layout::bind_authoritative_roots(&config.storage, config.node_id)
         .context("bind node storage layout")?;
     log_storage_layout(&config, &storage_binding);
+    log_single_node_group_commit_config(&config.single_node_group_commit);
     let index_runtime_config = config.index_runtime;
     let watch_retention = WatchRetention::new(
         config.source_journal_max_entries,
@@ -201,6 +206,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             .with_max_total_wal_bytes(config.max_total_wal_bytes)
             .with_watch_retention(watch_retention)
             .with_mutation_receipt_retention(mutation_receipt_retention)
+            .with_single_node_group_commit(config.single_node_group_commit.clone())
             .with_awaiting_publish_ttl_seconds(config.awaiting_publish_ttl_seconds),
     )
     .await
@@ -468,9 +474,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         bucket_governance.clone(),
         object_reader.clone(),
         object_lister.clone(),
-        name_resolver.clone(),
-        &config.storage.cache,
-        &config.storage.scratch,
         index_runtime_config,
         derived_checkpoints.clone(),
         startup_scan_evidence.clone(),
@@ -768,9 +771,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         })
         .await
         .context("start public gRPC and HTTP gateway listener")?;
-    index_runtime
-        .start_cache_reconciler()
-        .context("start bounded index cache reconciliation")?;
     let payload_gc = payload_gc::PayloadGarbageCollector::new(
         local_node,
         store.clone(),
@@ -873,6 +873,22 @@ fn log_storage_layout(config: &ServerConfig, binding: &storage_layout::StorageBi
         "KELDRA_PAYLOAD_DIR",
         "payload",
         &config.storage.payload,
+    );
+}
+
+fn log_single_node_group_commit_config(config: &SingleNodeGroupCommitConfig) {
+    let group_dwell_microseconds = u64::try_from(config.max_group_dwell().as_micros())
+        .expect("configured group dwell fits in u64 microseconds");
+    tracing::info!(
+        target: "keldra::single_node_group_commit_config",
+        max_requests = config.max_group_requests(),
+        max_operations = config.max_group_operations(),
+        max_inline_bytes = config.max_group_inline_bytes(),
+        max_queued_requests = config.max_queued_requests(),
+        max_queued_operations = config.max_queued_operations(),
+        max_queued_inline_bytes = config.max_queued_inline_bytes(),
+        group_dwell_microseconds,
+        "effective single-node group commit configuration"
     );
 }
 

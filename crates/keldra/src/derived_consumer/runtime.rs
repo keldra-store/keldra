@@ -6,24 +6,22 @@ use std::time::Duration;
 
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
-    DefinitionAssignment, DefinitionAssignmentCursor, DefinitionAssignmentMutation,
-    DefinitionConsumerKind, DefinitionKind, DerivedConsumerKind, LocalChange,
-    MAX_DEFINITION_STATE_SCAN_RECORDS, PlacementLogId, SourceId, Store, WatchJournalStatus,
+    DefinitionAssignment, DefinitionAssignmentMutation, DefinitionConsumerKind, DefinitionKind,
+    DerivedConsumerKind, LocalChange, PlacementLogId, SourceId, Store, WatchJournalStatus,
 };
 use tonic::Status;
 
 use crate::accounting::{AccountingCatalog, LoadedAccountingDefinition, read_rollup};
 use crate::cluster_object_read::ClusterObjectReader;
-use crate::index_runtime::catalog::IndexCatalog;
-use crate::index_runtime::coordination::{current_placement, load_index_assignment};
+use crate::index_runtime::coordination::current_placement;
 use crate::index_runtime::events::{
     IndexBarrier, IndexEventJournal, MAX_INDEX_EVENT_PAGE_BYTES, RoutedSourceEffect,
 };
-use crate::index_runtime::publisher::IndexCommitPublisher;
 
 use super::{
     DerivedBarrierEvidence, DerivedCheckpointPublisher, DerivedDefinitionIdentity,
     SparseDerivedInventory, SparseDerivedTracker, assigned::AssignedBucketInventory,
+    assignment_changes::AssignmentChangeCollector,
 };
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -72,13 +70,6 @@ impl DerivedProgressReporter {
 
 #[derive(Clone)]
 pub(crate) enum DerivedEvidenceResolver {
-    Index {
-        local_node: NodeId,
-        decisions: DecisionRaft,
-        reader: ClusterObjectReader,
-        publisher: IndexCommitPublisher,
-        catalog: IndexCatalog,
-    },
     Accounting {
         local_node: NodeId,
         decisions: DecisionRaft,
@@ -88,22 +79,6 @@ pub(crate) enum DerivedEvidenceResolver {
 }
 
 impl DerivedEvidenceResolver {
-    pub(crate) fn index(
-        local_node: NodeId,
-        decisions: DecisionRaft,
-        reader: ClusterObjectReader,
-        publisher: IndexCommitPublisher,
-        catalog: IndexCatalog,
-    ) -> Self {
-        Self::Index {
-            local_node,
-            decisions,
-            reader,
-            publisher,
-            catalog,
-        }
-    }
-
     pub(crate) fn accounting(
         local_node: NodeId,
         decisions: DecisionRaft,
@@ -124,42 +99,6 @@ impl DerivedEvidenceResolver {
         effects: &BTreeMap<SourceId, RoutedSourceEffect>,
     ) -> Result<Option<DerivedBarrierEvidence>, Status> {
         match self {
-            Self::Index {
-                local_node,
-                decisions,
-                reader,
-                publisher,
-                catalog,
-            } => {
-                let Some(definition) =
-                    load_index_assignment(*local_node, decisions, reader, assignment).await?
-                else {
-                    return Ok(None);
-                };
-                let current = publisher
-                    .load_current(
-                        &definition.stored,
-                        definition.tenant_id,
-                        definition.bucket_id,
-                    )
-                    .await?;
-                let evidence = current
-                    .filter(|current| {
-                        current.manifest.definition_version == definition.object_version
-                    })
-                    .map(|current| {
-                        current
-                            .manifest
-                            .barrier()
-                            .map(DerivedBarrierEvidence::Published)
-                            .map_err(|error| Status::data_loss(error.to_string()))
-                    })
-                    .transpose()?;
-                if !evidence_covers_effects(evidence.as_ref(), effects) {
-                    catalog.upsert_wait(definition).await?;
-                }
-                Ok(evidence)
-            }
             Self::Accounting {
                 local_node,
                 decisions,
@@ -215,17 +154,8 @@ impl DerivedConsumerRuntimeTask {
         resolver: DerivedEvidenceResolver,
     ) -> (DerivedProgressReporter, Self) {
         let (reporter, receiver) = DerivedProgressReporter::channel(kind);
-        let assignment_changes = store.subscribe_definition_assignment_changes();
         let task = tokio::spawn(run(
-            kind,
-            local_node,
-            decisions,
-            store,
-            journal,
-            publisher,
-            resolver,
-            receiver,
-            assignment_changes,
+            kind, local_node, decisions, store, journal, publisher, resolver, receiver,
         ));
         (reporter, Self { task })
     }
@@ -241,6 +171,7 @@ struct RuntimeState {
     tracker: SparseDerivedTracker,
     demux: IndexBarrier,
     assignments: AssignedBucketInventory,
+    assignment_changes: AssignmentChangeCollector,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -253,19 +184,10 @@ async fn run(
     publisher: DerivedCheckpointPublisher,
     resolver: DerivedEvidenceResolver,
     mut progress: tokio::sync::mpsc::Receiver<ProgressMessage>,
-    mut assignment_changes: tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
 ) {
     loop {
-        assignment_changes = assignment_changes.resubscribe();
         let initialized = initialize(
-            kind,
-            local_node,
-            &decisions,
-            &store,
-            &journal,
-            &publisher,
-            &resolver,
-            &mut assignment_changes,
+            kind, local_node, &decisions, &store, &journal, &publisher, &resolver,
         )
         .await;
         let mut state = match initialized {
@@ -284,18 +206,6 @@ async fn run(
                     Some(message) => apply_progress(&publisher, &mut state.tracker, message).await,
                     None => return,
                 },
-                received = assignment_changes.recv() => match received {
-                    Ok(mutations) => apply_assignment_changes(
-                        &mut state,
-                        mutations,
-                    ),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => Err(
-                        Status::unavailable(format!(
-                            "derived assignment notifications lagged by {skipped} batches",
-                        )),
-                    ),
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                },
                 _ = interval.tick() => advance_once(
                     kind,
                     &decisions,
@@ -303,7 +213,6 @@ async fn run(
                     &journal,
                     &publisher,
                     &resolver,
-                    &mut assignment_changes,
                     &mut state,
                 ).await,
             };
@@ -323,7 +232,6 @@ async fn initialize(
     journal: &IndexEventJournal,
     publisher: &DerivedCheckpointPublisher,
     resolver: &DerivedEvidenceResolver,
-    assignment_changes: &mut tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
 ) -> Result<RuntimeState, Status> {
     let target = journal.capture_barrier().await.map_err(event_status)?;
     wait_for_assignment_delivery(kind, decisions, store, &target).await?;
@@ -339,10 +247,10 @@ async fn initialize(
             .map(|(status, checkpoint)| (*status, checkpoint.clone())),
     )
     .map_err(tracker_status)?;
-    let mut assignments = AssignedBucketInventory::new(definition_kind(kind), target.fence);
+    let (mut assignments, assignment_changes) =
+        AssignmentChangeCollector::start(kind, store.clone(), target.fence).await?;
     scan_inventory(
         kind,
-        store,
         journal,
         resolver,
         &from,
@@ -356,12 +264,13 @@ async fn initialize(
     // this returns. Drain them before this disposable inventory is trusted.
     wait_for_assignment_delivery(kind, decisions, store, &target).await?;
     let mut tracker = inventory.finish();
-    drain_assignment_changes(&mut assignments, &mut tracker, assignment_changes)?;
+    synchronize_assignment_changes(&assignment_changes, &mut assignments, &mut tracker)?;
     publisher.publish_tracker(&mut tracker).await?;
     Ok(RuntimeState {
         tracker,
         demux: target,
         assignments,
+        assignment_changes,
     })
 }
 
@@ -439,40 +348,19 @@ fn baseline_barrier(
 
 async fn scan_inventory(
     kind: DerivedConsumerKind,
-    store: &Store,
     journal: &IndexEventJournal,
     resolver: &DerivedEvidenceResolver,
     from: &IndexBarrier,
     target: &IndexBarrier,
     inventory: &mut SparseDerivedInventory,
-    assignments: &mut AssignedBucketInventory,
+    assignments: &AssignedBucketInventory,
 ) -> Result<(), Status> {
-    let mut cursor: Option<DefinitionAssignmentCursor> = None;
-    let mut bucket = None;
-    let mut effects = BTreeMap::new();
-    loop {
-        let page = scan_assignments(store, kind, cursor.as_ref()).await?;
-        for assignment in page.assignments {
-            if assignment.rank != 0 || assignment.observed_fence != target.fence {
-                continue;
-            }
-            assignments.insert_scanned(assignment.clone());
-            let current_bucket = (assignment.tenant_id, assignment.bucket_id);
-            if bucket != Some(current_bucket) {
-                effects = routed_effects(
-                    kind,
-                    journal,
-                    current_bucket.0,
-                    current_bucket.1,
-                    from,
-                    target,
-                )
-                .await?;
-                bucket = Some(current_bucket);
-            }
-            if effects.is_empty() {
-                continue;
-            }
+    for ((tenant_id, bucket_id), definitions) in assignments.buckets() {
+        let effects = routed_effects(kind, journal, tenant_id, bucket_id, from, target).await?;
+        if effects.is_empty() {
+            continue;
+        }
+        for assignment in definitions.values() {
             let evidence = resolver.affected(&assignment, &effects).await?;
             for (&source, effect) in &effects {
                 inventory
@@ -491,12 +379,9 @@ async fn scan_inventory(
                     .map_err(tracker_status)?;
             }
         }
-        cursor = page.next_cursor;
-        if cursor.is_none() {
-            return Ok(());
-        }
         tokio::task::yield_now().await;
     }
+    Ok(())
 }
 
 async fn apply_progress(
@@ -510,13 +395,6 @@ async fn apply_progress(
     publisher.publish_tracker(tracker).await
 }
 
-fn apply_assignment_changes(
-    state: &mut RuntimeState,
-    mutations: Vec<DefinitionAssignmentMutation>,
-) -> Result<(), Status> {
-    apply_assignment_mutations(&mut state.assignments, &mut state.tracker, mutations)
-}
-
 async fn advance_once(
     kind: DerivedConsumerKind,
     decisions: &DecisionRaft,
@@ -524,20 +402,19 @@ async fn advance_once(
     journal: &IndexEventJournal,
     publisher: &DerivedCheckpointPublisher,
     resolver: &DerivedEvidenceResolver,
-    assignment_changes: &mut tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
     state: &mut RuntimeState,
 ) -> Result<(), Status> {
+    synchronize_assignment_changes(
+        &state.assignment_changes,
+        &mut state.assignments,
+        &mut state.tracker,
+    )?;
     let target = journal.capture_barrier().await.map_err(event_status)?;
     require_compatible(&state.demux, &target)?;
     if state.demux == target {
         return Ok(());
     }
     wait_for_assignment_delivery(kind, decisions, store, &target).await?;
-    drain_assignment_changes(
-        &mut state.assignments,
-        &mut state.tracker,
-        assignment_changes,
-    )?;
     // Routed effects are bounded by the target captured above. Move the
     // disposable tracker's settled view to that same target before asking it
     // to validate those effects; validating first compares new offsets with
@@ -817,27 +694,18 @@ fn change_buckets(kind: DerivedConsumerKind, change: &LocalChange) -> Vec<(u64, 
     }
 }
 
-fn drain_assignment_changes(
+fn synchronize_assignment_changes(
+    collector: &AssignmentChangeCollector,
     assignments: &mut AssignedBucketInventory,
     tracker: &mut SparseDerivedTracker,
-    receiver: &mut tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
 ) -> Result<(), Status> {
-    loop {
-        match receiver.try_recv() {
-            Ok(mutations) => apply_assignment_mutations(assignments, tracker, mutations)?,
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return Ok(()),
-            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                return Err(Status::unavailable(
-                    "derived assignment notifications closed",
-                ));
-            }
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
-                return Err(Status::unavailable(format!(
-                    "derived assignment notifications lagged by {skipped} batches",
-                )));
-            }
+    let changes = collector.drain()?;
+    if let Some(replacement) = changes.replacement {
+        for removed in assignments.replace_with(replacement) {
+            tracker.remove_identity(removed).map_err(tracker_status)?;
         }
     }
+    apply_assignment_mutations(assignments, tracker, changes.mutations)
 }
 
 fn apply_assignment_mutations(
@@ -896,25 +764,6 @@ async fn assignment_delivery_next(
     Ok(checkpoint
         .filter(|checkpoint| checkpoint.source_id == source && checkpoint.observed_fence == fence)
         .map_or(0, |checkpoint| checkpoint.next_offset))
-}
-
-async fn scan_assignments(
-    store: &Store,
-    kind: DerivedConsumerKind,
-    cursor: Option<&DefinitionAssignmentCursor>,
-) -> Result<keldra_store::DefinitionAssignmentPage, Status> {
-    let store = store.clone();
-    let cursor = cursor.cloned();
-    tokio::task::spawn_blocking(move || {
-        store.scan_definition_assignments_by_kind(
-            definition_kind(kind),
-            cursor.as_ref(),
-            MAX_DEFINITION_STATE_SCAN_RECORDS,
-        )
-    })
-    .await
-    .map_err(join_status)?
-    .map_err(internal_status)
 }
 
 fn require_compatible(from: &IndexBarrier, target: &IndexBarrier) -> Result<(), Status> {

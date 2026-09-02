@@ -1,47 +1,37 @@
 //! One fair hard ceiling for accounted index heap memory.
 //!
-//! Query and construction settings remain fair-share planning targets. The
-//! query share is reserved from background construction, queries have priority
-//! over queued builders, and FIFO ordering is preserved within each class. The
-//! process-wide ceiling is never exceeded. This pool intentionally excludes
-//! mmap cache, tmpfs pages, RocksDB and ordinary runtime allocations.
+//! The v6 pipeline holds its configured share for its lifetime. Queries use
+//! the remaining capacity with FIFO admission. The process-wide ceiling is
+//! never exceeded.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use keldra_index::IndexKind;
 use thiserror::Error;
 use tokio::sync::Notify;
 
 use crate::index_config::IndexRuntimeConfig;
 
-const ACCOUNT_COUNT: usize = 9;
+const ACCOUNT_COUNT: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkingMemoryAccount {
     Query,
-    Builder(IndexKind),
+    IndexingPipeline,
 }
 
 impl WorkingMemoryAccount {
     const fn slot(self) -> usize {
         match self {
             Self::Query => 0,
-            Self::Builder(kind) => kind as u8 as usize,
+            Self::IndexingPipeline => 1,
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
             Self::Query => "query",
-            Self::Builder(IndexKind::Path) => "path",
-            Self::Builder(IndexKind::MetadataFilter) => "metadata_filter",
-            Self::Builder(IndexKind::TypedJson) => "typed_json",
-            Self::Builder(IndexKind::FullText) => "full_text",
-            Self::Builder(IndexKind::Vector) => "vector",
-            Self::Builder(IndexKind::Hybrid) => "hybrid",
-            Self::Builder(IndexKind::GitSource) => "git_source",
-            Self::Builder(IndexKind::Tensor) => "tensor",
+            Self::IndexingPipeline => "indexing_pipeline",
         }
     }
 }
@@ -77,11 +67,7 @@ struct WorkingMemoryWaiter {
 
 impl IndexWorkingMemory {
     pub(crate) fn from_config(config: IndexRuntimeConfig) -> Result<Self, WorkingMemoryError> {
-        let mut shares = [0; ACCOUNT_COUNT];
-        shares[WorkingMemoryAccount::Query.slot()] = config.query_memory_bytes();
-        for kind in all_kinds() {
-            shares[WorkingMemoryAccount::Builder(kind).slot()] = config.builder_memory_bytes(kind);
-        }
+        let shares = [config.query_memory_bytes(), config.pipeline_memory_bytes()];
         Self::new(
             config
                 .working_memory_bytes()
@@ -172,7 +158,7 @@ impl IndexWorkingMemory {
                         .iter()
                         .take(index)
                         .any(|waiter| waiter.account == WorkingMemoryAccount::Query),
-                    WorkingMemoryAccount::Builder(_) => {
+                    WorkingMemoryAccount::IndexingPipeline => {
                         index == 0
                             && !state
                                 .waiters
@@ -183,7 +169,7 @@ impl IndexWorkingMemory {
                 let free = self.inner.hard_limit.saturating_sub(state.used);
                 let available = match account {
                     WorkingMemoryAccount::Query => free,
-                    WorkingMemoryAccount::Builder(_) => free.saturating_sub(
+                    WorkingMemoryAccount::IndexingPipeline => free.saturating_sub(
                         self.inner.shares[WorkingMemoryAccount::Query.slot()]
                             .saturating_sub(state.account_used[WorkingMemoryAccount::Query.slot()]),
                     ),
@@ -326,29 +312,6 @@ fn emit_state(
         gauge.keldra_index_working_memory_waiting_bytes = waiting_bytes,
         "index working-memory budget state"
     );
-    if let WorkingMemoryAccount::Builder(kind) = account {
-        tracing::debug!(
-            index.kind = ?kind,
-            gauge.keldra_index_construction_configured_bytes = account_share,
-            gauge.keldra_index_construction_leased_bytes = account_used,
-            gauge.keldra_index_construction_peak_leased_bytes = state.account_peak[account.slot()],
-            gauge.keldra_index_construction_waiting = waiting,
-            "index construction budget state"
-        );
-    }
-}
-
-const fn all_kinds() -> [IndexKind; 8] {
-    [
-        IndexKind::Path,
-        IndexKind::MetadataFilter,
-        IndexKind::TypedJson,
-        IndexKind::FullText,
-        IndexKind::Vector,
-        IndexKind::Hybrid,
-        IndexKind::GitSource,
-        IndexKind::Tensor,
-    ]
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -367,10 +330,8 @@ pub(crate) enum WorkingMemoryError {
 mod tests {
     use super::*;
 
-    fn pool(limit: u64, query_share: u64, builder_share: u64) -> IndexWorkingMemory {
-        let mut shares = [builder_share; ACCOUNT_COUNT];
-        shares[WorkingMemoryAccount::Query.slot()] = query_share;
-        IndexWorkingMemory::new(limit, shares).unwrap()
+    fn pool(limit: u64, query_share: u64, pipeline_share: u64) -> IndexWorkingMemory {
+        IndexWorkingMemory::new(limit, [query_share, pipeline_share]).unwrap()
     }
 
     #[tokio::test]
@@ -387,21 +348,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_bypasses_a_blocked_builder_without_exceeding_the_ceiling() {
+    async fn query_bypasses_a_blocked_pipeline_waiter_without_exceeding_the_ceiling() {
         let memory = pool(12, 4, 8);
         let held = memory
-            .acquire_up_to(WorkingMemoryAccount::Builder(IndexKind::Path), 8, 8)
+            .acquire_up_to(WorkingMemoryAccount::IndexingPipeline, 8, 8)
             .await
             .unwrap();
-        let builder_memory = memory.clone();
-        let builder = tokio::spawn(async move {
-            builder_memory
-                .acquire_up_to(WorkingMemoryAccount::Builder(IndexKind::Path), 8, 8)
+        let pipeline_memory = memory.clone();
+        let pipeline = tokio::spawn(async move {
+            pipeline_memory
+                .acquire_up_to(WorkingMemoryAccount::IndexingPipeline, 8, 8)
                 .await
                 .unwrap()
         });
         tokio::task::yield_now().await;
-        assert!(!builder.is_finished());
+        assert!(!pipeline.is_finished());
         let query_memory = memory.clone();
         let query = tokio::spawn(async move {
             query_memory
@@ -413,24 +374,37 @@ mod tests {
         let query = query.await.unwrap();
         assert_eq!(query.bytes(), 4);
         assert_eq!(memory.used(), 12);
-        assert!(!builder.is_finished());
+        assert!(!pipeline.is_finished());
         drop(query);
-        assert!(!builder.is_finished());
+        assert!(!pipeline.is_finished());
         drop(held);
-        let builder = builder.await.unwrap();
-        assert_eq!(builder.bytes(), 8);
+        let pipeline = pipeline.await.unwrap();
+        assert_eq!(pipeline.bytes(), 8);
         assert_eq!(memory.used(), 8);
     }
 
     #[tokio::test]
-    async fn builders_cannot_consume_the_idle_query_reservation() {
+    async fn pipeline_cannot_consume_the_idle_query_reservation() {
         let memory = pool(12, 4, 8);
         let permit = memory
-            .acquire_up_to(WorkingMemoryAccount::Builder(IndexKind::Path), 8, 12)
+            .acquire_up_to(WorkingMemoryAccount::IndexingPipeline, 8, 12)
             .await
             .unwrap();
         assert_eq!(permit.bytes(), 8);
         assert_eq!(memory.available(), 4);
+    }
+
+    #[tokio::test]
+    async fn permanent_projection_residency_remains_in_the_hard_parent() {
+        let memory = pool(40, 10, 10);
+        let projection = memory
+            .acquire_up_to(WorkingMemoryAccount::IndexingPipeline, 10, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(projection.bytes(), 10);
+        assert_eq!(memory.used(), 10);
+        assert_eq!(memory.available(), 30);
     }
 
     #[tokio::test]

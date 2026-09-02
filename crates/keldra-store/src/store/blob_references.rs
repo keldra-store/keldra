@@ -4,6 +4,7 @@ use crate::blob_gc::{BlobGcBudget, BlobGcCursor, BlobGcPhase, BlobGcTick};
 use crate::key::STORAGE_KEY_FORMAT_VERSION;
 
 use super::journal_capacity::SourceJournalAdmission;
+use super::mutation_prefetch::MutationReadCache;
 use super::payload_artifacts::{ArtifactKind, ArtifactManifest, RocksArtifactReader};
 use super::*;
 
@@ -51,6 +52,100 @@ impl Store {
         upload.write(bytes).await.map_err(storage_error)?;
         self.seal_blob_upload_with_admission(upload, admission)
             .await
+    }
+
+    pub(super) async fn stage_derived_progress_inline_blob_batch(
+        &self,
+        blobs: &[Vec<u8>],
+    ) -> Result<Vec<BlobRef>, MutationError> {
+        if blobs.len() > MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS {
+            return Err(MutationError::Storage(format!(
+                "derived-progress inline blob batch exceeds the {MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS}-item bound"
+            )));
+        }
+        if blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut logical_bytes = 0_u64;
+        let mut references = Vec::with_capacity(blobs.len());
+        for bytes in blobs {
+            if bytes.len() > PAYLOAD_ARTIFACT_CHUNK_BYTES {
+                return Err(MutationError::Storage(
+                    "derived-progress inline blob batch contains a chunked payload".into(),
+                ));
+            }
+            logical_bytes = logical_bytes
+                .checked_add(u64::try_from(bytes.len()).map_err(storage_error)?)
+                .ok_or_else(|| {
+                    MutationError::Storage(
+                        "derived-progress inline blob batch byte count overflow".into(),
+                    )
+                })?;
+            if logical_bytes > MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES {
+                return Err(MutationError::Storage(format!(
+                    "derived-progress inline blob batch exceeds the {MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES}-byte bound"
+                )));
+            }
+            let reference = blob_reference_for_bytes(bytes);
+            validate_complete_artifact(&reference, bytes)?;
+            references.push(reference);
+        }
+
+        let now = now_unix_millis()?;
+        let _guard = self.lock_commit("blob_reference").await;
+        self.persist_derived_progress_inline_blob_batch(blobs, &references, now)?;
+        Ok(references)
+    }
+
+    fn persist_derived_progress_inline_blob_batch(
+        &self,
+        blobs: &[Vec<u8>],
+        references: &[BlobRef],
+        now_unix_millis: u64,
+    ) -> Result<(), MutationError> {
+        let mut batch = WriteBatch::default();
+        let mut pending_inline_payloads = BTreeSet::new();
+        let mut pending_blob_references = PendingBlobReferences::new();
+        let mut changes = Vec::with_capacity(blobs.len());
+
+        for (bytes, reference) in blobs.iter().zip(references) {
+            if let Some((artifact_key, artifact_bytes)) =
+                self.prepare_inline_payload_value(reference, bytes, &pending_inline_payloads)?
+            {
+                self.stage_inline_complete_artifact(&mut batch, reference, &artifact_bytes)?;
+                pending_inline_payloads.insert(artifact_key);
+            }
+            let state = self
+                .prepare_sealed_blob_reservation(reference, now_unix_millis)?
+                .ok_or_else(|| {
+                    MutationError::Storage("inline payload reservation is missing".into())
+                })?;
+            let key = blob_reference_key(reference);
+            self.stage_blob_reference_update(
+                &mut batch,
+                &mut pending_blob_references,
+                key.clone(),
+                state,
+            )?;
+            changes.push(PendingLocalChange::ContentLifecycleChanged {
+                blob_identity: key,
+                revision: state.updated_at,
+                reference_deltas: Vec::new(),
+                accounting_transition: None,
+            });
+        }
+        self.stage_local_changes_with_admission(
+            &mut batch,
+            &changes,
+            LocalReferenceEffects::NoReferenceEffects,
+            SourceJournalAdmission::DerivedProgress,
+        )?;
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        self.db.write_opt(batch, &options).map_err(storage_error)?;
+        self.notify_local_invalidations();
+        Ok(())
     }
 
     pub fn lock_manager(&self) -> LocalLockManager {
@@ -887,6 +982,53 @@ impl Store {
             },
         };
         Ok((key, state))
+    }
+
+    /// Materializes inline bytes and, when their reference effect must remain
+    /// ordered behind a journal prefix, retains them with a reservation that
+    /// the eventual positive delta publishes without double-counting.
+    pub(super) fn prepare_coordinated_inline_payload(
+        &self,
+        operation: &PreparedOperation,
+        materialize: bool,
+        reserve_for_deferred_delta: bool,
+        pending_inline_payloads: &BTreeSet<Vec<u8>>,
+        pending_blob_references: &PendingBlobReferences,
+        read_cache: &MutationReadCache,
+        now_unix_millis: u64,
+    ) -> Result<
+        (
+            Option<(Vec<u8>, Vec<u8>)>,
+            Option<(Vec<u8>, BlobReferenceState)>,
+        ),
+        MutationError,
+    > {
+        if !materialize {
+            return Ok((None, None));
+        }
+        let PreparedOperation::Put { payload, .. } = operation else {
+            return Ok((None, None));
+        };
+        let inline_payload = match payload.inline_bytes() {
+            Some(bytes) => self.prepare_hashed_inline_payload_value_cached(
+                payload.reference(),
+                bytes,
+                pending_inline_payloads,
+                read_cache.inline_payload(payload.reference()),
+            )?,
+            None => None,
+        };
+        if !reserve_for_deferred_delta {
+            return Ok((inline_payload, None));
+        }
+        let key = blob_reference_key(payload.reference());
+        let reservation = if pending_blob_references.contains_key(&key) {
+            None
+        } else {
+            self.prepare_sealed_artifact_reservation(&key, now_unix_millis)?
+                .map(|state| (key, state))
+        };
+        Ok((inline_payload, reservation))
     }
 
     pub(super) fn prepare_inline_payload_value(

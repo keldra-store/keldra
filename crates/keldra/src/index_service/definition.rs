@@ -6,7 +6,7 @@ use keldra_api::v1::{
     UpdateIndexRequest,
 };
 use keldra_atomic_program::MAX_OBJECT_PATH_BYTES;
-use keldra_index::v4::DateFormat;
+use keldra_index::typed_json::DateFormat;
 use keldra_store::INDEX_DEFINITION_PREFIX;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use tonic::Status;
 
 use crate::index_runtime::date::validate_format;
-use crate::index_runtime::v4_schema::compile_schema;
+use crate::index_runtime::typed_json_schema::compile_typed_json_schema;
 
 const STORED_DEFINITION_FORMAT: u16 = 4;
 const MAX_INDEX_NAME_BYTES: usize = 128;
@@ -38,6 +38,13 @@ pub(crate) struct StoredIndexDefinition {
 }
 
 impl StoredIndexDefinition {
+    pub(crate) fn with_index_id(&self, index_id: u64) -> Self {
+        debug_assert_ne!(index_id, 0);
+        let mut physical = self.clone();
+        physical.index_id = index_id;
+        physical
+    }
+
     pub(crate) fn create(
         tenant: String,
         request: CreateIndexRequest,
@@ -124,7 +131,7 @@ impl StoredIndexDefinition {
         let specification = stored.specification()?;
         validate_specification(&specification)
             .map_err(|_| Status::data_loss("stored index specification is invalid"))?;
-        compile_schema(
+        compile_typed_json_schema(
             &stored.path_prefix,
             stored.content_type.as_deref(),
             &specification,
@@ -226,7 +233,7 @@ pub(crate) fn validate_create_definition(
         .clone()
         .ok_or_else(|| Status::invalid_argument("index specification is required"))?;
     validate_specification(&specification)?;
-    compile_schema(
+    compile_typed_json_schema(
         &request.path_prefix,
         content_type.as_deref(),
         &specification,
@@ -253,7 +260,7 @@ pub(crate) fn validate_update_definition(
         .clone()
         .ok_or_else(|| Status::invalid_argument("index specification is required"))?;
     validate_specification(&specification)?;
-    compile_schema(
+    compile_typed_json_schema(
         &request.path_prefix,
         content_type.as_deref(),
         &specification,
@@ -264,107 +271,32 @@ pub(crate) fn validate_update_definition(
 
 fn validate_specification(specification: &IndexSpecification) -> Result<(), Status> {
     match specification.specification.as_ref() {
-        Some(Specification::Path(_)) => Ok(()),
-        Some(Specification::MetadataFilter(specification)) => {
-            const ALLOWED: &[&str] = &[
-                "path",
-                "version",
-                "content_type",
-                "content_length",
-                "content_hash",
-                "committed_at_unix_millis",
-            ];
-            require_unique_nonempty(&specification.fields, "metadata field")?;
-            if specification
-                .fields
-                .iter()
-                .any(|field| !ALLOWED.contains(&field.as_str()))
-            {
-                return Err(Status::invalid_argument(
-                    "metadata index contains an unsupported object-head field",
-                ));
-            }
-            Ok(())
-        }
         Some(Specification::TypedJson(specification)) => {
             validate_typed_json_specification(specification)
         }
-        Some(Specification::FullText(specification)) => {
-            if specification.fields.is_empty() {
-                return Err(Status::invalid_argument(
-                    "full-text index needs at least one field",
-                ));
-            }
-            let mut names = BTreeSet::new();
-            for field in &specification.fields {
-                validate_field_parts(&field.name, &field.json_pointer)?;
-                if !names.insert(field.name.as_str()) {
-                    return Err(Status::invalid_argument(
-                        "full-text field names must be unique",
-                    ));
-                }
-            }
-            Ok(())
-        }
-        Some(Specification::Vector(specification)) => {
-            if specification.dimensions == 0 {
-                return Err(Status::invalid_argument(
-                    "vector dimensions must be non-zero",
-                ));
-            }
-            validate_json_pointer(&specification.json_pointer)
-        }
-        Some(Specification::Hybrid(specification)) => {
-            let full_text = specification
-                .full_text
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("hybrid full-text spec is required"))?;
-            let vector = specification
-                .vector
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("hybrid vector spec is required"))?;
-            validate_specification(&IndexSpecification {
-                specification: Some(Specification::FullText(full_text.clone())),
-            })?;
-            validate_specification(&IndexSpecification {
-                specification: Some(Specification::Vector(vector.clone())),
-            })?;
-            let text_weight = specification.full_text_weight;
-            let vector_weight = specification.vector_weight;
-            if !text_weight.is_finite()
-                || !vector_weight.is_finite()
-                || text_weight < 0.0
-                || vector_weight < 0.0
-                || (text_weight == 0.0) != (vector_weight == 0.0)
-            {
-                return Err(Status::invalid_argument(
-                    "hybrid weights must both be zero (equal) or finite and positive",
-                ));
-            }
-            Ok(())
-        }
-        Some(Specification::GitSource(specification)) => {
-            require_text(&specification.repository_id, "Git repository ID")
-        }
-        Some(Specification::Tensor(specification)) => {
-            require_text(&specification.model_id, "tensor model ID")
-        }
+        Some(
+            Specification::Path(_)
+            | Specification::MetadataFilter(_)
+            | Specification::FullText(_)
+            | Specification::Vector(_)
+            | Specification::Hybrid(_)
+            | Specification::GitSource(_)
+            | Specification::Tensor(_),
+        ) => Err(Status::unimplemented(
+            "the partition-owned indexing architecture currently supports TypedJson only",
+        )),
         None => Err(Status::invalid_argument("index specification is required")),
     }
 }
 
 fn kind_for(specification: &IndexSpecification) -> Result<IndexKind, Status> {
-    Ok(match specification.specification.as_ref() {
-        Some(Specification::Path(_)) => IndexKind::Path,
-        Some(Specification::MetadataFilter(_)) => IndexKind::MetadataFilter,
-        Some(Specification::TypedJson(_)) => IndexKind::TypedJson,
-        Some(Specification::FullText(_)) => IndexKind::FullText,
-        Some(Specification::Vector(_)) => IndexKind::Vector,
-        Some(Specification::Hybrid(_)) => IndexKind::Hybrid,
-        Some(Specification::GitSource(_)) => IndexKind::GitSource,
-        Some(Specification::Tensor(_)) => IndexKind::Tensor,
-        None => return Err(Status::data_loss("stored index specification is empty")),
-    })
+    match specification.specification.as_ref() {
+        Some(Specification::TypedJson(_)) => Ok(IndexKind::TypedJson),
+        Some(_) => Err(Status::data_loss(
+            "stored index definition uses a removed non-TypedJson index kind",
+        )),
+        None => Err(Status::data_loss("stored index specification is empty")),
+    }
 }
 
 fn validate_fields(fields: &[IndexField]) -> Result<(), Status> {
@@ -622,8 +554,8 @@ fn validate_explicit_rebuild(accepted_at_unix_millis: u64) -> Result<(), Status>
 #[cfg(test)]
 mod tests {
     use keldra_api::v1::{
-        DateIndexField, IndexOrder, KeywordIndexField, PathIndexSpec, SignedIntegerIndexField,
-        TensorIndexSpec, TypedJsonIndexSpec, index_specification,
+        DateIndexField, IndexOrder, KeywordIndexField, SignedIntegerIndexField, TensorIndexSpec,
+        TypedJsonIndexSpec, index_specification,
     };
 
     use super::*;
@@ -631,11 +563,27 @@ mod tests {
     fn request() -> CreateIndexRequest {
         CreateIndexRequest {
             bucket: "objects".into(),
-            name: "by-path".into(),
+            name: "by-json".into(),
             path_prefix: "tenant/123/".into(),
             content_type: String::new(),
             specification: Some(IndexSpecification {
-                specification: Some(index_specification::Specification::Path(PathIndexSpec {})),
+                specification: Some(index_specification::Specification::TypedJson(
+                    TypedJsonIndexSpec {
+                        fields: vec![IndexField {
+                            name: "version".into(),
+                            json_pointer: "/version".into(),
+                            cardinality: IndexFieldCardinality::Single as i32,
+                            capabilities: vec![
+                                IndexFieldCapability::Exact as i32,
+                                IndexFieldCapability::Range as i32,
+                            ],
+                            field_type: Some(FieldType::UnsignedInteger(
+                                keldra_api::v1::UnsignedIntegerIndexField {},
+                            )),
+                        }],
+                        physical_order: Vec::new(),
+                    },
+                )),
             }),
             command_id: "create-index".into(),
         }
@@ -651,12 +599,12 @@ mod tests {
             stored.specification().unwrap().specification.unwrap()
         );
         assert_eq!(
-            definition_path("by-path").unwrap(),
-            "_keldra/indices/v4/definitions/by-path"
+            definition_path("by-json").unwrap(),
+            "_keldra/indices/v6/definitions/by-json"
         );
         assert_eq!(
-            derive_index_id(7, 9, "by-path", "create-index").unwrap(),
-            derive_index_id(7, 9, "by-path", "create-index").unwrap()
+            derive_index_id(7, 9, "by-json", "create-index").unwrap(),
+            derive_index_id(7, 9, "by-json", "create-index").unwrap()
         );
     }
 
@@ -754,6 +702,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "format-v6 admission no longer has the legacy statistics-size ceiling"]
     fn definition_admission_rejects_a_schema_whose_statistics_cannot_fit() {
         let mut request = request();
         request.specification = Some(IndexSpecification {
@@ -958,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn tensor_definition_requires_and_preserves_its_model_identity() {
+    fn removed_index_kinds_are_rejected_at_definition_admission() {
         let mut request = request();
         request.specification = Some(IndexSpecification {
             specification: Some(index_specification::Specification::Tensor(
@@ -967,11 +916,12 @@ mod tests {
                 },
             )),
         });
-        let stored = StoredIndexDefinition::create("tenant".into(), request.clone(), 91).unwrap();
-        let api = stored.to_api(4).unwrap();
-
-        assert_eq!(api.kind, IndexKind::Tensor as i32);
-        assert_eq!(api.specification, request.specification);
+        assert_eq!(
+            StoredIndexDefinition::create("tenant".into(), request.clone(), 91)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unimplemented
+        );
 
         let mut invalid = request;
         invalid.specification = Some(IndexSpecification {
@@ -983,7 +933,7 @@ mod tests {
         });
         assert_eq!(
             validate_create_definition(&invalid).unwrap_err().code(),
-            tonic::Code::InvalidArgument
+            tonic::Code::Unimplemented
         );
     }
 }

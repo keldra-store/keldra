@@ -15,6 +15,8 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::data_peer::DataPeerTransport;
 #[path = "derived_consumer/assigned.rs"]
 mod assigned;
+#[path = "derived_consumer/assignment_changes.rs"]
+mod assignment_changes;
 #[path = "derived_consumer/tracker.rs"]
 mod tracker;
 pub(crate) use tracker::{

@@ -5,7 +5,7 @@ use std::future::Future;
 
 use keldra_store::{
     BatchOperation, CoordinatedObjectMutation, DefinitionMutationIntent, Durability,
-    MutationReceipt, ObjectMutationGovernance,
+    MutationReceipt, ObjectMutationGovernance, SourceJournalSettlement,
 };
 use tonic::Status;
 
@@ -14,6 +14,7 @@ use super::{
     mutation_status, operation_key, stage_distributed_put,
 };
 use crate::cluster_placement::ClusterPlacement;
+use crate::index_runtime::hot_ingress::PendingHotProjection;
 use crate::mutation_admission::{MutationAdmission, MutationPermit};
 use crate::payload_distribution::PreparedPayloadEvidence;
 
@@ -86,53 +87,10 @@ impl ObjectDistribution {
             Ok(placement) => placement,
             Err(error) => return (0..count).map(|_| Err(error.clone())).collect(),
         };
-        if placement.active_node_ids().len() == 1 {
-            if operations
-                .iter()
-                .all(|(_, intent, governance)| intent.is_none() && governance.is_none())
-            {
-                let operations = operations
-                    .into_iter()
-                    .map(|(operation, _, _)| operation)
-                    .collect();
-                return match self.mutation_admission.enter() {
-                    Ok(_permit) => self
-                        .store
-                        .bulk_write_with_backpressure(operations)
-                        .await
-                        .into_iter()
-                        .map(|outcome| outcome.result.map_err(mutation_status))
-                        .collect(),
-                    Err(error) => (0..count).map(|_| Err(error.clone())).collect(),
-                };
-            }
-            let mut outcomes = Vec::with_capacity(count);
-            for (operation, intent, governance) in operations {
-                let result = match (intent, governance) {
-                    (Some(intent), Some(governance)) => {
-                        self.mutate_with_governance_and_definition_intent(
-                            operation,
-                            governance,
-                            Some(intent),
-                        )
-                        .await
-                    }
-                    (Some(intent), None) => {
-                        self.mutate_with_definition_intent(operation, intent).await
-                    }
-                    (None, Some(governance)) => {
-                        self.mutate_with_governance(operation, governance).await
-                    }
-                    (None, None) => self.mutate(operation).await,
-                };
-                outcomes.push(result);
-            }
-            return outcomes;
-        }
-
         let mut governance_cache =
             BTreeMap::<(String, String), Result<ObjectMutationGovernance, Status>>::new();
         let mut grouped = BTreeMap::<Vec<u64>, Vec<BatchItem>>::new();
+        let mut pending_hot = BTreeMap::<usize, PendingHotProjection>::new();
         let mut outcomes = vec![None; count];
         for (index, (operation, definition_intent, supplied_governance)) in
             operations.into_iter().enumerate()
@@ -172,6 +130,11 @@ impl ObjectDistribution {
                 }
             };
             let group_key = group.replicas().iter().map(|node| node.0).collect();
+            if let Some(pending) = self.hot_indexing.get().and_then(|ingress| {
+                ingress.pending(governance.tenant_id, governance.bucket_id, &operation)
+            }) {
+                pending_hot.insert(index, pending);
+            }
             grouped.entry(group_key).or_default().push(BatchItem {
                 index,
                 operation,
@@ -183,9 +146,12 @@ impl ObjectDistribution {
         let mut tasks = tokio::task::JoinSet::new();
         for (_, items) in grouped {
             let distribution = self.clone();
+            let single_node = placement.active_node_ids().len() == 1;
             tasks.spawn(async move {
                 let indices = items.iter().map(|item| item.index).collect::<Vec<_>>();
-                let result = distribution.execute_mutation_group(items).await;
+                let result = distribution
+                    .execute_mutation_group(items, single_node)
+                    .await;
                 (indices, result)
             });
         }
@@ -201,7 +167,7 @@ impl ObjectDistribution {
                 }
             }
         }
-        outcomes
+        let outcomes = outcomes
             .into_iter()
             .map(|outcome| {
                 outcome.unwrap_or_else(|| {
@@ -210,7 +176,9 @@ impl ObjectDistribution {
                     ))
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        admit_aligned_hot_results(self.hot_indexing.get(), pending_hot, &outcomes);
+        outcomes
     }
 
     fn resolve_governance(
@@ -238,6 +206,7 @@ impl ObjectDistribution {
     async fn execute_mutation_group(
         &self,
         items: Vec<BatchItem>,
+        single_node: bool,
     ) -> Vec<(usize, Result<MutationReceipt, Status>)> {
         let mut outcomes = BTreeMap::new();
         let mut preparation = tokio::task::JoinSet::new();
@@ -248,6 +217,9 @@ impl ObjectDistribution {
                 let index = item.index;
                 let result = async {
                     let operation = match item.operation {
+                        BatchOperation::Put(request) if single_node => {
+                            Ok(BatchOperation::Put(request))
+                        }
                         BatchOperation::Put(request) => {
                             stage_distributed_put(&distribution.store, request)
                                 .await
@@ -306,17 +278,15 @@ impl ObjectDistribution {
                 return outcomes.into_iter().collect();
             }
             let attempt = begin_fenced_mutation_attempt(&self.mutation_admission, || async {
-                let placement = match self.placement()? {
-                    placement if placement.active_node_ids().len() > 1 => placement,
-                    _ => {
-                        return Err(Status::unavailable(
-                            "object placement changed while starting a distributed mutation batch",
-                        ));
-                    }
-                };
+                let placement = self.placement()?;
+                if (placement.active_node_ids().len() == 1) != single_node {
+                    return Err(Status::unavailable(
+                        "object placement changed while starting a mutation batch",
+                    ));
+                }
                 let group = self.current_mutation_group(&placement, &pending)?;
                 let prepared_payloads = self
-                    .prepare_mutation_group_payloads(&placement, &pending)
+                    .prepare_mutation_group_payloads(&placement, &pending, single_node)
                     .await;
                 let reconcilable = pending
                     .iter()
@@ -372,16 +342,32 @@ impl ObjectDistribution {
                 .collect();
             let completed = complete_metadata(async move {
                 let _permit = permit;
-                let coordinated = completion
-                    .store
-                    .coordinate_distributed_mutation_batch(store_operations, context)
-                    .await
-                    .map_err(mutation_status)?;
+                let (coordinated, settlement) = if single_node {
+                    let batch = completion
+                        .store
+                        .coordinate_single_node_mutation_batch_with_settlement(
+                            store_operations,
+                            context,
+                        )
+                        .await
+                        .map_err(mutation_status)?;
+                    (batch.outcomes, batch.source_journal_settlement)
+                } else {
+                    (
+                        completion
+                            .store
+                            .coordinate_distributed_mutation_batch(store_operations, context)
+                            .await
+                            .map_err(mutation_status)?,
+                        SourceJournalSettlement::RequiredAfterQuorum,
+                    )
+                };
                 let durable = completion
                     .replicate_mutation_group_batch(
                         &completion_placement,
                         &completion_group,
                         &coordinated,
+                        settlement,
                     )
                     .await;
                 Ok::<_, Status>((coordinated, durable))
@@ -433,6 +419,7 @@ impl ObjectDistribution {
                                 }
                             }
                             (BatchOperation::Delete(_), None) => {}
+                            (BatchOperation::Put(_), None) if single_node => {}
                             (BatchOperation::Clone(_), _) => {
                                 outcomes.insert(
                                     item.item.index,
@@ -507,6 +494,7 @@ impl ObjectDistribution {
         &self,
         placement: &ClusterPlacement,
         prepared: &[PreparedBatchItem],
+        single_node: bool,
     ) -> Vec<Result<Option<PreparedPayloadEvidence>, Status>> {
         let mut tasks = tokio::task::JoinSet::new();
         for item in prepared {
@@ -543,9 +531,10 @@ impl ObjectDistribution {
                         BatchOperation::Clone(_) => Err(Status::invalid_argument(
                             "CloneObject is not a BulkWrite operation",
                         )),
-                        BatchOperation::Put(_) => {
-                            unreachable!("put was sealed before the attempt")
-                        }
+                        BatchOperation::Put(_) if single_node => Ok(None),
+                        BatchOperation::Put(_) => Err(Status::internal(
+                            "distributed put was not sealed before payload placement",
+                        )),
                     }
                 }
                 .await;
@@ -586,6 +575,15 @@ impl ObjectDistribution {
         placement: &ClusterPlacement,
         prepared: &[PreparedBatchItem],
     ) -> Result<keldra_store::ObjectMutationContext, Status> {
+        if placement.active_node_ids().len() == 1 {
+            let context = self.serving.mutation_context()?;
+            if context.active_placement_log_id != placement.fence() {
+                return Err(Status::unavailable(
+                    "serving authority changed during grouped mutation reconciliation",
+                ));
+            }
+            return Ok(context);
+        }
         let mut contexts = tokio::task::JoinSet::new();
         let mut unique_paths = BTreeSet::new();
         for item in prepared {
@@ -631,6 +629,7 @@ impl ObjectDistribution {
         placement: &ClusterPlacement,
         group: &MutableRecordReplicaGroup,
         coordinated: &[Result<CoordinatedObjectMutation, keldra_store::MutationError>],
+        settlement: SourceJournalSettlement,
     ) -> Vec<Result<(), Status>> {
         let mut results = vec![Ok(()); coordinated.len()];
         for (index, outcome) in coordinated.iter().enumerate() {
@@ -730,7 +729,8 @@ impl ObjectDistribution {
                 )));
             }
         }
-        if let Some((source, _)) = quorum_positions.first().copied()
+        if matches!(settlement, SourceJournalSettlement::RequiredAfterQuorum)
+            && let Some((source, _)) = quorum_positions.first().copied()
             && let Err(error) = self
                 .store
                 .settle_source_journal_positions_if_contiguous(
@@ -751,6 +751,21 @@ impl ObjectDistribution {
             );
         }
         results
+    }
+}
+
+fn admit_aligned_hot_results(
+    ingress: Option<&crate::index_runtime::hot_ingress::HotProjectionIngress>,
+    pending: BTreeMap<usize, PendingHotProjection>,
+    results: &[Result<MutationReceipt, Status>],
+) {
+    let Some(ingress) = ingress else {
+        return;
+    };
+    for (index, pending) in pending {
+        if let Some(Ok(receipt)) = results.get(index) {
+            ingress.admit_committed(Some(pending), receipt);
+        }
     }
 }
 
@@ -784,6 +799,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::mutation_admission::DrainIdentity;
+    use keldra_store::{
+        Durability, LogicalRecordMutationContext, LogicalRecordValue, ObjectKey,
+        ObjectMutationContext, PlacementLogId, PutMode, PutRequest, StorageTenantId, Store,
+        StoreOptions, VersionId,
+    };
 
     use super::*;
 
@@ -791,6 +811,146 @@ mod tests {
         DrainIdentity {
             joining_node_id: 9,
             started_log_index: 41,
+        }
+    }
+
+    fn inline_put(path: &str) -> BatchOperation {
+        BatchOperation::Put(PutRequest {
+            key: ObjectKey::new("tenant", "bucket", path).unwrap(),
+            bytes: br#"{"value":"hot"}"#.to_vec(),
+            content_type: Some("application/json".into()),
+            mode: PutMode::Put,
+            command_id: Some(format!("put-{path}")),
+            durability: Durability::Local,
+        })
+    }
+
+    fn receipt(version: u64) -> MutationReceipt {
+        MutationReceipt {
+            command_id: Some(format!("v-{version}")),
+            fingerprint: [version as u8; 32],
+            version: VersionId(version),
+            deleted: false,
+            replayed: false,
+            replay_guarantee_expires_at_unix_millis: 1,
+        }
+    }
+
+    fn install_test_identity(store: &Store) {
+        let tenant = StorageTenantId::parse("tenant").unwrap();
+        for (record_version, typed_value) in [
+            (
+                101,
+                LogicalRecordValue::TenantNameClaim {
+                    storage_tenant: tenant,
+                    tenant_id: 1,
+                },
+            ),
+            (
+                102,
+                LogicalRecordValue::BucketNameClaim {
+                    tenant_id: 1,
+                    bucket: "bucket".into(),
+                    bucket_id: 1,
+                },
+            ),
+        ] {
+            let mutation = store
+                .construct_logical_record_mutation(
+                    typed_value,
+                    LogicalRecordMutationContext {
+                        record_version: VersionId(record_version),
+                        active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                        serving_fence_term: 1,
+                    },
+                )
+                .unwrap();
+            store.commit_logical_record_mutation(&mutation).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn single_node_coordinated_bulk_heads_are_v6_baseline_eligible() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        install_test_identity(&store);
+        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: store.bucket_policy("tenant", "bucket").unwrap(),
+        };
+        let source_before = store.local_watch_status().unwrap();
+        let paths = ["objects/first.json", "objects/second.json"];
+        let operations = paths
+            .iter()
+            .map(|path| (inline_put(path), governance.clone(), None))
+            .collect();
+
+        let outcomes = store
+            .coordinate_single_node_mutation_batch(
+                operations,
+                ObjectMutationContext {
+                    active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                    serving_fence_term: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), paths.len());
+        assert!(outcomes.iter().all(Result::is_ok));
+        let source_after = store.local_watch_status().unwrap();
+        assert_eq!(source_after.source_id, source_before.source_id);
+        for path in paths {
+            let head = store
+                .head(&ObjectKey::new("tenant", "bucket", path).unwrap())
+                .unwrap()
+                .expect("coordinated bulk put must create a head");
+            let stamp = head
+                .mutation_stamp
+                .expect("coordinated bulk head must carry its source stamp");
+            assert_eq!(stamp.source_id, source_after.source_id);
+            assert!(stamp.source_journal_position > source_before.tail);
+            assert!(stamp.source_journal_position <= source_after.tail);
+        }
+    }
+
+    #[test]
+    fn production_aligned_admission_handles_reordered_thousand_item_completion() {
+        let ingress =
+            crate::index_runtime::hot_ingress::HotProjectionIngress::new(4 * 1024 * 1024).unwrap();
+        ingress.activate_test_route(1, 2);
+        let mut pending = BTreeMap::new();
+        // Insert in reverse completion order; the production helper must bind
+        // by original result index, never task/group completion order.
+        for index in (0..1_000).rev() {
+            pending.insert(
+                index,
+                ingress
+                    .pending(1, 2, &inline_put(&format!("objects/{index}")))
+                    .unwrap(),
+            );
+        }
+        let mut results = (0..1_000)
+            .map(|index| Ok(receipt(20_000 + index as u64)))
+            .collect::<Vec<_>>();
+        results[111] = Err(Status::unavailable("injected failure"));
+        results[777].as_mut().unwrap().replayed = true;
+
+        admit_aligned_hot_results(Some(&ingress), pending, &results);
+
+        for index in 0..1_000 {
+            let payload = ingress.take_exact_selected(
+                1,
+                2,
+                &format!("objects/{index}"),
+                20_000 + index as u64,
+            );
+            assert_eq!(payload.is_some(), index != 111 && index != 777);
         }
     }
 

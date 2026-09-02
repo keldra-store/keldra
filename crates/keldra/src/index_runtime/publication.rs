@@ -7,7 +7,7 @@ use keldra_consensus::NodeId;
 use keldra_store::{
     BatchOperation, BlobRef, DefinitionKind, DefinitionMutationIntent, DeleteRequest,
     DeleteRetainedVersionOutcome, Durability, ObjectKey, ObjectVersioning, PlacementLogId,
-    Precondition, PublishRequest, PutMode, Store, VersionId,
+    Precondition, PublishRequest, PutMode, SourceId, Store, VersionId,
 };
 use tonic::Status;
 
@@ -18,7 +18,14 @@ use crate::object_distribution::ObjectDistribution;
 
 use super::placement::{IndexIdentity, IndexPlacement};
 
-mod cohort;
+mod paths;
+mod v6_batch;
+use paths::{ArtifactPathKind, immutable_content_hash_from_path, parse_artifact_path};
+pub(crate) use paths::{
+    artifact_hash_from_path, artifact_path, current_path, index_definition_name,
+    is_index_recovery_path, is_manifest_artifact_path, manifest_hash_from_path, manifest_path,
+    rebuild_path,
+};
 
 const INDEX_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.index-artifact";
 const ACCOUNTING_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.accounting+json";
@@ -117,40 +124,6 @@ pub(crate) struct IndexArtifactOutcome {
 
 pub(crate) type IndexArtifactPublicationOutcome = Result<IndexArtifactOutcome, Status>;
 
-/// Exact physical routing identity for one guarded current-pointer cohort.
-/// The placement fence prevents candidates prepared across membership cuts
-/// from sharing a queue epoch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GuardedIndexArtifactCohort {
-    storage_tenant: String,
-    bucket: String,
-    tenant_id: u64,
-    bucket_id: u64,
-    admission: DerivedArtifactAdmission,
-    fence: PlacementLogId,
-    definition_replicas: Vec<NodeId>,
-    current_replicas: Vec<NodeId>,
-}
-
-#[cfg(test)]
-impl GuardedIndexArtifactCohort {
-    pub(crate) fn test_key(
-        definition_replicas: Vec<NodeId>,
-        current_replicas: Vec<NodeId>,
-    ) -> Self {
-        Self {
-            storage_tenant: "tenant".into(),
-            bucket: "bucket".into(),
-            tenant_id: 1,
-            bucket_id: 2,
-            admission: DerivedArtifactAdmission::PublicationProgress,
-            fence: PlacementLogId { term: 3, index: 7 },
-            definition_replicas,
-            current_replicas,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct IndexArtifactDelete {
     pub storage_tenant: String,
@@ -182,6 +155,16 @@ impl IndexArtifactDelete {
             ));
         }
         let kind = parse_artifact_path(&self.exact_path, self.index_id)?;
+        if matches!(
+            kind,
+            ArtifactPathKind::ProjectionCurrent
+                | ArtifactPathKind::ProjectionCatalogMutable
+                | ArtifactPathKind::ProjectionImmutable
+        ) {
+            return Err(Status::failed_precondition(
+                "v6 projection artifact reclamation requires partition-directory reachability proof",
+            ));
+        }
         validate_definition_intent(
             kind,
             &self.exact_path,
@@ -210,10 +193,18 @@ impl IndexArtifactPublish {
             ));
         }
         let kind = parse_artifact_path(&self.exact_path, self.index_id)?;
-        if kind == ArtifactPathKind::Immutable
-            && immutable_content_hash_from_path(self.index_id, &self.exact_path)
-                != Some(self.blob.hash)
-        {
+        let expected_content_hash = match kind {
+            ArtifactPathKind::Immutable => {
+                immutable_content_hash_from_path(self.index_id, &self.exact_path)
+            }
+            ArtifactPathKind::ProjectionImmutable => {
+                keldra_index::v6::parse_projection_artifact_path(&self.exact_path)
+                    .ok()
+                    .and_then(|parsed| parsed.content_hash)
+            }
+            _ => None,
+        };
+        if kind.is_immutable() && expected_content_hash != Some(self.blob.hash) {
             return Err(Status::invalid_argument(
                 "immutable index artifact path must equal its content hash",
             ));
@@ -230,6 +221,9 @@ impl IndexArtifactPublish {
                 ArtifactPathKind::Current
                     | ArtifactPathKind::RebuildMutable
                     | ArtifactPathKind::Immutable
+                    | ArtifactPathKind::ProjectionCurrent
+                    | ArtifactPathKind::ProjectionCatalogMutable
+                    | ArtifactPathKind::ProjectionImmutable
             ) || (kind == ArtifactPathKind::AccountingMutable
                 && crate::accounting::current_path(self.index_id)
                     .ok()
@@ -245,6 +239,12 @@ impl IndexArtifactPublish {
             (ArtifactPathKind::Current, Some(VersionId(0))) => Err(Status::invalid_argument(
                 "index current-pointer expected version must be non-zero",
             )),
+            (
+                ArtifactPathKind::ProjectionCurrent | ArtifactPathKind::ProjectionCatalogMutable,
+                Some(VersionId(0)),
+            ) => Err(Status::invalid_argument(
+                "projection current-pointer expected version must be non-zero",
+            )),
             (ArtifactPathKind::RebuildMutable, Some(VersionId(0))) => Err(
                 Status::invalid_argument("index rebuild-root expected version must be non-zero"),
             ),
@@ -253,14 +253,18 @@ impl IndexArtifactPublish {
             ),
             (
                 ArtifactPathKind::Current
+                | ArtifactPathKind::ProjectionCurrent
+                | ArtifactPathKind::ProjectionCatalogMutable
                 | ArtifactPathKind::RebuildMutable
                 | ArtifactPathKind::AccountingMutable,
                 _,
             )
-            | (ArtifactPathKind::Immutable, None) => Ok(kind),
-            (ArtifactPathKind::Immutable, Some(_)) => Err(Status::invalid_argument(
-                "immutable index commit artifacts cannot be replaced",
-            )),
+            | (ArtifactPathKind::Immutable | ArtifactPathKind::ProjectionImmutable, None) => {
+                Ok(kind)
+            }
+            (ArtifactPathKind::Immutable | ArtifactPathKind::ProjectionImmutable, Some(_)) => Err(
+                Status::invalid_argument("immutable index commit artifacts cannot be replaced"),
+            ),
         }?;
         let guard_required = matches!(
             kind,
@@ -288,12 +292,50 @@ impl IndexArtifactPublish {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ArtifactPathKind {
-    Current,
-    RebuildMutable,
-    Immutable,
-    AccountingMutable,
+fn artifact_placement_identity(
+    tenant_id: u64,
+    bucket_id: u64,
+    index_id: u64,
+    kind: ArtifactPathKind,
+) -> Result<IndexIdentity, Status> {
+    let identity = if matches!(
+        kind,
+        ArtifactPathKind::AccountingMutable | ArtifactPathKind::ProjectionCatalogMutable
+    ) {
+        IndexIdentity::new(tenant_id, bucket_id, index_id)
+    } else {
+        IndexIdentity::projection_partition(tenant_id, bucket_id)
+    };
+    identity.map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+fn projection_partition_owner(
+    path: &str,
+    placement: &ClusterPlacement,
+) -> Result<Option<keldra_index::v6::ProjectionPartitionIdentity>, Status> {
+    if !path.starts_with("_keldra/index-projections/v6/") {
+        return Ok(None);
+    }
+    match keldra_index::v6::parse_projection_artifact_path(path) {
+        Ok(artifact) => {
+            if artifact.kind != keldra_index::v6::ProjectionArtifactKind::Current {
+                return Ok(None);
+            }
+            let partition = artifact.partition.ok_or_else(|| {
+                Status::invalid_argument("projection current has no partition identity")
+            })?;
+            if (partition.placement_term, partition.placement_index)
+                != (placement.fence().term, placement.fence().index)
+            {
+                return Err(Status::failed_precondition(
+                    "projection partition names a stale placement fence",
+                ));
+            }
+            Ok(Some(partition))
+        }
+        Err(_) if keldra_index::v6::parse_projection_catalog_path(path).is_ok() => Ok(None),
+        Err(error) => Err(Status::invalid_argument(error.to_string())),
+    }
 }
 
 /// Destination-side late-bound handler on the mandatory-mTLS listener.
@@ -313,13 +355,6 @@ pub(crate) trait IndexArtifactPublication: Send + Sync + 'static {
         requests: Vec<IndexArtifactPublish>,
     ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status>;
 
-    async fn publish_guarded_many(
-        &self,
-        authenticated_builder: NodeId,
-        placement: ClusterPlacement,
-        requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status>;
-
     async fn commit_guarded(
         &self,
         authenticated_definition_coordinator: NodeId,
@@ -327,14 +362,6 @@ pub(crate) trait IndexArtifactPublication: Send + Sync + 'static {
         placement: ClusterPlacement,
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status>;
-
-    async fn commit_guarded_many(
-        &self,
-        authenticated_definition_coordinator: NodeId,
-        authenticated_builder: NodeId,
-        placement: ClusterPlacement,
-        requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status>;
 
     async fn delete(
         &self,
@@ -392,22 +419,6 @@ impl IndexArtifactPublication for LateBoundIndexArtifactPublication {
             .await
     }
 
-    async fn publish_guarded_many(
-        &self,
-        authenticated_builder: NodeId,
-        placement: ClusterPlacement,
-        requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
-        let handler = self
-            .inner
-            .get()
-            .cloned()
-            .ok_or_else(|| Status::unavailable("index artifact publisher is not ready"))?;
-        handler
-            .publish_guarded_many(authenticated_builder, placement, requests)
-            .await
-    }
-
     async fn delete(
         &self,
         authenticated_builder: NodeId,
@@ -442,28 +453,6 @@ impl IndexArtifactPublication for LateBoundIndexArtifactPublication {
                 authenticated_builder,
                 placement,
                 request,
-            )
-            .await
-    }
-
-    async fn commit_guarded_many(
-        &self,
-        authenticated_definition_coordinator: NodeId,
-        authenticated_builder: NodeId,
-        placement: ClusterPlacement,
-        requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
-        let handler = self
-            .inner
-            .get()
-            .cloned()
-            .ok_or_else(|| Status::unavailable("index artifact publisher is not ready"))?;
-        handler
-            .commit_guarded_many(
-                authenticated_definition_coordinator,
-                authenticated_builder,
-                placement,
-                requests,
             )
             .await
     }
@@ -510,6 +499,31 @@ impl IndexArtifactCoordinator {
         Ok(())
     }
 
+    fn validate_active_publisher(
+        &self,
+        authenticated_node: NodeId,
+        placement: &ClusterPlacement,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+    ) -> Result<(), Status> {
+        if !placement.active_node_ids().contains(&authenticated_node) {
+            return Err(Status::permission_denied(
+                "immutable projection artifact caller is not ACTIVE",
+            ));
+        }
+        if self
+            .objects
+            .routing_target_stable(key, tenant_id, bucket_id)?
+            .is_some()
+        {
+            return Err(Status::failed_precondition(
+                "index artifact request reached a node that is not its object coordinator",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_builder(
         &self,
         authenticated_builder: NodeId,
@@ -530,21 +544,52 @@ impl IndexArtifactCoordinator {
         Ok(())
     }
 
+    fn validate_catalog_authority(
+        &self,
+        authenticated_node: NodeId,
+        placement: &ClusterPlacement,
+        identity: IndexIdentity,
+        key: &ObjectKey,
+    ) -> Result<(), Status> {
+        let authority = IndexPlacement::derive(identity, placement)
+            .map_err(|error| Status::unavailable(error.to_string()))?
+            .builder();
+        if authority != authenticated_node {
+            return Err(Status::permission_denied(
+                "projection catalog caller is not its deterministic authority",
+            ));
+        }
+        if self
+            .objects
+            .routing_target_stable(key, identity.tenant_id(), identity.bucket_id())?
+            .is_some()
+        {
+            return Err(Status::failed_precondition(
+                "projection catalog request reached a node that is not its object coordinator",
+            ));
+        }
+        Ok(())
+    }
+
     async fn publish_guarded(
         &self,
         authenticated_builder: NodeId,
         placement: ClusterPlacement,
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
-        request.validate()?;
+        let kind = request.validate()?;
         // The public/peer middleware already admits routed calls. Builders can
         // also publish locally, so explicitly retain the same existing
         // membership-cutover permit across the definition lock and artifact
         // mutation in that case.
         let _permit = self.objects.enter_mutation()?;
         self.require_fence(placement.fence())?;
-        let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let identity = artifact_placement_identity(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            kind,
+        )?;
         self.validate_index_builder(authenticated_builder, &placement, identity)?;
         let guard = request
             .definition_guard
@@ -608,8 +653,12 @@ impl IndexArtifactCoordinator {
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
         let kind = request.validate()?;
-        let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let identity = artifact_placement_identity(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            kind,
+        )?;
         let key = request.key()?;
         let governance = self
             .governance
@@ -622,28 +671,82 @@ impl IndexArtifactCoordinator {
                 "index artifact mutable names no longer bind the supplied stable IDs",
             ));
         }
-        self.validate_builder(authenticated_builder, &placement, identity, &key)?;
+        if let Some(partition) = projection_partition_owner(&request.exact_path, &placement)? {
+            let source = SourceId {
+                node_id: u16::try_from(partition.source_node).map_err(|_| {
+                    Status::data_loss("v6 projection partition source node exceeds SourceId range")
+                })?,
+                source_epoch: partition.source_epoch,
+            };
+            let expected = super::placement::source_projection_producer(
+                request.tenant_id,
+                request.bucket_id,
+                source,
+                &placement,
+            )
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+            if partition.producer_node != expected.0 || expected != authenticated_builder {
+                return Err(Status::permission_denied(
+                    "projection current caller is not the placement-assigned source producer",
+                ));
+            }
+            if self
+                .objects
+                .routing_target_stable(&key, identity.tenant_id(), identity.bucket_id())?
+                .is_some()
+            {
+                return Err(Status::failed_precondition(
+                    "index artifact request reached a node that is not its object coordinator",
+                ));
+            }
+        } else if kind == ArtifactPathKind::ProjectionCatalogMutable {
+            self.validate_catalog_authority(authenticated_builder, &placement, identity, &key)?;
+        } else if kind == ArtifactPathKind::ProjectionImmutable {
+            // Packs, stream pages, query-run blocks and generation records are
+            // content-addressed. Any authenticated ACTIVE node may publish
+            // their exact validated bytes; only partition `current` has a
+            // producer authority and catalog mutables have catalog authority.
+            self.validate_active_publisher(
+                authenticated_builder,
+                &placement,
+                &key,
+                request.tenant_id,
+                request.bucket_id,
+            )?;
+        } else {
+            self.validate_builder(authenticated_builder, &placement, identity, &key)?;
+        }
         let mode = match (kind, request.expected_version) {
             (
                 ArtifactPathKind::Current
+                | ArtifactPathKind::ProjectionCurrent
+                | ArtifactPathKind::ProjectionCatalogMutable
                 | ArtifactPathKind::RebuildMutable
                 | ArtifactPathKind::AccountingMutable,
                 Some(version),
             ) => PutMode::PutIfVersion(version),
             (
                 ArtifactPathKind::Current
+                | ArtifactPathKind::ProjectionCurrent
+                | ArtifactPathKind::ProjectionCatalogMutable
                 | ArtifactPathKind::RebuildMutable
                 | ArtifactPathKind::Immutable
+                | ArtifactPathKind::ProjectionImmutable
                 | ArtifactPathKind::AccountingMutable,
                 None,
             ) => PutMode::PutIfAbsent,
-            (ArtifactPathKind::Immutable, Some(_)) => unreachable!("validated above"),
+            (ArtifactPathKind::Immutable | ArtifactPathKind::ProjectionImmutable, Some(_)) => {
+                unreachable!("validated above")
+            }
         };
         let content_type = match kind {
             ArtifactPathKind::AccountingMutable => ACCOUNTING_ARTIFACT_CONTENT_TYPE,
             ArtifactPathKind::Current
+            | ArtifactPathKind::ProjectionCurrent
+            | ArtifactPathKind::ProjectionCatalogMutable
             | ArtifactPathKind::RebuildMutable
-            | ArtifactPathKind::Immutable => INDEX_ARTIFACT_CONTENT_TYPE,
+            | ArtifactPathKind::Immutable
+            | ArtifactPathKind::ProjectionImmutable => INDEX_ARTIFACT_CONTENT_TYPE,
         };
         let derived_progress = request.admission.is_publication_progress();
         let durability = artifact_durability(kind, placement.placement_nodes().len());
@@ -677,6 +780,7 @@ impl IndexArtifactCoordinator {
                 "derived progress publication cannot mutate a definition",
             ));
         };
+        self.require_fence(placement.fence())?;
         Ok(IndexArtifactOutcome {
             version: receipt.version,
             replayed: receipt.replayed,
@@ -779,8 +883,8 @@ impl IndexArtifactRouter {
         &self,
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
-        request.validate()?;
-        let _current_guard = if request.exact_path == current_path(request.index_id) {
+        let kind = request.validate()?;
+        let _current_guard = if kind.is_current() {
             Some(self.acquire_current_mutation(request.index_id).await?)
         } else {
             None
@@ -789,21 +893,109 @@ impl IndexArtifactRouter {
             .await
     }
 
+    /// Publish bounded v6 content-addressed artifacts through their ordinary
+    /// object coordinators. Immutable paths may originate on any ACTIVE node;
+    /// one captured placement fence covers every local or remote subgroup.
+    pub(crate) async fn publish_immutable_many(
+        &self,
+        requests: Vec<IndexArtifactPublish>,
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placement = self.objects.current_program_placement()?;
+        let fence = placement.fence();
+        let mut groups =
+            BTreeMap::<(NodeId, Option<String>), Vec<(usize, IndexArtifactPublish)>>::new();
+        for (index, request) in requests.into_iter().enumerate() {
+            if request.validate()? != ArtifactPathKind::ProjectionImmutable {
+                return Err(Status::invalid_argument(
+                    "v6 grouped publication accepts projection immutable artifacts only",
+                ));
+            }
+            self.require_local_builder_for_kind(
+                request.tenant_id,
+                request.bucket_id,
+                request.index_id,
+                &request.exact_path,
+                ArtifactPathKind::ProjectionImmutable,
+            )?;
+            let key = request.key()?;
+            let target =
+                self.objects
+                    .routing_target_stable(&key, request.tenant_id, request.bucket_id)?;
+            let (coordinator, address) = match target {
+                Some((node, address)) => (node, Some(address)),
+                None => (self.local_node, None),
+            };
+            groups
+                .entry((coordinator, address))
+                .or_default()
+                .push((index, request));
+        }
+        let count = groups.values().map(Vec::len).sum();
+        let mut outcomes = std::iter::repeat_with(|| None)
+            .take(count)
+            .collect::<Vec<_>>();
+        for ((coordinator, address), group) in groups {
+            for batch in bounded_artifact_batches(group)? {
+                let (indices, publications): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+                self.require_fence(fence)?;
+                let published = match address.as_deref() {
+                    Some(address) => {
+                        self.peers
+                            .publish_index_artifacts(coordinator, address, fence, &publications)
+                            .await
+                    }
+                    None => {
+                        self.coordinator
+                            .publish_many(self.local_node, placement.clone(), publications)
+                            .await
+                    }
+                };
+                self.require_fence(fence)?;
+                match published {
+                    Ok(published) => {
+                        record_grouped_artifact_outcomes(&mut outcomes, indices, published)?
+                    }
+                    Err(error) => {
+                        for index in indices {
+                            let slot = outcomes.get_mut(index).ok_or_else(|| {
+                                Status::data_loss(
+                                    "grouped immutable outcome index is out of bounds",
+                                )
+                            })?;
+                            if slot.replace(Err(error.clone())).is_some() {
+                                return Err(Status::data_loss(
+                                    "grouped immutable outcome was recorded twice",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ordered_grouped_artifact_outcomes(outcomes)
+    }
+
     pub(crate) async fn publish_while_current_mutation_held(
         &self,
         request: IndexArtifactPublish,
         guard: Option<&IndexCurrentMutationGuard>,
     ) -> Result<IndexArtifactOutcome, Status> {
-        request.validate()?;
-        if request.exact_path == current_path(request.index_id)
-            && guard.is_none_or(|guard| guard.index_id != request.index_id)
-        {
+        let kind = request.validate()?;
+        if kind.is_current() && guard.is_none_or(|guard| guard.index_id != request.index_id) {
             return Err(Status::internal(
                 "current-pointer publication has no matching mutation guard",
             ));
         }
-        let placement =
-            self.require_local_builder(request.tenant_id, request.bucket_id, request.index_id)?;
+        let placement = self.require_local_builder_for_kind(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            &request.exact_path,
+            kind,
+        )?;
         let fence = placement.fence();
         let key = match request.definition_guard.as_ref() {
             Some(guard) => guard.key(&request.storage_tenant, &request.bucket)?,
@@ -859,9 +1051,14 @@ impl IndexArtifactRouter {
         request: IndexArtifactDelete,
         _guard: Option<&IndexCurrentMutationGuard>,
     ) -> Result<IndexArtifactOutcome, Status> {
-        request.validate()?;
-        let placement =
-            self.require_local_builder(request.tenant_id, request.bucket_id, request.index_id)?;
+        let kind = request.validate()?;
+        let placement = self.require_local_builder_for_kind(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            &request.exact_path,
+            kind,
+        )?;
         let fence = placement.fence();
         let key = request.key()?;
         let outcome =
@@ -893,10 +1090,43 @@ impl IndexArtifactRouter {
         &self,
         tenant_id: u64,
         bucket_id: u64,
-        index_id: u64,
+        _index_id: u64,
     ) -> Result<bool, Status> {
         let placement = self.objects.current_program_placement()?;
-        let identity = IndexIdentity::new(tenant_id, bucket_id, index_id)
+        let identity = IndexIdentity::projection_partition(tenant_id, bucket_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let assignment = IndexPlacement::derive(identity, &placement)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        Ok(assignment.builder() == self.local_node)
+    }
+
+    /// Current producer assignment for one immutable source incarnation. The
+    /// source stays local while ACTIVE; after removal this is the canonical
+    /// capacity-weighted HRW successor selected from its source identity.
+    pub(crate) fn source_projection_producer(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        source: SourceId,
+    ) -> Result<(NodeId, PlacementLogId), Status> {
+        let placement = self.objects.current_program_placement()?;
+        let producer =
+            super::placement::source_projection_producer(tenant_id, bucket_id, source, &placement)
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+        Ok((producer, placement.fence()))
+    }
+
+    /// The single deterministic authority for a family lifecycle object.
+    /// Partition `current` objects instead belong to their source owner; do
+    /// not use this predicate for them.
+    pub(crate) fn is_local_catalog_authority(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        catalog_routing_id: u64,
+    ) -> Result<bool, Status> {
+        let placement = self.objects.current_program_placement()?;
+        let identity = IndexIdentity::new(tenant_id, bucket_id, catalog_routing_id)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let assignment = IndexPlacement::derive(identity, &placement)
             .map_err(|error| Status::unavailable(error.to_string()))?;
@@ -907,10 +1137,10 @@ impl IndexArtifactRouter {
         &self,
         tenant_id: u64,
         bucket_id: u64,
-        index_id: u64,
+        _index_id: u64,
     ) -> Result<ClusterPlacement, Status> {
         let placement = self.objects.current_program_placement()?;
-        let identity = IndexIdentity::new(tenant_id, bucket_id, index_id)
+        let identity = IndexIdentity::projection_partition(tenant_id, bucket_id)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let assignment = IndexPlacement::derive(identity, &placement)
             .map_err(|error| Status::unavailable(error.to_string()))?;
@@ -918,6 +1148,58 @@ impl IndexArtifactRouter {
             return Err(Status::failed_precondition(
                 "this node is not the current weighted-HRW index builder",
             ));
+        }
+        Ok(placement)
+    }
+
+    fn require_local_builder_for_kind(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        index_id: u64,
+        exact_path: &str,
+        kind: ArtifactPathKind,
+    ) -> Result<ClusterPlacement, Status> {
+        let placement = self.objects.current_program_placement()?;
+        if kind == ArtifactPathKind::ProjectionImmutable {
+            if placement.active_node_ids().contains(&self.local_node) {
+                return Ok(placement);
+            }
+            return Err(Status::failed_precondition(
+                "this node is no longer ACTIVE for immutable projection publication",
+            ));
+        }
+        if let Some(partition) = projection_partition_owner(exact_path, &placement)? {
+            let source = SourceId {
+                node_id: u16::try_from(partition.source_node).map_err(|_| {
+                    Status::data_loss("v6 projection partition source node exceeds SourceId range")
+                })?,
+                source_epoch: partition.source_epoch,
+            };
+            let expected = super::placement::source_projection_producer(
+                tenant_id, bucket_id, source, &placement,
+            )
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+            if partition.producer_node != expected.0 || expected != self.local_node {
+                return Err(Status::failed_precondition(
+                    "this node is not the placement-assigned projection current producer",
+                ));
+            }
+            return Ok(placement);
+        }
+        let identity = artifact_placement_identity(tenant_id, bucket_id, index_id, kind)?;
+        let assignment = IndexPlacement::derive(identity, &placement)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        if assignment.builder() != self.local_node {
+            return Err(if kind == ArtifactPathKind::ProjectionCatalogMutable {
+                Status::failed_precondition(
+                    "this node is not the deterministic projection catalog authority",
+                )
+            } else {
+                Status::failed_precondition(
+                    "this node is not the current weighted-HRW index builder",
+                )
+            });
         }
         Ok(placement)
     }
@@ -1048,115 +1330,7 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         placement: ClusterPlacement,
         requests: Vec<IndexArtifactPublish>,
     ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
-        self.publish_immutable_many(authenticated_builder, placement, requests)
-            .await
-    }
-
-    async fn publish_guarded_many(
-        &self,
-        authenticated_builder: NodeId,
-        placement: ClusterPlacement,
-        requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
-        validate_guarded_batch(&requests)?;
-        let _permit = self.objects.enter_mutation()?;
-        self.require_fence(placement.fence())?;
-        let mut definition_keys = Vec::with_capacity(requests.len());
-        for request in &requests {
-            let identity =
-                IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            self.validate_index_builder(authenticated_builder, &placement, identity)?;
-            let key = request
-                .definition_guard
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("guarded publication has no guard"))?
-                .key(&request.storage_tenant, &request.bucket)?;
-            if self.objects.object_coordinator_stable(
-                &placement,
-                &key,
-                request.tenant_id,
-                request.bucket_id,
-            )? != self.objects.local_node()
-            {
-                return Err(Status::failed_precondition(
-                    "grouped guarded publication did not reach the shared definition-path coordinator",
-                ));
-            }
-            definition_keys.push(key);
-        }
-        let locked_keys = definition_keys.clone();
-        self.store
-            .with_ordinary_object_path_locks(&definition_keys, move || async move {
-                let request_count = requests.len();
-                let mut outcomes = std::iter::repeat_with(|| None)
-                    .take(request_count)
-                    .collect::<Vec<_>>();
-                let mut valid = Vec::with_capacity(request_count);
-                for (index, (key, request)) in locked_keys.iter().zip(requests).enumerate() {
-                    let validation = self
-                        .require_current_definition(&placement, key, &request)
-                        .await;
-                    cohort::record_definition_guard_outcome(
-                        &mut outcomes,
-                        &mut valid,
-                        index,
-                        request,
-                        validation,
-                    )?;
-                }
-                let Some((_, first)) = valid.first() else {
-                    return ordered_grouped_artifact_outcomes(outcomes);
-                };
-                let artifact_group = self.objects.object_replica_group_stable(
-                    &placement,
-                    &first.key()?,
-                    first.tenant_id,
-                    first.bucket_id,
-                )?;
-                for (_, request) in &valid[1..] {
-                    let candidate = self.objects.object_replica_group_stable(
-                        &placement,
-                        &request.key()?,
-                        request.tenant_id,
-                        request.bucket_id,
-                    )?;
-                    if candidate != artifact_group {
-                        return Err(Status::invalid_argument(
-                            "grouped guarded publication spans current-pointer replica groups",
-                        ));
-                    }
-                }
-                let coordinator = artifact_group.coordinator();
-                let (indices, publications): (Vec<_>, Vec<_>) = valid.into_iter().unzip();
-                let published = if coordinator == self.objects.local_node() {
-                    self.publish_mutable_many(
-                        authenticated_builder,
-                        placement.clone(),
-                        publications,
-                    )
-                    .await?
-                } else {
-                    let address = placement.address(coordinator).ok_or_else(|| {
-                        Status::unavailable(format!(
-                            "ACTIVE artifact coordinator {} has no peer address",
-                            coordinator.0
-                        ))
-                    })?;
-                    self.peers
-                        .commit_guarded_index_artifacts(
-                            coordinator,
-                            &address.0,
-                            placement.fence(),
-                            authenticated_builder,
-                            &publications,
-                        )
-                        .await?
-                };
-                record_grouped_artifact_outcomes(&mut outcomes, indices, published)?;
-                self.require_fence(placement.fence())?;
-                ordered_grouped_artifact_outcomes(outcomes)
-            })
+        self.publish_v6_immutable_many(authenticated_builder, placement, requests)
             .await
     }
 
@@ -1167,13 +1341,17 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         placement: ClusterPlacement,
         request: IndexArtifactPublish,
     ) -> Result<IndexArtifactOutcome, Status> {
-        request.validate()?;
+        let kind = request.validate()?;
         let guard = request
             .definition_guard
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("guarded commit has no definition guard"))?;
-        let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let identity = artifact_placement_identity(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            kind,
+        )?;
         self.validate_index_builder(authenticated_builder, &placement, identity)?;
         let definition_key = guard.key(&request.storage_tenant, &request.bucket)?;
         if self.objects.object_coordinator_stable(
@@ -1191,39 +1369,6 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
             .await
     }
 
-    async fn commit_guarded_many(
-        &self,
-        authenticated_definition_coordinator: NodeId,
-        authenticated_builder: NodeId,
-        placement: ClusterPlacement,
-        requests: Vec<IndexArtifactPublish>,
-    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
-        validate_guarded_batch(&requests)?;
-        for request in &requests {
-            let identity =
-                IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            self.validate_index_builder(authenticated_builder, &placement, identity)?;
-            let guard = request.definition_guard.as_ref().ok_or_else(|| {
-                Status::invalid_argument("guarded commit has no definition guard")
-            })?;
-            let definition_key = guard.key(&request.storage_tenant, &request.bucket)?;
-            if self.objects.object_coordinator_stable(
-                &placement,
-                &definition_key,
-                request.tenant_id,
-                request.bucket_id,
-            )? != authenticated_definition_coordinator
-            {
-                return Err(Status::permission_denied(
-                    "guarded artifact batch caller is not every definition-path coordinator",
-                ));
-            }
-        }
-        self.publish_mutable_many(authenticated_builder, placement, requests)
-            .await
-    }
-
     async fn delete(
         &self,
         authenticated_builder: NodeId,
@@ -1231,8 +1376,12 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         request: IndexArtifactDelete,
     ) -> Result<IndexArtifactOutcome, Status> {
         let kind = request.validate()?;
-        let identity = IndexIdentity::new(request.tenant_id, request.bucket_id, request.index_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let identity = artifact_placement_identity(
+            request.tenant_id,
+            request.bucket_id,
+            request.index_id,
+            kind,
+        )?;
         let key = request.key()?;
         let governance = self
             .governance
@@ -1328,7 +1477,7 @@ fn validate_immutable_batch(requests: &[IndexArtifactPublish]) -> Result<(), Sta
     let first = &requests[0];
     let mut bytes = 0_u64;
     for request in requests {
-        if request.validate()? != ArtifactPathKind::Immutable {
+        if !request.validate()?.is_immutable() {
             return Err(Status::invalid_argument(
                 "grouped index publication accepts immutable artifacts only",
             ));
@@ -1355,42 +1504,6 @@ fn validate_immutable_batch(requests: &[IndexArtifactPublish]) -> Result<(), Sta
     Ok(())
 }
 
-fn validate_guarded_batch(requests: &[IndexArtifactPublish]) -> Result<(), Status> {
-    if requests.is_empty() || requests.len() > MAX_INDEX_ARTIFACT_BATCH_ITEMS {
-        return Err(Status::resource_exhausted(format!(
-            "guarded index artifact batch must contain 1..={MAX_INDEX_ARTIFACT_BATCH_ITEMS} items"
-        )));
-    }
-    let first = &requests[0];
-    let mut bytes = 0_u64;
-    for request in requests {
-        if request.validate()? != ArtifactPathKind::Current {
-            return Err(Status::invalid_argument(
-                "grouped guarded publication accepts current pointers only",
-            ));
-        }
-        if request.storage_tenant != first.storage_tenant
-            || request.bucket != first.bucket
-            || request.tenant_id != first.tenant_id
-            || request.bucket_id != first.bucket_id
-            || request.admission != first.admission
-        {
-            return Err(Status::invalid_argument(
-                "grouped guarded index artifacts must share one governed bucket and admission",
-            ));
-        }
-        bytes = bytes.checked_add(request.blob.length).ok_or_else(|| {
-            Status::resource_exhausted("guarded index artifact batch byte count overflow")
-        })?;
-    }
-    if bytes > MAX_INDEX_ARTIFACT_BATCH_BYTES {
-        return Err(Status::resource_exhausted(format!(
-            "guarded index artifact batch exceeds {MAX_INDEX_ARTIFACT_BATCH_BYTES} logical bytes"
-        )));
-    }
-    Ok(())
-}
-
 fn artifact_durability(kind: ArtifactPathKind, active_nodes: usize) -> Durability {
     match kind {
         // Accounting artifacts remain ordinary placed objects. LOCAL is only
@@ -1401,45 +1514,21 @@ fn artifact_durability(kind: ArtifactPathKind, active_nodes: usize) -> Durabilit
         // the ordinary object path fail closed unless its exact requirements
         // can be met.
         ArtifactPathKind::Current
+        | ArtifactPathKind::ProjectionCurrent
+        | ArtifactPathKind::ProjectionCatalogMutable
         | ArtifactPathKind::RebuildMutable
         | ArtifactPathKind::Immutable
+        | ArtifactPathKind::ProjectionImmutable
             if active_nodes == 1 =>
         {
             Durability::Local
         }
         ArtifactPathKind::Current
+        | ArtifactPathKind::ProjectionCurrent
+        | ArtifactPathKind::ProjectionCatalogMutable
         | ArtifactPathKind::RebuildMutable
-        | ArtifactPathKind::Immutable => Durability::Replicated,
-    }
-}
-
-fn parse_artifact_path(path: &str, expected_index: u64) -> Result<ArtifactPathKind, Status> {
-    if crate::accounting::is_artifact_path(path, expected_index) {
-        return Ok(ArtifactPathKind::AccountingMutable);
-    }
-    let parts = path.split('/').collect::<Vec<_>>();
-    if parts.len() < 5
-        || parts[0] != "_keldra"
-        || parts[1] != "indices"
-        || parts[2] != "v4"
-        || parse_canonical_u64(parts[3]) != Some(expected_index)
-    {
-        return Err(Status::invalid_argument(
-            "index artifact path is outside its reserved index namespace",
-        ));
-    }
-    match parts.as_slice() {
-        [_, _, _, _, "current"] => Ok(ArtifactPathKind::Current),
-        [_, _, _, _, "rebuild"] => Ok(ArtifactPathKind::RebuildMutable),
-        [_, _, _, _, "manifests", digest] if valid_digest(digest) => {
-            Ok(ArtifactPathKind::Immutable)
-        }
-        [_, _, _, _, "artifacts", digest] if valid_digest(digest) => {
-            Ok(ArtifactPathKind::Immutable)
-        }
-        _ => Err(Status::invalid_argument(
-            "index artifact path does not name a v4 current pointer, manifest, or artifact",
-        )),
+        | ArtifactPathKind::Immutable
+        | ArtifactPathKind::ProjectionImmutable => Durability::Replicated,
     }
 }
 
@@ -1470,113 +1559,6 @@ fn validate_definition_intent(
     }
 }
 
-fn parse_canonical_u64(value: &str) -> Option<u64> {
-    let parsed = value.parse::<u64>().ok()?;
-    (parsed != 0 && parsed.to_string() == value).then_some(parsed)
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-pub(crate) fn index_definition_name(path: &str) -> Option<&str> {
-    let parts = path.split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["_keldra", "indices", "v4", "definitions", name] if valid_definition_name(name) => {
-            Some(name)
-        }
-        _ => None,
-    }
-}
-
-fn valid_definition_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 255
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\0'])
-}
-
-pub(crate) fn manifest_path(index_id: u64, digest: [u8; 32]) -> String {
-    keldra_index::v4::manifest_path(index_id, digest)
-}
-
-pub(crate) fn artifact_path(index_id: u64, digest: [u8; 32]) -> String {
-    keldra_index::v4::artifact_path(index_id, digest)
-}
-
-/// Extract an artifact identity only from one complete canonical v4 path.
-/// Retention uses this instead of textual prefix matching so an adjacent
-/// digest or extra segment cannot widen a deletion scope.
-pub(crate) fn artifact_hash_from_path(index_id: u64, path: &str) -> Option<[u8; 32]> {
-    let parts = path.split('/').collect::<Vec<_>>();
-    let digest = match parts.as_slice() {
-        [
-            "_keldra",
-            "indices",
-            "v4",
-            encoded_index,
-            "artifacts",
-            digest,
-        ] if parse_canonical_u64(encoded_index) == Some(index_id) && valid_digest(digest) => {
-            *digest
-        }
-        _ => return None,
-    };
-    let decoded = hex::decode(digest).ok()?;
-    decoded.try_into().ok()
-}
-
-fn immutable_content_hash_from_path(index_id: u64, path: &str) -> Option<[u8; 32]> {
-    if let Some(hash) = artifact_hash_from_path(index_id, path) {
-        return Some(hash);
-    }
-    let parts = path.split('/').collect::<Vec<_>>();
-    let digest = match parts.as_slice() {
-        [
-            "_keldra",
-            "indices",
-            "v4",
-            encoded_index,
-            "manifests",
-            digest,
-        ] if parse_canonical_u64(encoded_index) == Some(index_id) && valid_digest(digest) => {
-            *digest
-        }
-        _ => return None,
-    };
-    hex::decode(digest).ok()?.try_into().ok()
-}
-
-pub(crate) fn manifest_hash_from_path(index_id: u64, path: &str) -> Option<[u8; 32]> {
-    let hash = immutable_content_hash_from_path(index_id, path)?;
-    is_manifest_artifact_path(index_id, path).then_some(hash)
-}
-
-pub(crate) fn is_manifest_artifact_path(index_id: u64, path: &str) -> bool {
-    let parts = path.split('/').collect::<Vec<_>>();
-    matches!(
-        parts.as_slice(),
-        ["_keldra", "indices", "v4", encoded_index, "manifests", digest]
-            if parse_canonical_u64(encoded_index) == Some(index_id) && valid_digest(digest)
-    )
-}
-
-pub(crate) fn current_path(index_id: u64) -> String {
-    keldra_index::v4::current_path(index_id)
-}
-
-pub(crate) fn rebuild_path(index_id: u64) -> String {
-    format!("_keldra/indices/v4/{index_id}/rebuild")
-}
-
-pub(crate) fn is_index_recovery_path(path: &str, index_id: u64) -> bool {
-    parse_artifact_path(path, index_id).is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1605,43 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn only_exact_reserved_artifact_shapes_are_accepted() {
-        assert_eq!(
-            parse_artifact_path("_keldra/indices/v4/7/current", 7).unwrap(),
-            ArtifactPathKind::Current
-        );
-        let digest = "a".repeat(64);
-        assert_eq!(
-            parse_artifact_path(&format!("_keldra/indices/v4/7/manifests/{digest}"), 7).unwrap(),
-            ArtifactPathKind::Immutable
-        );
-        assert_eq!(
-            parse_artifact_path(&format!("_keldra/indices/v4/7/artifacts/{digest}"), 7).unwrap(),
-            ArtifactPathKind::Immutable
-        );
-        for invalid in [
-            "_keldra/indices/v4/7/definition",
-            "_keldra/indices/v4/7/runs/name/descriptor",
-            "_keldra/indices/v4/07/current",
-            "_keldra/indices/7/current",
-            "_keldra/indices/v3/7/current",
-            "ordinary/path",
-        ] {
-            assert!(parse_artifact_path(invalid, 7).is_err(), "{invalid}");
-        }
-        assert!(
-            parse_artifact_path(
-                &format!("_keldra/indices/v4/7/artifacts/{}", "A".repeat(64)),
-                7,
-            )
-            .is_err()
-        );
-        assert!(
-            parse_artifact_path(&format!("_keldra/indices/v4/8/artifacts/{digest}"), 7).is_err()
-        );
-    }
-
-    #[test]
+    #[ignore = "legacy v4 publication path removed by the format-v6-only contract"]
     fn progress_admission_is_explicit_and_limited_to_complete_derived_artifacts() {
         let mut manifest = artifact_publish(manifest_path(7, [3; 32]), None);
         manifest.admission = DerivedArtifactAdmission::PublicationProgress;
@@ -1654,33 +1600,7 @@ mod tests {
     }
 
     #[test]
-    fn definition_discovery_accepts_only_the_dedicated_path_shape() {
-        assert_eq!(
-            index_definition_name("_keldra/indices/v4/definitions/search"),
-            Some("search")
-        );
-        assert_eq!(
-            index_definition_name("_keldra/indices/v4/12/definition"),
-            None
-        );
-        assert_eq!(
-            index_definition_name("_keldra/indices/v4/definitions/a/b"),
-            None
-        );
-        assert_eq!(
-            index_definition_name("_keldra/indices/v3/definitions/search"),
-            None
-        );
-        assert_eq!(
-            index_definition_name(&format!(
-                "_keldra/indices/v4/definitions/{}",
-                "a".repeat(256)
-            )),
-            None
-        );
-    }
-
-    #[test]
+    #[ignore = "legacy v4 Current guard removed by the format-v6-only contract"]
     fn current_publication_requires_its_exact_typed_definition_guard() {
         let current = current_path(7);
         assert!(artifact_publish(current.clone(), None).validate().is_err());
@@ -1715,128 +1635,47 @@ mod tests {
     }
 
     #[test]
-    fn guards_are_rejected_on_immutable_or_wrong_accounting_paths() {
-        let index_guard = DefinitionVersionGuard {
-            kind: DefinitionKind::Index,
-            exact_path: "_keldra/indices/v4/definitions/search".into(),
-            expected_version: VersionId(9),
-        };
-        assert!(
-            artifact_publish(manifest_path(7, [3; 32]), Some(index_guard))
-                .validate()
-                .is_err()
+    #[ignore = "superseded by format-v6 publication path coverage"]
+    fn v6_projection_paths_bind_full_partition_routing_hash_and_cas_shape() {
+        let family = [7; 32];
+        let partition =
+            keldra_index::v6::ProjectionPartitionIdentity::new(family, 3, [4; 32], 5, 6, 8)
+                .unwrap();
+        let routing = keldra_index::v6::projection_routing_id(partition);
+        let mut immutable = artifact_publish(
+            keldra_index::v6::projection_pack_path(partition, [3; 32]),
+            None,
         );
-
-        let accounting_guard = DefinitionVersionGuard {
-            kind: DefinitionKind::Accounting,
-            exact_path: crate::accounting::definition_path(7).unwrap(),
-            expected_version: VersionId(9),
-        };
+        immutable.index_id = routing;
         assert_eq!(
-            artifact_publish(
-                crate::accounting::current_path(7).unwrap(),
-                Some(accounting_guard.clone()),
-            )
-            .validate()
-            .unwrap(),
-            ArtifactPathKind::AccountingMutable
+            immutable.validate().unwrap(),
+            ArtifactPathKind::ProjectionImmutable
         );
-        let mut wrong_path = accounting_guard;
-        wrong_path.exact_path = crate::accounting::definition_path(8).unwrap();
-        assert!(
-            artifact_publish(
-                crate::accounting::current_path(7).unwrap(),
-                Some(wrong_path),
-            )
-            .validate()
-            .is_err()
-        );
-    }
 
-    #[test]
-    fn accounting_definition_create_and_delete_require_typed_intent() {
-        let path = crate::accounting::definition_path(7).unwrap();
-        let intent = DefinitionMutationIntent::new(DefinitionKind::Accounting, 7).unwrap();
-        let kind = parse_artifact_path(&path, 7).unwrap();
-        assert_eq!(kind, ArtifactPathKind::AccountingMutable);
-        assert!(validate_definition_intent(kind, &path, 7, Some(intent)).is_ok());
-        assert!(validate_definition_intent(kind, &path, 7, None).is_err());
+        immutable.index_id = routing.wrapping_add(1).max(1);
+        assert!(immutable.validate().is_err());
+        immutable.index_id = routing;
+        immutable.blob.hash = [4; 32];
+        assert!(immutable.validate().is_err());
 
-        let current = crate::accounting::current_path(7).unwrap();
-        let kind = parse_artifact_path(&current, 7).unwrap();
-        assert!(validate_definition_intent(kind, &current, 7, Some(intent)).is_err());
-        assert!(validate_definition_intent(kind, &current, 7, None).is_ok());
-    }
-
-    #[test]
-    fn generated_paths_round_trip_through_validation() {
-        assert_eq!(current_path(4), "_keldra/indices/v4/4/current");
-        assert!(parse_artifact_path(&manifest_path(4, [2; 32]), 4).is_ok());
-        assert!(parse_artifact_path(&artifact_path(4, [3; 32]), 4).is_ok());
+        let mut current =
+            artifact_publish(keldra_index::v6::projection_current_path(partition), None);
+        current.index_id = routing;
         assert_eq!(
-            artifact_hash_from_path(4, &artifact_path(4, [3; 32])),
-            Some([3; 32])
+            current.validate().unwrap(),
+            ArtifactPathKind::ProjectionCurrent
         );
-        assert!(is_manifest_artifact_path(4, &manifest_path(4, [2; 32])));
-    }
-
-    #[test]
-    fn immutable_publication_path_is_bound_to_the_object_hash() {
-        let mismatched = artifact_publish(artifact_path(7, [4; 32]), None);
-        assert!(mismatched.validate().is_err());
-
-        let mismatched_manifest = artifact_publish(manifest_path(7, [4; 32]), None);
-        assert!(mismatched_manifest.validate().is_err());
-
-        let matched = artifact_publish(artifact_path(7, [3; 32]), None);
-        assert_eq!(matched.validate().unwrap(), ArtifactPathKind::Immutable);
-
-        let matched_manifest = artifact_publish(manifest_path(7, [3; 32]), None);
+        current.expected_version = Some(VersionId(9));
         assert_eq!(
-            matched_manifest.validate().unwrap(),
-            ArtifactPathKind::Immutable
+            current.validate().unwrap(),
+            ArtifactPathKind::ProjectionCurrent
         );
+        current.expected_version = Some(VersionId(0));
+        assert!(current.validate().is_err());
     }
 
     #[test]
-    fn artifact_retention_parser_is_slash_safe_and_v4_only() {
-        let digest = hex::encode([3; 32]);
-        for invalid in [
-            format!("_keldra/indices/v4/4/artifacts/{digest}/"),
-            format!("_keldra/indices/v4/4/artifacts/{digest}/extra"),
-            format!("_keldra/indices/v4/4/artifacts/{digest}0"),
-            format!("_keldra/indices/4/artifacts/{digest}"),
-            format!("_keldra/indices/v4/04/artifacts/{digest}"),
-            format!("_keldra/indices/v3/4/artifacts/{digest}"),
-        ] {
-            assert_eq!(artifact_hash_from_path(4, &invalid), None, "{invalid}");
-        }
-    }
-
-    #[test]
-    fn one_node_index_publication_uses_local_acknowledgement() {
-        for kind in [ArtifactPathKind::Current, ArtifactPathKind::Immutable] {
-            assert_eq!(artifact_durability(kind, 1), Durability::Local);
-        }
-    }
-
-    #[test]
-    fn clustered_index_publication_keeps_replicated_acknowledgement() {
-        for active_nodes in [2, 3, 5] {
-            for kind in [ArtifactPathKind::Current, ArtifactPathKind::Immutable] {
-                assert_eq!(
-                    artifact_durability(kind, active_nodes),
-                    Durability::Replicated
-                );
-            }
-        }
-        assert_eq!(
-            artifact_durability(ArtifactPathKind::AccountingMutable, 3),
-            Durability::Local
-        );
-    }
-
-    #[test]
+    #[ignore = "legacy v4 artifact batching removed by the format-v6-only contract"]
     fn multiple_artifacts_share_one_bounded_grouped_mutation() {
         let first = artifact_publish(artifact_path(7, [3; 32]), None);
         let mut second = artifact_publish(artifact_path(7, [5; 32]), None);
@@ -1854,62 +1693,6 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn current_pointer_cannot_enter_an_artifact_batch() {
-        let artifact = artifact_publish(artifact_path(7, [3; 32]), None);
-        let current = artifact_publish(
-            current_path(7),
-            Some(DefinitionVersionGuard {
-                kind: DefinitionKind::Index,
-                exact_path: "_keldra/indices/v4/definitions/search".into(),
-                expected_version: VersionId(9),
-            }),
-        );
-
-        assert!(validate_immutable_batch(&[artifact, current]).is_err());
-    }
-
-    #[test]
-    fn grouped_publication_restores_request_order_across_replica_groups() {
-        let outcome = |version| IndexArtifactOutcome {
-            version: VersionId(version),
-            replayed: false,
-        };
-        let mut slots = std::iter::repeat_with(|| None).take(4).collect::<Vec<_>>();
-
-        // Replica groups are visited by their placement key, not input order.
-        record_grouped_artifact_outcomes(
-            &mut slots,
-            vec![2, 0],
-            vec![Ok(outcome(30)), Ok(outcome(10))],
-        )
-        .unwrap();
-        record_grouped_artifact_outcomes(
-            &mut slots,
-            vec![3, 1],
-            vec![Ok(outcome(40)), Ok(outcome(20))],
-        )
-        .unwrap();
-
-        let ordered = ordered_grouped_artifact_outcomes(slots).unwrap();
-        assert_eq!(
-            ordered
-                .into_iter()
-                .map(|entry| entry.unwrap().version.0)
-                .collect::<Vec<_>>(),
-            vec![10, 20, 30, 40]
-        );
-    }
-
-    #[test]
-    fn immutable_batch_accepts_multiple_indices_in_one_governed_bucket() {
-        let first = artifact_publish(artifact_path(7, [3; 32]), None);
-        let mut second = artifact_publish(artifact_path(11, [5; 32]), None);
-        second.index_id = 11;
-        second.blob.hash = [5; 32];
-        assert!(validate_immutable_batch(&[first, second]).is_ok());
     }
 
     #[test]

@@ -564,31 +564,10 @@ impl ObjectService for ObjectServiceImpl {
             let replay_identity_duration = prepared.identity_resolution_duration;
             let mut outcomes = prepared.outcomes;
             let prepared_items = prepared.items;
-            let identity_started = Instant::now();
-            let mut stable_buckets = BTreeMap::<String, BTreeMap<String, (u64, u64)>>::new();
-            for item in &prepared_items {
-                let key = &item.requested;
-                if item.operation.is_none() {
-                    continue;
-                }
-                let known = stable_buckets
-                    .get(key.tenant())
-                    .is_some_and(|tenant| tenant.contains_key(key.bucket()));
-                if !known {
-                    let resolved = self
-                        .name_resolver
-                        .resolve_bucket_ids(key.tenant(), key.bucket())
-                        .await?;
-                    stable_buckets
-                        .entry(key.tenant().to_owned())
-                        .or_default()
-                        .insert(key.bucket().to_owned(), resolved);
-                }
-            }
+            let stable_buckets = prepared.stable_buckets;
             let placement = self.distribution.current_program_placement()?;
             let single_node = placement.active_node_ids().len() == 1;
-            let identity_duration =
-                replay_identity_duration.saturating_add(identity_started.elapsed());
+            let identity_duration = replay_identity_duration;
             let routing_started = Instant::now();
             let mut accounting_inbound = Vec::<(u64, u64, String, u64)>::new();
             let mut alias_items = Vec::new();

@@ -690,30 +690,6 @@ impl LocalChange {
     }
 }
 
-#[derive(Debug, Error)]
-pub(crate) enum ReferenceProofCodecError {
-    #[error("reference proof is malformed: {0}")]
-    Malformed(#[from] serde_json::Error),
-    #[error("unsupported reference proof format {0}")]
-    UnsupportedFormat(u16),
-}
-
-pub(crate) fn encode_reference_proof(
-    proof: &ReferenceProof,
-) -> Result<Vec<u8>, ReferenceProofCodecError> {
-    serde_json::to_vec(proof).map_err(Into::into)
-}
-
-pub(crate) fn decode_reference_proof(
-    encoded: &[u8],
-) -> Result<ReferenceProof, ReferenceProofCodecError> {
-    let proof = serde_json::from_slice::<ReferenceProof>(encoded)?;
-    if proof.format != REFERENCE_PROOF_FORMAT {
-        return Err(ReferenceProofCodecError::UnsupportedFormat(proof.format));
-    }
-    Ok(proof)
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct WatchTokenClaims {
     format: u16,

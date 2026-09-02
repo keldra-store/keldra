@@ -14,6 +14,8 @@ use tempfile::TempDir;
 
 use super::*;
 
+mod alias_recovery;
+
 fn placement(node_ids: &[u64], fence: u64) -> ReferencePlacement {
     let nodes = node_ids
         .iter()
@@ -457,6 +459,30 @@ fn node_one_coordinator_path(prefix: &str) -> String {
                 })
         })
         .expect("test path coordinated by node one")
+}
+
+fn node_two_coordinator_paths(prefix: &str, count: usize) -> Vec<String> {
+    let mut paths = (0_u64..10_000)
+        .map(|candidate| format!("{prefix}-{candidate}"))
+        .filter(|path| {
+            [[1_u64, 2_u64].as_slice(), [1_u64, 2_u64, 3_u64].as_slice()]
+                .into_iter()
+                .all(|nodes| {
+                    let placement = placement(nodes, 1);
+                    MutableRecordReplicaGroup::select(
+                        PlacementKind::Object,
+                        placement.cluster_id(),
+                        &object_placement_key(1, 1, path),
+                        placement.placement_nodes(),
+                    )
+                    .is_some_and(|group| group.coordinator() == NodeId(2))
+                })
+        })
+        .take(count)
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), count, "enough test paths use node two");
+    paths.sort();
+    paths
 }
 
 async fn publish(source: &Store, path: &str, bytes: &[u8], command: &str) -> BlobRef {

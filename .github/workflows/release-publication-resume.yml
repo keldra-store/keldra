@@ -39,6 +39,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
 
       - name: Install verification tools
         run: |
@@ -109,6 +110,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.expected_commit }}
+          submodules: recursive
 
       - name: Download tested release image digests
         uses: actions/download-artifact@v4
@@ -188,30 +190,31 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            Keldra ${{ inputs.tag }} adds typed date fields, zero-copy object
-            clones, protected transparent object links, and durable reservations
-            that let atomic programs safely operate on authorized ordinary paths
-            without requiring PROGRAM_ONLY policy.
+            Keldra ${{ inputs.tag }} introduces the v6 memory-first Typed JSON
+            index architecture. Logical definitions with equivalent normalized
+            recipes share physical extraction, immutable segment artifacts, and
+            publication work instead of multiplying steady-state indexing cost
+            by catalog size.
 
-            Date fields accept ISO 8601 by default or one configured strftime
-            format, normalize to signed Unix epoch milliseconds in the index,
-            and support exact, range, order, and facet queries. Clones share the
-            source payload without copying bytes but retain independent version
-            lineages. Links are mutable aliases to one canonical target: writes
-            through any linked name update that target, unlink removes only the
-            alias, and target deletion is fenced while inbound links exist.
+            Partition-owned hot ingress, bounded CPU and memory admission,
+            journal-backed recovery, and atomic published root vectors keep
+            ingestion and queries on one explicit consistency boundary. Exact,
+            prefix, range, order, facet, aggregate, and full-text queries execute
+            against one published cut, while immutable artifacts remain ordinary
+            Keldra objects and local materialization remains disposable.
 
-            This release also fixes sparse optional point-field queries
-            incorrectly treating an omitted segment component as corruption
-            (#259).
+            This release also adds runtime-configurable single-node group-commit
+            bounds and reduces storage and publication amplification through
+            grouped current resolution, batched derived-artifact staging,
+            consolidated source-journal settlement, and reused decoded v6
+            component segments.
 
-            This release is a clean storage-format break and changes the cluster
-            and data-peer protocols. Start 0.15 on fresh authoritative volumes;
-            in-place 0.14 volume upgrades and mixed 0.14/0.15 operation are
-            unsupported. After all ACTIVE nodes attest support,
-            inspect GetClusterCapabilities and explicitly call
-            ActivateClusterCapabilities with its exact placement fence to enable
-            clone, link, and generalized ordinary-path atomic programs.
+            This release is a clean storage-format and index-architecture break
+            and changes cluster and data-peer protocols. Start 0.16 on fresh
+            authoritative and derived-index volumes; in-place upgrades from any
+            earlier Keldra release and mixed 0.15/0.16 operation are unsupported.
+            Move application data through the public API as new writes rather
+            than opening an earlier volume with 0.16.
 
             It includes the multi-platform Keldra server image, CLI, Rust client,
             generated API crate, and public qualification clients.

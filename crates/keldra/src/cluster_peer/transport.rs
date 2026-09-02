@@ -303,28 +303,6 @@ impl ClusterPeerTransport {
         decode_indexed_artifact_outcomes(response.outcomes, requests.len())
     }
 
-    pub(crate) async fn publish_guarded_index_artifacts(
-        &self,
-        target: NodeId,
-        address: &str,
-        expected_fence: PlacementLogId,
-        requests: &[IndexArtifactPublish],
-    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
-        let response = self
-            .client(target, address)?
-            .publish_guarded_index_artifacts(wire::PublishGuardedIndexArtifactsRequest {
-                peer: Some(self.context(expected_fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
-                publications: requests
-                    .iter()
-                    .map(|request| wire_index_artifact_publish(request, None))
-                    .collect(),
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        decode_indexed_artifact_outcomes(response.outcomes, requests.len())
-    }
-
     pub(crate) async fn commit_guarded_index_artifact(
         &self,
         target: NodeId,
@@ -344,30 +322,6 @@ impl ClusterPeerTransport {
             .into_inner();
         require_response_schema(response.schema_version)?;
         nonzero_artifact_outcome(response.version, response.replayed)
-    }
-
-    pub(crate) async fn commit_guarded_index_artifacts(
-        &self,
-        target: NodeId,
-        address: &str,
-        expected_fence: PlacementLogId,
-        builder: NodeId,
-        requests: &[IndexArtifactPublish],
-    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
-        let response = self
-            .client(target, address)?
-            .commit_guarded_index_artifacts(wire::CommitGuardedIndexArtifactsRequest {
-                peer: Some(self.context(expected_fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
-                builder_node_id: builder.0,
-                publications: requests
-                    .iter()
-                    .map(|request| wire_index_artifact_publish(request, None))
-                    .collect(),
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        decode_indexed_artifact_outcomes(response.outcomes, requests.len())
     }
 
     pub(crate) async fn delete_index_artifact(

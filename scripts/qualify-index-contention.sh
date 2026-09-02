@@ -12,11 +12,8 @@ topology="${KELDRA_INDEX_CONTENTION_TOPOLOGY:-single}"
 keep="${KELDRA_INDEX_CONTENTION_KEEP:-0}"
 server_rust_log="${KELDRA_INDEX_CONTENTION_RUST_LOG:-info,keldra::index_runtime::cpu=warn}"
 index_disk_cache_bytes="${KELDRA_INDEX_CONTENTION_INDEX_DISK_CACHE_BYTES:-1073741824}"
-index_memory_percent="${KELDRA_INDEX_CONTENTION_INDEX_MEMORY_PERCENT:-20}"
-index_kind_budget_bytes="${KELDRA_INDEX_CONTENTION_INDEX_KIND_BUDGET_BYTES:-268435456}"
-index_compaction_lanes="${KELDRA_INDEX_CONTENTION_INDEX_COMPACTION_MAX_LANES:-4}"
-index_projection_lanes="${KELDRA_INDEX_CONTENTION_INDEX_PROJECTION_MAX_LANES:-4}"
-index_rayon_workers="${KELDRA_INDEX_CONTENTION_INDEX_RAYON_WORKERS:-4}"
+index_pipeline_memory_bytes="${KELDRA_INDEX_CONTENTION_PIPELINE_MEMORY_BYTES:-1073741824}"
+indexing_cores="${KELDRA_INDEX_CONTENTION_INDEXING_CORES:-4}"
 source_journal_entries="${KELDRA_INDEX_CONTENTION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
 max_concurrent_query_p99_ms="${KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS:-2000}"
 max_publication_visibility_p99_ms="${KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS:-30000}"
@@ -26,10 +23,13 @@ visibility_poll_ms="${KELDRA_INDEX_CONTENTION_VISIBILITY_POLL_MILLISECONDS:-100}
 visibility_observation_timeout_seconds="${KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS:-${drain_timeout_seconds}}"
 visibility_sample_every_batches="${KELDRA_INDEX_CONTENTION_VISIBILITY_SAMPLE_EVERY_BATCHES:-16}"
 mutation_workers="${KELDRA_INDEX_CONTENTION_MUTATION_WORKERS:-4}"
+mutation_workload="${KELDRA_INDEX_CONTENTION_MUTATION_WORKLOAD:-material-change}"
 mutation_batch_size="${KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE:-32}"
 mutation_record_bytes="${KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES:-0}"
 mutation_queue_depth="${KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH:-32}"
 mutation_rate_operations_per_second="${KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND:-disabled}"
+physical_recipe_count="${KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT:-1}"
+work_root="${KELDRA_INDEX_CONTENTION_WORK_ROOT:-${HOME}/keldra_experiments/work/index-contention}"
 qualification_backend="${KELDRA_INDEX_CONTENTION_BACKEND:-docker}"
 driver_backend="${KELDRA_INDEX_CONTENTION_DRIVER_BACKEND:-ssh-macos}"
 driver_host="${KELDRA_INDEX_CONTENTION_DRIVER_HOST:-zcourts@192.168.64.1}"
@@ -39,13 +39,13 @@ server_advertise_host="${KELDRA_INDEX_CONTENTION_SERVER_ADVERTISE_HOST:-192.168.
 
 case "${mode}" in
   smoke)
-    matrix="${KELDRA_INDEX_CONTENTION_MATRIX:-1}"
+    matrix="${KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX:-1}"
     baseline_seconds="${KELDRA_INDEX_CONTENTION_BASELINE_SECONDS:-2}"
     concurrent_seconds="${KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS:-5}"
     post_seconds="${KELDRA_INDEX_CONTENTION_POST_SECONDS:-2}"
     ;;
   sustained)
-    matrix="${KELDRA_INDEX_CONTENTION_MATRIX:-1,4,16,64}"
+    matrix="${KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX:-1,64,1000}"
     baseline_seconds="${KELDRA_INDEX_CONTENTION_BASELINE_SECONDS:-120}"
     concurrent_seconds="${KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS:-600}"
     post_seconds="${KELDRA_INDEX_CONTENTION_POST_SECONDS:-120}"
@@ -58,6 +58,10 @@ case "${topology}" in
   *) echo "KELDRA_INDEX_CONTENTION_TOPOLOGY must be single or three" >&2; exit 2 ;;
 esac
 case "${keep}" in 0|1) ;; *) echo "KELDRA_INDEX_CONTENTION_KEEP must be 0 or 1" >&2; exit 2 ;; esac
+case "${mutation_workload}" in
+  material-change|projection-preserving) ;;
+  *) echo "KELDRA_INDEX_CONTENTION_MUTATION_WORKLOAD must be material-change or projection-preserving" >&2; exit 2 ;;
+esac
 case "${qualification_backend}" in
   docker) ;;
   *) echo "KELDRA_INDEX_CONTENTION_BACKEND must be docker" >&2; exit 2 ;;
@@ -79,19 +83,15 @@ for phase_seconds in "${baseline_seconds}" "${concurrent_seconds}" "${post_secon
     exit 2
   fi
 done
-for server_limit in "${index_disk_cache_bytes}" "${index_memory_percent}" \
-  "${index_kind_budget_bytes}" "${index_compaction_lanes}" \
-  "${index_projection_lanes}" "${index_rayon_workers}" "${source_journal_entries}"
+for server_limit in "${index_disk_cache_bytes}" \
+  "${index_pipeline_memory_bytes}" "${indexing_cores}" \
+  "${source_journal_entries}"
 do
   if [[ ! "${server_limit}" =~ ^[1-9][0-9]*$ ]]; then
     echo "contention server limits must be positive decimal integers" >&2
     exit 2
   fi
 done
-if ((index_memory_percent > 100)); then
-  echo "KELDRA_INDEX_CONTENTION_INDEX_MEMORY_PERCENT must not exceed 100" >&2
-  exit 2
-fi
 if [[ "${max_concurrent_query_p99_ms}" != disabled ]] \
   && { [[ ! "${max_concurrent_query_p99_ms}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || ! awk -v value="${max_concurrent_query_p99_ms}" 'BEGIN {exit !(value > 0)}'; }
@@ -109,7 +109,7 @@ fi
 for timeout_value in "${request_timeout_ms}" "${drain_timeout_seconds}" \
   "${visibility_poll_ms}" "${visibility_observation_timeout_seconds}" \
   "${visibility_sample_every_batches}" "${mutation_workers}" \
-  "${mutation_batch_size}" "${mutation_queue_depth}"
+  "${mutation_batch_size}" "${mutation_queue_depth}" "${physical_recipe_count}"
 do
   if [[ ! "${timeout_value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "request, drain, visibility, and sampling settings must be positive decimal integers" >&2
@@ -118,6 +118,10 @@ do
 done
 if [[ ! "${mutation_record_bytes}" =~ ^[0-9]+$ ]] || ((mutation_record_bytes > 64 * 1024 * 1024)); then
   echo "KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES must be 0..67108864" >&2
+  exit 2
+fi
+if ((physical_recipe_count > 64)); then
+  echo "KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT must be 1..64" >&2
   exit 2
 fi
 if ((mutation_queue_depth < mutation_workers)); then
@@ -132,24 +136,28 @@ then
   echo "mutation rate must be in 0..=1000000 operations/s or disabled" >&2
   exit 2
 fi
-IFS=, read -r -a builder_matrix <<<"${matrix}"
-if ((${#builder_matrix[@]} == 0)); then
-  echo "KELDRA_INDEX_CONTENTION_MATRIX must not be empty" >&2
+IFS=, read -r -a definition_matrix <<<"${matrix}"
+if ((${#definition_matrix[@]} == 0)); then
+  echo "KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX must not be empty" >&2
   exit 2
 fi
-seen_builder_values=,
-for builders in "${builder_matrix[@]}"; do
-  if [[ ! "${builders}" =~ ^[1-9][0-9]*$ ]] || ((builders > 64)); then
-    echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique integers from 1 through 64" >&2
+seen_definition_values=,
+for definitions in "${definition_matrix[@]}"; do
+  if [[ ! "${definitions}" =~ ^[1-9][0-9]*$ ]] || ((definitions > 250000)); then
+    echo "KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX must contain unique integers from 1 through 250000" >&2
     exit 2
   fi
-  case "${seen_builder_values}" in
-    *,"${builders}",*)
-      echo "KELDRA_INDEX_CONTENTION_MATRIX must contain unique integers from 1 through 64" >&2
+  case "${seen_definition_values}" in
+    *,"${definitions}",*)
+      echo "KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX must contain unique integers from 1 through 250000" >&2
       exit 2
       ;;
   esac
-  seen_builder_values="${seen_builder_values}${builders},"
+  seen_definition_values="${seen_definition_values}${definitions},"
+  if ((definitions < physical_recipe_count)); then
+    echo "every definition matrix value must be at least PHYSICAL_RECIPE_COUNT" >&2
+    exit 2
+  fi
 done
 
 for command in docker git jq; do
@@ -311,6 +319,8 @@ remote_evidence_root="${KELDRA_INDEX_CONTENTION_DRIVER_EVIDENCE_ROOT:-${driver_r
 remote_run_dir="${remote_evidence_root}/${run_id}"
 mkdir -p "${evidence_root}"
 mkdir "${run_dir}"
+mkdir -p "${work_root}"
+work_root="$(cd "${work_root}" && pwd -P)"
 chmod 0755 "${run_dir}"
 progress="${run_dir}/progress.jsonl"
 status_file="${run_dir}/status.json"
@@ -373,16 +383,15 @@ jq -n \
   --argjson visibility_observation_timeout_seconds "${visibility_observation_timeout_seconds}" \
   --argjson visibility_sample_every_batches "${visibility_sample_every_batches}" \
   --argjson mutation_workers "${mutation_workers}" \
+  --arg mutation_workload "${mutation_workload}" \
   --argjson mutation_batch_size "${mutation_batch_size}" \
   --argjson mutation_record_bytes "${mutation_record_bytes}" \
   --argjson mutation_queue_depth "${mutation_queue_depth}" \
   --arg mutation_rate_operations_per_second "${mutation_rate_operations_per_second}" \
+  --argjson physical_recipe_count "${physical_recipe_count}" \
   --argjson index_disk_cache_bytes "${index_disk_cache_bytes}" \
-  --argjson index_memory_percent "${index_memory_percent}" \
-  --argjson index_kind_budget_bytes "${index_kind_budget_bytes}" \
-  --argjson index_compaction_lanes "${index_compaction_lanes}" \
-  --argjson index_projection_lanes "${index_projection_lanes}" \
-  --argjson index_rayon_workers "${index_rayon_workers}" \
+  --argjson index_pipeline_memory_bytes "${index_pipeline_memory_bytes}" \
+  --argjson indexing_cores "${indexing_cores}" \
   --argjson source_journal_entries "${source_journal_entries}" \
   --arg uname "$(uname -a)" --argjson baseline_seconds "${baseline_seconds}" \
   --argjson concurrent_seconds "${concurrent_seconds}" --argjson post_seconds "${post_seconds}" \
@@ -391,7 +400,7 @@ jq -n \
   --argjson docker_cpus "${docker_cpus}" --argjson docker_memory_bytes "${docker_memory_bytes}" \
   --argjson filesystem_kib "${filesystem_kib}" \
   --argjson filesystem_available_kib "${filesystem_available_kib}" \
-  '{schema_version:1,run_id:$run_id,harness_source_commit:$source_commit,images:$images,execution:{server_backend:$server_backend,driver_backend:$driver_backend,driver_host:$driver_host,driver_repo_root:$driver_repo_root,server_advertise_host:$server_advertise_host},workload:{mode:$mode,topology:$topology,durability:$durability,comparison_order:$comparison_order,index_definition_count_matrix:($matrix|split(",")|map(tonumber)),baseline_seconds:$baseline_seconds,concurrent_seconds:$concurrent_seconds,post_seconds:$post_seconds,mutation_workers:$mutation_workers,mutation_batch_size:$mutation_batch_size,mutation_record_bytes:$mutation_record_bytes,mutation_queue_depth:$mutation_queue_depth,mutation_rate_operations_per_second:(if $mutation_rate_operations_per_second == "disabled" then null else ($mutation_rate_operations_per_second|tonumber) end),request_timeout_milliseconds:$request_timeout_ms,drain_timeout_seconds:$drain_timeout_seconds,visibility_poll_milliseconds:$visibility_poll_ms,visibility_observation_timeout_seconds:$visibility_observation_timeout_seconds,visibility_sample_every_batches:$visibility_sample_every_batches,max_concurrent_query_p99_milliseconds:(if $max_concurrent_query_p99_ms == "disabled" then null else ($max_concurrent_query_p99_ms|tonumber) end),max_publication_visibility_p99_milliseconds:(if $max_publication_visibility_p99_ms == "disabled" then null else ($max_publication_visibility_p99_ms|tonumber) end)},server:{rust_log:$server_rust_log,index_disk_cache_bytes:$index_disk_cache_bytes,index_memory_percent:$index_memory_percent,index_kind_budget_bytes:$index_kind_budget_bytes,index_compaction_max_lanes:$index_compaction_lanes,index_projection_max_lanes:$index_projection_lanes,index_rayon_workers:$index_rayon_workers,source_journal_max_entries:$source_journal_entries},hardware:{uname:$uname,host_logical_cpus:$host_logical_cpus,host_memory_bytes:$host_memory_bytes,docker_logical_cpus:$docker_cpus,docker_memory_bytes:$docker_memory_bytes,driver_uname:$driver_uname,driver_logical_cpus:$driver_logical_cpus,driver_memory_bytes:$driver_memory_bytes,evidence_filesystem_kib:$filesystem_kib,evidence_filesystem_available_kib:$filesystem_available_kib}}' \
+  '{schema_version:2,run_id:$run_id,harness_source_commit:$source_commit,images:$images,execution:{server_backend:$server_backend,driver_backend:$driver_backend,driver_host:$driver_host,driver_repo_root:$driver_repo_root,server_advertise_host:$server_advertise_host},workload:{mode:$mode,topology:$topology,durability:$durability,comparison_order:$comparison_order,index_definition_count_matrix:($matrix|split(",")|map(tonumber)),physical_recipe_count:$physical_recipe_count,baseline_seconds:$baseline_seconds,concurrent_seconds:$concurrent_seconds,post_seconds:$post_seconds,mutation_workers:$mutation_workers,mutation_workload:$mutation_workload,mutation_batch_size:$mutation_batch_size,mutation_record_bytes:$mutation_record_bytes,mutation_queue_depth:$mutation_queue_depth,mutation_rate_operations_per_second:(if $mutation_rate_operations_per_second == "disabled" then null else ($mutation_rate_operations_per_second|tonumber) end),request_timeout_milliseconds:$request_timeout_ms,drain_timeout_seconds:$drain_timeout_seconds,visibility_poll_milliseconds:$visibility_poll_ms,visibility_observation_timeout_seconds:$visibility_observation_timeout_seconds,visibility_sample_every_batches:$visibility_sample_every_batches,max_concurrent_query_p99_milliseconds:(if $max_concurrent_query_p99_ms == "disabled" then null else ($max_concurrent_query_p99_ms|tonumber) end),max_publication_visibility_p99_milliseconds:(if $max_publication_visibility_p99_ms == "disabled" then null else ($max_publication_visibility_p99_ms|tonumber) end)},server:{rust_log:$server_rust_log,index_disk_cache_bytes:$index_disk_cache_bytes,index_pipeline_memory_bytes:$index_pipeline_memory_bytes,indexing_cores:$indexing_cores,source_journal_max_entries:$source_journal_entries},hardware:{uname:$uname,host_logical_cpus:$host_logical_cpus,host_memory_bytes:$host_memory_bytes,docker_logical_cpus:$docker_cpus,docker_memory_bytes:$docker_memory_bytes,driver_uname:$driver_uname,driver_logical_cpus:$driver_logical_cpus,driver_memory_bytes:$driver_memory_bytes,evidence_filesystem_kib:$filesystem_kib,evidence_filesystem_available_kib:$filesystem_available_kib}}' \
   >"${run_dir}/run.json"
 
 if [[ "${driver_backend}" == ssh-macos ]]; then
@@ -408,7 +417,7 @@ current_container=""
 current_project=""
 current_state=""
 current_cell=""
-current_builders=0
+current_definitions=0
 current_image_id="${candidate_image_id}"
 current_role=""
 sampler_pid=""
@@ -441,7 +450,7 @@ cleanup_cell() {
   fi
   current_container=""
   current_project=""
-  if [[ "${keep}" != 1 && -n "${current_state}" && "${current_state}" == /var/tmp/keldra-index-contention.* ]]; then
+  if [[ "${keep}" != 1 && -n "${current_state}" && "${current_state}" == "${work_root}"/keldra-index-contention.* ]]; then
     docker run --rm --user 0 --volume "${current_state}:/state" "${current_image_id}" \
       rm -rf /state/node-1 /state/node-2 /state/node-3 /state/artifacts \
         /state/data /state/token-signing-key >/dev/null 2>&1 || true
@@ -453,7 +462,7 @@ cleanup() {
   local exit_status=$?
   trap - EXIT INT TERM
   if ((run_complete == 0)); then
-    emit_event failed "${current_cell}" "${current_builders}" "qualification interrupted or failed (exit ${exit_status})" || true
+    emit_event failed "${current_cell}" "${current_definitions}" "qualification interrupted or failed (exit ${exit_status})" || true
     if [[ -n "${current_container}" ]]; then
       docker logs "${current_container}" >"${run_dir}/failure-server.log" 2>&1 || true
     elif [[ -n "${current_project}" ]]; then
@@ -509,7 +518,7 @@ run_qualification_driver() {
     KELDRA_INDEX_CONTENTION_IMAGE="${current_image_id}" \
     KELDRA_INDEX_CONTENTION_TOPOLOGY="${driver_topology}" \
     KELDRA_INDEX_CONTENTION_DURABILITY="${durability}" \
-    KELDRA_INDEX_CONTENTION_DEFINITION_COUNT="${builders}" \
+    KELDRA_INDEX_CONTENTION_DEFINITION_COUNT="${definitions}" \
     KELDRA_INDEX_CONTENTION_BASELINE_SECONDS="${baseline_seconds}" \
     KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS="${concurrent_seconds}" \
     KELDRA_INDEX_CONTENTION_POST_SECONDS="${post_seconds}" \
@@ -519,10 +528,12 @@ run_qualification_driver() {
     KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS="${visibility_observation_timeout_seconds}" \
     KELDRA_INDEX_CONTENTION_VISIBILITY_SAMPLE_EVERY_BATCHES="${visibility_sample_every_batches}" \
     KELDRA_INDEX_CONTENTION_MUTATION_WORKERS="${mutation_workers}" \
+    KELDRA_INDEX_CONTENTION_MUTATION_WORKLOAD="${mutation_workload}" \
     KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE="${mutation_batch_size}" \
     KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES="${mutation_record_bytes}" \
     KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH="${mutation_queue_depth}" \
     KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND="${mutation_rate_operations_per_second}" \
+    KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT="${physical_recipe_count}" \
     KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS="${max_concurrent_query_p99_ms}" \
     KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS="${max_publication_visibility_p99_ms}" \
     KELDRA_INDEX_CONTENTION_OUTPUT="${output_path}" \
@@ -543,7 +554,7 @@ run_qualification_driver() {
     printf 'export KELDRA_INDEX_CONTENTION_IMAGE=%q\n' "${current_image_id}"
     printf 'export KELDRA_INDEX_CONTENTION_TOPOLOGY=%q\n' "${driver_topology}"
     printf 'export KELDRA_INDEX_CONTENTION_DURABILITY=%q\n' "${durability}"
-    printf 'export KELDRA_INDEX_CONTENTION_DEFINITION_COUNT=%q\n' "${builders}"
+    printf 'export KELDRA_INDEX_CONTENTION_DEFINITION_COUNT=%q\n' "${definitions}"
     printf 'export KELDRA_INDEX_CONTENTION_BASELINE_SECONDS=%q\n' "${baseline_seconds}"
     printf 'export KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS=%q\n' "${concurrent_seconds}"
     printf 'export KELDRA_INDEX_CONTENTION_POST_SECONDS=%q\n' "${post_seconds}"
@@ -553,10 +564,12 @@ run_qualification_driver() {
     printf 'export KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS=%q\n' "${visibility_observation_timeout_seconds}"
     printf 'export KELDRA_INDEX_CONTENTION_VISIBILITY_SAMPLE_EVERY_BATCHES=%q\n' "${visibility_sample_every_batches}"
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_WORKERS=%q\n' "${mutation_workers}"
+    printf 'export KELDRA_INDEX_CONTENTION_MUTATION_WORKLOAD=%q\n' "${mutation_workload}"
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=%q\n' "${mutation_batch_size}"
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES=%q\n' "${mutation_record_bytes}"
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=%q\n' "${mutation_queue_depth}"
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=%q\n' "${mutation_rate_operations_per_second}"
+    printf 'export KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT=%q\n' "${physical_recipe_count}"
     printf 'export KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=%q\n' "${max_concurrent_query_p99_ms}"
     printf 'export KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS=%q\n' "${max_publication_visibility_p99_ms}"
     printf 'export KELDRA_INDEX_CONTENTION_OUTPUT=%q\n' "${remote_run_dir}/${cell}/report.json"
@@ -585,23 +598,23 @@ emit_event run_started "" 0 "evidence=${run_dir}"
 for current_role in "${comparison_roles[@]}"; do
 current_image_id="$(image_id_for_role "${current_role}")"
 current_image_revision="$(image_revision_for_role "${current_role}")"
-for builders in "${builder_matrix[@]}"; do
-  cell="${current_role}-definitions-${builders}"
+for definitions in "${definition_matrix[@]}"; do
+  cell="${current_role}-definitions-${definitions}"
   cell_dir="${run_dir}/${cell}"
   mkdir "${cell_dir}"
   current_cell="${cell}"
-  current_builders="${builders}"
-  current_state="$(mktemp -d /var/tmp/keldra-index-contention.XXXXXX)"
+  current_definitions="${definitions}"
+  current_state="$(mktemp -d "${work_root}/keldra-index-contention.XXXXXX")"
   mkdir "${current_state}/artifacts"
   chmod 0777 "${current_state}/artifacts"
   dd if=/dev/urandom of="${current_state}/token-signing-key" \
     bs=64 count=1 2>/dev/null
   chmod 0600 "${current_state}/token-signing-key"
-  tenant="qcontention-${current_role:0:1}-${source_commit:0:8}-${builders}-${$}"
-  bucket="objects-${builders}"
-  client_id="contention-client-${builders}"
-  client_secret="contention-secret-${run_id}-${builders}-0000000000000000"
-  emit_event cell_start "${cell}" "${builders}" "creating fresh ${topology}-node state"
+  tenant="qcontention-${current_role:0:1}-${source_commit:0:8}-${definitions}-${$}"
+  bucket="objects-${definitions}"
+  client_id="contention-client-${definitions}"
+  client_secret="contention-secret-${run_id}-${definitions}-0000000000000000"
+  emit_event cell_start "${cell}" "${definitions}" "creating fresh ${topology}-node state"
 
   endpoints=()
   resource_containers=()
@@ -609,7 +622,7 @@ for builders in "${builder_matrix[@]}"; do
     mkdir "${current_state}/data"
     docker run --rm --user 0 --volume "${current_state}:/state" "${current_image_id}" \
       chown -R 10001:10001 /state/data /state/token-signing-key
-    current_container="keldra-contention-${run_id//[^a-zA-Z0-9_.-]/-}-${current_role}-${builders}"
+    current_container="keldra-contention-${run_id//[^a-zA-Z0-9_.-]/-}-${current_role}-${definitions}"
     docker run --detach --name "${current_container}" --platform "${platform}" \
       --publish "${server_advertise_host}:0:50051" \
       --env "RUST_LOG=${server_rust_log}" \
@@ -622,12 +635,8 @@ for builders in "${builder_matrix[@]}"; do
       --env KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=1000000 \
       --env KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=100000 \
       --env "KELDRA_INDEX_DISK_CACHE_BYTES=${index_disk_cache_bytes}" \
-      --env "KELDRA_INDEX_MEMORY_PERCENT=${index_memory_percent}" \
-      --env "KELDRA_INDEX_BUILDER_MEMORY_BYTES_PER_KIND=${index_kind_budget_bytes}" \
-      --env "KELDRA_INDEX_TYPED_JSON_BUILDER_MEMORY_BYTES=${index_kind_budget_bytes}" \
-      --env "KELDRA_INDEX_TYPED_JSON_COMPACTION_MAX_LANES=${index_compaction_lanes}" \
-      --env "KELDRA_INDEX_TYPED_JSON_PROJECTION_MAX_LANES=${index_projection_lanes}" \
-      --env "KELDRA_INDEX_RAYON_WORKERS=${index_rayon_workers}" \
+      --env "KELDRA_INDEX_PIPELINE_MEMORY_BYTES=${index_pipeline_memory_bytes}" \
+      --env "KELDRA_INDEXING_CORES=${indexing_cores}" \
       --env "KELDRA_SOURCE_JOURNAL_MAX_ENTRIES=${source_journal_entries}" \
       --volume "${current_state}/data:/var/lib/keldra" \
       --volume "${current_state}/token-signing-key:/run/secrets/keldra-token-signing-key:ro" \
@@ -665,7 +674,7 @@ for builders in "${builder_matrix[@]}"; do
     endpoints+=("http://${server_advertise_host}:${published_port}")
     resource_containers+=("${current_container}")
   else
-    current_project="keldra-contention-${run_id//[^a-zA-Z0-9_.-]/-}-${current_role}-${builders}"
+    current_project="keldra-contention-${run_id//[^a-zA-Z0-9_.-]/-}-${current_role}-${definitions}"
     for directory in node-1 node-2 node-3; do mkdir "${current_state}/${directory}"; chmod 0777 "${current_state}/${directory}"; done
     chmod 0755 "${current_state}"
     docker run --rm --user 0 --volume "${current_state}/token-signing-key:/key" "${current_image_id}" chown 10001:10001 /key
@@ -673,11 +682,8 @@ for builders in "${builder_matrix[@]}"; do
     export KELDRA_QUALIFICATION_START_NODE="${start_node}" KELDRA_IMAGE="${current_image_id}" KELDRA_DOCKER_PLATFORM="${platform}"
     export KELDRA_QUALIFICATION_RUST_LOG="${server_rust_log}"
     export KELDRA_QUALIFICATION_INDEX_DISK_CACHE_BYTES="${index_disk_cache_bytes}"
-    export KELDRA_QUALIFICATION_INDEX_MEMORY_PERCENT="${index_memory_percent}"
-    export KELDRA_QUALIFICATION_INDEX_KIND_BUDGET_BYTES="${index_kind_budget_bytes}"
-    export KELDRA_QUALIFICATION_INDEX_COMPACTION_MAX_LANES="${index_compaction_lanes}"
-    export KELDRA_QUALIFICATION_INDEX_PROJECTION_MAX_LANES="${index_projection_lanes}"
-    export KELDRA_QUALIFICATION_INDEX_RAYON_WORKERS="${index_rayon_workers}"
+    export KELDRA_QUALIFICATION_INDEX_PIPELINE_MEMORY_BYTES="${index_pipeline_memory_bytes}"
+    export KELDRA_QUALIFICATION_INDEXING_CORES="${indexing_cores}"
     export KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES="${source_journal_entries}"
     compose=(docker compose --project-name "${current_project}" --file "${compose_file}")
     "${compose[@]}" config --quiet
@@ -750,10 +756,10 @@ for builders in "${builder_matrix[@]}"; do
     done
   fi
   endpoint_csv="$(IFS=,; echo "${endpoints[*]}")"
-  emit_event topology_ready "${cell}" "${builders}" "endpoints=${#endpoints[@]}"
+  emit_event topology_ready "${cell}" "${definitions}" "endpoints=${#endpoints[@]}"
   start_resource_sampler "${cell_dir}/container-resources.jsonl" "${resource_containers[@]}"
   ln -sfn "${cell}/driver-progress.jsonl" "${run_dir}/active-driver-progress.jsonl"
-  emit_event workload_started "${cell}" "${builders}" "progress=${cell_dir}/driver-progress.jsonl"
+  emit_event workload_started "${cell}" "${definitions}" "progress=${cell_dir}/driver-progress.jsonl"
   set +e
   run_qualification_driver "${cell_dir}/report.json" "${cell_dir}/driver-progress.jsonl" \
     >"${cell_dir}/driver.stdout.log" 2>"${cell_dir}/driver.stderr.log"
@@ -771,17 +777,19 @@ for builders in "${builder_matrix[@]}"; do
   fi
   if [[ ! -s "${cell_dir}/report.json" ]] \
     || ! jq -e "${report_gate}" "${cell_dir}/report.json" >/dev/null \
+    || ! jq -e --argjson expected "${physical_recipe_count}" \
+      '.physical_recipe_count == $expected' "${cell_dir}/report.json" >/dev/null \
     || [[ ! -s "${cell_dir}/container-resources.jsonl" ]] \
     || ! jq -e . "${cell_dir}/container-resources.jsonl" >/dev/null; then
-    emit_event cell_failed "${cell}" "${builders}" "driver_exit=${driver_status}"
+    emit_event cell_failed "${cell}" "${definitions}" "driver_exit=${driver_status}"
     echo "contention cell ${cell} failed (driver exit ${driver_status}); evidence retained in ${cell_dir}" >&2
     exit 1
   fi
   if [[ "${current_role}" == baseline && "${driver_status}" != 0 ]]; then
-    emit_event baseline_performance_failed "${cell}" "${builders}" \
+    emit_event baseline_performance_failed "${cell}" "${definitions}" \
       "correctness and workload valid; responsiveness failure retained for comparison"
   else
-    emit_event cell_passed "${cell}" "${builders}" "report=${cell_dir}/report.json"
+    emit_event cell_passed "${cell}" "${definitions}" "report=${cell_dir}/report.json"
   fi
   cleanup_cell
 done
@@ -789,11 +797,11 @@ done
 if [[ -n "${baseline_image}" ]]; then
   comparison_rows="${run_dir}/comparison-rows.jsonl"
   : >"${comparison_rows}"
-  for builders in "${builder_matrix[@]}"; do
+  for definitions in "${definition_matrix[@]}"; do
     jq -cn \
-      --argjson definition_count "${builders}" \
-      --slurpfile before "${run_dir}/baseline-definitions-${builders}/report.json" \
-      --slurpfile after "${run_dir}/candidate-definitions-${builders}/report.json" '
+      --argjson definition_count "${definitions}" \
+      --slurpfile before "${run_dir}/baseline-definitions-${definitions}/report.json" \
+      --slurpfile after "${run_dir}/candidate-definitions-${definitions}/report.json" '
       def latency($report; $path):
         ($report | getpath($path)) | {samples,p50_ms,p95_ms,p99_ms,max_ms};
       def delta($after; $before):

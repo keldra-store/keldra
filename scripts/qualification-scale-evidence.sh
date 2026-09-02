@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Bounded scale comparison built from the existing public resource workload and
-# the low-cardinality telemetry emitted by Keldra itself.
+# Historical scale comparison for the superseded builder qualification workload
+# and its former low-cardinality telemetry.
 
 telemetry_files() {
   local prefix="$1"

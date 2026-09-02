@@ -1,8 +1,10 @@
 //! One physical coordinator batch for independently receipted distributed publishes.
 
+use super::evaluation_telemetry::EvaluationSubphaseMetrics;
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::DistributedEvaluationContext;
+use super::single_node_group_commit::{SingleNodeOperations, SingleNodeOutcomes};
 use super::*;
 use crate::model::{CoordinatedObjectMutation, ObjectMutationContext, ObjectMutationGovernance};
 use crate::{BatchOperation, DefinitionMutationIntent};
@@ -11,6 +13,108 @@ struct PreparedDistributedMutation {
     index: usize,
     operation: PreparedOperation,
     definition_intent: Option<DefinitionMutationIntent>,
+}
+
+struct CoordinatedBatchEvaluation {
+    outcomes: Vec<Result<CoordinatedObjectMutation, MutationError>>,
+    receipt_capacity_at: Option<usize>,
+    metrics: CoordinatorBatchMetrics,
+}
+
+#[derive(Debug)]
+struct SingleNodeGroupSettlement {
+    source: SourceId,
+    positions: Vec<u64>,
+}
+
+fn single_node_group_settlement(
+    outcomes: &[Result<CoordinatedObjectMutation, MutationError>],
+) -> Result<Option<SingleNodeGroupSettlement>, MutationError> {
+    let mut source = None;
+    let mut positions = Vec::<u64>::new();
+    for outcome in outcomes {
+        let Ok(coordinated) = outcome else {
+            continue;
+        };
+        if coordinated.receipt.replayed {
+            continue;
+        }
+        let mutation = coordinated.mutation.as_ref().ok_or_else(|| {
+            MutationError::Storage(
+                "single-node group omitted a committed non-replay mutation".into(),
+            )
+        })?;
+        if source
+            .replace(mutation.stamp.source_id)
+            .is_some_and(|current| current != mutation.stamp.source_id)
+        {
+            return Err(MutationError::Storage(
+                "single-node group committed more than one source-journal identity".into(),
+            ));
+        }
+        let alias_count = mutation
+            .alias_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.registry.aliases.len());
+        let end = mutation
+            .stamp
+            .source_journal_position
+            .checked_add(u64::try_from(alias_count).map_err(|_| {
+                MutationError::Storage("single-node alias journal range is exhausted".into())
+            })?)
+            .ok_or_else(|| {
+                MutationError::Storage("single-node alias journal range is exhausted".into())
+            })?;
+        if positions.last().is_some_and(|previous| {
+            previous.checked_add(1) != Some(mutation.stamp.source_journal_position)
+        }) {
+            return Err(MutationError::Storage(
+                "single-node group committed a non-contiguous source-journal range".into(),
+            ));
+        }
+        positions.extend(mutation.stamp.source_journal_position..=end);
+    }
+    Ok(source.map(|source| SingleNodeGroupSettlement { source, positions }))
+}
+
+fn apply_single_node_settlement_invariant_error(
+    outcomes: &mut [Result<CoordinatedObjectMutation, MutationError>],
+    error: MutationError,
+) {
+    for outcome in outcomes {
+        if outcome
+            .as_ref()
+            .is_ok_and(|coordinated| !coordinated.receipt.replayed)
+        {
+            *outcome = Err(error.clone());
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct CoordinatorBatchMetrics {
+    pub(super) prepare: std::time::Duration,
+    pub(super) policy_wait: std::time::Duration,
+    pub(super) path_wait: std::time::Duration,
+    pub(super) commit_wait: std::time::Duration,
+    pub(super) locked_setup: std::time::Duration,
+    pub(super) locked_prefetch: std::time::Duration,
+    pub(super) evaluate: std::time::Duration,
+    pub(super) evaluation_subphases: EvaluationSubphaseMetrics,
+    pub(super) stage: std::time::Duration,
+    pub(super) persist: std::time::Duration,
+    pub(super) settle: std::time::Duration,
+    pub(super) commit_hold: std::time::Duration,
+    pub(super) total: std::time::Duration,
+    pub(super) write_batch_entries: u64,
+    pub(super) write_batch_bytes: u64,
+    pub(super) physical_commit: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CoordinatorBatchPayloadPreparation {
+    Distributed,
+    SingleNode,
 }
 
 impl Store {
@@ -26,19 +130,187 @@ impl Store {
         )>,
         context: ObjectMutationContext,
     ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
+        let evaluated = self
+            .coordinate_mutation_batch(
+                operations,
+                context,
+                CoordinatorBatchPayloadPreparation::Distributed,
+            )
+            .await?;
+        if evaluated.receipt_capacity_at.is_some() {
+            Err(MutationError::ReceiptCapacity)
+        } else {
+            Ok(evaluated.outcomes)
+        }
+    }
+
+    /// Coordinate one independently receipted batch when the serving topology
+    /// has exactly one active node.
+    ///
+    /// The cluster layer owns and fences that topology decision. Small local
+    /// `Put` payloads stay in memory until this method folds their content,
+    /// metadata, mutation stamps and reference proofs into the final atomic
+    /// RocksDB batch. Replicated durability remains unavailable in a one-node
+    /// topology. Other operations retain the ordinary distributed preparation
+    /// rules.
+    pub async fn coordinate_single_node_mutation_batch(
+        &self,
+        operations: SingleNodeOperations,
+        context: ObjectMutationContext,
+    ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
+        self.coordinate_single_node_mutation_batch_with_settlement(operations, context)
+            .await
+            .map(|batch| batch.outcomes)
+    }
+
+    /// Internal cross-crate variant that makes post-coordination source
+    /// settlement ownership explicit to the distribution layer.
+    #[doc(hidden)]
+    pub async fn coordinate_single_node_mutation_batch_with_settlement(
+        &self,
+        operations: SingleNodeOperations,
+        context: ObjectMutationContext,
+    ) -> Result<SingleNodeMutationBatch, MutationError> {
+        if operations.is_empty() {
+            return Ok(SingleNodeMutationBatch {
+                outcomes: Vec::new(),
+                source_journal_settlement: SourceJournalSettlement::CompletedByCoordinator,
+            });
+        }
+        self.single_node_group_commit
+            .submit(self.clone(), operations, context)
+            .await
+    }
+
+    pub(super) async fn coordinate_single_node_mutation_group(
+        &self,
+        operations: SingleNodeOperations,
+        context: ObjectMutationContext,
+        request_operation_counts: &[usize],
+    ) -> (Vec<SingleNodeOutcomes>, Option<CoordinatorBatchMetrics>) {
+        let total = operations.len();
+        let evaluated = self
+            .coordinate_mutation_batch(
+                operations,
+                context,
+                CoordinatorBatchPayloadPreparation::SingleNode,
+            )
+            .await;
+        let mut evaluated = match evaluated {
+            Ok(evaluated) => evaluated,
+            Err(error) => {
+                return (
+                    request_operation_counts
+                        .iter()
+                        .map(|_| Err(error.clone()))
+                        .collect(),
+                    None,
+                );
+            }
+        };
+        let settle_started = std::time::Instant::now();
+        let source_journal_settlement = match single_node_group_settlement(&evaluated.outcomes) {
+            Ok(Some(settlement)) => {
+                #[cfg(test)]
+                self.single_node_group_commit.record_settlement_attempt();
+                if self
+                    .single_node_group_commit
+                    .take_injected_settlement_failure()
+                {
+                    SourceJournalSettlement::RequiredAfterQuorum
+                } else {
+                    match self
+                        .settle_source_journal_positions_if_contiguous(
+                            settlement.source,
+                            &settlement.positions,
+                        )
+                        .await
+                    {
+                        Ok(_) => SourceJournalSettlement::CompletedByCoordinator,
+                        Err(error) => {
+                            tracing::warn!(
+                                source = ?settlement.source,
+                                count = settlement.positions.len(),
+                                %error,
+                                "single-node group committed but source settlement requires quorum fallback"
+                            );
+                            SourceJournalSettlement::RequiredAfterQuorum
+                        }
+                    }
+                }
+            }
+            Ok(None) => SourceJournalSettlement::CompletedByCoordinator,
+            Err(error) => {
+                apply_single_node_settlement_invariant_error(&mut evaluated.outcomes, error);
+                SourceJournalSettlement::RequiredAfterQuorum
+            }
+        };
+        let settle_duration = settle_started.elapsed();
+        evaluated.metrics.settle = evaluated.metrics.settle.saturating_add(settle_duration);
+        evaluated.metrics.total = evaluated.metrics.total.saturating_add(settle_duration);
+        if request_operation_counts.iter().sum::<usize>() != total {
+            return (
+                request_operation_counts
+                    .iter()
+                    .map(|_| {
+                        Err(MutationError::Storage(
+                            "single-node group boundary is inconsistent".into(),
+                        ))
+                    })
+                    .collect(),
+                None,
+            );
+        }
+        let mut responses = Vec::with_capacity(request_operation_counts.len());
+        let mut start = 0;
+        for count in request_operation_counts {
+            let end = start + count;
+            let outcomes = evaluated.outcomes.drain(..*count).collect();
+            if evaluated
+                .receipt_capacity_at
+                .is_some_and(|capacity| capacity < end)
+            {
+                responses.push(Err(MutationError::ReceiptCapacity));
+            } else {
+                responses.push(Ok(SingleNodeMutationBatch {
+                    outcomes,
+                    source_journal_settlement,
+                }));
+            }
+            start = end;
+        }
+        (responses, Some(evaluated.metrics))
+    }
+
+    async fn coordinate_mutation_batch(
+        &self,
+        operations: Vec<(
+            BatchOperation,
+            ObjectMutationGovernance,
+            Option<DefinitionMutationIntent>,
+        )>,
+        context: ObjectMutationContext,
+        payload_preparation: CoordinatorBatchPayloadPreparation,
+    ) -> Result<CoordinatedBatchEvaluation, MutationError> {
+        let total_started = std::time::Instant::now();
         if context.serving_fence_term == 0 {
             return Err(MutationError::InvalidObjectMutation(
                 "serving-fence term must be non-zero".into(),
             ));
         }
         if operations.is_empty() {
-            return Ok(Vec::new());
+            return Ok(CoordinatedBatchEvaluation {
+                outcomes: Vec::new(),
+                receipt_capacity_at: None,
+                metrics: CoordinatorBatchMetrics::default(),
+            });
         }
 
         let total = operations.len();
         let mut prepared = Vec::with_capacity(total);
         let mut early = BTreeMap::new();
         let mut bucket_governance = BTreeMap::<Vec<u8>, ObjectMutationGovernance>::new();
+        let prepare_started = std::time::Instant::now();
         for (index, (operation, governance, definition_intent)) in
             operations.into_iter().enumerate()
         {
@@ -76,7 +348,16 @@ impl Store {
                 continue;
             }
             bucket_governance.insert(identity.encode().to_vec(), governance.clone());
-            match self.prepare(operation, identity, true).await {
+            let operation = match payload_preparation {
+                CoordinatorBatchPayloadPreparation::Distributed => {
+                    self.prepare(operation, identity, true).await
+                }
+                CoordinatorBatchPayloadPreparation::SingleNode => {
+                    self.prepare_single_node_coordinated(operation, identity)
+                        .await
+                }
+            };
+            match operation {
                 Ok(operation) => prepared.push(PreparedDistributedMutation {
                     index,
                     operation,
@@ -87,8 +368,12 @@ impl Store {
                 }
             }
         }
+        let prepare_duration = prepare_started.elapsed();
 
+        let policy_wait_started = std::time::Instant::now();
         let _policy_guard = self.policy_gate.read().await;
+        let policy_wait_duration = policy_wait_started.elapsed();
+        let path_wait_started = std::time::Instant::now();
         let _path_guards = self
             .ordinary_locks
             .acquire(
@@ -98,7 +383,12 @@ impl Store {
                     .collect::<Vec<_>>(),
             )
             .await;
+        let path_wait_duration = path_wait_started.elapsed();
+        let commit_wait_started = std::time::Instant::now();
         let _commit_guard = self.lock_commit("distributed_publish").await;
+        let commit_wait_duration = commit_wait_started.elapsed();
+        let commit_hold_started = std::time::Instant::now();
+        let locked_setup_started = std::time::Instant::now();
         let mut reserved = BTreeMap::new();
         for item in &prepared {
             if let Err(error) = self.require_unreserved_object_locked(
@@ -116,6 +406,32 @@ impl Store {
         let source = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let reference_effects = match payload_preparation {
+            CoordinatorBatchPayloadPreparation::Distributed => LocalReferenceEffects::Deferred,
+            CoordinatorBatchPayloadPreparation::SingleNode => {
+                let cursor = self.reference_delta_cursor(source.source_id).map_err(|error| {
+                    MutationError::Storage(format!(
+                        "cannot read local reference cursor before single-node coordination: {error}"
+                    ))
+                })?;
+                if cursor > source.tail {
+                    return Err(MutationError::Storage(format!(
+                        "local reference cursor {cursor} is ahead of source-journal tail {}",
+                        source.tail
+                    )));
+                }
+                if cursor == source.tail {
+                    LocalReferenceEffects::AppliedInline
+                } else {
+                    // A derived or distributed publication may have appended
+                    // reference work that the delivery runtime has not yet
+                    // consumed. Do not advance across that gap or apply this
+                    // group's effects out of order; append them to the same
+                    // authoritative journal for contiguous delivery instead.
+                    LocalReferenceEffects::Deferred
+                }
+            }
+        };
         let mut next_source_position = source.tail.checked_add(1).ok_or_else(|| {
             MutationError::Storage("local invalidation offset is exhausted".into())
         })?;
@@ -125,6 +441,8 @@ impl Store {
         let initial_receipt_status = receipt_status;
         let pruned_receipts =
             self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
+        let locked_setup_duration = locked_setup_started.elapsed();
+        let locked_prefetch_started = std::time::Instant::now();
         let read_cache = MutationReadCache::load(
             self,
             &prepared
@@ -132,6 +450,7 @@ impl Store {
                 .map(|item| &item.operation)
                 .collect::<Vec<_>>(),
         )?;
+        let locked_prefetch_duration = locked_prefetch_started.elapsed();
         let mut pending_heads = BTreeMap::new();
         let mut pending_versions = BTreeMap::new();
         let mut pending_receipts = BTreeMap::new();
@@ -149,7 +468,15 @@ impl Store {
         let mut high_watermark = None;
         let mut evaluated = BTreeMap::new();
         let mut receipt_capacity_exhausted = false;
+        let mut receipt_capacity_at = None;
+        let mut evaluation_subphases = match payload_preparation {
+            CoordinatorBatchPayloadPreparation::SingleNode => {
+                EvaluationSubphaseMetrics::single_node_group()
+            }
+            CoordinatorBatchPayloadPreparation::Distributed => EvaluationSubphaseMetrics::default(),
+        };
 
+        let evaluate_started = std::time::Instant::now();
         for item in &prepared {
             let outcome = self
                 .evaluate_operation(
@@ -170,15 +497,23 @@ impl Store {
                         mutation: context,
                         source_id: source.source_id,
                         source_journal_position: next_source_position,
+                        reference_effects,
+                        materialize_inline_payload: matches!(
+                            payload_preparation,
+                            CoordinatorBatchPayloadPreparation::SingleNode
+                        ),
                     }),
                     item.definition_intent,
+                    &mut evaluation_subphases,
                 )
                 .await;
+            let coordinator_bookkeeping_started = evaluation_subphases.start();
             if outcome
                 .as_ref()
                 .is_err_and(|error| matches!(error, MutationError::ReceiptCapacity))
             {
                 receipt_capacity_exhausted = true;
+                receipt_capacity_at = Some(item.index);
                 break;
             }
             if let Ok(value) = &outcome {
@@ -213,9 +548,6 @@ impl Store {
                         item.operation.key().path(),
                     ));
                 }
-                if let Some(mutation) = value.mutation.as_ref() {
-                    self.stage_object_mutation_reference_proof(&mut batch, mutation)?;
-                }
             }
             evaluated.insert(
                 item.index,
@@ -224,16 +556,32 @@ impl Store {
                     mutation: value.mutation,
                 }),
             );
+            evaluation_subphases.record_since(
+                super::evaluation_telemetry::EvaluationSubphase::Coordinator,
+                coordinator_bookkeeping_started,
+            );
         }
+        let proof_mutations = evaluation_subphases.measure(
+            super::evaluation_telemetry::EvaluationSubphase::Coordinator,
+            || {
+                evaluated
+                    .values()
+                    .filter_map(|outcome| outcome.as_ref().ok()?.mutation.as_ref())
+                    .collect::<Vec<_>>()
+            },
+        );
+        self.stage_object_mutation_reference_proofs(
+            &mut batch,
+            &proof_mutations,
+            &mut evaluation_subphases,
+        )?;
+        let evaluate_duration = evaluate_started.elapsed();
 
+        let stage_started = std::time::Instant::now();
         if receipt_status != initial_receipt_status {
             self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
         }
-        self.stage_local_changes(
-            &mut batch,
-            &pending_changes,
-            LocalReferenceEffects::Deferred,
-        )?;
+        self.stage_local_changes(&mut batch, &pending_changes, reference_effects)?;
         if let Some(high_watermark) = high_watermark {
             batch.put_cf(
                 self.cf(CF_METADATA)?,
@@ -241,31 +589,105 @@ impl Store {
                 serde_json::to_vec(&high_watermark).map_err(storage_error)?,
             );
         }
-        if !batch.is_empty() {
+        let stage_duration = stage_started.elapsed();
+        let persist_started = std::time::Instant::now();
+        let physical_commit = !batch.is_empty();
+        let write_batch_entries = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+        let write_batch_bytes = u64::try_from(batch.size_in_bytes()).unwrap_or(u64::MAX);
+        if physical_commit {
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
             self.db.write_opt(batch, &options).map_err(storage_error)?;
         }
+        let persist_duration = persist_started.elapsed();
+        let settle_started = std::time::Instant::now();
         if !pruned_receipts.is_empty() {
             self.mutation_capacity_notify.notify_waiters();
         }
         if !pending_changes.is_empty() {
+            if reference_effects == LocalReferenceEffects::AppliedInline {
+                self.settle_inline_source_changes()?;
+            }
             self.notify_local_invalidations();
         }
-        if receipt_capacity_exhausted {
-            return Err(MutationError::ReceiptCapacity);
-        }
-
+        let settle_duration = settle_started.elapsed();
         let mut outcomes = Vec::with_capacity(total);
         for index in 0..total {
-            outcomes.push(match evaluated.remove(&index) {
-                Some(outcome) => outcome,
-                None => Err(early.remove(&index).ok_or_else(|| {
-                    MutationError::Storage("distributed batch outcome index is inconsistent".into())
-                })?),
+            outcomes.push(if let Some(outcome) = evaluated.remove(&index) {
+                outcome
+            } else if let Some(error) = early.remove(&index) {
+                Err(error)
+            } else if receipt_capacity_exhausted {
+                Err(MutationError::ReceiptCapacity)
+            } else {
+                return Err(MutationError::Storage(
+                    "distributed batch outcome index is inconsistent".into(),
+                ));
             });
         }
-        Ok(outcomes)
+        let commit_hold_duration = commit_hold_started.elapsed();
+        let outcome = CoordinatedBatchEvaluation {
+            outcomes,
+            receipt_capacity_at,
+            metrics: CoordinatorBatchMetrics {
+                prepare: prepare_duration,
+                policy_wait: policy_wait_duration,
+                path_wait: path_wait_duration,
+                commit_wait: commit_wait_duration,
+                locked_setup: locked_setup_duration,
+                locked_prefetch: locked_prefetch_duration,
+                evaluate: evaluate_duration,
+                evaluation_subphases,
+                stage: stage_duration,
+                persist: persist_duration,
+                settle: settle_duration,
+                commit_hold: commit_hold_duration,
+                total: total_started.elapsed(),
+                write_batch_entries,
+                write_batch_bytes,
+                physical_commit,
+            },
+        };
+        Ok(outcome)
+    }
+
+    async fn prepare_single_node_coordinated(
+        &self,
+        operation: BatchOperation,
+        identity: BucketIdentity,
+    ) -> Result<PreparedOperation, MutationError> {
+        let durability = match &operation {
+            BatchOperation::Put(request) => request.durability,
+            BatchOperation::Publish(request) => request.durability,
+            BatchOperation::Clone(request) => request.durability,
+            BatchOperation::Delete(request) => request.durability,
+        };
+        require_local_durability(durability)?;
+        let mut request = match operation {
+            BatchOperation::Put(request) => request,
+            operation => return self.prepare(operation, identity, true).await,
+        };
+        validate_command_id(request.command_id.as_deref())?;
+        let bytes = std::mem::take(&mut request.bytes);
+        let payload = if bytes.len() <= PAYLOAD_ARTIFACT_CHUNK_BYTES {
+            let reference = blob_reference_for_bytes(&bytes);
+            PreparedPayload::Inline { reference, bytes }
+        } else {
+            PreparedPayload::Sealed(self.stage_blob(&bytes).await?)
+        };
+        let fingerprint = put_fingerprint(
+            &identity.head_key(request.key.path()),
+            request.mode,
+            request.content_type.as_deref(),
+            request.durability,
+            payload.reference(),
+        );
+        Ok(PreparedOperation::Put {
+            request,
+            identity,
+            payload,
+            fingerprint,
+        })
     }
 
     /// Evaluate independent, already payload-verified publishes in request order
@@ -405,8 +827,11 @@ impl Store {
                         mutation: context,
                         source_id: source.source_id,
                         source_journal_position: next_source_position,
+                        reference_effects: LocalReferenceEffects::Deferred,
+                        materialize_inline_payload: false,
                     }),
                     None,
+                    &mut EvaluationSubphaseMetrics::default(),
                 )
                 .await;
             if outcome
@@ -509,7 +934,9 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PlacementLogId;
+    use crate::{
+        OBJECT_ALIAS_REGISTRY_FORMAT, ObjectAliasRegistry, ObjectAliasSnapshot, PlacementLogId,
+    };
 
     fn request(path: &str, command: &str, blob: BlobRef) -> PublishRequest {
         PublishRequest {
@@ -520,6 +947,246 @@ mod tests {
             command_id: Some(command.into()),
             durability: Durability::Local,
         }
+    }
+
+    fn put_request(path: &str, command: &str, bytes: &[u8], durability: Durability) -> PutRequest {
+        PutRequest {
+            key: ObjectKey::new("tenant", "bucket", path).unwrap(),
+            bytes: bytes.to_vec(),
+            content_type: Some("application/octet-stream".into()),
+            mode: PutMode::PutIfAbsent,
+            command_id: Some(command.into()),
+            durability,
+        }
+    }
+
+    #[tokio::test]
+    async fn single_node_inline_put_batch_has_one_physical_commit_and_readable_stamped_payloads() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: store.bucket_policy("tenant", "bucket").unwrap(),
+        };
+        let context = ObjectMutationContext {
+            active_placement_log_id: PlacementLogId { term: 3, index: 7 },
+            serving_fence_term: 3,
+        };
+        let payloads = [
+            ("objects/0", b"zero".as_slice()),
+            ("objects/1", b"one".as_slice()),
+            ("objects/2", b"two".as_slice()),
+        ];
+        let operations = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, (path, bytes))| {
+                (
+                    BatchOperation::Put(put_request(
+                        path,
+                        &format!("put-{index}"),
+                        bytes,
+                        Durability::Local,
+                    )),
+                    governance.clone(),
+                    None,
+                )
+            })
+            .collect();
+        let before = store.db.latest_sequence_number();
+
+        let outcomes = store
+            .coordinate_single_node_mutation_batch(operations, context)
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), payloads.len());
+        let mut source = None;
+        let mut source_positions = Vec::new();
+        for (outcome, (path, bytes)) in outcomes.iter().zip(payloads) {
+            let coordinated = outcome.as_ref().unwrap();
+            let mutation = coordinated
+                .mutation
+                .as_ref()
+                .expect("new coordinated put must carry its replica mutation");
+            source.get_or_insert(mutation.stamp.source_id);
+            assert_eq!(source, Some(mutation.stamp.source_id));
+            source_positions.push(mutation.stamp.source_journal_position);
+            assert!(
+                store
+                    .read_reference_proof(
+                        mutation.stamp.source_id,
+                        mutation.stamp.source_journal_position,
+                    )
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                mutation.stamp.active_placement_log_id,
+                context.active_placement_log_id
+            );
+            assert_eq!(
+                mutation.stamp.serving_fence_term,
+                context.serving_fence_term
+            );
+            let key = ObjectKey::new("tenant", "bucket", path).unwrap();
+            let object = store
+                .get(&key)
+                .await
+                .unwrap()
+                .expect("committed inline payload must be readable");
+            assert_eq!(object.bytes, bytes);
+            let reference = mutation.version.blob.as_ref().unwrap();
+            let reference_state = store.blob_reference_state(reference).unwrap().unwrap();
+            assert_eq!((reference_state.ref_count, reference_state.flags), (1, 0));
+            assert_eq!(
+                store.head(&key).unwrap().unwrap().mutation_stamp,
+                Some(mutation.stamp)
+            );
+        }
+        let journal = store.local_watch_status().unwrap();
+        assert_eq!(journal.settled_through, journal.tail);
+        assert_eq!(
+            store.reference_delta_cursor(journal.source_id).unwrap(),
+            journal.tail
+        );
+        assert_eq!(source_positions.last().copied(), Some(journal.tail));
+        assert!(
+            store
+                .settle_source_journal_positions_if_contiguous(
+                    source.expect("batch must have a source"),
+                    &source_positions,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "the production local acknowledgement must not need another durable settlement"
+        );
+        assert_eq!(
+            store
+                .db
+                .get_updates_since(before)
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let sequence_before_replicated = store.db.latest_sequence_number();
+        let replicated = store
+            .coordinate_single_node_mutation_batch(
+                vec![(
+                    BatchOperation::Put(put_request(
+                        "objects/replicated",
+                        "put-replicated",
+                        b"not locally satisfiable",
+                        Durability::Replicated,
+                    )),
+                    governance,
+                    None,
+                )],
+                context,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            replicated.as_slice(),
+            [Err(MutationError::DurabilityUnavailable)]
+        ));
+        assert_eq!(
+            store.db.latest_sequence_number(),
+            sequence_before_replicated
+        );
+    }
+
+    #[tokio::test]
+    async fn group_settlement_collects_aliases_and_ignores_errors_and_replays() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: store.bucket_policy("tenant", "bucket").unwrap(),
+        };
+        let mut coordinated = store
+            .coordinate_single_node_mutation_batch(
+                vec![(
+                    BatchOperation::Put(put_request(
+                        "objects/alias-target",
+                        "alias-target",
+                        b"target",
+                        Durability::Local,
+                    )),
+                    governance,
+                    None,
+                )],
+                ObjectMutationContext {
+                    active_placement_log_id: PlacementLogId { term: 3, index: 7 },
+                    serving_fence_term: 3,
+                },
+            )
+            .await
+            .unwrap()
+            .remove(0)
+            .unwrap();
+        let mutation = coordinated.mutation.as_mut().unwrap();
+        let first_position = mutation.stamp.source_journal_position;
+        mutation.alias_snapshot = Some(ObjectAliasSnapshot {
+            registry: ObjectAliasRegistry {
+                format: OBJECT_ALIAS_REGISTRY_FORMAT,
+                revision: 1,
+                aliases: vec!["aliases/a".into(), "aliases/b".into()],
+                program_commit_cursor: Some(1),
+            },
+            canonical_version: mutation.version.clone(),
+        });
+        let source = mutation.stamp.source_id;
+        let mut replay = coordinated.clone();
+        replay.receipt.replayed = true;
+        replay
+            .mutation
+            .as_mut()
+            .unwrap()
+            .stamp
+            .source_id
+            .source_epoch = [9; 32];
+        let outcomes = vec![
+            Err(MutationError::Storage(
+                "pre-existing operation error".into(),
+            )),
+            Ok(coordinated.clone()),
+            Ok(replay),
+        ];
+
+        let settlement = single_node_group_settlement(&outcomes)
+            .unwrap()
+            .expect("the non-replay mutation must require settlement");
+        assert_eq!(settlement.source, source);
+        assert_eq!(
+            settlement.positions,
+            vec![first_position, first_position + 1, first_position + 2]
+        );
+
+        let mut wrong_source = coordinated;
+        let wrong_source_mutation = wrong_source.mutation.as_mut().unwrap();
+        wrong_source_mutation.stamp.source_journal_position += 3;
+        wrong_source_mutation.stamp.source_id.source_epoch = [7; 32];
+        assert!(
+            single_node_group_settlement(&[outcomes[1].clone(), Ok(wrong_source)])
+                .unwrap_err()
+                .to_string()
+                .contains("more than one source-journal identity")
+        );
     }
 
     #[tokio::test]

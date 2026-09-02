@@ -124,6 +124,8 @@ pub(crate) const CF_OBJECT_ALIAS_REGISTRIES: &str = "object_alias_registries";
 pub(crate) const VERSION_HIGH_WATERMARK_KEY: &[u8] = b"version_high_watermark";
 const INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY: &[u8] = b"integrated_payload_storage_format";
 const INTEGRATED_PAYLOAD_STORAGE_FORMAT: u8 = 1;
+const DURABLE_MUTATION_RECORD_FORMAT_KEY: &[u8] = b"durable_mutation_record_format";
+const DURABLE_MUTATION_RECORD_FORMAT: u8 = 1;
 const MUTATION_RECEIPT_COUNT_KEY: &[u8] = b"mutation_receipt_count";
 const MUTATION_RECEIPT_BYTES_KEY: &[u8] = b"mutation_receipt_bytes";
 const RECEIPT_RECORD_PREFIX: u8 = 0;
@@ -135,6 +137,12 @@ pub const DEFAULT_MUTATION_RECEIPT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_AWAITING_PUBLISH_TTL_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_MAX_TOTAL_WAL_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 pub const PAYLOAD_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum item count in one trusted derived-progress inline staging commit.
+#[doc(hidden)]
+pub const MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS: usize = 1_000;
+/// Maximum logical payload bytes in one trusted derived-progress inline staging commit.
+#[doc(hidden)]
+pub const MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 pub const PAYLOAD_BLOB_MIN_BYTES: u64 = 64 * 1024;
 pub const MAX_LIST_OBJECTS: usize = 1_000;
 pub const MAX_LIST_OBJECT_VERSIONS: usize = 1_000;
@@ -353,6 +361,7 @@ pub struct StoreOptions {
     pub sync_writes: bool,
     pub watch_retention: WatchRetention,
     pub mutation_receipt_retention: MutationReceiptRetention,
+    pub single_node_group_commit: SingleNodeGroupCommitConfig,
     /// Blob inactivity grace. The production server requires this to cover
     /// its fixed 24-hour atomic-replay window; short values are only useful to
     /// embedded callers such as focused garbage-collection tests.
@@ -376,6 +385,7 @@ pub struct Store {
     /// Exact-path locks owned only by the nominated atomic-program executor.
     pub(crate) program_locks: LocalLockManager,
     pub(crate) commit_lock: Arc<tokio::sync::Mutex<()>>,
+    single_node_group_commit: single_node_group_commit::SingleNodeGroupCommit,
     pub(crate) policy_gate: Arc<tokio::sync::RwLock<()>>,
     pub(crate) authz_write_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) bucket_options_lock: Arc<std::sync::Mutex<()>>,
@@ -613,7 +623,7 @@ pub(crate) type PendingBlobReferences = BTreeMap<Vec<u8>, BlobReferenceState>;
 
 impl Store {
     /// Allocate one node-scoped Snowflake identity for an ordinary derived
-    /// object such as a format-v4 index segment. A durable publication made
+    /// object such as a v6 index artifact. A durable publication made
     /// afterward advances the same persisted high-water mark, so an identity
     /// lost before publication is harmless and a published identity cannot be
     /// reused after restart.
@@ -935,9 +945,7 @@ impl Store {
                 .chain(COLUMN_FAMILIES.iter().map(|name| (*name).to_owned()))
                 .collect::<BTreeSet<_>>();
             if actual != expected {
-                anyhow::bail!(
-                    "existing Keldra volume does not use the exact 0.15 integrated payload layout"
-                );
+                anyhow::bail!("existing Keldra volume does not use the exact 0.16 storage layout");
             }
         }
         let metadata_memory = Arc::new(MetadataMemoryResources::new());
@@ -979,6 +987,23 @@ impl Store {
                 )?;
             }
         }
+        match db.get_cf(metadata_cf, DURABLE_MUTATION_RECORD_FORMAT_KEY)? {
+            Some(encoded) if encoded.as_ref() == [DURABLE_MUTATION_RECORD_FORMAT] => {}
+            Some(_) => anyhow::bail!("durable mutation record format marker is unsupported"),
+            None if existing_database => {
+                anyhow::bail!("existing Keldra volume has no durable mutation record format marker")
+            }
+            None => {
+                let mut write = WriteOptions::default();
+                write.set_sync(options.sync_writes);
+                db.put_cf_opt(
+                    metadata_cf,
+                    DURABLE_MUTATION_RECORD_FORMAT_KEY,
+                    [DURABLE_MUTATION_RECORD_FORMAT],
+                    &write,
+                )?;
+            }
+        }
         let high_watermark = db
             .get_cf(metadata_cf, VERSION_HIGH_WATERMARK_KEY)?
             .map(|encoded| serde_json::from_slice::<VersionId>(&encoded))
@@ -999,6 +1024,9 @@ impl Store {
             ordinary_locks: LocalLockManager::default(),
             program_locks: LocalLockManager::default(),
             commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            single_node_group_commit: single_node_group_commit::SingleNodeGroupCommit::new(
+                options.single_node_group_commit.clone(),
+            ),
             policy_gate: Arc::new(tokio::sync::RwLock::new(())),
             authz_write_lock: Arc::new(std::sync::Mutex::new(())),
             bucket_options_lock: Arc::new(std::sync::Mutex::new(())),
@@ -1429,6 +1457,7 @@ pub(crate) mod definition_state;
 mod delete_version;
 mod derived_consumers;
 mod distributed_publish_batch;
+mod evaluation_telemetry;
 mod index_orphan_scrub_due;
 mod index_retention_due;
 mod journal_capacity;
@@ -1441,8 +1470,13 @@ mod mutation_types;
 mod mutation_unary;
 mod mutations;
 mod options;
+mod single_node_group_commit;
 use mutation_fingerprint::*;
+pub use single_node_group_commit::{
+    SingleNodeGroupCommitConfig, SingleNodeMutationBatch, SourceJournalSettlement,
+};
 mod object_alias_registry;
+mod object_mutation_codec;
 mod object_mutation_replica_batch;
 mod object_snapshot;
 mod object_snapshot_scan;
@@ -1452,6 +1486,7 @@ mod payload_handoff;
 mod pending_local_change;
 mod program_reservations;
 mod reads;
+mod receipt_codec;
 mod reference_deltas;
 mod reference_proofs;
 mod retained_snapshot_scan;

@@ -560,7 +560,7 @@ async fn local_cluster_listing_uses_stable_ids_and_excludes_non_owned_heads() {
 }
 
 #[tokio::test]
-async fn internal_index_definition_listing_is_format_four_and_bucket_scoped() {
+async fn internal_index_definition_listing_is_v6_and_bucket_scoped() {
     let (_temporary, store) = store().await;
     let definition = format!("{INDEX_DEFINITION_PREFIX}search");
     store
@@ -568,7 +568,7 @@ async fn internal_index_definition_listing_is_format_four_and_bucket_scoped() {
             &definition,
             b"definition",
             Precondition::Absent,
-            "format-four",
+            "v6-definition",
         ))
         .await
         .unwrap();
@@ -627,7 +627,7 @@ async fn internal_index_definition_listing_is_format_four_and_bucket_scoped() {
         store.list_local_owned_index_definitions(
             identity.tenant_id.0,
             identity.bucket_id.0,
-            "_keldra/indexes/v2/definitions/",
+            "_keldra/not-index/definitions/",
             None,
             10,
             |_, _, _| true,
@@ -639,7 +639,7 @@ async fn internal_index_definition_listing_is_format_four_and_bucket_scoped() {
             identity.tenant_id.0,
             identity.bucket_id.0,
             INDEX_DEFINITION_PREFIX,
-            Some("_keldra/indexes/v2/definitions/search"),
+            Some("_keldra/not-index/definitions/search"),
             10,
             |_, _, _| true,
         ),

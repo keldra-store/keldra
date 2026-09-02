@@ -344,6 +344,9 @@ impl Store {
         }) {
             return Err(DefinitionStateError::CheckpointRegression);
         }
+        if mutations.is_empty() && existing_checkpoint == Some(*checkpoint) {
+            return Ok(());
+        }
         let mut batch = WriteBatch::default();
         let assignments_changed = self.stage_assignment_mutations(&mut batch, mutations)?;
         batch.put_cf(
@@ -438,6 +441,42 @@ impl Store {
         &self,
     ) -> tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>> {
         self.definition_assignment_notify.subscribe()
+    }
+
+    /// Visits one exact committed assignment inventory and returns a receiver
+    /// whose first possible notification is newer than that inventory.
+    ///
+    /// Assignment writes and notification publication use the same
+    /// `definition_state_lock`. Holding it through the scan and subscription
+    /// closes the gap which a lossy notification queue cannot close itself.
+    /// The visitor permits callers to build their own compact inventory without
+    /// allocating a second unbounded `Vec` in Store.
+    pub fn visit_definition_assignment_snapshot(
+        &self,
+        kind: DefinitionKind,
+        mut visitor: impl FnMut(DefinitionAssignment),
+    ) -> Result<
+        tokio::sync::broadcast::Receiver<Vec<DefinitionAssignmentMutation>>,
+        DefinitionStateError,
+    > {
+        let _guard = self.definition_state_lock.lock().map_err(|_| {
+            DefinitionStateError::Storage("definition-state lock is poisoned".into())
+        })?;
+        let prefix = assignment_prefix(Some(kind), None, None);
+        for item in self.db.iterator_cf(
+            self.definition_state_cf()?,
+            IteratorMode::From(&prefix, Direction::Forward),
+        ) {
+            let (key, value) = item.map_err(state_storage)?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            match decode_assignment(&key, &value) {
+                Ok(assignment) => visitor(assignment),
+                Err(error) => report_corrupt_record("assignment", &key, &error),
+            }
+        }
+        Ok(self.definition_assignment_notify.subscribe())
     }
 
     fn stage_assignment_mutations(

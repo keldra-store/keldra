@@ -1,6 +1,104 @@
 use super::*;
 
 const MUTATION_CAPACITY_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const JOURNAL_OUTCOME_REPORT_INTERVAL: u64 = 256;
+
+static REFERENCE_SAFE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REFERENCE_SAFE_REGRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REFERENCE_SAFE_EQUAL_NOOP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REFERENCE_SAFE_MAINTENANCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REFERENCE_SAFE_ADVANCED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static SETTLEMENT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SETTLEMENT_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SETTLEMENT_ALREADY_SETTLED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SETTLEMENT_GAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SETTLEMENT_ADVANCED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+enum ReferenceSafeOutcome {
+    Regressed,
+    EqualNoop,
+    Maintenance,
+    Advanced,
+}
+
+fn record_reference_safe_outcome(outcome: ReferenceSafeOutcome) {
+    let counter = match outcome {
+        ReferenceSafeOutcome::Regressed => &REFERENCE_SAFE_REGRESSED,
+        ReferenceSafeOutcome::EqualNoop => &REFERENCE_SAFE_EQUAL_NOOP,
+        ReferenceSafeOutcome::Maintenance => &REFERENCE_SAFE_MAINTENANCE,
+        ReferenceSafeOutcome::Advanced => &REFERENCE_SAFE_ADVANCED,
+    };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let calls = REFERENCE_SAFE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    // Emit cumulative snapshots sparsely: the sample ordinal identifies the
+    // exact 256-call boundary and bounds the unreported tail without producing
+    // one tracing event per journal poll.
+    if calls.is_multiple_of(JOURNAL_OUTCOME_REPORT_INTERVAL) {
+        tracing::info!(
+            source_journal.reference_safe.sample_ordinal = calls / JOURNAL_OUTCOME_REPORT_INTERVAL,
+            source_journal.reference_safe.unreported_tail_max = JOURNAL_OUTCOME_REPORT_INTERVAL - 1,
+            source_journal.reference_safe.calls_total = calls,
+            source_journal.reference_safe.regressed_noops_total =
+                REFERENCE_SAFE_REGRESSED.load(std::sync::atomic::Ordering::Relaxed),
+            source_journal.reference_safe.equal_noops_total =
+                REFERENCE_SAFE_EQUAL_NOOP.load(std::sync::atomic::Ordering::Relaxed),
+            source_journal.reference_safe.maintenance_total =
+                REFERENCE_SAFE_MAINTENANCE.load(std::sync::atomic::Ordering::Relaxed),
+            source_journal.reference_safe.advances_total =
+                REFERENCE_SAFE_ADVANCED.load(std::sync::atomic::Ordering::Relaxed),
+            "source-journal reference-safe outcomes"
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettlementOutcome {
+    Empty,
+    AlreadySettled,
+    Gap,
+    Advanced,
+}
+
+fn record_settlement_outcome(outcome: SettlementOutcome) {
+    let counter = match outcome {
+        SettlementOutcome::Empty => &SETTLEMENT_EMPTY,
+        SettlementOutcome::AlreadySettled => &SETTLEMENT_ALREADY_SETTLED,
+        SettlementOutcome::Gap => &SETTLEMENT_GAP,
+        SettlementOutcome::Advanced => &SETTLEMENT_ADVANCED,
+    };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let calls = SETTLEMENT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if calls.is_multiple_of(JOURNAL_OUTCOME_REPORT_INTERVAL) {
+        tracing::info!(
+            source_journal.settlement.sample_ordinal = calls / JOURNAL_OUTCOME_REPORT_INTERVAL,
+            source_journal.settlement.unreported_tail_max = JOURNAL_OUTCOME_REPORT_INTERVAL - 1,
+            source_journal.settlement.calls_total = calls,
+            source_journal.settlement.empty_noops_total =
+                SETTLEMENT_EMPTY.load(std::sync::atomic::Ordering::Relaxed),
+            source_journal.settlement.already_settled_noops_total =
+                SETTLEMENT_ALREADY_SETTLED.load(std::sync::atomic::Ordering::Relaxed),
+            source_journal.settlement.gap_noops_total =
+                SETTLEMENT_GAP.load(std::sync::atomic::Ordering::Relaxed),
+            source_journal.settlement.advances_total =
+                SETTLEMENT_ADVANCED.load(std::sync::atomic::Ordering::Relaxed),
+            "source-journal settlement outcomes"
+        );
+    }
+}
+
+fn settlement_noop_outcome(settled_through: u64, offsets: &[u64]) -> SettlementOutcome {
+    if offsets.iter().all(|offset| *offset <= settled_through) {
+        SettlementOutcome::AlreadySettled
+    } else {
+        SettlementOutcome::Gap
+    }
+}
 
 impl Store {
     /// Advances the highest contiguous source offset known durable at every
@@ -11,6 +109,35 @@ impl Store {
         &self,
         offset: u64,
     ) -> Result<(), MutationError> {
+        let current = self
+            .source_journal_reference_safe_through
+            .load(std::sync::atomic::Ordering::Acquire);
+        if offset < current {
+            record_reference_safe_outcome(ReferenceSafeOutcome::Regressed);
+            return Ok(());
+        }
+        let status = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        if offset > status.tail {
+            return Err(MutationError::Storage(format!(
+                "source journal safe-through cursor {offset} is beyond tail {}",
+                status.tail
+            )));
+        }
+        // Equality cannot always be a no-op: an over-limit journal may now be
+        // prunable because another safe cut advanced. Under both bounds there
+        // is no retention work or capacity transition to wake. Concurrent
+        // appends notify independently, and derived checkpoint advancement
+        // runs retention itself.
+        if offset == current
+            && status.retained_entries <= self.watch_retention.max_entries
+            && status.retained_bytes <= self.watch_retention.max_bytes
+        {
+            record_reference_safe_outcome(ReferenceSafeOutcome::EqualNoop);
+            return Ok(());
+        }
+
         let _commit_guard = self.lock_commit("watch_journal").await;
         let status = self
             .local_watch_status()
@@ -19,6 +146,7 @@ impl Store {
             .source_journal_reference_safe_through
             .load(std::sync::atomic::Ordering::Acquire);
         if offset < current {
+            record_reference_safe_outcome(ReferenceSafeOutcome::Regressed);
             return Ok(());
         }
         if offset > status.tail {
@@ -27,12 +155,25 @@ impl Store {
                 status.tail
             )));
         }
+        if offset == current
+            && status.retained_entries <= self.watch_retention.max_entries
+            && status.retained_bytes <= self.watch_retention.max_bytes
+        {
+            record_reference_safe_outcome(ReferenceSafeOutcome::EqualNoop);
+            return Ok(());
+        }
+        let outcome = if offset == current {
+            ReferenceSafeOutcome::Maintenance
+        } else {
+            ReferenceSafeOutcome::Advanced
+        };
         self.source_journal_reference_safe_through
             .store(offset, std::sync::atomic::Ordering::Release);
         self.enforce_local_watch_retention()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         self.mutation_capacity_notify.notify_waiters();
         self.notify_local_invalidations();
+        record_reference_safe_outcome(outcome);
         Ok(())
     }
 
@@ -99,6 +240,7 @@ impl Store {
         offsets: &[u64],
     ) -> Result<Option<u64>, MutationError> {
         if offsets.is_empty() {
+            record_settlement_outcome(SettlementOutcome::Empty);
             return Ok(None);
         }
         let _commit_guard = self.lock_commit("watch_journal").await;
@@ -129,6 +271,7 @@ impl Store {
             through = next;
         }
         if through == status.settled_through {
+            record_settlement_outcome(settlement_noop_outcome(status.settled_through, offsets));
             return Ok(None);
         }
 
@@ -144,6 +287,7 @@ impl Store {
             .map_err(storage_error)?;
         self.mutation_capacity_notify.notify_waiters();
         self.notify_local_invalidations();
+        record_settlement_outcome(SettlementOutcome::Advanced);
         Ok(Some(through))
     }
 
@@ -596,6 +740,173 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn append_local_change(store: &Store, suffix: &str) {
+        store
+            .put(PutRequest {
+                key: ObjectKey::new("tenant", "bucket", format!("reference-safe-{suffix}"))
+                    .unwrap(),
+                bytes: suffix.as_bytes().to_vec(),
+                content_type: None,
+                mode: PutMode::PutIfAbsent,
+                command_id: Some(format!("reference-safe-{suffix}")),
+                durability: Durability::Local,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn equal_reference_safe_under_limits_skips_lock_write_and_wakeup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let status = store.local_watch_status().unwrap();
+        let sequence = store.db.latest_sequence_number();
+        let notifications = store.watch_notify.subscribe();
+        let commit_guard = store.lock_commit("equal-reference-safe-test").await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            store.advance_source_journal_reference_safe_through(status.retention_floor),
+        )
+        .await
+        .expect("an under-limit equality must not wait for the commit lock")
+        .unwrap();
+
+        assert_eq!(store.db.latest_sequence_number(), sequence);
+        assert!(!notifications.has_changed().unwrap());
+        drop(commit_guard);
+    }
+
+    #[tokio::test]
+    async fn equal_reference_safe_over_limits_still_runs_locked_retention() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        append_local_change(&store, "first").await;
+        append_local_change(&store, "second").await;
+        store.watch_retention = WatchRetention::new(1, u64::MAX).unwrap();
+        let before = store.local_watch_status().unwrap();
+        assert!(before.retained_entries > store.watch_retention.max_entries);
+        store
+            .source_journal_reference_safe_through
+            .store(before.tail, std::sync::atomic::Ordering::Release);
+        let sequence = store.db.latest_sequence_number();
+        let notifications = store.watch_notify.subscribe();
+        let commit_guard = store.lock_commit("over-limit-reference-safe-test").await;
+        let call_store = store.clone();
+        let mut call = tokio::spawn(async move {
+            call_store
+                .advance_source_journal_reference_safe_through(before.tail)
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut call)
+                .await
+                .is_err(),
+            "an over-limit equality must wait for locked retention"
+        );
+        drop(commit_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), call)
+            .await
+            .expect("retention must finish after the commit lock is released")
+            .unwrap()
+            .unwrap();
+
+        let after = store.local_watch_status().unwrap();
+        assert!(after.retention_floor > before.retention_floor);
+        assert!(store.db.latest_sequence_number() > sequence);
+        assert!(notifications.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn advancing_reference_safe_rechecks_after_a_raced_advance() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        append_local_change(&store, "race").await;
+        let tail = store.local_watch_status().unwrap().tail;
+        store
+            .source_journal_reference_safe_through
+            .store(0, std::sync::atomic::Ordering::Release);
+        let sequence = store.db.latest_sequence_number();
+        let notifications = store.watch_notify.subscribe();
+        let commit_guard = store.lock_commit("raced-reference-safe-test").await;
+        let call_store = store.clone();
+        let call = tokio::spawn(async move {
+            call_store
+                .advance_source_journal_reference_safe_through(tail)
+                .await
+        });
+        tokio::task::yield_now().await;
+        store
+            .source_journal_reference_safe_through
+            .store(tail, std::sync::atomic::Ordering::Release);
+        drop(commit_guard);
+        call.await.unwrap().unwrap();
+
+        assert_eq!(
+            store
+                .source_journal_reference_safe_through
+                .load(std::sync::atomic::Ordering::Acquire),
+            tail
+        );
+        assert_eq!(store.db.latest_sequence_number(), sequence);
+        assert!(!notifications.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn advancing_regressed_and_future_reference_safe_offsets_keep_their_contracts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        append_local_change(&store, "contracts").await;
+        let tail = store.local_watch_status().unwrap().tail;
+        store
+            .source_journal_reference_safe_through
+            .store(0, std::sync::atomic::Ordering::Release);
+        store
+            .advance_source_journal_reference_safe_through(tail)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .source_journal_reference_safe_through
+                .load(std::sync::atomic::Ordering::Acquire),
+            tail
+        );
+
+        let commit_guard = store.lock_commit("regressed-reference-safe-test").await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            store.advance_source_journal_reference_safe_through(tail - 1),
+        )
+        .await
+        .expect("an obviously regressed offset must not wait for the commit lock")
+        .unwrap();
+        drop(commit_guard);
+
+        let error = store
+            .advance_source_journal_reference_safe_through(tail + 1)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("beyond tail"));
+    }
+
+    #[test]
+    fn settlement_noop_telemetry_distinguishes_replays_from_gaps() {
+        assert_eq!(
+            settlement_noop_outcome(3, &[1, 2, 3]),
+            SettlementOutcome::AlreadySettled
+        );
+        assert_eq!(settlement_noop_outcome(3, &[3, 5]), SettlementOutcome::Gap);
+    }
 
     #[tokio::test]
     async fn open_rejects_a_durable_settled_cursor_beyond_the_raw_tail() {

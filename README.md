@@ -19,15 +19,12 @@ rendezvous hashing.
 | Authorization | 0.10.0 | Application credentials, short-lived JWTs, protected administration, Zanzibar schemas, tuples, roles, and checks |
 | Atomic programs | 0.10.0 | Explicitly selected, deterministic multi-path state transitions without routing ordinary uploads through a transaction system |
 | Distributed clusters | 0.10.0 | Any-node ingress, peer mTLS, replicated metadata, weighted placement, and 2+1 erasure-coded payload durability |
-| Materialized indices | 0.10.0 | Path, object metadata, typed JSON, full text, vector, hybrid, Git-source, and tensor indices |
+| Materialized Typed JSON indices | 0.16.0 | Memory-first partition-owned projection, logical catalog sharing, immutable segment/root publication, and bounded query materialization |
 | Rust client | 0.10.0 | Credential exchange, authenticated clients, streaming upload helpers, and the complete generated gRPC API |
 | PersonalDB, public reads, accounting, S3 and Git | 0.10.0 | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
 | Online cluster growth | 0.10.0 | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
 | Shared public listener | 0.10.0 | Native gRPC, S3, Git, administrative APIs and configured HTTP plugins share one authorized public endpoint; peer mTLS remains isolated |
-| Streaming succinct indices | 0.10.0 | Bounded per-kind construction memory, incremental immutable runs, streaming compaction, `sux`-based merged structures, and lazy block materialization |
-| Sparse index coordination | 0.10.0 | Non-blocking startup, transactional definition locators, routed change journals, scoped recovery, resumable accounting, and budgeted maintenance |
-| Scalable bulk indices | 0.10.0 | Direct bounded bulk builds, packed artifacts, stable compressed postings, authorized rebuilds, and lossless journal backpressure |
-| Native segment indices | 0.10.0 | Keldra-owned immutable segments, exact predicate intersection, optional physical ordering, stable cursors, bounded arbitrary sorting, and shared query-memory admission |
+| Memory-first index pipeline | 0.16.0 | Bounded hot ingress, shared physical recipe routing, partition-local segment/root publication, journal recovery, and CPU/memory-first catch-up |
 | Dates, zero-copy clones, and protected links | 0.15.0 | ISO 8601 or configured date parsing, independent clones sharing immutable payload bytes, and transparent mutable aliases with deletion fencing |
 | General atomic paths | 0.15.0 | Durable path reservations let authorized ordinary paths participate in bounded atomic programs without requiring `PROGRAM_ONLY` policy |
 | Java client | — | TODO |
@@ -49,7 +46,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.15.0
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.16.0
 export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
@@ -161,7 +158,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add keldra@0.15.0
+cargo add keldra@0.16.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -237,7 +234,7 @@ it, and the target cannot be deleted until every inbound link is removed.
 The complete Rust example is in
 [clients/rust/README.md](clients/rust/README.md#clone-bytes-or-link-a-mutable-name).
 Clone and link require cluster protocol/storage capability `2/2`; complete the
-0.15 activation runbook below before using them.
+0.16 activation runbook below before using them.
 
 ## Create a PersonalDB group
 
@@ -249,7 +246,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add keldra@0.15.0 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.16.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -562,80 +559,70 @@ The lifecycle is deliberately explicit:
    the nominated executor, and publishes every resulting head atomically.
 
 Ordinary uploads—including large media—continue to use `Put`; they never enter
-this orchestration path. A complete two-document program and invocation is kept
-executable in
-[`scripts/qualify-three-node.sh`](scripts/qualify-three-node.sh).
+this orchestration path. The retained historical three-node Docker qualification
+contains a complete two-document program and invocation fixture.
 
 ## Create and query indices
 
-Indices are bucket-local definitions scoped by an optional path prefix and
-content type. Each definition's HRW-selected writer consumes every node's
-ordered source journal, writes bounded immutable native segments, merges
-deterministic size tiers, and publishes complete generations through the
-ordinary object store. Seekable postings and numeric points intersect selective
-predicates before typed doc values are read; an optional definition-time
-physical order supports early termination and true search-after pagination.
-Hits identify authoritative objects instead of copying source fields into the
-index. Up to three HRW-selected query replicas materialize only the blocks a
-query needs through the shared bounded cache.
-Construction and query memory share one hard process-wide ceiling, so corpus
-size does not become unaccounted heap. Per-kind construction settings and the
-query setting remain fair-share planning targets; active work can borrow idle
-capacity without crossing the aggregate ceiling. Query responses always
-include freshness evidence; while a new complete generation is building,
-Keldra continues serving the preceding complete generation rather than exposing
-a partial one.
+Typed JSON is the current materialized-index surface. The clean-break v6
+pipeline consumes each source partition in order, keeps bounded hot work in
+memory, shares extraction and physical recipes across logically equivalent
+definitions, and publishes immutable partition roots at durable checkpoints.
+Logical definitions are catalog state and equivalent definitions share physical
+recipes. Query nodes materialize the exact published root vector needed for
+their atomic cut and perform the
+authoritative object/version check before returning a hit. The pipeline recovers
+from the durable source journal after a restart, so its in-memory queues are
+not a second authority.
 
-The startup default is 256 MiB of construction memory and at most four
-compaction lanes for each index kind, shared by every local definition of that
-kind, with four Rayon workers across the process. Set
-`KELDRA_INDEX_BUILDER_MEMORY_BYTES_PER_KIND` for the common memory fallback and
-`KELDRA_INDEX_RAYON_WORKERS` for the process-wide worker ceiling. Every kind can
-override the fallback and lane cap independently with
-`KELDRA_INDEX_<KIND>_BUILDER_MEMORY_BYTES` and
-`KELDRA_INDEX_<KIND>_COMPACTION_MAX_LANES`, where `<KIND>` is `PATH`,
-`METADATA_FILTER`, `TYPED_JSON`, `FULL_TEXT`, `VECTOR`, `HYBRID`, `GIT_SOURCE`,
-or `TENSOR`.
+The current operational scale runbook is
+[index contention qualification](docs/qualification/index-contention.md). It
+defines the CPU- and memory-normalized SSD qualification and the v6 telemetry
+required to claim ingestion/index catch-up. The architecture contract is
+[KELDRA-0020](docs/rfcs/keldra_0020_logical_index_catalog_and_shared_physical_projections.md).
 
-Projection concurrency also defaults to four lanes per kind. Configure it with
-`KELDRA_INDEX_PATH_PROJECTION_MAX_LANES`,
-`KELDRA_INDEX_METADATA_FILTER_PROJECTION_MAX_LANES`,
-`KELDRA_INDEX_TYPED_JSON_PROJECTION_MAX_LANES`,
-`KELDRA_INDEX_FULL_TEXT_PROJECTION_MAX_LANES`,
-`KELDRA_INDEX_VECTOR_PROJECTION_MAX_LANES`,
-`KELDRA_INDEX_HYBRID_PROJECTION_MAX_LANES`,
-`KELDRA_INDEX_GIT_SOURCE_PROJECTION_MAX_LANES`, and
-`KELDRA_INDEX_TENSOR_PROJECTION_MAX_LANES`. These caps share the process Rayon
-worker pool and the corresponding kind's construction-memory budget.
+### Current v6 resource controls
 
-`KELDRA_INDEX_MAX_SEGMENTS_PER_TIER` and
-`KELDRA_INDEX_MAX_UNMERGED_BYTES_PER_TIER` bound merge debt, with per-kind
-overrides following the same naming pattern. `KELDRA_INDEX_QUERY_MEMORY_BYTES`
-is the query fair share. `KELDRA_INDEX_WORKING_MEMORY_BYTES` optionally sets the
-hard aggregate query/build/compaction ceiling; without it, Keldra uses the
-checked sum of the query and eight per-kind shares (2.5 GiB with defaults).
-Queries and builders can borrow idle bytes and derive their workspace from the
-actual grant, while queued mandatory work retains FIFO priority.
+The indexing pipeline is CPU- and memory-scalable.
+`KELDRA_INDEXING_CORES` sets the process indexing-worker ceiling and
+`KELDRA_INDEX_PIPELINE_MEMORY_BYTES` bounds aggregate pipeline memory. Plan on
+256 MiB per indexing core unless measured evidence supports another allocation.
+`KELDRA_INDEX_WORKING_MEMORY_BYTES` is the hard aggregate ceiling and must admit
+the pipeline plus `KELDRA_INDEX_QUERY_MEMORY_BYTES`. Segment formation uses
+`KELDRA_INDEX_FLUSH_BYTES`, `KELDRA_INDEX_FLUSH_MAX_AGE_MILLIS`, and
+`KELDRA_INDEX_FLUSH_MAX_OPERATIONS`; LSM debt uses
+`KELDRA_INDEX_LSM_MAX_RUNS_PER_LEVEL` and
+`KELDRA_INDEX_LSM_MAX_UNMERGED_BYTES_PER_LEVEL`. These are node-wide controls.
+
+Single-node mutation group commit can be tuned without rebuilding the server.
+Pass a strict JSON file with `--config-file` or `KELDRA_CONFIG_FILE`:
+
+```json
+{
+  "single_node_group_commit": {
+    "max_requests": 10,
+    "max_operations": 5000,
+    "max_inline_bytes": 67108864,
+    "max_queued_requests": 64,
+    "max_queued_operations": 8000,
+    "max_queued_inline_bytes": 134217728,
+    "group_dwell_microseconds": 250
+  }
+}
+```
+
+Each field also has a `KELDRA_SINGLE_NODE_GROUP_COMMIT_*` environment variable
+and a matching `--single-node-group-commit-*` argument. Precedence is command
+line, then environment, then JSON file, then the compiled default. The server
+rejects zero or contradictory bounds and logs the complete effective group
+configuration at startup.
 
 `BulkWrite` accepts at most 1,000 operations and 64 MiB of encoded protobuf.
 Its independent server deadline defaults to ten minutes and is configured with
 `KELDRA_BULK_WRITE_TIMEOUT_SECONDS`; a shorter client `grpc-timeout` still wins.
-This deadline is separate from `KELDRA_ATOMIC_PROGRAM_TIMEOUT_SECONDS`, so
-ordinary ingestion on slower durable storage does not weaken atomic-program
-execution bounds.
-
-Actual compaction concurrency is the minimum of that kind's configured cap,
-the process worker ceiling, the number of deterministic key ranges, and the
-memory admission `1 + floor((kind budget - shared workspace) / incremental
-lane workspace)`. A cap of one preserves the sequential merge path. Cache
-limits remain separate: `KELDRA_INDEX_DISK_CACHE_BYTES` controls the shared
-disposable disk cache and `KELDRA_INDEX_MEMORY_PERCENT` caps aggregate in-flight
-block materialization. Immutable cache files are read through mmap, allowing
-the operating system to retain clean hot pages and reclaim them under pressure.
-`QueryIndex` has a separate five-minute server maximum so a cold first page can
-materialize the required blocks without inheriting the ordinary 30-second RPC
-limit. Set `KELDRA_INDEX_QUERY_TIMEOUT_SECONDS` at startup to tune it; a shorter
-client `grpc-timeout` always wins.
+This deadline is separate from `KELDRA_ATOMIC_PROGRAM_TIMEOUT_SECONDS`.
+`QueryIndex` uses its own startup-configured request limit,
+`KELDRA_INDEX_QUERY_TIMEOUT_SECONDS`, subject to a shorter client deadline.
 
 Construct an authenticated index client from the same token used for objects:
 
@@ -656,20 +643,12 @@ let mut indices = index_client(channel, &token.access_token)?;
 # }
 ```
 
-Call `CreateIndex` with a `CreateIndexRequest`, then `QueryIndex` with the
-matching query variant. These are the eight engines and their minimal useful
-definitions:
+Call `CreateIndex` with a Typed JSON `CreateIndexRequest`, then `QueryIndex`
+with a `TypedJsonIndexQuery`. Typed fields map to JSON Pointers and explicitly
+declare their exact, prefix, range, order, facet, aggregate, or full-text
+capabilities.
 
-| Engine | Definition | Query | Source object shape |
-| --- | --- | --- | --- |
-| Path | `PathIndexSpec {}` | `PathIndexQuery { prefix, start_after }` | Any object |
-| Metadata filter | fields such as `path`, `content_type`, `content_length` | Predicates over retained head fields | Any object |
-| Typed JSON | typed fields mapped to JSON Pointers with explicit exact, prefix, range, order, facet, aggregate, or full-text capabilities | Capability-checked predicates, ordering, facets, and numeric aggregates | `{"status":"active"}` |
-| Full text | named text fields mapped to JSON Pointers | Text or phrase query | `{"body":"durable journal delivery"}` |
-| Vector | JSON Pointer, dimensions, cosine/dot/Euclidean metric | A vector with the declared dimensions | `{"embedding":[1.0,0.0,0.0]}` |
-| Hybrid | Full-text and vector specifications plus weights | Text and vector together | `{"title":"rust search","embedding":[1.0,0.0,0.0]}` |
-| Git source | Repository ID | Commit ID and exact/prefix tree path | Git manifest containing repository, commit, tree path, object ID, pack path/version, offset, and length |
-| Tensor | Model ID | Tensor name | Tensor manifest containing model, tensor name, source path/version, offset, length, dtype, and shape |
+### Typed JSON API
 
 For example, the Rust builder makes the field type and its permitted operations
 explicit. This definition indexes `/status` as an exact, uninterpreted keyword;
@@ -728,27 +707,24 @@ predicates, ordering, and facets, but not aggregates. Date predicate literals
 use the field's configured format, and facet bucket values are formatted back
 with that same format.
 
-The repository's public-API qualification constructs, populates, paginates,
-updates, deletes, rebuilds, and restart-verifies all eight variants in
-[`crates/keldra/examples/cluster_index_qualification.rs`](crates/keldra/examples/cluster_index_qualification.rs).
-Tensor coverage separately removes a referenced result object while its source
-manifest remains current, exercising the public no-stale-version boundary
-rather than relying only on the next index generation.
-Its Typed JSON case exercises every field type and declared capability,
+The v6 public-API and SSD qualification constructs, populates, paginates,
+updates, deletes, restart-recovers, and load-tests Typed JSON definitions. It
+exercises every field type and declared capability,
 including multi-valued exact/facet/aggregate semantics, fielded text and phrase
 search, identity-only hits, facets, and all five numeric aggregate operations.
 The production-shaped qualification binds
 those result checks to per-query logical reads, candidate counts, cursor seeks,
 cache fetches, CPU, memory, and elapsed time from Keldra's operational signals.
 
-## Run a three-node cluster
+## Run a three-node non-index qualification
 
-The local qualification starts three real nodes, admits joiners with one-use
+The Docker qualification starts three real nodes, admits joiners with one-use
 bundles, establishes peer mTLS, exercises replicated and erasure-coded storage,
-queries every index type, and performs a rolling restart:
+and performs a rolling restart. Index qualification is a separate SSD-kit
+phase:
 
 ```sh
-KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.15.0 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.16.0 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -767,13 +743,14 @@ Production formation uses the same sequence:
 The public gRPC endpoint may sit behind an ordinary TLS terminator. Peer traffic
 uses mandatory certificates created and rotated by the cluster.
 
-### Start 0.15 on fresh volumes and activate its capabilities
+### Start 0.16 on fresh volumes and activate its capabilities
 
-Keldra 0.15 is a clean storage-format break. Start every 0.15 node with fresh
-authoritative volumes; it does not open, migrate, or reuse a 0.14 data volume.
-Mixed 0.14/0.15 clusters are unsupported. If application data must move from an
-older cluster, keep that cluster separate and import the data through the public
-API as new writes.
+Keldra 0.16 is a clean storage-format and index-architecture break. Start every
+0.16 node with fresh authoritative and derived-index volumes; it does not open,
+migrate, or reuse a volume from an earlier Keldra release. Mixed 0.15/0.16
+clusters are unsupported. If application data must move from an older cluster,
+keep that cluster separate and import the data through the public API as new
+writes.
 
 Inspect cluster capabilities. Activation is safe only when it reports active
 protocol/storage `1/1`, target `2/2`, no blocking ACTIVE node IDs,
@@ -797,8 +774,8 @@ administration commands. The status command prints the exact activation command
 when the cluster is ready.
 
 Before admitting production traffic, smoke clone independence, link
-write-through, target-delete fencing, unlink, and date queries. Never start a
-0.14 binary against a volume initialized or touched by 0.15.
+write-through, target-delete fencing, unlink, and date queries. Never start an
+earlier Keldra binary against a volume initialized or touched by 0.16.
 
 ### Place storage by workload
 
@@ -858,17 +835,18 @@ locks, and index files do not.
 
 Names resolve to stable numeric IDs, so renaming human-facing identifiers does
 not rewrite every storage key. Ordered per-node source journals feed watches,
-reference accounting, and the single writer for each materialized index. Index
-artifacts are ordinary Keldra objects; local materialization is disposable
-acceleration, not another authoritative storage plane.
+reference accounting, and each node's assigned v6 index partitions. Immutable
+index artifacts are ordinary Keldra objects; local materialization is
+disposable acceleration, not another authoritative storage plane.
 
 The architecture contracts live in
 [KELDRA-0009](docs/rfcs/keldra_0009_atomic_programs.md) and
 [KELDRA-0010](docs/rfcs/keldra_0010_cluster_distribution.md). The current
 clean-break native-segment index architecture is specified by
 [KELDRA-0014](docs/rfcs/keldra_0014_native_segment_indexes.md). The approved
-clean-break 0.15 payload layout, lifecycle, GC, replication boundary, and WAL
-contract is specified by
+integrated payload layout, lifecycle, GC, replication boundary, and WAL
+contract—introduced in 0.15 and retained within 0.16's fresh-volume
+requirement—is specified by
 [KELDRA-0018](docs/rfcs/keldra_0018_integrated_payload_storage.md).
 
 ## Build and qualify
@@ -885,29 +863,20 @@ Build and qualify the container locally before CI:
 ```sh
 KELDRA_IMAGE=keldra:local ./scripts/build-image.sh
 KELDRA_IMAGE=keldra:local ./scripts/release-gates.sh image
-KELDRA_QUALIFICATION_MODE=release \
-KELDRA_QUALIFICATION_INDEX_KIND_BUDGET_BYTES=268435456 \
-KELDRA_QUALIFICATION_INDEX_COMPACTION_MAX_LANES=4 \
-KELDRA_QUALIFICATION_INDEX_RAYON_WORKERS=4 \
-KELDRA_QUALIFICATION_INDEX_MAX_ANONYMOUS_GROWTH_BYTES=2147483648 \
-  KELDRA_IMAGE=keldra:local ./scripts/qualify-single-node.sh
-KELDRA_QUALIFICATION_MODE=release \
-  KELDRA_IMAGE=keldra:local ./scripts/qualify-three-node.sh
+# On the attested SSD binary kit; see docs/qualification/index-contention.md.
+cd ~/keldra_experiments/kit
+KELDRA_V6_SCALE_MODE=sustained ./qualify-index-v6-ssd-scale.sh
 ```
 
-The production-shaped index qualification generates 839,980 private-data-free
-JSON objects with 12 indexed fields, verifies every live path and version after
-updates and deletes, and records phase-by-phase RSS and anonymous-memory peaks.
-The wrapper scripts above build the release-mode qualification client, bind the
-evidence to the exact image revision, and run the client directly so Cargo does
-not hold the shared build lock during the long qualification.
+The v6 qualification kit verifies its source revision and checksums before
+running. It records offered, accepted, source, selected, prepared, projected,
+sealed, and checkpointed throughput; source lag and drain; query latency; and
+CPU, RSS, WAL/store-write evidence under `~/keldra_experiments`. The
+single-node and three-node wrappers qualify non-index storage, authorization,
+and cluster behavior only.
 
-The pinned `sux` and Rayon dependencies, resolved versions, and license choices are
-recorded in [the index dependency record](docs/dependency-licenses.md).
-
-Keldra 0.11 deployments start with new volumes. Format-v4 index definitions and
-native segment artifacts are built from authoritative source objects rather
-than migrated from format v3. Current operational boundaries are collected in
-the [known limitations](docs/known-limitations.md).
+Keldra 0.16 deployments start on fresh authoritative and derived-index volumes.
+Current operational boundaries are collected in the [known
+limitations](docs/known-limitations.md).
 
 Apache-2.0 licensed.

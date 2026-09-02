@@ -13,6 +13,28 @@ fn store_options_default_to_the_existing_root_layout() {
     assert_eq!(options.payload_directory, root.join("blobs"));
     assert_eq!(options.max_total_wal_bytes, 50 * 1024 * 1024 * 1024);
     assert_eq!(options.pending_upload_max_bytes, 16 * 1024 * 1024 * 1024);
+    assert_eq!(options.single_node_group_commit.max_group_requests(), 5);
+    assert_eq!(
+        options.single_node_group_commit.max_group_operations(),
+        5_000
+    );
+    assert_eq!(
+        options.single_node_group_commit.max_group_inline_bytes(),
+        64 * 1024 * 1024
+    );
+    assert_eq!(options.single_node_group_commit.max_queued_requests(), 64);
+    assert_eq!(
+        options.single_node_group_commit.max_queued_operations(),
+        8_000
+    );
+    assert_eq!(
+        options.single_node_group_commit.max_queued_inline_bytes(),
+        128 * 1024 * 1024
+    );
+    assert_eq!(
+        options.single_node_group_commit.max_group_dwell(),
+        std::time::Duration::from_micros(250)
+    );
 }
 
 #[tokio::test]
@@ -112,6 +134,32 @@ async fn existing_store_without_the_integrated_format_marker_is_rejected() {
 }
 
 #[tokio::test]
+async fn existing_store_without_the_durable_mutation_record_marker_is_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let options = StoreOptions::new(temporary.path(), 1);
+    let store = Store::open(options.clone()).await.unwrap();
+    store
+        .db
+        .delete_cf(
+            store.cf(CF_METADATA).unwrap(),
+            DURABLE_MUTATION_RECORD_FORMAT_KEY,
+        )
+        .unwrap();
+    drop(store);
+
+    let error = Store::open(options)
+        .await
+        .err()
+        .expect("missing durable mutation record marker must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("has no durable mutation record format marker")
+    );
+}
+
+#[tokio::test]
 async fn pre_integrated_column_family_layout_is_rejected_without_migration() {
     let temporary = tempfile::tempdir().unwrap();
     let metadata = temporary.path().join("metadata");
@@ -131,7 +179,7 @@ async fn pre_integrated_column_family_layout_is_rejected_without_migration() {
     assert!(
         error
             .to_string()
-            .contains("does not use the exact 0.15 integrated payload layout")
+            .contains("does not use the exact 0.16 storage layout")
     );
 }
 

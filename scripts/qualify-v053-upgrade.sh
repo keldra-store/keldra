@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Historical pre-0.15 upgrade evidence. Clean-break 0.15 deployments start on
+# fresh volumes and do not run this migration qualification.
+echo "qualify-v053-upgrade.sh is superseded historical upgrade evidence; 0.15 starts on fresh volumes." >&2
+exit 2
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 legacy_image="ghcr.io/worka-ai/keldra:0.5.3"
 candidate_image="${KELDRA_IMAGE:?KELDRA_IMAGE must name the already-built candidate image}"

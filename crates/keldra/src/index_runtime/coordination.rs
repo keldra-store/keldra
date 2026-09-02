@@ -26,14 +26,23 @@ use crate::data_peer::DataPeerTransport;
 use crate::index_service::{StoredIndexDefinition, definition_path};
 
 use super::catalog::{CatalogDefinition, CatalogIdentity, IndexCatalog};
+use super::events::IndexEventJournal;
 use super::events::MAX_INDEX_EVENT_PAGE_BYTES;
-use super::placement::{IndexIdentity, IndexPlacement};
-
+use super::placement::IndexPlacement;
+mod assignment_loading;
 #[path = "coordination/assignment_recovery.rs"]
 mod assignment_recovery;
+#[path = "coordination/catalog_checkpoint.rs"]
+mod catalog_checkpoint;
 #[path = "coordination/delivery_checkpoint.rs"]
 mod delivery_checkpoint;
 mod reconcile;
+use assignment_loading::{
+    assignment_placement, consumer_kind, delivery_consumer_kind, fence_after, internal_status,
+    join_status, mutation_identity, refresh_index_assignment, remove_stale_assignment,
+    require_placement,
+};
+pub(crate) use assignment_loading::{current_placement, load_index_assignment};
 use assignment_recovery::AssignmentInventoryRecovery;
 use delivery_checkpoint::{
     DeliveryProgress, advance_assignment_checkpoints, commit_delivery_progress,
@@ -46,7 +55,6 @@ const MEMBERSHIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const ASSIGNMENT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_DEFINITION_BYTES: u64 = 64 * 1024 * 1024;
 const LOCATOR_MERGE_SOURCE_PAGE: u32 = 64;
-
 #[derive(Clone)]
 pub(crate) struct ClusterDefinitionLocatorScanner {
     local_node: NodeId,
@@ -54,7 +62,6 @@ pub(crate) struct ClusterDefinitionLocatorScanner {
     store: Store,
     peers: DataPeerTransport,
 }
-
 impl ClusterDefinitionLocatorScanner {
     pub(crate) fn new(
         local_node: NodeId,
@@ -151,7 +158,6 @@ impl ClusterDefinitionLocatorScanner {
         })
     }
 }
-
 struct LocatorSource {
     node: NodeId,
     address: String,
@@ -159,7 +165,6 @@ struct LocatorSource {
     buffered: VecDeque<DefinitionLocator>,
     exhausted: bool,
 }
-
 pub(crate) struct ClusterDefinitionLocatorScan {
     scanner: ClusterDefinitionLocatorScanner,
     scope: LocatorScanScope,
@@ -167,7 +172,6 @@ pub(crate) struct ClusterDefinitionLocatorScan {
     sources: Vec<LocatorSource>,
     finished: bool,
 }
-
 #[derive(Clone, Copy)]
 enum LocatorScanScope {
     Kind(DefinitionKind),
@@ -177,7 +181,6 @@ enum LocatorScanScope {
         bucket_id: u64,
     },
 }
-
 impl ClusterDefinitionLocatorScan {
     /// Return one bounded, globally ordered page. Replicated copies are
     /// adjacent by canonical definition path and collapse to the highest
@@ -305,7 +308,6 @@ impl ClusterDefinitionLocatorScan {
         Ok(fill)
     }
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocatorSourceFill {
     Ready,
@@ -465,9 +467,13 @@ impl DefinitionCoordinationTask {
         cluster_peers: ClusterPeerTransport,
         reader: ClusterObjectReader,
         catalog: IndexCatalog,
+        journal: std::sync::Arc<IndexEventJournal>,
     ) -> Self {
         let mut tasks = Vec::new();
-        for kind in [DefinitionKind::Index, DefinitionKind::Accounting] {
+        // TypedJson v6 has one all-source catalog feed, not index definition
+        // assignment delivery. `V6IndexCatalog` is exclusively owned by that
+        // feed's baseline/replay checkpoint below.
+        for kind in [DefinitionKind::Accounting] {
             tasks.push(tokio::spawn(run_source_delivery(
                 kind,
                 local_node,
@@ -482,15 +488,197 @@ impl DefinitionCoordinationTask {
             local_node,
             decisions.clone(),
             store.clone(),
-            peers,
+            peers.clone(),
             cluster_peers,
             reader.clone(),
         )));
-        tasks.push(tokio::spawn(run_index_assignments(
-            local_node, decisions, store, reader, catalog,
+        tasks.push(tokio::spawn(run_index_catalog(
+            ClusterDefinitionLocatorScanner::new(local_node, decisions.clone(), store, peers),
+            reader,
+            catalog,
+            journal,
         )));
         Self { tasks }
     }
+}
+
+/// Compile the authoritative ordinary index-definition catalog on every
+/// active source owner. Assignment records are deliberately not consulted:
+/// they belonged to the removed one-builder-per-definition architecture.
+async fn run_index_catalog(
+    scanner: ClusterDefinitionLocatorScanner,
+    reader: ClusterObjectReader,
+    catalog: IndexCatalog,
+    journal: std::sync::Arc<IndexEventJournal>,
+) {
+    loop {
+        let result = run_index_catalog_epoch(&scanner, &reader, &catalog, &journal).await;
+        match result {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::warn!(%error, "authoritative index catalog refresh will retry");
+                tokio::time::sleep(ASSIGNMENT_RETRY_INTERVAL).await;
+            }
+        }
+    }
+}
+
+async fn run_index_catalog_epoch(
+    scanner: &ClusterDefinitionLocatorScanner,
+    reader: &ClusterObjectReader,
+    catalog: &IndexCatalog,
+    journal: &IndexEventJournal,
+) -> Result<(), Status> {
+    // Capture before the baseline scan. Every definition committed while the
+    // scan is open is therefore either already visible in the scan or replayed
+    // idempotently from this exact all-source control-plane cut.
+    let mut cursor = journal
+        .capture_barrier()
+        .await
+        .map_err(index_event_status)?;
+    refresh_index_catalog(scanner, reader, catalog).await?;
+    let mut replayed_rows = 0_u64;
+    let mut replayed_bytes = 0_u64;
+    loop {
+        let target = journal
+            .capture_barrier()
+            .await
+            .map_err(index_event_status)?;
+        while let Some(page) = journal
+            .next_definition_page(
+                DefinitionKind::Index,
+                &cursor,
+                &target,
+                MAX_INDEX_EVENT_PAGE_BYTES,
+            )
+            .await
+            .map_err(index_event_status)?
+        {
+            replayed_rows = replayed_rows.saturating_add(page.changes.len() as u64);
+            replayed_bytes = replayed_bytes.saturating_add(page.encoded_bytes);
+            for change in &page.changes {
+                let transition = definition_transition(DefinitionKind::Index, &change.change)?;
+                apply_index_catalog_transition(reader, catalog, transition).await?;
+            }
+            cursor = page.through;
+        }
+        // This is the one durable proof that an otherwise empty local catalog
+        // has completed its baseline inventory and the exact all-source
+        // journal suffix through `target`. Retention must never infer that
+        // proof from an empty in-memory map.
+        catalog_checkpoint::persist(&scanner.store, &cursor, replayed_rows, replayed_bytes).await?;
+        replayed_rows = 0;
+        replayed_bytes = 0;
+        tokio::time::sleep(DELIVERY_IDLE_INTERVAL).await;
+    }
+}
+
+async fn refresh_index_catalog(
+    scanner: &ClusterDefinitionLocatorScanner,
+    reader: &ClusterObjectReader,
+    catalog: &IndexCatalog,
+) -> Result<(), Status> {
+    let mut scan = scanner.begin_kind(
+        DefinitionKind::Index,
+        &current_placement(&scanner.decisions)?,
+    )?;
+    while let Some(page) = scan
+        .next_page(MAX_DEFINITION_STATE_SCAN_RECORDS as usize)
+        .await?
+    {
+        for locator in page {
+            let identity = CatalogIdentity {
+                tenant_id: locator.tenant_id,
+                bucket_id: locator.bucket_id,
+                index_id: locator.definition_id,
+            };
+            match locator.operation {
+                DefinitionOperation::Delete => {
+                    catalog
+                        .delete_wait(identity, locator.object_version.0)
+                        .await?;
+                }
+                DefinitionOperation::Upsert => {
+                    let Some(opened) = load_definition_locator_object(reader, &locator).await?
+                    else {
+                        return Err(Status::unavailable(
+                            "live index definition changed during catalog compilation",
+                        ));
+                    };
+                    let stored = StoredIndexDefinition::decode(&opened.bytes)?;
+                    if stored.index_id != locator.definition_id
+                        || definition_path(&stored.name)? != locator.path
+                    {
+                        return Err(Status::data_loss(
+                            "index locator identity disagrees with its ordinary definition",
+                        ));
+                    }
+                    catalog
+                        .upsert_wait(CatalogDefinition::new(
+                            locator.tenant_id,
+                            locator.bucket_id,
+                            opened.object_version.0,
+                            stored,
+                        )?)
+                        .await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn apply_index_catalog_transition(
+    reader: &ClusterObjectReader,
+    catalog: &IndexCatalog,
+    transition: &DefinitionTransition,
+) -> Result<(), Status> {
+    let identity = CatalogIdentity {
+        tenant_id: transition.tenant_id,
+        bucket_id: transition.bucket_id,
+        index_id: transition.definition_id,
+    };
+    match transition.operation {
+        DefinitionOperation::Delete => {
+            catalog
+                .delete_wait(identity, transition.object_version.0)
+                .await
+        }
+        DefinitionOperation::Upsert => {
+            let Some(opened) = load_definition_object(
+                reader,
+                transition.tenant_id,
+                transition.bucket_id,
+                &transition.path,
+                transition.object_version,
+            )
+            .await?
+            else {
+                // A later journal record names the currently selected version.
+                return Ok(());
+            };
+            let stored = StoredIndexDefinition::decode(&opened.bytes)?;
+            if stored.index_id != transition.definition_id
+                || definition_path(&stored.name)? != transition.path
+            {
+                return Err(Status::data_loss(
+                    "index transition identity disagrees with its ordinary definition",
+                ));
+            }
+            catalog
+                .upsert_wait(CatalogDefinition::new(
+                    transition.tenant_id,
+                    transition.bucket_id,
+                    opened.object_version.0,
+                    stored,
+                )?)
+                .await
+        }
+    }
+}
+
+fn index_event_status(error: super::events::IndexEventError) -> Status {
+    Status::unavailable(format!("index catalog journal: {error}"))
 }
 
 impl Drop for DefinitionCoordinationTask {
@@ -1190,7 +1378,7 @@ async fn apply_membership_change(
 ) -> Result<(), Status> {
     transfer_assignments(local_node, decisions, store, peers, placement).await?;
     if reconcile_locators {
-        for kind in [DefinitionKind::Index, DefinitionKind::Accounting] {
+        for kind in [DefinitionKind::Accounting] {
             reconcile::reconcile_kind(
                 kind,
                 local_node,
@@ -1225,7 +1413,7 @@ async fn transfer_assignments(
     peers: &DataPeerTransport,
     placement: &ClusterPlacement,
 ) -> Result<(), Status> {
-    for kind in [DefinitionKind::Index, DefinitionKind::Accounting] {
+    for kind in [DefinitionKind::Accounting] {
         let mut cursor: Option<DefinitionAssignmentCursor> = None;
         loop {
             let page = {
@@ -1466,166 +1654,6 @@ async fn scan_index_assignment_page(
     Ok(page.next_cursor)
 }
 
-async fn refresh_index_assignment(
-    local_node: NodeId,
-    decisions: &DecisionRaft,
-    store: &Store,
-    reader: &ClusterObjectReader,
-    catalog: &IndexCatalog,
-    identity: (u64, u64, u64),
-) -> Result<(), Status> {
-    catalog.remove(identity.0, identity.1, identity.2)?;
-    let assignment = {
-        let store = store.clone();
-        tokio::task::spawn_blocking(move || {
-            store.definition_assignment(DefinitionKind::Index, identity.0, identity.1, identity.2)
-        })
-        .await
-        .map_err(join_status)?
-        .map_err(internal_status)?
-    };
-    let Some(assignment) = assignment else {
-        return Ok(());
-    };
-    if assignment.rank != 0 {
-        return Ok(());
-    }
-    match load_index_assignment(local_node, decisions, reader, &assignment).await? {
-        Some(definition) => catalog.upsert(definition)?,
-        None => remove_stale_assignment(store, &assignment).await?,
-    }
-    Ok(())
-}
-
-async fn remove_stale_assignment(
-    store: &Store,
-    assignment: &DefinitionAssignment,
-) -> Result<(), Status> {
-    let assignment = assignment.clone();
-    let store = store.clone();
-    tokio::task::spawn_blocking(move || store.remove_definition_assignment_if_matches(&assignment))
-        .await
-        .map_err(join_status)?
-        .map(|_| ())
-        .map_err(internal_status)
-}
-
-pub(crate) async fn load_index_assignment(
-    local_node: NodeId,
-    decisions: &DecisionRaft,
-    reader: &ClusterObjectReader,
-    assignment: &DefinitionAssignment,
-) -> Result<Option<CatalogDefinition>, Status> {
-    assignment
-        .validate()
-        .map_err(|error| Status::data_loss(error.to_string()))?;
-    if assignment.kind != DefinitionKind::Index {
-        return Ok(None);
-    }
-    let placement = current_placement(decisions)?;
-    let owners = assignment_placement(
-        assignment.tenant_id,
-        assignment.bucket_id,
-        assignment.definition_id,
-        &placement,
-    )?;
-    if owners.rank_of(local_node) != Some(assignment.rank)
-        || assignment.observed_fence != placement.fence()
-    {
-        return Ok(None);
-    }
-    let Some(opened) = load_assigned_definition_object(reader, assignment).await? else {
-        return Ok(None);
-    };
-    let stored = StoredIndexDefinition::decode(&opened.bytes)?;
-    if stored.index_id != assignment.definition_id
-        || definition_path(&stored.name)? != assignment.definition_path
-    {
-        return Err(Status::data_loss(
-            "assigned index identity disagrees with the ordinary definition",
-        ));
-    }
-    require_placement(decisions, placement.fence())?;
-    Ok(Some(CatalogDefinition::new(
-        assignment.tenant_id,
-        assignment.bucket_id,
-        opened.object_version.0,
-        stored,
-    )?))
-}
-
-fn mutation_identity(mutation: &DefinitionAssignmentMutation) -> (u64, u64, u64) {
-    match mutation {
-        DefinitionAssignmentMutation::Upsert(value) => {
-            (value.tenant_id, value.bucket_id, value.definition_id)
-        }
-        DefinitionAssignmentMutation::Delete(value) => {
-            (value.tenant_id, value.bucket_id, value.definition_id)
-        }
-        DefinitionAssignmentMutation::Remove {
-            tenant_id,
-            bucket_id,
-            definition_id,
-            ..
-        } => (*tenant_id, *bucket_id, *definition_id),
-    }
-}
-
-fn assignment_placement(
-    tenant_id: u64,
-    bucket_id: u64,
-    definition_id: u64,
-    placement: &ClusterPlacement,
-) -> Result<IndexPlacement, Status> {
-    let identity = IndexIdentity::new(tenant_id, bucket_id, definition_id)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    IndexPlacement::derive(identity, placement)
-        .map_err(|error| Status::unavailable(error.to_string()))
-}
-
-fn consumer_kind(kind: DefinitionKind) -> DefinitionConsumerKind {
-    match kind {
-        DefinitionKind::Index => DefinitionConsumerKind::IndexAssignments,
-        DefinitionKind::Accounting => DefinitionConsumerKind::AccountingAssignments,
-    }
-}
-
-fn delivery_consumer_kind(kind: DefinitionKind) -> DefinitionConsumerKind {
-    match kind {
-        DefinitionKind::Index => DefinitionConsumerKind::IndexDelivery,
-        DefinitionKind::Accounting => DefinitionConsumerKind::AccountingDelivery,
-    }
-}
-
-pub(crate) fn current_placement(decisions: &DecisionRaft) -> Result<ClusterPlacement, Status> {
-    let state = decisions
-        .state()
-        .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
-    ClusterPlacement::from_applied(&state).map_err(|error| Status::unavailable(error.to_string()))
-}
-
-fn require_placement(decisions: &DecisionRaft, expected: PlacementLogId) -> Result<(), Status> {
-    if current_placement(decisions)?.fence() == expected {
-        Ok(())
-    } else {
-        Err(Status::unavailable(
-            "cluster placement changed during definition coordination",
-        ))
-    }
-}
-
-fn fence_after(left: PlacementLogId, right: PlacementLogId) -> bool {
-    (left.term, left.index) > (right.term, right.index)
-}
-
-fn join_status(error: tokio::task::JoinError) -> Status {
-    Status::internal(format!("definition coordination task failed: {error}"))
-}
-
-fn internal_status(error: impl std::fmt::Display) -> Status {
-    Status::internal(error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1834,7 +1862,7 @@ mod tests {
             40,
             50,
             Some(DefinitionCheckpoint {
-                consumer_kind: DefinitionConsumerKind::IndexDelivery,
+                consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
                 source_id: source,
                 next_offset: 47,
                 observed_fence: PlacementLogId { term: 2, index: 9 },
@@ -1876,7 +1904,7 @@ mod tests {
         for checkpoint in [
             None,
             Some(DefinitionCheckpoint {
-                consumer_kind: DefinitionConsumerKind::IndexDelivery,
+                consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
                 source_id: source,
                 next_offset: 20,
                 observed_fence: PlacementLogId { term: 3, index: 4 },
@@ -1901,25 +1929,6 @@ mod tests {
     }
 
     #[test]
-    fn retained_route_evidence_loss_triggers_true_gap_reconciliation() {
-        assert!(routed_failure_requires_reconciliation(
-            &RoutedJournalError::MissingPrimary { offset: 12 }
-        ));
-        assert!(routed_failure_requires_reconciliation(
-            &RoutedJournalError::RouteMismatch { offset: 12 }
-        ));
-        assert!(routed_failure_requires_reconciliation(
-            &RoutedJournalError::CursorExpired {
-                cursor: 3,
-                retention_floor: 4,
-            }
-        ));
-        assert!(!routed_failure_requires_reconciliation(
-            &RoutedJournalError::Storage("temporary".into())
-        ));
-    }
-
-    #[test]
     fn successful_reconciliation_checkpoint_resumes_after_its_source_tail() {
         let source = SourceId {
             node_id: 2,
@@ -1936,18 +1945,8 @@ mod tests {
         assert_eq!(checkpoint.next_offset, 42);
         assert_eq!(
             checkpoint.consumer_kind,
-            DefinitionConsumerKind::IndexDelivery
+            DefinitionConsumerKind::V6IndexCatalog
         );
-    }
-
-    #[test]
-    fn completed_assignment_inventory_has_no_periodic_revisit() {
-        assert!(AssignmentInventoryRecovery::after_page(None).is_none());
-
-        let cursor = DefinitionAssignmentCursor::from_bytes(vec![1, b'A', 1]).unwrap();
-        let continued = AssignmentInventoryRecovery::after_page(Some(cursor.clone())).unwrap();
-        assert_eq!(continued.cursor, Some(cursor));
-        assert!(continued.due <= tokio::time::Instant::now());
     }
 
     #[tokio::test]
