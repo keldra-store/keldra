@@ -584,7 +584,6 @@ impl ObjectDistribution {
             }
             return Ok(context);
         }
-        let mut contexts = tokio::task::JoinSet::new();
         let mut unique_paths = BTreeSet::new();
         for item in prepared {
             let key = operation_key(&item.item.operation);
@@ -594,34 +593,9 @@ impl ObjectDistribution {
                 key.clone(),
             ));
         }
-        for (tenant_id, bucket_id, key) in unique_paths {
-            let distribution = self.clone();
-            let fence = placement.fence();
-            contexts.spawn(async move {
-                distribution
-                    .reconcile_before_mutation_stable(&key, tenant_id, bucket_id, fence)
-                    .await
-            });
-        }
-        let mut context = None;
-        while let Some(joined) = contexts.join_next().await {
-            match joined {
-                Ok(Ok(candidate)) if context.is_none() => context = Some(candidate),
-                Ok(Ok(candidate)) if context == Some(candidate) => {}
-                Ok(Ok(_)) => {
-                    return Err(Status::unavailable(
-                        "serving authority changed during grouped mutation reconciliation",
-                    ));
-                }
-                Ok(Err(error)) => return Err(error),
-                Err(error) => {
-                    return Err(Status::internal(format!(
-                        "grouped mutation reconciliation task failed: {error}"
-                    )));
-                }
-            }
-        }
-        context.ok_or_else(|| Status::internal("distributed mutation batch is empty"))
+        let unique_paths = unique_paths.into_iter().collect::<Vec<_>>();
+        self.reconcile_before_mutation_batch_stable(&unique_paths, placement.fence())
+            .await
     }
 
     async fn replicate_mutation_group_batch(

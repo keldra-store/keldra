@@ -275,6 +275,12 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
     ) -> Result<Response<wire::ObjectPathSnapshotResponse>, Status> {
         self.read_object_path_snapshot_call(request).await
     }
+    async fn read_object_path_snapshots(
+        &self,
+        request: Request<wire::ObjectPathSnapshotBatchRequest>,
+    ) -> Result<Response<wire::ObjectPathSnapshotBatchResponse>, Status> {
+        self.read_object_path_snapshots_call(request).await
+    }
     async fn read_current_object_snapshot(
         &self,
         request: Request<wire::ObjectPathSnapshotRequest>,
@@ -392,63 +398,54 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
     ) -> Result<Response<wire::SourceJournalPage>, Status> {
         source_journal::read(self, request).await
     }
-
     async fn read_routed_source_journal(
         &self,
         request: Request<wire::RoutedSourceJournalReadRequest>,
     ) -> Result<Response<wire::RoutedSourceJournalPage>, Status> {
         definition_coordination::read_routed_source_journal(self, request).await
     }
-
     async fn apply_derived_consumer_checkpoint(
         &self,
         request: Request<wire::ApplyDerivedConsumerCheckpointRequest>,
     ) -> Result<Response<wire::DerivedConsumerCheckpointApplied>, Status> {
         derived_consumer::apply(self, request).await
     }
-
     async fn apply_definition_assignment_page(
         &self,
         request: Request<wire::ApplyDefinitionAssignmentPageRequest>,
     ) -> Result<Response<wire::DefinitionAssignmentPageApplied>, Status> {
         definition_coordination::apply_definition_assignment_page(self, request).await
     }
-
     async fn get_definition_checkpoint(
         &self,
         request: Request<wire::DefinitionCheckpointRequest>,
     ) -> Result<Response<wire::DefinitionCheckpointState>, Status> {
         definition_coordination::get_definition_checkpoint(self, request).await
     }
-
     async fn apply_definition_assignments(
         &self,
         request: Request<wire::ApplyDefinitionAssignmentsRequest>,
     ) -> Result<Response<wire::DefinitionAssignmentPageApplied>, Status> {
         definition_coordination::apply_definition_assignments(self, request).await
     }
-
     async fn scan_definition_locators_by_bucket(
         &self,
         request: Request<wire::DefinitionLocatorScanRequest>,
     ) -> Result<Response<wire::DefinitionLocatorScanPage>, Status> {
         definition_coordination::scan_definition_locators_by_bucket(self, request).await
     }
-
     async fn scan_definition_locators_by_kind(
         &self,
         request: Request<wire::DefinitionLocatorKindScanRequest>,
     ) -> Result<Response<wire::DefinitionLocatorScanPage>, Status> {
         definition_coordination::scan_definition_locators_by_kind(self, request).await
     }
-
     async fn scan_definition_assignments_by_kind(
         &self,
         request: Request<wire::DefinitionAssignmentScanRequest>,
     ) -> Result<Response<wire::DefinitionAssignmentScanPage>, Status> {
         definition_coordination::scan_definition_assignments_by_kind(self, request).await
     }
-
     async fn small_content_exists(
         &self,
         mut request: Request<wire::ContentRequest>,
@@ -472,7 +469,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             exists,
         }))
     }
-
     async fn get_small_content(
         &self,
         mut request: Request<wire::ContentRequest>,
@@ -518,7 +514,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             tokio_stream::wrappers::ReceiverStream::new(receiver),
         )))
     }
-
     async fn put_small_content(
         &self,
         request: Request<Streaming<wire::SmallContentPutFrame>>,
@@ -588,7 +583,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             }));
         }
     }
-
     async fn get_complete_source(
         &self,
         mut request: Request<wire::ContentRequest>,
@@ -609,7 +603,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             .await?;
         Ok(Response::new(stream_blob(reader)))
     }
-
     async fn put_complete_source(
         &self,
         request: Request<Streaming<wire::CompleteSourcePutFrame>>,
@@ -676,7 +669,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             }));
         }
     }
-
     async fn shard_exists(
         &self,
         mut request: Request<wire::ShardRequest>,
@@ -704,7 +696,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             exists,
         }))
     }
-
     async fn get_shard(
         &self,
         mut request: Request<wire::ShardRequest>,
@@ -1272,6 +1263,15 @@ mod tests {
             "ReadObjectPathSnapshot"
         );
         require_denied!(
+            client.read_object_path_snapshots(wire::ObjectPathSnapshotBatchRequest {
+                peer: Some(peer.clone()),
+                tenant_id: 0,
+                bucket_id: 0,
+                exact_paths: Vec::new(),
+            }),
+            "ReadObjectPathSnapshots"
+        );
+        require_denied!(
             client.read_current_object_snapshot(wire::ObjectPathSnapshotRequest {
                 peer: Some(peer.clone()),
                 tenant_id: 0,
@@ -1511,7 +1511,7 @@ mod tests {
             "InstallPayloadLifecycle"
         );
         assert_eq!(
-            denied, 50,
+            denied, 51,
             "the DataPeer RPC list changed without updating this test"
         );
     }

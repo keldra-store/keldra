@@ -216,6 +216,46 @@ fn current_only_batch_selector_rejects_short_replica_batches() {
 }
 
 #[test]
+fn complete_record_batch_selector_handles_public_maximum_without_reordering() {
+    let mut present = snapshot(9, Some(8), 9);
+    present.exact_path = "docs/present".into();
+    let mut first = vec![None; MAX_OBJECT_RECORD_EXPORT_RECORDS as usize];
+    let mut second = first.clone();
+    let mut minority = first.clone();
+    first[731] = Some(present.clone());
+    second[731] = Some(present.clone());
+    minority[731] = Some(snapshot(8, Some(7), 8));
+
+    let selected = select_object_snapshot_batch_quorum(
+        &[
+            (NodeId(1), first),
+            (NodeId(2), second),
+            (NodeId(3), minority),
+        ],
+        2,
+        3,
+        MAX_OBJECT_RECORD_EXPORT_RECORDS as usize,
+    )
+    .unwrap();
+
+    assert_eq!(selected.len(), MAX_OBJECT_RECORD_EXPORT_RECORDS as usize);
+    assert_eq!(selected[731], Some(present));
+    assert_eq!(selected.iter().filter(|entry| entry.is_some()).count(), 1);
+}
+
+#[test]
+fn complete_record_batch_selector_rejects_short_replica_batches() {
+    let error = select_object_snapshot_batch_quorum(
+        &[(NodeId(1), vec![None]), (NodeId(2), Vec::new())],
+        2,
+        2,
+        1,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), Code::DataLoss);
+}
+
+#[test]
 fn exact_version_batch_never_substitutes_a_newer_descriptor() {
     let version_n = current_snapshot(8, Some(7), 8).version;
     let version_n_plus_one = current_snapshot(9, Some(8), 9).version;

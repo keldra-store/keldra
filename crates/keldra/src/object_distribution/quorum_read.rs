@@ -18,6 +18,9 @@ struct ReplicaObservation {
     snapshot: Option<ObjectPathSnapshot>,
 }
 
+const OBJECT_RECONCILIATION_BATCH_PATHS: usize = 128;
+const OBJECT_RECONCILIATION_MAX_IN_FLIGHT_READS: usize = 16;
+
 impl ObjectDistribution {
     /// Waits for the highest program cursor named by one exact-current batch.
     /// FinalizedThrough is monotonic, so proving the maximum proves every
@@ -71,6 +74,190 @@ impl ObjectDistribution {
                 "object placement changed while reconciling its mutation state",
             ));
         }
+        let context = self.serving.mutation_context()?;
+        if context.active_placement_log_id != expected_fence {
+            return Err(changed_fence());
+        }
+        Ok(context)
+    }
+
+    /// Reconciles a bounded mutation group's complete object records without
+    /// opening one peer RPC per path. Entries are partitioned by stable IDs and
+    /// ranked replica group, then read through bounded ordered peer batches.
+    pub(super) async fn reconcile_before_mutation_batch_stable(
+        &self,
+        entries: &[(u64, u64, ObjectKey)],
+        expected_fence: PlacementLogId,
+    ) -> Result<ObjectMutationContext, Status> {
+        if entries.is_empty() || entries.len() > MAX_OBJECT_RECORD_EXPORT_RECORDS as usize {
+            return Err(Status::invalid_argument(format!(
+                "mutation reconciliation batch must contain 1..={MAX_OBJECT_RECORD_EXPORT_RECORDS} paths"
+            )));
+        }
+        let initial_context = self.serving.mutation_context()?;
+        let placement = self.placement()?;
+        if initial_context.active_placement_log_id != expected_fence
+            || placement.fence() != expected_fence
+        {
+            return Err(changed_fence());
+        }
+
+        let mut grouped = BTreeMap::<(u64, u64, Vec<NodeId>), FullObjectBatchGroup>::new();
+        for (index, (tenant_id, bucket_id, key)) in entries.iter().enumerate() {
+            let group = self.replica_group_stable(&placement, *tenant_id, *bucket_id, key)?;
+            if group.coordinator() != self.local_node {
+                return Err(Status::unavailable(
+                    "local node is not the coordinator for every reconciled mutation",
+                ));
+            }
+            grouped
+                .entry((*tenant_id, *bucket_id, group.replicas().to_vec()))
+                .or_insert_with(|| FullObjectBatchGroup {
+                    tenant_id: *tenant_id,
+                    bucket_id: *bucket_id,
+                    replicas: group.replicas().to_vec(),
+                    required: group.required_acknowledgements(),
+                    entries: Vec::new(),
+                })
+                .entries
+                .push((index, key.path().to_owned()));
+        }
+        let mut groups = Vec::new();
+        for group in grouped.into_values() {
+            for entries in group.entries.chunks(OBJECT_RECONCILIATION_BATCH_PATHS) {
+                groups.push(FullObjectBatchGroup {
+                    tenant_id: group.tenant_id,
+                    bucket_id: group.bucket_id,
+                    replicas: group.replicas.clone(),
+                    required: group.required,
+                    entries: entries.to_vec(),
+                });
+            }
+        }
+
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            OBJECT_RECONCILIATION_MAX_IN_FLIGHT_READS,
+        ));
+        let mut observations = vec![Vec::new(); groups.len()];
+        let mut reads = tokio::task::JoinSet::new();
+        for (group_index, group) in groups.iter().enumerate() {
+            let exact_paths = group
+                .entries
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect::<Vec<_>>();
+            for node in group.replicas.iter().copied() {
+                let permit = semaphore.clone();
+                if node == self.local_node {
+                    let store = self.store.clone();
+                    let exact_paths = exact_paths.clone();
+                    let tenant_id = group.tenant_id;
+                    let bucket_id = group.bucket_id;
+                    reads.spawn(async move {
+                        let _permit = permit.acquire_owned().await.map_err(|_| {
+                            Status::internal("object reconciliation read limiter closed")
+                        })?;
+                        let result = tokio::task::spawn_blocking(move || {
+                            store.export_object_path_records(tenant_id, bucket_id, &exact_paths)
+                        })
+                        .await
+                        .map_err(|error| {
+                            Status::internal(format!(
+                                "local object reconciliation batch task failed: {error}"
+                            ))
+                        })?
+                        .map_err(snapshot_status);
+                        Ok::<_, Status>((group_index, node, result))
+                    });
+                    continue;
+                }
+                let Some(address) = placement.address(node).cloned() else {
+                    tracing::warn!(node_id = node.0, "object replica has no peer address");
+                    continue;
+                };
+                let peers = self.peers.clone();
+                let exact_paths = exact_paths.clone();
+                let tenant_id = group.tenant_id;
+                let bucket_id = group.bucket_id;
+                reads.spawn(async move {
+                    let _permit = permit.acquire_owned().await.map_err(|_| {
+                        Status::internal("object reconciliation read limiter closed")
+                    })?;
+                    let result = peers
+                        .read_object_path_snapshots(
+                            node,
+                            &address.0,
+                            tenant_id,
+                            bucket_id,
+                            &exact_paths,
+                        )
+                        .await;
+                    Ok::<_, Status>((group_index, node, result))
+                });
+            }
+        }
+        while let Some(result) = reads.join_next().await {
+            match result {
+                Ok(Ok((group_index, node, Ok(batch)))) => {
+                    observations[group_index].push((node, batch));
+                }
+                Ok(Ok((_group_index, node, Err(error)))) => tracing::warn!(
+                    node_id = node.0,
+                    %error,
+                    "object reconciliation batch replica read failed"
+                ),
+                Ok(Err(error)) => tracing::warn!(
+                    %error,
+                    "object reconciliation batch replica read setup failed"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "object reconciliation batch replica read task failed"
+                ),
+            }
+        }
+
+        for (group, observations) in groups.iter().zip(&observations) {
+            let selected = select_object_snapshot_batch_quorum(
+                observations,
+                group.required,
+                group.replicas.len(),
+                group.entries.len(),
+            )?;
+            for (entry_index, ((_, exact_path), selected)) in
+                group.entries.iter().zip(selected).enumerate()
+            {
+                validate_object_observation_identity(
+                    selected.as_ref(),
+                    group.tenant_id,
+                    group.bucket_id,
+                    exact_path,
+                )?;
+                for (node, batch) in observations {
+                    let observed = &batch[entry_index];
+                    validate_object_observation_identity(
+                        observed.as_ref(),
+                        group.tenant_id,
+                        group.bucket_id,
+                        exact_path,
+                    )?;
+                    if observed != &selected {
+                        self.repair_observation(
+                            &placement,
+                            *node,
+                            group.tenant_id,
+                            group.bucket_id,
+                            exact_path,
+                            observed.as_ref(),
+                            selected.as_ref(),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        self.require_unchanged_read_fence(expected_fence)?;
         let context = self.serving.mutation_context()?;
         if context.active_placement_log_id != expected_fence {
             return Err(changed_fence());
@@ -631,6 +818,14 @@ struct CurrentObjectBatchGroup {
     entries: Vec<(usize, String)>,
 }
 
+struct FullObjectBatchGroup {
+    tenant_id: u64,
+    bucket_id: u64,
+    replicas: Vec<NodeId>,
+    required: usize,
+    entries: Vec<(usize, String)>,
+}
+
 struct ExactVersionBatchGroup {
     replicas: Vec<NodeId>,
     required: usize,
@@ -699,6 +894,56 @@ fn select_quorum_snapshot(
         .map(|observation| observation.snapshot.clone())
         .collect::<Vec<_>>();
     select_object_snapshot_quorum(&snapshots, required, replica_count)
+}
+
+fn validate_object_observation_identity(
+    snapshot: Option<&ObjectPathSnapshot>,
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_path: &str,
+) -> Result<(), Status> {
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    snapshot.validate().map_err(snapshot_status)?;
+    if snapshot.tenant_id != tenant_id
+        || snapshot.bucket_id != bucket_id
+        || snapshot.exact_path != exact_path
+    {
+        return Err(Status::data_loss(
+            "object replica returned another object identity",
+        ));
+    }
+    Ok(())
+}
+
+fn select_object_snapshot_batch_quorum(
+    observations: &[(NodeId, Vec<Option<ObjectPathSnapshot>>)],
+    required: usize,
+    replica_count: usize,
+    expected_records: usize,
+) -> Result<Vec<Option<ObjectPathSnapshot>>, Status> {
+    if observations
+        .iter()
+        .any(|(_, observation)| observation.len() != expected_records)
+    {
+        return Err(Status::data_loss(
+            "object replica batch returned the wrong result count",
+        ));
+    }
+    let mut selected = Vec::with_capacity(expected_records);
+    for index in 0..expected_records {
+        let candidates = observations
+            .iter()
+            .map(|(_, observation)| observation[index].clone())
+            .collect::<Vec<_>>();
+        selected.push(select_object_snapshot_quorum(
+            &candidates,
+            required,
+            replica_count,
+        )?);
+    }
+    Ok(selected)
 }
 
 fn select_current_object_snapshot_quorum(
