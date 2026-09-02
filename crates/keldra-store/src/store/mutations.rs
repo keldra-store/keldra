@@ -1005,9 +1005,19 @@ impl Store {
         let local_reference_cursor = match reference_effects {
             LocalReferenceEffects::AppliedInline => {
                 if cursor != old_tail {
-                    return Err(MutationError::Storage(format!(
-                        "local reference cursor {cursor} does not match source-journal tail {old_tail}"
-                    )));
+                    // A proof-backed deferred publication may advance the
+                    // source tail while reference delivery is still applying
+                    // its ordered effects. Inline writers must wait for that
+                    // consumer rather than treating the temporary lag as
+                    // storage corruption. Backpressure callers drop this
+                    // commit guard, wait for journal progress, and retry the
+                    // unchanged atomic batch against a fresh tail.
+                    tracing::debug!(
+                        reference_cursor = cursor,
+                        source_journal_tail = old_tail,
+                        "inline reference effects are waiting for source-journal catch-up"
+                    );
+                    return Err(MutationError::SourceJournalCapacity);
                 }
                 Some(status.source_id)
             }

@@ -494,6 +494,114 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
 }
 
 #[tokio::test]
+async fn local_atomic_finalization_waits_for_deferred_reference_delivery() {
+    let (_temporary, store, verified) = configured_store().await;
+    let deferred_blob = store.stage_blob(b"deferred predecessor").await.unwrap();
+    let before = store.local_watch_status().unwrap();
+    let mut deferred_batch = WriteBatch::default();
+    store
+        .stage_local_changes(
+            &mut deferred_batch,
+            &[PendingLocalChange::ContentLifecycleChanged {
+                blob_identity: [
+                    deferred_blob.hash.as_slice(),
+                    deferred_blob.length.to_be_bytes().as_slice(),
+                ]
+                .concat(),
+                revision: now_unix_millis().unwrap(),
+                reference_deltas: vec![ReferenceDelta {
+                    blob: deferred_blob.clone(),
+                    change: 1,
+                }],
+                accounting_transition: None,
+            }],
+            LocalReferenceEffects::Deferred,
+        )
+        .unwrap();
+    store.write_program_batch(deferred_batch).unwrap();
+    store.notify_local_invalidations();
+    let deferred = store.local_watch_status().unwrap();
+    assert_eq!(deferred.tail, before.tail + 1);
+    assert_eq!(
+        store.reference_delta_cursor(deferred.source_id).unwrap(),
+        before.tail
+    );
+
+    let engine = store.program_engine(&verified).unwrap();
+    let lease = engine
+        .prepare(
+            &InvocationContext::new("tenant").unwrap(),
+            &invocation("deferred-catch-up", ExpectedHead::Absent),
+        )
+        .await
+        .unwrap();
+    let prepared = store.prepare_program_bundle(&lease).await.unwrap();
+    let local_commit = commit(&prepared, None, 1);
+    let _reservations = commit_prepared_reservations(&store, &prepared, &local_commit).await;
+    let backlog = store.local_watch_status().unwrap();
+    assert!(backlog.tail >= deferred.tail);
+    assert_eq!(
+        store.reference_delta_cursor(backlog.source_id).unwrap(),
+        before.tail
+    );
+    let apply = store.apply_program_bundle(lease, &prepared, local_commit, mutation_context());
+    tokio::pin!(apply);
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut apply)
+            .await
+            .is_err(),
+        "atomic finalization must wait while reference delivery is behind"
+    );
+    assert!(store.applied_program_commit().unwrap().is_none());
+
+    store
+        .apply_reference_deltas(ReferenceDeltaBatch {
+            source: backlog.source_id,
+            after: before.tail,
+            through: backlog.tail,
+            deltas: vec![DestinationReferenceDelta {
+                artifact: DestinationReferenceArtifact::CompleteBlob(deferred_blob),
+                change: 1,
+            }],
+        })
+        .await
+        .unwrap();
+    let lifecycle_tail = store.local_watch_status().unwrap().tail;
+    assert_eq!(lifecycle_tail, backlog.tail + 1);
+    store
+        .apply_reference_deltas(ReferenceDeltaBatch {
+            source: backlog.source_id,
+            after: backlog.tail,
+            through: lifecycle_tail,
+            deltas: Vec::new(),
+        })
+        .await
+        .unwrap();
+    store
+        .advance_source_journal_reference_safe_through(lifecycle_tail)
+        .await
+        .unwrap();
+
+    let applied = tokio::time::timeout(std::time::Duration::from_secs(5), &mut apply)
+        .await
+        .expect("atomic finalization resumes after reference catch-up")
+        .unwrap();
+    assert_eq!(applied.receipt.command_id, "deferred-catch-up");
+    let final_status = store.local_watch_status().unwrap();
+    assert_eq!(
+        store
+            .reference_delta_cursor(final_status.source_id)
+            .unwrap(),
+        final_status.tail
+    );
+    // This test advances the reference consumer directly, not the separate
+    // proof-backed visibility consumer. Atomic finalization must not jump that
+    // durable settlement cursor across the pre-existing deferred change.
+    assert_eq!(final_status.settled_through, backlog.settled_through);
+}
+
+#[tokio::test]
 async fn preparation_rejects_an_atomic_transition_that_cannot_fit_the_source_journal() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(
