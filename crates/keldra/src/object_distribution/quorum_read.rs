@@ -241,7 +241,7 @@ impl ObjectDistribution {
                         group.bucket_id,
                         exact_path,
                     )?;
-                    if observed != &selected {
+                    if !object_snapshots_equivalent(observed, &selected) {
                         self.repair_observation(
                             &placement,
                             *node,
@@ -343,7 +343,7 @@ impl ObjectDistribution {
         )?;
         for observation in observations
             .iter()
-            .filter(|observation| observation.snapshot != selected)
+            .filter(|observation| !object_snapshots_equivalent(&observation.snapshot, &selected))
         {
             self.repair_observation(
                 &placement,
@@ -1124,7 +1124,7 @@ pub(crate) fn select_object_snapshot_quorum(
         }
         let agreeing = observations
             .iter()
-            .filter(|candidate| *candidate == observation)
+            .filter(|candidate| object_snapshots_equivalent(candidate, observation))
             .count();
         if agreeing >= required {
             return Ok(observation.clone());
@@ -1143,6 +1143,45 @@ pub(crate) fn select_object_snapshot_quorum(
     Err(Status::unavailable(
         "object replicas have neither an exact quorum nor one direct predecessor-linked successor",
     ))
+}
+
+/// Complete object snapshots carry two replica-local sets that describe
+/// whether journal-owned version retention is still pending or has been
+/// released on that replica. Their union is authoritative for the retained
+/// descriptor set, but moving an identity between those sets is local cleanup
+/// progress rather than an object mutation. Quorum selection must therefore
+/// compare the union while repair leaves each replica's cleanup state intact.
+fn object_snapshots_equivalent(
+    left: &Option<ObjectPathSnapshot>,
+    right: &Option<ObjectPathSnapshot>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.tenant_id == right.tenant_id
+                && left.bucket_id == right.bucket_id
+                && left.exact_path == right.exact_path
+                && left.head == right.head
+                && left.versions == right.versions
+                && journal_retention_ids(left).eq(journal_retention_ids(right))
+                && left.definition_locator == right.definition_locator
+                && left.alias_registry == right.alias_registry
+                && left.alias_registry_transition == right.alias_registry_transition
+        }
+        _ => false,
+    }
+}
+
+fn journal_retention_ids(snapshot: &ObjectPathSnapshot) -> impl Iterator<Item = VersionId> + '_ {
+    let mut pending = snapshot.journal_pending_versions.iter().peekable();
+    let mut released = snapshot.journal_released_versions.iter().peekable();
+    std::iter::from_fn(move || match (pending.peek(), released.peek()) {
+        (Some(left), Some(right)) if left < right => pending.next().copied(),
+        (Some(_), Some(_)) => released.next().copied(),
+        (Some(_), None) => pending.next().copied(),
+        (None, Some(_)) => released.next().copied(),
+        (None, None) => None,
+    })
 }
 
 fn is_direct_successor(

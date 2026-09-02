@@ -113,7 +113,7 @@ async fn reconcile_stores(
         .collect::<Vec<_>>();
     let selected = select_quorum_snapshot(&observations, required, stores.len())?;
     for (store, observation) in stores.iter().zip(&observations) {
-        if observation.snapshot != selected {
+        if !object_snapshots_equivalent(&observation.snapshot, &selected) {
             install(store, selected.as_ref()).await;
         }
     }
@@ -387,6 +387,37 @@ async fn two_of_two_repairs_one_direct_predecessor() {
     let selected = reconcile_stores(&stores, 2).await.unwrap();
     assert_eq!(selected, read(&stores[0]));
     assert_eq!(read(&stores[0]), read(&stores[1]));
+}
+
+#[tokio::test]
+async fn journal_retention_progress_is_not_object_divergence_or_repaired() {
+    let (_root, stores) = stores(2).await;
+    let mut pending = baseline();
+    pending.journal_pending_versions = vec![pending.head.version];
+    let mut released = baseline();
+    released.journal_released_versions = vec![released.head.version];
+    install(&stores[0], Some(&pending)).await;
+    install(&stores[1], Some(&released)).await;
+
+    assert_eq!(
+        reconcile_stores(&stores, 2).await.unwrap(),
+        Some(pending.clone())
+    );
+    assert_eq!(read(&stores[0]), Some(pending));
+    assert_eq!(read(&stores[1]), Some(released));
+}
+
+#[test]
+fn journal_retention_union_still_requires_exact_quorum() {
+    let mut retained = baseline();
+    retained.journal_pending_versions = vec![retained.head.version];
+
+    assert_eq!(
+        select_object_snapshot_quorum(&[Some(retained), Some(baseline())], 2, 2)
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
 }
 
 #[tokio::test]
