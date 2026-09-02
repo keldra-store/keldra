@@ -587,6 +587,7 @@ require_qprobe_head() {
   fi
 }
 
+converged_qprobe_head=
 wait_for_qprobe_head_after_growth() {
   local node="$1"
   local path="$2"
@@ -598,7 +599,7 @@ wait_for_qprobe_head_after_growth() {
       head qprobe objects "${path}" 2>&1)" \
       && [[ "${actual}" == "${expected}" ]]
     then
-      printf '%s\n' "${actual}"
+      converged_qprobe_head="${actual}"
       return 0
     fi
     sleep 1
@@ -742,8 +743,9 @@ echo "[keldra-qualification] one-node large object survived restart before growt
 
 prepare_and_start_node 2
 
-growth_one_two_node_head="$(wait_for_qprobe_head_after_growth \
-  keldra-2 growth/from-one.bin "${growth_one_head}")"
+wait_for_qprobe_head_after_growth \
+  keldra-2 growth/from-one.bin "${growth_one_head}"
+growth_one_two_node_head="${converged_qprobe_head}"
 growth_one_hash="$(head_blake3 "${growth_one_two_node_head}")"
 move_complete_blob keldra-1 "${growth_one_hash}"
 rm -f "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
