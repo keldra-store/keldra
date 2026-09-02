@@ -21,12 +21,19 @@ case "${qualification_mode}" in
 esac
 release_source_journal_max_entries="${KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
 pressure_source_journal_max_entries="${KELDRA_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES:-64}"
+release_max_atomic_commit_entries="${KELDRA_QUALIFICATION_MAX_ATOMIC_COMMIT_ENTRIES:-4096}"
 if [[ ! "${release_source_journal_max_entries}" =~ ^[1-9][0-9]*$ ]]; then
   echo "KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES must be a positive decimal integer" >&2
   exit 2
 fi
-if [[ ! "${pressure_source_journal_max_entries}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "KELDRA_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES must be a positive decimal integer" >&2
+if [[ ! "${pressure_source_journal_max_entries}" =~ ^[1-9][0-9]*$ ]] \
+  || ((pressure_source_journal_max_entries < 2))
+then
+  echo "KELDRA_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES must be an integer of at least 2" >&2
+  exit 2
+fi
+if [[ ! "${release_max_atomic_commit_entries}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "KELDRA_QUALIFICATION_MAX_ATOMIC_COMMIT_ENTRIES must be a positive decimal integer" >&2
   exit 2
 fi
 case "${KELDRA_DOCKER_PLATFORM:-}" in
@@ -715,8 +722,9 @@ cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
 require_qprobe_head keldra-1 growth/from-two.bin "${growth_two_head}"
 echo "[keldra-qualification] two-node REPLICATED read preserved its head and bytes"
 
+export KELDRA_QUALIFICATION_MAX_ATOMIC_COMMIT_ENTRIES="$((pressure_source_journal_max_entries - 1))"
 start_source_journal_phase "${pressure_source_journal_max_entries}" keldra-1 keldra-2
-echo "[keldra-qualification] cutover pressure phase uses source-journal max entries ${pressure_source_journal_max_entries}"
+echo "[keldra-qualification] cutover pressure phase uses source-journal max entries ${pressure_source_journal_max_entries} and max atomic commit entries ${KELDRA_QUALIFICATION_MAX_ATOMIC_COMMIT_ENTRIES}"
 prepare_no_event_membership_cutover_qualification \
   keldra-2 2 qprobe-client "${qprobe_secret}" qprobe objects \
   "${pressure_source_journal_max_entries}"
@@ -762,6 +770,7 @@ for unavailable_node in keldra-1 keldra-2 keldra-3; do
     "${unavailable_node}" growth/from-two.bin "${growth_two_head}"
 done
 echo "[keldra-qualification] three-node 2+1 reads preserved both large object heads and bytes through every single-node outage"
+export KELDRA_QUALIFICATION_MAX_ATOMIC_COMMIT_ENTRIES="${release_max_atomic_commit_entries}"
 start_release_source_journal_phase "${release_source_journal_max_entries}"
 
 echo "[keldra-qualification] three-node cluster is ACTIVE"
