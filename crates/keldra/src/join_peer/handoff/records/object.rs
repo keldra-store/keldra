@@ -112,8 +112,7 @@ async fn transfer_identity(
                     None => Ok(None),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let selected =
-                select_object_snapshot_quorum(&candidates, quorum(old.len())?, old.len())?;
+            let selected = select_handoff_path_quorum(&candidates, quorum(old.len())?, old.len())?;
             repair_joiner_path(
                 topology,
                 peers,
@@ -175,7 +174,7 @@ pub(super) async fn reconcile_path(
                 .await?,
         );
     }
-    let selected = select_object_snapshot_quorum(&candidates, quorum(old.len())?, old.len())?;
+    let selected = select_handoff_path_quorum(&candidates, quorum(old.len())?, old.len())?;
     repair_joiner_path(
         topology,
         peers,
@@ -235,6 +234,41 @@ fn select_receipt_quorum(
     ))
 }
 
+/// Selects complete object authority without mistaking replica-local journal
+/// cleanup progress for divergent object state. A JOINING replica receives no
+/// old source-journal work to retire, and it cannot serve mutations before the
+/// final payload/cursor handoff. Journal-managed descriptors are therefore
+/// installed as released. User-retained versions and every other snapshot
+/// field remain exact quorum authority.
+fn select_handoff_path_quorum(
+    observed: &[Option<ObjectPathSnapshot>],
+    required: usize,
+    replica_count: usize,
+) -> Result<Option<ObjectPathSnapshot>, Status> {
+    let normalized = observed
+        .iter()
+        .cloned()
+        .map(|snapshot| snapshot.map(release_handoff_retention).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+    select_object_snapshot_quorum(&normalized, required, replica_count)
+}
+
+fn release_handoff_retention(
+    mut snapshot: ObjectPathSnapshot,
+) -> Result<ObjectPathSnapshot, Status> {
+    snapshot
+        .validate()
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+    snapshot
+        .journal_released_versions
+        .append(&mut snapshot.journal_pending_versions);
+    snapshot.journal_released_versions.sort_unstable();
+    snapshot
+        .validate()
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+    Ok(snapshot)
+}
+
 fn identity(record: &ObjectRecordExport) -> Identity {
     match record {
         ObjectRecordExport::ExactPath(record) => Identity::Path {
@@ -266,5 +300,80 @@ impl Identity {
                 ..
             } => (*tenant_id, *bucket_id, exact_path),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use keldra_store::{BlobRef, Head, Version, VersionId};
+    use tonic::Code;
+
+    use super::*;
+
+    fn snapshot() -> ObjectPathSnapshot {
+        let version = VersionId(7);
+        ObjectPathSnapshot {
+            tenant_id: 11,
+            bucket_id: 22,
+            exact_path: "objects/entry".into(),
+            head: Head {
+                version,
+                deleted: false,
+                mutation_stamp: None,
+            },
+            versions: vec![Version {
+                id: version,
+                blob: Some(BlobRef {
+                    hash: [1; 32],
+                    length: 1,
+                }),
+                content_type: None,
+                deleted: false,
+                committed_at_unix_millis: 1,
+                protected_link_descriptor: false,
+            }],
+            journal_pending_versions: vec![version],
+            journal_released_versions: Vec::new(),
+            definition_locator: None,
+            alias_registry: None,
+            alias_registry_transition: None,
+        }
+    }
+
+    #[test]
+    fn handoff_equates_pending_and_released_journal_retention() {
+        let pending = snapshot();
+        let mut released = pending.clone();
+        released.journal_pending_versions.clear();
+        released
+            .journal_released_versions
+            .push(released.head.version);
+
+        assert_eq!(
+            select_handoff_path_quorum(&[Some(pending), Some(released.clone())], 2, 2).unwrap(),
+            Some(released)
+        );
+    }
+
+    #[test]
+    fn handoff_does_not_hide_authoritative_or_user_retention_divergence() {
+        let pending = snapshot();
+        let mut conflicting = pending.clone();
+        conflicting.versions[0].blob.as_mut().unwrap().hash = [2; 32];
+        assert_eq!(
+            select_handoff_path_quorum(&[Some(pending.clone()), Some(conflicting)], 2, 2)
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+
+        let mut user_retained = pending.clone();
+        user_retained.journal_pending_versions.clear();
+        assert_eq!(
+            select_handoff_path_quorum(&[Some(pending), Some(user_retained)], 2, 2)
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
     }
 }
