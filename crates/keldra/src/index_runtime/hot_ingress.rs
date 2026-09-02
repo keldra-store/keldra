@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn overflow_evicts_fifo_and_never_blocks_ingestion() {
+    fn full_budget_falls_back_without_blocking_ingestion() {
         let ingress = HotProjectionIngress::new(800).unwrap();
         ingress.activate_test_route(1, 2);
         for version in 1..=20 {
@@ -640,8 +640,8 @@ mod tests {
             let pending = ingress.pending(1, 2, &put(&path, 100));
             ingress.admit_committed(pending, &receipt(version));
         }
-        assert!(ingress.take_exact_selected(1, 2, "item-1", 1).is_none());
-        assert!(ingress.take_exact_selected(1, 2, "item-20", 20).is_some());
+        assert!(ingress.take_exact_selected(1, 2, "item-1", 1).is_some());
+        assert!(ingress.take_exact_selected(1, 2, "item-20", 20).is_none());
         assert!(ingress.used_bytes() <= 800);
     }
 

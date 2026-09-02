@@ -600,7 +600,7 @@ mod tests {
         );
         assert_eq!(
             definition_path("by-json").unwrap(),
-            "_keldra/indices/v4/definitions/by-json"
+            "_keldra/indices/v6/definitions/by-json"
         );
         assert_eq!(
             derive_index_id(7, 9, "by-json", "create-index").unwrap(),

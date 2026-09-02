@@ -800,7 +800,8 @@ mod tests {
 
     use crate::mutation_admission::DrainIdentity;
     use keldra_store::{
-        Durability, ObjectKey, ObjectMutationContext, PlacementLogId, PutMode, PutRequest, Store,
+        Durability, LogicalRecordMutationContext, LogicalRecordValue, ObjectKey,
+        ObjectMutationContext, PlacementLogId, PutMode, PutRequest, StorageTenantId, Store,
         StoreOptions, VersionId,
     };
 
@@ -835,12 +836,46 @@ mod tests {
         }
     }
 
+    fn install_test_identity(store: &Store) {
+        let tenant = StorageTenantId::parse("tenant").unwrap();
+        for (record_version, typed_value) in [
+            (
+                101,
+                LogicalRecordValue::TenantNameClaim {
+                    storage_tenant: tenant,
+                    tenant_id: 1,
+                },
+            ),
+            (
+                102,
+                LogicalRecordValue::BucketNameClaim {
+                    tenant_id: 1,
+                    bucket: "bucket".into(),
+                    bucket_id: 1,
+                },
+            ),
+        ] {
+            let mutation = store
+                .construct_logical_record_mutation(
+                    typed_value,
+                    LogicalRecordMutationContext {
+                        record_version: VersionId(record_version),
+                        active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                        serving_fence_term: 1,
+                    },
+                )
+                .unwrap();
+            store.commit_logical_record_mutation(&mutation).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn single_node_coordinated_bulk_heads_are_v6_baseline_eligible() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
             .unwrap();
+        install_test_identity(&store);
         let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
         let governance = ObjectMutationGovernance {
             tenant_id,

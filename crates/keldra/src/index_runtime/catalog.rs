@@ -1102,7 +1102,7 @@ mod tests {
     fn ordinary_definition_compiles_one_bound_typed_json_schema_and_fingerprint() {
         let definition = definition(1, 2, 9);
         assert_eq!(definition.schema.path_prefix, "");
-        assert_eq!(definition.schema.fields[0].name, "path");
+        assert_eq!(definition.schema.fields[0].name, "value");
         assert_eq!(
             definition.schema_fingerprint,
             definition.schema.fingerprint().unwrap()
