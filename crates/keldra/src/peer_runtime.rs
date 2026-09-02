@@ -519,6 +519,7 @@ impl PeerRuntime {
         payload_read_scratch: PathBuf,
         erasure_profile: ErasureProfile,
         maximum_unary_time: Duration,
+        bulk_write_timeout: Duration,
         max_blob_bytes: u64,
     ) -> Result<PeerServerHandle> {
         if let Some(identity) = self.mutation_admission.drain_identity() {
@@ -542,6 +543,7 @@ impl PeerRuntime {
             store,
             erasure_profile,
             maximum_unary_time,
+            bulk_write_timeout,
             max_blob_bytes,
             leases,
             activation_gate,
@@ -557,6 +559,7 @@ impl PeerRuntime {
         store: Store,
         erasure_profile: ErasureProfile,
         maximum_unary_time: Duration,
+        bulk_write_timeout: Duration,
         max_blob_bytes: u64,
         leases: ServingLeaseIssuer,
         activation_gate: Arc<dyn JoinActivationGate>,
@@ -623,6 +626,7 @@ impl PeerRuntime {
             self.routed_personaldb.clone(),
             self.routed_public_handlers.clone(),
             self.routed_authz_handlers.clone(),
+            bulk_write_timeout,
         )
         .into_server();
         let cluster_service = MutationAdmissionService::new(
@@ -1313,6 +1317,7 @@ mod tests {
                 directory.path().join("payload-read-scratch"),
                 ErasureProfile::default(),
                 Duration::from_secs(30),
+                Duration::from_secs(600),
                 16 * 1024 * 1024,
             )
             .await
@@ -1467,6 +1472,7 @@ mod tests {
                 first_store,
                 ErasureProfile::default(),
                 Duration::from_secs(30),
+                Duration::from_secs(600),
                 16 * 1024 * 1024,
                 ServingLeaseIssuer::new(),
                 Arc::new(AllowCompletedHandoff),
@@ -1496,6 +1502,7 @@ mod tests {
                 second_directory.path().join("payload-read-scratch"),
                 ErasureProfile::default(),
                 Duration::from_secs(30),
+                Duration::from_secs(600),
                 16 * 1024 * 1024,
             )
             .await
@@ -1575,6 +1582,7 @@ mod tests {
                 second_directory.path().join("payload-read-scratch"),
                 ErasureProfile::default(),
                 Duration::from_secs(30),
+                Duration::from_secs(600),
                 16 * 1024 * 1024,
             )
             .await

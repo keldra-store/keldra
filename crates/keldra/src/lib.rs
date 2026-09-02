@@ -257,6 +257,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             config.storage.scratch.join("payload-read"),
             config.erasure_profile,
             config.atomic_program_timeout,
+            config.bulk_write_timeout,
             config.max_blob_bytes,
         )
         .await?;
