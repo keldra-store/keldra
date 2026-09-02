@@ -22,6 +22,7 @@ esac
 minimum_source_journal_max_entries=4097
 release_source_journal_max_entries="${KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
 pressure_source_journal_max_entries="${KELDRA_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES:-${minimum_source_journal_max_entries}}"
+joining_node_ready_timeout_seconds="${KELDRA_QUALIFICATION_JOIN_TIMEOUT_SECONDS:-900}"
 if [[ ! "${release_source_journal_max_entries}" =~ ^[1-9][0-9]*$ ]] \
   || ((release_source_journal_max_entries < minimum_source_journal_max_entries))
 then
@@ -32,6 +33,10 @@ if [[ ! "${pressure_source_journal_max_entries}" =~ ^[1-9][0-9]*$ ]] \
   || ((pressure_source_journal_max_entries < minimum_source_journal_max_entries))
 then
   echo "KELDRA_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES must be at least ${minimum_source_journal_max_entries} so it can hold the production 4096-entry atomic maximum plus its completion event" >&2
+  exit 2
+fi
+if [[ ! "${joining_node_ready_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "KELDRA_QUALIFICATION_JOIN_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 2
 fi
 case "${KELDRA_DOCKER_PLATFORM:-}" in
@@ -373,9 +378,10 @@ wait_for_bootstrap() {
 }
 wait_for_node() {
   local node="$1"
+  local timeout_seconds="${2:-90}"
   local attempt
   local output=""
-  for attempt in $(seq 1 90); do
+  for attempt in $(seq 1 "${timeout_seconds}"); do
     if output="$(run_cli "${node}" qprobe-client \
       qualification-probe-secret-000000000000000000000000 \
       list qprobe objects --prefix readiness/ --limit 1 2>&1)"
@@ -384,7 +390,7 @@ wait_for_node() {
     fi
     sleep 1
   done
-  echo "${node} did not become an authenticated ACTIVE server within 90 seconds" >&2
+  echo "${node} did not become an authenticated ACTIVE server within ${timeout_seconds} seconds" >&2
   echo "last client error: ${output}" >&2
   return 1
 }

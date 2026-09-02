@@ -86,7 +86,7 @@ start_prepared_node() {
   local node_id="$1"
   local service="keldra-${node_id}"
   compose up --detach "${service}"
-  wait_for_node "${service}"
+  wait_for_node "${service}" "${joining_node_ready_timeout_seconds}"
   if [[ -e "${KELDRA_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
     echo "${service} became ready without consuming and deleting its join bundle" >&2
     return 1
