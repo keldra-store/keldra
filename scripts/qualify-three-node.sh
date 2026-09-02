@@ -587,6 +587,28 @@ require_qprobe_head() {
   fi
 }
 
+wait_for_qprobe_head_after_growth() {
+  local node="$1"
+  local path="$2"
+  local expected="$3"
+  local attempt
+  local actual=""
+  for attempt in $(seq 1 90); do
+    if actual="$(run_cli "${node}" qprobe-client "${qprobe_secret}" \
+      head qprobe objects "${path}" 2>&1)" \
+      && [[ "${actual}" == "${expected}" ]]
+    then
+      printf '%s\n' "${actual}"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${node} did not converge on the existing head for ${path} after cluster growth" >&2
+  echo "expected: ${expected}" >&2
+  echo "last result: ${actual}" >&2
+  return 1
+}
+
 head_blake3() {
   local head="$1"
   local hash
@@ -720,14 +742,8 @@ echo "[keldra-qualification] one-node large object survived restart before growt
 
 prepare_and_start_node 2
 
-growth_one_two_node_head="$(run_cli keldra-2 qprobe-client "${qprobe_secret}" \
-  head qprobe objects growth/from-one.bin)"
-if [[ "${growth_one_two_node_head}" != "${growth_one_head}" ]]; then
-  echo "node 2 observed another head for the one-node object after ADD" >&2
-  echo "expected: ${growth_one_head}" >&2
-  echo "actual:   ${growth_one_two_node_head}" >&2
-  exit 1
-fi
+growth_one_two_node_head="$(wait_for_qprobe_head_after_growth \
+  keldra-2 growth/from-one.bin "${growth_one_head}")"
 growth_one_hash="$(head_blake3 "${growth_one_two_node_head}")"
 move_complete_blob keldra-1 "${growth_one_hash}"
 rm -f "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
