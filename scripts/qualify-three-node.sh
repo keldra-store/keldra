@@ -594,13 +594,18 @@ wait_for_qprobe_head_after_growth() {
   local expected="$3"
   local attempt
   local actual=""
+  local evidence="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-head-convergence.txt"
   for attempt in $(seq 1 90); do
-    if actual="$(run_cli "${node}" qprobe-client "${qprobe_secret}" \
-      head qprobe objects "${path}" 2>&1)" \
-      && [[ "${actual}" == "${expected}" ]]
+    if run_cli "${node}" qprobe-client "${qprobe_secret}" \
+      head qprobe objects "${path}" >"${evidence}" 2>&1
     then
-      converged_qprobe_head="${actual}"
-      return 0
+      actual="$(<"${evidence}")"
+      if [[ "${actual}" == "${expected}" ]]; then
+        converged_qprobe_head="${actual}"
+        return 0
+      fi
+    else
+      actual="$(<"${evidence}")"
     fi
     sleep 1
   done
