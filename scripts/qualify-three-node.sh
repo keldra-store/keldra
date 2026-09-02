@@ -22,7 +22,7 @@ esac
 minimum_source_journal_max_entries=4097
 release_source_journal_max_entries="${KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
 pressure_source_journal_max_entries="${KELDRA_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES:-${minimum_source_journal_max_entries}}"
-joining_node_ready_timeout_seconds="${KELDRA_QUALIFICATION_JOIN_TIMEOUT_SECONDS:-900}"
+joining_node_ready_timeout_seconds="${KELDRA_QUALIFICATION_JOIN_TIMEOUT_SECONDS:-1800}"
 if [[ ! "${release_source_journal_max_entries}" =~ ^[1-9][0-9]*$ ]] \
   || ((release_source_journal_max_entries < minimum_source_journal_max_entries))
 then
