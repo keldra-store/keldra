@@ -940,6 +940,7 @@ mod tests {
             .unwrap();
         let recovered = store.local_watch_status().unwrap();
         assert_eq!(recovered.settled_through, recovered.tail);
+        store.single_node_group_commit.wait_until_idle().await;
         drop(store);
 
         let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
