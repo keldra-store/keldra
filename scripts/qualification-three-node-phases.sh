@@ -157,34 +157,15 @@ run_cutover_writes() {
   local phase="$6"
   local first="$7"
   local count="$8"
-  local concurrency=8
-  local last=$((first + count))
-  local pid
-  local position
-  local -a pids=()
-  local failed=0
-  for ((position = first; position < last; position++)); do
-    run_cli "${node}" "${client_id}" "${client_secret}" \
-      put "${tenant}" "${bucket}" \
-        "membership-cutover/${phase}-${position}.bin" \
-        /qualification/artifacts/membership-cutover-byte.bin \
-        --command-id "membership-cutover-${phase}-${position}" \
-        --durability local --if-absent >/dev/null &
-    pids+=("$!")
-    if ((${#pids[@]} == concurrency)); then
-      for pid in "${pids[@]}"; do
-        wait "${pid}" || failed=1
-      done
-      pids=()
-    fi
-  done
-  for pid in "${pids[@]}"; do
-    wait "${pid}" || failed=1
-  done
-  if ((failed != 0)); then
-    echo "ordinary ${phase} writes failed during membership-cutover qualification" >&2
-    return 1
-  fi
+  KELDRA_CUTOVER_QUALIFICATION_ENDPOINT="$(public_endpoint_for "${node}")" \
+  KELDRA_CUTOVER_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_CUTOVER_QUALIFICATION_BUCKET="${bucket}" \
+  KELDRA_CUTOVER_QUALIFICATION_CLIENT_ID="${client_id}" \
+  KELDRA_CUTOVER_QUALIFICATION_CLIENT_SECRET="${client_secret}" \
+  KELDRA_CUTOVER_QUALIFICATION_PHASE="${phase}" \
+  KELDRA_CUTOVER_QUALIFICATION_FIRST="${first}" \
+  KELDRA_CUTOVER_QUALIFICATION_COUNT="${count}" \
+    "${qualification_binaries[cluster_cutover_qualification]}" >/dev/null
 }
 
 prepare_no_event_membership_cutover_qualification() {
@@ -204,8 +185,6 @@ prepare_no_event_membership_cutover_qualification() {
     echo "no-event membership cutover source must not be the reconciliation coordinator" >&2
     return 1
   fi
-  printf 'x' >"${KELDRA_QUALIFICATION_DIR}/artifacts/membership-cutover-byte.bin"
-  chmod 0444 "${KELDRA_QUALIFICATION_DIR}/artifacts/membership-cutover-byte.bin"
 
   for round in 0 1; do
     run_cutover_writes \

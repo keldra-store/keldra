@@ -14,7 +14,6 @@ x-keldra-environment: &keldra-environment
   KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_BURST: "100"
   KELDRA_ERASURE_DATA_SHARDS: "2"
   KELDRA_ERASURE_PARITY_SHARDS: "1"
-  KELDRA_MAX_ATOMIC_COMMIT_ENTRIES: "${KELDRA_QUALIFICATION_MAX_ATOMIC_COMMIT_ENTRIES:-4096}"
   # Keep release qualification honest about the process-wide index bounds.
   # The corpus size can grow independently without silently growing these
   # budgets.
