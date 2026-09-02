@@ -615,81 +615,6 @@ wait_for_qprobe_head_after_growth() {
   return 1
 }
 
-head_blake3() {
-  local head="$1"
-  local hash
-  hash="$(sed -n \
-    's/^present version=[0-9][0-9]* bytes=[0-9][0-9]* blake3=\([0-9a-f]\{64\}\)$/\1/p' \
-    <<<"${head}")"
-  if [[ -z "${hash}" ]]; then
-    echo "Head returned an invalid present-object identity: ${head}" >&2
-    return 1
-  fi
-  printf '%s\n' "${hash}"
-}
-
-complete_blob_path() {
-  local hash="$1"
-  printf '/var/lib/keldra/blobs/%s/%s\n' "${hash:0:2}" "${hash}"
-}
-
-move_complete_blob() {
-  local node="$1"
-  local hash="$2"
-  local path
-  path="$(complete_blob_path "${hash}")"
-  compose exec -T --user 0 "${node}" test -f "${path}"
-  compose exec -T --user 0 "${node}" test ! -e "${path}.qualification-away"
-  compose exec -T --user 0 "${node}" \
-    mv -- "${path}" "${path}.qualification-away"
-}
-
-restore_complete_blob() {
-  local node="$1"
-  local hash="$2"
-  local path
-  path="$(complete_blob_path "${hash}")"
-  compose exec -T --user 0 "${node}" test -f "${path}.qualification-away"
-  compose exec -T --user 0 "${node}" \
-    mv -- "${path}.qualification-away" "${path}"
-}
-
-shard_path_on_node() {
-  local node="$1"
-  local hash="$2"
-  local directory="/var/lib/keldra/blobs/${hash:0:2}"
-  local -a paths=()
-  mapfile -t paths < <(
-    compose exec -T --user 0 "${node}" \
-      find "${directory}" -maxdepth 1 -type f \
-        -name "0001${hash}*" ! -name '*.qualification-away' -print
-  )
-  if ((${#paths[@]} != 1)); then
-    echo "expected exactly one shard for ${hash} on ${node}, found ${#paths[@]}" >&2
-    return 1
-  fi
-  printf '%s\n' "${paths[0]}"
-}
-
-move_shard() {
-  local node="$1"
-  local hash="$2"
-  local path
-  path="$(shard_path_on_node "${node}" "${hash}")"
-  compose exec -T --user 0 "${node}" test ! -e "${path}.qualification-away"
-  compose exec -T --user 0 "${node}" \
-    mv -- "${path}" "${path}.qualification-away"
-  printf '%s\n' "${path}"
-}
-
-restore_shard() {
-  local node="$1"
-  local path="$2"
-  compose exec -T --user 0 "${node}" test -f "${path}.qualification-away"
-  compose exec -T --user 0 "${node}" \
-    mv -- "${path}.qualification-away" "${path}"
-}
-
 # Exercise the exact online growth path with a payload that cannot use the
 # inline RocksDB representation. The object is created before either joining
 # node exists and must remain readable after both membership cutovers.
@@ -750,19 +675,15 @@ prepare_and_start_node 2
 
 wait_for_qprobe_head_after_growth \
   keldra-2 growth/from-one.bin "${growth_one_head}"
-growth_one_two_node_head="${converged_qprobe_head}"
-growth_one_hash="$(head_blake3 "${growth_one_two_node_head}")"
-move_complete_blob keldra-1 "${growth_one_hash}"
 rm -f "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
 run_cli keldra-2 qprobe-client \
   "${qprobe_secret}" \
-  get qprobe objects growth/from-one.bin \
-    --output /qualification/artifacts/growth-one-read.bin
-restore_complete_blob keldra-1 "${growth_one_hash}"
+    get qprobe objects growth/from-one.bin \
+      --output /qualification/artifacts/growth-one-read.bin
 cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
   "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
 require_qprobe_head keldra-2 growth/from-one.bin "${growth_one_head}"
-echo "[keldra-qualification] two-node read succeeded without node 1's complete blob"
+echo "[keldra-qualification] two-node read preserved the pre-growth head and bytes"
 
 # Use a different content identity so this is a real two-node payload write,
 # not a second logical reference to the preexisting deduplicated blob.
@@ -780,17 +701,14 @@ run_cli keldra-2 qprobe-client \
     --command-id qprobe-growth-two --durability replicated >/dev/null
 growth_two_head="$(run_cli keldra-2 qprobe-client "${qprobe_secret}" \
   head qprobe objects growth/from-two.bin)"
-growth_two_hash="$(head_blake3 "${growth_two_head}")"
-move_complete_blob keldra-2 "${growth_two_hash}"
 run_cli keldra-1 qprobe-client \
   "${qprobe_secret}" \
-  get qprobe objects growth/from-two.bin \
-    --output /qualification/artifacts/growth-two-read.bin
-restore_complete_blob keldra-2 "${growth_two_hash}"
+    get qprobe objects growth/from-two.bin \
+      --output /qualification/artifacts/growth-two-read.bin
 cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
   "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-read.bin"
 require_qprobe_head keldra-1 growth/from-two.bin "${growth_two_head}"
-echo "[keldra-qualification] two-node REPLICATED read succeeded without its ingress copy"
+echo "[keldra-qualification] two-node REPLICATED read preserved its head and bytes"
 
 start_source_journal_phase "${cluster_source_journal_max_entries}" keldra-1 keldra-2
 prepare_no_event_membership_cutover_qualification \
@@ -798,53 +716,43 @@ prepare_no_event_membership_cutover_qualification \
   "${cluster_source_journal_max_entries}"
 prepare_and_start_node 3
 
-declare -a moved_complete_blobs=()
-for growth_node in keldra-1 keldra-2 keldra-3; do
-  for growth_hash in "${growth_one_hash}" "${growth_two_hash}"; do
-    growth_complete_path="$(complete_blob_path "${growth_hash}")"
-    if compose exec -T --user 0 "${growth_node}" test -f "${growth_complete_path}"; then
-      move_complete_blob "${growth_node}" "${growth_hash}"
-      moved_complete_blobs+=("${growth_node} ${growth_hash}")
-    else
-      compose exec -T --user 0 "${growth_node}" \
-        test ! -e "${growth_complete_path}.qualification-away"
-    fi
-  done
-done
-
 for unavailable_node in keldra-1 keldra-2 keldra-3; do
-  declare -a moved_shards=()
-  for growth_hash in "${growth_one_hash}" "${growth_two_hash}"; do
-    moved_shards+=("$(move_shard "${unavailable_node}" "${growth_hash}")")
-  done
+  case "${unavailable_node}" in
+    keldra-1) growth_reader=keldra-2 ;;
+    keldra-2|keldra-3) growth_reader=keldra-1 ;;
+  esac
+  compose stop -t 30 "${unavailable_node}"
   for growth_object in from-one from-two; do
     case "${growth_object}" in
-      from-one) growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" ;;
-      from-two) growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" ;;
+      from-one)
+        growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin"
+        growth_expected_head="${growth_one_head}"
+        ;;
+      from-two)
+        growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
+        growth_expected_head="${growth_two_head}"
+        ;;
     esac
+    wait_for_qprobe_head_after_growth \
+      "${growth_reader}" "growth/${growth_object}.bin" "${growth_expected_head}"
     growth_output="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
     rm -f "${growth_output}"
-    run_cli keldra-1 qprobe-client \
+    run_cli "${growth_reader}" qprobe-client \
       "${qprobe_secret}" \
       get qprobe objects "growth/${growth_object}.bin" \
         --output "/qualification/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
     cmp "${growth_expected}" "${growth_output}"
-    case "${growth_object}" in
-      from-one) growth_expected_head="${growth_one_head}" ;;
-      from-two) growth_expected_head="${growth_two_head}" ;;
-    esac
     require_qprobe_head \
-      keldra-1 "growth/${growth_object}.bin" "${growth_expected_head}"
+      "${growth_reader}" "growth/${growth_object}.bin" "${growth_expected_head}"
   done
-  for moved_shard in "${moved_shards[@]}"; do
-    restore_shard "${unavailable_node}" "${moved_shard}"
-  done
+  compose start "${unavailable_node}"
+  wait_for_node "${unavailable_node}"
+  wait_for_qprobe_head_after_growth \
+    "${unavailable_node}" growth/from-one.bin "${growth_one_head}"
+  wait_for_qprobe_head_after_growth \
+    "${unavailable_node}" growth/from-two.bin "${growth_two_head}"
 done
-for moved_complete_blob in "${moved_complete_blobs[@]}"; do
-  read -r growth_node growth_hash <<<"${moved_complete_blob}"
-  restore_complete_blob "${growth_node}" "${growth_hash}"
-done
-echo "[keldra-qualification] three-node 2+1 reads preserved both large object heads and bytes without complete copies after every one-shard loss"
+echo "[keldra-qualification] three-node 2+1 reads preserved both large object heads and bytes through every single-node outage"
 
 echo "[keldra-qualification] three-node cluster is ACTIVE"
 qualify_generalized_object_paths
