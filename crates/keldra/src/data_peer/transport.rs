@@ -1494,10 +1494,15 @@ impl DataPeerTransport {
             .client(target, target_address)?
             .put_authz_realm(tokio_stream::wrappers::ReceiverStream::new(receiver))
             .await;
-        producer.await.map_err(|error| {
-            Status::internal(format!("realm forwarding task failed: {error}"))
-        })??;
+        let produced = producer
+            .await
+            .map_err(|error| Status::internal(format!("realm forwarding task failed: {error}")))?;
+        // A destination that rejects the stream drops its request receiver,
+        // which also makes the forwarding task observe a closed channel. The
+        // destination status is the authoritative failure and must not be
+        // masked by that secondary cancellation.
         let response = response?.into_inner();
+        produced?;
         require_response_schema(response.schema_version)?;
         Ok(response.replayed)
     }
