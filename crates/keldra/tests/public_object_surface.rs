@@ -22,12 +22,14 @@ use keldra_api::v1::{
     BulkPutRequest, BulkWriteRequest, CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest,
     DeleteVersionRequest, DisableAccountingRequest, Durability, EnableAccountingRequest,
     GetAccountingRequest, GetClusterCapabilitiesRequest, GetIndexRequest, GetObjectRequest,
-    HeadObjectRequest, IndexQuery, IndexSpecification, InvokeProgramRequest,
-    ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode, ObjectAddress,
-    ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader,
-    PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest,
-    PutToken, QueryIndexRequest, ReadFailureCode, RebuildIndexRequest, SetBucketPolicyRequest,
-    SetBucketVersioningRequest, UpdateIndexRequest, WatchNow, WatchPrefixRequest, WatchStateHint,
+    HeadObjectRequest, IndexField, IndexFieldCapability, IndexFieldCardinality, IndexQuery,
+    IndexSpecification, InvokeProgramRequest, KeywordIndexField, ListObjectVersionsRequest,
+    ListObjectsRequest, MutationFailureCode, ObjectAddress,
+    ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PutHeader, PutIfAbsentOperation,
+    PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest, PutToken,
+    QueryIndexRequest, ReadFailureCode, RebuildIndexRequest, SetBucketPolicyRequest,
+    SetBucketVersioningRequest, TypedJsonIndexSpec, UpdateIndexRequest, WatchNow,
+    WatchPrefixRequest, WatchStateHint,
 };
 use keldra_authz::ObjectRef;
 use keldra_store::{
@@ -39,6 +41,23 @@ use serde::Serialize;
 use tempfile::TempDir;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Response, Status};
+
+fn typed_json_specification() -> IndexSpecification {
+    IndexSpecification {
+        specification: Some(IndexSpecificationValue::TypedJson(TypedJsonIndexSpec {
+            fields: vec![IndexField {
+                name: "value".into(),
+                json_pointer: "/value".into(),
+                cardinality: IndexFieldCardinality::Single as i32,
+                capabilities: vec![IndexFieldCapability::Exact as i32],
+                field_type: Some(keldra_api::v1::index_field::FieldType::Keyword(
+                    KeywordIndexField {},
+                )),
+            }],
+            physical_order: Vec::new(),
+        })),
+    }
+}
 
 const SIGNING_KEY: &[u8] = b"keldra-public-object-surface-test-key";
 const OWNER_SECRET: &str = "owner-secret-0123456789abcdef0123456789abcdef";
@@ -453,9 +472,7 @@ async fn raw_reserved_objects_are_denied_but_trusted_adapters_still_work() {
                 name: "reserved-boundary".into(),
                 path_prefix: "docs/".into(),
                 content_type: String::new(),
-                specification: Some(IndexSpecification {
-                    specification: Some(IndexSpecificationValue::Path(PathIndexSpec {})),
-                }),
+                specification: Some(typed_json_specification()),
                 command_id: "create-reserved-boundary".into(),
             },
             token,
@@ -510,9 +527,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
         name: "authorization-boundary".into(),
         path_prefix: "docs/".into(),
         content_type: String::new(),
-        specification: Some(IndexSpecification {
-            specification: Some(IndexSpecificationValue::Path(PathIndexSpec {})),
-        }),
+        specification: Some(typed_json_specification()),
         command_id: "create-authorization-boundary".into(),
     };
     assert_permission_denied(
@@ -546,9 +561,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
                     expected_version: created.version,
                     path_prefix: "docs/updated".into(),
                     content_type: String::new(),
-                    specification: Some(IndexSpecification {
-                        specification: Some(IndexSpecificationValue::Path(PathIndexSpec {})),
-                    }),
+                    specification: Some(typed_json_specification()),
                     command_id: "update-authorization-boundary".into(),
                 },
                 &denied_token,
@@ -676,9 +689,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
                 expected_version: rebuilt.version,
                 path_prefix: "docs/updated".into(),
                 content_type: String::new(),
-                specification: Some(IndexSpecification {
-                    specification: Some(IndexSpecificationValue::Path(PathIndexSpec {})),
-                }),
+                specification: Some(typed_json_specification()),
                 command_id: "update-after-rebuild".into(),
             },
             owner_token,
