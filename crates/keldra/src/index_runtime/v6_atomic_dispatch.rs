@@ -164,7 +164,7 @@ impl AtomicFinalizationDispatcher {
                     .first_key_value()
                     .map(|(&position, &cursor)| (position, cursor))
             });
-            let Some((position, cursor)) = next else {
+            let Some((_position, cursor)) = next else {
                 break;
             };
             let expected = self
@@ -172,10 +172,12 @@ impl AtomicFinalizationDispatcher {
                 .get(&cursor)
                 .and_then(|(_, sources)| sources.get(&source))
                 .cloned();
+            // A source-head hold normally reaches us before the executor's
+            // AtomicBatchPublished record.  It is not corruption for that
+            // membership to be absent yet; retain the hold until the later
+            // all-source observation supplies the authoritative batch.
             let Some(expected) = expected else {
-                return Err(Status::data_loss(
-                    "held atomic source position has no finalized batch membership",
-                ));
+                break;
             };
             let group = expected
                 .iter()

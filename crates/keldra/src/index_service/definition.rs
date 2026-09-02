@@ -707,7 +707,7 @@ mod tests {
         request.specification = Some(IndexSpecification {
             specification: Some(index_specification::Specification::TypedJson(
                 TypedJsonIndexSpec {
-                    fields: (0..6_000)
+                    fields: (0..65_537)
                         .map(|ordinal| IndexField {
                             name: format!("field-{ordinal}"),
                             json_pointer: format!("/field-{ordinal}"),

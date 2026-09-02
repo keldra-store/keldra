@@ -953,7 +953,7 @@ fn family_physical_generation(recipe: &PhysicalCatalogRecipe) -> [u8; 32] {
 mod tests {
     use keldra_api::v1::{
         CreateIndexRequest, IndexField, IndexFieldCapability, IndexFieldCardinality,
-        IndexSpecification, KeywordIndexField, PathIndexSpec, TypedJsonIndexSpec, index_field,
+        IndexSpecification, KeywordIndexField, TypedJsonIndexSpec, index_field,
     };
 
     use super::*;
@@ -972,8 +972,11 @@ mod tests {
                     content_type: String::new(),
                     specification: Some(IndexSpecification {
                         specification: Some(
-                            keldra_api::v1::index_specification::Specification::Path(
-                                PathIndexSpec {},
+                            keldra_api::v1::index_specification::Specification::TypedJson(
+                                TypedJsonIndexSpec {
+                                    fields: vec![keyword_field("value", "/value")],
+                                    physical_order: Vec::new(),
+                                },
                             ),
                         ),
                     }),

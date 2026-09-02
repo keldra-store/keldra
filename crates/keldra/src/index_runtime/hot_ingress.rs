@@ -635,12 +635,13 @@ mod tests {
     fn overflow_evicts_fifo_and_never_blocks_ingestion() {
         let ingress = HotProjectionIngress::new(800).unwrap();
         ingress.activate_test_route(1, 2);
-        for (path, version) in [("a", 1), ("b", 2), ("c", 3)] {
-            let pending = ingress.pending(1, 2, &put(path, 100));
+        for version in 1..=20 {
+            let path = format!("item-{version}");
+            let pending = ingress.pending(1, 2, &put(&path, 100));
             ingress.admit_committed(pending, &receipt(version));
         }
-        assert!(ingress.take_exact_selected(1, 2, "a", 1).is_none());
-        assert!(ingress.take_exact_selected(1, 2, "c", 3).is_some());
+        assert!(ingress.take_exact_selected(1, 2, "item-1", 1).is_none());
+        assert!(ingress.take_exact_selected(1, 2, "item-20", 20).is_some());
         assert!(ingress.used_bytes() <= 800);
     }
 
