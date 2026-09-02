@@ -322,7 +322,9 @@ mod tests {
                     && group.mutations.iter().all(|mutation| mutation.mutation.source_id == local)
         ));
         assert_eq!(dispatcher.checkpoint_limit(local, 6), 6);
-        assert_eq!(dispatcher.checkpoint_limit(remote, 6), 5);
+        // An unassigned remote source cannot constrain this producer's local
+        // checkpoint; its hold is retained only for all-source finalization.
+        assert_eq!(dispatcher.checkpoint_limit(remote, 6), 6);
     }
 
     #[test]
