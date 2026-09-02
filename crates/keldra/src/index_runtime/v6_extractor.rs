@@ -9,12 +9,17 @@ use keldra_index::v6::{
     PreparedTypedJsonDocument, ProjectedDocumentState, QueryBlockCredits, RecipeIdentity,
     TypedJsonDocumentInput, TypedJsonSelectedField, prepare_typed_json_document,
 };
+use keldra_index::{
+    IndexError,
+    typed_json::{FieldSchema, FieldType, ScalarValue},
+};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
 
 use super::catalog::PhysicalCatalogRecipe;
 use super::cpu::IndexCpuPool;
+use super::date::parse_millis;
 use super::hot_ingress::HotProjectionIngress;
 use super::json_projection::{ProjectedScalarPointers, project_scalar_pointers};
 use super::source::{IndexBuildObject, IndexSourceMutation};
@@ -164,7 +169,9 @@ impl V6ProjectionExtractor {
                             .selected
                             .as_ref()
                             .and_then(|selected| selected.get(&field.source_selector))
-                            .map(|selected| selected.values.clone())
+                            .map(|selected| normalize_selected_values(field, &selected.values))
+                            .transpose()
+                            .map_err(index_status)?
                     } else {
                         None
                     },
@@ -200,6 +207,68 @@ impl V6ProjectionExtractor {
     }
 }
 
+/// Bind definition-neutral JSON number tags to one declared field type.
+///
+/// JSON has no distinct positive signed-integer spelling: `100` is selected as
+/// `Unsigned(100)` even when a definition declares a signed field. Likewise an
+/// integral JSON spelling may legally feed a Float field when it is exactly
+/// representable. This is the schema-local normalization boundary retained by
+/// the former v4 projector; it performs no lossy numeric coercion.
+fn normalize_selected_values(
+    field: &FieldSchema,
+    selected: &[ScalarValue],
+) -> Result<Vec<ScalarValue>, IndexError> {
+    selected
+        .iter()
+        .cloned()
+        .map(|value| normalize_selected_value(field, value))
+        .collect()
+}
+
+fn normalize_selected_value(
+    field: &FieldSchema,
+    value: ScalarValue,
+) -> Result<ScalarValue, IndexError> {
+    if value == ScalarValue::Null {
+        return Ok(value);
+    }
+    let invalid = || {
+        IndexError::Decode(format!(
+            "Typed JSON field `{}` contains a value outside its declared type",
+            field.name
+        ))
+    };
+    Ok(match (field.field_type, value) {
+        (FieldType::Boolean, ScalarValue::Boolean(value)) => ScalarValue::Boolean(value),
+        (FieldType::SignedInteger, ScalarValue::Signed(value)) => ScalarValue::Signed(value),
+        (FieldType::SignedInteger, ScalarValue::Unsigned(value)) => {
+            ScalarValue::Signed(i64::try_from(value).map_err(|_| invalid())?)
+        }
+        (FieldType::UnsignedInteger, ScalarValue::Unsigned(value)) => ScalarValue::Unsigned(value),
+        (FieldType::UnsignedInteger, ScalarValue::Signed(0)) => ScalarValue::Unsigned(0),
+        (FieldType::Float, ScalarValue::Number(bits)) => ScalarValue::Number(bits),
+        (FieldType::Float, ScalarValue::Signed(value)) => {
+            ScalarValue::exact_number_from_i64(value).ok_or_else(invalid)?
+        }
+        (FieldType::Float, ScalarValue::Unsigned(value)) => {
+            ScalarValue::exact_number_from_u64(value).ok_or_else(invalid)?
+        }
+        (FieldType::Date, ScalarValue::String(value)) => ScalarValue::Signed(
+            parse_millis(
+                &value,
+                &field.effective_date_format().ok_or_else(|| {
+                    IndexError::InvalidDefinition("Date field has no format".into())
+                })?,
+            )
+            .map_err(|_| invalid())?,
+        ),
+        (FieldType::Keyword | FieldType::Text, ScalarValue::String(value)) => {
+            ScalarValue::String(value)
+        }
+        _ => return Err(invalid()),
+    })
+}
+
 fn index_status(error: keldra_index::IndexError) -> Status {
     match error {
         keldra_index::IndexError::ResourceLimit { .. } => {
@@ -229,4 +298,69 @@ pub(crate) fn matching_recipes(
         })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use keldra_index::typed_json::{
+        Analyzer, Cardinality, Collation, DateFormat, FieldCapabilities, FieldId,
+    };
+
+    use super::*;
+
+    fn field(field_type: FieldType) -> FieldSchema {
+        FieldSchema {
+            id: FieldId::new(0),
+            name: "value".into(),
+            source_selector: "/value".into(),
+            field_type,
+            cardinality: Cardinality::Single,
+            allow_missing: true,
+            allow_null: true,
+            collation: Collation::BinaryUtf8,
+            capabilities: match field_type {
+                FieldType::Text => FieldCapabilities::FULL_TEXT,
+                _ => FieldCapabilities::EXACT,
+            },
+            analyzer: (field_type == FieldType::Text)
+                .then_some(Analyzer::UnicodeAlphanumericLowercase),
+            date_format: (field_type == FieldType::Date).then_some(DateFormat::Iso8601),
+        }
+    }
+
+    #[test]
+    fn definition_neutral_numbers_bind_to_declared_numeric_types() {
+        assert_eq!(
+            normalize_selected_values(
+                &field(FieldType::SignedInteger),
+                &[ScalarValue::Unsigned(7)]
+            )
+            .unwrap(),
+            [ScalarValue::Signed(7)]
+        );
+        assert_eq!(
+            normalize_selected_values(&field(FieldType::Float), &[ScalarValue::Unsigned(7)])
+                .unwrap(),
+            [ScalarValue::number(7.0).unwrap()]
+        );
+        assert!(
+            normalize_selected_values(
+                &field(FieldType::SignedInteger),
+                &[ScalarValue::Unsigned(u64::MAX)]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn selected_date_strings_bind_to_epoch_milliseconds() {
+        assert_eq!(
+            normalize_selected_values(
+                &field(FieldType::Date),
+                &[ScalarValue::String("1970-01-02".into())]
+            )
+            .unwrap(),
+            [ScalarValue::Signed(86_400_000)]
+        );
+    }
 }
