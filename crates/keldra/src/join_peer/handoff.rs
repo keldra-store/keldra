@@ -237,7 +237,11 @@ impl TypedAddHandoff {
         finished: &BTreeMap<NodeId, SourceTail>,
     ) -> Result<Vec<LocalChange>, Status> {
         let mut changes = Vec::new();
-        for endpoint in &topology.active {
+        for endpoint in topology
+            .active
+            .iter()
+            .chain(std::iter::once(&topology.joining))
+        {
             let before = started
                 .get(&endpoint.node_id)
                 .ok_or_else(|| Status::data_loss("initial source journal is missing"))?;
@@ -375,7 +379,11 @@ impl TypedAddHandoff {
         // completes, so the resulting snapshot is stable across all owners.
         self.mutation_admission.close_now(identity)?;
         let mut remote_closes = tokio::task::JoinSet::new();
-        for endpoint in &topology.active {
+        for endpoint in topology
+            .active
+            .iter()
+            .chain(std::iter::once(&topology.joining))
+        {
             if endpoint.node_id == self.local_node {
                 continue;
             }
@@ -389,7 +397,7 @@ impl TypedAddHandoff {
         }
 
         let local = self.mutation_admission.drain(identity).await?;
-        let mut remote = Vec::with_capacity(topology.active.len().saturating_sub(1));
+        let mut remote = Vec::with_capacity(topology.active.len());
         while let Some(result) = remote_closes.join_next().await {
             remote.push(result.map_err(|error| {
                 Status::internal(format!("remote mutation-drain task failed: {error}"))
@@ -411,7 +419,11 @@ impl TypedAddHandoff {
                 joining_node_id: scope.joining_node_id,
                 started_log_index: scope.started_log_index,
             });
-        for endpoint in &topology.active {
+        for endpoint in topology
+            .active
+            .iter()
+            .chain(std::iter::once(&topology.joining))
+        {
             if endpoint.node_id == self.local_node {
                 continue;
             }

@@ -728,7 +728,7 @@ async fn open_with_identity(
     .await
     .context("open bounded decision Raft with private transport")?;
     pins.install(decisions.clone())?;
-    let mutation_admission = initial_mutation_admission(&decisions)?;
+    let mutation_admission = initial_mutation_admission(&decisions, config.node_id)?;
     Ok((
         decisions,
         PeerRuntime {
@@ -756,14 +756,19 @@ async fn open_with_identity(
     ))
 }
 
-fn initial_mutation_admission(decisions: &DecisionRaft) -> Result<MutationAdmission> {
+fn initial_mutation_admission(
+    decisions: &DecisionRaft,
+    local_node: NodeId,
+) -> Result<MutationAdmission> {
     let state = decisions
         .state()
         .context("read initial mutation admission")?;
     let identity = state
         .cluster_control()
         .transition()
-        .filter(|transition| transition.kind == MembershipTransitionKind::Add)
+        .filter(|transition| {
+            transition.kind == MembershipTransitionKind::Add && transition.node_id != local_node
+        })
         .filter(|transition| {
             state
                 .cluster_control()
@@ -1170,17 +1175,7 @@ impl CommittedPeerPinProvider for RaftCommittedPeerPins {
                 return None;
             }
             let descriptor = state.cluster_control().nodes().get(&node_id)?;
-            let allowed = match kind {
-                PeerRpcKind::JoinControl => {
-                    matches!(descriptor.state, NodeState::Active | NodeState::Joining)
-                }
-                PeerRpcKind::AppendEntries
-                | PeerRpcKind::Vote
-                | PeerRpcKind::InstallSnapshot
-                | PeerRpcKind::ServingLease
-                | PeerRpcKind::DataPlane
-                | PeerRpcKind::StateTransfer => descriptor.state == NodeState::Active,
-            };
+            let allowed = committed_peer_rpc_allowed(descriptor.state, kind);
             return allowed.then_some(CommittedPeerPins {
                 current: descriptor.current_peer_spki_sha256,
                 overlap: descriptor.overlap_peer_spki_sha256,
@@ -1189,6 +1184,18 @@ impl CommittedPeerPinProvider for RaftCommittedPeerPins {
         self.bootstrap
             .as_ref()?
             .authorized_catch_up_pins(cluster_id, node_id, kind)
+    }
+}
+
+fn committed_peer_rpc_allowed(state: NodeState, kind: PeerRpcKind) -> bool {
+    match kind {
+        PeerRpcKind::JoinControl | PeerRpcKind::ServingLease | PeerRpcKind::DataPlane => {
+            matches!(state, NodeState::Active | NodeState::Joining)
+        }
+        PeerRpcKind::AppendEntries
+        | PeerRpcKind::Vote
+        | PeerRpcKind::InstallSnapshot
+        | PeerRpcKind::StateTransfer => state == NodeState::Active,
     }
 }
 
@@ -1203,6 +1210,25 @@ mod tests {
     use crate::serving_fence::ServingFenceRuntime;
 
     struct AllowCompletedHandoff;
+
+    #[test]
+    fn joining_peer_has_only_coordinator_and_join_authority() {
+        for allowed in [
+            PeerRpcKind::JoinControl,
+            PeerRpcKind::ServingLease,
+            PeerRpcKind::DataPlane,
+        ] {
+            assert!(committed_peer_rpc_allowed(NodeState::Joining, allowed));
+        }
+        for denied in [
+            PeerRpcKind::AppendEntries,
+            PeerRpcKind::Vote,
+            PeerRpcKind::InstallSnapshot,
+            PeerRpcKind::StateTransfer,
+        ] {
+            assert!(!committed_peer_rpc_allowed(NodeState::Joining, denied));
+        }
+    }
 
     #[tonic::async_trait]
     impl JoinActivationGate for AllowCompletedHandoff {

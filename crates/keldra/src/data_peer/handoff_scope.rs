@@ -27,6 +27,7 @@ enum HandoffAuthoritySource {
 pub(super) enum HandoffTarget {
     AnyNode,
     ActiveNode,
+    ActiveOrJoiningNode,
     JoiningNode,
 }
 
@@ -178,6 +179,15 @@ fn validate_facts(
     {
         return Err(Status::failed_precondition(
             "handoff drain was sent to a node outside old ACTIVE membership",
+        ));
+    }
+    if target == HandoffTarget::ActiveOrJoiningNode
+        && local_descriptor.is_none_or(|descriptor| {
+            !matches!(descriptor.state, NodeState::Active | NodeState::Joining)
+        })
+    {
+        return Err(Status::failed_precondition(
+            "handoff drain was sent outside ACTIVE or JOINING membership",
         ));
     }
     Ok(())

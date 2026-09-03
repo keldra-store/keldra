@@ -7,7 +7,7 @@ pub(super) async fn drain_mutations(
     mut request: Request<wire::MutationDrainRequest>,
 ) -> Result<Response<wire::MutationDrained>, Status> {
     let (caller, scope) = authorize_scope(service, &mut request)?;
-    service.validate_handoff(caller, Some(&scope), HandoffTarget::ActiveNode)?;
+    service.validate_handoff(caller, Some(&scope), HandoffTarget::ActiveOrJoiningNode)?;
     let identity = drain_identity(&scope);
     service.cutover_admission.close_now(identity)?;
     service

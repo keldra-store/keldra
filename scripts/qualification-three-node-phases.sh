@@ -87,10 +87,26 @@ start_prepared_node() {
   local service="keldra-${node_id}"
   compose up --detach "${service}"
   wait_for_node "${service}" "${joining_node_ready_timeout_seconds}"
+  echo "[keldra-qualification] ${service} public coordinator endpoint became ready within ${joining_node_ready_timeout_seconds}s"
   if [[ -e "${KELDRA_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
     echo "${service} became ready without consuming and deleting its join bundle" >&2
     return 1
   fi
+}
+
+wait_for_background_join() {
+  local service="$1"
+  local timeout_seconds="$2"
+  local attempt
+  for attempt in $(seq 1 "${timeout_seconds}"); do
+    if service_logs "${service}" | grep -Fq 'background cluster join completed'; then
+      echo "[keldra-qualification] ${service} background ownership handoff completed"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${service} did not complete background ownership handoff within ${timeout_seconds}s" >&2
+  return 1
 }
 
 prepare_and_start_node() {

@@ -22,7 +22,8 @@ esac
 minimum_source_journal_max_entries=4097
 release_source_journal_max_entries="${KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
 pressure_source_journal_max_entries="${KELDRA_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES:-${minimum_source_journal_max_entries}}"
-joining_node_ready_timeout_seconds="${KELDRA_QUALIFICATION_JOIN_TIMEOUT_SECONDS:-1800}"
+joining_node_ready_timeout_seconds="${KELDRA_QUALIFICATION_JOIN_READY_TIMEOUT_SECONDS:-10}"
+joining_node_handoff_timeout_seconds="${KELDRA_QUALIFICATION_JOIN_TIMEOUT_SECONDS:-1800}"
 if [[ ! "${release_source_journal_max_entries}" =~ ^[1-9][0-9]*$ ]] \
   || ((release_source_journal_max_entries < minimum_source_journal_max_entries))
 then
@@ -36,6 +37,10 @@ then
   exit 2
 fi
 if [[ ! "${joining_node_ready_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "KELDRA_QUALIFICATION_JOIN_READY_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "${joining_node_handoff_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
   echo "KELDRA_QUALIFICATION_JOIN_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 2
 fi
@@ -727,6 +732,7 @@ cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
   "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-read.bin"
 require_qprobe_head keldra-1 growth/from-two.bin "${growth_two_head}"
 echo "[keldra-qualification] two-node REPLICATED read preserved its head and bytes"
+wait_for_background_join keldra-2 "${joining_node_handoff_timeout_seconds}"
 
 start_source_journal_phase "${pressure_source_journal_max_entries}" keldra-1 keldra-2
 echo "[keldra-qualification] cutover pressure phase uses source-journal max entries ${pressure_source_journal_max_entries}"
@@ -734,6 +740,20 @@ prepare_no_event_membership_cutover_qualification \
   keldra-2 2 qprobe-client "${qprobe_secret}" qprobe objects \
   "${pressure_source_journal_max_entries}"
 prepare_and_start_node 3
+printf '%s\n' 'joining coordinator write' \
+  >"${KELDRA_QUALIFICATION_DIR}/artifacts/joining-coordinator-write.txt"
+run_cli keldra-3 qprobe-client "${qprobe_secret}" \
+  put qprobe objects growth/through-joining-node.txt \
+    /qualification/artifacts/joining-coordinator-write.txt \
+    --command-id qprobe-joining-coordinator-write \
+    --durability replicated --if-absent >/dev/null
+run_cli keldra-1 qprobe-client "${qprobe_secret}" \
+  get qprobe objects growth/through-joining-node.txt \
+    --output /qualification/artifacts/joining-coordinator-read.txt
+cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/joining-coordinator-write.txt" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/joining-coordinator-read.txt"
+echo "[keldra-qualification] JOINING node coordinated authenticated reads and writes before ownership activation"
+wait_for_background_join keldra-3 "${joining_node_handoff_timeout_seconds}"
 qualify_no_event_membership_cutover \
   keldra-2 2 qprobe-client "${qprobe_secret}" qprobe objects \
   "${pressure_source_journal_max_entries}"

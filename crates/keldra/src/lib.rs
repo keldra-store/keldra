@@ -261,17 +261,25 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             config.max_blob_bytes,
         )
         .await?;
-    if let Some(pending_join) = pending_join.as_ref() {
+    let join_decisions = decisions.clone();
+    let join_state_dir = config.storage.state.clone();
+    let join_profile = config.erasure_profile;
+    let mut pending_join_task = tokio::spawn(async move {
+        let Some(pending_join) = pending_join else {
+            return std::future::pending::<Result<()>>().await;
+        };
         peer_runtime::complete_pending_join(
-            pending_join,
-            &decisions,
-            &config.storage.state,
-            config.erasure_profile,
+            &pending_join,
+            &join_decisions,
+            &join_state_dir,
+            join_profile,
             DECISION_LEADER_TIMEOUT,
         )
         .await
         .context("join existing cluster through typed ownership handoff")?;
-    }
+        tracing::info!("background cluster join completed");
+        std::future::pending::<Result<()>>().await
+    });
     decisions
         .wait_for_leader(DECISION_LEADER_TIMEOUT)
         .await
@@ -790,12 +798,15 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         Signal(std::io::Result<()>),
         Public(Result<Result<()>, tokio::task::JoinError>),
         Peer(Result<Result<()>, tokio::task::JoinError>),
+        Join(Result<Result<()>, tokio::task::JoinError>),
     }
     let first_stop = tokio::select! {
         signal = tokio::signal::ctrl_c() => FirstStop::Signal(signal),
         public = public_server.task_mut() => FirstStop::Public(public),
         peer = peer_server.task_mut() => FirstStop::Peer(peer),
+        join = &mut pending_join_task => FirstStop::Join(join),
     };
+    pending_join_task.abort();
     let server_result = match first_stop {
         FirstStop::Signal(signal) => {
             let public = public_server.shutdown().await;
@@ -820,6 +831,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 .context("serve private peer listener");
             peer?;
             public
+        }
+        FirstStop::Join(join) => {
+            let public = public_server.shutdown().await;
+            let peer = peer_server.shutdown().await;
+            join.context("join background cluster-membership task")??;
+            public?;
+            peer
         }
     };
     blob_maintenance.shutdown().await;

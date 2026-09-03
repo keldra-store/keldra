@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use keldra_consensus::{
-    AuthenticatedPeer, ClusterId, NodeId, PeerRpcKind, PeerSpkiSha256, authorize_peer_rpc,
+    AuthenticatedPeer, ClusterId, MembershipTransitionKind, NodeId, NodeState, PeerRpcKind,
+    PeerSpkiSha256, authorize_peer_rpc,
 };
 use keldra_store::PlacementLogId;
 use tonic::{Request, Status};
@@ -83,9 +84,21 @@ impl ClusterPeerService {
             term: context.placement_term,
             index: context.placement_index,
         };
+        let joining_coordinator = state
+            .cluster_control()
+            .transition()
+            .is_some_and(|transition| {
+                transition.kind == MembershipTransitionKind::Add
+                    && transition.node_id == source
+                    && state
+                        .cluster_control()
+                        .nodes()
+                        .get(&source)
+                        .is_some_and(|descriptor| descriptor.state == NodeState::Joining)
+            });
         if placement.cluster_id() != cluster_id
             || placement.fence() != expected_fence
-            || !placement.active_node_ids().contains(&source)
+            || (!placement.active_node_ids().contains(&source) && !joining_coordinator)
             || !placement.active_node_ids().contains(&self.local_node)
         {
             return Err(Status::unavailable(
