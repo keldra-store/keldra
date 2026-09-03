@@ -370,7 +370,7 @@ impl ClusterPeerService {
         let deadline = tokio::time::Instant::now() + admitted.timeout;
         let raw = request.get_ref();
         let stable_tenant_id = raw.stable_tenant_id;
-        require_realm_coordinator(&admitted.placement, self.local_node, stable_tenant_id)?;
+        require_realm_read_replica(&admitted.placement, self.local_node, stable_tenant_id)?;
         let scope: AuthzScope = decode_json(&raw.scope_json)?;
         scope
             .handoff_order_key()
@@ -430,7 +430,7 @@ impl ClusterPeerService {
         let deadline = tokio::time::Instant::now() + admitted.timeout;
         let raw = request.get_ref();
         let stable_tenant_id = raw.stable_tenant_id;
-        require_realm_coordinator(&admitted.placement, self.local_node, stable_tenant_id)?;
+        require_realm_read_replica(&admitted.placement, self.local_node, stable_tenant_id)?;
         if raw.checks_json.is_empty() || raw.checks_json.len() > 1_000 {
             return Err(Status::resource_exhausted(
                 "fresh authorization batch must contain 1..=1000 checks",
@@ -531,14 +531,17 @@ fn require_realm_replica(
     Ok(())
 }
 
-fn require_realm_coordinator(
+fn require_realm_read_replica(
     placement: &crate::cluster_placement::ClusterPlacement,
     local: NodeId,
     stable_tenant_id: u64,
 ) -> Result<(), Status> {
-    if realm_group(placement, stable_tenant_id)?.coordinator() != local {
+    if !realm_group(placement, stable_tenant_id)?
+        .replicas()
+        .contains(&local)
+    {
         return Err(Status::failed_precondition(
-            "fresh authorization check is not addressed to the tenant coordinator",
+            "fresh authorization check is not addressed to a selected tenant replica",
         ));
     }
     Ok(())

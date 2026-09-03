@@ -850,7 +850,7 @@ impl ZanzibarDistribution {
         check: AuthorizationCheck,
     ) -> Result<(bool, AuthzRevision, u64), Status> {
         let _serial = self.core.coordinator_serial.read().await;
-        let replicas = self.require_coordinator(stable_tenant_id)?;
+        let replicas = self.require_read_replica(stable_tenant_id)?;
         let serving = self.serving.mutation_context()?;
         let checked_scope = scope.clone();
         let (allowed, revision) = self
@@ -875,7 +875,7 @@ impl ZanzibarDistribution {
         checks: Vec<AuthorizationCheck>,
     ) -> Result<(Vec<bool>, AuthzRevision, u64), Status> {
         let _serial = self.core.coordinator_serial.read().await;
-        let replicas = self.require_coordinator(stable_tenant_id)?;
+        let replicas = self.require_read_replica(stable_tenant_id)?;
         let serving = self.serving.mutation_context()?;
         let checked_scope = scope.clone();
         let (allowed, revision) = self
@@ -898,9 +898,9 @@ impl ZanzibarDistribution {
         original_group: &MutableRecordReplicaGroup,
         original_serving: ObjectMutationContext,
     ) -> Result<(), Status> {
-        let current_replicas = self.require_coordinator(stable_tenant_id).map_err(|_| {
-            Status::unavailable("authorization coordinator changed during fresh check")
-        })?;
+        let current_replicas = self
+            .require_read_replica(stable_tenant_id)
+            .map_err(|_| Status::unavailable("authorization replica changed during fresh check"))?;
         let current_serving = self.serving.mutation_context()?;
         if current_replicas.group != *original_group || current_serving != original_serving {
             return Err(Status::unavailable(
@@ -923,6 +923,26 @@ impl ZanzibarDistribution {
                 "authorization tenant is coordinated by node {}",
                 replicas.group.coordinator().0
             )));
+        }
+        Ok(replicas)
+    }
+
+    /// Fresh checks are read-only, but still reconcile the complete realm from
+    /// its exact replica quorum before evaluation. Any selected replica may do
+    /// that work so loss of rank zero does not make a healthy quorum
+    /// unavailable. Mutation coordination remains rank-zero-only.
+    fn require_read_replica(&self, stable_tenant_id: u64) -> Result<TenantReplicaSet, Status> {
+        let state = self
+            .decisions
+            .state()
+            .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
+        let placement = ClusterPlacement::from_applied(&state)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let replicas = TenantReplicaSet::from_placement(&placement, stable_tenant_id)?;
+        if !replicas.group.replicas().contains(&self.local_node) {
+            return Err(Status::failed_precondition(
+                "fresh authorization check did not reach a selected tenant replica",
+            ));
         }
         Ok(replicas)
     }
