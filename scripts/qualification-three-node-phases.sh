@@ -99,7 +99,11 @@ wait_for_background_join() {
   local timeout_seconds="$2"
   local attempt
   for attempt in $(seq 1 "${timeout_seconds}"); do
-    if service_logs "${service}" | grep -Fq 'background cluster join completed'; then
+    # Consume the complete log stream. With pipefail, grep -q can close the
+    # pipe after the match and turn docker logs' SIGPIPE into a false failure.
+    if service_logs "${service}" \
+      | grep -F 'background cluster join completed' >/dev/null
+    then
       echo "[keldra-qualification] ${service} background ownership handoff completed"
       return 0
     fi
