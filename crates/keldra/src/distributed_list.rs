@@ -788,14 +788,11 @@ async fn gather_cluster_page(
         ));
     }
     let active = placement.active_node_ids();
-    if !active.contains(&local_node) {
-        return Err(Status::unavailable(
-            "the ingress node is not ACTIVE in this placement",
-        ));
-    }
 
     let mut tasks = tokio::task::JoinSet::new();
     for source in active.iter().copied() {
+        // A JOINING ingress is not an authoritative list source yet, but it can
+        // serve immediately by forwarding the request to every ACTIVE source.
         let query = query.clone();
         if source == local_node {
             let store = store.clone();
@@ -1716,6 +1713,8 @@ mod tests {
         drop(stores);
         drop(directories);
     }
+
+    include!("distributed_list_joining_test.rs");
 
     #[tokio::test]
     async fn any_peer_failure_or_stale_fence_fails_the_whole_page() {
