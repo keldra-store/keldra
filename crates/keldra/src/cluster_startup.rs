@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use keldra_consensus::{
     ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, ClusterId, Command, DecisionRaft,
-    ErasureCodeProfile, JwtSigningKeyFingerprint, NodeId, SYSTEM_BOOTSTRAP_VERSION,
+    ErasureCodeProfile, JwtSigningKeyFingerprint, NodeId, NodeState, SYSTEM_BOOTSTRAP_VERSION,
     SystemBootstrapState as ConsensusBootstrapState,
 };
 use keldra_store::{ErasureProfile, Store, SystemBootstrapState as LocalBootstrapState};
@@ -14,6 +14,41 @@ enum BootstrapAction {
     Ready,
     CommitExistingLocalState,
     CreateLocalStateThenCommit,
+}
+
+/// Wait until a joining node has applied the cluster state imported by its
+/// background catch-up task. A received Raft vote can identify the leader
+/// before that state is locally applied, so leader discovery alone is not a
+/// sufficient startup barrier for an admitted node.
+pub(crate) async fn wait_for_joining_cluster_state(
+    decisions: &DecisionRaft,
+    local_node: NodeId,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .context("join startup timeout exceeds the process clock")?;
+    loop {
+        if joining_node_is_applied(decisions, local_node)? {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the admitted node descriptor to apply locally"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn joining_node_is_applied(decisions: &DecisionRaft, local_node: NodeId) -> Result<bool> {
+    Ok(decisions
+        .state()?
+        .cluster_control()
+        .nodes()
+        .get(&local_node)
+        .is_some_and(|descriptor| {
+            matches!(descriptor.state, NodeState::Joining | NodeState::Active)
+        }))
 }
 
 /// Ensure the one-node genesis group has exactly one stable cluster identity.
@@ -360,6 +395,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("--run-system-bootstrap"));
+    }
+
+    #[tokio::test]
+    async fn joining_startup_waits_for_its_applied_descriptor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let decisions = DecisionRaft::open(temporary.path().join("decisions"), 1, 16, 64 * 1024)
+            .await
+            .unwrap();
+        decisions.ensure_one_node().await.unwrap();
+        decisions
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
+        ensure_genesis_identity(&decisions).await.unwrap();
+
+        assert!(!joining_node_is_applied(&decisions, NodeId(1)).unwrap());
+        commit_test_active_placement(&decisions).await;
+        wait_for_joining_cluster_state(&decisions, NodeId(1), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let error = wait_for_joining_cluster_state(&decisions, NodeId(2), Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("descriptor"));
+        decisions.shutdown().await.unwrap();
     }
 
     #[tokio::test]

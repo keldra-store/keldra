@@ -285,6 +285,15 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .wait_for_leader(DECISION_LEADER_TIMEOUT)
         .await
         .context("elect decision leader")?;
+    if background_join_in_progress {
+        cluster_startup::wait_for_joining_cluster_state(
+            &decisions,
+            local_node,
+            DECISION_LEADER_TIMEOUT,
+        )
+        .await
+        .context("apply existing cluster state before joining-node startup")?;
+    }
     let _capability_advertisement = cluster_capabilities::CapabilityAdvertisementTask::start(
         decisions.clone(),
         cluster_transport.clone(),
