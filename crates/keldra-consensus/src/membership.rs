@@ -14,9 +14,6 @@ use crate::{
     MembershipTransitionKind, NodeId, NodeState, PeerNode,
 };
 
-const LEARNER_CATCH_UP_ATTEMPTS: usize = 2;
-const LEARNER_CATCH_UP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
-
 #[derive(Debug)]
 struct MembershipView {
     voters: BTreeSet<NodeId>,
@@ -24,6 +21,8 @@ struct MembershipView {
     addresses: BTreeMap<NodeId, String>,
     joint: bool,
 }
+
+const LEARNER_PROGRESS_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl DecisionRaft {
     /// Add the node named by the current ADD transition as a learner and wait
@@ -67,24 +66,32 @@ impl DecisionRaft {
         }
 
         let mut caught_up = false;
-        for attempt in 0..LEARNER_CATCH_UP_ATTEMPTS {
-            let add = self.add_learner(
+        for _ in 0..2 {
+            self.add_learner(
                 transition.node_id.0,
                 PeerNode::new(descriptor.peer_address.0.clone()),
-                true,
-            );
-            match tokio::time::timeout(LEARNER_CATCH_UP_ATTEMPT_TIMEOUT, add).await {
-                Ok(result) => {
-                    result?;
-                    caught_up = true;
-                    break;
-                }
-                Err(_) if attempt + 1 < LEARNER_CATCH_UP_ATTEMPTS => {}
-                Err(_) => {
-                    return Err(DecisionRaftError::Unavailable(
-                        "timed out waiting for learner catch-up".into(),
-                    ));
-                }
+                false,
+            )
+            .await?;
+            let node_id = transition.node_id.0;
+            if self
+                .raft
+                .wait(Some(LEARNER_PROGRESS_TIMEOUT))
+                .metrics(
+                    move |metrics| {
+                        metrics
+                            .replication
+                            .as_ref()
+                            .and_then(|replication| replication.get(&node_id))
+                            .is_some_and(Option::is_some)
+                    },
+                    "wait for learner replication progress",
+                )
+                .await
+                .is_ok()
+            {
+                caught_up = true;
+                break;
             }
         }
         if !caught_up {
