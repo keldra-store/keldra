@@ -408,6 +408,24 @@ impl LogicalRecordDistribution {
             .collect())
     }
 
+    /// Return the selected read replicas with this process first when it owns
+    /// one replica. A local selected replica still performs the complete
+    /// quorum read and repair; preferring it avoids routing a peer name lookup
+    /// back through another selected node before reaching local authority.
+    pub(crate) fn read_targets_local_first(
+        &self,
+        id: &LogicalRecordId,
+    ) -> Result<Vec<LogicalRecordReadTarget>, Status> {
+        Ok(order_read_targets_local_first(
+            self.read_targets(id)?,
+            self.local_node,
+        ))
+    }
+
+    pub(crate) fn is_local_read_target(&self, target: &LogicalRecordReadTarget) -> bool {
+        target.node_id == self.local_node
+    }
+
     pub(crate) fn read_target(
         &self,
         id: &LogicalRecordId,
@@ -849,6 +867,21 @@ fn require_local_read_replica(
             local_node.0
         )))
     }
+}
+
+fn order_read_targets_local_first(
+    mut targets: Vec<LogicalRecordReadTarget>,
+    local_node: NodeId,
+) -> Vec<LogicalRecordReadTarget> {
+    if let Some(index) = targets
+        .iter()
+        .position(|target| target.node_id == local_node)
+        && index != 0
+    {
+        let local = targets.remove(index);
+        targets.insert(0, local);
+    }
+    targets
 }
 
 fn logical_record_status(error: LogicalRecordError) -> Status {

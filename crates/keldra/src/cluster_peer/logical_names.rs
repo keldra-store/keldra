@@ -1,4 +1,6 @@
 use keldra_store::{LogicalRecordId, LogicalRecordValue, StorageTenantId};
+use std::time::Duration;
+
 use tonic::{Request, Response, Status};
 
 use super::{
@@ -70,36 +72,33 @@ impl ClusterPeerTransport {
         &self,
         target: &LogicalRecordReadTarget,
         id: &LogicalRecordId,
+        timeout: Duration,
     ) -> Result<Option<LogicalRecordValue>, Status> {
         match id {
             LogicalRecordId::TenantNameClaim { storage_tenant } => {
+                let mut request = Request::new(wire::ResolveTenantNameRequest {
+                    peer: Some(self.context(target.placement_fence, 0, timeout)?),
+                    storage_tenant: storage_tenant.as_str().to_owned(),
+                });
+                request.set_timeout(timeout.min(MAX_CLUSTER_OPERATION_TIME));
                 let response = self
                     .client(target.node_id, &target.address)?
-                    .resolve_tenant_name(wire::ResolveTenantNameRequest {
-                        peer: Some(self.context(
-                            target.placement_fence,
-                            0,
-                            MAX_CLUSTER_OPERATION_TIME,
-                        )?),
-                        storage_tenant: storage_tenant.as_str().to_owned(),
-                    })
+                    .resolve_tenant_name(request)
                     .await?
                     .into_inner();
                 require_response_schema(response.schema_version)?;
                 decode_tenant_name(storage_tenant, response)
             }
             LogicalRecordId::BucketNameClaim { tenant_id, bucket } => {
+                let mut request = Request::new(wire::ResolveBucketNameRequest {
+                    peer: Some(self.context(target.placement_fence, 0, timeout)?),
+                    tenant_id: *tenant_id,
+                    bucket: bucket.clone(),
+                });
+                request.set_timeout(timeout.min(MAX_CLUSTER_OPERATION_TIME));
                 let response = self
                     .client(target.node_id, &target.address)?
-                    .resolve_bucket_name(wire::ResolveBucketNameRequest {
-                        peer: Some(self.context(
-                            target.placement_fence,
-                            0,
-                            MAX_CLUSTER_OPERATION_TIME,
-                        )?),
-                        tenant_id: *tenant_id,
-                        bucket: bucket.clone(),
-                    })
+                    .resolve_bucket_name(request)
                     .await?
                     .into_inner();
                 require_response_schema(response.schema_version)?;

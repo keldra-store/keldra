@@ -713,6 +713,23 @@ async fn every_selected_replica_may_coordinate_a_quorum_read() {
 }
 
 #[test]
+fn selected_read_targets_prefer_local_without_losing_ranked_fallbacks() {
+    let target = |node_id| LogicalRecordReadTarget {
+        node_id: NodeId(node_id),
+        address: format!("node-{node_id}"),
+        placement_fence: PlacementLogId { term: 3, index: 7 },
+    };
+    assert_eq!(
+        order_read_targets_local_first(vec![target(1), target(2), target(3)], NodeId(2)),
+        vec![target(2), target(1), target(3)]
+    );
+    assert_eq!(
+        order_read_targets_local_first(vec![target(1), target(2), target(3)], NodeId(9)),
+        vec![target(1), target(2), target(3)]
+    );
+}
+
+#[test]
 fn placement_keys_use_only_the_fixed_rfc_encodings() {
     let (_, tenant) = placement_key(&LogicalRecordId::TenantRecord { tenant_id: 7 }).unwrap();
     assert_eq!(tenant, 7_u64.to_be_bytes());
