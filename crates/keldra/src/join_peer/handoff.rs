@@ -237,11 +237,10 @@ impl TypedAddHandoff {
         finished: &BTreeMap<NodeId, SourceTail>,
     ) -> Result<Vec<LocalChange>, Status> {
         let mut changes = Vec::new();
-        for endpoint in topology
-            .active
-            .iter()
-            .chain(std::iter::once(&topology.joining))
-        {
+        // Only ACTIVE nodes are mutation authorities during the handoff. The
+        // JOINING public endpoint routes work to those authorities and does
+        // not become a source-journal authority until activation.
+        for endpoint in &topology.active {
             let before = started
                 .get(&endpoint.node_id)
                 .ok_or_else(|| Status::data_loss("initial source journal is missing"))?;
