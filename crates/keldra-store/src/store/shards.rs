@@ -145,10 +145,45 @@ impl Store {
         &self,
         codec: &ErasureCodec,
         identity: &ShardIdentity,
+        encoded_shard: R,
+    ) -> Result<ShardSealOutcome, ShardStoreError> {
+        self.seal_shard_with_admission(
+            codec,
+            identity,
+            encoded_shard,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn seal_replica_shard<R: Read>(
+        &self,
+        codec: &ErasureCodec,
+        identity: &ShardIdentity,
+        encoded_shard: R,
+    ) -> Result<ShardSealOutcome, ShardStoreError> {
+        self.seal_shard_with_admission(
+            codec,
+            identity,
+            encoded_shard,
+            SourceJournalAdmission::PhysicalReplica,
+        )
+        .await
+    }
+
+    async fn seal_shard_with_admission<R: Read>(
+        &self,
+        codec: &ErasureCodec,
+        identity: &ShardIdentity,
         mut encoded_shard: R,
+        admission: SourceJournalAdmission,
     ) -> Result<ShardSealOutcome, ShardStoreError> {
         identity.validate_for(codec)?;
-        let Some((manifest, start)) = self.prepare_shard_install(codec, identity).await? else {
+        let Some((manifest, start)) = self
+            .prepare_shard_install(codec, identity, admission)
+            .await?
+        else {
             return Ok(ShardSealOutcome::AlreadyPresent);
         };
         discard_exact(
@@ -189,10 +224,45 @@ impl Store {
         &self,
         codec: &ErasureCodec,
         identity: &ShardIdentity,
+        encoded_shard: R,
+    ) -> Result<ShardSealOutcome, ShardStoreError> {
+        self.seal_shard_stream_with_admission(
+            codec,
+            identity,
+            encoded_shard,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn seal_replica_shard_stream<R: AsyncRead + Unpin>(
+        &self,
+        codec: &ErasureCodec,
+        identity: &ShardIdentity,
+        encoded_shard: R,
+    ) -> Result<ShardSealOutcome, ShardStoreError> {
+        self.seal_shard_stream_with_admission(
+            codec,
+            identity,
+            encoded_shard,
+            SourceJournalAdmission::PhysicalReplica,
+        )
+        .await
+    }
+
+    async fn seal_shard_stream_with_admission<R: AsyncRead + Unpin>(
+        &self,
+        codec: &ErasureCodec,
+        identity: &ShardIdentity,
         mut encoded_shard: R,
+        admission: SourceJournalAdmission,
     ) -> Result<ShardSealOutcome, ShardStoreError> {
         identity.validate_for(codec)?;
-        let Some((manifest, start)) = self.prepare_shard_install(codec, identity).await? else {
+        let Some((manifest, start)) = self
+            .prepare_shard_install(codec, identity, admission)
+            .await?
+        else {
             return Ok(ShardSealOutcome::AlreadyPresent);
         };
         let mut buffer = vec![0_u8; PAYLOAD_ARTIFACT_CHUNK_BYTES];
@@ -236,6 +306,7 @@ impl Store {
         &self,
         codec: &ErasureCodec,
         identity: &ShardIdentity,
+        admission: SourceJournalAdmission,
     ) -> Result<Option<(ArtifactManifest, u32)>, ShardStoreError> {
         if self
             .read_shard_manifest(identity)
@@ -250,7 +321,7 @@ impl Store {
             self.reserve_sealed_artifact_with_admission_wait(
                 &identity.encode(),
                 now_unix_millis().map_err(shard_error)?,
-                SourceJournalAdmission::Bounded,
+                admission,
             )
             .await
             .map_err(shard_error)?;
@@ -263,7 +334,7 @@ impl Store {
                 &identity.encode(),
                 manifest.clone(),
                 now_unix_millis().map_err(shard_error)?,
-                SourceJournalAdmission::Bounded,
+                admission,
             )
             .await
             .map_err(shard_error)?;

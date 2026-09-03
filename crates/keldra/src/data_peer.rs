@@ -1,7 +1,5 @@
 //! Typed storage operations on Keldra's mandatory-mTLS private peer listener.
 //!
-//! This is not a RocksDB endpoint; methods decode versioned logical store types.
-
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Read;
@@ -351,7 +349,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             .bounded(&metadata, async move {
                 admission.require_fence(placement_fence)?;
                 let applied = store
-                    .apply_reference_deltas(mutation)
+                    .apply_reference_deltas_progress(mutation)
                     .await
                     .map_err(|error| Status::failed_precondition(error.to_string()))?;
                 admission.require_fence(placement_fence)?;
@@ -571,13 +569,13 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
                     "content does not match its immutable identity",
                 ));
             }
-            let stored = tokio::time::timeout(timeout, self.store.stage_blob(&bytes))
-                .await
-                .map_err(|_| Status::deadline_exceeded("content store deadline exceeded"))?
-                .map_err(map_mutation_error)?;
-            if stored != expected {
-                return Err(Status::data_loss("stored content identity changed"));
-            }
+            tokio::time::timeout(
+                timeout,
+                self.store.seal_replica_small_copy(&expected, &bytes),
+            )
+            .await
+            .map_err(|_| Status::deadline_exceeded("content store deadline exceeded"))?
+            .map_err(map_payload_error)?;
             return Ok(Response::new(wire::ContentStored {
                 schema_version: DATA_PEER_SCHEMA_VERSION,
             }));
@@ -658,7 +656,8 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             }
             let outcome = tokio::time::timeout(
                 idle,
-                self.store.seal_complete_source_upload(&expected, upload),
+                self.store
+                    .seal_replica_complete_source_upload(&expected, upload),
             )
             .await
             .map_err(|_| Status::deadline_exceeded("complete-source seal made no progress"))?
@@ -774,7 +773,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         let seal_identity = identity.clone();
         let seal = tokio::spawn(async move {
             store
-                .seal_shard_stream(&codec, &seal_identity, receiver)
+                .seal_replica_shard_stream(&codec, &seal_identity, receiver)
                 .await
         });
 
@@ -1000,7 +999,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         handoff::install_payload_lifecycle(self, request).await
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

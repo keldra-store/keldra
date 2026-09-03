@@ -961,7 +961,6 @@ impl Store {
             SourceJournalAdmission::Bounded,
         )
     }
-
     pub(super) fn stage_local_changes_with_admission(
         &self,
         batch: &mut WriteBatch,
@@ -969,7 +968,9 @@ impl Store {
         reference_effects: LocalReferenceEffects,
         admission: SourceJournalAdmission,
     ) -> Result<(), MutationError> {
-        if changes.is_empty() {
+        if admission.suppresses_physical_replica_changes(changes, reference_effects)?
+            || changes.is_empty()
+        {
             return Ok(());
         }
 

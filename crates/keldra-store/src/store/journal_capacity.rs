@@ -7,6 +7,39 @@ use crate::BlobUpload;
 pub(super) enum SourceJournalAdmission {
     Bounded,
     DerivedProgress,
+    /// A physical payload replica is not a new logical source mutation. Its
+    /// awaiting-publication lifecycle and GC authority are durable, but the
+    /// originating object's journal remains the sole reference authority.
+    PhysicalReplica,
+}
+
+impl SourceJournalAdmission {
+    pub(super) fn suppresses_physical_replica_changes(
+        self,
+        changes: &[PendingLocalChange],
+        reference_effects: LocalReferenceEffects,
+    ) -> Result<bool, MutationError> {
+        if self != Self::PhysicalReplica {
+            return Ok(false);
+        }
+        let physical_only = reference_effects == LocalReferenceEffects::NoReferenceEffects
+            && changes.iter().all(|change| {
+                matches!(
+                    change,
+                    PendingLocalChange::ContentLifecycleChanged {
+                        reference_deltas,
+                        accounting_transition,
+                        ..
+                    } if reference_deltas.is_empty() && accounting_transition.is_none()
+                )
+            });
+        if !physical_only {
+            return Err(MutationError::Storage(
+                "physical replica installation cannot suppress a logical source change".into(),
+            ));
+        }
+        Ok(true)
+    }
 }
 
 impl Store {

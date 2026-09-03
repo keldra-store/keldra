@@ -1,3 +1,4 @@
+use super::journal_capacity::SourceJournalAdmission;
 use super::*;
 use crate::{
     DestinationReferenceArtifact, FRAGMENT_FORMAT_VERSION, ReferenceDeltaApplied,
@@ -15,6 +16,27 @@ impl Store {
     pub async fn apply_reference_deltas(
         &self,
         request: ReferenceDeltaBatch,
+    ) -> Result<ReferenceDeltaApplied, ReferenceDeltaError> {
+        self.apply_reference_deltas_with_admission(request, SourceJournalAdmission::Bounded)
+            .await
+    }
+
+    /// Complete authenticated ordered-reference progress even when the local
+    /// source journal is full. Callers must validate source identity and the
+    /// active placement fence before and after this operation.
+    #[doc(hidden)]
+    pub async fn apply_reference_deltas_progress(
+        &self,
+        request: ReferenceDeltaBatch,
+    ) -> Result<ReferenceDeltaApplied, ReferenceDeltaError> {
+        self.apply_reference_deltas_with_admission(request, SourceJournalAdmission::DerivedProgress)
+            .await
+    }
+
+    async fn apply_reference_deltas_with_admission(
+        &self,
+        request: ReferenceDeltaBatch,
+        admission: SourceJournalAdmission,
     ) -> Result<ReferenceDeltaApplied, ReferenceDeltaError> {
         if request.through < request.after {
             return Err(ReferenceDeltaError::InvalidRange);
@@ -103,10 +125,11 @@ impl Store {
             cursor_key,
             request.through.to_be_bytes(),
         );
-        self.stage_local_changes(
+        self.stage_local_changes_with_admission(
             &mut batch,
             &lifecycle_changes,
             LocalReferenceEffects::NoReferenceEffects,
+            admission,
         )
         .map_err(ReferenceDeltaError::from)?;
         let mut options = WriteOptions::default();
@@ -225,6 +248,7 @@ mod tests {
     use super::*;
     use crate::{
         DestinationReferenceDelta, ErasureCodec, ErasureProfile, ShardIdentity, StoreOptions,
+        WatchRetention,
     };
 
     fn source() -> SourceId {
@@ -293,6 +317,82 @@ mod tests {
         assert!(replayed.replayed);
         assert_eq!(store.blob_reference_state(&blob).unwrap().unwrap(), state);
         assert_eq!(store.scan_local_changes(0, 10).unwrap(), changes);
+    }
+
+    #[tokio::test]
+    async fn physical_replica_and_reference_progress_break_full_journal_cycle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("store");
+        let bytes = b"reference progress replica";
+        let replica = blob_reference_for_bytes(bytes);
+        {
+            let store = Store::open(
+                StoreOptions::new(&root, 1)
+                    .with_watch_retention(WatchRetention::new(1, 1024 * 1024).unwrap()),
+            )
+            .await
+            .unwrap();
+            store.stage_blob(b"fill the journal").await.unwrap();
+            let full = store.local_watch_status().unwrap();
+            assert_eq!((full.tail, full.retained_entries), (1, 1));
+
+            assert_eq!(
+                store
+                    .seal_replica_small_copy(&replica, bytes)
+                    .await
+                    .unwrap(),
+                CompleteCopySealOutcome::Created
+            );
+            assert_eq!(store.local_watch_status().unwrap(), full);
+            let reserved = store.blob_reference_state(&replica).unwrap().unwrap();
+            assert_eq!((reserved.ref_count, reserved.flags), (1, AWAITING_PUBLISH));
+
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    store.stage_blob(b"ordinary writes remain bounded"),
+                )
+                .await
+                .is_err()
+            );
+            let applied = store
+                .apply_reference_deltas_progress(batch(0, 4, &replica, 1))
+                .await
+                .unwrap();
+            assert_eq!(
+                applied,
+                ReferenceDeltaApplied {
+                    through: 4,
+                    replayed: false,
+                }
+            );
+            let progressed = store.local_watch_status().unwrap();
+            assert_eq!((progressed.tail, progressed.retained_entries), (2, 2));
+            assert!(
+                store
+                    .source_journal_runtime_metrics()
+                    .unwrap()
+                    .progress_debt_entries()
+                    >= 1
+            );
+            assert_eq!(store.scan_local_changes(0, 10).unwrap().len(), 2);
+            let published = store.blob_reference_state(&replica).unwrap().unwrap();
+            assert_eq!((published.ref_count, published.flags), (1, 0));
+        }
+
+        let reopened = Store::open(
+            StoreOptions::new(&root, 1)
+                .with_watch_retention(WatchRetention::new(1, 1024 * 1024).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened.reference_delta_cursor(source()).unwrap(), 4);
+        let published = reopened.blob_reference_state(&replica).unwrap().unwrap();
+        assert_eq!((published.ref_count, published.flags), (1, 0));
+        assert_eq!(
+            reopened.complete_copy_state(&replica).await.unwrap(),
+            PayloadArtifactState::Valid
+        );
     }
 
     #[tokio::test]

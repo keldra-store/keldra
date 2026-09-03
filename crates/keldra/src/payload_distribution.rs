@@ -463,7 +463,7 @@ impl PayloadDistribution {
         bytes: &[u8],
     ) -> Result<(), PayloadDistributionError> {
         if owner == self.local_node {
-            self.store.seal_small_copy(reference, bytes).await?;
+            self.store.seal_replica_small_copy(reference, bytes).await?;
             return Ok(());
         }
         let address = peer_address(placement, owner)?;
@@ -591,7 +591,7 @@ impl PayloadDistribution {
                 installs.push(tokio::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         let codec = ErasureCodec::new(profile)?;
-                        runtime.block_on(store.seal_shard(&codec, &identity, reader))
+                        runtime.block_on(store.seal_replica_shard(&codec, &identity, reader))
                     })
                     .await
                     .map_err(|error| error.to_string())?
