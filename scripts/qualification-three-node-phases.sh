@@ -178,9 +178,13 @@ prepare_no_event_membership_cutover_qualification() {
   local bound="$7"
   local batch=$((bound * 2))
   local attempt
+  local clear_tail
   local fence
   local line
+  local previous_clear_line=
+  local previous_clear_tail=
   local round
+  local stable_clear=0
   if [[ "${node_id}" == "1" ]]; then
     echo "no-event membership cutover source must not be the reconciliation coordinator" >&2
     return 1
@@ -190,15 +194,41 @@ prepare_no_event_membership_cutover_qualification() {
     run_cutover_writes \
       "${node}" "${client_id}" "${client_secret}" "${tenant}" "${bucket}" \
       pre "$((round * batch))" "${batch}"
-    for attempt in $(seq 1 30); do
+    # LOCAL durability may finish its deliberately asynchronous payload
+    # placement after the client has received every mutation receipt. A
+    # single sampled clear cut therefore does not prove that the source is
+    # quiescent: the 10-second sampler can still be showing the state from
+    # immediately before a final background placement. Require the same clear
+    # tail in two distinct samples before declaring the membership cutover to
+    # be a no-event interval.
+    previous_clear_line=
+    previous_clear_tail=
+    stable_clear=0
+    for attempt in $(seq 1 45); do
       line="$(latest_source_journal_sample "${node}")"
-      source_journal_sample_is_clear_at_bound "${line}" "${bound}" && break
+      if source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
+        clear_tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
+        if [[ -n "${previous_clear_line}" \
+          && "${line}" != "${previous_clear_line}" \
+          && "${clear_tail}" == "${previous_clear_tail}" ]]
+        then
+          stable_clear=1
+          break
+        fi
+        if [[ "${line}" != "${previous_clear_line}" ]]; then
+          previous_clear_line="${line}"
+          previous_clear_tail="${clear_tail}"
+        fi
+      else
+        previous_clear_line=
+        previous_clear_tail=
+      fi
       sleep 1
     done
-    source_journal_sample_is_clear_at_bound "${line}" "${bound}" && break
+    ((stable_clear == 1)) && break
   done
-  if ! source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
-    echo "${node} did not reach a clear source-journal entry bound of ${bound}" >&2
+  if ((stable_clear != 1)); then
+    echo "${node} did not reach a stable clear source-journal entry bound of ${bound}" >&2
     printf '%s\n' "${line}" >&2
     return 1
   fi
