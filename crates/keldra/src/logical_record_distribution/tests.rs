@@ -158,7 +158,7 @@ async fn fixture_with_retention(
         local_node,
         store: stores[&local_node].clone(),
         peers: transport.clone(),
-        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        coordinator_serial: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
         mutation_admission: crate::mutation_admission::MutationAdmission::new(),
     };
     Fixture {
@@ -285,7 +285,7 @@ async fn exact_journal_capacity_blocks_without_mutation_then_wakes_and_retries()
 
     let serial = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        fixture.core.coordinator_serial.lock(),
+        fixture.core.serial_for(&policy_value("second").id()).lock(),
     )
     .await
     .expect("capacity waiting must release the coordinator serialization lock");
@@ -643,7 +643,40 @@ async fn retry_after_lost_response_returns_the_exact_committed_version() {
 }
 
 #[tokio::test]
-async fn one_process_mutex_serializes_complete_reconcile_mutate_sequences() {
+async fn independent_quorum_reads_do_not_queue_behind_one_reconciliation() {
+    let fixture = fixture(3).await;
+    fixture.transport.block_reads.store(true, Ordering::SeqCst);
+    let first_id = policy_value("read").id();
+    let second_id = (0..100)
+        .map(|suffix| LogicalRecordId::Credential {
+            client_id: format!("independent-{suffix}"),
+        })
+        .find(|id| logical_record_serial_lane(id) != logical_record_serial_lane(&first_id))
+        .expect("test identities should occupy independent serial lanes");
+    let mut reads = Vec::new();
+    for id in [first_id, second_id] {
+        let core = fixture.core.clone();
+        let route = fixture.route.clone();
+        reads.push(tokio::spawn(async move {
+            let _serial = core.serial_for(&id).lock().await;
+            core.reconcile(&route, &id).await
+        }));
+    }
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        fixture.transport.wait_for_reads(4),
+    )
+    .await
+    .expect("both quorum reads should reach their two remote replicas");
+    fixture.transport.release_reads();
+    for read in reads {
+        assert_eq!(read.await.unwrap().unwrap(), None);
+    }
+}
+
+#[tokio::test]
+async fn one_process_write_gate_serializes_complete_reconcile_mutate_sequences() {
     let fixture = fixture(3).await;
     fixture.transport.block_reads.store(true, Ordering::SeqCst);
     let first_core = fixture.core.clone();

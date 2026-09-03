@@ -5,6 +5,7 @@
 //! three weighted-HRW ranks; no record ownership is persisted in Raft.
 
 use std::sync::Arc;
+use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
@@ -18,6 +19,8 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
+
+const LOGICAL_RECORD_SERIAL_LANES: usize = 64;
 
 /// Typed private transport seam. Peers expose logical records, never raw
 /// column-family keys or values.
@@ -72,10 +75,11 @@ struct LogicalRecordDistributionCore {
     local_node: NodeId,
     store: Store,
     peers: Arc<dyn LogicalRecordReplicaTransport>,
-    /// Routing provides one coordinator per record. A single local gate is
-    /// sufficient to serialize every reconcile/mutate sequence handled by
-    /// this process without a per-record lock registry.
-    coordinator_serial: Arc<tokio::sync::Mutex<()>>,
+    /// Reads and mutations for one logical record must remain serial so a
+    /// quorum repair cannot race a successor. Fixed keyed lanes preserve that
+    /// ordering without letting one unavailable peer queue every unrelated
+    /// name and credential lookup in the process behind its reconciliation.
+    coordinator_serial: Arc<[tokio::sync::Mutex<()>; LOGICAL_RECORD_SERIAL_LANES]>,
     mutation_admission: crate::mutation_admission::MutationAdmission,
 }
 
@@ -89,11 +93,11 @@ impl LogicalRecordDistributionCore {
     where
         F: FnMut() -> Result<(), Status> + Send,
     {
+        let id = typed_value.id();
         loop {
-            let serial = self.coordinator_serial.lock().await;
+            let serial = self.serial_for(&id).lock().await;
             let permit = self.mutation_admission.enter()?;
             require_current_fence()?;
-            let id = typed_value.id();
             let current = self.reconcile(route, &id).await?;
             require_current_fence()?;
             if let Some(LogicalRecordCandidate::Versioned(existing)) = current
@@ -318,6 +322,10 @@ impl LogicalRecordDistributionCore {
         }
         Ok(local)
     }
+
+    fn serial_for(&self, id: &LogicalRecordId) -> &tokio::sync::Mutex<()> {
+        &self.coordinator_serial[logical_record_serial_lane(id)]
+    }
 }
 
 /// Production wrapper that derives every route from the currently applied
@@ -348,7 +356,7 @@ impl LogicalRecordDistribution {
                 local_node,
                 store,
                 peers,
-                coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+                coordinator_serial: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
                 mutation_admission,
             },
         }
@@ -380,7 +388,7 @@ impl LogicalRecordDistribution {
         &self,
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordValue>, Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
+        let _serial = self.core.serial_for(id).lock().await;
         let route = self.route(id)?;
         require_local_read_replica(&route, self.local_node)?;
         self.require_current_read_route(id, &route)?;
@@ -598,6 +606,13 @@ fn placement_key(id: &LogicalRecordId) -> Result<(PlacementKind, Vec<u8>), Statu
             "tenant schemas belong to the tenant-wide Zanzibar replica group",
         )),
     }
+}
+
+fn logical_record_serial_lane(id: &LogicalRecordId) -> usize {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    usize::try_from(hasher.finish() % LOGICAL_RECORD_SERIAL_LANES as u64)
+        .expect("logical-record serial lane fits usize")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
