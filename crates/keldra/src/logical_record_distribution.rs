@@ -5,6 +5,7 @@
 //! three weighted-HRW ranks; no record ownership is persisted in Raft.
 
 use std::sync::Arc;
+use std::time::Duration;
 use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
 use keldra_consensus::{DecisionRaft, NodeId};
@@ -21,6 +22,7 @@ use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
 
 const LOGICAL_RECORD_SERIAL_LANES: usize = 64;
+const LOGICAL_RECORD_REPLICA_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Typed private transport seam. Peers expose logical records, never raw
 /// column-family keys or values.
@@ -81,6 +83,7 @@ struct LogicalRecordDistributionCore {
     /// name and credential lookup in the process behind its reconciliation.
     coordinator_serial: Arc<[tokio::sync::Mutex<()>; LOGICAL_RECORD_SERIAL_LANES]>,
     mutation_admission: crate::mutation_admission::MutationAdmission,
+    replica_timeout: Duration,
 }
 
 impl LogicalRecordDistributionCore {
@@ -163,10 +166,18 @@ impl LogicalRecordDistributionCore {
         {
             let peers = self.peers.clone();
             let id = id.clone();
+            let replica_timeout = self.replica_timeout;
             tasks.spawn(async move {
-                let result = peers
-                    .read_candidate(endpoint.node_id, &endpoint.address, &id)
-                    .await;
+                let result = tokio::time::timeout(
+                    replica_timeout,
+                    peers.read_candidate(endpoint.node_id, &endpoint.address, &id),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Status::deadline_exceeded(
+                        "logical-record replica read timed out",
+                    ))
+                });
                 (endpoint.node_id, result)
             });
         }
@@ -231,16 +242,35 @@ impl LogicalRecordDistributionCore {
                 .iter()
                 .find(|(node, _)| *node == endpoint.node_id)
                 .and_then(|(_, result)| result.as_ref().ok());
+            // A peer that could not answer the quorum read is not allowed to
+            // delay an otherwise durable result with a second repair attempt.
+            // Join/reconciliation or a later read will repair that minority.
+            if observed.is_none() {
+                continue;
+            }
             if observed == Some(&winner) {
                 continue;
             }
             let peers = self.peers.clone();
             let id = id.clone();
             let winner = winner.clone();
+            let replica_timeout = self.replica_timeout;
             repairs.spawn(async move {
-                let result = peers
-                    .repair_candidate(endpoint.node_id, &endpoint.address, &id, winner.as_ref())
-                    .await;
+                let result = tokio::time::timeout(
+                    replica_timeout,
+                    peers.repair_candidate(
+                        endpoint.node_id,
+                        &endpoint.address,
+                        &id,
+                        winner.as_ref(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Status::deadline_exceeded(
+                        "logical-record replica repair timed out",
+                    ))
+                });
                 (endpoint.node_id, result)
             });
         }
@@ -298,10 +328,18 @@ impl LogicalRecordDistributionCore {
         {
             let peers = self.peers.clone();
             let mutation = mutation.clone();
+            let replica_timeout = self.replica_timeout;
             tasks.spawn(async move {
-                let result = peers
-                    .apply_mutation(endpoint.node_id, &endpoint.address, &mutation)
-                    .await;
+                let result = tokio::time::timeout(
+                    replica_timeout,
+                    peers.apply_mutation(endpoint.node_id, &endpoint.address, &mutation),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Status::deadline_exceeded(
+                        "logical-record replica mutation timed out",
+                    ))
+                });
                 (endpoint.node_id, result)
             });
         }
@@ -358,6 +396,7 @@ impl LogicalRecordDistribution {
                 peers,
                 coordinator_serial: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
                 mutation_admission,
+                replica_timeout: LOGICAL_RECORD_REPLICA_TIMEOUT,
             },
         }
     }

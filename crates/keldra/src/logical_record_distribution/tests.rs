@@ -18,6 +18,7 @@ struct StoreTransport {
     stores: BTreeMap<NodeId, Store>,
     failed_applies: Mutex<BTreeSet<NodeId>>,
     failed_repairs: Mutex<BTreeSet<NodeId>>,
+    hung_reads: Mutex<BTreeSet<NodeId>>,
     block_reads: AtomicBool,
     reads_started: AtomicUsize,
     reads_changed: tokio::sync::Notify,
@@ -31,6 +32,10 @@ impl StoreTransport {
 
     fn fail_repair(&self, node: NodeId) {
         self.failed_repairs.lock().unwrap().insert(node);
+    }
+
+    fn hang_read(&self, node: NodeId) {
+        self.hung_reads.lock().unwrap().insert(node);
     }
 
     async fn wait_for_reads(&self, expected: usize) {
@@ -57,6 +62,9 @@ impl LogicalRecordReplicaTransport for StoreTransport {
         _address: &str,
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordCandidate>, Status> {
+        if self.hung_reads.lock().unwrap().contains(&target) {
+            std::future::pending().await
+        }
         if self.block_reads.load(Ordering::SeqCst) {
             self.reads_started.fetch_add(1, Ordering::SeqCst);
             self.reads_changed.notify_waiters();
@@ -160,6 +168,7 @@ async fn fixture_with_retention(
         peers: transport.clone(),
         coordinator_serial: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
         mutation_admission: crate::mutation_admission::MutationAdmission::new(),
+        replica_timeout: LOGICAL_RECORD_REPLICA_TIMEOUT,
     };
     Fixture {
         _root: root,
@@ -398,6 +407,42 @@ async fn quorum_proven_current_state_repairs_a_multi_version_stale_replica() {
             selected
         );
     }
+}
+
+#[tokio::test]
+async fn unavailable_minority_cannot_block_a_three_node_read_quorum() {
+    let mut fixture = fixture(3).await;
+    fixture.core.replica_timeout = std::time::Duration::from_millis(50);
+    let replicas = fixture.route.group.replicas();
+    let value = policy_value("quorum");
+    let candidate = fixture.stores[&replicas[0]]
+        .construct_logical_record_mutation(value.clone(), context(&fixture.route, 100))
+        .unwrap();
+    for replica in &replicas[..2] {
+        fixture.stores[replica]
+            .apply_logical_record_mutation_replica(&candidate)
+            .unwrap();
+    }
+    fixture.transport.hang_read(replicas[2]);
+
+    let selected = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        fixture.core.reconcile(&fixture.route, &value.id()),
+    )
+    .await
+    .expect("the unavailable minority must be bounded")
+    .unwrap();
+    assert_eq!(
+        selected,
+        Some(LogicalRecordCandidate::Versioned(candidate.clone()))
+    );
+    assert_eq!(
+        fixture.stores[&replicas[2]]
+            .logical_record_candidate(&value.id())
+            .unwrap(),
+        None,
+        "an unavailable minority remains eligible for later reconciliation"
+    );
 }
 
 #[tokio::test]
