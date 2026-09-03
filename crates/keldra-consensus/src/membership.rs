@@ -4,12 +4,18 @@
 //! helpers only derive and apply the OpenRaft step which that one transition
 //! currently permits; they add no second transition state or Raft payload.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use crate::{
     DecisionRaft, DecisionRaftError, FIXED_VOTER_TARGET, MembershipTransition,
     MembershipTransitionKind, NodeId, NodeState, PeerNode,
 };
+
+const LEARNER_CATCH_UP_ATTEMPTS: usize = 2;
+const LEARNER_CATCH_UP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 struct MembershipView {
@@ -60,12 +66,32 @@ impl DecisionRaft {
             ));
         }
 
-        self.add_learner(
-            transition.node_id.0,
-            PeerNode::new(descriptor.peer_address.0.clone()),
-            true,
-        )
-        .await?;
+        let mut caught_up = false;
+        for attempt in 0..LEARNER_CATCH_UP_ATTEMPTS {
+            let add = self.add_learner(
+                transition.node_id.0,
+                PeerNode::new(descriptor.peer_address.0.clone()),
+                true,
+            );
+            match tokio::time::timeout(LEARNER_CATCH_UP_ATTEMPT_TIMEOUT, add).await {
+                Ok(result) => {
+                    result?;
+                    caught_up = true;
+                    break;
+                }
+                Err(_) if attempt + 1 < LEARNER_CATCH_UP_ATTEMPTS => {}
+                Err(_) => {
+                    return Err(DecisionRaftError::Unavailable(
+                        "timed out waiting for learner catch-up".into(),
+                    ));
+                }
+            }
+        }
+        if !caught_up {
+            return Err(DecisionRaftError::Unavailable(
+                "learner catch-up did not complete".into(),
+            ));
+        }
 
         let after = self.membership_view()?;
         if after.voters.contains(&transition.node_id) {
