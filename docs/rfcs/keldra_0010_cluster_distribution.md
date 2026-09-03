@@ -1025,9 +1025,14 @@ cluster administration APIs are ordinary JWT-authenticated,
 Zanzibar-authorized system-realm operations.
 
 Credential exchange is routed by stable client/application identity to the
-current credential coordinator. The destination performs Argon2 verification
-and token issuance. The cluster-shared signing-key fingerprint is committed;
-the secret key is provisioned to nodes out of band.
+current credential replica group. The rank-zero replica is preferred; an
+availability or deadline failure may fall through in rank order to another
+selected replica. Exactly one destination performs Argon2 verification and
+token issuance after quorum-reading the complete credential and application
+records and rechecking its placement fence. Invalid credentials, corrupt
+records, and authorization failures never trigger fallback. The cluster-shared
+signing-key fingerprint is committed; the secret key is provisioned to nodes
+out of band.
 
 ## 17. Globally unique tenant names
 

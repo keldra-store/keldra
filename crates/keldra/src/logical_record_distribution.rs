@@ -373,24 +373,39 @@ impl LogicalRecordDistribution {
             .await
     }
 
-    /// Reconcile one complete logical record at its current HRW coordinator.
-    /// No replica-local or cached value is exposed through this boundary.
+    /// Reconcile one complete logical record at any currently selected replica.
+    /// No replica-local or cached value is exposed through this boundary: the
+    /// selected replica still obtains and repairs an exact read quorum.
     pub(crate) async fn read(
         &self,
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordValue>, Status> {
         let _serial = self.core.coordinator_serial.lock().await;
         let route = self.route(id)?;
-        if route.group.coordinator() != self.local_node {
-            return Err(Status::failed_precondition(format!(
-                "logical record is coordinated by node {}",
-                route.group.coordinator().0
-            )));
-        }
-        self.require_current_route(id, &route)?;
+        require_local_read_replica(&route, self.local_node)?;
+        self.require_current_read_route(id, &route)?;
         let candidate = self.core.reconcile(&route, id).await?;
-        self.require_current_route(id, &route)?;
+        self.require_current_read_route(id, &route)?;
         Ok(candidate.map(|candidate| candidate.typed_value().clone()))
+    }
+
+    /// Return every current replica in deterministic placement order. Callers
+    /// prefer rank zero but may try a later replica after an availability
+    /// failure; each target independently performs the same quorum read.
+    pub(crate) fn read_targets(
+        &self,
+        id: &LogicalRecordId,
+    ) -> Result<Vec<LogicalRecordReadTarget>, Status> {
+        let route = self.route(id)?;
+        Ok(route
+            .endpoints
+            .iter()
+            .map(|endpoint| LogicalRecordReadTarget {
+                node_id: endpoint.node_id,
+                address: endpoint.address.clone(),
+                placement_fence: route.active_placement_log_id,
+            })
+            .collect())
     }
 
     pub(crate) fn read_target(
@@ -428,6 +443,20 @@ impl LogicalRecordDistribution {
         }
     }
 
+    pub(crate) fn require_replica_read_target(
+        &self,
+        id: &LogicalRecordId,
+        expected: &LogicalRecordReadTarget,
+    ) -> Result<(), Status> {
+        if self.read_targets(id)?.contains(expected) {
+            Ok(())
+        } else {
+            Err(Status::unavailable(
+                "logical-record replica placement changed during read",
+            ))
+        }
+    }
+
     fn require_current_route(
         &self,
         id: &LogicalRecordId,
@@ -437,6 +466,20 @@ impl LogicalRecordDistribution {
         if current != *expected || current.group.coordinator() != self.local_node {
             return Err(Status::unavailable(
                 "logical-record placement or serving fence changed during coordination",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_current_read_route(
+        &self,
+        id: &LogicalRecordId,
+        expected: &LogicalRecordRoute,
+    ) -> Result<(), Status> {
+        let current = self.route(id)?;
+        if current != *expected || !current.group.replicas().contains(&self.local_node) {
+            return Err(Status::unavailable(
+                "logical-record placement or serving fence changed during read",
             ));
         }
         Ok(())
@@ -791,6 +834,20 @@ fn candidate_version(candidate: Option<&LogicalRecordCandidate>) -> Option<Versi
     match candidate {
         Some(LogicalRecordCandidate::Versioned(mutation)) => Some(mutation.record_version),
         None | Some(LogicalRecordCandidate::Baseline { .. }) => None,
+    }
+}
+
+fn require_local_read_replica(
+    route: &LogicalRecordRoute,
+    local_node: NodeId,
+) -> Result<(), Status> {
+    if route.group.replicas().contains(&local_node) {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(format!(
+            "logical record is not replicated by node {}",
+            local_node.0
+        )))
     }
 }
 

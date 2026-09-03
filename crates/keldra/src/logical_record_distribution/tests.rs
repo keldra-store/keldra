@@ -698,6 +698,20 @@ async fn coordinator_rechecks_the_exact_fence_before_mutation_and_return() {
     assert_eq!(checks.load(Ordering::SeqCst), 3);
 }
 
+#[tokio::test]
+async fn every_selected_replica_may_coordinate_a_quorum_read() {
+    let fixture = fixture(3).await;
+    for replica in fixture.route.group.replicas() {
+        require_local_read_replica(&fixture.route, *replica).unwrap();
+    }
+    assert_eq!(
+        require_local_read_replica(&fixture.route, NodeId(999))
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+}
+
 #[test]
 fn placement_keys_use_only_the_fixed_rfc_encodings() {
     let (_, tenant) = placement_key(&LogicalRecordId::TenantRecord { tenant_id: 7 }).unwrap();
