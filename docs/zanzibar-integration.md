@@ -6,8 +6,8 @@ its `keldra` crates.io dependency to `clients/rust`; this proves the candidate
 client API without giving Zanzibar a path dependency in its own released
 manifest.
 
-Zanzibar `0.4.0` targets exactly Keldra `0.16.0`. When built from the Zanzibar
-repository alone it resolves `keldra = "=0.16.0"` from crates.io. When built
+Zanzibar `0.4.1` targets exactly Keldra `0.16.1`. When built from the Zanzibar
+repository alone it resolves `keldra = "=0.16.1"` from crates.io. When built
 from this parent workspace, Cargo's root patch resolves that same dependency to
 the local client. These are intentionally separate release modes.
 

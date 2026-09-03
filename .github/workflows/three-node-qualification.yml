@@ -6,12 +6,12 @@ on:
       release_tag:
         description: Immutable Keldra release tag to qualify
         required: true
-        default: 0.16.0
+        default: 0.16.1
         type: string
       image:
         description: Published Keldra image matching the release tag
         required: true
-        default: ghcr.io/keldra-store/keldra:0.16.0
+        default: ghcr.io/keldra-store/keldra:0.16.1
         type: string
 
 permissions:

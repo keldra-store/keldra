@@ -10,14 +10,14 @@
 
 ## Workspace
 
-All workspace packages currently share version `0.16.0`:
+All workspace packages currently share version `0.16.1`:
 
 - server, CLI, and Rust client: `keldra-server`, `keldra-cli`, and `keldra`;
 - core crates: `keldra-api`, `keldra-authz`, `keldra-atomic-program`,
   `keldra-consensus`, `keldra-index`, and `keldra-store`;
 - qualification tooling: `keldra-osv-qualification`.
 
-Keldra 0.16.0 runs as one flat cluster of capacity-weighted nodes with native
+Keldra 0.16.1 runs as one flat cluster of capacity-weighted nodes with native
 on-disk state, cluster-managed mTLS between peers, cluster-wide derived
 streaming indices, and no external metadata database, external PKI, or second
 storage system. It includes PersonalDB, accounting, S3 and Git gateways, and
@@ -101,12 +101,12 @@ Never force activation past a blocker, and never start an earlier Keldra binary
 against storage initialized or touched by 0.16.
 
 The release tag must be the exact, unprefixed workspace version. After the
-validated commit is pushed, maintainers publish `0.16.0` with:
+validated commit is pushed, maintainers publish `0.16.1` with:
 
 ```sh
 validated_commit="$(git rev-parse HEAD)"
-git tag 0.16.0 "$validated_commit"
-git push origin refs/tags/0.16.0
+git tag 0.16.1 "$validated_commit"
+git push origin refs/tags/0.16.1
 ```
 
 The tag-triggered workflow reruns the static, Rust, and per-architecture image
@@ -120,15 +120,15 @@ client crate:
 
 ```sh
 cargo publish --locked -p keldra-api
-cargo info keldra-api@0.16.0
+cargo info keldra-api@0.16.1
 
 cargo publish --locked -p keldra
-cargo info keldra@0.16.0
+cargo info keldra@0.16.1
 ```
 
-Do not publish `keldra` until `cargo info keldra-api@0.16.0` resolves from
+Do not publish `keldra` until `cargo info keldra-api@0.16.1` resolves from
 crates.io. After both commands succeed, run both `cargo info` checks again and
-confirm that each reports version `0.16.0` from crates.io.
+confirm that each reports version `0.16.1` from crates.io.
 
 Use Cargo's shared target directory and locking. Do not create ad-hoc target
 directories unless the task explicitly requires isolation.
