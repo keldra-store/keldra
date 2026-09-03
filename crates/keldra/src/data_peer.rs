@@ -472,9 +472,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         mut request: Request<wire::ContentRequest>,
     ) -> Result<Response<Self::GetSmallContentStream>, Status> {
         let peer = request.get_ref().peer.clone();
-        // Public reads received by a JOINING coordinator must be able to fetch
-        // immutable bytes from the current ACTIVE owners. This is an ordinary
-        // data-plane read, not ownership handoff/state transfer.
+        // JOINING coordinators proxy immutable reads to ACTIVE owners.
         self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         let reference = parse_small_blob(request.get_ref().blob.as_ref())?;
         let metadata = request.metadata().clone();
@@ -589,8 +587,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         mut request: Request<wire::ContentRequest>,
     ) -> Result<Response<Self::GetCompleteSourceStream>, Status> {
         let peer = request.get_ref().peer.clone();
-        // See `get_small_content`: JOINING coordinators proxy immutable reads
-        // through the data plane while ownership handoff continues.
         self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         let reference = parse_blob(request.get_ref().blob.as_ref())?;
         require_large_blob(&reference, self.max_blob_bytes)?;
@@ -705,8 +701,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         mut request: Request<wire::ShardRequest>,
     ) -> Result<Response<Self::GetShardStream>, Status> {
         let peer = request.get_ref().peer.clone();
-        // Shards participate in the same proxied public-read path as complete
-        // copies and therefore use data-plane authority.
         self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         let metadata = request.metadata().clone();
         let identity = parse_shard(&request.into_inner())?;
