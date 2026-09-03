@@ -74,10 +74,9 @@ impl DecisionRaft {
             )
             .await?;
             let node_id = transition.node_id.0;
-            if self
-                .raft
-                .wait(Some(LEARNER_PROGRESS_TIMEOUT))
-                .metrics(
+            if tokio::time::timeout(
+                LEARNER_PROGRESS_TIMEOUT,
+                self.raft.wait(None).metrics(
                     move |metrics| {
                         metrics
                             .replication
@@ -86,9 +85,10 @@ impl DecisionRaft {
                             .is_some_and(Option::is_some)
                     },
                     "wait for learner replication progress",
-                )
-                .await
-                .is_ok()
+                ),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
             {
                 caught_up = true;
                 break;
