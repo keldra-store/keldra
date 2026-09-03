@@ -101,7 +101,6 @@ impl Store {
         .result
     }
 
-    /// Evaluates operations in order and persists successful outcomes in one write.
     pub async fn bulk_write(&self, operations: Vec<BatchOperation>) -> Vec<BatchOutcome> {
         self.bulk_write_inner(
             operations,
@@ -113,7 +112,6 @@ impl Store {
         .await
     }
 
-    /// Applies a coordinator batch while preserving payloads and replay semantics.
     pub async fn bulk_write_with_backpressure(
         &self,
         operations: Vec<BatchOperation>,
@@ -986,7 +984,6 @@ impl Store {
             && (status.retained_entries > self.watch_retention.max_entries
                 || status.retained_bytes > self.watch_retention.max_bytes)
         {
-            // Repay publication debt before an ordinary append retries.
             return Err(MutationError::SourceJournalCapacity);
         }
         let old_tail = status.tail;
@@ -1005,13 +1002,8 @@ impl Store {
         let local_reference_cursor = match reference_effects {
             LocalReferenceEffects::AppliedInline => {
                 if cursor != old_tail {
-                    // A proof-backed deferred publication may advance the
-                    // source tail while reference delivery is still applying
-                    // its ordered effects. Inline writers must wait for that
-                    // consumer rather than treating the temporary lag as
-                    // storage corruption. Backpressure callers drop this
-                    // commit guard, wait for journal progress, and retry the
-                    // unchanged atomic batch against a fresh tail.
+                    // Deferred publication can advance the tail before ordered
+                    // reference delivery. Retry against a fresh tail.
                     tracing::debug!(
                         reference_cursor = cursor,
                         source_journal_tail = old_tail,
@@ -1083,7 +1075,6 @@ impl Store {
             if status.retained_entries > self.watch_retention.max_entries
                 || status.retained_bytes > self.watch_retention.max_bytes
             {
-                // Keep capacity retirement in a separate committed prune.
                 return Err(MutationError::SourceJournalCapacity);
             }
         }
@@ -1507,7 +1498,6 @@ impl Store {
                 None => self.head_by_storage_key(&encoded_key)?,
             },
         };
-        // Retain the durable predecessor: re-reading it adds two fenced point gets.
         let current_stored_version = match current.as_ref() {
             Some(head) if !pending_versions.contains_key(&encoded_key) => Some(
                 match read_cache.stored_version(&encoded_key) {
@@ -1606,9 +1596,7 @@ impl Store {
             Some(PutMode::PutImmutable) if !immutable_path => {
                 return Err(MutationError::ImmutablePolicyRequired);
             }
-            Some(PutMode::PutImmutable) => {
-                // Publish once or replay identical content without a new version.
-            }
+            Some(PutMode::PutImmutable) => {}
             Some(_) | None if immutable_path => {
                 return Err(MutationError::Immutable);
             }
