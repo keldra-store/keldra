@@ -246,6 +246,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let program_quiescence_binding = peer_runtime.program_quiescence();
     let index_artifacts_binding = peer_runtime.index_artifacts();
     let pending_join = peer_runtime.join_transport();
+    let background_join_in_progress = pending_join.is_some();
     let mutation_admission = peer_runtime.mutation_admission();
     // The private listener must be accepting before an existing multi-node
     // group can elect a leader after a coordinated restart.
@@ -362,15 +363,19 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     .context("initialize cluster object reader")?;
     let programs =
         programs::ProgramCoordinator::start(store.clone(), decisions.clone(), local_node).await?;
-    cluster_startup::reconcile_system_bootstrap(
-        &store,
-        &decisions,
-        local_node,
-        &config.storage.state,
-        config.run_system_bootstrap,
-        config.system_bootstrap_credential_output.as_deref(),
-    )
-    .await?;
+    if background_join_in_progress {
+        cluster_startup::require_cluster_bootstrap_during_join(&decisions)?;
+    } else {
+        cluster_startup::reconcile_system_bootstrap(
+            &store,
+            &decisions,
+            local_node,
+            &config.storage.state,
+            config.run_system_bootstrap,
+            config.system_bootstrap_credential_output.as_deref(),
+        )
+        .await?;
+    }
     let authz_repository = store.authz();
     let logical_records = logical_record_distribution::LogicalRecordDistribution::new(
         local_node,

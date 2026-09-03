@@ -201,6 +201,31 @@ pub(crate) async fn reconcile_system_bootstrap(
     }
 }
 
+/// Require the cluster-wide bootstrap marker while a joining node receives
+/// its protected local bootstrap records through the typed handoff.
+///
+/// Public calls on a JOINING node are routed to ACTIVE authorities. The local
+/// marker is therefore not an authority until the final handoff installs it,
+/// but the cluster marker must already prove bootstrap completed.
+pub(crate) fn require_cluster_bootstrap_during_join(decisions: &DecisionRaft) -> Result<()> {
+    joining_bootstrap_ready(decisions.state()?.system_bootstrap())
+}
+
+fn joining_bootstrap_ready(bootstrap: ConsensusBootstrapState) -> Result<()> {
+    match bootstrap {
+        ConsensusBootstrapState::Complete {
+            version: SYSTEM_BOOTSTRAP_VERSION,
+            ..
+        } => Ok(()),
+        ConsensusBootstrapState::Complete { version, .. } => {
+            bail!("Raft system-bootstrap version {version} is unsupported")
+        }
+        ConsensusBootstrapState::Missing => {
+            bail!("cluster system bootstrap is not complete")
+        }
+    }
+}
+
 async fn read_local_bootstrap_state(store: &Store) -> Result<LocalBootstrapState> {
     let state_store = store.clone();
     tokio::task::spawn_blocking(move || state_store.system_bootstrap_state())
@@ -269,6 +294,26 @@ mod tests {
             version: SYSTEM_BOOTSTRAP_VERSION,
             committed_log_index,
         }
+    }
+
+    #[test]
+    fn joining_node_requires_only_the_completed_cluster_marker() {
+        assert!(joining_bootstrap_ready(raft_complete(7)).is_ok());
+        assert!(
+            joining_bootstrap_ready(ConsensusBootstrapState::Missing)
+                .unwrap_err()
+                .to_string()
+                .contains("not complete")
+        );
+        assert!(
+            joining_bootstrap_ready(ConsensusBootstrapState::Complete {
+                version: SYSTEM_BOOTSTRAP_VERSION + 1,
+                committed_log_index: 7,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported")
+        );
     }
 
     #[test]
