@@ -202,7 +202,7 @@ impl ClusterPeerService {
         let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
         let stable_tenant_id = request.get_ref().stable_tenant_id;
         let scope: AuthzScope = decode_json(&request.get_ref().scope_json)?;
-        require_realm_replica(
+        require_realm_reconciliation_peer(
             &admitted.placement,
             admitted.authenticated.node_id,
             self.local_node,
@@ -232,7 +232,7 @@ impl ClusterPeerService {
         let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
         let stable_tenant_id = request.get_ref().stable_tenant_id;
         let scope: AuthzScope = decode_json(&request.get_ref().scope_json)?;
-        require_realm_replica(
+        require_realm_reconciliation_peer(
             &admitted.placement,
             admitted.authenticated.node_id,
             self.local_node,
@@ -301,7 +301,7 @@ impl ClusterPeerService {
         )?;
         let deadline = started + admitted.timeout;
         let scope: AuthzScope = decode_json(&first.scope_json)?;
-        require_realm_replica(
+        require_realm_reconciliation_peer(
             &admitted.placement,
             admitted.authenticated.node_id,
             self.local_node,
@@ -526,6 +526,33 @@ fn require_realm_replica(
     if group.coordinator() != source || !group.replicas().contains(&local) {
         return Err(Status::failed_precondition(
             "authorization realm is not routed from its coordinator to this replica",
+        ));
+    }
+    Ok(())
+}
+
+fn require_realm_reconciliation_peer(
+    placement: &crate::cluster_placement::ClusterPlacement,
+    source: NodeId,
+    local: NodeId,
+    stable_tenant_id: u64,
+    scope: &AuthzScope,
+) -> Result<(), Status> {
+    let group = realm_group(placement, stable_tenant_id)?;
+    scope
+        .handoff_order_key()
+        .map_err(super::storage::authz_status)?;
+    require_realm_reconciliation_members(&group, source, local)
+}
+
+fn require_realm_reconciliation_members(
+    group: &MutableRecordReplicaGroup,
+    source: NodeId,
+    local: NodeId,
+) -> Result<(), Status> {
+    if !group.replicas().contains(&source) || !group.replicas().contains(&local) {
+        return Err(Status::failed_precondition(
+            "authorization realm reconciliation must stay within its selected replicas",
         ));
     }
     Ok(())
@@ -759,7 +786,12 @@ impl Read for BlockingFrameReader {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
+    use keldra_consensus::ClusterId;
+
     use super::*;
+    use crate::placement::PlacementNode;
 
     #[test]
     fn consistency_wire_requires_a_revision_only_for_bounded_modes() {
@@ -827,5 +859,35 @@ mod tests {
         let mut oversized = valid;
         oversized.content.push(1);
         assert!(require_content_frame(&oversized, 9).is_err());
+    }
+
+    #[test]
+    fn reconciliation_reads_and_repairs_accept_any_selected_peer_only() {
+        let nodes = [NodeId(1), NodeId(2), NodeId(3)]
+            .into_iter()
+            .map(|node_id| PlacementNode::new(node_id, NonZeroU32::new(1_000_000).unwrap()))
+            .collect::<Vec<_>>();
+        let group = MutableRecordReplicaGroup::select(
+            PlacementKind::ZanzibarRealm,
+            ClusterId([7; 16]),
+            &1_u64.to_be_bytes(),
+            &nodes,
+        )
+        .unwrap();
+        let replicas = group.replicas();
+
+        assert!(require_realm_reconciliation_members(&group, replicas[1], replicas[2]).is_ok());
+        assert_eq!(
+            require_realm_reconciliation_members(&group, NodeId(99), replicas[0])
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            require_realm_reconciliation_members(&group, replicas[0], NodeId(99))
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 }
