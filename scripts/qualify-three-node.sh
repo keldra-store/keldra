@@ -155,6 +155,7 @@ export KELDRA_IMAGE="${image_id}"
 export KELDRA_QUALIFICATION_PROJECT="${KELDRA_QUALIFICATION_PROJECT:-keldra-v090-${$}}"
 export KELDRA_QUALIFICATION_DIR="$(mktemp -d /var/tmp/keldra-v090-qualification.XXXXXX)"
 export KELDRA_QUALIFICATION_START_NODE="${start_node}"
+qualification_suffix="${KELDRA_QUALIFICATION_DIR##*.}"
 KELDRA_QUALIFICATION_STATE_DIR="${KELDRA_QUALIFICATION_DIR}/artifacts"
 keep="${KELDRA_QUALIFICATION_KEEP:-0}"
 compose() {
