@@ -4,7 +4,7 @@
 //! executor coordinates complete logical records through their independent
 //! HRW coordinators and applies authorization grants only after those record
 //! quorums are durable. Credential verification is routed by client ID to the
-//! first available selected credential replica, preferring rank zero, and
+//! first available selected credential replica, preferring the local replica, and
 //! performs Argon2 only on that verifier.
 
 use std::time::{Duration, Instant};
@@ -402,7 +402,7 @@ impl DistributedControlPlane {
         request: api::ExchangeClientCredentialsRequest,
     ) -> Result<api::AccessToken, Status> {
         let id = credential_record_id(&request.client_id)?;
-        let targets = self.logical.read_targets(&id)?;
+        let targets = self.logical.read_targets_local_first(&id)?;
         let started = Instant::now();
         let mut last_unavailable = None;
         for (index, target) in targets.iter().enumerate() {
@@ -1313,7 +1313,7 @@ impl DistributedControlPlane {
         &self,
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordValue>, Status> {
-        let targets = self.logical.read_targets(id)?;
+        let targets = self.logical.read_targets_local_first(id)?;
         let started = Instant::now();
         let mut last_unavailable = None;
         for (index, target) in targets.iter().enumerate() {
