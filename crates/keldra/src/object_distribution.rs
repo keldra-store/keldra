@@ -315,12 +315,6 @@ impl ObjectDistribution {
             }
         }
 
-        if !placement.active_node_ids().contains(&upload_source) {
-            return Err(Status::failed_precondition(
-                "the upload source is not ACTIVE in the current placement",
-            ));
-        }
-
         let mut evidence = Vec::with_capacity(requests.len());
         for request in &requests {
             let prepared = self
@@ -562,12 +556,6 @@ impl ObjectDistribution {
                 group.coordinator().0
             )));
         }
-        if !placement.active_node_ids().contains(&upload_source) {
-            return Err(Status::failed_precondition(
-                "the upload source is not ACTIVE in the current placement",
-            ));
-        }
-
         let reference = request.blob.clone();
         let evidence = self
             .prepare_payload(&placement, upload_source, &reference, request.durability)
@@ -1096,7 +1084,7 @@ impl ObjectDistribution {
             .await
     }
 
-    /// Make a blob sealed by one exact ACTIVE upload source recoverable before
+    /// Make a blob sealed by one acknowledged upload source recoverable before
     /// a built-in atomic transaction becomes visible on the nominated executor.
     pub(crate) async fn prepare_program_blob_from_source(
         &self,
@@ -1104,11 +1092,6 @@ impl ObjectDistribution {
         upload_source: NodeId,
     ) -> Result<(), Status> {
         let placement = self.placement()?;
-        if !placement.active_node_ids().contains(&upload_source) {
-            return Err(Status::failed_precondition(
-                "built-in transaction upload source is not ACTIVE",
-            ));
-        }
         let evidence = self
             .prepare_payload(&placement, upload_source, reference, Durability::Replicated)
             .await?;
@@ -1146,6 +1129,14 @@ impl ObjectDistribution {
         reference: &BlobRef,
         durability: Durability,
     ) -> Result<crate::payload_distribution::PreparedPayloadEvidence, Status> {
+        let address = placement
+            .upload_source_address(upload_source)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "upload source {} is not an acknowledged ACTIVE or JOINING member",
+                    upload_source.0
+                ))
+            })?;
         if upload_source == self.local_node {
             return self
                 .payload
@@ -1153,12 +1144,6 @@ impl ObjectDistribution {
                 .await
                 .map_err(payload_status);
         }
-        let address = placement.address(upload_source).ok_or_else(|| {
-            Status::unavailable(format!(
-                "ACTIVE upload source {} has no peer address",
-                upload_source.0
-            ))
-        })?;
         self.payload_peers
             .prepare_payload(upload_source, &address.0, reference, durability)
             .await

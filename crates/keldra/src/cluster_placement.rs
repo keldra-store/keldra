@@ -19,6 +19,7 @@ pub(crate) struct ClusterPlacement {
     fence: PlacementLogId,
     nodes: Vec<PlacementNode>,
     addresses: BTreeMap<NodeId, PeerAddress>,
+    upload_addresses: BTreeMap<NodeId, PeerAddress>,
 }
 
 impl ClusterPlacement {
@@ -30,7 +31,7 @@ impl ClusterPlacement {
             .cluster_control()
             .active_placement_log_id()
             .ok_or(ClusterPlacementError::FenceUnavailable)?;
-        let (nodes, addresses) = active_nodes(state.cluster_control().nodes())?;
+        let (nodes, addresses, upload_addresses) = active_nodes(state.cluster_control().nodes())?;
         if nodes.is_empty() {
             return Err(ClusterPlacementError::NoActiveNodes);
         }
@@ -42,6 +43,7 @@ impl ClusterPlacement {
             },
             nodes,
             addresses,
+            upload_addresses,
         })
     }
 
@@ -61,6 +63,10 @@ impl ClusterPlacement {
         self.addresses.get(&node_id)
     }
 
+    pub(crate) fn upload_source_address(&self, node_id: NodeId) -> Option<&PeerAddress> {
+        self.upload_addresses.get(&node_id)
+    }
+
     pub(crate) fn rank(&self, kind: PlacementKind, key: &[u8]) -> Vec<NodeId> {
         rank_nodes(kind, self.cluster_id, key, &self.nodes)
             .into_iter()
@@ -75,15 +81,26 @@ impl ClusterPlacement {
 
 fn active_nodes(
     descriptors: &BTreeMap<NodeId, NodeDescriptor>,
-) -> Result<(Vec<PlacementNode>, BTreeMap<NodeId, PeerAddress>), ClusterPlacementError> {
+) -> Result<
+    (
+        Vec<PlacementNode>,
+        BTreeMap<NodeId, PeerAddress>,
+        BTreeMap<NodeId, PeerAddress>,
+    ),
+    ClusterPlacementError,
+> {
     let mut nodes = Vec::with_capacity(descriptors.len());
     let mut addresses = BTreeMap::new();
+    let mut upload_addresses = BTreeMap::new();
     for (node_id, descriptor) in descriptors {
         if descriptor.node_id != *node_id {
             return Err(ClusterPlacementError::DescriptorIdentityMismatch {
                 key: *node_id,
                 descriptor: descriptor.node_id,
             });
+        }
+        if matches!(descriptor.state, NodeState::Active | NodeState::Joining) {
+            upload_addresses.insert(*node_id, descriptor.peer_address.clone());
         }
         if descriptor.state != NodeState::Active {
             continue;
@@ -93,7 +110,7 @@ fn active_nodes(
         nodes.push(PlacementNode::new(*node_id, weight));
         addresses.insert(*node_id, descriptor.peer_address.clone());
     }
-    Ok((nodes, addresses))
+    Ok((nodes, addresses, upload_addresses))
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -139,7 +156,7 @@ mod tests {
             (NodeId(3), descriptor(3, NodeState::Active, 500_000)),
         ]);
 
-        let (nodes, addresses) = active_nodes(&descriptors).unwrap();
+        let (nodes, addresses, upload_addresses) = active_nodes(&descriptors).unwrap();
         assert_eq!(
             nodes.iter().map(|node| node.node_id()).collect::<Vec<_>>(),
             [NodeId(1), NodeId(3)]
@@ -147,6 +164,10 @@ mod tests {
         assert_eq!(
             addresses.keys().copied().collect::<Vec<_>>(),
             [NodeId(1), NodeId(3)]
+        );
+        assert_eq!(
+            upload_addresses.keys().copied().collect::<Vec<_>>(),
+            [NodeId(1), NodeId(2), NodeId(3)]
         );
     }
 

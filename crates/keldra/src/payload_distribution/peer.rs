@@ -1,7 +1,7 @@
 //! One bounded, operation-specific peer RPC for preparing payload evidence.
 //!
 //! The request goes directly to the upload source named by the public ready
-//! capability. Mandatory peer mTLS and the committed ACTIVE membership are
+//! capability. Mandatory peer mTLS and acknowledged cluster membership are
 //! checked on every call. The operation does not expose storage internals or
 //! persist a source-location record.
 
@@ -124,9 +124,9 @@ impl wire::payload_peer_server::PayloadPeer for PayloadPeerService {
                 "peer cluster does not match applied membership",
             ));
         }
-        if !placement.active_node_ids().contains(&self.local_node) {
+        if placement.upload_source_address(self.local_node).is_none() {
             return Err(Status::unavailable(
-                "upload source is not ACTIVE in applied membership",
+                "upload source is not an acknowledged ACTIVE or JOINING member",
             ));
         }
         let reference = parse_blob(request.get_ref().blob.as_ref(), self.max_blob_bytes)?;
