@@ -36,8 +36,8 @@ pub(crate) trait PayloadPlacementView: Send + Sync {
     fn cluster_id(&self) -> ClusterId;
     fn fence(&self) -> keldra_store::PlacementLogId;
     fn placement_nodes(&self) -> &[PlacementNode];
-    fn active_node_ids(&self) -> Vec<NodeId>;
     fn address(&self, node: NodeId) -> Option<&str>;
+    fn upload_source_address(&self, node: NodeId) -> Option<&str>;
 }
 
 impl PayloadPlacementView for ClusterPlacement {
@@ -53,12 +53,12 @@ impl PayloadPlacementView for ClusterPlacement {
         self.placement_nodes()
     }
 
-    fn active_node_ids(&self) -> Vec<NodeId> {
-        self.active_node_ids()
-    }
-
     fn address(&self, node: NodeId) -> Option<&str> {
         self.address(node).map(|address| address.0.as_str())
+    }
+
+    fn upload_source_address(&self, node: NodeId) -> Option<&str> {
+        ClusterPlacement::upload_source_address(self, node).map(|address| address.0.as_str())
     }
 }
 
@@ -368,7 +368,7 @@ impl PayloadDistribution {
             || evidence.placement_fence != placement.fence()
             || evidence.blob != *reference
             || evidence.upload_source != upload_source
-            || !placement.active_node_ids().contains(&upload_source)
+            || placement.upload_source_address(upload_source).is_none()
         {
             return Err(PayloadDistributionError::InvalidEvidence);
         }
@@ -753,6 +753,7 @@ mod tests {
     struct TestPlacement {
         nodes: Vec<PlacementNode>,
         addresses: BTreeMap<NodeId, String>,
+        upload_addresses: BTreeMap<NodeId, String>,
     }
 
     impl TestPlacement {
@@ -761,18 +762,28 @@ mod tests {
         }
 
         fn with_nodes(ids: &[NodeId]) -> Self {
+            let addresses = ids
+                .iter()
+                .copied()
+                .map(|node| (node, format!("node-{}:50052", node.0)))
+                .collect::<BTreeMap<_, _>>();
             Self {
                 nodes: ids
                     .iter()
                     .copied()
                     .map(|node| PlacementNode::new(node, NonZeroU32::new(1_000_000).unwrap()))
                     .collect(),
-                addresses: ids
-                    .iter()
-                    .copied()
-                    .map(|node| (node, format!("node-{}:50052", node.0)))
-                    .collect(),
+                upload_addresses: addresses.clone(),
+                addresses,
             }
+        }
+
+        fn with_joining_upload_source(ids: &[NodeId], joining: NodeId) -> Self {
+            let mut placement = Self::with_nodes(ids);
+            placement
+                .upload_addresses
+                .insert(joining, format!("node-{}:50052", joining.0));
+            placement
         }
     }
 
@@ -789,12 +800,12 @@ mod tests {
             &self.nodes
         }
 
-        fn active_node_ids(&self) -> Vec<NodeId> {
-            self.nodes.iter().map(|node| node.node_id()).collect()
-        }
-
         fn address(&self, node: NodeId) -> Option<&str> {
             self.addresses.get(&node).map(String::as_str)
+        }
+
+        fn upload_source_address(&self, node: NodeId) -> Option<&str> {
+            self.upload_addresses.get(&node).map(String::as_str)
         }
     }
 
@@ -1019,6 +1030,40 @@ mod tests {
                 PayloadArtifactState::Valid
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joining_upload_source_evidence_is_valid_for_active_owners() {
+        let temporary = tempfile::tempdir().unwrap();
+        let stores = stores(temporary.path()).await;
+        let source = stores[&NodeId(3)].clone();
+        let reference = source.stage_blob(b"joining source payload").await.unwrap();
+        let peers = Arc::new(TestPeers::new(stores.clone()));
+        let placement =
+            TestPlacement::with_joining_upload_source(&[NodeId(1), NodeId(2)], NodeId(3));
+        let source_distribution =
+            PayloadDistribution::new(NodeId(3), source, peers.clone(), ErasureProfile::default());
+        let path_distribution = PayloadDistribution::new(
+            NodeId(1),
+            stores[&NodeId(1)].clone(),
+            peers,
+            ErasureProfile::default(),
+        );
+
+        let evidence = source_distribution
+            .prepare_on_upload_source(&placement, &reference, Durability::Replicated)
+            .await
+            .unwrap();
+        path_distribution
+            .verify_on_path_coordinator(
+                &placement,
+                &reference,
+                Durability::Replicated,
+                NodeId(3),
+                &evidence,
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
