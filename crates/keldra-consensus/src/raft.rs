@@ -1802,8 +1802,8 @@ mod snapshot_compatibility_tests {
                         current_peer_spki_sha256: crate::PeerSpkiSha256([1; 32]),
                         overlap_peer_spki_sha256: None,
                         join_capability_hash: Some(crate::JoinCapabilityHash([2; 32])),
-                        supported_protocol: crate::CapabilityRange { min: 1, max: 1 },
-                        supported_storage_format: crate::CapabilityRange { min: 1, max: 1 },
+                        supported_protocol: crate::CapabilityRange { min: 1, max: 2 },
+                        supported_storage_format: crate::CapabilityRange { min: 1, max: 2 },
                     },
                 },
             )

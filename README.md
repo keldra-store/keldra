@@ -743,7 +743,7 @@ Production formation uses the same sequence:
 The public gRPC endpoint may sit behind an ordinary TLS terminator. Peer traffic
 uses mandatory certificates created and rotated by the cluster.
 
-### Start 0.16 on fresh volumes and activate its capabilities
+### Start 0.16 on fresh volumes
 
 Keldra 0.16 is a clean storage-format and index-architecture break. Start every
 0.16 node with fresh authoritative and derived-index volumes; it does not open,
@@ -752,21 +752,14 @@ clusters are unsupported. If application data must move from an older cluster,
 keep that cluster separate and import the data through the public API as new
 writes.
 
-Inspect cluster capabilities. Activation is safe only when it reports active
-protocol/storage `1/1`, target `2/2`, no blocking ACTIVE node IDs,
-`activation_quiescent=true`, and `ready_for_target_activation=true`. Activate
-`2/2` using that same response's exact placement term and index, then re-read
-status and require active `2/2`. If placement changes, discard the old fence and
-inspect again. Never force activation past a blocker.
+Fresh 0.16 clusters select protocol/storage capability `2/2` during bootstrap,
+including single-node clusters. Confirm that status reports active and target
+`2/2` before admitting production traffic. Capability activation remains an
+explicit, placement-fenced administration operation for a cluster that was
+deliberately initialized with an older selected capability.
 
 ```sh
 keldra --endpoint "$KELDRA_ENDPOINT" get-cluster-capabilities
-
-keldra --endpoint "$KELDRA_ENDPOINT" activate-cluster-capabilities \
-  --protocol-version 2 \
-  --storage-format 2 \
-  --expected-placement-term "$PLACEMENT_TERM" \
-  --expected-placement-index "$PLACEMENT_INDEX"
 ```
 
 Supply the same system-operator credentials used for other protected
