@@ -688,9 +688,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let tokens = config.token_manager;
     let object_tokens = tokens.clone();
     let object_rate_limits = request_rate_limits.clone();
-    let object_authority = serving_fence.authority();
+    // Object operations carry their placement fence through the distributed
+    // read/write path. Keeping the ingress interceptor authentication-only lets
+    // a JOINING node act as a gateway while ACTIVE replicas remain authoritative.
     let authenticate_object = move |request: tonic::Request<()>| {
-        let request = object_authority.require(request)?;
         object_rate_limits.authenticate_object(&object_tokens, request)
     };
     let index_tokens = tokens.clone();
