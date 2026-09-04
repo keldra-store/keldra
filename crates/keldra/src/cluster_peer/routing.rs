@@ -467,7 +467,7 @@ impl ClusterPeerService {
         let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
         let nomination = self.require_program_executor(
             &admitted.placement,
-            admitted.authenticated.node_id,
+            self.local_node,
             request.get_ref().executor_nomination_log_index,
         )?;
         if request.get_ref().lookups.len() > keldra_store::MAX_ATOMIC_BATCH_MUTATIONS {
