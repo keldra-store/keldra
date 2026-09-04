@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use keldra_index::typed_json::{FieldSchema, RecipeFingerprints, TypedJsonSchema};
+use keldra_index::typed_json::{FieldId, FieldSchema, RecipeFingerprints, TypedJsonSchema};
 use keldra_index::v6::{
     IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryPermit, IndexingMemoryStage,
 };
@@ -280,12 +280,16 @@ impl PhysicalCatalogRecipe {
         schema.fields = self
             .fields
             .iter()
-            .map(|(recipe, field)| {
+            .enumerate()
+            .map(|(ordinal, (recipe, field))| {
                 let mut field = (**field).clone();
+                field.id = FieldId::new(u32::try_from(ordinal).map_err(|_| {
+                    Status::resource_exhausted("physical field catalog exceeds field ID capacity")
+                })?);
                 field.name = format!("__keldra_recipe_{}", hex::encode(recipe));
-                field
+                Ok(field)
             })
-            .collect();
+            .collect::<Result<Vec<_>, Status>>()?;
         schema.physical_order.clear();
         schema.canonicalize_physical_fields().map_err(schema_status)
     }
@@ -1233,6 +1237,15 @@ mod tests {
         assert_eq!(families[0].fields.len(), 3);
         assert_eq!(contracts.len(), 2);
         assert_ne!(first_generation, second_generation);
+        let projection = families[0].projection_schema().unwrap();
+        assert_eq!(projection.fields.len(), 3);
+        assert!(
+            projection
+                .fields
+                .iter()
+                .enumerate()
+                .all(|(ordinal, field)| field.id.get() == ordinal as u32)
+        );
 
         // An equivalent alias changes only the compact logical/query binding,
         // never the physical family generation or recipe union.
