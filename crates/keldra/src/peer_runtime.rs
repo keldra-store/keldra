@@ -1189,13 +1189,15 @@ impl CommittedPeerPinProvider for RaftCommittedPeerPins {
 
 fn committed_peer_rpc_allowed(state: NodeState, kind: PeerRpcKind) -> bool {
     match kind {
-        PeerRpcKind::JoinControl | PeerRpcKind::ServingLease | PeerRpcKind::DataPlane => {
+        PeerRpcKind::JoinControl
+        | PeerRpcKind::ServingLease
+        | PeerRpcKind::DataPlane
+        | PeerRpcKind::StateTransfer => {
             matches!(state, NodeState::Active | NodeState::Joining)
         }
-        PeerRpcKind::AppendEntries
-        | PeerRpcKind::Vote
-        | PeerRpcKind::InstallSnapshot
-        | PeerRpcKind::StateTransfer => state == NodeState::Active,
+        PeerRpcKind::AppendEntries | PeerRpcKind::Vote | PeerRpcKind::InstallSnapshot => {
+            state == NodeState::Active
+        }
     }
 }
 
@@ -1212,11 +1214,12 @@ mod tests {
     struct AllowCompletedHandoff;
 
     #[test]
-    fn joining_peer_has_only_coordinator_and_join_authority() {
+    fn joining_peer_can_read_active_state_for_proxying_and_handoff() {
         for allowed in [
             PeerRpcKind::JoinControl,
             PeerRpcKind::ServingLease,
             PeerRpcKind::DataPlane,
+            PeerRpcKind::StateTransfer,
         ] {
             assert!(committed_peer_rpc_allowed(NodeState::Joining, allowed));
         }
@@ -1224,7 +1227,6 @@ mod tests {
             PeerRpcKind::AppendEntries,
             PeerRpcKind::Vote,
             PeerRpcKind::InstallSnapshot,
-            PeerRpcKind::StateTransfer,
         ] {
             assert!(!committed_peer_rpc_allowed(NodeState::Joining, denied));
         }
