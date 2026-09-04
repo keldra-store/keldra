@@ -428,7 +428,7 @@ impl LogicalRecordDistribution {
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordValue>, Status> {
         let _serial = self.core.serial_for(id).lock().await;
-        let route = self.route(id)?;
+        let route = self.read_route(id)?;
         require_local_read_replica(&route, self.local_node)?;
         self.require_current_read_route(id, &route)?;
         let candidate = self.core.reconcile(&route, id).await?;
@@ -546,7 +546,7 @@ impl LogicalRecordDistribution {
         id: &LogicalRecordId,
         expected: &LogicalRecordRoute,
     ) -> Result<(), Status> {
-        let current = self.route(id)?;
+        let current = self.read_route(id)?;
         if current != *expected || !current.group.replicas().contains(&self.local_node) {
             return Err(Status::unavailable(
                 "logical-record placement or serving fence changed during read",
