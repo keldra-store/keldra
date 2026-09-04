@@ -312,12 +312,7 @@ async fn open_writer(
         credits.clone(),
     )
     .map_err(index_status)?;
-    let query_permit = credits
-        .acquire(
-            IndexingMemoryStage::OrderingCatalog,
-            limits.bytes.saturating_div(4).max(1),
-        )
-        .map_err(|_| Status::resource_exhausted("v6 query memory unavailable"))?;
+    let query_credits = empty_query_credits(credits, limits)?;
     let through_atomic = current.as_ref().map_or_else(
         || target.atomic.finalized_through().unwrap_or(0),
         |loaded| loaded.current.through_atomic_position,
@@ -335,7 +330,7 @@ async fn open_writer(
         scanned,
         accumulator,
         query: PreparedQueryMutationBatch::default(),
-        query_credits: QueryBlockCredits::from_pipeline_permit(query_permit),
+        query_credits,
         since: None,
         source_bytes: 0,
         pending_prepared_rows: 0,
@@ -349,6 +344,17 @@ async fn open_writer(
         pending_mutation_capacity,
         _pending_mutation_permit: pending_mutation_permit,
     })
+}
+
+fn empty_query_credits(
+    credits: &IndexingMemoryCredits,
+    limits: Limits,
+) -> Result<QueryBlockCredits, Status> {
+    let permit = credits
+        .acquire(IndexingMemoryStage::OrderingCatalog, 1)
+        .map_err(|_| Status::resource_exhausted("v6 query memory unavailable"))?;
+    QueryBlockCredits::from_growable_pipeline_permit(permit, limits.bytes.saturating_div(4).max(1))
+        .map_err(index_status)
 }
 
 async fn backfill(
@@ -979,13 +985,8 @@ async fn flush(
         None
     };
     let query = std::mem::take(&mut writer.query);
-    let placeholder = credits
-        .acquire(IndexingMemoryStage::OrderingCatalog, 1)
-        .map_err(|_| Status::resource_exhausted("v6 query transfer memory unavailable"))?;
-    let query_credits = std::mem::replace(
-        &mut writer.query_credits,
-        QueryBlockCredits::from_pipeline_permit(placeholder),
-    );
+    let placeholder = empty_query_credits(credits, limits)?;
+    let query_credits = std::mem::replace(&mut writer.query_credits, placeholder);
     let prepared = if let Some((base, _)) = &compaction {
         publisher
             .prepare_atomic_generation_after_compaction(
@@ -1060,13 +1061,6 @@ async fn flush(
             writer.source_bytes,
         )
         .await?;
-    let next_query_permit = credits
-        .acquire(
-            IndexingMemoryStage::OrderingCatalog,
-            limits.bytes.saturating_div(4).max(1),
-        )
-        .map_err(|_| Status::resource_exhausted("v6 next query memory unavailable"))?;
-    writer.query_credits = QueryBlockCredits::from_pipeline_permit(next_query_permit);
     writer.current = Some(published);
     let telemetry = super::v6_telemetry::global();
     super::v6_telemetry::V6PipelineTelemetry::add(
@@ -1294,6 +1288,43 @@ mod tests {
     #[test]
     fn fresh_partition_publication_starts_at_the_zero_sentinel() {
         assert_eq!(publication_start(None), 0);
+    }
+
+    #[test]
+    fn empty_physical_family_writers_do_not_preallocate_query_capacity() {
+        let bytes = 1_024;
+        let credits = IndexingMemoryCredits::new(
+            bytes,
+            IndexingMemoryLimits {
+                hot_payload_bytes: bytes,
+                worker_scratch_bytes: bytes,
+                prepared_rows_bytes: bytes,
+                replay_input_bytes: bytes,
+                projection_accumulator_bytes: bytes,
+                seal_scratch_bytes: bytes,
+                ordering_catalog_bytes: bytes,
+            },
+        )
+        .unwrap();
+        let limits = Limits {
+            bytes,
+            flush_bytes: 64,
+            flush_age: Duration::from_secs(1),
+            flush_operations: 64,
+            lsm_runs: 64,
+            lsm_bytes: 1_024,
+            parallelism: 1,
+        };
+
+        let writers = (0..5)
+            .map(|_| empty_query_credits(&credits, limits).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(writers.len(), 5);
+        assert_eq!(
+            credits.stage_used_bytes(IndexingMemoryStage::OrderingCatalog),
+            5
+        );
     }
 
     #[test]
