@@ -180,7 +180,15 @@ pub(super) async fn put_end(
             .await?;
             return Ok(Response::new(receipt));
         }
-        let receipt = match service.distribution.routing_target(&publish.key)? {
+        let governance = service
+            .bucket_governance
+            .resolve(publish.key.tenant(), publish.key.bucket())
+            .await?;
+        let receipt = match service.distribution.routing_target_stable(
+            &publish.key,
+            governance.tenant_id,
+            governance.bucket_id,
+        )? {
             Some(_) if peer_routed => {
                 return Err(Status::failed_precondition(
                     "a routed PutEnd reached a node that is not its coordinator",
@@ -211,24 +219,18 @@ pub(super) async fn put_end(
                         .await?
                 }
             }
-            None => {
-                let governance = service
-                    .bucket_governance
-                    .resolve(publish.key.tenant(), publish.key.bucket())
-                    .await?;
-                api_receipt(
-                    run_request_until(
-                        deadline,
-                        service.distribution.publish_from_source_with_governance(
-                            publish,
-                            keldra_consensus::NodeId(ready.upload_source_node_id),
-                            governance,
-                        ),
-                        "put publication deadline exceeded",
-                    )
-                    .await?,
+            None => api_receipt(
+                run_request_until(
+                    deadline,
+                    service.distribution.publish_from_source_with_governance(
+                        publish,
+                        keldra_consensus::NodeId(ready.upload_source_node_id),
+                        governance,
+                    ),
+                    "put publication deadline exceeded",
                 )
-            }
+                .await?,
+            ),
         };
         Ok(Response::new(receipt))
     }

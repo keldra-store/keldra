@@ -339,7 +339,15 @@ impl ObjectService for ObjectServiceImpl {
         self.authorize_object(&caller, &mutation.key, ObjectPermission::Delete)
             .await?;
         object_link::require_no_inbound_links(self, &mutation.key).await?;
-        let receipt = match self.distribution.routing_target(&mutation.key)? {
+        let governance = self
+            .bucket_governance
+            .resolve(mutation.key.tenant(), mutation.key.bucket())
+            .await?;
+        let receipt = match self.distribution.routing_target_stable(
+            &mutation.key,
+            governance.tenant_id,
+            governance.bucket_id,
+        )? {
             Some((target, address)) => {
                 self.cluster_peers
                     .route_delete(
@@ -355,7 +363,8 @@ impl ObjectService for ObjectServiceImpl {
             None => api_receipt(
                 run_request_until(
                     deadline,
-                    self.distribution.mutate(BatchOperation::Delete(mutation)),
+                    self.distribution
+                        .mutate_with_governance(BatchOperation::Delete(mutation), governance),
                     "delete deadline exceeded",
                 )
                 .await?,
@@ -406,7 +415,15 @@ impl ObjectService for ObjectServiceImpl {
         self.authorize_object(&caller, &mutation.key, ObjectPermission::Delete)
             .await?;
         object_link::require_no_inbound_links(self, &mutation.key).await?;
-        let receipt = match self.distribution.routing_target(&mutation.key)? {
+        let governance = self
+            .bucket_governance
+            .resolve(mutation.key.tenant(), mutation.key.bucket())
+            .await?;
+        let receipt = match self.distribution.routing_target_stable(
+            &mutation.key,
+            governance.tenant_id,
+            governance.bucket_id,
+        )? {
             Some((target, address)) => {
                 if object_path_access::is_internal(&path_access) {
                     self.cluster_peers
@@ -435,7 +452,8 @@ impl ObjectService for ObjectServiceImpl {
             None => api_receipt(
                 run_request_until(
                     deadline,
-                    self.distribution.mutate(BatchOperation::Delete(mutation)),
+                    self.distribution
+                        .mutate_with_governance(BatchOperation::Delete(mutation), governance),
                     "conditional delete deadline exceeded",
                 )
                 .await?,
