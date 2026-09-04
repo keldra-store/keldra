@@ -26,7 +26,9 @@ use super::v6_backfill::open_partition_baseline;
 use super::v6_extractor::{SelectedV6Source, V6ProjectionExtractor, matching_recipes};
 use super::v6_journal_dispatch::{V6OrderedSourceDispatcher, V6SourceDispatch};
 use super::v6_mutation_window::coalesce_latest_by_source_path;
-use super::v6_publication::{LoadedV6ProjectionGeneration, V6ProjectionPublisher};
+use super::v6_publication::{
+    LoadedV6ProjectionGeneration, V6ProjectionPublisher, V6PublicationPredecessor,
+};
 
 const POLL: Duration = Duration::from_millis(25);
 const RETRY: Duration = Duration::from_millis(250);
@@ -57,6 +59,7 @@ struct Writer {
     source: SourceId,
     partition: ProjectionPartitionIdentity,
     current: Option<LoadedV6ProjectionGeneration>,
+    catalog_rebuild_current_version: Option<VersionId>,
     dispatcher: V6OrderedSourceDispatcher,
     scanned: IndexBarrier,
     accumulator: PartitionProjectionAccumulator,
@@ -265,7 +268,7 @@ async fn open_writer(
             .map_err(|_| Status::data_loss("v6 source node exceeds SourceId"))?,
         source_epoch: partition.source_epoch,
     };
-    let current = publisher
+    let loaded_current = publisher
         .load_current(
             &recipe.storage_tenant,
             &recipe.bucket,
@@ -274,6 +277,8 @@ async fn open_writer(
             partition,
         )
         .await?;
+    let (current, catalog_rebuild_current_version) =
+        current_for_catalog(loaded_current, recipe.physical_generation);
     let durable_start = current
         .as_ref()
         .map_or(1, |loaded| loaded.current.next_offset);
@@ -326,6 +331,7 @@ async fn open_writer(
         source,
         partition,
         current,
+        catalog_rebuild_current_version,
         dispatcher,
         scanned,
         accumulator,
@@ -344,6 +350,21 @@ async fn open_writer(
         pending_mutation_capacity,
         _pending_mutation_permit: pending_mutation_permit,
     })
+}
+
+fn current_for_catalog(
+    current: Option<LoadedV6ProjectionGeneration>,
+    physical_catalog_generation: [u8; 32],
+) -> (Option<LoadedV6ProjectionGeneration>, Option<VersionId>) {
+    match current {
+        Some(current)
+            if current.current.physical_catalog_generation == physical_catalog_generation =>
+        {
+            (Some(current), None)
+        }
+        Some(current) => (None, Some(current.current_object_version)),
+        None => (None, None),
+    }
 }
 
 fn empty_query_credits(
@@ -1048,6 +1069,13 @@ async fn flush(
             )
             .await?;
     }
+    let predecessor = if let Some(version) = writer.catalog_rebuild_current_version {
+        V6PublicationPredecessor::CatalogRebuild(version)
+    } else if let Some(current) = writer.current.as_ref() {
+        V6PublicationPredecessor::Current(current)
+    } else {
+        V6PublicationPredecessor::Initial
+    };
     let published = publisher
         .publish_atomic_generation(
             &writer.recipe.storage_tenant,
@@ -1055,12 +1083,13 @@ async fn flush(
             writer.recipe.family.tenant_id,
             writer.recipe.family.bucket_id,
             writer.partition,
-            writer.current.as_ref(),
+            predecessor,
             prepared,
             rows,
             writer.source_bytes,
         )
         .await?;
+    writer.catalog_rebuild_current_version = None;
     writer.current = Some(published);
     let telemetry = super::v6_telemetry::global();
     super::v6_telemetry::V6PipelineTelemetry::add(
@@ -1251,6 +1280,37 @@ fn current_placement(decisions: &DecisionRaft) -> Result<ClusterPlacement, Statu
 mod tests {
     use super::*;
 
+    fn partition() -> ProjectionPartitionIdentity {
+        ProjectionPartitionIdentity {
+            family_id: [3; 32],
+            source_node: 1,
+            source_epoch: [4; 32],
+            producer_node: 1,
+            placement_term: 1,
+            placement_index: 1,
+        }
+    }
+
+    fn loaded_current(
+        physical_catalog_generation: [u8; 32],
+        current_object_version: VersionId,
+    ) -> LoadedV6ProjectionGeneration {
+        let generation = keldra_index::v6::ProjectionGeneration::initial(
+            partition(),
+            physical_catalog_generation,
+            12,
+            12,
+            Vec::new(),
+        )
+        .unwrap();
+        let current = keldra_index::v6::ProjectionCurrent::new([9; 32], &generation).unwrap();
+        LoadedV6ProjectionGeneration {
+            current,
+            current_object_version,
+            generation,
+        }
+    }
+
     fn query_update(
         document: keldra_index::v6::StableDocumentKey,
         path: &str,
@@ -1288,6 +1348,26 @@ mod tests {
     #[test]
     fn fresh_partition_publication_starts_at_the_zero_sentinel() {
         assert_eq!(publication_start(None), 0);
+    }
+
+    #[test]
+    fn stale_catalog_current_is_only_the_cas_guard_for_a_fresh_rebuild() {
+        let current = loaded_current([7; 32], VersionId(41));
+
+        let (resumed, replacement) = current_for_catalog(Some(current.clone()), [7; 32]);
+        assert_eq!(
+            resumed.unwrap().current_object_version,
+            current.current_object_version
+        );
+        assert_eq!(replacement, None);
+
+        let (resumed, replacement) = current_for_catalog(Some(current), [8; 32]);
+        assert!(resumed.is_none());
+        assert_eq!(replacement, Some(VersionId(41)));
+
+        let (resumed, replacement) = current_for_catalog(None, [8; 32]);
+        assert!(resumed.is_none());
+        assert_eq!(replacement, None);
     }
 
     #[test]
