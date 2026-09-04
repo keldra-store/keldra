@@ -12,7 +12,7 @@ use keldra_store::{
     AuthzConsistency, AuthzRealmAggregate, AuthzRealmMutation, AuthzRealmMutationContext,
     AuthzRealmSnapshotApplied, AuthzRealmTransferManifest, AuthzRepository, AuthzRevision,
     AuthzSchemaPublicationMutation, AuthzScope, AuthzStoreError, BindSchemaRequest,
-    CoordinatedAuthzRealmMutation, CoordinatedAuthzSchemaPublication, ObjectMutationContext,
+    CoordinatedAuthzRealmMutation, CoordinatedAuthzSchemaPublication, PlacementLogId,
     PublishSchemaRequest, ReplicaAuthzRealmMutationApplied, ReplicaAuthzSchemaPublicationApplied,
     SchemaRef, StorageTenantId, Store, TupleBatchRequest,
 };
@@ -850,8 +850,7 @@ impl ZanzibarDistribution {
         check: AuthorizationCheck,
     ) -> Result<(bool, AuthzRevision, u64), Status> {
         let _serial = self.core.coordinator_serial.read().await;
-        let replicas = self.require_read_replica(stable_tenant_id)?;
-        let serving = self.serving.mutation_context()?;
+        let (replicas, placement_fence) = self.require_read_replica(stable_tenant_id)?;
         let checked_scope = scope.clone();
         let (allowed, revision) = self
             .core
@@ -863,7 +862,7 @@ impl ZanzibarDistribution {
             .get_binding(&checked_scope)
             .map_err(authz_status)?
             .ok_or_else(|| Status::failed_precondition("authorization realm has no binding"))?;
-        self.require_unchanged_fresh_context(stable_tenant_id, &replicas.group, serving)?;
+        self.require_unchanged_fresh_context(stable_tenant_id, &replicas.group, placement_fence)?;
         Ok((allowed, revision, binding.generation))
     }
 
@@ -875,8 +874,7 @@ impl ZanzibarDistribution {
         checks: Vec<AuthorizationCheck>,
     ) -> Result<(Vec<bool>, AuthzRevision, u64), Status> {
         let _serial = self.core.coordinator_serial.read().await;
-        let replicas = self.require_read_replica(stable_tenant_id)?;
-        let serving = self.serving.mutation_context()?;
+        let (replicas, placement_fence) = self.require_read_replica(stable_tenant_id)?;
         let checked_scope = scope.clone();
         let (allowed, revision) = self
             .core
@@ -888,7 +886,7 @@ impl ZanzibarDistribution {
             .get_binding(&checked_scope)
             .map_err(authz_status)?
             .ok_or_else(|| Status::failed_precondition("authorization realm has no binding"))?;
-        self.require_unchanged_fresh_context(stable_tenant_id, &replicas.group, serving)?;
+        self.require_unchanged_fresh_context(stable_tenant_id, &replicas.group, placement_fence)?;
         Ok((allowed, revision, binding.generation))
     }
 
@@ -896,15 +894,14 @@ impl ZanzibarDistribution {
         &self,
         stable_tenant_id: u64,
         original_group: &MutableRecordReplicaGroup,
-        original_serving: ObjectMutationContext,
+        original_fence: PlacementLogId,
     ) -> Result<(), Status> {
-        let current_replicas = self
+        let (current_replicas, current_fence) = self
             .require_read_replica(stable_tenant_id)
             .map_err(|_| Status::unavailable("authorization replica changed during fresh check"))?;
-        let current_serving = self.serving.mutation_context()?;
-        if current_replicas.group != *original_group || current_serving != original_serving {
+        if current_replicas.group != *original_group || current_fence != original_fence {
             return Err(Status::unavailable(
-                "authorization serving fence or replica group changed during fresh check",
+                "authorization placement fence or replica group changed during fresh check",
             ));
         }
         Ok(())
@@ -931,7 +928,10 @@ impl ZanzibarDistribution {
     /// its exact replica quorum before evaluation. Any selected replica may do
     /// that work so loss of rank zero does not make a healthy quorum
     /// unavailable. Mutation coordination remains rank-zero-only.
-    fn require_read_replica(&self, stable_tenant_id: u64) -> Result<TenantReplicaSet, Status> {
+    fn require_read_replica(
+        &self,
+        stable_tenant_id: u64,
+    ) -> Result<(TenantReplicaSet, PlacementLogId), Status> {
         let state = self
             .decisions
             .state()
@@ -944,7 +944,7 @@ impl ZanzibarDistribution {
                 "fresh authorization check did not reach a selected tenant replica",
             ));
         }
-        Ok(replicas)
+        Ok((replicas, placement.fence()))
     }
 
     fn require_context(
