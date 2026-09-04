@@ -26,6 +26,7 @@ use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::placement::PlacementKind;
 
 const AUTHORIZATION_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTHORIZATION_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StableBucketAuthorization {
@@ -252,32 +253,14 @@ impl AuthoritativeSystemAuthorization {
                 "authorization check batch must not be empty",
             ));
         }
-        let placement = self.placement()?;
-        let fence = placement.fence();
-        let group = MutableRecordReplicaGroup::select(
-            PlacementKind::ZanzibarRealm,
-            placement.cluster_id(),
-            &stable_tenant_id.to_be_bytes(),
-            placement.placement_nodes(),
+        self.fresh_checks_with_placement_retry(
+            stable_tenant_id,
+            &scope,
+            AuthzConsistency::Latest,
+            &checks,
+            &[],
         )
-        .ok_or_else(|| Status::unavailable("cluster has no tenant Zanzibar replica"))?;
-        let result = self
-            .fresh_checks_from_replicas(
-                &placement,
-                &group,
-                stable_tenant_id,
-                &scope,
-                AuthzConsistency::Latest,
-                &checks,
-                &[],
-            )
-            .await?;
-        if self.placement()?.fence() != fence {
-            return Err(Status::unavailable(
-                "authorization placement changed during the request",
-            ));
-        }
-        Ok(result)
+        .await
     }
 
     async fn stable_bucket_bindings(
@@ -321,32 +304,62 @@ impl AuthoritativeSystemAuthorization {
                 "authorization check batch must not be empty",
             ));
         }
-        let placement = self.placement()?;
-        let fence = placement.fence();
-        let group = MutableRecordReplicaGroup::select(
-            PlacementKind::ZanzibarRealm,
-            placement.cluster_id(),
-            &SYSTEM_STABLE_TENANT_ID.to_be_bytes(),
-            placement.placement_nodes(),
+        self.fresh_checks_with_placement_retry(
+            SYSTEM_STABLE_TENANT_ID,
+            &AuthzScope::system(),
+            consistency,
+            &checks,
+            &stable_buckets,
         )
-        .ok_or_else(|| Status::unavailable("cluster has no system Zanzibar replica"))?;
-        let result = self
-            .fresh_checks_from_replicas(
-                &placement,
-                &group,
-                SYSTEM_STABLE_TENANT_ID,
-                &AuthzScope::system(),
-                consistency,
-                &checks,
-                &stable_buckets,
-            )
-            .await?;
-        if self.placement()?.fence() != fence {
-            return Err(Status::unavailable(
-                "authorization placement changed during the request",
-            ));
+        .await
+    }
+
+    async fn fresh_checks_with_placement_retry(
+        &self,
+        stable_tenant_id: u64,
+        scope: &AuthzScope,
+        consistency: AuthzConsistency,
+        checks: &[AuthorizationCheck],
+        stable_buckets: &[StableBucketAuthorization],
+    ) -> Result<FreshAuthorizationResult, Status> {
+        let deadline = tokio::time::Instant::now() + AUTHORIZATION_READ_TIMEOUT;
+        loop {
+            let attempt = async {
+                let placement = self.placement()?;
+                let group = MutableRecordReplicaGroup::select(
+                    PlacementKind::ZanzibarRealm,
+                    placement.cluster_id(),
+                    &stable_tenant_id.to_be_bytes(),
+                    placement.placement_nodes(),
+                )
+                .ok_or_else(|| Status::unavailable("cluster has no Zanzibar replica"))?;
+                self.fresh_checks_from_replicas(
+                    &placement,
+                    &group,
+                    stable_tenant_id,
+                    scope,
+                    consistency,
+                    checks,
+                    stable_buckets,
+                )
+                .await
+            };
+            let result = tokio::time::timeout_at(deadline, attempt)
+                .await
+                .map_err(|_| Status::deadline_exceeded("authorization read deadline exceeded"))?;
+            match result {
+                Ok(result) => return Ok(result),
+                Err(error) if retryable_authorization_availability(&error) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(error);
+                    }
+                    tokio::time::sleep_until((now + AUTHORIZATION_RETRY_INTERVAL).min(deadline))
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
