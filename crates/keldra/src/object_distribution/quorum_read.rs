@@ -289,11 +289,11 @@ impl ObjectDistribution {
         tenant_id: u64,
         bucket_id: u64,
     ) -> Result<Option<ObjectPathSnapshot>, Status> {
-        let initial_fence = self.serving.mutation_context()?.active_placement_log_id;
+        // Reads may enter through a JOINING gateway. Applied ACTIVE placement
+        // selects every authoritative replica; mutation callers separately
+        // require their local serving lease before committing.
         let placement = self.placement()?;
-        if placement.fence() != initial_fence {
-            return Err(changed_fence());
-        }
+        let initial_fence = placement.fence();
         let group = self.replica_group_stable(&placement, tenant_id, bucket_id, key)?;
 
         let mut observations = Vec::with_capacity(group.replicas().len());
@@ -397,11 +397,8 @@ impl ObjectDistribution {
                 "current object quorum batch must contain at most {MAX_OBJECT_RECORD_EXPORT_RECORDS} paths"
             )));
         }
-        let initial_fence = self.serving.mutation_context()?.active_placement_log_id;
         let placement = self.placement()?;
-        if placement.fence() != initial_fence {
-            return Err(changed_fence());
-        }
+        let initial_fence = placement.fence();
 
         let mut grouped = BTreeMap::<Vec<NodeId>, CurrentObjectBatchGroup>::new();
         for (index, key) in keys.iter().enumerate() {
@@ -543,11 +540,8 @@ impl ObjectDistribution {
                 "exact-version quorum batch must contain at most {MAX_OBJECT_RECORD_EXPORT_RECORDS} non-zero versions"
             )));
         }
-        let initial_fence = self.serving.mutation_context()?.active_placement_log_id;
         let placement = self.placement()?;
-        if placement.fence() != initial_fence {
-            return Err(changed_fence());
-        }
+        let initial_fence = placement.fence();
 
         let mut grouped = BTreeMap::<Vec<NodeId>, ExactVersionBatchGroup>::new();
         for (index, (key, version)) in keys.iter().zip(versions).enumerate() {
@@ -685,11 +679,8 @@ impl ObjectDistribution {
         ),
         Status,
     > {
-        let initial_fence = self.serving.mutation_context()?.active_placement_log_id;
         let placement = self.placement()?;
-        if placement.fence() != initial_fence {
-            return Err(changed_fence());
-        }
+        let initial_fence = placement.fence();
         let group = self.replica_group_stable(&placement, tenant_id, bucket_id, key)?;
 
         let mut observations = Vec::with_capacity(group.replicas().len());
@@ -803,9 +794,8 @@ impl ObjectDistribution {
     }
 
     fn require_unchanged_read_fence(&self, initial: PlacementLogId) -> Result<(), Status> {
-        let current = self.serving.mutation_context()?.active_placement_log_id;
         let placement = self.placement()?;
-        if current != initial || placement.fence() != initial {
+        if placement.fence() != initial {
             return Err(changed_fence());
         }
         Ok(())

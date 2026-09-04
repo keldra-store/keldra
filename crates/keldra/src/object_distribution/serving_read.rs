@@ -15,11 +15,13 @@ impl ObjectDistribution {
         &self,
         expected: PlacementLogId,
     ) -> Result<(), Status> {
-        let current = self.serving.mutation_context()?.active_placement_log_id;
+        // The public gateway can be JOINING. The applied placement is the
+        // read fence; selected ACTIVE peers independently authenticate and
+        // validate that same fence before returning authoritative data.
         let placement = self.placement()?;
-        if current != expected || placement.fence() != expected {
+        if placement.fence() != expected {
             return Err(Status::unavailable(
-                "serving fence changed during the cluster object read",
+                "applied placement changed during the cluster object read",
             ));
         }
         Ok(())
