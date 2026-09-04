@@ -32,7 +32,6 @@ pub(super) const UNLINK_OBJECT_AUTHORITY_KIND: u16 = 3;
 pub(super) const PUT_THROUGH_LINK_AUTHORITY_KIND: u16 = 4;
 pub(super) const PUT_IMMUTABLE_THROUGH_LINK_AUTHORITY_KIND: u16 = 5;
 pub(super) const OBJECT_LINK_CONTRACT_VERSION: u16 = 1;
-
 #[derive(Clone)]
 pub(super) enum ResolvedAddress {
     Ordinary(ObjectKey),
