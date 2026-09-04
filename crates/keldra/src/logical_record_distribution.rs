@@ -443,7 +443,12 @@ impl LogicalRecordDistribution {
         &self,
         id: &LogicalRecordId,
     ) -> Result<Vec<LogicalRecordReadTarget>, Status> {
-        let route = self.route(id)?;
+        // A JOINING node may act as a public gateway before it owns a serving
+        // fence. Name reads still go only to replicas selected from the
+        // applied ACTIVE placement, where the target performs the ordinary
+        // fenced quorum read. Do not require the gateway itself to be a
+        // serving replica merely to discover those targets.
+        let route = self.read_route(id)?;
         Ok(route
             .endpoints
             .iter()
@@ -569,6 +574,29 @@ impl LogicalRecordDistribution {
                 "serving lease does not cover the applied placement",
             ));
         }
+        self.route_from_placement(id, placement, serving.serving_fence_term)
+    }
+
+    fn read_route(&self, id: &LogicalRecordId) -> Result<LogicalRecordRoute, Status> {
+        self.core
+            .store
+            .logical_record_candidate(id)
+            .map_err(logical_record_status)?;
+        let state = self
+            .decisions
+            .state()
+            .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
+        let placement = ClusterPlacement::from_applied(&state)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        self.route_from_placement(id, placement, 0)
+    }
+
+    fn route_from_placement(
+        &self,
+        id: &LogicalRecordId,
+        placement: ClusterPlacement,
+        serving_fence_term: u64,
+    ) -> Result<LogicalRecordRoute, Status> {
         let (kind, key) = placement_key(id)?;
         let group = MutableRecordReplicaGroup::select(
             kind,
@@ -596,8 +624,8 @@ impl LogicalRecordDistribution {
         Ok(LogicalRecordRoute {
             group,
             endpoints,
-            active_placement_log_id: serving.active_placement_log_id,
-            serving_fence_term: serving.serving_fence_term,
+            active_placement_log_id: placement.fence(),
+            serving_fence_term,
         })
     }
 }
