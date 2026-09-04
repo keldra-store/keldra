@@ -35,8 +35,8 @@ fn joining_descriptor() -> NodeDescriptor {
         current_peer_spki_sha256: PeerSpkiSha256([1; 32]),
         overlap_peer_spki_sha256: None,
         join_capability_hash: Some(JoinCapabilityHash([2; 32])),
-        supported_protocol: CapabilityRange { min: 1, max: 1 },
-        supported_storage_format: CapabilityRange { min: 1, max: 1 },
+        supported_protocol: CapabilityRange { min: 1, max: 2 },
+        supported_storage_format: CapabilityRange { min: 1, max: 2 },
     }
 }
 
