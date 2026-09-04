@@ -741,6 +741,8 @@ run_cli keldra-1 qprobe-client "${qprobe_secret}" \
 cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/joining-coordinator-write.txt" \
   "${KELDRA_QUALIFICATION_DIR}/artifacts/joining-coordinator-read.txt"
 echo "[keldra-qualification] JOINING node coordinated authenticated reads and writes before ownership activation"
+refresh_no_event_membership_cutover_tail \
+  keldra-2 "${pressure_source_journal_max_entries}"
 wait_for_background_join keldra-3 "${joining_node_handoff_timeout_seconds}"
 qualify_no_event_membership_cutover \
   keldra-2 2 qprobe-client "${qprobe_secret}" qprobe objects \

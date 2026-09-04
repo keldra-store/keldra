@@ -272,6 +272,41 @@ prepare_no_event_membership_cutover_qualification() {
   echo "[keldra-qualification] non-coordinator source ${node_id} reached journal bound ${bound} at tail ${membership_cutover_source_tail} before the no-event 2->3 cutover"
 }
 
+refresh_no_event_membership_cutover_tail() {
+  local node="$1"
+  local bound="$2"
+  local attempt
+  local clear_tail
+  local line=
+  local previous_clear_line=
+  local previous_clear_tail=
+  for attempt in $(seq 1 45); do
+    line="$(latest_source_journal_sample "${node}")"
+    if source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
+      clear_tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
+      if [[ -n "${previous_clear_line}" \
+        && "${line}" != "${previous_clear_line}" \
+        && "${clear_tail}" == "${previous_clear_tail}" ]]
+      then
+        membership_cutover_source_tail="${clear_tail}"
+        echo "[keldra-qualification] refreshed no-event cutover baseline at tail ${membership_cutover_source_tail} after the JOINING-node probe"
+        return 0
+      fi
+      if [[ "${line}" != "${previous_clear_line}" ]]; then
+        previous_clear_line="${line}"
+        previous_clear_tail="${clear_tail}"
+      fi
+    else
+      previous_clear_line=
+      previous_clear_tail=
+    fi
+    sleep 1
+  done
+  echo "${node} did not return to a stable clear source-journal entry bound of ${bound} after the JOINING-node probe" >&2
+  printf '%s\n' "${line}" >&2
+  return 1
+}
+
 new_cutover_fence_line() {
   local log="$1"
   local node_id="$2"
