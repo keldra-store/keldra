@@ -34,6 +34,7 @@ use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
 
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone)]
 pub(crate) struct DistributedControlPlane {
@@ -402,47 +403,61 @@ impl DistributedControlPlane {
         request: api::ExchangeClientCredentialsRequest,
     ) -> Result<api::AccessToken, Status> {
         let id = credential_record_id(&request.client_id)?;
-        let targets = self.logical.read_targets_local_first(&id)?;
         let started = Instant::now();
         let mut last_unavailable = None;
-        for (index, target) in targets.iter().enumerate() {
-            let remaining_targets = targets.len() - index;
-            let timeout = control_attempt_timeout(started, remaining_targets)?;
-            let result = if target.node_id == self.local_node {
-                tokio::time::timeout(
-                    timeout,
-                    self.execute_credential_exchange(request.clone(), target),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(Status::deadline_exceeded(
-                        "credential verification timed out",
-                    ))
-                })
-            } else {
-                self.peers
-                    .route_credential_exchange(
-                        target.node_id,
-                        &target.address,
-                        request.clone(),
-                        timeout,
-                    )
-                    .await
-            };
-            match result {
-                Ok(token) => {
-                    self.logical.require_replica_read_target(&id, target)?;
-                    return Ok(token);
-                }
+        loop {
+            let targets = match self.logical.read_targets_local_first(&id) {
+                Ok(targets) => targets,
                 Err(error) if retryable_control_availability(&error) => {
                     last_unavailable = Some(error);
+                    wait_for_control_retry(started).await?;
+                    continue;
                 }
                 Err(error) => return Err(error),
+            };
+            for (index, target) in targets.iter().enumerate() {
+                let remaining_targets = targets.len() - index;
+                let timeout = control_attempt_timeout(started, remaining_targets)?;
+                let result = if target.node_id == self.local_node {
+                    tokio::time::timeout(
+                        timeout,
+                        self.execute_credential_exchange(request.clone(), target),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Status::deadline_exceeded(
+                            "credential verification timed out",
+                        ))
+                    })
+                } else {
+                    self.peers
+                        .route_credential_exchange(
+                            target.node_id,
+                            &target.address,
+                            request.clone(),
+                            timeout,
+                        )
+                        .await
+                };
+                match result {
+                    Ok(token) => match self.logical.require_replica_read_target(&id, target) {
+                        Ok(()) => return Ok(token),
+                        Err(error) if retryable_control_availability(&error) => {
+                            last_unavailable = Some(error);
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    },
+                    Err(error) if retryable_control_availability(&error) => {
+                        last_unavailable = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Err(deadline) = wait_for_control_retry(started).await {
+                return Err(last_unavailable.unwrap_or(deadline));
             }
         }
-        Err(last_unavailable.unwrap_or_else(|| {
-            Status::unavailable("credential exchange has no available verifier")
-        }))
     }
 
     pub(crate) async fn execute_routed_credential_exchange(
@@ -1918,6 +1933,15 @@ fn control_attempt_timeout(started: Instant, remaining_targets: usize) -> Result
         .ok_or_else(|| Status::deadline_exceeded("control operation deadline exceeded"))?;
     let divisor = u32::try_from(remaining_targets.max(1)).unwrap_or(u32::MAX);
     Ok(remaining / divisor)
+}
+
+async fn wait_for_control_retry(started: Instant) -> Result<(), Status> {
+    let remaining = CONTROL_OPERATION_TIMEOUT
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| Status::deadline_exceeded("control operation deadline exceeded"))?;
+    tokio::time::sleep(CONTROL_RETRY_INTERVAL.min(remaining)).await;
+    Ok(())
 }
 
 fn retryable_control_availability(error: &Status) -> bool {
