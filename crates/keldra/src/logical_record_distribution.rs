@@ -181,11 +181,24 @@ impl LogicalRecordDistributionCore {
                 (endpoint.node_id, result)
             });
         }
-        while let Some(joined) = tasks.join_next().await {
+        while !has_exact_candidate_quorum(&observations, route.group.required_acknowledgements()) {
+            let Some(joined) = tasks.join_next().await else {
+                break;
+            };
             observations.push(joined.map_err(|error| {
                 Status::internal(format!("logical-record read task failed: {error}"))
             })?);
         }
+        // Preserve every response which is already complete, including a
+        // directly linked successor of the quorum anchor. Once an exact quorum
+        // exists, a still-pending minority is unavailable for this read: it is
+        // neither overwritten nor needed to prove the selected current state.
+        while let Some(joined) = tasks.try_join_next() {
+            observations.push(joined.map_err(|error| {
+                Status::internal(format!("logical-record read task failed: {error}"))
+            })?);
+        }
+        tasks.abort_all();
 
         let successful = observations
             .iter()
@@ -628,6 +641,25 @@ impl LogicalRecordDistribution {
             serving_fence_term,
         })
     }
+}
+
+fn has_exact_candidate_quorum(
+    observations: &[(NodeId, Result<Option<LogicalRecordCandidate>, Status>)],
+    required: usize,
+) -> bool {
+    if required == 0 {
+        return false;
+    }
+    observations.iter().any(|(_, result)| {
+        let Ok(candidate) = result else {
+            return false;
+        };
+        observations
+            .iter()
+            .filter(|(_, other)| other.as_ref().ok() == Some(candidate))
+            .count()
+            >= required
+    })
 }
 
 fn placement_key(id: &LogicalRecordId) -> Result<(PlacementKind, Vec<u8>), Status> {

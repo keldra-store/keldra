@@ -18,6 +18,12 @@ struct ReplicaObservation {
     snapshot: Option<ObjectPathSnapshot>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CurrentObjectObservationPolicy {
+    Quorum,
+    AllReadable,
+}
+
 const OBJECT_RECONCILIATION_BATCH_PATHS: usize = 128;
 const OBJECT_RECONCILIATION_MAX_IN_FLIGHT_READS: usize = 16;
 
@@ -324,23 +330,13 @@ impl ObjectDistribution {
                 (node, result)
             });
         }
-        while let Some(result) = reads.join_next().await {
-            match result {
-                Ok((node, Ok(snapshot))) => {
-                    observations.push(ReplicaObservation { node, snapshot });
-                }
-                Ok((node, Err(error))) => {
-                    tracing::warn!(node_id = node.0, %error, "remote object replica read failed");
-                }
-                Err(error) => tracing::warn!(%error, "object replica read task failed"),
-            }
-        }
-
-        let selected = select_quorum_snapshot(
-            &observations,
+        let (selected, observations) = collect_object_snapshot_quorum(
+            observations,
+            reads,
             group.required_acknowledgements(),
             group.replicas().len(),
-        )?;
+        )
+        .await?;
         for observation in observations
             .iter()
             .filter(|observation| !object_snapshots_equivalent(&observation.snapshot, &selected))
@@ -371,7 +367,12 @@ impl ObjectDistribution {
         bucket_id: u64,
     ) -> Result<Option<CurrentObjectSnapshot>, Status> {
         let (initial_fence, observations, required, replica_count) = self
-            .current_object_observations_stable(key, tenant_id, bucket_id)
+            .current_object_observations_stable(
+                key,
+                tenant_id,
+                bucket_id,
+                CurrentObjectObservationPolicy::Quorum,
+            )
             .await?;
         let selected =
             select_current_object_snapshot_quorum(&observations, required, replica_count)?;
@@ -415,6 +416,7 @@ impl ObjectDistribution {
         }
         let groups = grouped.into_values().collect::<Vec<_>>();
         let mut observations = vec![Vec::new(); groups.len()];
+        let mut group_ready = vec![false; groups.len()];
         let mut reads = tokio::task::JoinSet::new();
 
         for (group_index, group) in groups.iter().enumerate() {
@@ -467,26 +469,36 @@ impl ObjectDistribution {
             }
         }
         while let Some(result) = reads.join_next().await {
-            match result {
-                Ok(Ok((group_index, _node, Ok(batch)))) => observations[group_index].push(batch),
-                Ok(Ok((_group_index, node, Err(error)))) => tracing::warn!(
-                    node_id = node.0,
-                    %error,
-                    "current-object batch replica read failed"
-                ),
-                Ok(Err(error)) => tracing::warn!(
-                    %error,
-                    "current-object batch replica read setup failed"
-                ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    "current-object batch replica read task failed"
-                ),
+            if let Some(group_index) = record_current_object_batch_read(&mut observations, result) {
+                let group = &groups[group_index];
+                match select_current_object_snapshot_batch_quorum(
+                    &observations[group_index],
+                    group.required,
+                    group.replicas.len(),
+                    group.entries.len(),
+                ) {
+                    Ok(_) => group_ready[group_index] = true,
+                    Err(error) if error.code() == tonic::Code::Unavailable => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if group_ready.iter().all(|ready| *ready) {
+                while let Some(result) = reads.try_join_next() {
+                    record_current_object_batch_read(&mut observations, result);
+                }
+                reads.abort_all();
+                break;
             }
         }
 
         let mut selected = vec![None; keys.len()];
         for (group, observations) in groups.iter().zip(&observations) {
+            validate_current_object_snapshot_batch_identity(
+                observations,
+                tenant_id,
+                bucket_id,
+                &group.entries,
+            )?;
             let group_selected = select_current_object_snapshot_batch_quorum(
                 observations,
                 group.required,
@@ -558,6 +570,7 @@ impl ObjectDistribution {
         }
         let groups = grouped.into_values().collect::<Vec<_>>();
         let mut observations = vec![Vec::new(); groups.len()];
+        let mut group_ready = vec![false; groups.len()];
         let mut reads = tokio::task::JoinSet::new();
         for (group_index, group) in groups.iter().enumerate() {
             let selections = group
@@ -605,21 +618,25 @@ impl ObjectDistribution {
             }
         }
         while let Some(result) = reads.join_next().await {
-            match result {
-                Ok(Ok((group_index, _node, Ok(batch)))) => observations[group_index].push(batch),
-                Ok(Ok((_group_index, node, Err(error)))) => tracing::warn!(
-                    node_id = node.0,
-                    %error,
-                    "exact-version batch replica read failed"
-                ),
-                Ok(Err(error)) => tracing::warn!(
-                    %error,
-                    "exact-version batch replica read setup failed"
-                ),
-                Err(error) => tracing::warn!(
-                    %error,
-                    "exact-version batch replica read task failed"
-                ),
+            if let Some(group_index) = record_exact_version_batch_read(&mut observations, result) {
+                let group = &groups[group_index];
+                match select_exact_version_batch_quorum(
+                    &observations[group_index],
+                    group.required,
+                    group.replicas.len(),
+                    &group.entries,
+                ) {
+                    Ok(_) => group_ready[group_index] = true,
+                    Err(error) if error.code() == tonic::Code::Unavailable => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if group_ready.iter().all(|ready| *ready) {
+                while let Some(result) = reads.try_join_next() {
+                    record_exact_version_batch_read(&mut observations, result);
+                }
+                reads.abort_all();
+                break;
             }
         }
 
@@ -653,7 +670,12 @@ impl ObjectDistribution {
         expected_version: VersionId,
     ) -> Result<Option<CurrentObjectSnapshot>, Status> {
         let (initial_fence, observations, required, replica_count) = self
-            .current_object_observations_stable(key, tenant_id, bucket_id)
+            .current_object_observations_stable(
+                key,
+                tenant_id,
+                bucket_id,
+                CurrentObjectObservationPolicy::AllReadable,
+            )
             .await?;
         let selected = select_guarded_current_object_snapshot_quorum(
             &observations,
@@ -670,6 +692,7 @@ impl ObjectDistribution {
         key: &ObjectKey,
         tenant_id: u64,
         bucket_id: u64,
+        policy: CurrentObjectObservationPolicy,
     ) -> Result<
         (
             PlacementLogId,
@@ -727,25 +750,17 @@ impl ObjectDistribution {
                 (node, result)
             });
         }
-        while let Some(result) = reads.join_next().await {
-            match result {
-                Ok((_node, Ok(snapshot))) => {
-                    validate_current_object_observation_identity(
-                        snapshot.as_ref(),
-                        tenant_id,
-                        bucket_id,
-                        key.path(),
-                    )?;
-                    observations.push(snapshot);
-                }
-                Ok((node, Err(error))) => tracing::warn!(
-                    node_id = node.0,
-                    %error,
-                    "remote current-object replica read failed"
-                ),
-                Err(error) => tracing::warn!(%error, "current-object replica read task failed"),
-            }
-        }
+        observations = collect_current_object_observations(
+            observations,
+            reads,
+            tenant_id,
+            bucket_id,
+            key.path(),
+            group.required_acknowledgements(),
+            group.replicas().len(),
+            policy,
+        )
+        .await?;
 
         Ok((
             initial_fence,
@@ -799,6 +814,177 @@ impl ObjectDistribution {
             return Err(changed_fence());
         }
         Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_current_object_observations(
+    mut observations: Vec<Option<CurrentObjectSnapshot>>,
+    mut reads: tokio::task::JoinSet<(NodeId, Result<Option<CurrentObjectSnapshot>, Status>)>,
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_path: &str,
+    required: usize,
+    replica_count: usize,
+    policy: CurrentObjectObservationPolicy,
+) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
+    loop {
+        if policy == CurrentObjectObservationPolicy::Quorum {
+            match select_current_object_snapshot_quorum(&observations, required, replica_count) {
+                Ok(_) => {
+                    while let Some(result) = reads.try_join_next() {
+                        record_current_object_read(
+                            &mut observations,
+                            result,
+                            tenant_id,
+                            bucket_id,
+                            exact_path,
+                        )?;
+                    }
+                    reads.abort_all();
+                    return Ok(observations);
+                }
+                Err(error) if error.code() == tonic::Code::Unavailable => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(result) = reads.join_next().await else {
+            return Ok(observations);
+        };
+        record_current_object_read(&mut observations, result, tenant_id, bucket_id, exact_path)?;
+    }
+}
+
+fn record_current_object_read(
+    observations: &mut Vec<Option<CurrentObjectSnapshot>>,
+    result: Result<(NodeId, Result<Option<CurrentObjectSnapshot>, Status>), tokio::task::JoinError>,
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_path: &str,
+) -> Result<(), Status> {
+    match result {
+        Ok((_node, Ok(snapshot))) => {
+            validate_current_object_observation_identity(
+                snapshot.as_ref(),
+                tenant_id,
+                bucket_id,
+                exact_path,
+            )?;
+            observations.push(snapshot);
+        }
+        Ok((node, Err(error))) => tracing::warn!(
+            node_id = node.0,
+            %error,
+            "remote current-object replica read failed"
+        ),
+        Err(error) => tracing::warn!(%error, "current-object replica read task failed"),
+    }
+    Ok(())
+}
+
+fn record_current_object_batch_read(
+    observations: &mut [Vec<Vec<Option<CurrentObjectSnapshot>>>],
+    result: Result<
+        Result<
+            (
+                usize,
+                NodeId,
+                Result<Vec<Option<CurrentObjectSnapshot>>, Status>,
+            ),
+            Status,
+        >,
+        tokio::task::JoinError,
+    >,
+) -> Option<usize> {
+    match result {
+        Ok(Ok((group_index, _node, Ok(batch)))) => {
+            observations[group_index].push(batch);
+            Some(group_index)
+        }
+        Ok(Ok((_group_index, node, Err(error)))) => {
+            tracing::warn!(
+                node_id = node.0,
+                %error,
+                "current-object batch replica read failed"
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "current-object batch replica read setup failed");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "current-object batch replica read task failed");
+            None
+        }
+    }
+}
+
+fn record_exact_version_batch_read(
+    observations: &mut [Vec<Vec<Option<Version>>>],
+    result: Result<
+        Result<(usize, NodeId, Result<Vec<Option<Version>>, Status>), Status>,
+        tokio::task::JoinError,
+    >,
+) -> Option<usize> {
+    match result {
+        Ok(Ok((group_index, _node, Ok(batch)))) => {
+            observations[group_index].push(batch);
+            Some(group_index)
+        }
+        Ok(Ok((_group_index, node, Err(error)))) => {
+            tracing::warn!(node_id = node.0, %error, "exact-version batch replica read failed");
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "exact-version batch replica read setup failed");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "exact-version batch replica read task failed");
+            None
+        }
+    }
+}
+
+async fn collect_object_snapshot_quorum(
+    mut observations: Vec<ReplicaObservation>,
+    mut reads: tokio::task::JoinSet<(NodeId, Result<Option<ObjectPathSnapshot>, Status>)>,
+    required: usize,
+    replica_count: usize,
+) -> Result<(Option<ObjectPathSnapshot>, Vec<ReplicaObservation>), Status> {
+    loop {
+        match select_quorum_snapshot(&observations, required, replica_count) {
+            Ok(_) => {
+                while let Some(result) = reads.try_join_next() {
+                    record_object_snapshot_read(&mut observations, result);
+                }
+                reads.abort_all();
+                let selected = select_quorum_snapshot(&observations, required, replica_count)?;
+                return Ok((selected, observations));
+            }
+            Err(error) if error.code() == tonic::Code::Unavailable => {}
+            Err(error) => return Err(error),
+        }
+        let Some(result) = reads.join_next().await else {
+            break;
+        };
+        record_object_snapshot_read(&mut observations, result);
+    }
+    let selected = select_quorum_snapshot(&observations, required, replica_count)?;
+    Ok((selected, observations))
+}
+
+fn record_object_snapshot_read(
+    observations: &mut Vec<ReplicaObservation>,
+    result: Result<(NodeId, Result<Option<ObjectPathSnapshot>, Status>), tokio::task::JoinError>,
+) {
+    match result {
+        Ok((node, Ok(snapshot))) => observations.push(ReplicaObservation { node, snapshot }),
+        Ok((node, Err(error))) => {
+            tracing::warn!(node_id = node.0, %error, "remote object replica read failed");
+        }
+        Err(error) => tracing::warn!(%error, "object replica read task failed"),
     }
 }
 
@@ -992,6 +1178,30 @@ fn validate_current_object_observation_identity(
         return Err(Status::data_loss(
             "current object replica returned another object identity",
         ));
+    }
+    Ok(())
+}
+
+fn validate_current_object_snapshot_batch_identity(
+    observations: &[Vec<Option<CurrentObjectSnapshot>>],
+    tenant_id: u64,
+    bucket_id: u64,
+    entries: &[(usize, String)],
+) -> Result<(), Status> {
+    for observation in observations {
+        if observation.len() != entries.len() {
+            return Err(Status::data_loss(
+                "current object replica batch returned the wrong result count",
+            ));
+        }
+        for (snapshot, (_, exact_path)) in observation.iter().zip(entries) {
+            validate_current_object_observation_identity(
+                snapshot.as_ref(),
+                tenant_id,
+                bucket_id,
+                exact_path,
+            )?;
+        }
     }
     Ok(())
 }

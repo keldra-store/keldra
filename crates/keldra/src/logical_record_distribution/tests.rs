@@ -411,8 +411,7 @@ async fn quorum_proven_current_state_repairs_a_multi_version_stale_replica() {
 
 #[tokio::test]
 async fn unavailable_minority_cannot_block_a_three_node_read_quorum() {
-    let mut fixture = fixture(3).await;
-    fixture.core.replica_timeout = std::time::Duration::from_millis(50);
+    let fixture = fixture(3).await;
     let replicas = fixture.route.group.replicas();
     let value = policy_value("quorum");
     let candidate = fixture.stores[&replicas[0]]
@@ -430,7 +429,7 @@ async fn unavailable_minority_cannot_block_a_three_node_read_quorum() {
         fixture.core.reconcile(&fixture.route, &value.id()),
     )
     .await
-    .expect("the unavailable minority must be bounded")
+    .expect("an exact quorum must not wait for the unavailable minority")
     .unwrap();
     assert_eq!(
         selected,
@@ -442,6 +441,45 @@ async fn unavailable_minority_cannot_block_a_three_node_read_quorum() {
             .unwrap(),
         None,
         "an unavailable minority remains eligible for later reconciliation"
+    );
+}
+
+#[tokio::test]
+async fn slow_minority_successor_is_left_intact_after_predecessor_quorum() {
+    let fixture = fixture(3).await;
+    let replicas = fixture.route.group.replicas();
+    let first_value = policy_value("predecessor");
+    let first = fixture.stores[&replicas[0]]
+        .construct_logical_record_mutation(first_value.clone(), context(&fixture.route, 100))
+        .unwrap();
+    for replica in replicas {
+        fixture.stores[replica]
+            .apply_logical_record_mutation_replica(&first)
+            .unwrap();
+    }
+    let successor = fixture.stores[&replicas[2]]
+        .construct_logical_record_mutation(policy_value("successor"), context(&fixture.route, 200))
+        .unwrap();
+    fixture.stores[&replicas[2]]
+        .apply_logical_record_mutation_replica(&successor)
+        .unwrap();
+    fixture.transport.hang_read(replicas[2]);
+
+    let selected = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        fixture.core.reconcile(&fixture.route, &first_value.id()),
+    )
+    .await
+    .expect("a slow minority successor must not block the predecessor quorum")
+    .unwrap();
+
+    assert_eq!(selected, Some(LogicalRecordCandidate::Versioned(first)));
+    assert_eq!(
+        fixture.stores[&replicas[2]]
+            .logical_record_candidate(&first_value.id())
+            .unwrap(),
+        Some(LogicalRecordCandidate::Versioned(successor)),
+        "the unavailable successor remains eligible for a later reconciliation"
     );
 }
 

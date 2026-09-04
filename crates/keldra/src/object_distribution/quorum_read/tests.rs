@@ -129,6 +129,69 @@ async fn one_of_one_selects_the_complete_local_state() {
     assert_eq!(reconcile_stores(&stores, 1).await.unwrap(), Some(expected));
 }
 
+#[tokio::test]
+async fn exact_quorum_does_not_wait_for_an_unresponsive_third_object_replica() {
+    let expected = baseline();
+    let observations = vec![ReplicaObservation {
+        node: NodeId(1),
+        snapshot: Some(expected.clone()),
+    }];
+    let mut reads = tokio::task::JoinSet::new();
+    let second = expected.clone();
+    reads.spawn(async move { (NodeId(2), Ok(Some(second))) });
+    reads.spawn(async move {
+        std::future::pending::<()>().await;
+        (NodeId(3), Ok(None))
+    });
+
+    let (selected, observed) = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        collect_object_snapshot_quorum(observations, reads, 2, 3),
+    )
+    .await
+    .expect("an exact quorum must not wait for the unavailable minority")
+    .unwrap();
+
+    assert_eq!(selected, Some(expected));
+    assert_eq!(observed.len(), 2);
+}
+
+#[tokio::test]
+async fn exact_current_quorum_does_not_wait_for_an_unresponsive_third_replica() {
+    let expected = current_snapshot(9, Some(8), 9);
+    let observations = vec![Some(expected.clone())];
+    let mut reads = tokio::task::JoinSet::new();
+    let second = expected.clone();
+    reads.spawn(async move { (NodeId(2), Ok(Some(second))) });
+    reads.spawn(async move {
+        std::future::pending::<()>().await;
+        (NodeId(3), Ok(None))
+    });
+
+    let observed = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        collect_current_object_observations(
+            observations,
+            reads,
+            11,
+            22,
+            "ledger/entry",
+            2,
+            3,
+            CurrentObjectObservationPolicy::Quorum,
+        ),
+    )
+    .await
+    .expect("an exact current quorum must not wait for the unavailable minority")
+    .unwrap();
+
+    assert_eq!(
+        select_current_object_snapshot_quorum(&observed, 2, 3).unwrap(),
+        Some(expected)
+    );
+    assert_eq!(observed.len(), 2);
+}
+
 #[test]
 fn current_only_selector_requires_the_same_quorum_without_history() {
     let selected = current_snapshot(9, Some(8), 9);

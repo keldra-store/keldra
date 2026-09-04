@@ -362,45 +362,10 @@ impl DistributedPayloadReader {
     where
         W: Write + Send + 'static,
     {
-        let mut states = Vec::with_capacity(owners.len());
-        let mut valid = Vec::with_capacity(owners.len());
-        for owner in owners {
-            let Some(address) = placement.address(owner.owner()) else {
-                states.push(OwnerState::Unavailable);
-                continue;
-            };
-            let identity = ShardIdentity::new(reference.clone(), owner.ordinal());
-            let mut spool = self.spools.create().map_err(PayloadReadError::Spool)?;
-            let maximum = self
-                .codec
-                .encoded_shard_length(reference, owner.ordinal())?;
-            let mut bounded = FrameBoundedWriter::new(spool.as_mut(), maximum);
-            let fetched = self
-                .transport
-                .get_shard(
-                    placement.fence(),
-                    owner.owner(),
-                    address,
-                    &identity,
-                    &mut bounded,
-                )
-                .await;
-            let violated = bounded.violated;
-            drop(bounded);
-            let state = classify_shard_fetch(
-                self.codec.as_ref(),
-                &identity,
-                fetched,
-                violated,
-                spool.as_mut(),
-            )?;
-            if state == OwnerState::Healthy {
-                spool.seek(SeekFrom::Start(0))?;
-                valid.push((owner.ordinal(), spool));
-            }
-            states.push(state);
-        }
         let required = usize::from(self.profile.data_shards());
+        let (valid, states) = self
+            .fetch_shards(placement, reference, owners, required)
+            .await?;
         if valid.len() < required {
             let unavailable = PayloadReadError::Unavailable {
                 kind: "shard",
@@ -492,6 +457,65 @@ impl DistributedPayloadReader {
         Ok(report)
     }
 
+    async fn fetch_shards(
+        &self,
+        placement: &(impl PayloadReadPlacementView + ?Sized),
+        reference: &BlobRef,
+        owners: &[crate::payload_placement::ShardPlacement],
+        required: usize,
+    ) -> Result<(Vec<(u16, Box<dyn PayloadReadSpool>)>, Vec<OwnerState>), PayloadReadError> {
+        let mut states = vec![OwnerState::Unavailable; owners.len()];
+        let mut reads = tokio::task::JoinSet::new();
+        for (index, owner) in owners.iter().copied().enumerate() {
+            let Some(address) = placement.address(owner.owner()).map(str::to_owned) else {
+                continue;
+            };
+            let transport = self.transport.clone();
+            let spools = self.spools.clone();
+            let codec = self.codec.clone();
+            let reference = reference.clone();
+            let fence = placement.fence();
+            reads.spawn(async move {
+                let identity = ShardIdentity::new(reference.clone(), owner.ordinal());
+                let mut spool = spools.create().map_err(PayloadReadError::Spool)?;
+                let maximum = codec.encoded_shard_length(&reference, owner.ordinal())?;
+                let mut bounded = FrameBoundedWriter::new(spool.as_mut(), maximum);
+                let fetched = transport
+                    .get_shard(fence, owner.owner(), &address, &identity, &mut bounded)
+                    .await;
+                let violated = bounded.violated;
+                drop(bounded);
+                let state = classify_shard_fetch(
+                    codec.as_ref(),
+                    &identity,
+                    fetched,
+                    violated,
+                    spool.as_mut(),
+                )?;
+                let valid = if state == OwnerState::Healthy {
+                    spool.seek(SeekFrom::Start(0))?;
+                    Some((owner.ordinal(), spool))
+                } else {
+                    None
+                };
+                Ok::<_, PayloadReadError>((index, state, valid))
+            });
+        }
+
+        let mut valid = Vec::with_capacity(owners.len());
+        while valid.len() < required {
+            let Some(result) = reads.join_next().await else {
+                break;
+            };
+            record_shard_fetch(&mut states, &mut valid, result)?;
+        }
+        while let Some(result) = reads.try_join_next() {
+            record_shard_fetch(&mut states, &mut valid, result)?;
+        }
+        reads.abort_all();
+        Ok((valid, states))
+    }
+
     async fn repair_large(
         &self,
         placement: &(impl PayloadReadPlacementView + ?Sized),
@@ -559,6 +583,23 @@ impl DistributedPayloadReader {
             }
         }
     }
+}
+
+type ValidShard = (u16, Box<dyn PayloadReadSpool>);
+type ShardReadOutcome = (usize, OwnerState, Option<ValidShard>);
+
+fn record_shard_fetch(
+    states: &mut [OwnerState],
+    valid: &mut Vec<ValidShard>,
+    result: Result<Result<ShardReadOutcome, PayloadReadError>, tokio::task::JoinError>,
+) -> Result<(), PayloadReadError> {
+    let (index, state, shard) =
+        result.map_err(|error| PayloadReadError::Task(error.to_string()))??;
+    states[index] = state;
+    if let Some(shard) = shard {
+        valid.push(shard);
+    }
+    Ok(())
 }
 
 fn classify_small_fetch(
@@ -840,7 +881,7 @@ impl fmt::Display for StateSummary {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
     use std::num::NonZeroU32;
     use std::sync::Mutex;
@@ -902,6 +943,8 @@ mod tests {
     struct TestTransport {
         small: BTreeMap<NodeId, Vec<u8>>,
         complete: BTreeMap<NodeId, Vec<u8>>,
+        shards: BTreeMap<(NodeId, u16), Vec<u8>>,
+        hung_shards: BTreeSet<NodeId>,
         small_repairs: Mutex<Vec<NodeId>>,
         shard_repairs: AtomicUsize,
     }
@@ -960,22 +1003,37 @@ mod tests {
         async fn get_shard(
             &self,
             _fence: PlacementLogId,
-            _target: NodeId,
+            target: NodeId,
             _address: &str,
-            _identity: &ShardIdentity,
-            _destination: &mut (dyn Write + Send),
+            identity: &ShardIdentity,
+            destination: &mut (dyn Write + Send),
         ) -> Result<(), PayloadReadTransportError> {
-            Err(PayloadReadTransportError::NotFound)
+            if self.hung_shards.contains(&target) {
+                return std::future::pending().await;
+            }
+            let bytes = self
+                .shards
+                .get(&(target, identity.ordinal()))
+                .ok_or(PayloadReadTransportError::NotFound)?;
+            for frame in bytes.chunks(PAYLOAD_READ_FRAME_BYTES) {
+                destination
+                    .write_all(frame)
+                    .map_err(|error| PayloadReadTransportError::Destination(error.to_string()))?;
+            }
+            Ok(())
         }
 
         async fn put_shard(
             &self,
             _fence: PlacementLogId,
-            _target: NodeId,
+            target: NodeId,
             _address: &str,
             _identity: &ShardIdentity,
             mut source: Box<dyn Read + Send>,
         ) -> Result<(), PayloadReadTransportError> {
+            if self.hung_shards.contains(&target) {
+                return std::future::pending().await;
+            }
             io::copy(&mut source, &mut io::sink())
                 .map_err(|error| PayloadReadTransportError::Destination(error.to_string()))?;
             self.shard_repairs.fetch_add(1, Ordering::Relaxed);
@@ -1081,6 +1139,60 @@ mod tests {
 
         assert_eq!(*output.0.lock().unwrap(), bytes);
         assert_eq!(report.sources.healthy, 1);
+    }
+
+    #[tokio::test]
+    async fn erasure_read_does_not_wait_for_an_unresponsive_shard_owner() {
+        let bytes = large_bytes();
+        let reference = reference(&bytes);
+        let profile = ErasureProfile::default();
+        let codec = ErasureCodec::new(profile).unwrap();
+        let mut encoded = vec![Vec::new(); usize::from(profile.total_shards())];
+        codec
+            .encode(Cursor::new(&bytes), &reference, &mut encoded)
+            .unwrap();
+        let placement = TestPlacement::new(&[1, 2, 3]);
+        let PayloadPlacement::Large(desired) = select_payload_placement(
+            placement.cluster_id(),
+            &reference,
+            profile,
+            placement.placement_nodes(),
+        ) else {
+            panic!("expected erasure-coded placement")
+        };
+        let hung = desired.shards()[0].owner();
+        let shards = desired
+            .shards()
+            .iter()
+            .skip(1)
+            .map(|shard| {
+                (
+                    (shard.owner(), shard.ordinal()),
+                    encoded[usize::from(shard.ordinal())].clone(),
+                )
+            })
+            .collect();
+        let transport = Arc::new(TestTransport {
+            shards,
+            hung_shards: BTreeSet::from([hung]),
+            ..TestTransport::default()
+        });
+        let reader =
+            DistributedPayloadReader::new(profile, transport, Arc::new(MemorySpools)).unwrap();
+        let output = SharedOutput::default();
+
+        let report = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            reader.read(&placement, &reference, output.clone()),
+        )
+        .await
+        .expect("two valid shards must not wait for the unavailable shard owner")
+        .unwrap();
+
+        assert_eq!(*output.0.lock().unwrap(), bytes);
+        assert_eq!(report.sources.healthy, 2);
+        assert_eq!(report.sources.unavailable, 1);
+        assert_eq!(report.repairs_attempted, 0);
     }
 
     #[tokio::test]
