@@ -482,7 +482,7 @@ impl LogicalRecordDistribution {
         &self,
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordReadTarget>, Status> {
-        let route = self.route(id)?;
+        let route = self.read_route(id)?;
         let coordinator = route.group.coordinator();
         if coordinator == self.local_node {
             return Ok(None);
