@@ -47,94 +47,97 @@ pub(super) async fn invoke(
     )?;
 
     let clustered = service.programs.is_clustered()?;
-    if clustered && peer_routed {
-        if service.programs.executor_routing_target()?.is_some() {
-            return Err(Status::failed_precondition(
-                "a routed InvokeProgram reached a node that is not the nominated executor",
-            ));
-        }
-    } else if clustered {
-        loop {
-            let Some((target, address)) = service.programs.executor_routing_target()? else {
-                break;
-            };
-            match service
-                .cluster_peers
-                .route_invoke_program(
-                    target,
-                    &address,
-                    bearer.signed_token(),
-                    api_request.clone(),
-                    deadline_remaining(deadline)?,
-                )
-                .await
-            {
-                Ok(response) => return Ok(Response::new(response)),
-                Err(error) if routed_program_target_is_stale(&error) => {
-                    let remaining = deadline_remaining(deadline)?;
-                    tokio::time::sleep(ROUTED_PROGRAM_RETRY_INTERVAL.min(remaining)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
     let invocation_id = api_request.invocation_id.clone();
     let result = if clustered {
-        let authorization = service.authoritative_system.clone();
-        let governance = service.bucket_governance.clone();
-        let dependency_caller = caller.clone();
-        let logical_caller = caller.clone();
-        let logical_access = path_access.clone();
-        let logical_scope = plugin_scope.clone();
-        let canonical_access = path_access.clone();
-        let canonical_scope = plugin_scope.clone();
-        run_atomic_program_until(
-            deadline,
-            service.programs.invoke_distributed(
-                program,
-                expected_program_hash,
-                api_request.invocation_id,
-                &api_request.input_json,
-                durability_name(durability),
-                deadline_remaining(deadline)?,
-                move |dependencies| {
-                    let caller = logical_caller.clone();
-                    let access = logical_access.clone();
-                    let scope = logical_scope.clone();
-                    async move {
-                        for dependency in dependencies {
-                            authorize_program_dependency_capability(
-                                &caller,
-                                &access,
-                                scope.as_ref(),
-                                &dependency,
-                            )?;
-                        }
-                        Ok(())
-                    }
-                },
-                move |dependencies| {
-                    let authorization = authorization.clone();
-                    let governance = governance.clone();
-                    let caller = dependency_caller.clone();
-                    let access = canonical_access.clone();
-                    let scope = canonical_scope.clone();
-                    async move {
-                        authorize_program_dependencies_authoritatively(
-                            &authorization,
-                            &governance,
-                            &caller,
-                            &access,
-                            scope.as_ref(),
-                            dependencies,
+        loop {
+            match service.programs.executor_routing_target()? {
+                Some(_) if peer_routed => {
+                    return Err(Status::failed_precondition(
+                        "a routed InvokeProgram reached a node that is not the nominated executor",
+                    ));
+                }
+                Some((target, address)) => {
+                    match service
+                        .cluster_peers
+                        .route_invoke_program(
+                            target,
+                            &address,
+                            bearer.signed_token(),
+                            api_request.clone(),
+                            deadline_remaining(deadline)?,
                         )
                         .await
+                    {
+                        Ok(response) => return Ok(Response::new(response)),
+                        Err(error) if should_retry_public_program(peer_routed, &error) => {}
+                        Err(error) => return Err(error),
                     }
-                },
-            ),
-        )
-        .await?
+                }
+                None => {
+                    let authorization = service.authoritative_system.clone();
+                    let governance = service.bucket_governance.clone();
+                    let dependency_caller = caller.clone();
+                    let logical_caller = caller.clone();
+                    let logical_access = path_access.clone();
+                    let logical_scope = plugin_scope.clone();
+                    let canonical_access = path_access.clone();
+                    let canonical_scope = plugin_scope.clone();
+                    match run_atomic_program_until(
+                        deadline,
+                        service.programs.invoke_distributed(
+                            program.clone(),
+                            expected_program_hash,
+                            api_request.invocation_id.clone(),
+                            &api_request.input_json,
+                            durability_name(durability),
+                            deadline_remaining(deadline)?,
+                            move |dependencies| {
+                                let caller = logical_caller.clone();
+                                let access = logical_access.clone();
+                                let scope = logical_scope.clone();
+                                async move {
+                                    for dependency in dependencies {
+                                        authorize_program_dependency_capability(
+                                            &caller,
+                                            &access,
+                                            scope.as_ref(),
+                                            &dependency,
+                                        )?;
+                                    }
+                                    Ok(())
+                                }
+                            },
+                            move |dependencies| {
+                                let authorization = authorization.clone();
+                                let governance = governance.clone();
+                                let caller = dependency_caller.clone();
+                                let access = canonical_access.clone();
+                                let scope = canonical_scope.clone();
+                                async move {
+                                    authorize_program_dependencies_authoritatively(
+                                        &authorization,
+                                        &governance,
+                                        &caller,
+                                        &access,
+                                        scope.as_ref(),
+                                        dependencies,
+                                    )
+                                    .await
+                                }
+                            },
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => break result,
+                        Err(error) if should_retry_public_program(peer_routed, &error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            let remaining = deadline_remaining(deadline)?;
+            tokio::time::sleep(ROUTED_PROGRAM_RETRY_INTERVAL.min(remaining)).await;
+        }
     } else {
         let authorization = service.system_authorization().await?;
         run_atomic_program_until(
@@ -209,6 +212,10 @@ fn routed_program_target_is_stale(status: &Status) -> bool {
             || status
                 .message()
                 .contains("applied cluster membership is unavailable"))
+}
+
+fn should_retry_public_program(peer_routed: bool, status: &Status) -> bool {
+    !peer_routed && routed_program_target_is_stale(status)
 }
 
 fn authorize_program_dependency(
@@ -305,7 +312,7 @@ async fn authorize_program_dependencies_authoritatively(
 
 #[cfg(test)]
 mod tests {
-    use super::routed_program_target_is_stale;
+    use super::{routed_program_target_is_stale, should_retry_public_program};
     use tonic::Status;
 
     #[test]
@@ -322,5 +329,14 @@ mod tests {
         assert!(!routed_program_target_is_stale(&Status::permission_denied(
             "not authorized",
         )));
+    }
+
+    #[test]
+    fn public_program_retries_executor_move_from_local_or_remote_attempt() {
+        let moved = Status::unavailable(
+            "EXECUTOR_MOVED: peer is not the current nominated atomic executor",
+        );
+        assert!(should_retry_public_program(false, &moved));
+        assert!(!should_retry_public_program(true, &moved));
     }
 }
