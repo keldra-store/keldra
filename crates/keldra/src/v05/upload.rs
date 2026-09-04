@@ -10,6 +10,7 @@ pub(super) async fn start_put(
     let started = Instant::now();
     let result = async {
         let caller = authenticated_caller(&request)?;
+        let deadline = request_deadline(request.metadata(), service.atomic_program_timeout)?;
         let mut metadata = put_metadata(request.into_inner())?;
         object_path_access::require_key(&path_access, &metadata.key)?;
         require_plugin_key_scope(plugin_scope.as_ref(), &metadata.key)?;
@@ -29,7 +30,8 @@ pub(super) async fn start_put(
         }
         service
             .distribution
-            .require_durability_available(metadata.durability)?;
+            .wait_for_durability_available(metadata.durability, deadline)
+            .await?;
         service
             .issue_upload_token(&caller, &metadata)
             .map(Response::new)

@@ -535,6 +535,9 @@ impl ObjectService for ObjectServiceImpl {
                 effective_request_timeout(request.metadata(), self.bulk_write_timeout);
             let operations = request.into_inner().operations;
             validate_bulk_limits(&operations)?;
+            if operations.iter().any(bulk::requests_replicated_durability) {
+                self.distribution.wait_for_joining_replica(deadline).await?;
+            }
             object_path_access::validate_definition_intents(&path_access, operations.len())?;
             let mut local = Vec::with_capacity(operations.len());
             let mut remote = BTreeMap::<
