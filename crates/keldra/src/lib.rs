@@ -724,11 +724,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         AdministrationServiceServer::new(administration_service),
         authenticate,
     );
-    let credential_authority = serving_fence.authority();
-    let credential_service = tonic::service::interceptor::InterceptedService::new(
-        CredentialServiceServer::new(credential_service),
-        move |request| credential_authority.require(request),
-    );
+    let credential_service = CredentialServiceServer::new(credential_service);
 
     let object_service = MutationAdmissionService::new(
         object_service,
@@ -773,8 +769,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .add_service(authz_service)
         .add_service(administration_service)
         // Deliberately not bearer-authenticated: this service exchanges
-        // durable long-lived credentials for that bearer token. It still
-        // requires the node-wide serving fence.
+        // durable long-lived credentials for that bearer token. Its
+        // distributed verifier selects and rechecks an ACTIVE replica.
         .add_service(credential_service)
         .into_axum_router();
     let gateway_router = plugin_gateway::router(plugin_state)
