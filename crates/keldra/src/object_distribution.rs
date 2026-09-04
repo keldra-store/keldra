@@ -1010,9 +1010,17 @@ impl ObjectDistribution {
             return Ok(());
         }
         if self.wait_for_joining_replica(deadline).await? {
+            self.wait_for_local_serving_fence(deadline).await?;
             return Ok(());
         }
         Err(mutation_status(MutationError::DurabilityUnavailable))
+    }
+
+    pub(crate) async fn wait_for_local_serving_fence(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Status> {
+        self.serving.wait_until_valid(deadline).await
     }
 
     /// Wait only when an ADD transition is already in progress. This lets a

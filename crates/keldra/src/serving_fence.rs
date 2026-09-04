@@ -52,6 +52,24 @@ impl ServingAuthority {
         self.mutation_context().is_ok()
     }
 
+    pub(crate) async fn wait_until_valid(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Status> {
+        loop {
+            if self.has_valid_lease() {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Status::deadline_exceeded(
+                    "a current serving fence did not become available before the request deadline",
+                ));
+            }
+            tokio::time::sleep(remaining.min(READY_POLL_INTERVAL)).await;
+        }
+    }
+
     fn lease_margin(&self) -> Option<Duration> {
         self.mutation_context().ok()?;
         let state = self.state.read().ok()?;
