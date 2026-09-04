@@ -8,6 +8,8 @@ use tonic::{Request, Response, Status};
 use super::*;
 use crate::authentication::PluginObjectScope;
 
+const ROUTED_PROGRAM_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+
 pub(super) async fn invoke(
     service: &ObjectServiceImpl,
     request: Request<InvokeProgramRequest>,
@@ -45,24 +47,35 @@ pub(super) async fn invoke(
     )?;
 
     let clustered = service.programs.is_clustered()?;
-    if clustered {
-        if let Some((target, address)) = service.programs.executor_routing_target()? {
-            if peer_routed {
-                return Err(Status::failed_precondition(
-                    "a routed InvokeProgram reached a node that is not the nominated executor",
-                ));
-            }
-            return service
+    if clustered && peer_routed {
+        if service.programs.executor_routing_target()?.is_some() {
+            return Err(Status::failed_precondition(
+                "a routed InvokeProgram reached a node that is not the nominated executor",
+            ));
+        }
+    } else if clustered {
+        loop {
+            let Some((target, address)) = service.programs.executor_routing_target()? else {
+                break;
+            };
+            match service
                 .cluster_peers
                 .route_invoke_program(
                     target,
                     &address,
                     bearer.signed_token(),
-                    api_request,
+                    api_request.clone(),
                     deadline_remaining(deadline)?,
                 )
                 .await
-                .map(Response::new);
+            {
+                Ok(response) => return Ok(Response::new(response)),
+                Err(error) if routed_program_target_is_stale(&error) => {
+                    let remaining = deadline_remaining(deadline)?;
+                    tokio::time::sleep(ROUTED_PROGRAM_RETRY_INTERVAL.min(remaining)).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -186,6 +199,18 @@ pub(super) async fn invoke(
     }))
 }
 
+fn routed_program_target_is_stale(status: &Status) -> bool {
+    status.code() == tonic::Code::Unavailable
+        && (status.message().starts_with("EXECUTOR_MOVED:")
+            || status
+                .message()
+                .contains("placement changed during cluster operation")
+            || status.message().contains("placement fence changed")
+            || status
+                .message()
+                .contains("applied cluster membership is unavailable"))
+}
+
 fn authorize_program_dependency(
     authorization: &SystemAuthorization,
     caller: &Caller,
@@ -275,5 +300,27 @@ async fn authorize_program_dependencies_authoritatively(
         Err(Status::permission_denied(
             "atomic program dependency is not authorized",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::routed_program_target_is_stale;
+    use tonic::Status;
+
+    #[test]
+    fn routed_program_retries_only_stale_executor_or_placement() {
+        assert!(routed_program_target_is_stale(&Status::unavailable(
+            "EXECUTOR_MOVED: peer is not the current nominated atomic executor",
+        )));
+        assert!(routed_program_target_is_stale(&Status::unavailable(
+            "active placement changed during cluster operation",
+        )));
+        assert!(!routed_program_target_is_stale(&Status::unavailable(
+            "peer TLS I/O failed",
+        )));
+        assert!(!routed_program_target_is_stale(&Status::permission_denied(
+            "not authorized",
+        )));
     }
 }
