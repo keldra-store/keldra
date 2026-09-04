@@ -16,6 +16,7 @@ use crate::logical_name_resolution::LogicalNameResolver;
 use crate::logical_record_distribution::{LogicalRecordDistribution, LogicalRecordReadTarget};
 
 const GOVERNANCE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const GOVERNANCE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone)]
 pub(crate) struct BucketGovernance {
@@ -148,39 +149,63 @@ impl BucketGovernance {
         &self,
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordValue>, Status> {
-        let targets = self.records.read_targets_local_first(id)?;
         let started = Instant::now();
         let mut last_unavailable = None;
-        for (index, target) in targets.iter().enumerate() {
-            let timeout = governance_attempt_timeout(started, targets.len() - index)?;
-            let result = if self.records.is_local_read_target(target) {
-                tokio::time::timeout(timeout, self.records.read(id))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(Status::deadline_exceeded(
-                            "bucket-governance read timed out",
-                        ))
-                    })
-            } else {
-                self.peers
-                    .read_coordinated_logical_record(target.node_id, &target.address, id, timeout)
-                    .await
-            };
-            match result {
-                Ok(value) => {
-                    self.records.require_replica_read_target(id, target)?;
-                    return Ok(value);
-                }
+        loop {
+            let targets = match self.records.read_targets_local_first(id) {
+                Ok(targets) => targets,
                 Err(error) if retryable_governance_availability(&error) => {
                     last_unavailable = Some(error);
+                    wait_for_governance_retry(started).await?;
+                    continue;
                 }
                 Err(error) => return Err(error),
+            };
+            for (index, target) in targets.iter().enumerate() {
+                let timeout = governance_attempt_timeout(started, targets.len() - index)?;
+                let result = if self.records.is_local_read_target(target) {
+                    tokio::time::timeout(timeout, self.records.read(id))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(Status::deadline_exceeded(
+                                "bucket-governance read timed out",
+                            ))
+                        })
+                } else {
+                    self.peers
+                        .read_coordinated_logical_record(
+                            target.node_id,
+                            &target.address,
+                            id,
+                            timeout,
+                        )
+                        .await
+                };
+                match result {
+                    Ok(value) => {
+                        self.records.require_replica_read_target(id, target)?;
+                        return Ok(value);
+                    }
+                    Err(error) if retryable_governance_availability(&error) => {
+                        last_unavailable = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Err(deadline) = wait_for_governance_retry(started).await {
+                return Err(last_unavailable.unwrap_or(deadline));
             }
         }
-        Err(last_unavailable.unwrap_or_else(|| {
-            Status::unavailable("bucket governance has no available read replica")
-        }))
     }
+}
+
+async fn wait_for_governance_retry(started: Instant) -> Result<(), Status> {
+    let remaining = GOVERNANCE_READ_TIMEOUT
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| Status::deadline_exceeded("bucket-governance read deadline exceeded"))?;
+    tokio::time::sleep(GOVERNANCE_RETRY_INTERVAL.min(remaining)).await;
+    Ok(())
 }
 
 fn governance_attempt_timeout(
