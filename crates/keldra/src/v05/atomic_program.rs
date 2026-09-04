@@ -50,13 +50,13 @@ pub(super) async fn invoke(
     let invocation_id = api_request.invocation_id.clone();
     let result = if clustered {
         loop {
-            match service.programs.executor_routing_target()? {
-                Some(_) if peer_routed => {
+            match service.programs.executor_routing_target() {
+                Ok(Some(_)) if peer_routed => {
                     return Err(Status::failed_precondition(
                         "a routed InvokeProgram reached a node that is not the nominated executor",
                     ));
                 }
-                Some((target, address)) => {
+                Ok(Some((target, address))) => {
                     match service
                         .cluster_peers
                         .route_invoke_program(
@@ -73,7 +73,7 @@ pub(super) async fn invoke(
                         Err(error) => return Err(error),
                     }
                 }
-                None => {
+                Ok(None) => {
                     let authorization = service.authoritative_system.clone();
                     let governance = service.bucket_governance.clone();
                     let dependency_caller = caller.clone();
@@ -134,6 +134,8 @@ pub(super) async fn invoke(
                         Err(error) => return Err(error),
                     }
                 }
+                Err(error) if should_retry_public_program(peer_routed, &error) => {}
+                Err(error) => return Err(error),
             }
             let remaining = deadline_remaining(deadline)?;
             tokio::time::sleep(ROUTED_PROGRAM_RETRY_INTERVAL.min(remaining)).await;
@@ -211,7 +213,8 @@ fn routed_program_target_is_stale(status: &Status) -> bool {
             || status.message().contains("placement fence changed")
             || status
                 .message()
-                .contains("applied cluster membership is unavailable"))
+                .contains("applied cluster membership is unavailable")
+            || status.message().contains("has no ACTIVE peer address"))
 }
 
 fn should_retry_public_program(peer_routed: bool, status: &Status) -> bool {
@@ -322,6 +325,9 @@ mod tests {
         )));
         assert!(routed_program_target_is_stale(&Status::unavailable(
             "active placement changed during cluster operation",
+        )));
+        assert!(routed_program_target_is_stale(&Status::unavailable(
+            "nominated atomic executor 2 has no ACTIVE peer address",
         )));
         assert!(!routed_program_target_is_stale(&Status::unavailable(
             "peer TLS I/O failed",
