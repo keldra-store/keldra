@@ -1460,6 +1460,58 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
     assert_eq!(truncated, Err(ProgramStoreError::PreparedBundleMismatch));
 }
 
+#[test]
+fn distributed_path_stage_program_hash_shape_follows_authority() {
+    let mut stage = ProgramPathStage {
+        format: PROGRAM_PATH_STAGE_FORMAT,
+        begin_cursor: 40,
+        bundle_hash: PreparedBundleHash([0x11; 32]),
+        program_hash: ProgramHash([0; 32]),
+        authority: ProgramBundleAuthority::BuiltInObjectTransaction {
+            kind: 1,
+            contract_version: 1,
+        },
+        participant_manifest_hash: [0x22; 32],
+        tenant_id: 1,
+        bucket_id: 1,
+        path: counter_path(),
+        expected: ObservedHead::NeverExisted,
+        previous_version: None,
+        version: Version {
+            id: VersionId(1),
+            blob: Some(BlobRef {
+                hash: [0x33; 32],
+                length: 1,
+            }),
+            content_type: None,
+            deleted: false,
+            committed_at_unix_millis: 1,
+            protected_link_descriptor: false,
+        },
+    };
+
+    assert!(stage.validate().is_ok());
+    stage.program_hash = ProgramHash([0x44; 32]);
+    assert!(stage.validate().is_err());
+
+    for authority in [
+        ProgramBundleAuthority::StoredProgram {
+            program_path_hash: [0x55; 32],
+            program_hash: [0x44; 32],
+        },
+        ProgramBundleAuthority::LegacyProgramOnly {
+            program_path_hash: [0x55; 32],
+            program_hash: [0x44; 32],
+        },
+    ] {
+        stage.authority = authority;
+        assert!(stage.validate().is_ok());
+        stage.program_hash = ProgramHash([0; 32]);
+        assert!(stage.validate().is_err());
+        stage.program_hash = ProgramHash([0x44; 32]);
+    }
+}
+
 #[tokio::test]
 async fn distributed_versioned_program_counts_each_same_blob_retained_version() {
     let (_temporary, store, _program) = configured_store().await;
