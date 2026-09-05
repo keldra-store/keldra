@@ -234,7 +234,7 @@ it, and the target cannot be deleted until every inbound link is removed.
 The complete Rust example is in
 [clients/rust/README.md](clients/rust/README.md#clone-bytes-or-link-a-mutable-name).
 Clone and link require cluster protocol/storage capability `2/2`; complete the
-0.16 activation runbook below before using them.
+fresh 0.16 bootstrap checks below before using them.
 
 ## Create a PersonalDB group
 

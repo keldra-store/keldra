@@ -66,39 +66,29 @@ cargo package --locked -p keldra
 
 ## Release
 
-### Initialize 0.16 and activate capability 2/2
+### Initialize 0.16 at capability 2/2
 
 Keldra 0.16 changes the cluster/data-peer protocols and introduces a clean-break
 storage format and index architecture. Every 0.16 node must use fresh
 authoritative and derived-index volumes; mixed 0.15/0.16 operation and in-place
 upgrades from any earlier Keldra release are unsupported.
 
-1. Initialize a fresh 0.16 cluster. If application data must move from an older
-   cluster, import it through the public API as new writes.
-2. Keep production writes disabled while ACTIVE nodes attest support. Inspect cluster
-   capabilities and require active `1/1`, target `2/2`, no blocking ACTIVE node
-   IDs, `activation_quiescent=true`, and
-   `ready_for_target_activation=true`.
-3. Activate protocol/storage `2/2` using the exact placement term and index from
-   that status response. If placement changes, discard the old fence and inspect
-   again.
-4. Re-read status and require active `2/2`. Smoke clone independence, link
-   write-through, target-delete fencing, unlink, and date queries before
-   admitting production traffic.
+1. Initialize a fresh 0.16 cluster. Fresh clusters start with protocol/storage
+   capability `2/2`, regardless of node count. If application data must move
+   from an older cluster, import it through the public API as new writes.
+2. Inspect cluster capabilities and require active and target protocol/storage
+   capability `2/2` with no blocking ACTIVE node IDs.
+3. Smoke clone independence, link write-through, target-delete fencing, unlink,
+   and date queries before admitting production traffic.
 
-Use the authenticated CLI surface; the status command prints the exact safe
-activation command when the cluster is ready:
+Use the authenticated CLI surface to inspect the active capabilities:
 
 ```sh
 keldra --endpoint "$KELDRA_ENDPOINT" get-cluster-capabilities
-keldra --endpoint "$KELDRA_ENDPOINT" activate-cluster-capabilities \
-  --protocol-version 2 --storage-format 2 \
-  --expected-placement-term "$PLACEMENT_TERM" \
-  --expected-placement-index "$PLACEMENT_INDEX"
 ```
 
-Never force activation past a blocker, and never start an earlier Keldra binary
-against storage initialized or touched by 0.16.
+Never start an earlier Keldra binary against storage initialized or touched by
+0.16.
 
 The release tag must be the exact, unprefixed workspace version. After the
 validated commit is pushed, maintainers publish `0.16.1` with:
