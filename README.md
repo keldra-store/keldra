@@ -46,7 +46,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.16.0
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.17.0
 export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
@@ -158,7 +158,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add keldra@0.16.0
+cargo add keldra@0.17.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -234,7 +234,7 @@ it, and the target cannot be deleted until every inbound link is removed.
 The complete Rust example is in
 [clients/rust/README.md](clients/rust/README.md#clone-bytes-or-link-a-mutable-name).
 Clone and link require cluster protocol/storage capability `2/2`; complete the
-0.16 activation runbook below before using them.
+fresh 0.17 bootstrap checks below before using them.
 
 ## Create a PersonalDB group
 
@@ -246,7 +246,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add keldra@0.16.0 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.17.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -724,7 +724,7 @@ and performs a rolling restart. Index qualification is a separate SSD-kit
 phase:
 
 ```sh
-KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.16.0 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.17.0 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -743,30 +743,23 @@ Production formation uses the same sequence:
 The public gRPC endpoint may sit behind an ordinary TLS terminator. Peer traffic
 uses mandatory certificates created and rotated by the cluster.
 
-### Start 0.16 on fresh volumes and activate its capabilities
+### Start 0.17 on fresh volumes
 
-Keldra 0.16 is a clean storage-format and index-architecture break. Start every
-0.16 node with fresh authoritative and derived-index volumes; it does not open,
-migrate, or reuse a volume from an earlier Keldra release. Mixed 0.15/0.16
+Keldra 0.17 is a clean storage-format and index-architecture break. Start every
+0.17 node with fresh authoritative and derived-index volumes; it does not open,
+migrate, or reuse a volume from an earlier Keldra release. Mixed 0.16/0.17
 clusters are unsupported. If application data must move from an older cluster,
 keep that cluster separate and import the data through the public API as new
 writes.
 
-Inspect cluster capabilities. Activation is safe only when it reports active
-protocol/storage `1/1`, target `2/2`, no blocking ACTIVE node IDs,
-`activation_quiescent=true`, and `ready_for_target_activation=true`. Activate
-`2/2` using that same response's exact placement term and index, then re-read
-status and require active `2/2`. If placement changes, discard the old fence and
-inspect again. Never force activation past a blocker.
+Fresh 0.17 clusters select protocol/storage capability `2/2` during bootstrap,
+including single-node clusters. Confirm that status reports active and target
+`2/2` before admitting production traffic. Capability activation remains an
+explicit, placement-fenced administration operation for a cluster that was
+deliberately initialized with an older selected capability.
 
 ```sh
 keldra --endpoint "$KELDRA_ENDPOINT" get-cluster-capabilities
-
-keldra --endpoint "$KELDRA_ENDPOINT" activate-cluster-capabilities \
-  --protocol-version 2 \
-  --storage-format 2 \
-  --expected-placement-term "$PLACEMENT_TERM" \
-  --expected-placement-index "$PLACEMENT_INDEX"
 ```
 
 Supply the same system-operator credentials used for other protected
@@ -775,7 +768,7 @@ when the cluster is ready.
 
 Before admitting production traffic, smoke clone independence, link
 write-through, target-delete fencing, unlink, and date queries. Never start an
-earlier Keldra binary against a volume initialized or touched by 0.16.
+earlier Keldra binary against a volume initialized or touched by 0.17.
 
 ### Place storage by workload
 
@@ -845,7 +838,7 @@ The architecture contracts live in
 clean-break native-segment index architecture is specified by
 [KELDRA-0014](docs/rfcs/keldra_0014_native_segment_indexes.md). The approved
 integrated payload layout, lifecycle, GC, replication boundary, and WAL
-contract—introduced in 0.15 and retained within 0.16's fresh-volume
+contract—introduced in 0.15 and retained within 0.17's fresh-volume
 requirement—is specified by
 [KELDRA-0018](docs/rfcs/keldra_0018_integrated_payload_storage.md).
 
@@ -875,7 +868,7 @@ CPU, RSS, WAL/store-write evidence under `~/keldra_experiments`. The
 single-node and three-node wrappers qualify non-index storage, authorization,
 and cluster behavior only.
 
-Keldra 0.16 deployments start on fresh authoritative and derived-index volumes.
+Keldra 0.17 deployments start on fresh authoritative and derived-index volumes.
 Current operational boundaries are collected in the [known
 limitations](docs/known-limitations.md).
 

@@ -75,6 +75,36 @@ impl Store {
         expected: &BlobRef,
         upload: crate::BlobUpload,
     ) -> Result<CompleteCopySealOutcome, PayloadStoreError> {
+        self.seal_complete_source_upload_with_admission(
+            expected,
+            upload,
+            SourceJournalAdmission::Bounded,
+        )
+        .await
+    }
+
+    /// Install a complete physical replica without inventing a local logical
+    /// source event. The awaiting-publication reservation remains GC-safe.
+    #[doc(hidden)]
+    pub async fn seal_replica_complete_source_upload(
+        &self,
+        expected: &BlobRef,
+        upload: crate::BlobUpload,
+    ) -> Result<CompleteCopySealOutcome, PayloadStoreError> {
+        self.seal_complete_source_upload_with_admission(
+            expected,
+            upload,
+            SourceJournalAdmission::PhysicalReplica,
+        )
+        .await
+    }
+
+    async fn seal_complete_source_upload_with_admission(
+        &self,
+        expected: &BlobRef,
+        upload: crate::BlobUpload,
+        admission: SourceJournalAdmission,
+    ) -> Result<CompleteCopySealOutcome, PayloadStoreError> {
         if is_small_blob(expected) {
             return Err(PayloadStoreError::NotLarge);
         }
@@ -88,7 +118,7 @@ impl Store {
                 "sealed complete source changed content identity".into(),
             ));
         }
-        self.seal_staged_blob_with_admission(staged, SourceJournalAdmission::Bounded)
+        self.seal_staged_blob_with_admission(staged, admission)
             .await?;
         Ok(if previous == PayloadArtifactState::Valid {
             CompleteCopySealOutcome::AlreadyPresent
@@ -107,12 +137,38 @@ impl Store {
         expected: &BlobRef,
         bytes: &[u8],
     ) -> Result<CompleteCopySealOutcome, PayloadStoreError> {
+        self.seal_small_copy_with_admission(expected, bytes, SourceJournalAdmission::Bounded)
+            .await
+    }
+
+    /// Install one complete physical replica under GC authority without
+    /// appending a second logical source event for the same object mutation.
+    #[doc(hidden)]
+    pub async fn seal_replica_small_copy(
+        &self,
+        expected: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<CompleteCopySealOutcome, PayloadStoreError> {
+        self.seal_small_copy_with_admission(
+            expected,
+            bytes,
+            SourceJournalAdmission::PhysicalReplica,
+        )
+        .await
+    }
+
+    async fn seal_small_copy_with_admission(
+        &self,
+        expected: &BlobRef,
+        bytes: &[u8],
+        admission: SourceJournalAdmission,
+    ) -> Result<CompleteCopySealOutcome, PayloadStoreError> {
         if !is_small_blob(expected) {
             return Err(PayloadStoreError::NotSmall);
         }
         validate_small_blob(expected, bytes)?;
         let previous = self.complete_copy_state(expected).await?;
-        let actual = self.stage_blob(bytes).await?;
+        let actual = self.stage_blob_with_admission(bytes, admission).await?;
         if &actual != expected {
             return Err(PayloadStoreError::Storage(
                 "sealed small copy changed content identity".into(),

@@ -190,9 +190,12 @@ impl Store {
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         let current = status.settled_through;
         if offset < current {
-            return Err(MutationError::Storage(format!(
-                "source journal settled cursor regressed from {current} to {offset}"
-            )));
+            // Visibility recovery classifies proofs without holding the commit
+            // lock. A direct quorum settlement may therefore advance this cut
+            // before recovery submits its captured prefix. The requested cut
+            // is already durably satisfied; treating that ordinary race as a
+            // regression would pause recovery and delay later journal work.
+            return Ok(());
         }
         if offset > status.tail {
             return Err(MutationError::Storage(format!(

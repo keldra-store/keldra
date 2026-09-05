@@ -1,7 +1,5 @@
 //! Typed storage operations on Keldra's mandatory-mTLS private peer listener.
 //!
-//! This is not a RocksDB endpoint; methods decode versioned logical store types.
-
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Read;
@@ -275,6 +273,12 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
     ) -> Result<Response<wire::ObjectPathSnapshotResponse>, Status> {
         self.read_object_path_snapshot_call(request).await
     }
+    async fn read_object_path_snapshots(
+        &self,
+        request: Request<wire::ObjectPathSnapshotBatchRequest>,
+    ) -> Result<Response<wire::ObjectPathSnapshotBatchResponse>, Status> {
+        self.read_object_path_snapshots_call(request).await
+    }
     async fn read_current_object_snapshot(
         &self,
         request: Request<wire::ObjectPathSnapshotRequest>,
@@ -345,7 +349,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             .bounded(&metadata, async move {
                 admission.require_fence(placement_fence)?;
                 let applied = store
-                    .apply_reference_deltas(mutation)
+                    .apply_reference_deltas_progress(mutation)
                     .await
                     .map_err(|error| Status::failed_precondition(error.to_string()))?;
                 admission.require_fence(placement_fence)?;
@@ -392,63 +396,54 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
     ) -> Result<Response<wire::SourceJournalPage>, Status> {
         source_journal::read(self, request).await
     }
-
     async fn read_routed_source_journal(
         &self,
         request: Request<wire::RoutedSourceJournalReadRequest>,
     ) -> Result<Response<wire::RoutedSourceJournalPage>, Status> {
         definition_coordination::read_routed_source_journal(self, request).await
     }
-
     async fn apply_derived_consumer_checkpoint(
         &self,
         request: Request<wire::ApplyDerivedConsumerCheckpointRequest>,
     ) -> Result<Response<wire::DerivedConsumerCheckpointApplied>, Status> {
         derived_consumer::apply(self, request).await
     }
-
     async fn apply_definition_assignment_page(
         &self,
         request: Request<wire::ApplyDefinitionAssignmentPageRequest>,
     ) -> Result<Response<wire::DefinitionAssignmentPageApplied>, Status> {
         definition_coordination::apply_definition_assignment_page(self, request).await
     }
-
     async fn get_definition_checkpoint(
         &self,
         request: Request<wire::DefinitionCheckpointRequest>,
     ) -> Result<Response<wire::DefinitionCheckpointState>, Status> {
         definition_coordination::get_definition_checkpoint(self, request).await
     }
-
     async fn apply_definition_assignments(
         &self,
         request: Request<wire::ApplyDefinitionAssignmentsRequest>,
     ) -> Result<Response<wire::DefinitionAssignmentPageApplied>, Status> {
         definition_coordination::apply_definition_assignments(self, request).await
     }
-
     async fn scan_definition_locators_by_bucket(
         &self,
         request: Request<wire::DefinitionLocatorScanRequest>,
     ) -> Result<Response<wire::DefinitionLocatorScanPage>, Status> {
         definition_coordination::scan_definition_locators_by_bucket(self, request).await
     }
-
     async fn scan_definition_locators_by_kind(
         &self,
         request: Request<wire::DefinitionLocatorKindScanRequest>,
     ) -> Result<Response<wire::DefinitionLocatorScanPage>, Status> {
         definition_coordination::scan_definition_locators_by_kind(self, request).await
     }
-
     async fn scan_definition_assignments_by_kind(
         &self,
         request: Request<wire::DefinitionAssignmentScanRequest>,
     ) -> Result<Response<wire::DefinitionAssignmentScanPage>, Status> {
         definition_coordination::scan_definition_assignments_by_kind(self, request).await
     }
-
     async fn small_content_exists(
         &self,
         mut request: Request<wire::ContentRequest>,
@@ -472,13 +467,13 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             exists,
         }))
     }
-
     async fn get_small_content(
         &self,
         mut request: Request<wire::ContentRequest>,
     ) -> Result<Response<Self::GetSmallContentStream>, Status> {
         let peer = request.get_ref().peer.clone();
-        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
+        // JOINING coordinators proxy immutable reads to ACTIVE owners.
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         let reference = parse_small_blob(request.get_ref().blob.as_ref())?;
         let metadata = request.metadata().clone();
         let store = self.store.clone();
@@ -518,7 +513,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             tokio_stream::wrappers::ReceiverStream::new(receiver),
         )))
     }
-
     async fn put_small_content(
         &self,
         request: Request<Streaming<wire::SmallContentPutFrame>>,
@@ -576,25 +570,24 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
                     "content does not match its immutable identity",
                 ));
             }
-            let stored = tokio::time::timeout(timeout, self.store.stage_blob(&bytes))
-                .await
-                .map_err(|_| Status::deadline_exceeded("content store deadline exceeded"))?
-                .map_err(map_mutation_error)?;
-            if stored != expected {
-                return Err(Status::data_loss("stored content identity changed"));
-            }
+            tokio::time::timeout(
+                timeout,
+                self.store.seal_replica_small_copy(&expected, &bytes),
+            )
+            .await
+            .map_err(|_| Status::deadline_exceeded("content store deadline exceeded"))?
+            .map_err(map_payload_error)?;
             return Ok(Response::new(wire::ContentStored {
                 schema_version: DATA_PEER_SCHEMA_VERSION,
             }));
         }
     }
-
     async fn get_complete_source(
         &self,
         mut request: Request<wire::ContentRequest>,
     ) -> Result<Response<Self::GetCompleteSourceStream>, Status> {
         let peer = request.get_ref().peer.clone();
-        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         let reference = parse_blob(request.get_ref().blob.as_ref())?;
         require_large_blob(&reference, self.max_blob_bytes)?;
         let metadata = request.metadata().clone();
@@ -609,7 +602,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             .await?;
         Ok(Response::new(stream_blob(reader)))
     }
-
     async fn put_complete_source(
         &self,
         request: Request<Streaming<wire::CompleteSourcePutFrame>>,
@@ -665,7 +657,8 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             }
             let outcome = tokio::time::timeout(
                 idle,
-                self.store.seal_complete_source_upload(&expected, upload),
+                self.store
+                    .seal_replica_complete_source_upload(&expected, upload),
             )
             .await
             .map_err(|_| Status::deadline_exceeded("complete-source seal made no progress"))?
@@ -676,7 +669,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             }));
         }
     }
-
     async fn shard_exists(
         &self,
         mut request: Request<wire::ShardRequest>,
@@ -704,13 +696,12 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             exists,
         }))
     }
-
     async fn get_shard(
         &self,
         mut request: Request<wire::ShardRequest>,
     ) -> Result<Response<Self::GetShardStream>, Status> {
         let peer = request.get_ref().peer.clone();
-        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
         let metadata = request.metadata().clone();
         let identity = parse_shard(&request.into_inner())?;
         require_large_blob(identity.blob(), self.max_blob_bytes)?;
@@ -783,7 +774,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         let seal_identity = identity.clone();
         let seal = tokio::spawn(async move {
             store
-                .seal_shard_stream(&codec, &seal_identity, receiver)
+                .seal_replica_shard_stream(&codec, &seal_identity, receiver)
                 .await
         });
 
@@ -1009,7 +1000,6 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         handoff::install_payload_lifecycle(self, request).await
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1272,6 +1262,15 @@ mod tests {
             "ReadObjectPathSnapshot"
         );
         require_denied!(
+            client.read_object_path_snapshots(wire::ObjectPathSnapshotBatchRequest {
+                peer: Some(peer.clone()),
+                tenant_id: 0,
+                bucket_id: 0,
+                exact_paths: Vec::new(),
+            }),
+            "ReadObjectPathSnapshots"
+        );
+        require_denied!(
             client.read_current_object_snapshot(wire::ObjectPathSnapshotRequest {
                 peer: Some(peer.clone()),
                 tenant_id: 0,
@@ -1511,7 +1510,7 @@ mod tests {
             "InstallPayloadLifecycle"
         );
         assert_eq!(
-            denied, 50,
+            denied, 51,
             "the DataPeer RPC list changed without updating this test"
         );
     }

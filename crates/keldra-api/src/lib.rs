@@ -1,4 +1,4 @@
-//! Generated Rust types for the Keldra 0.16 gRPC API.
+//! Generated Rust types for the Keldra 0.17 gRPC API.
 
 pub mod v1 {
     tonic::include_proto!("keldra.v1");

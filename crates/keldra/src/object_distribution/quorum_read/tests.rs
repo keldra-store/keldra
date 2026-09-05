@@ -113,7 +113,7 @@ async fn reconcile_stores(
         .collect::<Vec<_>>();
     let selected = select_quorum_snapshot(&observations, required, stores.len())?;
     for (store, observation) in stores.iter().zip(&observations) {
-        if observation.snapshot != selected {
+        if !object_snapshots_equivalent(&observation.snapshot, &selected) {
             install(store, selected.as_ref()).await;
         }
     }
@@ -127,6 +127,69 @@ async fn one_of_one_selects_the_complete_local_state() {
     install(&stores[0], Some(&expected)).await;
 
     assert_eq!(reconcile_stores(&stores, 1).await.unwrap(), Some(expected));
+}
+
+#[tokio::test]
+async fn exact_quorum_does_not_wait_for_an_unresponsive_third_object_replica() {
+    let expected = baseline();
+    let observations = vec![ReplicaObservation {
+        node: NodeId(1),
+        snapshot: Some(expected.clone()),
+    }];
+    let mut reads = tokio::task::JoinSet::new();
+    let second = expected.clone();
+    reads.spawn(async move { (NodeId(2), Ok(Some(second))) });
+    reads.spawn(async move {
+        std::future::pending::<()>().await;
+        (NodeId(3), Ok(None))
+    });
+
+    let (selected, observed) = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        collect_object_snapshot_quorum(observations, reads, 2, 3),
+    )
+    .await
+    .expect("an exact quorum must not wait for the unavailable minority")
+    .unwrap();
+
+    assert_eq!(selected, Some(expected));
+    assert_eq!(observed.len(), 2);
+}
+
+#[tokio::test]
+async fn exact_current_quorum_does_not_wait_for_an_unresponsive_third_replica() {
+    let expected = current_snapshot(9, Some(8), 9);
+    let observations = vec![Some(expected.clone())];
+    let mut reads = tokio::task::JoinSet::new();
+    let second = expected.clone();
+    reads.spawn(async move { (NodeId(2), Ok(Some(second))) });
+    reads.spawn(async move {
+        std::future::pending::<()>().await;
+        (NodeId(3), Ok(None))
+    });
+
+    let observed = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        collect_current_object_observations(
+            observations,
+            reads,
+            11,
+            22,
+            "ledger/entry",
+            2,
+            3,
+            CurrentObjectObservationPolicy::Quorum,
+        ),
+    )
+    .await
+    .expect("an exact current quorum must not wait for the unavailable minority")
+    .unwrap();
+
+    assert_eq!(
+        select_current_object_snapshot_quorum(&observed, 2, 3).unwrap(),
+        Some(expected)
+    );
+    assert_eq!(observed.len(), 2);
 }
 
 #[test]
@@ -207,6 +270,46 @@ fn current_only_batch_selector_preserves_input_order_and_selects_each_exact_quor
 fn current_only_batch_selector_rejects_short_replica_batches() {
     let error = select_current_object_snapshot_batch_quorum(
         &[vec![Some(current_snapshot(1, None, 1))], Vec::new()],
+        2,
+        2,
+        1,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), Code::DataLoss);
+}
+
+#[test]
+fn complete_record_batch_selector_handles_public_maximum_without_reordering() {
+    let mut present = snapshot(9, Some(8), 9);
+    present.exact_path = "docs/present".into();
+    let mut first = vec![None; MAX_OBJECT_RECORD_EXPORT_RECORDS as usize];
+    let mut second = first.clone();
+    let mut minority = first.clone();
+    first[731] = Some(present.clone());
+    second[731] = Some(present.clone());
+    minority[731] = Some(snapshot(8, Some(7), 8));
+
+    let selected = select_object_snapshot_batch_quorum(
+        &[
+            (NodeId(1), first),
+            (NodeId(2), second),
+            (NodeId(3), minority),
+        ],
+        2,
+        3,
+        MAX_OBJECT_RECORD_EXPORT_RECORDS as usize,
+    )
+    .unwrap();
+
+    assert_eq!(selected.len(), MAX_OBJECT_RECORD_EXPORT_RECORDS as usize);
+    assert_eq!(selected[731], Some(present));
+    assert_eq!(selected.iter().filter(|entry| entry.is_some()).count(), 1);
+}
+
+#[test]
+fn complete_record_batch_selector_rejects_short_replica_batches() {
+    let error = select_object_snapshot_batch_quorum(
+        &[(NodeId(1), vec![None]), (NodeId(2), Vec::new())],
         2,
         2,
         1,
@@ -347,6 +450,37 @@ async fn two_of_two_repairs_one_direct_predecessor() {
     let selected = reconcile_stores(&stores, 2).await.unwrap();
     assert_eq!(selected, read(&stores[0]));
     assert_eq!(read(&stores[0]), read(&stores[1]));
+}
+
+#[tokio::test]
+async fn journal_retention_progress_is_not_object_divergence_or_repaired() {
+    let (_root, stores) = stores(2).await;
+    let mut pending = baseline();
+    pending.journal_pending_versions = vec![pending.head.version];
+    let mut released = baseline();
+    released.journal_released_versions = vec![released.head.version];
+    install(&stores[0], Some(&pending)).await;
+    install(&stores[1], Some(&released)).await;
+
+    assert_eq!(
+        reconcile_stores(&stores, 2).await.unwrap(),
+        Some(pending.clone())
+    );
+    assert_eq!(read(&stores[0]), Some(pending));
+    assert_eq!(read(&stores[1]), Some(released));
+}
+
+#[test]
+fn journal_retention_union_still_requires_exact_quorum() {
+    let mut retained = baseline();
+    retained.journal_pending_versions = vec![retained.head.version];
+
+    assert_eq!(
+        select_object_snapshot_quorum(&[Some(retained), Some(baseline())], 2, 2)
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
 }
 
 #[tokio::test]

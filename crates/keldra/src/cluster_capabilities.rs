@@ -7,15 +7,15 @@ pub(crate) const BASELINE_STORAGE_FORMAT_VERSION: u16 = 1;
 pub(crate) const GENERALIZED_ATOMIC_PEER_PROTOCOL_VERSION: u16 = 2;
 pub(crate) const GENERALIZED_ATOMIC_STORAGE_FORMAT_VERSION: u16 = 2;
 
-/// Protocols understood by this binary. Support does not activate version 2;
-/// Raft's selected cluster capability is the feature authority.
+/// Protocols understood by this binary. Fresh clusters select the current
+/// version; Raft's selected capability remains authoritative thereafter.
 pub(crate) const PEER_PROTOCOL_CAPABILITY: CapabilityRange = CapabilityRange {
     min: BASELINE_PEER_PROTOCOL_VERSION,
     max: GENERALIZED_ATOMIC_PEER_PROTOCOL_VERSION,
 };
 
 /// Storage formats understood by this binary. Version 2 includes durable path
-/// and governance reservations but remains unavailable until Raft activation.
+/// and governance reservations and is selected when a fresh cluster starts.
 pub(crate) const STORAGE_FORMAT_CAPABILITY: CapabilityRange = CapabilityRange {
     min: BASELINE_STORAGE_FORMAT_VERSION,
     max: GENERALIZED_ATOMIC_STORAGE_FORMAT_VERSION,

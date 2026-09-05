@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # qualified separately by scripts/qualify-index-v6-ssd-scale.sh.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
-requested_image="${KELDRA_IMAGE:-keldra:0.16.0}"
+requested_image="${KELDRA_IMAGE:-keldra:0.17.0}"
 keep="${KELDRA_QUALIFICATION_KEEP:-0}"
 qualification_mode="${KELDRA_QUALIFICATION_MODE:-smoke}"
 case "${qualification_mode}" in
@@ -95,9 +95,9 @@ if [[ "${image_revision}" != "${source_commit}" ]]; then
 fi
 server_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra-server --version)"
 client_version="$(docker run --rm --platform "${platform}" "${image_id}" keldra --version)"
-if [[ "${server_version}" != "keldra-server 0.16.0" \
-  || "${client_version}" != "keldra 0.16.0" ]]; then
-  echo "qualification requires the exact Keldra 0.16.0 image" >&2
+if [[ "${server_version}" != "keldra-server 0.17.0" \
+  || "${client_version}" != "keldra 0.17.0" ]]; then
+  echo "qualification requires the exact Keldra 0.17.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2

@@ -4,14 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
 use keldra_store::{
-    BatchOperation, CoordinatedObjectMutation, DefinitionMutationIntent, Durability,
-    MutationReceipt, ObjectMutationGovernance, SourceJournalSettlement,
+    BatchOperation, BlobRef, CoordinatedObjectMutation, DefinitionMutationIntent, Durability,
+    MutationReceipt, ObjectMutationGovernance, PublishRequest, SourceJournalSettlement,
 };
 use tonic::Status;
 
 use super::{
     MutableRecordReplicaGroup, ObjectDistribution, complete_metadata, mutation_capacity_kind,
-    mutation_status, operation_key, stage_distributed_put,
+    mutation_status, operation_key,
 };
 use crate::cluster_placement::ClusterPlacement;
 use crate::index_runtime::hot_ingress::PendingHotProjection;
@@ -30,6 +30,8 @@ struct BatchItem {
 struct PreparedBatchItem {
     item: BatchItem,
 }
+
+type BlobIdentity = ([u8; 32], u64);
 
 impl ObjectDistribution {
     pub(crate) async fn mutate_many(
@@ -205,49 +207,79 @@ impl ObjectDistribution {
 
     async fn execute_mutation_group(
         &self,
-        items: Vec<BatchItem>,
+        mut items: Vec<BatchItem>,
         single_node: bool,
     ) -> Vec<(usize, Result<MutationReceipt, Status>)> {
         let mut outcomes = BTreeMap::new();
+        let (put_identities, unique_put_payloads) = if single_node {
+            (BTreeMap::new(), Vec::new())
+        } else {
+            take_unique_distributed_put_payloads(&mut items)
+        };
         let mut preparation = tokio::task::JoinSet::new();
         let group_indices = items.iter().map(|item| item.index).collect::<Vec<_>>();
-        for item in items {
-            let distribution = self.clone();
+        for (identity, bytes) in unique_put_payloads {
+            let store = self.store.clone();
             preparation.spawn(async move {
-                let index = item.index;
-                let result = async {
-                    let operation = match item.operation {
-                        BatchOperation::Put(request) if single_node => {
-                            Ok(BatchOperation::Put(request))
-                        }
-                        BatchOperation::Put(request) => {
-                            stage_distributed_put(&distribution.store, request)
-                                .await
-                                .map(BatchOperation::Publish)
-                        }
-                        BatchOperation::Clone(_) => Err(Status::invalid_argument(
-                            "CloneObject is not a BulkWrite operation",
-                        )),
-                        operation => Ok(operation),
-                    }?;
-                    Ok::<_, Status>(PreparedBatchItem {
-                        item: BatchItem { operation, ..item },
-                    })
-                }
-                .await;
-                (index, result)
+                let staged = store.stage_blob(&bytes).await.map_err(mutation_status);
+                (identity, staged)
             });
         }
-        let mut prepared = Vec::new();
+        let mut staged_puts = BTreeMap::new();
+        let mut preparation_join_error = None;
         while let Some(joined) = preparation.join_next().await {
             match joined {
-                Ok((_, Ok(item))) => prepared.push(item),
-                Ok((index, Err(error))) => {
-                    tracing::warn!(%error, "distributed bulk payload preparation failed");
-                    outcomes.insert(index, Err(error));
+                Ok((identity, result)) => {
+                    staged_puts.insert(identity, result);
                 }
                 Err(error) => {
                     tracing::error!(%error, "distributed bulk payload task failed");
+                    preparation_join_error = Some(Status::internal(format!(
+                        "distributed bulk payload task failed: {error}"
+                    )));
+                }
+            }
+        }
+        let mut prepared = Vec::with_capacity(items.len());
+        for item in items {
+            let index = item.index;
+            let operation = match item.operation {
+                BatchOperation::Put(request) if single_node => Ok(BatchOperation::Put(request)),
+                BatchOperation::Put(request) => {
+                    let result = preparation_join_error.as_ref().map_or_else(
+                        || {
+                            let identity = put_identities.get(&index).ok_or_else(|| {
+                                Status::internal("distributed put identity is missing")
+                            })?;
+                            staged_puts.get(identity).cloned().ok_or_else(|| {
+                                Status::internal("distributed put payload outcome is missing")
+                            })?
+                        },
+                        |error| Err(error.clone()),
+                    );
+                    result.map(|blob| {
+                        BatchOperation::Publish(PublishRequest {
+                            key: request.key,
+                            blob,
+                            content_type: request.content_type,
+                            mode: request.mode,
+                            command_id: request.command_id,
+                            durability: request.durability,
+                        })
+                    })
+                }
+                BatchOperation::Clone(_) => Err(Status::invalid_argument(
+                    "CloneObject is not a BulkWrite operation",
+                )),
+                operation => Ok(operation),
+            };
+            match operation {
+                Ok(operation) => prepared.push(PreparedBatchItem {
+                    item: BatchItem { operation, ..item },
+                }),
+                Err(error) => {
+                    tracing::warn!(%error, "distributed bulk payload preparation failed");
+                    outcomes.insert(index, Err(error));
                 }
             }
         }
@@ -385,6 +417,7 @@ impl ObjectDistribution {
                     return failed_group_outcomes(outcomes, &attempt_items, error);
                 }
             };
+            let mut payload_continuations = BTreeMap::<BlobIdentity, BlobRef>::new();
             for (((item, evidence), coordinated), durable) in attempt_items
                 .iter()
                 .zip(payload_evidence.iter())
@@ -398,10 +431,12 @@ impl ObjectDistribution {
                         match (&item.item.operation, evidence.as_ref()) {
                             (BatchOperation::Publish(request), Some(evidence)) => {
                                 match request.durability {
-                                    Durability::Local => self.continue_payload_placement(
-                                        self.local_node,
-                                        request.blob.clone(),
-                                    ),
+                                    Durability::Local => {
+                                        retain_unique_blob(
+                                            &mut payload_continuations,
+                                            &request.blob,
+                                        );
+                                    }
                                     Durability::Replicated => {
                                         if let Err(error) = self
                                             .wait_for_replicated_reference(
@@ -441,6 +476,9 @@ impl ObjectDistribution {
                     }
                 };
                 outcomes.insert(item.item.index, result);
+            }
+            for reference in payload_continuations.into_values() {
+                self.continue_payload_placement(self.local_node, reference);
             }
             if let Err(error) = self.placement().and_then(|current| {
                 (current.fence() == placement.fence())
@@ -584,7 +622,6 @@ impl ObjectDistribution {
             }
             return Ok(context);
         }
-        let mut contexts = tokio::task::JoinSet::new();
         let mut unique_paths = BTreeSet::new();
         for item in prepared {
             let key = operation_key(&item.item.operation);
@@ -594,34 +631,9 @@ impl ObjectDistribution {
                 key.clone(),
             ));
         }
-        for (tenant_id, bucket_id, key) in unique_paths {
-            let distribution = self.clone();
-            let fence = placement.fence();
-            contexts.spawn(async move {
-                distribution
-                    .reconcile_before_mutation_stable(&key, tenant_id, bucket_id, fence)
-                    .await
-            });
-        }
-        let mut context = None;
-        while let Some(joined) = contexts.join_next().await {
-            match joined {
-                Ok(Ok(candidate)) if context.is_none() => context = Some(candidate),
-                Ok(Ok(candidate)) if context == Some(candidate) => {}
-                Ok(Ok(_)) => {
-                    return Err(Status::unavailable(
-                        "serving authority changed during grouped mutation reconciliation",
-                    ));
-                }
-                Ok(Err(error)) => return Err(error),
-                Err(error) => {
-                    return Err(Status::internal(format!(
-                        "grouped mutation reconciliation task failed: {error}"
-                    )));
-                }
-            }
-        }
-        context.ok_or_else(|| Status::internal("distributed mutation batch is empty"))
+        let unique_paths = unique_paths.into_iter().collect::<Vec<_>>();
+        self.reconcile_before_mutation_batch_stable(&unique_paths, placement.fence())
+            .await
     }
 
     async fn replicate_mutation_group_batch(
@@ -754,6 +766,39 @@ impl ObjectDistribution {
     }
 }
 
+fn blob_identity(reference: &BlobRef) -> BlobIdentity {
+    (reference.hash, reference.length)
+}
+
+fn retain_unique_blob(retained: &mut BTreeMap<BlobIdentity, BlobRef>, reference: &BlobRef) {
+    retained
+        .entry(blob_identity(reference))
+        .or_insert_with(|| reference.clone());
+}
+
+fn take_unique_distributed_put_payloads(
+    items: &mut [BatchItem],
+) -> (BTreeMap<usize, BlobIdentity>, Vec<(BlobIdentity, Vec<u8>)>) {
+    let mut identities = BTreeMap::new();
+    let mut unique = BTreeSet::new();
+    let mut payloads = Vec::new();
+    for item in items {
+        let BatchOperation::Put(request) = &mut item.operation else {
+            continue;
+        };
+        let identity = (
+            *blake3::hash(&request.bytes).as_bytes(),
+            request.bytes.len() as u64,
+        );
+        identities.insert(item.index, identity);
+        let bytes = std::mem::take(&mut request.bytes);
+        if unique.insert(identity) {
+            payloads.push((identity, bytes));
+        }
+    }
+    (identities, payloads)
+}
+
 fn admit_aligned_hot_results(
     ingress: Option<&crate::index_runtime::hot_ingress::HotProjectionIngress>,
     pending: BTreeMap<usize, PendingHotProjection>,
@@ -800,9 +845,9 @@ mod tests {
 
     use crate::mutation_admission::DrainIdentity;
     use keldra_store::{
-        Durability, LogicalRecordMutationContext, LogicalRecordValue, ObjectKey,
-        ObjectMutationContext, PlacementLogId, PutMode, PutRequest, StorageTenantId, Store,
-        StoreOptions, VersionId,
+        BucketPolicy, Durability, LogicalRecordMutationContext, LogicalRecordValue, ObjectKey,
+        ObjectMutationContext, ObjectVersioning, PlacementLogId, PutMode, PutRequest,
+        StorageTenantId, Store, StoreOptions, VersionId,
     };
 
     use super::*;
@@ -834,6 +879,56 @@ mod tests {
             replayed: false,
             replay_guarantee_expires_at_unix_millis: 1,
         }
+    }
+
+    fn batch_item(index: usize, path: &str, bytes: &[u8]) -> BatchItem {
+        let mut operation = inline_put(path);
+        let BatchOperation::Put(request) = &mut operation else {
+            unreachable!("inline_put always constructs Put")
+        };
+        request.bytes = bytes.to_vec();
+        BatchItem {
+            index,
+            operation,
+            governance: ObjectMutationGovernance {
+                tenant_id: 1,
+                bucket_id: 1,
+                versioning: ObjectVersioning::Unversioned,
+                policy: BucketPolicy::default(),
+            },
+            definition_intent: None,
+        }
+    }
+
+    #[test]
+    fn distributed_put_preparation_and_continuation_are_unique_by_blob() {
+        let mut items = (0..1_000)
+            .map(|index| batch_item(index, &format!("objects/{index}"), b"x"))
+            .chain(std::iter::once(batch_item(1_000, "objects/other", b"y")))
+            .collect::<Vec<_>>();
+
+        let (identities, payloads) = take_unique_distributed_put_payloads(&mut items);
+
+        assert_eq!(identities.len(), 1_001);
+        assert_eq!(payloads.len(), 2);
+        assert!(items.iter().all(|item| match &item.operation {
+            BatchOperation::Put(request) => request.bytes.is_empty(),
+            _ => false,
+        }));
+        assert_eq!(identities[&0], identities[&999]);
+        assert_ne!(identities[&0], identities[&1_000]);
+
+        let mut continuations = BTreeMap::new();
+        for identity in identities.into_values() {
+            retain_unique_blob(
+                &mut continuations,
+                &BlobRef {
+                    hash: identity.0,
+                    length: identity.1,
+                },
+            );
+        }
+        assert_eq!(continuations.len(), 2);
     }
 
     fn install_test_identity(store: &Store) {

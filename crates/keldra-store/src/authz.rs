@@ -182,7 +182,7 @@ impl fmt::Display for SchemaDigest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SchemaRef {
     pub schema_id: SchemaId,
     pub schema_revision: u64,

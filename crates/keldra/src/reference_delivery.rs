@@ -137,11 +137,11 @@ impl crate::payload_distribution::PayloadPlacementView for ReferencePlacement {
         self.placement_nodes()
     }
 
-    fn active_node_ids(&self) -> Vec<NodeId> {
-        self.active_node_ids()
+    fn address(&self, node: NodeId) -> Option<&str> {
+        self.address(node)
     }
 
-    fn address(&self, node: NodeId) -> Option<&str> {
+    fn upload_source_address(&self, node: NodeId) -> Option<&str> {
         self.address(node)
     }
 }

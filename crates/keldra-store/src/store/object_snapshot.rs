@@ -396,6 +396,35 @@ impl Store {
         self.current_path_snapshot(&head_key)
     }
 
+    /// Reads a bounded ordered set of complete exact-path records from one
+    /// RocksDB snapshot. This is the batched peer reconciliation boundary used
+    /// before a distributed mutation group is evaluated.
+    pub fn export_object_path_records(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_paths: &[String],
+    ) -> Result<Vec<Option<ObjectPathSnapshot>>, ObjectSnapshotError> {
+        require_nonzero(tenant_id, "tenant ID")?;
+        require_nonzero(bucket_id, "bucket ID")?;
+        if exact_paths.is_empty() || exact_paths.len() > MAX_OBJECT_RECORD_EXPORT_RECORDS as usize {
+            return Err(ObjectSnapshotError::InvalidExportLimit(format!(
+                "object snapshot batch records must be 1..={MAX_OBJECT_RECORD_EXPORT_RECORDS}"
+            )));
+        }
+        let identity = stable_identity(tenant_id, bucket_id);
+        let mut head_keys = Vec::with_capacity(exact_paths.len());
+        for exact_path in exact_paths {
+            validate_exact_path(exact_path)?;
+            head_keys.push(identity.head_key(exact_path));
+        }
+        let snapshot = self.db.snapshot();
+        head_keys
+            .iter()
+            .map(|head_key| self.path_snapshot_at(&snapshot, head_key))
+            .collect()
+    }
+
     /// Enumerates local authoritative exact-path state and retained typed
     /// receipts. Cluster placement filtering belongs to the join coordinator.
     pub fn export_object_records(
@@ -767,6 +796,14 @@ impl Store {
         head_key: &[u8],
     ) -> Result<Option<ObjectPathSnapshot>, ObjectSnapshotError> {
         let snapshot = self.db.snapshot();
+        self.path_snapshot_at(&snapshot, head_key)
+    }
+
+    fn path_snapshot_at(
+        &self,
+        snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
+        head_key: &[u8],
+    ) -> Result<Option<ObjectPathSnapshot>, ObjectSnapshotError> {
         let Some(encoded_head) = snapshot
             .get_cf(self.cf(CF_HEADS).map_err(object_storage)?, head_key)
             .map_err(object_storage)?
@@ -774,12 +811,12 @@ impl Store {
             return Ok(None);
         };
         let locator = definition_locator_for_head_key(
-            &snapshot,
+            snapshot,
             self.cf(CF_DEFINITION_STATE).map_err(object_storage)?,
             head_key,
         )?;
         let (alias_registry, alias_registry_transition) = alias_snapshot_for_head_key(
-            &snapshot,
+            snapshot,
             self.cf(CF_OBJECT_ALIAS_REGISTRIES)
                 .map_err(object_storage)?,
             head_key,

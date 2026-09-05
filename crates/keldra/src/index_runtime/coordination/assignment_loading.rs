@@ -72,6 +72,7 @@ pub(crate) async fn load_index_assignment(
     }
     let placement = current_placement(decisions)?;
     let owners = assignment_placement(
+        DefinitionKind::Index,
         assignment.tenant_id,
         assignment.bucket_id,
         assignment.definition_id,
@@ -120,15 +121,28 @@ pub(super) fn mutation_identity(mutation: &DefinitionAssignmentMutation) -> (u64
 }
 
 pub(super) fn assignment_placement(
+    kind: DefinitionKind,
     tenant_id: u64,
     bucket_id: u64,
-    _definition_id: u64,
+    definition_id: u64,
     placement: &ClusterPlacement,
 ) -> Result<IndexPlacement, Status> {
-    let identity = IndexIdentity::projection_partition(tenant_id, bucket_id)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let identity = assignment_identity(kind, tenant_id, bucket_id, definition_id)?;
     IndexPlacement::derive(identity, placement)
         .map_err(|error| Status::unavailable(error.to_string()))
+}
+
+fn assignment_identity(
+    kind: DefinitionKind,
+    tenant_id: u64,
+    bucket_id: u64,
+    definition_id: u64,
+) -> Result<IndexIdentity, Status> {
+    match kind {
+        DefinitionKind::Index => IndexIdentity::projection_partition(tenant_id, bucket_id),
+        DefinitionKind::Accounting => IndexIdentity::new(tenant_id, bucket_id, definition_id),
+    }
+    .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 pub(super) fn consumer_kind(kind: DefinitionKind) -> DefinitionConsumerKind {
@@ -175,4 +189,26 @@ pub(super) fn join_status(error: tokio::task::JoinError) -> Status {
 
 pub(super) fn internal_status(error: impl std::fmt::Display) -> Status {
     Status::internal(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assignment_identity_follows_definition_kind() {
+        let first_index = assignment_identity(DefinitionKind::Index, 1, 2, 3).unwrap();
+        let second_index = assignment_identity(DefinitionKind::Index, 1, 2, 4).unwrap();
+        assert_eq!(first_index, second_index);
+        assert_eq!(
+            first_index,
+            IndexIdentity::projection_partition(1, 2).unwrap()
+        );
+
+        let first_accounting = assignment_identity(DefinitionKind::Accounting, 1, 2, 3).unwrap();
+        let second_accounting = assignment_identity(DefinitionKind::Accounting, 1, 2, 4).unwrap();
+        assert_ne!(first_accounting, second_accounting);
+        assert_eq!(first_accounting, IndexIdentity::new(1, 2, 3).unwrap());
+        assert_eq!(second_accounting, IndexIdentity::new(1, 2, 4).unwrap());
+    }
 }

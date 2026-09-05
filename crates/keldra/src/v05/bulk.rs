@@ -97,6 +97,20 @@ pub(super) fn operation_inbound_bytes(operation: &BulkOperation) -> u64 {
     }
 }
 
+pub(super) fn requests_replicated_durability(operation: &BulkOperation) -> bool {
+    use keldra_api::v1::bulk_operation::Operation;
+    let durability = match operation.operation.as_ref() {
+        Some(Operation::Put(request))
+        | Some(Operation::PutIfAbsent(request))
+        | Some(Operation::PutImmutable(request)) => request.durability,
+        Some(Operation::PutIfVersion(request)) => request.durability,
+        Some(Operation::Delete(request)) => request.durability,
+        Some(Operation::DeleteIfVersion(request)) => request.durability,
+        None => return false,
+    };
+    durability == keldra_api::v1::Durability::Replicated as i32
+}
+
 pub(super) fn record_phase_metrics(
     validation: Duration,
     authorization: Duration,
@@ -259,7 +273,8 @@ fn remap_remote_outcomes(
 
 #[cfg(test)]
 mod tests {
-    use keldra_api::v1::MutationReceipt;
+    use keldra_api::v1::bulk_operation::Operation;
+    use keldra_api::v1::{BulkPutRequest, Durability, MutationReceipt};
 
     use super::*;
 
@@ -283,5 +298,24 @@ mod tests {
         assert_eq!(duplicate.code(), tonic::Code::DataLoss);
         let missing = remap_remote_outcomes(vec![receipt(0)], &[4, 9]).unwrap_err();
         assert_eq!(missing.code(), tonic::Code::DataLoss);
+    }
+
+    #[test]
+    fn replicated_bulk_items_are_detected_without_rejecting_malformed_items() {
+        let replicated = BulkOperation {
+            operation: Some(Operation::Put(BulkPutRequest {
+                durability: Durability::Replicated as i32,
+                ..Default::default()
+            })),
+        };
+        let local = BulkOperation {
+            operation: Some(Operation::Put(BulkPutRequest {
+                durability: Durability::Local as i32,
+                ..Default::default()
+            })),
+        };
+        assert!(requests_replicated_durability(&replicated));
+        assert!(!requests_replicated_durability(&local));
+        assert!(!requests_replicated_durability(&BulkOperation::default()));
     }
 }

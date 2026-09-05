@@ -208,6 +208,7 @@ async fn correct_assignment(
     )
     .await?;
     let owners = assignment_placement(
+        existing.kind,
         existing.tenant_id,
         existing.bucket_id,
         existing.definition_id,
@@ -268,6 +269,7 @@ async fn reconcile_locators(
                 continue;
             }
             let owners = assignment_placement(
+                kind,
                 locator.tenant_id,
                 locator.bucket_id,
                 locator.definition_id,
@@ -562,6 +564,7 @@ fn queue_cursorless_transition(
     by_destination: &mut BTreeMap<NodeId, Vec<DefinitionAssignmentMutation>>,
 ) -> Result<(), Status> {
     let owners = assignment_placement(
+        transition.kind,
         transition.tenant_id,
         transition.bucket_id,
         transition.definition_id,

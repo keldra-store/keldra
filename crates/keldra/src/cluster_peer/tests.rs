@@ -4,7 +4,8 @@ use tonic::metadata::{MetadataMap, MetadataValue};
 use super::admission::{validate_context, validate_context_with_timeout_limit};
 use super::routing::test_bearer;
 use super::{
-    CLUSTER_PEER_SCHEMA_VERSION, MAX_INDEX_SOURCE_SNAPSHOT_TIME, decode_json, encode_json, wire,
+    CLUSTER_PEER_SCHEMA_VERSION, MAX_CLUSTER_BULK_OPERATION_TIME, MAX_INDEX_SOURCE_SNAPSHOT_TIME,
+    decode_json, encode_json, wire,
 };
 
 #[test]
@@ -83,6 +84,23 @@ fn snapshot_scan_has_a_bounded_internal_deadline_beyond_public_requests() {
     assert!(validate_context(&context, 0).is_err());
     assert!(
         validate_context_with_timeout_limit(&context, 0, MAX_INDEX_SOURCE_SNAPSHOT_TIME,).is_ok()
+    );
+}
+
+#[test]
+fn bulk_route_accepts_the_remaining_bulk_budget_beyond_ordinary_peer_time() {
+    let context = wire::PeerContext {
+        schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+        cluster_id: vec![7; 16],
+        source_node_id: 3,
+        placement_term: 4,
+        placement_index: 9,
+        hop_count: 1,
+        remaining_deadline_millis: 600_000,
+    };
+    assert!(validate_context(&context, 1).is_err());
+    assert!(
+        validate_context_with_timeout_limit(&context, 1, MAX_CLUSTER_BULK_OPERATION_TIME,).is_ok()
     );
 }
 

@@ -14,11 +14,11 @@ use keldra_consensus::{
     ParticipantManifestHash, PreparedBatch,
 };
 use keldra_store::{
-    BlobRef, BuiltInObjectTransactionPlan, PreparedBundleHash, PreparedBundleRef,
-    PreparedProgramBundle, PreparedProgramRecord, ProgramAliasBinding,
-    ProgramAliasRegistryMutation, ProgramAliasRegistryStage, ProgramHash, ProgramPathMutation,
-    ProgramPathStage, ProgramReservation, SealedAtomicBatchPublication, Store, Version,
-    alias_registry_stages_from_prepared, path_stage_from_prepared,
+    BlobRef, BuiltInObjectTransactionPlan, ObjectMutationContext, PlacementLogId,
+    PreparedBundleHash, PreparedBundleRef, PreparedProgramBundle, PreparedProgramRecord,
+    ProgramAliasBinding, ProgramAliasRegistryMutation, ProgramAliasRegistryStage, ProgramHash,
+    ProgramPathMutation, ProgramPathStage, ProgramReservation, SealedAtomicBatchPublication, Store,
+    Version, alias_registry_stages_from_prepared, path_stage_from_prepared,
 };
 use tonic::Status;
 
@@ -1251,6 +1251,7 @@ impl DistributedPrograms {
         budget: Duration,
     ) -> Result<ProgramPathMutation, Status> {
         let placement = self.objects.current_program_placement()?;
+        let mutation_context = atomic_mutation_context(placement.fence(), nomination);
         let group = self.objects.program_replica_group(
             stage.tenant_id,
             stage.bucket_id,
@@ -1262,7 +1263,7 @@ impl DistributedPrograms {
                 .coordinate_program_path_finalization(
                     stage.clone(),
                     commit_cursor,
-                    self.objects.program_mutation_context()?,
+                    mutation_context,
                 )
                 .await
                 .map_err(super::program_store_status)?
@@ -1346,6 +1347,7 @@ impl DistributedPrograms {
         budget: Duration,
     ) -> Result<ProgramAliasRegistryMutation, Status> {
         let placement = self.objects.current_program_placement()?;
+        let mutation_context = atomic_mutation_context(placement.fence(), nomination);
         let group = self.objects.program_replica_group(
             stage.tenant_id,
             stage.bucket_id,
@@ -1357,7 +1359,7 @@ impl DistributedPrograms {
                 .coordinate_program_alias_registry_finalization(
                     stage.clone(),
                     commit_cursor,
-                    self.objects.program_mutation_context()?,
+                    mutation_context,
                 )
                 .await
                 .map_err(super::program_store_status)?
@@ -1394,10 +1396,7 @@ impl DistributedPrograms {
         {
             let result = if replica == self.local_node {
                 self.store
-                    .apply_program_alias_registry_finalization_replica(
-                        &mutation,
-                        self.objects.program_mutation_context()?,
-                    )
+                    .apply_program_alias_registry_finalization_replica(&mutation, mutation_context)
                     .await
                     .map(|_| ())
                     .map_err(super::program_store_status)
@@ -1661,6 +1660,18 @@ impl StateReader for DistributedStateReader {
     }
 }
 
+fn atomic_mutation_context(
+    placement: PlacementLogId,
+    nomination: ExecutorNomination,
+) -> ObjectMutationContext {
+    ObjectMutationContext {
+        active_placement_log_id: placement,
+        // The executor nomination is the atomic mutation fence. The ordinary
+        // serving-lease term belongs to a separate mutation path.
+        serving_fence_term: nomination.nomination_log_index,
+    }
+}
+
 fn require_mutation(
     mutation: &ProgramPathMutation,
     stage: &ProgramPathStage,
@@ -1716,7 +1727,27 @@ pub(super) fn result_from_record(
 
 #[cfg(test)]
 mod reservation_tests {
-    use super::terminal_rejections_make_threshold_impossible;
+    use keldra_consensus::{ExecutorNomination, NodeId};
+    use keldra_store::PlacementLogId;
+
+    use super::{atomic_mutation_context, terminal_rejections_make_threshold_impossible};
+
+    #[test]
+    fn local_atomic_context_uses_the_executor_nomination_fence() {
+        let ordinary_serving_term = 7;
+        let nomination = ExecutorNomination {
+            executor: NodeId(2),
+            nomination_log_index: 29,
+        };
+        assert_ne!(nomination.nomination_log_index, ordinary_serving_term);
+
+        let placement = PlacementLogId { term: 5, index: 22 };
+        let context = atomic_mutation_context(placement, nomination);
+
+        assert_eq!(context.active_placement_log_id, placement);
+        assert_eq!(context.serving_fence_term, nomination.nomination_log_index);
+        assert_ne!(context.serving_fence_term, ordinary_serving_term);
+    }
 
     #[test]
     fn terminal_error_is_returned_only_when_success_threshold_is_impossible() {

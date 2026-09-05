@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use keldra_consensus::{
     ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, ClusterId, Command, DecisionRaft,
-    ErasureCodeProfile, JwtSigningKeyFingerprint, NodeId, SYSTEM_BOOTSTRAP_VERSION,
+    ErasureCodeProfile, JwtSigningKeyFingerprint, NodeId, NodeState, SYSTEM_BOOTSTRAP_VERSION,
     SystemBootstrapState as ConsensusBootstrapState,
 };
 use keldra_store::{ErasureProfile, Store, SystemBootstrapState as LocalBootstrapState};
@@ -14,6 +14,41 @@ enum BootstrapAction {
     Ready,
     CommitExistingLocalState,
     CreateLocalStateThenCommit,
+}
+
+/// Wait until a joining node has applied the cluster state imported by its
+/// background catch-up task. A received Raft vote can identify the leader
+/// before that state is locally applied, so leader discovery alone is not a
+/// sufficient startup barrier for an admitted node.
+pub(crate) async fn wait_for_joining_cluster_state(
+    decisions: &DecisionRaft,
+    local_node: NodeId,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .context("join startup timeout exceeds the process clock")?;
+    loop {
+        if joining_node_is_applied(decisions, local_node)? {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the admitted node descriptor to apply locally"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn joining_node_is_applied(decisions: &DecisionRaft, local_node: NodeId) -> Result<bool> {
+    Ok(decisions
+        .state()?
+        .cluster_control()
+        .nodes()
+        .get(&local_node)
+        .is_some_and(|descriptor| {
+            matches!(descriptor.state, NodeState::Joining | NodeState::Active)
+        }))
 }
 
 /// Ensure the one-node genesis group has exactly one stable cluster identity.
@@ -201,6 +236,31 @@ pub(crate) async fn reconcile_system_bootstrap(
     }
 }
 
+/// Require the cluster-wide bootstrap marker while a joining node receives
+/// its protected local bootstrap records through the typed handoff.
+///
+/// Public calls on a JOINING node are routed to ACTIVE authorities. The local
+/// marker is therefore not an authority until the final handoff installs it,
+/// but the cluster marker must already prove bootstrap completed.
+pub(crate) fn require_cluster_bootstrap_during_join(decisions: &DecisionRaft) -> Result<()> {
+    joining_bootstrap_ready(decisions.state()?.system_bootstrap())
+}
+
+fn joining_bootstrap_ready(bootstrap: ConsensusBootstrapState) -> Result<()> {
+    match bootstrap {
+        ConsensusBootstrapState::Complete {
+            version: SYSTEM_BOOTSTRAP_VERSION,
+            ..
+        } => Ok(()),
+        ConsensusBootstrapState::Complete { version, .. } => {
+            bail!("Raft system-bootstrap version {version} is unsupported")
+        }
+        ConsensusBootstrapState::Missing => {
+            bail!("cluster system bootstrap is not complete")
+        }
+    }
+}
+
 async fn read_local_bootstrap_state(store: &Store) -> Result<LocalBootstrapState> {
     let state_store = store.clone();
     tokio::task::spawn_blocking(move || state_store.system_bootstrap_state())
@@ -272,6 +332,26 @@ mod tests {
     }
 
     #[test]
+    fn joining_node_requires_only_the_completed_cluster_marker() {
+        assert!(joining_bootstrap_ready(raft_complete(7)).is_ok());
+        assert!(
+            joining_bootstrap_ready(ConsensusBootstrapState::Missing)
+                .unwrap_err()
+                .to_string()
+                .contains("not complete")
+        );
+        assert!(
+            joining_bootstrap_ready(ConsensusBootstrapState::Complete {
+                version: SYSTEM_BOOTSTRAP_VERSION + 1,
+                committed_log_index: 7,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported")
+        );
+    }
+
+    #[test]
     fn bootstrap_state_matrix_is_fail_closed() {
         assert_eq!(
             bootstrap_action(LOCAL_COMPLETE, raft_complete(7), false).unwrap(),
@@ -315,6 +395,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("--run-system-bootstrap"));
+    }
+
+    #[tokio::test]
+    async fn joining_startup_waits_for_its_applied_descriptor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let decisions = DecisionRaft::open(temporary.path().join("decisions"), 1, 16, 64 * 1024)
+            .await
+            .unwrap();
+        decisions.ensure_one_node().await.unwrap();
+        decisions
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
+        ensure_genesis_identity(&decisions).await.unwrap();
+
+        assert!(!joining_node_is_applied(&decisions, NodeId(1)).unwrap());
+        commit_test_active_placement(&decisions).await;
+        wait_for_joining_cluster_state(&decisions, NodeId(1), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let error = wait_for_joining_cluster_state(&decisions, NodeId(2), Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("descriptor"));
+        decisions.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -452,8 +557,8 @@ mod tests {
                     current_peer_spki_sha256: PeerSpkiSha256([1; 32]),
                     overlap_peer_spki_sha256: None,
                     join_capability_hash: Some(JoinCapabilityHash([2; 32])),
-                    supported_protocol: CapabilityRange { min: 1, max: 1 },
-                    supported_storage_format: CapabilityRange { min: 1, max: 1 },
+                    supported_protocol: CapabilityRange { min: 1, max: 2 },
+                    supported_storage_format: CapabilityRange { min: 1, max: 2 },
                 },
             })
             .await

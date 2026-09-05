@@ -3,10 +3,11 @@
 //! Public administration is routed once to the Raft-nominated executor. The
 //! executor coordinates complete logical records through their independent
 //! HRW coordinators and applies authorization grants only after those record
-//! quorums are durable. Credential verification is routed by client ID and
-//! performs Argon2 only on that coordinator.
+//! quorums are durable. Credential verification is routed by client ID to the
+//! first available selected credential replica, preferring the local replica, and
+//! performs Argon2 only on that verifier.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use keldra_api::v1 as api;
 use keldra_authz::{AuthorizationCheck, ObjectRef};
@@ -33,6 +34,7 @@ use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
 
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone)]
 pub(crate) struct DistributedControlPlane {
@@ -400,30 +402,80 @@ impl DistributedControlPlane {
         &self,
         request: api::ExchangeClientCredentialsRequest,
     ) -> Result<api::AccessToken, Status> {
-        if let Some(target) = self.credential_target(&request.client_id)? {
-            return self
-                .peers
-                .route_credential_exchange(
-                    target.node_id,
-                    &target.address,
-                    request,
-                    CONTROL_OPERATION_TIMEOUT,
-                )
-                .await;
+        let id = credential_record_id(&request.client_id)?;
+        let started = Instant::now();
+        let mut last_unavailable = None;
+        loop {
+            let targets = match self.logical.read_targets_local_first(&id) {
+                Ok(targets) => targets,
+                Err(error) if retryable_control_availability(&error) => {
+                    last_unavailable = Some(error);
+                    wait_for_control_retry(started).await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for (index, target) in targets.iter().enumerate() {
+                let remaining_targets = targets.len() - index;
+                let timeout = control_attempt_timeout(started, remaining_targets)?;
+                let result = if target.node_id == self.local_node {
+                    tokio::time::timeout(
+                        timeout,
+                        self.execute_credential_exchange(request.clone(), target),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Status::deadline_exceeded(
+                            "credential verification timed out",
+                        ))
+                    })
+                } else {
+                    self.peers
+                        .route_credential_exchange(
+                            target.node_id,
+                            &target.address,
+                            request.clone(),
+                            timeout,
+                        )
+                        .await
+                };
+                match result {
+                    Ok(token) => match self.logical.require_replica_read_target(&id, target) {
+                        Ok(()) => return Ok(token),
+                        Err(error) if retryable_control_availability(&error) => {
+                            last_unavailable = Some(error);
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    },
+                    Err(error) if retryable_control_availability(&error) => {
+                        last_unavailable = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Err(deadline) = wait_for_control_retry(started).await {
+                return Err(last_unavailable.unwrap_or(deadline));
+            }
         }
-        self.execute_credential_exchange(request).await
     }
 
     pub(crate) async fn execute_routed_credential_exchange(
         &self,
         request: api::ExchangeClientCredentialsRequest,
     ) -> Result<api::AccessToken, Status> {
-        if self.credential_target(&request.client_id)?.is_some() {
-            return Err(Status::failed_precondition(
-                "credential exchange did not reach its current coordinator",
-            ));
-        }
-        self.execute_credential_exchange(request).await
+        let id = credential_record_id(&request.client_id)?;
+        let target = self
+            .logical
+            .read_targets(&id)?
+            .into_iter()
+            .find(|target| target.node_id == self.local_node)
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "credential exchange did not reach a current credential replica",
+                )
+            })?;
+        self.execute_credential_exchange(request, &target).await
     }
 
     pub(crate) async fn coordinate_logical_record(
@@ -439,7 +491,6 @@ impl DistributedControlPlane {
         &self,
         id: LogicalRecordId,
     ) -> Result<Option<LogicalRecordValue>, Status> {
-        self.require_local_logical_coordinator(&id)?;
         self.logical.read(&id).await
     }
 
@@ -1150,10 +1201,9 @@ impl DistributedControlPlane {
     async fn execute_credential_exchange(
         &self,
         request: api::ExchangeClientCredentialsRequest,
+        expected_target: &crate::logical_record_distribution::LogicalRecordReadTarget,
     ) -> Result<api::AccessToken, Status> {
-        let credential_id = LogicalRecordId::Credential {
-            client_id: request.client_id.clone(),
-        };
+        let credential_id = credential_record_id(&request.client_id)?;
         let credential = match self.read_record(&credential_id).await? {
             Some(LogicalRecordValue::Credential(record)) => record,
             Some(_) => return Err(Status::data_loss("credential record has the wrong type")),
@@ -1178,11 +1228,8 @@ impl DistributedControlPlane {
             Some(_) => return Err(Status::data_loss("application and credential disagree")),
             None => return Err(invalid_credentials()),
         }
-        if self.credential_target(&request.client_id)?.is_some() {
-            return Err(Status::unavailable(
-                "credential placement changed during verification",
-            ));
-        }
+        self.logical
+            .require_replica_read_target(&credential_id, expected_target)?;
         let access_token = self
             .tokens
             .mint(verified.storage_tenant, verified.app_id)
@@ -1281,20 +1328,34 @@ impl DistributedControlPlane {
         &self,
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordValue>, Status> {
-        let Some(target) = self.logical.read_target(id)? else {
-            return self.logical.read(id).await;
-        };
-        let value = self
-            .peers
-            .read_coordinated_logical_record(
-                target.node_id,
-                &target.address,
-                id,
-                CONTROL_OPERATION_TIMEOUT,
-            )
-            .await?;
-        self.logical.require_read_target(id, &target)?;
-        Ok(value)
+        let targets = self.logical.read_targets_local_first(id)?;
+        let started = Instant::now();
+        let mut last_unavailable = None;
+        for (index, target) in targets.iter().enumerate() {
+            let remaining_targets = targets.len() - index;
+            let timeout = control_attempt_timeout(started, remaining_targets)?;
+            let result = if target.node_id == self.local_node {
+                tokio::time::timeout(timeout, self.logical.read(id))
+                    .await
+                    .unwrap_or_else(|_| Err(Status::deadline_exceeded("logical read timed out")))
+            } else {
+                self.peers
+                    .read_coordinated_logical_record(target.node_id, &target.address, id, timeout)
+                    .await
+            };
+            match result {
+                Ok(value) => {
+                    self.logical.require_replica_read_target(id, target)?;
+                    return Ok(value);
+                }
+                Err(error) if retryable_control_availability(&error) => {
+                    last_unavailable = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_unavailable
+            .unwrap_or_else(|| Status::unavailable("logical record has no available read replica")))
     }
 
     async fn ensure_administration_record(
@@ -1612,31 +1673,6 @@ impl DistributedControlPlane {
         }
     }
 
-    fn credential_target(&self, client_id: &str) -> Result<Option<ControlTarget>, Status> {
-        if client_id.is_empty() {
-            return Err(Status::unauthenticated(
-                "the client credentials are invalid",
-            ));
-        }
-        let placement = self.placement()?;
-        let node = placement
-            .rank(PlacementKind::Credential, client_id.as_bytes())
-            .into_iter()
-            .next()
-            .ok_or_else(|| Status::unavailable("cluster has no credential coordinator"))?;
-        if node == self.local_node {
-            return Ok(None);
-        }
-        let address = placement
-            .address(node)
-            .ok_or_else(|| Status::unavailable("credential coordinator has no peer address"))?;
-        Ok(Some(ControlTarget {
-            node_id: node,
-            address: address.0.clone(),
-            placement_fence: placement.fence(),
-        }))
-    }
-
     fn system_realm_target(&self) -> Result<Option<ControlTarget>, Status> {
         let placement = self.placement()?;
         let group = MutableRecordReplicaGroup::select(
@@ -1876,5 +1912,80 @@ fn versioning_to_api(value: ObjectVersioning) -> api::ObjectVersioning {
     match value {
         ObjectVersioning::Unversioned => api::ObjectVersioning::Unversioned,
         ObjectVersioning::Enabled => api::ObjectVersioning::Enabled,
+    }
+}
+
+fn credential_record_id(client_id: &str) -> Result<LogicalRecordId, Status> {
+    if client_id.is_empty() {
+        return Err(Status::unauthenticated(
+            "the client credentials are invalid",
+        ));
+    }
+    Ok(LogicalRecordId::Credential {
+        client_id: client_id.to_owned(),
+    })
+}
+
+fn control_attempt_timeout(started: Instant, remaining_targets: usize) -> Result<Duration, Status> {
+    let remaining = CONTROL_OPERATION_TIMEOUT
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| Status::deadline_exceeded("control operation deadline exceeded"))?;
+    let divisor = u32::try_from(remaining_targets.max(1)).unwrap_or(u32::MAX);
+    Ok(remaining / divisor)
+}
+
+async fn wait_for_control_retry(started: Instant) -> Result<(), Status> {
+    let remaining = CONTROL_OPERATION_TIMEOUT
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| Status::deadline_exceeded("control operation deadline exceeded"))?;
+    tokio::time::sleep(CONTROL_RETRY_INTERVAL.min(remaining)).await;
+    Ok(())
+}
+
+fn retryable_control_availability(error: &Status) -> bool {
+    matches!(
+        error.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+    )
+}
+
+#[cfg(test)]
+mod credential_failover_tests {
+    use super::*;
+
+    #[test]
+    fn credential_failover_retries_only_availability_failures() {
+        assert!(retryable_control_availability(&Status::unavailable("down")));
+        assert!(retryable_control_availability(&Status::deadline_exceeded(
+            "slow"
+        )));
+        for code in [
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+            tonic::Code::DataLoss,
+            tonic::Code::InvalidArgument,
+            tonic::Code::Internal,
+        ] {
+            assert!(!retryable_control_availability(&Status::new(
+                code,
+                "fail closed"
+            )));
+        }
+    }
+
+    #[test]
+    fn empty_client_identity_is_rejected_before_routing() {
+        assert_eq!(
+            credential_record_id("").unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            credential_record_id("client").unwrap(),
+            LogicalRecordId::Credential {
+                client_id: "client".to_owned()
+            }
+        );
     }
 }

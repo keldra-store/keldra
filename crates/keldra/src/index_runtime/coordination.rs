@@ -1069,6 +1069,7 @@ async fn deliver_transition(
     destination_next: &mut BTreeMap<NodeId, u64>,
 ) -> Result<(), Status> {
     let assignment = assignment_placement(
+        transition.kind,
         transition.tenant_id,
         transition.bucket_id,
         transition.definition_id,
@@ -1433,6 +1434,7 @@ async fn transfer_assignments(
             let mut by_destination = BTreeMap::<NodeId, Vec<DefinitionAssignmentMutation>>::new();
             for existing in page.assignments {
                 let owners = assignment_placement(
+                    existing.kind,
                     existing.tenant_id,
                     existing.bucket_id,
                     existing.definition_id,

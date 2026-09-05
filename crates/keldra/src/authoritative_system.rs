@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use keldra_authz::{AuthorizationCheck, ObjectRef};
 use keldra_consensus::{DecisionRaft, NodeId};
@@ -23,6 +24,9 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::logical_name_resolution::LogicalNameResolver;
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::placement::PlacementKind;
+
+const AUTHORIZATION_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTHORIZATION_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StableBucketAuthorization {
@@ -249,54 +253,14 @@ impl AuthoritativeSystemAuthorization {
                 "authorization check batch must not be empty",
             ));
         }
-        let placement = self.placement()?;
-        let fence = placement.fence();
-        let group = MutableRecordReplicaGroup::select(
-            PlacementKind::ZanzibarRealm,
-            placement.cluster_id(),
-            &stable_tenant_id.to_be_bytes(),
-            placement.placement_nodes(),
+        self.fresh_checks_with_placement_retry(
+            stable_tenant_id,
+            &scope,
+            AuthzConsistency::Latest,
+            &checks,
+            &[],
         )
-        .ok_or_else(|| Status::unavailable("cluster has no tenant Zanzibar replica"))?;
-        let coordinator = group.coordinator();
-        let result = if coordinator == self.local_node {
-            let (allowed, revision, binding_generation) = self
-                .zanzibar
-                .fresh_checks_with_generation(
-                    stable_tenant_id,
-                    scope,
-                    AuthzConsistency::Latest,
-                    checks.clone(),
-                )
-                .await?;
-            FreshAuthorizationResult {
-                allowed,
-                revision,
-                binding_generation,
-            }
-        } else {
-            let address = placement.address(coordinator).ok_or_else(|| {
-                Status::unavailable("tenant Zanzibar coordinator has no current peer address")
-            })?;
-            self.peers
-                .fresh_authorization_checks(
-                    coordinator,
-                    &address.0,
-                    stable_tenant_id,
-                    &scope,
-                    AuthzConsistency::Latest,
-                    &checks,
-                    &[],
-                    fence,
-                )
-                .await?
-        };
-        if self.placement()?.fence() != fence {
-            return Err(Status::unavailable(
-                "authorization placement changed during the request",
-            ));
-        }
-        Ok(result)
+        .await
     }
 
     async fn stable_bucket_bindings(
@@ -340,55 +304,149 @@ impl AuthoritativeSystemAuthorization {
                 "authorization check batch must not be empty",
             ));
         }
-        let placement = self.placement()?;
-        let fence = placement.fence();
-        let group = MutableRecordReplicaGroup::select(
-            PlacementKind::ZanzibarRealm,
-            placement.cluster_id(),
-            &SYSTEM_STABLE_TENANT_ID.to_be_bytes(),
-            placement.placement_nodes(),
+        self.fresh_checks_with_placement_retry(
+            SYSTEM_STABLE_TENANT_ID,
+            &AuthzScope::system(),
+            consistency,
+            &checks,
+            &stable_buckets,
         )
-        .ok_or_else(|| Status::unavailable("cluster has no system Zanzibar replica"))?;
-        let coordinator = group.coordinator();
-        let result = if coordinator == self.local_node {
-            self.verify_stable_buckets(&stable_buckets).await?;
-            let (allowed, revision, binding_generation) = self
-                .zanzibar
-                .fresh_checks_with_generation(
-                    SYSTEM_STABLE_TENANT_ID,
-                    AuthzScope::system(),
+        .await
+    }
+
+    async fn fresh_checks_with_placement_retry(
+        &self,
+        stable_tenant_id: u64,
+        scope: &AuthzScope,
+        consistency: AuthzConsistency,
+        checks: &[AuthorizationCheck],
+        stable_buckets: &[StableBucketAuthorization],
+    ) -> Result<FreshAuthorizationResult, Status> {
+        let deadline = tokio::time::Instant::now() + AUTHORIZATION_READ_TIMEOUT;
+        loop {
+            let attempt = async {
+                let placement = self.placement()?;
+                let group = MutableRecordReplicaGroup::select(
+                    PlacementKind::ZanzibarRealm,
+                    placement.cluster_id(),
+                    &stable_tenant_id.to_be_bytes(),
+                    placement.placement_nodes(),
+                )
+                .ok_or_else(|| Status::unavailable("cluster has no Zanzibar replica"))?;
+                self.fresh_checks_from_replicas(
+                    &placement,
+                    &group,
+                    stable_tenant_id,
+                    scope,
                     consistency,
                     checks,
+                    stable_buckets,
                 )
-                .await?;
-            FreshAuthorizationResult {
-                allowed,
-                revision,
-                binding_generation,
+                .await
+            };
+            let result = tokio::time::timeout_at(deadline, attempt)
+                .await
+                .map_err(|_| Status::deadline_exceeded("authorization read deadline exceeded"))?;
+            match result {
+                Ok(result) => return Ok(result),
+                Err(error) if retryable_authorization_availability(&error) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(error);
+                    }
+                    tokio::time::sleep_until((now + AUTHORIZATION_RETRY_INTERVAL).min(deadline))
+                        .await;
+                }
+                Err(error) => return Err(error),
             }
-        } else {
-            let address = placement.address(coordinator).ok_or_else(|| {
-                Status::unavailable("system Zanzibar coordinator has no current peer address")
-            })?;
-            self.peers
-                .fresh_authorization_checks(
-                    coordinator,
-                    &address.0,
-                    SYSTEM_STABLE_TENANT_ID,
-                    &AuthzScope::system(),
-                    consistency,
-                    &checks,
-                    &stable_buckets,
-                    fence,
-                )
-                .await?
-        };
-        if self.placement()?.fence() != fence {
-            return Err(Status::unavailable(
-                "authorization placement changed during the request",
-            ));
         }
-        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fresh_checks_from_replicas(
+        &self,
+        placement: &ClusterPlacement,
+        group: &MutableRecordReplicaGroup,
+        stable_tenant_id: u64,
+        scope: &AuthzScope,
+        consistency: AuthzConsistency,
+        checks: &[AuthorizationCheck],
+        stable_buckets: &[StableBucketAuthorization],
+    ) -> Result<FreshAuthorizationResult, Status> {
+        let fence = placement.fence();
+        let targets = authorization_read_targets_local_first(group.replicas(), self.local_node);
+        let started = Instant::now();
+        let mut last_unavailable = None;
+        for (index, target) in targets.iter().copied().enumerate() {
+            let timeout = authorization_attempt_timeout(started, targets.len() - index)?;
+            let result = if target == self.local_node {
+                tokio::time::timeout(timeout, async {
+                    self.verify_stable_buckets(stable_buckets).await?;
+                    let (allowed, revision, binding_generation) = self
+                        .zanzibar
+                        .fresh_checks_with_generation(
+                            stable_tenant_id,
+                            scope.clone(),
+                            consistency,
+                            checks.to_vec(),
+                        )
+                        .await?;
+                    Ok::<_, Status>(FreshAuthorizationResult {
+                        allowed,
+                        revision,
+                        binding_generation,
+                    })
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Status::deadline_exceeded(
+                        "fresh authorization read timed out",
+                    ))
+                })
+            } else {
+                let address = placement.address(target).ok_or_else(|| {
+                    Status::unavailable("authorization replica has no current peer address")
+                })?;
+                self.peers
+                    .fresh_authorization_checks(
+                        target,
+                        &address.0,
+                        stable_tenant_id,
+                        scope,
+                        consistency,
+                        checks,
+                        stable_buckets,
+                        fence,
+                        timeout,
+                    )
+                    .await
+            };
+            match result {
+                Ok(result) => {
+                    let current = self.placement()?;
+                    let current_group = MutableRecordReplicaGroup::select(
+                        PlacementKind::ZanzibarRealm,
+                        current.cluster_id(),
+                        &stable_tenant_id.to_be_bytes(),
+                        current.placement_nodes(),
+                    )
+                    .ok_or_else(|| Status::unavailable("cluster has no Zanzibar replica"))?;
+                    if current.fence() != fence || current_group != *group {
+                        return Err(Status::unavailable(
+                            "authorization placement changed during the request",
+                        ));
+                    }
+                    return Ok(result);
+                }
+                Err(error) if retryable_authorization_availability(&error) => {
+                    last_unavailable = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_unavailable.unwrap_or_else(|| {
+            Status::unavailable("authorization realm has no available read replica")
+        }))
     }
 
     async fn verify_stable_buckets(
@@ -417,6 +475,33 @@ impl AuthoritativeSystemAuthorization {
         ClusterPlacement::from_applied(&state)
             .map_err(|error| Status::unavailable(error.to_string()))
     }
+}
+
+fn authorization_read_targets_local_first(replicas: &[NodeId], local_node: NodeId) -> Vec<NodeId> {
+    let mut targets = replicas.to_vec();
+    if let Some(index) = targets.iter().position(|node| *node == local_node) {
+        targets.swap(0, index);
+    }
+    targets
+}
+
+fn authorization_attempt_timeout(
+    started: Instant,
+    remaining_targets: usize,
+) -> Result<Duration, Status> {
+    let remaining = AUTHORIZATION_READ_TIMEOUT
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| Status::deadline_exceeded("authorization read deadline exceeded"))?;
+    let divisor = u32::try_from(remaining_targets.max(1)).unwrap_or(u32::MAX);
+    Ok(remaining / divisor)
+}
+
+fn retryable_authorization_availability(error: &Status) -> bool {
+    matches!(
+        error.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+    )
 }
 
 #[tonic::async_trait]
@@ -465,5 +550,38 @@ mod tests {
     #[test]
     fn protected_zanzibar_group_has_one_stable_identity() {
         assert_eq!(SYSTEM_STABLE_TENANT_ID, 1);
+    }
+
+    #[test]
+    fn authorization_reads_prefer_the_local_selected_replica() {
+        assert_eq!(
+            authorization_read_targets_local_first(&[NodeId(1), NodeId(2), NodeId(3)], NodeId(2),),
+            vec![NodeId(2), NodeId(1), NodeId(3)]
+        );
+        assert_eq!(
+            authorization_read_targets_local_first(&[NodeId(1), NodeId(2), NodeId(3)], NodeId(9),),
+            vec![NodeId(1), NodeId(2), NodeId(3)]
+        );
+    }
+
+    #[test]
+    fn authorization_failover_retries_only_availability_failures() {
+        assert!(retryable_authorization_availability(&Status::unavailable(
+            "down"
+        )));
+        assert!(retryable_authorization_availability(
+            &Status::deadline_exceeded("slow")
+        ));
+        for code in [
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+            tonic::Code::DataLoss,
+            tonic::Code::InvalidArgument,
+            tonic::Code::Internal,
+        ] {
+            assert!(!retryable_authorization_availability(&Status::new(
+                code, "closed"
+            )));
+        }
     }
 }

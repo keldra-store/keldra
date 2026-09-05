@@ -519,6 +519,7 @@ impl PeerRuntime {
         payload_read_scratch: PathBuf,
         erasure_profile: ErasureProfile,
         maximum_unary_time: Duration,
+        bulk_write_timeout: Duration,
         max_blob_bytes: u64,
     ) -> Result<PeerServerHandle> {
         if let Some(identity) = self.mutation_admission.drain_identity() {
@@ -542,6 +543,7 @@ impl PeerRuntime {
             store,
             erasure_profile,
             maximum_unary_time,
+            bulk_write_timeout,
             max_blob_bytes,
             leases,
             activation_gate,
@@ -557,6 +559,7 @@ impl PeerRuntime {
         store: Store,
         erasure_profile: ErasureProfile,
         maximum_unary_time: Duration,
+        bulk_write_timeout: Duration,
         max_blob_bytes: u64,
         leases: ServingLeaseIssuer,
         activation_gate: Arc<dyn JoinActivationGate>,
@@ -623,6 +626,7 @@ impl PeerRuntime {
             self.routed_personaldb.clone(),
             self.routed_public_handlers.clone(),
             self.routed_authz_handlers.clone(),
+            bulk_write_timeout,
         )
         .into_server();
         let cluster_service = MutationAdmissionService::new(
@@ -724,7 +728,7 @@ async fn open_with_identity(
     .await
     .context("open bounded decision Raft with private transport")?;
     pins.install(decisions.clone())?;
-    let mutation_admission = initial_mutation_admission(&decisions)?;
+    let mutation_admission = initial_mutation_admission(&decisions, config.node_id)?;
     Ok((
         decisions,
         PeerRuntime {
@@ -752,14 +756,19 @@ async fn open_with_identity(
     ))
 }
 
-fn initial_mutation_admission(decisions: &DecisionRaft) -> Result<MutationAdmission> {
+fn initial_mutation_admission(
+    decisions: &DecisionRaft,
+    local_node: NodeId,
+) -> Result<MutationAdmission> {
     let state = decisions
         .state()
         .context("read initial mutation admission")?;
     let identity = state
         .cluster_control()
         .transition()
-        .filter(|transition| transition.kind == MembershipTransitionKind::Add)
+        .filter(|transition| {
+            transition.kind == MembershipTransitionKind::Add && transition.node_id != local_node
+        })
         .filter(|transition| {
             state
                 .cluster_control()
@@ -1166,17 +1175,7 @@ impl CommittedPeerPinProvider for RaftCommittedPeerPins {
                 return None;
             }
             let descriptor = state.cluster_control().nodes().get(&node_id)?;
-            let allowed = match kind {
-                PeerRpcKind::JoinControl => {
-                    matches!(descriptor.state, NodeState::Active | NodeState::Joining)
-                }
-                PeerRpcKind::AppendEntries
-                | PeerRpcKind::Vote
-                | PeerRpcKind::InstallSnapshot
-                | PeerRpcKind::ServingLease
-                | PeerRpcKind::DataPlane
-                | PeerRpcKind::StateTransfer => descriptor.state == NodeState::Active,
-            };
+            let allowed = committed_peer_rpc_allowed(descriptor.state, kind);
             return allowed.then_some(CommittedPeerPins {
                 current: descriptor.current_peer_spki_sha256,
                 overlap: descriptor.overlap_peer_spki_sha256,
@@ -1185,6 +1184,20 @@ impl CommittedPeerPinProvider for RaftCommittedPeerPins {
         self.bootstrap
             .as_ref()?
             .authorized_catch_up_pins(cluster_id, node_id, kind)
+    }
+}
+
+fn committed_peer_rpc_allowed(state: NodeState, kind: PeerRpcKind) -> bool {
+    match kind {
+        PeerRpcKind::JoinControl
+        | PeerRpcKind::ServingLease
+        | PeerRpcKind::DataPlane
+        | PeerRpcKind::StateTransfer => {
+            matches!(state, NodeState::Active | NodeState::Joining)
+        }
+        PeerRpcKind::AppendEntries | PeerRpcKind::Vote | PeerRpcKind::InstallSnapshot => {
+            state == NodeState::Active
+        }
     }
 }
 
@@ -1199,6 +1212,25 @@ mod tests {
     use crate::serving_fence::ServingFenceRuntime;
 
     struct AllowCompletedHandoff;
+
+    #[test]
+    fn joining_peer_can_read_active_state_for_proxying_and_handoff() {
+        for allowed in [
+            PeerRpcKind::JoinControl,
+            PeerRpcKind::ServingLease,
+            PeerRpcKind::DataPlane,
+            PeerRpcKind::StateTransfer,
+        ] {
+            assert!(committed_peer_rpc_allowed(NodeState::Joining, allowed));
+        }
+        for denied in [
+            PeerRpcKind::AppendEntries,
+            PeerRpcKind::Vote,
+            PeerRpcKind::InstallSnapshot,
+        ] {
+            assert!(!committed_peer_rpc_allowed(NodeState::Joining, denied));
+        }
+    }
 
     #[tonic::async_trait]
     impl JoinActivationGate for AllowCompletedHandoff {
@@ -1313,6 +1345,7 @@ mod tests {
                 directory.path().join("payload-read-scratch"),
                 ErasureProfile::default(),
                 Duration::from_secs(30),
+                Duration::from_secs(600),
                 16 * 1024 * 1024,
             )
             .await
@@ -1467,6 +1500,7 @@ mod tests {
                 first_store,
                 ErasureProfile::default(),
                 Duration::from_secs(30),
+                Duration::from_secs(600),
                 16 * 1024 * 1024,
                 ServingLeaseIssuer::new(),
                 Arc::new(AllowCompletedHandoff),
@@ -1496,6 +1530,7 @@ mod tests {
                 second_directory.path().join("payload-read-scratch"),
                 ErasureProfile::default(),
                 Duration::from_secs(30),
+                Duration::from_secs(600),
                 16 * 1024 * 1024,
             )
             .await
@@ -1575,6 +1610,7 @@ mod tests {
                 second_directory.path().join("payload-read-scratch"),
                 ErasureProfile::default(),
                 Duration::from_secs(30),
+                Duration::from_secs(600),
                 16 * 1024 * 1024,
             )
             .await

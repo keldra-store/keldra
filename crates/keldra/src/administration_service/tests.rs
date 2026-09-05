@@ -87,7 +87,7 @@ fn prepare_request() -> api::PrepareNodeRequest {
 }
 
 #[tokio::test]
-async fn cluster_capability_status_and_activation_are_explicit_and_fenced() {
+async fn fresh_cluster_selects_current_capabilities_and_activation_is_fenced() {
     let (_directory, _store, service) = service().await;
     let status = service
         .get_cluster_capabilities(authenticated(
@@ -98,8 +98,8 @@ async fn cluster_capability_status_and_activation_are_explicit_and_fenced() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(status.active_protocol_version, 1);
-    assert_eq!(status.active_storage_format, 1);
+    assert_eq!(status.active_protocol_version, 2);
+    assert_eq!(status.active_storage_format, 2);
     assert_eq!(status.target_protocol_version, 2);
     assert_eq!(status.target_storage_format, 2);
     assert!(status.ready_for_target_activation);

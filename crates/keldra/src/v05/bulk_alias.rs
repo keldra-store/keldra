@@ -532,7 +532,8 @@ async fn execute_one(
         BatchOperation::Put(put) => {
             service
                 .distribution
-                .require_durability_available(put.durability)?;
+                .wait_for_durability_available(put.durability, deadline)
+                .await?;
             let mut upload = service.store.begin_blob_upload().await.map_err(status)?;
             let mut length = 0;
             write_upload_chunk(&mut upload, &mut length, &put.bytes, service.max_blob_bytes)
@@ -582,7 +583,8 @@ async fn execute_one(
         BatchOperation::Delete(delete) => {
             service
                 .distribution
-                .require_durability_available(delete.durability)?;
+                .wait_for_durability_available(delete.durability, deadline)
+                .await?;
             let command_id = delete.command_id.as_deref().ok_or_else(|| {
                 Status::invalid_argument("bulk linked Delete command ID is required")
             })?;

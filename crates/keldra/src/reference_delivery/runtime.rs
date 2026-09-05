@@ -132,7 +132,7 @@ impl ReferenceDestinations for StoreReferenceDestinations {
         if node == self.local_node {
             return self
                 .store
-                .apply_reference_deltas(batch)
+                .apply_reference_deltas_progress(batch)
                 .await
                 .map_err(|error| error.to_string());
         }
@@ -244,7 +244,7 @@ impl StorePositiveReferencePreparation {
             .await
             .map_err(source_fetch_status)?;
         self.store
-            .seal_small_copy(reference, &bytes)
+            .seal_replica_small_copy(reference, &bytes)
             .await
             .map_err(|error| SourceFetchError::Failed(error.to_string()))?;
         Ok(())
@@ -297,7 +297,7 @@ impl StorePositiveReferencePreparation {
                     ));
                 }
                 self.store
-                    .seal_complete_source_upload(reference, upload)
+                    .seal_replica_complete_source_upload(reference, upload)
                     .await
                     .map_err(|error| SourceFetchError::Failed(error.to_string()))?;
                 return Ok(());

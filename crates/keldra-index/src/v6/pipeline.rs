@@ -84,6 +84,35 @@ impl IndexingMemoryPermit {
         self.bytes
     }
 
+    /// Grow an existing reservation without releasing its current admission.
+    /// Failure leaves the permit and the shared accounting unchanged.
+    pub(crate) fn grow_to(&mut self, bytes: usize) -> Result<(), MemoryAdmission> {
+        if bytes <= self.bytes {
+            return Ok(());
+        }
+        let additional = bytes - self.bytes;
+        let mut state = self
+            .credits
+            .inner
+            .lock()
+            .expect("indexing memory credit lock poisoned");
+        let stage_index = self.stage.index();
+        let total_available = state.total_limit_bytes.saturating_sub(state.used_bytes);
+        let stage_available = state.stage_limit_bytes[stage_index]
+            .saturating_sub(state.stage_used_bytes[stage_index]);
+        let available_bytes = total_available.min(stage_available);
+        if additional > available_bytes {
+            return Err(MemoryAdmission::ReplayRequired {
+                needed_bytes: additional,
+                available_bytes,
+            });
+        }
+        state.used_bytes += additional;
+        state.stage_used_bytes[stage_index] += additional;
+        self.bytes = bytes;
+        Ok(())
+    }
+
     /// Release construction headroom after the retained value's exact size is
     /// known. The permit remains charged to its original stage.
     pub fn shrink_to(&mut self, bytes: usize) -> Result<(), IndexError> {

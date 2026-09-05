@@ -246,6 +246,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let program_quiescence_binding = peer_runtime.program_quiescence();
     let index_artifacts_binding = peer_runtime.index_artifacts();
     let pending_join = peer_runtime.join_transport();
+    let background_join_in_progress = pending_join.is_some();
     let mutation_admission = peer_runtime.mutation_admission();
     // The private listener must be accepting before an existing multi-node
     // group can elect a leader after a coordinated restart.
@@ -257,24 +258,42 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             config.storage.scratch.join("payload-read"),
             config.erasure_profile,
             config.atomic_program_timeout,
+            config.bulk_write_timeout,
             config.max_blob_bytes,
         )
         .await?;
-    if let Some(pending_join) = pending_join.as_ref() {
+    let join_decisions = decisions.clone();
+    let join_state_dir = config.storage.state.clone();
+    let join_profile = config.erasure_profile;
+    let mut pending_join_task = tokio::spawn(async move {
+        let Some(pending_join) = pending_join else {
+            return std::future::pending::<Result<()>>().await;
+        };
         peer_runtime::complete_pending_join(
-            pending_join,
-            &decisions,
-            &config.storage.state,
-            config.erasure_profile,
+            &pending_join,
+            &join_decisions,
+            &join_state_dir,
+            join_profile,
             DECISION_LEADER_TIMEOUT,
         )
         .await
         .context("join existing cluster through typed ownership handoff")?;
-    }
+        tracing::info!("background cluster join completed");
+        std::future::pending::<Result<()>>().await
+    });
     decisions
         .wait_for_leader(DECISION_LEADER_TIMEOUT)
         .await
         .context("elect decision leader")?;
+    if background_join_in_progress {
+        cluster_startup::wait_for_joining_cluster_state(
+            &decisions,
+            local_node,
+            DECISION_LEADER_TIMEOUT,
+        )
+        .await
+        .context("apply existing cluster state before joining-node startup")?;
+    }
     let _capability_advertisement = cluster_capabilities::CapabilityAdvertisementTask::start(
         decisions.clone(),
         cluster_transport.clone(),
@@ -353,15 +372,19 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     .context("initialize cluster object reader")?;
     let programs =
         programs::ProgramCoordinator::start(store.clone(), decisions.clone(), local_node).await?;
-    cluster_startup::reconcile_system_bootstrap(
-        &store,
-        &decisions,
-        local_node,
-        &config.storage.state,
-        config.run_system_bootstrap,
-        config.system_bootstrap_credential_output.as_deref(),
-    )
-    .await?;
+    if background_join_in_progress {
+        cluster_startup::require_cluster_bootstrap_during_join(&decisions)?;
+    } else {
+        cluster_startup::reconcile_system_bootstrap(
+            &store,
+            &decisions,
+            local_node,
+            &config.storage.state,
+            config.run_system_bootstrap,
+            config.system_bootstrap_credential_output.as_deref(),
+        )
+        .await?;
+    }
     let authz_repository = store.authz();
     let logical_records = logical_record_distribution::LogicalRecordDistribution::new(
         local_node,
@@ -665,9 +688,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let tokens = config.token_manager;
     let object_tokens = tokens.clone();
     let object_rate_limits = request_rate_limits.clone();
-    let object_authority = serving_fence.authority();
+    // Object operations carry their placement fence through the distributed
+    // read/write path. Keeping the ingress interceptor authentication-only lets
+    // a JOINING node act as a gateway while ACTIVE replicas remain authoritative.
     let authenticate_object = move |request: tonic::Request<()>| {
-        let request = object_authority.require(request)?;
         object_rate_limits.authenticate_object(&object_tokens, request)
     };
     let index_tokens = tokens.clone();
@@ -700,11 +724,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         AdministrationServiceServer::new(administration_service),
         authenticate,
     );
-    let credential_authority = serving_fence.authority();
-    let credential_service = tonic::service::interceptor::InterceptedService::new(
-        CredentialServiceServer::new(credential_service),
-        move |request| credential_authority.require(request),
-    );
+    let credential_service = CredentialServiceServer::new(credential_service);
 
     let object_service = MutationAdmissionService::new(
         object_service,
@@ -749,8 +769,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .add_service(authz_service)
         .add_service(administration_service)
         // Deliberately not bearer-authenticated: this service exchanges
-        // durable long-lived credentials for that bearer token. It still
-        // requires the node-wide serving fence.
+        // durable long-lived credentials for that bearer token. Its
+        // distributed verifier selects and rechecks an ACTIVE replica.
         .add_service(credential_service)
         .into_axum_router();
     let gateway_router = plugin_gateway::router(plugin_state)
@@ -789,12 +809,15 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         Signal(std::io::Result<()>),
         Public(Result<Result<()>, tokio::task::JoinError>),
         Peer(Result<Result<()>, tokio::task::JoinError>),
+        Join(Result<Result<()>, tokio::task::JoinError>),
     }
     let first_stop = tokio::select! {
         signal = tokio::signal::ctrl_c() => FirstStop::Signal(signal),
         public = public_server.task_mut() => FirstStop::Public(public),
         peer = peer_server.task_mut() => FirstStop::Peer(peer),
+        join = &mut pending_join_task => FirstStop::Join(join),
     };
+    pending_join_task.abort();
     let server_result = match first_stop {
         FirstStop::Signal(signal) => {
             let public = public_server.shutdown().await;
@@ -819,6 +842,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 .context("serve private peer listener");
             peer?;
             public
+        }
+        FirstStop::Join(join) => {
+            let public = public_server.shutdown().await;
+            let peer = peer_server.shutdown().await;
+            join.context("join background cluster-membership task")??;
+            public?;
+            peer
         }
     };
     blob_maintenance.shutdown().await;

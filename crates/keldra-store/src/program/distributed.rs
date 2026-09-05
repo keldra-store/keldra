@@ -54,10 +54,17 @@ impl ProgramPathStage {
     }
 
     pub fn validate(&self) -> Result<(), ProgramStoreError> {
+        let valid_program_hash = match self.authority {
+            ProgramBundleAuthority::StoredProgram { .. }
+            | ProgramBundleAuthority::LegacyProgramOnly { .. } => self.program_hash.0 != [0; 32],
+            ProgramBundleAuthority::BuiltInObjectTransaction { .. } => {
+                self.program_hash.0 == [0; 32]
+            }
+        };
         if self.format != PROGRAM_PATH_STAGE_FORMAT
             || self.begin_cursor == 0
             || self.bundle_hash.0 == [0; 32]
-            || self.program_hash.0 == [0; 32]
+            || !valid_program_hash
             || self.participant_manifest_hash == [0; 32]
             || self.tenant_id == 0
             || self.bucket_id == 0

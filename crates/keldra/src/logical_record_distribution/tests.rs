@@ -18,6 +18,7 @@ struct StoreTransport {
     stores: BTreeMap<NodeId, Store>,
     failed_applies: Mutex<BTreeSet<NodeId>>,
     failed_repairs: Mutex<BTreeSet<NodeId>>,
+    hung_reads: Mutex<BTreeSet<NodeId>>,
     block_reads: AtomicBool,
     reads_started: AtomicUsize,
     reads_changed: tokio::sync::Notify,
@@ -31,6 +32,10 @@ impl StoreTransport {
 
     fn fail_repair(&self, node: NodeId) {
         self.failed_repairs.lock().unwrap().insert(node);
+    }
+
+    fn hang_read(&self, node: NodeId) {
+        self.hung_reads.lock().unwrap().insert(node);
     }
 
     async fn wait_for_reads(&self, expected: usize) {
@@ -57,6 +62,9 @@ impl LogicalRecordReplicaTransport for StoreTransport {
         _address: &str,
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordCandidate>, Status> {
+        if self.hung_reads.lock().unwrap().contains(&target) {
+            std::future::pending().await
+        }
         if self.block_reads.load(Ordering::SeqCst) {
             self.reads_started.fetch_add(1, Ordering::SeqCst);
             self.reads_changed.notify_waiters();
@@ -158,8 +166,9 @@ async fn fixture_with_retention(
         local_node,
         store: stores[&local_node].clone(),
         peers: transport.clone(),
-        coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+        coordinator_serial: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
         mutation_admission: crate::mutation_admission::MutationAdmission::new(),
+        replica_timeout: LOGICAL_RECORD_REPLICA_TIMEOUT,
     };
     Fixture {
         _root: root,
@@ -285,7 +294,7 @@ async fn exact_journal_capacity_blocks_without_mutation_then_wakes_and_retries()
 
     let serial = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        fixture.core.coordinator_serial.lock(),
+        fixture.core.serial_for(&policy_value("second").id()).lock(),
     )
     .await
     .expect("capacity waiting must release the coordinator serialization lock");
@@ -398,6 +407,80 @@ async fn quorum_proven_current_state_repairs_a_multi_version_stale_replica() {
             selected
         );
     }
+}
+
+#[tokio::test]
+async fn unavailable_minority_cannot_block_a_three_node_read_quorum() {
+    let fixture = fixture(3).await;
+    let replicas = fixture.route.group.replicas();
+    let value = policy_value("quorum");
+    let candidate = fixture.stores[&replicas[0]]
+        .construct_logical_record_mutation(value.clone(), context(&fixture.route, 100))
+        .unwrap();
+    for replica in &replicas[..2] {
+        fixture.stores[replica]
+            .apply_logical_record_mutation_replica(&candidate)
+            .unwrap();
+    }
+    fixture.transport.hang_read(replicas[2]);
+
+    let selected = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        fixture.core.reconcile(&fixture.route, &value.id()),
+    )
+    .await
+    .expect("an exact quorum must not wait for the unavailable minority")
+    .unwrap();
+    assert_eq!(
+        selected,
+        Some(LogicalRecordCandidate::Versioned(candidate.clone()))
+    );
+    assert_eq!(
+        fixture.stores[&replicas[2]]
+            .logical_record_candidate(&value.id())
+            .unwrap(),
+        None,
+        "an unavailable minority remains eligible for later reconciliation"
+    );
+}
+
+#[tokio::test]
+async fn slow_minority_successor_is_left_intact_after_predecessor_quorum() {
+    let fixture = fixture(3).await;
+    let replicas = fixture.route.group.replicas();
+    let first_value = policy_value("predecessor");
+    let first = fixture.stores[&replicas[0]]
+        .construct_logical_record_mutation(first_value.clone(), context(&fixture.route, 100))
+        .unwrap();
+    for replica in replicas {
+        fixture.stores[replica]
+            .apply_logical_record_mutation_replica(&first)
+            .unwrap();
+    }
+    let successor = fixture.stores[&replicas[2]]
+        .construct_logical_record_mutation(policy_value("successor"), context(&fixture.route, 200))
+        .unwrap();
+    fixture.stores[&replicas[2]]
+        .apply_logical_record_mutation_replica(&successor)
+        .unwrap();
+    fixture.transport.hang_read(replicas[2]);
+
+    let selected = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        fixture.core.reconcile(&fixture.route, &first_value.id()),
+    )
+    .await
+    .expect("a slow minority successor must not block the predecessor quorum")
+    .unwrap();
+
+    assert_eq!(selected, Some(LogicalRecordCandidate::Versioned(first)));
+    assert_eq!(
+        fixture.stores[&replicas[2]]
+            .logical_record_candidate(&first_value.id())
+            .unwrap(),
+        Some(LogicalRecordCandidate::Versioned(successor)),
+        "the unavailable successor remains eligible for a later reconciliation"
+    );
 }
 
 #[tokio::test]
@@ -643,7 +726,40 @@ async fn retry_after_lost_response_returns_the_exact_committed_version() {
 }
 
 #[tokio::test]
-async fn one_process_mutex_serializes_complete_reconcile_mutate_sequences() {
+async fn independent_quorum_reads_do_not_queue_behind_one_reconciliation() {
+    let fixture = fixture(3).await;
+    fixture.transport.block_reads.store(true, Ordering::SeqCst);
+    let first_id = policy_value("read").id();
+    let second_id = (0..100)
+        .map(|suffix| LogicalRecordId::Credential {
+            client_id: format!("independent-{suffix}"),
+        })
+        .find(|id| logical_record_serial_lane(id) != logical_record_serial_lane(&first_id))
+        .expect("test identities should occupy independent serial lanes");
+    let mut reads = Vec::new();
+    for id in [first_id, second_id] {
+        let core = fixture.core.clone();
+        let route = fixture.route.clone();
+        reads.push(tokio::spawn(async move {
+            let _serial = core.serial_for(&id).lock().await;
+            core.reconcile(&route, &id).await
+        }));
+    }
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        fixture.transport.wait_for_reads(4),
+    )
+    .await
+    .expect("both quorum reads should reach their two remote replicas");
+    fixture.transport.release_reads();
+    for read in reads {
+        assert_eq!(read.await.unwrap().unwrap(), None);
+    }
+}
+
+#[tokio::test]
+async fn one_process_write_gate_serializes_complete_reconcile_mutate_sequences() {
     let fixture = fixture(3).await;
     fixture.transport.block_reads.store(true, Ordering::SeqCst);
     let first_core = fixture.core.clone();
@@ -696,6 +812,37 @@ async fn coordinator_rechecks_the_exact_fence_before_mutation_and_return() {
         .await
         .unwrap();
     assert_eq!(checks.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn every_selected_replica_may_coordinate_a_quorum_read() {
+    let fixture = fixture(3).await;
+    for replica in fixture.route.group.replicas() {
+        require_local_read_replica(&fixture.route, *replica).unwrap();
+    }
+    assert_eq!(
+        require_local_read_replica(&fixture.route, NodeId(999))
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+}
+
+#[test]
+fn selected_read_targets_prefer_local_without_losing_ranked_fallbacks() {
+    let target = |node_id| LogicalRecordReadTarget {
+        node_id: NodeId(node_id),
+        address: format!("node-{node_id}"),
+        placement_fence: PlacementLogId { term: 3, index: 7 },
+    };
+    assert_eq!(
+        order_read_targets_local_first(vec![target(1), target(2), target(3)], NodeId(2)),
+        vec![target(2), target(1), target(3)]
+    );
+    assert_eq!(
+        order_read_targets_local_first(vec![target(1), target(2), target(3)], NodeId(9)),
+        vec![target(1), target(2), target(3)]
+    );
 }
 
 #[test]

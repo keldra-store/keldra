@@ -5,6 +5,8 @@
 //! three weighted-HRW ranks; no record ownership is persisted in Raft.
 
 use std::sync::Arc;
+use std::time::Duration;
+use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
@@ -18,6 +20,9 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
+
+const LOGICAL_RECORD_SERIAL_LANES: usize = 64;
+const LOGICAL_RECORD_REPLICA_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Typed private transport seam. Peers expose logical records, never raw
 /// column-family keys or values.
@@ -72,11 +77,13 @@ struct LogicalRecordDistributionCore {
     local_node: NodeId,
     store: Store,
     peers: Arc<dyn LogicalRecordReplicaTransport>,
-    /// Routing provides one coordinator per record. A single local gate is
-    /// sufficient to serialize every reconcile/mutate sequence handled by
-    /// this process without a per-record lock registry.
-    coordinator_serial: Arc<tokio::sync::Mutex<()>>,
+    /// Reads and mutations for one logical record must remain serial so a
+    /// quorum repair cannot race a successor. Fixed keyed lanes preserve that
+    /// ordering without letting one unavailable peer queue every unrelated
+    /// name and credential lookup in the process behind its reconciliation.
+    coordinator_serial: Arc<[tokio::sync::Mutex<()>; LOGICAL_RECORD_SERIAL_LANES]>,
     mutation_admission: crate::mutation_admission::MutationAdmission,
+    replica_timeout: Duration,
 }
 
 impl LogicalRecordDistributionCore {
@@ -89,11 +96,11 @@ impl LogicalRecordDistributionCore {
     where
         F: FnMut() -> Result<(), Status> + Send,
     {
+        let id = typed_value.id();
         loop {
-            let serial = self.coordinator_serial.lock().await;
+            let serial = self.serial_for(&id).lock().await;
             let permit = self.mutation_admission.enter()?;
             require_current_fence()?;
-            let id = typed_value.id();
             let current = self.reconcile(route, &id).await?;
             require_current_fence()?;
             if let Some(LogicalRecordCandidate::Versioned(existing)) = current
@@ -159,18 +166,39 @@ impl LogicalRecordDistributionCore {
         {
             let peers = self.peers.clone();
             let id = id.clone();
+            let replica_timeout = self.replica_timeout;
             tasks.spawn(async move {
-                let result = peers
-                    .read_candidate(endpoint.node_id, &endpoint.address, &id)
-                    .await;
+                let result = tokio::time::timeout(
+                    replica_timeout,
+                    peers.read_candidate(endpoint.node_id, &endpoint.address, &id),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Status::deadline_exceeded(
+                        "logical-record replica read timed out",
+                    ))
+                });
                 (endpoint.node_id, result)
             });
         }
-        while let Some(joined) = tasks.join_next().await {
+        while !has_exact_candidate_quorum(&observations, route.group.required_acknowledgements()) {
+            let Some(joined) = tasks.join_next().await else {
+                break;
+            };
             observations.push(joined.map_err(|error| {
                 Status::internal(format!("logical-record read task failed: {error}"))
             })?);
         }
+        // Preserve every response which is already complete, including a
+        // directly linked successor of the quorum anchor. Once an exact quorum
+        // exists, a still-pending minority is unavailable for this read: it is
+        // neither overwritten nor needed to prove the selected current state.
+        while let Some(joined) = tasks.try_join_next() {
+            observations.push(joined.map_err(|error| {
+                Status::internal(format!("logical-record read task failed: {error}"))
+            })?);
+        }
+        tasks.abort_all();
 
         let successful = observations
             .iter()
@@ -227,16 +255,35 @@ impl LogicalRecordDistributionCore {
                 .iter()
                 .find(|(node, _)| *node == endpoint.node_id)
                 .and_then(|(_, result)| result.as_ref().ok());
+            // A peer that could not answer the quorum read is not allowed to
+            // delay an otherwise durable result with a second repair attempt.
+            // Join/reconciliation or a later read will repair that minority.
+            if observed.is_none() {
+                continue;
+            }
             if observed == Some(&winner) {
                 continue;
             }
             let peers = self.peers.clone();
             let id = id.clone();
             let winner = winner.clone();
+            let replica_timeout = self.replica_timeout;
             repairs.spawn(async move {
-                let result = peers
-                    .repair_candidate(endpoint.node_id, &endpoint.address, &id, winner.as_ref())
-                    .await;
+                let result = tokio::time::timeout(
+                    replica_timeout,
+                    peers.repair_candidate(
+                        endpoint.node_id,
+                        &endpoint.address,
+                        &id,
+                        winner.as_ref(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Status::deadline_exceeded(
+                        "logical-record replica repair timed out",
+                    ))
+                });
                 (endpoint.node_id, result)
             });
         }
@@ -294,10 +341,18 @@ impl LogicalRecordDistributionCore {
         {
             let peers = self.peers.clone();
             let mutation = mutation.clone();
+            let replica_timeout = self.replica_timeout;
             tasks.spawn(async move {
-                let result = peers
-                    .apply_mutation(endpoint.node_id, &endpoint.address, &mutation)
-                    .await;
+                let result = tokio::time::timeout(
+                    replica_timeout,
+                    peers.apply_mutation(endpoint.node_id, &endpoint.address, &mutation),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Status::deadline_exceeded(
+                        "logical-record replica mutation timed out",
+                    ))
+                });
                 (endpoint.node_id, result)
             });
         }
@@ -317,6 +372,10 @@ impl LogicalRecordDistributionCore {
             )));
         }
         Ok(local)
+    }
+
+    fn serial_for(&self, id: &LogicalRecordId) -> &tokio::sync::Mutex<()> {
+        &self.coordinator_serial[logical_record_serial_lane(id)]
     }
 }
 
@@ -348,8 +407,9 @@ impl LogicalRecordDistribution {
                 local_node,
                 store,
                 peers,
-                coordinator_serial: Arc::new(tokio::sync::Mutex::new(())),
+                coordinator_serial: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
                 mutation_admission,
+                replica_timeout: LOGICAL_RECORD_REPLICA_TIMEOUT,
             },
         }
     }
@@ -373,31 +433,69 @@ impl LogicalRecordDistribution {
             .await
     }
 
-    /// Reconcile one complete logical record at its current HRW coordinator.
-    /// No replica-local or cached value is exposed through this boundary.
+    /// Reconcile one complete logical record at any currently selected replica.
+    /// No replica-local or cached value is exposed through this boundary: the
+    /// selected replica still obtains and repairs an exact read quorum.
     pub(crate) async fn read(
         &self,
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordValue>, Status> {
-        let _serial = self.core.coordinator_serial.lock().await;
-        let route = self.route(id)?;
-        if route.group.coordinator() != self.local_node {
-            return Err(Status::failed_precondition(format!(
-                "logical record is coordinated by node {}",
-                route.group.coordinator().0
-            )));
-        }
-        self.require_current_route(id, &route)?;
+        let _serial = self.core.serial_for(id).lock().await;
+        let route = self.read_route(id)?;
+        require_local_read_replica(&route, self.local_node)?;
+        self.require_current_read_route(id, &route)?;
         let candidate = self.core.reconcile(&route, id).await?;
-        self.require_current_route(id, &route)?;
+        self.require_current_read_route(id, &route)?;
         Ok(candidate.map(|candidate| candidate.typed_value().clone()))
+    }
+
+    /// Return every current replica in deterministic placement order. Callers
+    /// prefer rank zero but may try a later replica after an availability
+    /// failure; each target independently performs the same quorum read.
+    pub(crate) fn read_targets(
+        &self,
+        id: &LogicalRecordId,
+    ) -> Result<Vec<LogicalRecordReadTarget>, Status> {
+        // A JOINING node may act as a public gateway before it owns a serving
+        // fence. Name reads still go only to replicas selected from the
+        // applied ACTIVE placement, where the target performs the ordinary
+        // fenced quorum read. Do not require the gateway itself to be a
+        // serving replica merely to discover those targets.
+        let route = self.read_route(id)?;
+        Ok(route
+            .endpoints
+            .iter()
+            .map(|endpoint| LogicalRecordReadTarget {
+                node_id: endpoint.node_id,
+                address: endpoint.address.clone(),
+                placement_fence: route.active_placement_log_id,
+            })
+            .collect())
+    }
+
+    /// Return the selected read replicas with this process first when it owns
+    /// one replica. A local selected replica still performs the complete
+    /// quorum read and repair; preferring it avoids routing a peer name lookup
+    /// back through another selected node before reaching local authority.
+    pub(crate) fn read_targets_local_first(
+        &self,
+        id: &LogicalRecordId,
+    ) -> Result<Vec<LogicalRecordReadTarget>, Status> {
+        Ok(order_read_targets_local_first(
+            self.read_targets(id)?,
+            self.local_node,
+        ))
+    }
+
+    pub(crate) fn is_local_read_target(&self, target: &LogicalRecordReadTarget) -> bool {
+        target.node_id == self.local_node
     }
 
     pub(crate) fn read_target(
         &self,
         id: &LogicalRecordId,
     ) -> Result<Option<LogicalRecordReadTarget>, Status> {
-        let route = self.route(id)?;
+        let route = self.read_route(id)?;
         let coordinator = route.group.coordinator();
         if coordinator == self.local_node {
             return Ok(None);
@@ -428,6 +526,20 @@ impl LogicalRecordDistribution {
         }
     }
 
+    pub(crate) fn require_replica_read_target(
+        &self,
+        id: &LogicalRecordId,
+        expected: &LogicalRecordReadTarget,
+    ) -> Result<(), Status> {
+        if self.read_targets(id)?.contains(expected) {
+            Ok(())
+        } else {
+            Err(Status::unavailable(
+                "logical-record replica placement changed during read",
+            ))
+        }
+    }
+
     fn require_current_route(
         &self,
         id: &LogicalRecordId,
@@ -437,6 +549,20 @@ impl LogicalRecordDistribution {
         if current != *expected || current.group.coordinator() != self.local_node {
             return Err(Status::unavailable(
                 "logical-record placement or serving fence changed during coordination",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_current_read_route(
+        &self,
+        id: &LogicalRecordId,
+        expected: &LogicalRecordRoute,
+    ) -> Result<(), Status> {
+        let current = self.read_route(id)?;
+        if current != *expected || !current.group.replicas().contains(&self.local_node) {
+            return Err(Status::unavailable(
+                "logical-record placement or serving fence changed during read",
             ));
         }
         Ok(())
@@ -461,6 +587,29 @@ impl LogicalRecordDistribution {
                 "serving lease does not cover the applied placement",
             ));
         }
+        self.route_from_placement(id, placement, serving.serving_fence_term)
+    }
+
+    fn read_route(&self, id: &LogicalRecordId) -> Result<LogicalRecordRoute, Status> {
+        self.core
+            .store
+            .logical_record_candidate(id)
+            .map_err(logical_record_status)?;
+        let state = self
+            .decisions
+            .state()
+            .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
+        let placement = ClusterPlacement::from_applied(&state)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        self.route_from_placement(id, placement, 0)
+    }
+
+    fn route_from_placement(
+        &self,
+        id: &LogicalRecordId,
+        placement: ClusterPlacement,
+        serving_fence_term: u64,
+    ) -> Result<LogicalRecordRoute, Status> {
         let (kind, key) = placement_key(id)?;
         let group = MutableRecordReplicaGroup::select(
             kind,
@@ -488,10 +637,29 @@ impl LogicalRecordDistribution {
         Ok(LogicalRecordRoute {
             group,
             endpoints,
-            active_placement_log_id: serving.active_placement_log_id,
-            serving_fence_term: serving.serving_fence_term,
+            active_placement_log_id: placement.fence(),
+            serving_fence_term,
         })
     }
+}
+
+fn has_exact_candidate_quorum(
+    observations: &[(NodeId, Result<Option<LogicalRecordCandidate>, Status>)],
+    required: usize,
+) -> bool {
+    if required == 0 {
+        return false;
+    }
+    observations.iter().any(|(_, result)| {
+        let Ok(candidate) = result else {
+            return false;
+        };
+        observations
+            .iter()
+            .filter(|(_, other)| other.as_ref().ok() == Some(candidate))
+            .count()
+            >= required
+    })
 }
 
 fn placement_key(id: &LogicalRecordId) -> Result<(PlacementKind, Vec<u8>), Status> {
@@ -537,6 +705,13 @@ fn placement_key(id: &LogicalRecordId) -> Result<(PlacementKind, Vec<u8>), Statu
             "tenant schemas belong to the tenant-wide Zanzibar replica group",
         )),
     }
+}
+
+fn logical_record_serial_lane(id: &LogicalRecordId) -> usize {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    usize::try_from(hasher.finish() % LOGICAL_RECORD_SERIAL_LANES as u64)
+        .expect("logical-record serial lane fits usize")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -792,6 +967,35 @@ fn candidate_version(candidate: Option<&LogicalRecordCandidate>) -> Option<Versi
         Some(LogicalRecordCandidate::Versioned(mutation)) => Some(mutation.record_version),
         None | Some(LogicalRecordCandidate::Baseline { .. }) => None,
     }
+}
+
+fn require_local_read_replica(
+    route: &LogicalRecordRoute,
+    local_node: NodeId,
+) -> Result<(), Status> {
+    if route.group.replicas().contains(&local_node) {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(format!(
+            "logical record is not replicated by node {}",
+            local_node.0
+        )))
+    }
+}
+
+fn order_read_targets_local_first(
+    mut targets: Vec<LogicalRecordReadTarget>,
+    local_node: NodeId,
+) -> Vec<LogicalRecordReadTarget> {
+    if let Some(index) = targets
+        .iter()
+        .position(|target| target.node_id == local_node)
+        && index != 0
+    {
+        let local = targets.remove(index);
+        targets.insert(0, local);
+    }
+    targets
 }
 
 fn logical_record_status(error: LogicalRecordError) -> Status {

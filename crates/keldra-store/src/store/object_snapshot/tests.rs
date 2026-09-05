@@ -78,6 +78,39 @@ fn path_record(records: &[ObjectRecordExport], path: &str) -> ObjectPathSnapshot
 }
 
 #[tokio::test]
+async fn complete_path_batch_preserves_history_absence_duplicates_and_order() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = populated_store(temporary.path()).await;
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let paths = vec![
+        "b".to_owned(),
+        "missing".to_owned(),
+        "a".to_owned(),
+        "b".to_owned(),
+    ];
+
+    let snapshots = store
+        .export_object_path_records(tenant_id, bucket_id, &paths)
+        .unwrap();
+
+    assert_eq!(snapshots.len(), paths.len());
+    assert_eq!(snapshots[0], snapshots[3]);
+    assert!(snapshots[1].is_none());
+    assert_eq!(snapshots[0].as_ref().unwrap().exact_path, "b");
+    assert_eq!(snapshots[0].as_ref().unwrap().versions.len(), 1);
+    assert_eq!(snapshots[2].as_ref().unwrap().exact_path, "a");
+    assert_eq!(snapshots[2].as_ref().unwrap().versions.len(), 2);
+    for (snapshot, path) in snapshots.iter().zip(paths) {
+        assert_eq!(
+            snapshot,
+            &store
+                .export_object_path_record(tenant_id, bucket_id, &path)
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
 async fn bounded_pages_install_replay_and_survive_restart_without_payload_bytes() {
     let temporary = tempfile::tempdir().unwrap();
     let source_path = temporary.path().join("source");

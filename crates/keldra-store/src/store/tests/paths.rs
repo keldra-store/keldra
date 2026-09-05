@@ -179,7 +179,7 @@ async fn pre_integrated_column_family_layout_is_rejected_without_migration() {
     assert!(
         error
             .to_string()
-            .contains("does not use the exact 0.16 storage layout")
+            .contains("does not use the current storage layout")
     );
 }
 

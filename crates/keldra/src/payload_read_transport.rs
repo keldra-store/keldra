@@ -80,7 +80,7 @@ impl PayloadReadTransport for StorePayloadReadTransport {
     ) -> Result<(), PayloadReadTransportError> {
         if self.is_local(target) {
             self.store
-                .seal_small_copy(reference, bytes)
+                .seal_replica_small_copy(reference, bytes)
                 .await
                 .map(|_| ())
                 .map_err(map_payload_error)
@@ -250,7 +250,7 @@ impl PayloadReadTransport for StorePayloadReadTransport {
     ) -> Result<(), PayloadReadTransportError> {
         if self.is_local(target) {
             self.store
-                .seal_shard(&self.codec, identity, source)
+                .seal_replica_shard(&self.codec, identity, source)
                 .await
                 .map(|_| ())
                 .map_err(map_shard_error)

@@ -60,6 +60,7 @@ pub(crate) use transport::ClusterPeerTransport;
 pub(crate) const CLUSTER_PEER_SCHEMA_VERSION: u32 = 4;
 const MAX_CLUSTER_PEER_MESSAGE_BYTES: usize = 64 * 1024 * 1024 + 64 * 1024;
 const MAX_CLUSTER_OPERATION_TIME: Duration = Duration::from_secs(30);
+const MAX_CLUSTER_BULK_OPERATION_TIME: Duration = Duration::from_millis(u32::MAX as u64);
 const MAX_INDEX_SOURCE_SNAPSHOT_TIME: Duration = Duration::from_secs(60 * 60);
 const MAX_TYPED_JSON_BYTES: usize = 16 * 1024 * 1024;
 
@@ -79,6 +80,7 @@ pub(crate) struct ClusterPeerService {
     routed_personaldb: RoutedPersonalDbHandlers,
     routed: RoutedPublicHandlers,
     routed_authz: RoutedAuthzHandlers,
+    bulk_write_timeout: Duration,
 }
 
 pub(crate) type ClusterPeerServer =
@@ -100,6 +102,7 @@ impl ClusterPeerService {
         routed_personaldb: RoutedPersonalDbHandlers,
         routed: RoutedPublicHandlers,
         routed_authz: RoutedAuthzHandlers,
+        bulk_write_timeout: Duration,
     ) -> Self {
         Self {
             local_node,
@@ -116,6 +119,7 @@ impl ClusterPeerService {
             routed_personaldb,
             routed,
             routed_authz,
+            bulk_write_timeout,
         }
     }
 

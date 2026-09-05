@@ -1436,7 +1436,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2021,7 +2021,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -2353,7 +2353,7 @@ dependencies = [
 
 [[package]]
 name = "keldra"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "jiff",
  "keldra-api",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-api"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-atomic-program"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-authz"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-cli"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-consensus"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "bincode",
  "hyper-util",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-index"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "blake3",
  "thiserror 2.0.19",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-osv-qualification"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-server"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-store"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2815,9 +2815,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openraft"
-version = "0.9.24"
+version = "0.9.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80d35e2f60cdf9bcfc39a020966091017c6dc2a4b43b355a22ca3e76106f4a0a"
+checksum = "a97014fb78acb77be3a40ac2da305f6dd3a6b243f3a908ace87d29b3972eaafd"
 dependencies = [
  "anyerror",
  "byte-unit",
@@ -3328,7 +3328,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.43",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -3367,9 +3367,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3770,7 +3770,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3840,7 +3840,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4312,7 +4312,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4996,7 +4996,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5282,7 +5282,7 @@ dependencies = [
 
 [[package]]
 name = "zanzibar"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "keldra",

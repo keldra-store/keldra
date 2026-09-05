@@ -237,6 +237,9 @@ impl TypedAddHandoff {
         finished: &BTreeMap<NodeId, SourceTail>,
     ) -> Result<Vec<LocalChange>, Status> {
         let mut changes = Vec::new();
+        // Only ACTIVE nodes are mutation authorities during the handoff. The
+        // JOINING public endpoint routes work to those authorities and does
+        // not become a source-journal authority until activation.
         for endpoint in &topology.active {
             let before = started
                 .get(&endpoint.node_id)
@@ -284,30 +287,34 @@ impl TypedAddHandoff {
         Ok(changes)
     }
 
-    async fn require_reference_cursors(
+    async fn await_reference_cursors(
         &self,
+        descriptor: &NodeDescriptor,
+        transition: &MembershipTransition,
         topology: &HandoffTopology,
         peers: &DataPeerTransport,
         tails: &BTreeMap<NodeId, SourceTail>,
     ) -> Result<(), Status> {
-        for destination in &topology.active {
-            for tail in tails.values() {
-                let cursor = peers
-                    .handoff_reference_cursor(
-                        destination.node_id,
-                        &destination.address,
-                        tail.source_id,
-                    )
-                    .await?;
-                if cursor != tail.tail {
-                    return Err(Status::unavailable(format!(
-                        "node {} reference cursor is {cursor}, expected {} before handoff",
-                        destination.node_id.0, tail.tail
-                    )));
+        loop {
+            let mut caught_up = true;
+            for destination in &topology.active {
+                for tail in tails.values() {
+                    let cursor = peers
+                        .handoff_reference_cursor(
+                            destination.node_id,
+                            &destination.address,
+                            tail.source_id,
+                        )
+                        .await?;
+                    caught_up &= reference_cursor_caught_up(destination.node_id, cursor, *tail)?;
                 }
             }
+            if caught_up {
+                return Ok(());
+            }
+            self.require_current(descriptor, transition).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        Ok(())
     }
 
     async fn advance_joiner_reference_cursors(
@@ -371,7 +378,11 @@ impl TypedAddHandoff {
         // completes, so the resulting snapshot is stable across all owners.
         self.mutation_admission.close_now(identity)?;
         let mut remote_closes = tokio::task::JoinSet::new();
-        for endpoint in &topology.active {
+        for endpoint in topology
+            .active
+            .iter()
+            .chain(std::iter::once(&topology.joining))
+        {
             if endpoint.node_id == self.local_node {
                 continue;
             }
@@ -385,7 +396,7 @@ impl TypedAddHandoff {
         }
 
         let local = self.mutation_admission.drain(identity).await?;
-        let mut remote = Vec::with_capacity(topology.active.len().saturating_sub(1));
+        let mut remote = Vec::with_capacity(topology.active.len());
         while let Some(result) = remote_closes.join_next().await {
             remote.push(result.map_err(|error| {
                 Status::internal(format!("remote mutation-drain task failed: {error}"))
@@ -407,7 +418,11 @@ impl TypedAddHandoff {
                 joining_node_id: scope.joining_node_id,
                 started_log_index: scope.started_log_index,
             });
-        for endpoint in &topology.active {
+        for endpoint in topology
+            .active
+            .iter()
+            .chain(std::iter::once(&topology.joining))
+        {
             if endpoint.node_id == self.local_node {
                 continue;
             }
@@ -475,7 +490,7 @@ impl JoinActivationGate for TypedAddHandoff {
         let final_tail = self
             .settled_journal_tails(descriptor, transition, &topology, &peers)
             .await?;
-        self.require_reference_cursors(&topology, &peers, &final_tail)
+        self.await_reference_cursors(descriptor, transition, &topology, &peers, &final_tail)
             .await?;
         records::transfer_all(&topology, &peers).await?;
         let final_changes = self
@@ -607,6 +622,26 @@ fn source_tail(status: WatchJournalStatus) -> SourceTail {
     }
 }
 
+fn reference_cursor_caught_up(
+    destination: NodeId,
+    cursor: u64,
+    source: SourceTail,
+) -> Result<bool, Status> {
+    if cursor < source.retention_floor {
+        return Err(Status::data_loss(format!(
+            "node {} reference cursor {cursor} precedes retained source-journal floor {}",
+            destination.0, source.retention_floor
+        )));
+    }
+    if cursor > source.tail {
+        return Err(Status::data_loss(format!(
+            "node {} reference cursor {cursor} exceeds handoff source-journal tail {}",
+            destination.0, source.tail
+        )));
+    }
+    Ok(cursor == source.tail)
+}
+
 fn require_no_effect_payload_suffix(changes: &[LocalChange]) -> Result<(), Status> {
     for change in changes {
         match change {
@@ -628,12 +663,13 @@ fn require_no_effect_payload_suffix(changes: &[LocalChange]) -> Result<(), Statu
 
 #[cfg(test)]
 mod tests {
+    use keldra_consensus::NodeId;
     use keldra_store::{
         AggregateChanged, AggregateKind, BlobRef, ContentLifecycleChanged, LocalChange,
-        ObjectHeadChange, ObjectHeadChangeKind, ReferenceDelta, VersionId,
+        ObjectHeadChange, ObjectHeadChangeKind, ReferenceDelta, SourceId, VersionId,
     };
 
-    use super::require_no_effect_payload_suffix;
+    use super::{SourceTail, reference_cursor_caught_up, require_no_effect_payload_suffix};
 
     fn lifecycle(reference_deltas: Vec<ReferenceDelta>) -> LocalChange {
         LocalChange::ContentLifecycleChanged(ContentLifecycleChanged {
@@ -686,5 +722,33 @@ mod tests {
         });
         assert!(require_no_effect_payload_suffix(&[object]).is_err());
         assert!(require_no_effect_payload_suffix(&[aggregate]).is_err());
+    }
+
+    #[test]
+    fn handoff_reference_cursor_waits_only_for_a_retained_prefix() {
+        let source = SourceTail {
+            source_id: SourceId {
+                node_id: 2,
+                source_epoch: [3; 32],
+            },
+            tail: 12,
+            settled_through: 12,
+            retention_floor: 4,
+        };
+
+        assert!(!reference_cursor_caught_up(NodeId(1), 8, source).unwrap());
+        assert!(reference_cursor_caught_up(NodeId(1), 12, source).unwrap());
+        assert_eq!(
+            reference_cursor_caught_up(NodeId(1), 3, source)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
+        assert_eq!(
+            reference_cursor_caught_up(NodeId(1), 13, source)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
     }
 }

@@ -73,6 +73,21 @@ message ObjectPathSnapshotResponse {
   bytes snapshot_json = 2;
 }
 
+// One bounded ordered complete-record read for paths in the same stable
+// tenant/bucket. `snapshots_json` encodes
+// `Vec<Option<keldra_store::ObjectPathSnapshot>>` in request order.
+message ObjectPathSnapshotBatchRequest {
+  PeerContext peer = 1;
+  uint64 tenant_id = 2;
+  uint64 bucket_id = 3;
+  repeated string exact_paths = 4;
+}
+
+message ObjectPathSnapshotBatchResponse {
+  uint32 schema_version = 1;
+  bytes snapshots_json = 2;
+}
+
 // `snapshot_json` is the typed JSON encoding of
 // `Option<keldra_store::CurrentObjectSnapshot>`; it contains exactly the
 // current head and the immutable descriptor named by that head.
@@ -591,6 +606,7 @@ service DataPeer {
   rpc ApplyObjectMutationBatch(TypedMutationBatchRequest) returns (ObjectMutationBatchApplied);
   rpc ApplyRetainedVersionDelete(TypedMutationRequest) returns (RetainedVersionDeleteApplied);
   rpc ReadObjectPathSnapshot(ObjectPathSnapshotRequest) returns (ObjectPathSnapshotResponse);
+  rpc ReadObjectPathSnapshots(ObjectPathSnapshotBatchRequest) returns (ObjectPathSnapshotBatchResponse);
   rpc ReadCurrentObjectSnapshot(ObjectPathSnapshotRequest) returns (CurrentObjectSnapshotResponse);
   rpc ReadCurrentObjectSnapshots(CurrentObjectSnapshotBatchRequest) returns (CurrentObjectSnapshotBatchResponse);
   rpc ReadExactObjectVersions(ExactObjectVersionBatchRequest) returns (ExactObjectVersionBatchResponse);

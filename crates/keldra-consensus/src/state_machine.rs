@@ -424,6 +424,8 @@ impl StateMachine {
         }
 
         self.cluster_id = Some(cluster_id);
+        self.cluster_control.active_protocol_version = 2;
+        self.cluster_control.active_storage_format = 2;
         Ok(ApplyResult::ClusterInitialized { cluster_id })
     }
 
@@ -824,6 +826,25 @@ mod capability_tests {
     use openraft::{CommittedLeaderId, LogId};
 
     use super::*;
+
+    #[test]
+    fn fresh_cluster_initialization_selects_current_capabilities() {
+        let mut state = StateMachine::new(4, 64 * 1024).unwrap();
+        assert_eq!(state.cluster_control().active_protocol_version(), 1);
+        assert_eq!(state.cluster_control().active_storage_format(), 1);
+
+        state
+            .apply(
+                LogId::new(CommittedLeaderId::new(1, 1), 1),
+                &Command::InitializeCluster {
+                    cluster_id: ClusterId([1; 16]),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(state.cluster_control().active_protocol_version(), 2);
+        assert_eq!(state.cluster_control().active_storage_format(), 2);
+    }
 
     #[test]
     fn generalized_lifecycle_fails_closed_before_cluster_activation() {

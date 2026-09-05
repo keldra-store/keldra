@@ -14,7 +14,7 @@ pub(crate) use quorum_read::select_object_snapshot_quorum;
 use std::future::Future;
 use std::time::Duration;
 
-use keldra_consensus::{DecisionRaft, NodeId};
+use keldra_consensus::{DecisionRaft, MembershipTransitionKind, NodeId, NodeState};
 use keldra_store::{
     BatchOperation, BlobRef, CloneRequest, CoordinatedObjectMutation,
     CoordinatedRetainedVersionDelete, DefinitionMutationIntent, DeleteRetainedVersionOutcome,
@@ -315,12 +315,6 @@ impl ObjectDistribution {
             }
         }
 
-        if !placement.active_node_ids().contains(&upload_source) {
-            return Err(Status::failed_precondition(
-                "the upload source is not ACTIVE in the current placement",
-            ));
-        }
-
         let mut evidence = Vec::with_capacity(requests.len());
         for request in &requests {
             let prepared = self
@@ -562,12 +556,6 @@ impl ObjectDistribution {
                 group.coordinator().0
             )));
         }
-        if !placement.active_node_ids().contains(&upload_source) {
-            return Err(Status::failed_precondition(
-                "the upload source is not ACTIVE in the current placement",
-            ));
-        }
-
         let reference = request.blob.clone();
         let evidence = self
             .prepare_payload(&placement, upload_source, &reference, request.durability)
@@ -992,22 +980,68 @@ impl ObjectDistribution {
         Ok(self.placement()?.active_node_ids().len() == 1)
     }
 
-    /// Reject a response guarantee which the committed ACTIVE membership
-    /// cannot satisfy before the caller starts expensive or mutating work.
+    /// Wait for an in-progress ADD transition to make replicated durability
+    /// available, or reject a guarantee which the committed membership cannot
+    /// satisfy before the caller starts expensive or mutating work.
     ///
     /// Ordinary Put/Delete still perform their authoritative durability check
     /// at publication. This early check shares the same committed placement
     /// authority and only closes the one-node case where `REPLICATED` is
     /// impossible by definition. Membership may change afterwards, so the
     /// publication-time check remains mandatory.
-    pub(crate) fn require_durability_available(
+    pub(crate) async fn wait_for_durability_available(
         &self,
         durability: Durability,
+        deadline: tokio::time::Instant,
     ) -> Result<(), Status> {
-        if durability == Durability::Replicated && self.is_single_node()? {
-            Err(mutation_status(MutationError::DurabilityUnavailable))
-        } else {
-            Ok(())
+        if durability != Durability::Replicated {
+            return Ok(());
+        }
+        if self.wait_for_joining_replica(deadline).await? {
+            self.wait_for_local_serving_fence(deadline).await?;
+            return Ok(());
+        }
+        Err(mutation_status(MutationError::DurabilityUnavailable))
+    }
+
+    pub(crate) async fn wait_for_local_serving_fence(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Status> {
+        self.serving.wait_until_valid(deadline).await
+    }
+
+    /// Wait only when an ADD transition is already in progress. This lets a
+    /// mixed BulkWrite retain its per-item durability failures on a permanent
+    /// single-node cluster while avoiding a transient failure during join.
+    pub(crate) async fn wait_for_joining_replica(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, Status> {
+        loop {
+            let state = self
+                .decisions
+                .state()
+                .map_err(|_| Status::unavailable("applied cluster membership is unavailable"))?;
+            if state.cluster_control().active_node_count() > 1 {
+                return Ok(true);
+            }
+            let add_in_progress = state
+                .cluster_control()
+                .transition()
+                .filter(|transition| transition.kind == MembershipTransitionKind::Add)
+                .and_then(|transition| state.cluster_control().nodes().get(&transition.node_id))
+                .is_some_and(|descriptor| descriptor.state == NodeState::Joining);
+            if !add_in_progress {
+                return Ok(false);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Status::deadline_exceeded(
+                    "replicated durability did not become available before the request deadline",
+                ));
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
         }
     }
 
@@ -1050,7 +1084,7 @@ impl ObjectDistribution {
             .await
     }
 
-    /// Make a blob sealed by one exact ACTIVE upload source recoverable before
+    /// Make a blob sealed by one acknowledged upload source recoverable before
     /// a built-in atomic transaction becomes visible on the nominated executor.
     pub(crate) async fn prepare_program_blob_from_source(
         &self,
@@ -1058,11 +1092,6 @@ impl ObjectDistribution {
         upload_source: NodeId,
     ) -> Result<(), Status> {
         let placement = self.placement()?;
-        if !placement.active_node_ids().contains(&upload_source) {
-            return Err(Status::failed_precondition(
-                "built-in transaction upload source is not ACTIVE",
-            ));
-        }
         let evidence = self
             .prepare_payload(&placement, upload_source, reference, Durability::Replicated)
             .await?;
@@ -1100,6 +1129,14 @@ impl ObjectDistribution {
         reference: &BlobRef,
         durability: Durability,
     ) -> Result<crate::payload_distribution::PreparedPayloadEvidence, Status> {
+        let address = placement
+            .upload_source_address(upload_source)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "upload source {} is not an acknowledged ACTIVE or JOINING member",
+                    upload_source.0
+                ))
+            })?;
         if upload_source == self.local_node {
             return self
                 .payload
@@ -1107,12 +1144,6 @@ impl ObjectDistribution {
                 .await
                 .map_err(payload_status);
         }
-        let address = placement.address(upload_source).ok_or_else(|| {
-            Status::unavailable(format!(
-                "ACTIVE upload source {} has no peer address",
-                upload_source.0
-            ))
-        })?;
         self.payload_peers
             .prepare_payload(upload_source, &address.0, reference, durability)
             .await

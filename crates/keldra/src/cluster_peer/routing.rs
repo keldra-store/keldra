@@ -13,7 +13,10 @@ use prost::Message;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
-use super::{CLUSTER_PEER_SCHEMA_VERSION, ClusterPeerService, encode_json, wire};
+use super::{
+    CLUSTER_PEER_SCHEMA_VERSION, ClusterPeerService, MAX_CLUSTER_BULK_OPERATION_TIME, encode_json,
+    wire,
+};
 
 const MAX_ROUTED_BULK_ITEMS: usize = 1_000;
 const MAX_ROUTED_BULK_BYTES: usize = 64 * 1024 * 1024;
@@ -308,7 +311,8 @@ impl ClusterPeerService {
                 "definition mutation evidence is valid only on the internal bulk route",
             ));
         }
-        let (call, timeout) = self.routed_call(&request, request.get_ref().peer.as_ref(), bulk)?;
+        let (call, timeout) =
+            self.routed_bulk_call(&request, request.get_ref().peer.as_ref(), bulk)?;
         let fence = call.placement_fence;
         let response = tokio::time::timeout(timeout, self.routed.get()?.bulk_write(call))
             .await
@@ -380,7 +384,7 @@ impl ClusterPeerService {
             bulk.operations.len(),
         )?;
         let (mut call, timeout) =
-            self.routed_call(&request, request.get_ref().peer.as_ref(), bulk)?;
+            self.routed_bulk_call(&request, request.get_ref().peer.as_ref(), bulk)?;
         call.definition_intents = definition_intents;
         let fence = call.placement_fence;
         let response = tokio::time::timeout(timeout, self.routed.get()?.internal_bulk_write(call))
@@ -463,7 +467,7 @@ impl ClusterPeerService {
         let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
         let nomination = self.require_program_executor(
             &admitted.placement,
-            admitted.authenticated.node_id,
+            self.local_node,
             request.get_ref().executor_nomination_log_index,
         )?;
         if request.get_ref().lookups.len() > keldra_store::MAX_ATOMIC_BATCH_MUTATIONS {
@@ -550,6 +554,33 @@ impl ClusterPeerService {
         value: T,
     ) -> Result<(RoutedCall<T>, std::time::Duration), Status> {
         let admitted = self.admit(request, context, 1)?;
+        let bearer = bearer_from_metadata(request.metadata())?;
+        Ok((
+            RoutedCall {
+                bearer,
+                source_node: admitted.authenticated.node_id,
+                placement_fence: admitted.placement.fence(),
+                request: value,
+                definition_intents: Vec::new(),
+                atomic_executor_replay_checked: false,
+                delete_version_original_alias: None,
+            },
+            admitted.timeout,
+        ))
+    }
+
+    fn routed_bulk_call<T>(
+        &self,
+        request: &Request<impl Sized>,
+        context: Option<&wire::PeerContext>,
+        value: T,
+    ) -> Result<(RoutedCall<T>, std::time::Duration), Status> {
+        let admitted = self.admit_with_timeout_limit(
+            request,
+            context,
+            1,
+            self.bulk_write_timeout.min(MAX_CLUSTER_BULK_OPERATION_TIME),
+        )?;
         let bearer = bearer_from_metadata(request.metadata())?;
         Ok((
             RoutedCall {

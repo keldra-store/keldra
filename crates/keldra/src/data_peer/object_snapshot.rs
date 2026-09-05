@@ -65,7 +65,7 @@ fn validate_current_snapshot_identity(
     Ok(())
 }
 
-fn validate_current_snapshot_batch_request(
+fn validate_snapshot_batch_request(
     tenant_id: u64,
     bucket_id: u64,
     exact_paths: &[String],
@@ -76,14 +76,14 @@ fn validate_current_snapshot_batch_request(
         || exact_paths.len() > MAX_OBJECT_MUTATION_BATCH_ITEMS
     {
         return Err(Status::invalid_argument(format!(
-            "current object snapshot batch must contain 1..={MAX_OBJECT_MUTATION_BATCH_ITEMS} paths under valid stable IDs"
+            "object snapshot batch must contain 1..={MAX_OBJECT_MUTATION_BATCH_ITEMS} paths under valid stable IDs"
         )));
     }
     let mut request_bytes = 0_usize;
     for exact_path in exact_paths {
         if ObjectKey::new("t", "b", exact_path).is_err() {
             return Err(Status::invalid_argument(
-                "current object snapshot batch contains an invalid exact path",
+                "object snapshot batch contains an invalid exact path",
             ));
         }
         request_bytes = request_bytes
@@ -104,11 +104,28 @@ fn validate_exact_version_batch_request(
     exact_paths: &[String],
     version_ids: &[u64],
 ) -> Result<(), Status> {
-    validate_current_snapshot_batch_request(tenant_id, bucket_id, exact_paths)?;
+    validate_snapshot_batch_request(tenant_id, bucket_id, exact_paths)?;
     if version_ids.len() != exact_paths.len() || version_ids.contains(&0) {
         return Err(Status::invalid_argument(
             "exact-version batch paths and non-zero version IDs must have equal lengths",
         ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_batch(
+    snapshots: &[Option<ObjectPathSnapshot>],
+    tenant_id: u64,
+    bucket_id: u64,
+    exact_paths: &[String],
+) -> Result<(), Status> {
+    if snapshots.len() != exact_paths.len() {
+        return Err(Status::data_loss(
+            "object snapshot batch result count disagrees with its request",
+        ));
+    }
+    for (snapshot, exact_path) in snapshots.iter().zip(exact_paths) {
+        validate_snapshot_identity(snapshot.as_ref(), tenant_id, bucket_id, exact_path)?;
     }
     Ok(())
 }
@@ -225,13 +242,47 @@ impl DataPeerService {
         }))
     }
 
+    pub(super) async fn read_object_path_snapshots_call(
+        &self,
+        mut request: Request<wire::ObjectPathSnapshotBatchRequest>,
+    ) -> Result<Response<wire::ObjectPathSnapshotBatchResponse>, Status> {
+        let peer = request.get_ref().peer.clone();
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
+        validate_snapshot_batch_request(
+            request.get_ref().tenant_id,
+            request.get_ref().bucket_id,
+            &request.get_ref().exact_paths,
+        )?;
+        let metadata = request.metadata().clone();
+        let request = request.into_inner();
+        let tenant_id = request.tenant_id;
+        let bucket_id = request.bucket_id;
+        let exact_paths = request.exact_paths;
+        let store = self.store.clone();
+        let snapshots = self
+            .bounded(&metadata, async move {
+                tokio::task::spawn_blocking(move || {
+                    store.export_object_path_records(tenant_id, bucket_id, &exact_paths)
+                })
+                .await
+                .map_err(|error| Status::internal(format!("object snapshot batch read: {error}")))?
+                .map_err(map_object_snapshot_error)
+            })
+            .await?;
+        let snapshots_json = encode_object_snapshot(&snapshots)?;
+        Ok(Response::new(wire::ObjectPathSnapshotBatchResponse {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            snapshots_json,
+        }))
+    }
+
     pub(super) async fn read_current_object_snapshots_call(
         &self,
         mut request: Request<wire::CurrentObjectSnapshotBatchRequest>,
     ) -> Result<Response<wire::CurrentObjectSnapshotBatchResponse>, Status> {
         let peer = request.get_ref().peer.clone();
         self.authorize(&mut request, peer.as_ref(), PeerRpcKind::DataPlane)?;
-        validate_current_snapshot_batch_request(
+        validate_snapshot_batch_request(
             request.get_ref().tenant_id,
             request.get_ref().bucket_id,
             &request.get_ref().exact_paths,
@@ -406,6 +457,32 @@ impl DataPeerTransport {
         Ok(snapshot)
     }
 
+    pub(crate) async fn read_object_path_snapshots(
+        &self,
+        target: NodeId,
+        address: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_paths: &[String],
+    ) -> Result<Vec<Option<ObjectPathSnapshot>>, Status> {
+        validate_snapshot_batch_request(tenant_id, bucket_id, exact_paths)?;
+        let response = self
+            .client(target, address)?
+            .read_object_path_snapshots(wire::ObjectPathSnapshotBatchRequest {
+                peer: Some(self.context()),
+                tenant_id,
+                bucket_id,
+                exact_paths: exact_paths.to_vec(),
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        require_object_snapshot_bound(&response.snapshots_json)?;
+        let snapshots: Vec<Option<ObjectPathSnapshot>> = decode_typed(&response.snapshots_json)?;
+        validate_snapshot_batch(&snapshots, tenant_id, bucket_id, exact_paths)?;
+        Ok(snapshots)
+    }
+
     pub(crate) async fn read_current_object_snapshots(
         &self,
         target: NodeId,
@@ -414,7 +491,7 @@ impl DataPeerTransport {
         bucket_id: u64,
         exact_paths: &[String],
     ) -> Result<Vec<Option<CurrentObjectSnapshot>>, Status> {
-        validate_current_snapshot_batch_request(tenant_id, bucket_id, exact_paths)?;
+        validate_snapshot_batch_request(tenant_id, bucket_id, exact_paths)?;
         let response = self
             .client(target, address)?
             .read_current_object_snapshots(wire::CurrentObjectSnapshotBatchRequest {

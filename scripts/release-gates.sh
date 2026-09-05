@@ -138,33 +138,15 @@ image_gates() (
         --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
         get-cluster-capabilities 2>/dev/null || true
     )"
-    if grep -Eq 'active_protocol=1 active_storage=1 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
+    if grep -Eq 'active_protocol=2 active_storage=2 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
       break
     fi
     sleep 1
   done
-  if ! grep -Eq 'active_protocol=1 active_storage=1 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
-    echo "Keldra did not become ready for capability 2/2 activation: ${capabilities}" >&2
+  if ! grep -Eq 'active_protocol=2 active_storage=2 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
+    echo "Keldra did not start with active capability 2/2: ${capabilities}" >&2
     return 1
   fi
-  local placement_term placement_index
-  placement_term="$(sed -n 's/.*placement_term=\([0-9][0-9]*\).*/\1/p' <<<"${capabilities}")"
-  placement_index="$(sed -n 's/.*placement_index=\([0-9][0-9]*\).*/\1/p' <<<"${capabilities}")"
-  if [[ ! "${placement_term}" =~ ^[1-9][0-9]*$ || ! "${placement_index}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Keldra returned an invalid capability placement fence: ${capabilities}" >&2
-    return 1
-  fi
-  run_step "image capability 2/2 activation" docker run --rm \
-    --network "container:${container}" \
-    --volume "${scratch}/data:/var/lib/keldra:ro" \
-    "${image}" \
-    keldra --endpoint http://127.0.0.1:50051 \
-    --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
-    activate-cluster-capabilities \
-      --protocol-version 2 \
-      --storage-format 2 \
-      --expected-placement-term "${placement_term}" \
-      --expected-placement-index "${placement_index}"
 
   run_step "image authenticated bucket provisioning" docker run --rm \
     --network "container:${container}" \

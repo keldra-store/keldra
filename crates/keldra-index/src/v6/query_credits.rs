@@ -16,8 +16,14 @@ pub trait QueryMemoryPermit: Send {
 }
 
 enum QueryCreditPermit {
-    Pipeline { _permit: IndexingMemoryPermit },
-    Query { _permit: Box<dyn QueryMemoryPermit> },
+    Pipeline {
+        permit: IndexingMemoryPermit,
+        maximum: usize,
+        growable: bool,
+    },
+    Query {
+        _permit: Box<dyn QueryMemoryPermit>,
+    },
 }
 
 impl std::fmt::Debug for QueryBlockCredits {
@@ -33,12 +39,43 @@ impl std::fmt::Debug for QueryBlockCredits {
 
 impl QueryBlockCredits {
     pub fn from_pipeline_permit(permit: IndexingMemoryPermit) -> Self {
+        let admitted = permit.bytes();
         Self {
-            admitted: permit.bytes(),
-            remaining: permit.bytes(),
+            admitted,
+            remaining: admitted,
             loaded_blocks: 0,
-            _permit: QueryCreditPermit::Pipeline { _permit: permit },
+            _permit: QueryCreditPermit::Pipeline {
+                permit,
+                maximum: admitted,
+                growable: false,
+            },
         }
+    }
+
+    /// Start with a minimal pipeline reservation and grow it only as query
+    /// records become resident. The shared pipeline and stage limits remain
+    /// authoritative for every increment.
+    #[doc(hidden)]
+    pub fn from_growable_pipeline_permit(
+        permit: IndexingMemoryPermit,
+        maximum: usize,
+    ) -> Result<Self, IndexError> {
+        let admitted = permit.bytes();
+        if maximum < admitted {
+            return Err(IndexError::InvalidDefinition(
+                "v6 query memory maximum is below its initial admission".into(),
+            ));
+        }
+        Ok(Self {
+            admitted,
+            remaining: admitted,
+            loaded_blocks: 0,
+            _permit: QueryCreditPermit::Pipeline {
+                permit,
+                maximum,
+                growable: true,
+            },
+        })
     }
 
     pub fn from_query_permit(permit: Box<dyn QueryMemoryPermit>) -> Result<Self, IndexError> {
@@ -62,10 +99,45 @@ impl QueryBlockCredits {
 
     pub fn reserve(&mut self, bytes: usize) -> Result<(), IndexError> {
         if bytes > self.remaining {
-            return Err(IndexError::ResourceLimit {
-                needed: bytes,
-                limit: self.remaining,
-            });
+            let additional = bytes - self.remaining;
+            match &mut self._permit {
+                QueryCreditPermit::Pipeline {
+                    permit,
+                    maximum,
+                    growable: true,
+                } => {
+                    let next = self
+                        .admitted
+                        .checked_add(additional)
+                        .ok_or(IndexError::OffsetOverflow)?;
+                    if next > *maximum {
+                        return Err(IndexError::ResourceLimit {
+                            needed: next,
+                            limit: *maximum,
+                        });
+                    }
+                    permit.grow_to(next).map_err(|admission| match admission {
+                        super::MemoryAdmission::ReplayRequired {
+                            available_bytes, ..
+                        } => IndexError::ResourceLimit {
+                            needed: next,
+                            limit: self.admitted.saturating_add(available_bytes),
+                        },
+                        super::MemoryAdmission::Admitted => unreachable!(),
+                    })?;
+                    self.admitted = next;
+                    self.remaining = self
+                        .remaining
+                        .checked_add(additional)
+                        .ok_or(IndexError::OffsetOverflow)?;
+                }
+                _ => {
+                    return Err(IndexError::ResourceLimit {
+                        needed: bytes,
+                        limit: self.remaining,
+                    });
+                }
+            }
         }
         self.remaining -= bytes;
         Ok(())
@@ -112,5 +184,65 @@ impl QueryBlockCredits {
         self.remaining += bytes;
         self.loaded_blocks -= 1;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v6::{IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage};
+
+    fn memory(bytes: usize) -> IndexingMemoryCredits {
+        IndexingMemoryCredits::new(
+            bytes,
+            IndexingMemoryLimits {
+                hot_payload_bytes: bytes,
+                worker_scratch_bytes: bytes,
+                prepared_rows_bytes: bytes,
+                replay_input_bytes: bytes,
+                projection_accumulator_bytes: bytes,
+                seal_scratch_bytes: bytes,
+                ordering_catalog_bytes: bytes,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn growable_pipeline_credits_charge_only_resident_query_bytes() {
+        let memory = memory(256);
+        let permit = memory
+            .acquire(IndexingMemoryStage::OrderingCatalog, 1)
+            .unwrap();
+        let mut credits = QueryBlockCredits::from_growable_pipeline_permit(permit, 128).unwrap();
+
+        assert_eq!(memory.used_bytes(), 1);
+        credits.reserve(96).unwrap();
+        assert_eq!(memory.used_bytes(), 96);
+        assert_eq!(credits.remaining(), 0);
+        credits.release(32).unwrap();
+        assert_eq!(memory.used_bytes(), 96);
+        assert_eq!(credits.remaining(), 32);
+        drop(credits);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn growable_pipeline_credits_fail_without_losing_existing_admission() {
+        let memory = memory(128);
+        let _other = memory
+            .acquire(IndexingMemoryStage::OrderingCatalog, 64)
+            .unwrap();
+        let permit = memory
+            .acquire(IndexingMemoryStage::OrderingCatalog, 1)
+            .unwrap();
+        let mut credits = QueryBlockCredits::from_growable_pipeline_permit(permit, 128).unwrap();
+
+        assert!(matches!(
+            credits.reserve(65),
+            Err(IndexError::ResourceLimit { .. })
+        ));
+        assert_eq!(memory.used_bytes(), 65);
+        assert_eq!(credits.remaining(), 1);
     }
 }

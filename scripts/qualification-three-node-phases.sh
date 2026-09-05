@@ -86,11 +86,31 @@ start_prepared_node() {
   local node_id="$1"
   local service="keldra-${node_id}"
   compose up --detach "${service}"
-  wait_for_node "${service}"
+  wait_for_node "${service}" "${joining_node_ready_timeout_seconds}"
+  echo "[keldra-qualification] ${service} public coordinator endpoint became ready within ${joining_node_ready_timeout_seconds}s"
   if [[ -e "${KELDRA_QUALIFICATION_DIR}/artifacts/keldra-node-${node_id}.join.json" ]]; then
     echo "${service} became ready without consuming and deleting its join bundle" >&2
     return 1
   fi
+}
+
+wait_for_background_join() {
+  local service="$1"
+  local timeout_seconds="$2"
+  local attempt
+  for attempt in $(seq 1 "${timeout_seconds}"); do
+    # Consume the complete log stream. With pipefail, grep -q can close the
+    # pipe after the match and turn docker logs' SIGPIPE into a false failure.
+    if service_logs "${service}" \
+      | grep -F 'background cluster join completed' >/dev/null
+    then
+      echo "[keldra-qualification] ${service} background ownership handoff completed"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${service} did not complete background ownership handoff within ${timeout_seconds}s" >&2
+  return 1
 }
 
 prepare_and_start_node() {
@@ -157,34 +177,15 @@ run_cutover_writes() {
   local phase="$6"
   local first="$7"
   local count="$8"
-  local concurrency=8
-  local last=$((first + count))
-  local pid
-  local position
-  local -a pids=()
-  local failed=0
-  for ((position = first; position < last; position++)); do
-    run_cli "${node}" "${client_id}" "${client_secret}" \
-      put "${tenant}" "${bucket}" \
-        "membership-cutover/${phase}-${position}.bin" \
-        /qualification/artifacts/membership-cutover-byte.bin \
-        --command-id "membership-cutover-${phase}-${position}" \
-        --durability local --if-absent >/dev/null &
-    pids+=("$!")
-    if ((${#pids[@]} == concurrency)); then
-      for pid in "${pids[@]}"; do
-        wait "${pid}" || failed=1
-      done
-      pids=()
-    fi
-  done
-  for pid in "${pids[@]}"; do
-    wait "${pid}" || failed=1
-  done
-  if ((failed != 0)); then
-    echo "ordinary ${phase} writes failed during membership-cutover qualification" >&2
-    return 1
-  fi
+  KELDRA_CUTOVER_QUALIFICATION_ENDPOINT="$(public_endpoint_for "${node}")" \
+  KELDRA_CUTOVER_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_CUTOVER_QUALIFICATION_BUCKET="${bucket}" \
+  KELDRA_CUTOVER_QUALIFICATION_CLIENT_ID="${client_id}" \
+  KELDRA_CUTOVER_QUALIFICATION_CLIENT_SECRET="${client_secret}" \
+  KELDRA_CUTOVER_QUALIFICATION_PHASE="${phase}" \
+  KELDRA_CUTOVER_QUALIFICATION_FIRST="${first}" \
+  KELDRA_CUTOVER_QUALIFICATION_COUNT="${count}" \
+    "${qualification_binaries[cluster_cutover_qualification]}" >/dev/null
 }
 
 prepare_no_event_membership_cutover_qualification() {
@@ -197,29 +198,57 @@ prepare_no_event_membership_cutover_qualification() {
   local bound="$7"
   local batch=$((bound * 2))
   local attempt
+  local clear_tail
   local fence
   local line
+  local previous_clear_line=
+  local previous_clear_tail=
   local round
+  local stable_clear=0
   if [[ "${node_id}" == "1" ]]; then
     echo "no-event membership cutover source must not be the reconciliation coordinator" >&2
     return 1
   fi
-  printf 'x' >"${KELDRA_QUALIFICATION_DIR}/artifacts/membership-cutover-byte.bin"
-  chmod 0444 "${KELDRA_QUALIFICATION_DIR}/artifacts/membership-cutover-byte.bin"
 
   for round in 0 1; do
     run_cutover_writes \
       "${node}" "${client_id}" "${client_secret}" "${tenant}" "${bucket}" \
       pre "$((round * batch))" "${batch}"
-    for attempt in $(seq 1 30); do
+    # LOCAL durability may finish its deliberately asynchronous payload
+    # placement after the client has received every mutation receipt. A
+    # single sampled clear cut therefore does not prove that the source is
+    # quiescent: the 10-second sampler can still be showing the state from
+    # immediately before a final background placement. Require the same clear
+    # tail in two distinct samples before declaring the membership cutover to
+    # be a no-event interval.
+    previous_clear_line=
+    previous_clear_tail=
+    stable_clear=0
+    for attempt in $(seq 1 45); do
       line="$(latest_source_journal_sample "${node}")"
-      source_journal_sample_is_clear_at_bound "${line}" "${bound}" && break
+      if source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
+        clear_tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
+        if [[ -n "${previous_clear_line}" \
+          && "${line}" != "${previous_clear_line}" \
+          && "${clear_tail}" == "${previous_clear_tail}" ]]
+        then
+          stable_clear=1
+          break
+        fi
+        if [[ "${line}" != "${previous_clear_line}" ]]; then
+          previous_clear_line="${line}"
+          previous_clear_tail="${clear_tail}"
+        fi
+      else
+        previous_clear_line=
+        previous_clear_tail=
+      fi
       sleep 1
     done
-    source_journal_sample_is_clear_at_bound "${line}" "${bound}" && break
+    ((stable_clear == 1)) && break
   done
-  if ! source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
-    echo "${node} did not reach a clear source-journal entry bound of ${bound}" >&2
+  if ((stable_clear != 1)); then
+    echo "${node} did not reach a stable clear source-journal entry bound of ${bound}" >&2
     printf '%s\n' "${line}" >&2
     return 1
   fi
@@ -241,6 +270,41 @@ prepare_no_event_membership_cutover_qualification() {
   fi
   membership_cutover_source_log_start="$(log_cursor)"
   echo "[keldra-qualification] non-coordinator source ${node_id} reached journal bound ${bound} at tail ${membership_cutover_source_tail} before the no-event 2->3 cutover"
+}
+
+refresh_no_event_membership_cutover_tail() {
+  local node="$1"
+  local bound="$2"
+  local attempt
+  local clear_tail
+  local line=
+  local previous_clear_line=
+  local previous_clear_tail=
+  for attempt in $(seq 1 45); do
+    line="$(latest_source_journal_sample "${node}")"
+    if source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
+      clear_tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
+      if [[ -n "${previous_clear_line}" \
+        && "${line}" != "${previous_clear_line}" \
+        && "${clear_tail}" == "${previous_clear_tail}" ]]
+      then
+        membership_cutover_source_tail="${clear_tail}"
+        echo "[keldra-qualification] refreshed no-event cutover baseline at tail ${membership_cutover_source_tail} after the JOINING-node probe"
+        return 0
+      fi
+      if [[ "${line}" != "${previous_clear_line}" ]]; then
+        previous_clear_line="${line}"
+        previous_clear_tail="${clear_tail}"
+      fi
+    else
+      previous_clear_line=
+      previous_clear_tail=
+    fi
+    sleep 1
+  done
+  echo "${node} did not return to a stable clear source-journal entry bound of ${bound} after the JOINING-node probe" >&2
+  printf '%s\n' "${line}" >&2
+  return 1
 }
 
 new_cutover_fence_line() {

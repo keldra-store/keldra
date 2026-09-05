@@ -57,7 +57,8 @@ pub(super) async fn clone_object(
     let durability = durability(api_request.durability)?;
     service
         .distribution
-        .require_durability_available(durability)?;
+        .wait_for_durability_available(durability, deadline)
+        .await?;
     let mode = clone_mode(api_request.operation.as_ref())?;
     let source_requested_path = object_path(&source)?;
     let destination_requested_path = object_path(&destination)?;

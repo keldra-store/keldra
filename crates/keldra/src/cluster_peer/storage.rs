@@ -259,7 +259,7 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
     ) -> Result<Response<wire::LogicalRecordCandidate>, Status> {
         let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
         let id: LogicalRecordId = decode_json(&request.get_ref().id_json)?;
-        require_logical_replica(
+        require_logical_read_replicas(
             &admitted.placement,
             admitted.authenticated.node_id,
             self.local_node,
@@ -1151,6 +1151,64 @@ fn require_logical_replica(
         ));
     }
     Ok(())
+}
+
+fn require_logical_read_replicas(
+    placement: &crate::cluster_placement::ClusterPlacement,
+    source: keldra_consensus::NodeId,
+    local: keldra_consensus::NodeId,
+    id: &LogicalRecordId,
+) -> Result<(), Status> {
+    let (kind, key) = logical_placement_key(id)?;
+    let group = MutableRecordReplicaGroup::select(
+        kind,
+        placement.cluster_id(),
+        &key,
+        placement.placement_nodes(),
+    )
+    .ok_or_else(|| Status::unavailable("cluster has no logical-record replica"))?;
+    require_logical_read_pair(group.replicas(), source, local)
+}
+
+fn require_logical_read_pair(
+    replicas: &[keldra_consensus::NodeId],
+    source: keldra_consensus::NodeId,
+    local: keldra_consensus::NodeId,
+) -> Result<(), Status> {
+    if !replicas.contains(&source) || !replicas.contains(&local) {
+        return Err(Status::failed_precondition(
+            "logical record read is not routed between selected replicas",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod logical_record_peer_admission_tests {
+    use keldra_consensus::NodeId;
+
+    use super::*;
+
+    #[test]
+    fn logical_read_allows_selected_peers_and_rejects_outsiders() {
+        let replicas = [NodeId(1), NodeId(2), NodeId(3)];
+        let selected = NodeId(2);
+        let outside = NodeId(99);
+
+        require_logical_read_pair(&replicas, NodeId(3), selected).unwrap();
+        assert_eq!(
+            require_logical_read_pair(&replicas, outside, selected)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            require_logical_read_pair(&replicas, selected, outside)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
 }
 
 fn require_schema_replica(

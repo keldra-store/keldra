@@ -32,7 +32,6 @@ pub(super) const UNLINK_OBJECT_AUTHORITY_KIND: u16 = 3;
 pub(super) const PUT_THROUGH_LINK_AUTHORITY_KIND: u16 = 4;
 pub(super) const PUT_IMMUTABLE_THROUGH_LINK_AUTHORITY_KIND: u16 = 5;
 pub(super) const OBJECT_LINK_CONTRACT_VERSION: u16 = 1;
-
 #[derive(Clone)]
 pub(super) enum ResolvedAddress {
     Ordinary(ObjectKey),
@@ -495,7 +494,8 @@ pub(super) async fn link_object(
     let fingerprint = object_link_command_fingerprint(&link, Some(&supplied_target), durability);
     service
         .distribution
-        .require_durability_available(durability)?;
+        .wait_for_durability_available(durability, deadline)
+        .await?;
     let governance = service
         .bucket_governance
         .resolve(link.tenant(), link.bucket())
@@ -760,7 +760,8 @@ pub(super) async fn unlink_object(
     let fingerprint = object_link_command_fingerprint(&link, None, durability);
     service
         .distribution
-        .require_durability_available(durability)?;
+        .wait_for_durability_available(durability, deadline)
+        .await?;
     let governance = service
         .bucket_governance
         .resolve(link.tenant(), link.bucket())
@@ -850,7 +851,8 @@ pub(super) async fn delete_if_version_link(
     let fingerprint = conditional_unlink_fingerprint(&link, expected_target_version, durability);
     service
         .distribution
-        .require_durability_available(durability)?;
+        .wait_for_durability_available(durability, deadline)
+        .await?;
     let governance = service
         .bucket_governance
         .resolve(link.tenant(), link.bucket())

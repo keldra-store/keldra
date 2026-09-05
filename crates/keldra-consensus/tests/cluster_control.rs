@@ -29,8 +29,8 @@ fn joining(node_id: u64) -> NodeDescriptor {
         current_peer_spki_sha256: PeerSpkiSha256([node_id as u8; 32]),
         overlap_peer_spki_sha256: None,
         join_capability_hash: Some(JoinCapabilityHash([(node_id + 32) as u8; 32])),
-        supported_protocol: CapabilityRange { min: 1, max: 1 },
-        supported_storage_format: CapabilityRange { min: 1, max: 1 },
+        supported_protocol: CapabilityRange { min: 1, max: 2 },
+        supported_storage_format: CapabilityRange { min: 1, max: 2 },
     }
 }
 

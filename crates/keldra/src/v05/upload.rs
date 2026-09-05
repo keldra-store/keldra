@@ -10,6 +10,7 @@ pub(super) async fn start_put(
     let started = Instant::now();
     let result = async {
         let caller = authenticated_caller(&request)?;
+        let deadline = request_deadline(request.metadata(), service.atomic_program_timeout)?;
         let mut metadata = put_metadata(request.into_inner())?;
         object_path_access::require_key(&path_access, &metadata.key)?;
         require_plugin_key_scope(plugin_scope.as_ref(), &metadata.key)?;
@@ -29,7 +30,8 @@ pub(super) async fn start_put(
         }
         service
             .distribution
-            .require_durability_available(metadata.durability)?;
+            .wait_for_durability_available(metadata.durability, deadline)
+            .await?;
         service
             .issue_upload_token(&caller, &metadata)
             .map(Response::new)
@@ -178,7 +180,15 @@ pub(super) async fn put_end(
             .await?;
             return Ok(Response::new(receipt));
         }
-        let receipt = match service.distribution.routing_target(&publish.key)? {
+        let governance = service
+            .bucket_governance
+            .resolve(publish.key.tenant(), publish.key.bucket())
+            .await?;
+        let receipt = match service.distribution.routing_target_stable(
+            &publish.key,
+            governance.tenant_id,
+            governance.bucket_id,
+        )? {
             Some(_) if peer_routed => {
                 return Err(Status::failed_precondition(
                     "a routed PutEnd reached a node that is not its coordinator",
@@ -209,24 +219,18 @@ pub(super) async fn put_end(
                         .await?
                 }
             }
-            None => {
-                let governance = service
-                    .bucket_governance
-                    .resolve(publish.key.tenant(), publish.key.bucket())
-                    .await?;
-                api_receipt(
-                    run_request_until(
-                        deadline,
-                        service.distribution.publish_from_source_with_governance(
-                            publish,
-                            keldra_consensus::NodeId(ready.upload_source_node_id),
-                            governance,
-                        ),
-                        "put publication deadline exceeded",
-                    )
-                    .await?,
+            None => api_receipt(
+                run_request_until(
+                    deadline,
+                    service.distribution.publish_from_source_with_governance(
+                        publish,
+                        keldra_consensus::NodeId(ready.upload_source_node_id),
+                        governance,
+                    ),
+                    "put publication deadline exceeded",
                 )
-            }
+                .await?,
+            ),
         };
         Ok(Response::new(receipt))
     }

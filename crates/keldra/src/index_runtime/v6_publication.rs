@@ -57,6 +57,12 @@ pub(crate) struct LoadedV6ProjectionGeneration {
     pub(crate) generation: ProjectionGeneration,
 }
 
+pub(crate) enum V6PublicationPredecessor<'a> {
+    Initial,
+    Current(&'a LoadedV6ProjectionGeneration),
+    CatalogRebuild(VersionId),
+}
+
 #[derive(Debug)]
 struct ArtifactBytes {
     path: String,
@@ -504,11 +510,18 @@ impl V6ProjectionPublisher {
         tenant_id: u64,
         bucket_id: u64,
         partition: ProjectionPartitionIdentity,
-        previous: Option<&LoadedV6ProjectionGeneration>,
+        predecessor: V6PublicationPredecessor<'_>,
         prepared: PreparedAtomicProjectionGeneration,
         published_source_rows: u64,
         published_source_bytes: u64,
     ) -> Result<LoadedV6ProjectionGeneration, Status> {
+        let (previous, expected_current_version) = match predecessor {
+            V6PublicationPredecessor::Initial => (None, None),
+            V6PublicationPredecessor::Current(previous) => {
+                (Some(previous), Some(previous.current_object_version))
+            }
+            V6PublicationPredecessor::CatalogRebuild(version) => (None, Some(version)),
+        };
         let plan = plan_atomic_publication(partition, previous, prepared)?;
         if published_source_rows != plan.source_rows {
             return Err(Status::data_loss(
@@ -555,7 +568,7 @@ impl V6ProjectionPublisher {
                 projection_routing_id(partition),
                 projection_current_path(partition),
                 current_blob,
-                previous.map(|loaded| loaded.current_object_version),
+                expected_current_version,
             ))
             .await?;
         let loaded_generation = self

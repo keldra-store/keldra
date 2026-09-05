@@ -50,7 +50,8 @@ pub(super) async fn delete_version(
     require_governance_versioning_enabled(&governance)?;
     service
         .distribution
-        .require_durability_available(durability)?;
+        .wait_for_durability_available(durability, deadline)
+        .await?;
     let original_alias = linked.then(|| api_address(requested_key));
     api_request.address = Some(api_address(&key));
     let outcome = match service.distribution.routing_target_stable(

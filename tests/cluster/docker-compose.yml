@@ -1,7 +1,7 @@
 name: ${KELDRA_QUALIFICATION_PROJECT:-keldra-v6-qualification}
 
 x-keldra-environment: &keldra-environment
-  RUST_LOG: ${KELDRA_QUALIFICATION_RUST_LOG:-info,keldra::index_runtime::retention=debug}
+  RUST_LOG: ${KELDRA_QUALIFICATION_RUST_LOG:-info,keldra::index_runtime::retention=debug,keldra::observability::runtime=debug}
   KELDRA_LISTEN: 0.0.0.0:50051
   KELDRA_PEER_LISTEN: 0.0.0.0:50052
   KELDRA_TOKEN_SIGNING_KEY_FILE: /run/secrets/keldra-token-signing-key

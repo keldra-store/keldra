@@ -22,8 +22,9 @@ use tonic::{Request, Status};
 
 use super::storage::{list_page_from_wire, schema_query_json};
 use super::{
-    CLUSTER_PEER_SCHEMA_VERSION, MAX_CLUSTER_OPERATION_TIME, MAX_CLUSTER_PEER_MESSAGE_BYTES,
-    MAX_INDEX_SOURCE_SNAPSHOT_TIME, decode_json, encode_json, require_response_schema, wire,
+    CLUSTER_PEER_SCHEMA_VERSION, MAX_CLUSTER_BULK_OPERATION_TIME, MAX_CLUSTER_OPERATION_TIME,
+    MAX_CLUSTER_PEER_MESSAGE_BYTES, MAX_INDEX_SOURCE_SNAPSHOT_TIME, decode_json, encode_json,
+    require_response_schema, wire,
 };
 use crate::authentication::Caller;
 use crate::authz_distribution::AuthzSchemaReplicaQuery;
@@ -747,11 +748,21 @@ impl ClusterPeerTransport {
     ) -> Result<BulkWriteResponse, Status> {
         let fence = self.placement()?.fence();
         let mut request = Request::new(wire::RouteBulkWriteRequest {
-            peer: Some(self.context(fence, 1, remaining)?),
+            peer: Some(self.context_with_timeout_limit(
+                fence,
+                1,
+                remaining,
+                MAX_CLUSTER_BULK_OPERATION_TIME,
+            )?),
             request: Some(value),
             definition_intents: Vec::new(),
         });
-        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        add_bearer_and_timeout_with_limit(
+            &mut request,
+            bearer,
+            remaining,
+            MAX_CLUSTER_BULK_OPERATION_TIME,
+        )?;
         Ok(self
             .client(target, address)?
             .route_bulk_write(request)
@@ -810,11 +821,21 @@ impl ClusterPeerTransport {
             })
             .collect::<Result<Vec<_>, Status>>()?;
         let mut request = Request::new(wire::RouteBulkWriteRequest {
-            peer: Some(self.context(fence, 1, remaining)?),
+            peer: Some(self.context_with_timeout_limit(
+                fence,
+                1,
+                remaining,
+                MAX_CLUSTER_BULK_OPERATION_TIME,
+            )?),
             request: Some(value),
             definition_intents,
         });
-        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        add_bearer_and_timeout_with_limit(
+            &mut request,
+            bearer,
+            remaining,
+            MAX_CLUSTER_BULK_OPERATION_TIME,
+        )?;
         Ok(self
             .client(target, address)?
             .route_internal_bulk_write(request)

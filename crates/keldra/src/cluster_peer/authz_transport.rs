@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use keldra_authz::{AuthorizationCheck, ObjectRef, RealmId};
 use keldra_consensus::NodeId;
 use keldra_store::{
@@ -5,7 +7,7 @@ use keldra_store::{
     AuthzSchemaPublicationMutation, AuthzScope, PlacementLogId, ReplicaAuthzRealmMutationApplied,
     ReplicaAuthzSchemaPublicationApplied, StorageTenantId,
 };
-use tonic::Status;
+use tonic::{Request, Status};
 
 use super::{
     ClusterPeerTransport, MAX_CLUSTER_OPERATION_TIME, decode_json, encode_json,
@@ -300,6 +302,7 @@ impl ClusterPeerTransport {
         checks: &[AuthorizationCheck],
         stable_buckets: &[StableBucketAuthorization],
         placement_fence: PlacementLogId,
+        timeout: Duration,
     ) -> Result<FreshAuthorizationResult, Status> {
         if checks.is_empty() || checks.len() > 1_000 {
             return Err(Status::invalid_argument(
@@ -307,25 +310,27 @@ impl ClusterPeerTransport {
             ));
         }
         let (mode, revision) = consistency_to_wire(consistency);
+        let mut request = Request::new(wire::FreshAuthorizationChecksRequest {
+            peer: Some(self.context(placement_fence, 0, timeout)?),
+            stable_tenant_id,
+            scope_json: encode_json(scope)?,
+            checks_json: checks.iter().map(encode_json).collect::<Result<_, _>>()?,
+            consistency: mode as i32,
+            consistency_revision: revision,
+            stable_buckets: stable_buckets
+                .iter()
+                .map(|binding| wire::StableBucketBinding {
+                    storage_tenant: binding.storage_tenant.clone(),
+                    bucket: binding.bucket.clone(),
+                    expected_tenant_id: binding.expected_tenant_id,
+                    expected_bucket_id: binding.expected_bucket_id,
+                })
+                .collect(),
+        });
+        request.set_timeout(timeout.min(MAX_CLUSTER_OPERATION_TIME));
         let response = self
             .client(target, address)?
-            .fresh_authorization_checks(wire::FreshAuthorizationChecksRequest {
-                peer: Some(self.context(placement_fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
-                stable_tenant_id,
-                scope_json: encode_json(scope)?,
-                checks_json: checks.iter().map(encode_json).collect::<Result<_, _>>()?,
-                consistency: mode as i32,
-                consistency_revision: revision,
-                stable_buckets: stable_buckets
-                    .iter()
-                    .map(|binding| wire::StableBucketBinding {
-                        storage_tenant: binding.storage_tenant.clone(),
-                        bucket: binding.bucket.clone(),
-                        expected_tenant_id: binding.expected_tenant_id,
-                        expected_bucket_id: binding.expected_bucket_id,
-                    })
-                    .collect(),
-            })
+            .fresh_authorization_checks(request)
             .await?
             .into_inner();
         require_response_schema(response.schema_version)?;

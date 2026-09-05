@@ -49,7 +49,7 @@ pub enum PeerRpcKind {
     DataPlane,
     /// Admission and catch-up control used only by the typed JoinPeer API.
     JoinControl,
-    /// Leader-orchestrated typed storage transfer between ACTIVE peers.
+    /// Typed storage reads and leader-orchestrated membership handoff.
     StateTransfer,
 }
 

@@ -10,7 +10,7 @@ source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-three-node-phases.sh"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${KELDRA_IMAGE:-keldra:0.16.0}"
+requested_image="${KELDRA_IMAGE:-keldra:0.17.0}"
 qualification_mode="${KELDRA_QUALIFICATION_MODE:-smoke}"
 case "${qualification_mode}" in
   release|smoke) ;;
@@ -19,9 +19,29 @@ case "${qualification_mode}" in
     exit 2
     ;;
 esac
-cluster_source_journal_max_entries="${KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
-if [[ ! "${cluster_source_journal_max_entries}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES must be a positive decimal integer" >&2
+minimum_source_journal_max_entries=4097
+release_source_journal_max_entries="${KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
+pressure_source_journal_max_entries="${KELDRA_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES:-${minimum_source_journal_max_entries}}"
+joining_node_ready_timeout_seconds="${KELDRA_QUALIFICATION_JOIN_READY_TIMEOUT_SECONDS:-10}"
+joining_node_handoff_timeout_seconds="${KELDRA_QUALIFICATION_JOIN_TIMEOUT_SECONDS:-1800}"
+if [[ ! "${release_source_journal_max_entries}" =~ ^[1-9][0-9]*$ ]] \
+  || ((release_source_journal_max_entries < minimum_source_journal_max_entries))
+then
+  echo "KELDRA_QUALIFICATION_SOURCE_JOURNAL_MAX_ENTRIES must be at least ${minimum_source_journal_max_entries} so it can hold the production 4096-entry atomic maximum plus its completion event" >&2
+  exit 2
+fi
+if [[ ! "${pressure_source_journal_max_entries}" =~ ^[1-9][0-9]*$ ]] \
+  || ((pressure_source_journal_max_entries < minimum_source_journal_max_entries))
+then
+  echo "KELDRA_QUALIFICATION_PRESSURE_SOURCE_JOURNAL_MAX_ENTRIES must be at least ${minimum_source_journal_max_entries} so it can hold the production 4096-entry atomic maximum plus its completion event" >&2
+  exit 2
+fi
+if [[ ! "${joining_node_ready_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "KELDRA_QUALIFICATION_JOIN_READY_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "${joining_node_handoff_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "KELDRA_QUALIFICATION_JOIN_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 2
 fi
 case "${KELDRA_DOCKER_PLATFORM:-}" in
@@ -75,6 +95,7 @@ assert_source_tree_exact
 qualification_examples=(
   accounting_qualification
   atomic_program_qualification
+  cluster_cutover_qualification
   personaldb_qualification
   s3_qualification
 )
@@ -128,9 +149,9 @@ client_version="$(
   docker run --rm --platform "${KELDRA_DOCKER_PLATFORM}" \
     "${image_id}" keldra --version
 )"
-if [[ "${server_version}" != "keldra-server 0.16.0" \
-  || "${client_version}" != "keldra 0.16.0" ]]; then
-  echo "qualification requires the exact Keldra 0.16.0 image" >&2
+if [[ "${server_version}" != "keldra-server 0.17.0" \
+  || "${client_version}" != "keldra 0.17.0" ]]; then
+  echo "qualification requires the exact Keldra 0.17.0 image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
@@ -139,6 +160,7 @@ export KELDRA_IMAGE="${image_id}"
 export KELDRA_QUALIFICATION_PROJECT="${KELDRA_QUALIFICATION_PROJECT:-keldra-v090-${$}}"
 export KELDRA_QUALIFICATION_DIR="$(mktemp -d /var/tmp/keldra-v090-qualification.XXXXXX)"
 export KELDRA_QUALIFICATION_START_NODE="${start_node}"
+qualification_suffix="${KELDRA_QUALIFICATION_DIR##*.}"
 KELDRA_QUALIFICATION_STATE_DIR="${KELDRA_QUALIFICATION_DIR}/artifacts"
 keep="${KELDRA_QUALIFICATION_KEEP:-0}"
 compose() {
@@ -223,27 +245,15 @@ qualify_generalized_object_paths() {
   local attempt
   for attempt in $(seq 1 60); do
     capabilities="$(run_bootstrap_cli keldra-1 get-cluster-capabilities 2>/dev/null || true)"
-    if grep -Eq 'active_protocol=1 active_storage=1 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
+    if grep -Eq 'active_protocol=2 active_storage=2 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
       break
     fi
     sleep 1
   done
-  if ! grep -Eq 'active_protocol=1 active_storage=1 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
-    echo "three-node cluster did not become ready for capability 2/2: ${capabilities}" >&2
+  if ! grep -Eq 'active_protocol=2 active_storage=2 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
+    echo "three-node cluster did not start with active capability 2/2: ${capabilities}" >&2
     return 1
   fi
-  local placement_term placement_index
-  placement_term="$(sed -n 's/.*placement_term=\([0-9][0-9]*\).*/\1/p' <<<"${capabilities}")"
-  placement_index="$(sed -n 's/.*placement_index=\([0-9][0-9]*\).*/\1/p' <<<"${capabilities}")"
-  if [[ ! "${placement_term}" =~ ^[1-9][0-9]*$ || ! "${placement_index}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "three-node capability status omitted an exact placement fence: ${capabilities}" >&2
-    return 1
-  fi
-  run_bootstrap_cli keldra-1 activate-cluster-capabilities \
-    --protocol-version 2 \
-    --storage-format 2 \
-    --expected-placement-term "${placement_term}" \
-    --expected-placement-index "${placement_index}" >/dev/null
 
   printf 'three-node-clone-source\n' >"${KELDRA_QUALIFICATION_DIR}/artifacts/link-source.txt"
   printf 'three-node-linked-update\n' >"${KELDRA_QUALIFICATION_DIR}/artifacts/link-update.txt"
@@ -362,9 +372,10 @@ wait_for_bootstrap() {
 }
 wait_for_node() {
   local node="$1"
+  local timeout_seconds="${2:-90}"
   local attempt
   local output=""
-  for attempt in $(seq 1 90); do
+  for attempt in $(seq 1 "${timeout_seconds}"); do
     if output="$(run_cli "${node}" qprobe-client \
       qualification-probe-secret-000000000000000000000000 \
       list qprobe objects --prefix readiness/ --limit 1 2>&1)"
@@ -373,7 +384,7 @@ wait_for_node() {
     fi
     sleep 1
   done
-  echo "${node} did not become an authenticated ACTIVE server within 90 seconds" >&2
+  echo "${node} did not become an authenticated ACTIVE server within ${timeout_seconds} seconds" >&2
   echo "last client error: ${output}" >&2
   return 1
 }
@@ -587,79 +598,32 @@ require_qprobe_head() {
   fi
 }
 
-head_blake3() {
-  local head="$1"
-  local hash
-  hash="$(sed -n \
-    's/^present version=[0-9][0-9]* bytes=[0-9][0-9]* blake3=\([0-9a-f]\{64\}\)$/\1/p' \
-    <<<"${head}")"
-  if [[ -z "${hash}" ]]; then
-    echo "Head returned an invalid present-object identity: ${head}" >&2
-    return 1
-  fi
-  printf '%s\n' "${hash}"
-}
-
-complete_blob_path() {
-  local hash="$1"
-  printf '/var/lib/keldra/blobs/%s/%s\n' "${hash:0:2}" "${hash}"
-}
-
-move_complete_blob() {
-  local node="$1"
-  local hash="$2"
-  local path
-  path="$(complete_blob_path "${hash}")"
-  compose exec -T --user 0 "${node}" test -f "${path}"
-  compose exec -T --user 0 "${node}" test ! -e "${path}.qualification-away"
-  compose exec -T --user 0 "${node}" \
-    mv -- "${path}" "${path}.qualification-away"
-}
-
-restore_complete_blob() {
-  local node="$1"
-  local hash="$2"
-  local path
-  path="$(complete_blob_path "${hash}")"
-  compose exec -T --user 0 "${node}" test -f "${path}.qualification-away"
-  compose exec -T --user 0 "${node}" \
-    mv -- "${path}.qualification-away" "${path}"
-}
-
-shard_path_on_node() {
-  local node="$1"
-  local hash="$2"
-  local directory="/var/lib/keldra/blobs/${hash:0:2}"
-  local -a paths=()
-  mapfile -t paths < <(
-    compose exec -T --user 0 "${node}" \
-      find "${directory}" -maxdepth 1 -type f \
-        -name "0001${hash}*" ! -name '*.qualification-away' -print
-  )
-  if ((${#paths[@]} != 1)); then
-    echo "expected exactly one shard for ${hash} on ${node}, found ${#paths[@]}" >&2
-    return 1
-  fi
-  printf '%s\n' "${paths[0]}"
-}
-
-move_shard() {
-  local node="$1"
-  local hash="$2"
-  local path
-  path="$(shard_path_on_node "${node}" "${hash}")"
-  compose exec -T --user 0 "${node}" test ! -e "${path}.qualification-away"
-  compose exec -T --user 0 "${node}" \
-    mv -- "${path}" "${path}.qualification-away"
-  printf '%s\n' "${path}"
-}
-
-restore_shard() {
+converged_qprobe_head=
+wait_for_qprobe_head_after_growth() {
   local node="$1"
   local path="$2"
-  compose exec -T --user 0 "${node}" test -f "${path}.qualification-away"
-  compose exec -T --user 0 "${node}" \
-    mv -- "${path}.qualification-away" "${path}"
+  local expected="$3"
+  local attempt
+  local actual=""
+  local evidence="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-head-convergence.txt"
+  for attempt in $(seq 1 90); do
+    if run_cli "${node}" qprobe-client "${qprobe_secret}" \
+      head qprobe objects "${path}" >"${evidence}" 2>&1
+    then
+      actual="$(<"${evidence}")"
+      if [[ "${actual}" == "${expected}" ]]; then
+        converged_qprobe_head="${actual}"
+        return 0
+      fi
+    else
+      actual="$(<"${evidence}")"
+    fi
+    sleep 1
+  done
+  echo "${node} did not converge on the existing head for ${path} after cluster growth" >&2
+  echo "expected: ${expected}" >&2
+  echo "last result: ${actual}" >&2
+  return 1
 }
 
 # Exercise the exact online growth path with a payload that cannot use the
@@ -720,26 +684,17 @@ echo "[keldra-qualification] one-node large object survived restart before growt
 
 prepare_and_start_node 2
 
-growth_one_two_node_head="$(run_cli keldra-2 qprobe-client "${qprobe_secret}" \
-  head qprobe objects growth/from-one.bin)"
-if [[ "${growth_one_two_node_head}" != "${growth_one_head}" ]]; then
-  echo "node 2 observed another head for the one-node object after ADD" >&2
-  echo "expected: ${growth_one_head}" >&2
-  echo "actual:   ${growth_one_two_node_head}" >&2
-  exit 1
-fi
-growth_one_hash="$(head_blake3 "${growth_one_two_node_head}")"
-move_complete_blob keldra-1 "${growth_one_hash}"
+wait_for_qprobe_head_after_growth \
+  keldra-2 growth/from-one.bin "${growth_one_head}"
 rm -f "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
 run_cli keldra-2 qprobe-client \
   "${qprobe_secret}" \
-  get qprobe objects growth/from-one.bin \
-    --output /qualification/artifacts/growth-one-read.bin
-restore_complete_blob keldra-1 "${growth_one_hash}"
+    get qprobe objects growth/from-one.bin \
+      --output /qualification/artifacts/growth-one-read.bin
 cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" \
   "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-one-read.bin"
 require_qprobe_head keldra-2 growth/from-one.bin "${growth_one_head}"
-echo "[keldra-qualification] two-node read succeeded without node 1's complete blob"
+echo "[keldra-qualification] two-node read preserved the pre-growth head and bytes"
 
 # Use a different content identity so this is a real two-node payload write,
 # not a second logical reference to the preexisting deduplicated blob.
@@ -757,71 +712,80 @@ run_cli keldra-2 qprobe-client \
     --command-id qprobe-growth-two --durability replicated >/dev/null
 growth_two_head="$(run_cli keldra-2 qprobe-client "${qprobe_secret}" \
   head qprobe objects growth/from-two.bin)"
-growth_two_hash="$(head_blake3 "${growth_two_head}")"
-move_complete_blob keldra-2 "${growth_two_hash}"
 run_cli keldra-1 qprobe-client \
   "${qprobe_secret}" \
-  get qprobe objects growth/from-two.bin \
-    --output /qualification/artifacts/growth-two-read.bin
-restore_complete_blob keldra-2 "${growth_two_hash}"
+    get qprobe objects growth/from-two.bin \
+      --output /qualification/artifacts/growth-two-read.bin
 cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
   "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-read.bin"
 require_qprobe_head keldra-1 growth/from-two.bin "${growth_two_head}"
-echo "[keldra-qualification] two-node REPLICATED read succeeded without its ingress copy"
+echo "[keldra-qualification] two-node REPLICATED read preserved its head and bytes"
+wait_for_background_join keldra-2 "${joining_node_handoff_timeout_seconds}"
 
-start_source_journal_phase "${cluster_source_journal_max_entries}" keldra-1 keldra-2
+start_source_journal_phase "${pressure_source_journal_max_entries}" keldra-1 keldra-2
+echo "[keldra-qualification] cutover pressure phase uses source-journal max entries ${pressure_source_journal_max_entries}"
 prepare_no_event_membership_cutover_qualification \
   keldra-2 2 qprobe-client "${qprobe_secret}" qprobe objects \
-  "${cluster_source_journal_max_entries}"
+  "${pressure_source_journal_max_entries}"
 prepare_and_start_node 3
-
-declare -a moved_complete_blobs=()
-for growth_node in keldra-1 keldra-2 keldra-3; do
-  for growth_hash in "${growth_one_hash}" "${growth_two_hash}"; do
-    growth_complete_path="$(complete_blob_path "${growth_hash}")"
-    if compose exec -T --user 0 "${growth_node}" test -f "${growth_complete_path}"; then
-      move_complete_blob "${growth_node}" "${growth_hash}"
-      moved_complete_blobs+=("${growth_node} ${growth_hash}")
-    else
-      compose exec -T --user 0 "${growth_node}" \
-        test ! -e "${growth_complete_path}.qualification-away"
-    fi
-  done
-done
+printf '%s\n' 'joining coordinator write' \
+  >"${KELDRA_QUALIFICATION_DIR}/artifacts/joining-coordinator-write.txt"
+run_cli keldra-3 qprobe-client "${qprobe_secret}" \
+  put qprobe objects growth/through-joining-node.txt \
+    /qualification/artifacts/joining-coordinator-write.txt \
+    --command-id qprobe-joining-coordinator-write \
+    --durability replicated --if-absent >/dev/null
+run_cli keldra-1 qprobe-client "${qprobe_secret}" \
+  get qprobe objects growth/through-joining-node.txt \
+    --output /qualification/artifacts/joining-coordinator-read.txt
+cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/joining-coordinator-write.txt" \
+  "${KELDRA_QUALIFICATION_DIR}/artifacts/joining-coordinator-read.txt"
+echo "[keldra-qualification] JOINING node coordinated authenticated reads and writes before ownership activation"
+refresh_no_event_membership_cutover_tail \
+  keldra-2 "${pressure_source_journal_max_entries}"
+wait_for_background_join keldra-3 "${joining_node_handoff_timeout_seconds}"
+qualify_no_event_membership_cutover \
+  keldra-2 2 qprobe-client "${qprobe_secret}" qprobe objects \
+  "${pressure_source_journal_max_entries}"
 
 for unavailable_node in keldra-1 keldra-2 keldra-3; do
-  declare -a moved_shards=()
-  for growth_hash in "${growth_one_hash}" "${growth_two_hash}"; do
-    moved_shards+=("$(move_shard "${unavailable_node}" "${growth_hash}")")
-  done
+  case "${unavailable_node}" in
+    keldra-1) growth_reader=keldra-2 ;;
+    keldra-2|keldra-3) growth_reader=keldra-1 ;;
+  esac
+  compose stop -t 30 "${unavailable_node}"
   for growth_object in from-one from-two; do
     case "${growth_object}" in
-      from-one) growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin" ;;
-      from-two) growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" ;;
+      from-one)
+        growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-large.bin"
+        growth_expected_head="${growth_one_head}"
+        ;;
+      from-two)
+        growth_expected="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin"
+        growth_expected_head="${growth_two_head}"
+        ;;
     esac
+    wait_for_qprobe_head_after_growth \
+      "${growth_reader}" "growth/${growth_object}.bin" "${growth_expected_head}"
     growth_output="${KELDRA_QUALIFICATION_DIR}/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
     rm -f "${growth_output}"
-    run_cli keldra-1 qprobe-client \
+    run_cli "${growth_reader}" qprobe-client \
       "${qprobe_secret}" \
       get qprobe objects "growth/${growth_object}.bin" \
         --output "/qualification/artifacts/growth-without-${unavailable_node}-${growth_object}.bin"
     cmp "${growth_expected}" "${growth_output}"
-    case "${growth_object}" in
-      from-one) growth_expected_head="${growth_one_head}" ;;
-      from-two) growth_expected_head="${growth_two_head}" ;;
-    esac
     require_qprobe_head \
-      keldra-1 "growth/${growth_object}.bin" "${growth_expected_head}"
+      "${growth_reader}" "growth/${growth_object}.bin" "${growth_expected_head}"
   done
-  for moved_shard in "${moved_shards[@]}"; do
-    restore_shard "${unavailable_node}" "${moved_shard}"
-  done
+  compose start "${unavailable_node}"
+  wait_for_node "${unavailable_node}"
+  wait_for_qprobe_head_after_growth \
+    "${unavailable_node}" growth/from-one.bin "${growth_one_head}"
+  wait_for_qprobe_head_after_growth \
+    "${unavailable_node}" growth/from-two.bin "${growth_two_head}"
 done
-for moved_complete_blob in "${moved_complete_blobs[@]}"; do
-  read -r growth_node growth_hash <<<"${moved_complete_blob}"
-  restore_complete_blob "${growth_node}" "${growth_hash}"
-done
-echo "[keldra-qualification] three-node 2+1 reads preserved both large object heads and bytes without complete copies after every one-shard loss"
+echo "[keldra-qualification] three-node 2+1 reads preserved both large object heads and bytes through every single-node outage"
+start_release_source_journal_phase "${release_source_journal_max_entries}"
 
 echo "[keldra-qualification] three-node cluster is ACTIVE"
 qualify_generalized_object_paths

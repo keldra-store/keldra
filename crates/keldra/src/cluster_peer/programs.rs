@@ -372,7 +372,7 @@ impl ClusterPeerService {
     pub(super) fn require_program_executor(
         &self,
         placement: &ClusterPlacement,
-        authenticated_source: NodeId,
+        expected_executor: NodeId,
         nomination_log_index: u64,
     ) -> Result<ExecutorNomination, Status> {
         let nomination = self
@@ -381,7 +381,7 @@ impl ClusterPeerService {
             .map_err(|_| Status::unavailable("atomic executor state is unavailable"))?
             .executor()
             .ok_or_else(|| Status::unavailable("EXECUTOR_MOVED: no executor is nominated"))?;
-        if nomination.executor != authenticated_source
+        if nomination.executor != expected_executor
             || nomination.nomination_log_index != nomination_log_index
             || !placement.active_node_ids().contains(&nomination.executor)
         {

@@ -788,14 +788,45 @@ async fn next_realm_put_frame(
 struct RealmFrameWriter {
     sender: tokio::sync::mpsc::Sender<Result<wire::AuthzRealmFrame, Status>>,
     offset: u64,
+    pending: Vec<u8>,
 }
 
 impl RealmFrameWriter {
     fn new(sender: tokio::sync::mpsc::Sender<Result<wire::AuthzRealmFrame, Status>>) -> Self {
-        Self { sender, offset: 0 }
+        Self {
+            sender,
+            offset: 0,
+            pending: Vec::with_capacity(DATA_PEER_FRAME_BYTES),
+        }
     }
 
-    fn finish(self) {
+    fn send_pending(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let content =
+            std::mem::replace(&mut self.pending, Vec::with_capacity(DATA_PEER_FRAME_BYTES));
+        let content_len = content.len();
+        self.sender
+            .blocking_send(Ok(wire::AuthzRealmFrame {
+                schema_version: DATA_PEER_SCHEMA_VERSION,
+                offset: self.offset,
+                content,
+                end: false,
+                manifest_json: Vec::new(),
+            }))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "realm stream closed"))?;
+        self.offset = self
+            .offset
+            .checked_add(content_len as u64)
+            .ok_or_else(|| io::Error::other("realm stream length overflow"))?;
+        Ok(())
+    }
+
+    fn finish(mut self) {
+        if self.send_pending().is_err() {
+            return;
+        }
         let _ = self.sender.blocking_send(Ok(wire::AuthzRealmFrame {
             schema_version: DATA_PEER_SCHEMA_VERSION,
             offset: self.offset,
@@ -812,26 +843,21 @@ impl RealmFrameWriter {
 
 impl Write for RealmFrameWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        for content in bytes.chunks(DATA_PEER_FRAME_BYTES) {
-            self.sender
-                .blocking_send(Ok(wire::AuthzRealmFrame {
-                    schema_version: DATA_PEER_SCHEMA_VERSION,
-                    offset: self.offset,
-                    content: content.to_vec(),
-                    end: false,
-                    manifest_json: Vec::new(),
-                }))
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "realm stream closed"))?;
-            self.offset = self
-                .offset
-                .checked_add(content.len() as u64)
-                .ok_or_else(|| io::Error::other("realm stream length overflow"))?;
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let available = DATA_PEER_FRAME_BYTES - self.pending.len();
+            let take = available.min(remaining.len());
+            self.pending.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            if self.pending.len() == DATA_PEER_FRAME_BYTES {
+                self.send_pending()?;
+            }
         }
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.send_pending()
     }
 }
 
@@ -861,5 +887,46 @@ impl Read for BlockingFrameReader {
             };
             self.current = io::Cursor::new(next);
         }
+    }
+}
+
+#[cfg(test)]
+mod realm_frame_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tiny_writes_are_coalesced_into_bounded_transport_frames() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let total_bytes = 2 * DATA_PEER_FRAME_BYTES + 17;
+        let writer = tokio::task::spawn_blocking(move || {
+            let mut writer = RealmFrameWriter::new(sender);
+            for value in 0..total_bytes {
+                writer.write_all(&[(value % 251) as u8]).unwrap();
+            }
+            writer.flush().unwrap();
+            writer.finish();
+        });
+
+        let mut frames = Vec::new();
+        while let Some(frame) = receiver.recv().await {
+            let frame = frame.unwrap();
+            let end = frame.end;
+            frames.push(frame);
+            if end {
+                break;
+            }
+        }
+        writer.await.unwrap();
+
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[0].offset, 0);
+        assert_eq!(frames[0].content.len(), DATA_PEER_FRAME_BYTES);
+        assert_eq!(frames[1].offset, DATA_PEER_FRAME_BYTES as u64);
+        assert_eq!(frames[1].content.len(), DATA_PEER_FRAME_BYTES);
+        assert_eq!(frames[2].offset, (2 * DATA_PEER_FRAME_BYTES) as u64);
+        assert_eq!(frames[2].content.len(), 17);
+        assert_eq!(frames[3].offset, total_bytes as u64);
+        assert!(frames[3].content.is_empty());
+        assert!(frames[3].end);
     }
 }

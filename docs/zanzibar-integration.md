@@ -6,8 +6,8 @@ its `keldra` crates.io dependency to `clients/rust`; this proves the candidate
 client API without giving Zanzibar a path dependency in its own released
 manifest.
 
-Zanzibar `0.4.0` targets exactly Keldra `0.16.0`. When built from the Zanzibar
-repository alone it resolves `keldra = "=0.16.0"` from crates.io. When built
+Zanzibar `0.5.0` targets exactly Keldra `0.17.0`. When built from the Zanzibar
+repository alone it resolves `keldra = "=0.17.0"` from crates.io. When built
 from this parent workspace, Cargo's root patch resolves that same dependency to
 the local client. These are intentionally separate release modes.
 
@@ -28,7 +28,7 @@ the local client. These are intentionally separate release modes.
 4. Tag and release Keldra. Once Keldra's `keldra` client package is available
    on crates.io and its image is published, rerun Zanzibar's standalone CI and
    end-to-end test against those public artifacts. Only after they pass, merge
-   the candidate to Zanzibar `main`, tag, and publish the Zanzibar patch.
+   the candidate to Zanzibar `main`, tag, and publish the Zanzibar release.
 
 Do not add a path dependency to Zanzibar's own manifest: that would make its
 crates.io package non-standalone. Do not release Keldra with a locally modified

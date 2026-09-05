@@ -429,12 +429,11 @@ async fn safe_through_cursor_is_monotonic_bounded_and_reconstructed_fail_closed(
             .await
             .is_err()
     );
-    assert!(
-        store
-            .advance_source_journal_settled_through(1)
-            .await
-            .is_err()
-    );
+    store
+        .advance_source_journal_settled_through(1)
+        .await
+        .unwrap();
+    assert_eq!(store.local_watch_status().unwrap().settled_through, 2);
 
     assert!(
         store

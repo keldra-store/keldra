@@ -4,7 +4,10 @@
 //! helpers only derive and apply the OpenRaft step which that one transition
 //! currently permits; they add no second transition state or Raft payload.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use crate::{
     DecisionRaft, DecisionRaftError, FIXED_VOTER_TARGET, MembershipTransition,
@@ -18,6 +21,8 @@ struct MembershipView {
     addresses: BTreeMap<NodeId, String>,
     joint: bool,
 }
+
+const LEARNER_PROGRESS_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl DecisionRaft {
     /// Add the node named by the current ADD transition as a learner and wait
@@ -60,12 +65,40 @@ impl DecisionRaft {
             ));
         }
 
-        self.add_learner(
-            transition.node_id.0,
-            PeerNode::new(descriptor.peer_address.0.clone()),
-            true,
-        )
-        .await?;
+        let mut caught_up = false;
+        for _ in 0..2 {
+            self.add_learner(
+                transition.node_id.0,
+                PeerNode::new(descriptor.peer_address.0.clone()),
+                false,
+            )
+            .await?;
+            let node_id = transition.node_id.0;
+            if tokio::time::timeout(
+                LEARNER_PROGRESS_TIMEOUT,
+                self.raft.wait(None).metrics(
+                    move |metrics| {
+                        metrics
+                            .replication
+                            .as_ref()
+                            .and_then(|replication| replication.get(&node_id))
+                            .is_some_and(Option::is_some)
+                    },
+                    "wait for learner replication progress",
+                ),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+            {
+                caught_up = true;
+                break;
+            }
+        }
+        if !caught_up {
+            return Err(DecisionRaftError::Unavailable(
+                "learner catch-up did not complete".into(),
+            ));
+        }
 
         let after = self.membership_view()?;
         if after.voters.contains(&transition.node_id) {
