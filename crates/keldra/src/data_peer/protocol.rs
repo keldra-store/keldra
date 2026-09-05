@@ -12,7 +12,7 @@ pub(super) type AuthzRealmStream = std::pin::Pin<
 >;
 
 // 0.16.0 released schema 4. Bounded complete-record mutation reconciliation
-// requires the batch RPC added in 0.16.1, so mixed peers must fail closed
+// requires the batch RPC added in 0.17.0, so mixed peers must fail closed
 // instead of silently falling back to the stream-exhausting unary fan-out.
 pub(crate) const DATA_PEER_SCHEMA_VERSION: u32 = 5;
 pub(crate) const DATA_PEER_FRAME_BYTES: usize = 64 * 1024;

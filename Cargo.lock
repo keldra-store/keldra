@@ -2353,7 +2353,7 @@ dependencies = [
 
 [[package]]
 name = "keldra"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "jiff",
  "keldra-api",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-api"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-atomic-program"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-authz"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-cli"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-consensus"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "bincode",
  "hyper-util",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-index"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "blake3",
  "thiserror 2.0.19",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-osv-qualification"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-server"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "keldra-store"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5282,7 +5282,7 @@ dependencies = [
 
 [[package]]
 name = "zanzibar"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "keldra",

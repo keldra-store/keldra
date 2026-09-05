@@ -1,6 +1,6 @@
 # Keldra architecture
 
-Status: current high-level architecture for Keldra 0.16
+Status: current high-level architecture for Keldra 0.17
 
 This document describes the system Keldra is intended to operate as. It is the
 starting point for reviewing implementation choices and more detailed RFCs. If
@@ -26,7 +26,7 @@ Keldra follows a small set of architectural rules:
 6. Correctness-critical metadata is committed synchronously. Rebuildable and
    placement work proceeds asynchronously where the requested durability allows
    it.
-7. Keldra 0.16 is a clean storage and protocol generation. It does not provide
+7. Keldra 0.17 is a clean storage and protocol generation. It does not provide
    backward compatibility with earlier on-disk or protocol versions.
 
 There is no separate proxy authority, readiness authority, per-object ownership
@@ -123,7 +123,7 @@ object state and authorization before returning results.
 
 ### 4.1 Fresh cluster
 
-A fresh cluster starts with one Raft voter and records the current Keldra 0.16
+A fresh cluster starts with one Raft voter and records the current Keldra 0.17
 protocol and storage capability, currently `2/2`. This is independent of node
 count: a one-node cluster does not start in a legacy capability mode and does
 not require a later activation ceremony.
@@ -210,8 +210,8 @@ Index scratch space, reconstructed payloads, and gateway caches are explicitly
 disposable. A node's RocksDB database is one replica; it is never treated as a
 complete cluster-wide database.
 
-Keldra 0.16 uses its current compact durable codecs and storage markers. Earlier
-volumes are not opened or migrated in place. Operators must start 0.16 with new
+Keldra 0.17 uses its current compact durable codecs and storage markers. Earlier
+volumes are not opened or migrated in place. Operators must start 0.17 with new
 storage and move data through supported public or cluster workflows.
 
 ## 7. Writes
@@ -352,7 +352,7 @@ background movement cannot silently weaken object authority or durability.
   complete operator-facing remove/reweight workflow is not yet shipped.
 - One membership transition is processed at a time.
 - TypedJson is the implemented v6 index kind for this release.
-- Keldra 0.16 requires fresh storage; there is no in-place compatibility path
+- Keldra 0.17 requires fresh storage; there is no in-place compatibility path
   from earlier versions.
 
 These are limits of the present release, not reasons to add new authorities or

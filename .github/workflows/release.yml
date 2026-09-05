@@ -350,11 +350,11 @@ jobs:
             component segments.
 
             This release is a clean storage-format and index-architecture break
-            and changes cluster and data-peer protocols. Start 0.16 on fresh
+            and changes cluster and data-peer protocols. Start 0.17 on fresh
             authoritative and derived-index volumes; in-place upgrades from any
-            earlier Keldra release and mixed 0.15/0.16 operation are unsupported.
+            earlier Keldra release and mixed 0.16/0.17 operation are unsupported.
             Move application data through the public API as new writes rather
-            than opening an earlier volume with 0.16.
+            than opening an earlier volume with 0.17.
 
             It includes the multi-platform Keldra server image, CLI, Rust client,
             generated API crate, and public qualification clients.
