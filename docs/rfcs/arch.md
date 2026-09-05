@@ -289,6 +289,10 @@ current Raft state. An explicit moved-executor or stale-placement response
 causes a state refresh and retry of the same invocation ID within the original
 deadline. A peer-routed request never routes again.
 
+The nominated executor follows the current ACTIVE Raft leader because it
+submits compact atomic decisions directly to Raft. Leadership change uses the
+existing durable executor nomination fence; it does not move object replicas.
+
 ## 11. Indexing
 
 An index definition is an authorized ordinary Keldra object. Compatible logical

@@ -417,9 +417,9 @@ async fn renew_once(
     })
 }
 
-/// Only the current ACTIVE leader repairs a missing or ineligible executor.
-/// NominateExecutor is the existing durable fence; no separate election state
-/// or timer is introduced.
+/// Only the current ACTIVE leader repairs a missing or different executor.
+/// Atomic execution submits Raft decisions directly, so the executor follows
+/// the current leader through the existing durable NominateExecutor fence.
 async fn repair_executor_nomination(
     decisions: &DecisionRaft,
     state: &StateMachine,
@@ -457,14 +457,10 @@ fn executor_nominee(state: &StateMachine, leader: NodeId, local: NodeId) -> Opti
     {
         return None;
     }
-    let current_is_active = state.executor().is_some_and(|nomination| {
-        state
-            .cluster_control()
-            .nodes()
-            .get(&nomination.executor)
-            .is_some_and(|descriptor| descriptor.state == NodeState::Active)
-    });
-    (!current_is_active).then_some(leader)
+    state
+        .executor()
+        .is_none_or(|nomination| nomination.executor != leader)
+        .then_some(leader)
 }
 
 #[cfg(test)]
@@ -612,6 +608,45 @@ mod tests {
             .unwrap();
         assert_ne!(first, second);
         assert!(!authority.has_valid_lease());
+
+        let joining = NodeDescriptor {
+            node_id: NodeId(2),
+            peer_address: PeerAddress("keldra-local://2".into()),
+            storage_weight_millionths: 1_000_000,
+            state: NodeState::Joining,
+            current_peer_spki_sha256: PeerSpkiSha256([3; 32]),
+            overlap_peer_spki_sha256: None,
+            join_capability_hash: Some(JoinCapabilityHash([4; 32])),
+            supported_protocol: CapabilityRange { min: 1, max: 2 },
+            supported_storage_format: CapabilityRange { min: 1, max: 2 },
+        };
+        let mut changed_leader_state = raft.state().unwrap();
+        changed_leader_state
+            .apply(
+                second,
+                &Command::BeginAddNode {
+                    format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                    descriptor: joining,
+                },
+            )
+            .unwrap();
+        changed_leader_state
+            .apply(
+                second,
+                &Command::CompleteMembershipTransition {
+                    format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                    started_log_index: second.index,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            executor_nominee(&changed_leader_state, NodeId(2), NodeId(2)),
+            Some(NodeId(2))
+        );
+        assert_eq!(
+            executor_nominee(&changed_leader_state, NodeId(2), NodeId(1)),
+            None
+        );
         raft.shutdown().await.unwrap();
     }
 }
