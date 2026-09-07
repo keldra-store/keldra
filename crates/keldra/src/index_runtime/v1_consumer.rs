@@ -520,7 +520,11 @@ async fn advance(
     credits: &IndexingMemoryCredits,
     limits: Limits,
 ) -> Result<(), Status> {
-    if writer.current.is_none() && writer.accumulator.next_offset() == 0 {
+    // Dense baseline offsets describe snapshot rows, not completion. Keep
+    // pulling the captured snapshot until its terminal flush installs Current;
+    // entering journal replay after the first non-empty batch would prepare the
+    // same source versions twice in one unpublished query run.
+    if writer.current.is_none() {
         backfill(
             writer, scanner, reader, extractor, publisher, credits, limits,
         )
@@ -1248,18 +1252,46 @@ fn merge_query(
     target: &mut PreparedQueryMutationBatch,
     mut source: PreparedQueryMutationBatch,
 ) -> Result<(), Status> {
+    // Preparations in one unpublished window are all relative to the persisted
+    // Current, while the projection accumulator keeps only the newest state.
+    // Mirror that authority here so a document has one gate and one delta per
+    // field recipe in the mini-run.
     if let Some(incoming) = source.membership.take() {
         match &mut target.membership {
             Some(current) if current.recipe == incoming.recipe => {
-                current.gates.extend(incoming.gates)
+                merge_query_gates(&mut current.gates, incoming.gates);
             }
-            None => target.membership = Some(incoming),
+            None => {
+                let mut incoming = incoming;
+                let gates = std::mem::take(&mut incoming.gates);
+                merge_query_gates(&mut incoming.gates, gates);
+                target.membership = Some(incoming);
+            }
             Some(_) => return Err(Status::data_loss("v1 membership recipe conflict")),
         }
     }
-    target.fields.extend(source.fields);
-    target.fields.sort_by_key(|field| field.recipe);
+    for field in source.fields {
+        let key = (field.recipe, field.delta.presence.document);
+        match target.fields.binary_search_by_key(&key, |current| {
+            (current.recipe, current.delta.presence.document)
+        }) {
+            Ok(index) => target.fields[index] = field,
+            Err(index) => target.fields.insert(index, field),
+        }
+    }
     Ok(())
+}
+
+fn merge_query_gates(
+    target: &mut Vec<keldra_index::v1::QueryDocumentGate>,
+    source: Vec<keldra_index::v1::QueryDocumentGate>,
+) {
+    for gate in source {
+        match target.binary_search_by_key(&gate.document, |current| current.document) {
+            Ok(index) => target[index] = gate,
+            Err(index) => target.insert(index, gate),
+        }
+    }
 }
 
 pub(crate) fn source_scope(source: SourceId) -> [u8; 32] {
@@ -1372,6 +1404,29 @@ mod tests {
                 }],
             }),
             fields: Vec::new(),
+        }
+    }
+
+    fn query_field_update(
+        document: keldra_index::v1::StableDocumentKey,
+        version: u64,
+    ) -> keldra_index::v1::PreparedQueryRecipeDelta {
+        keldra_index::v1::PreparedQueryRecipeDelta {
+            recipe: keldra_index::v1::RecipeIdentity::new([4; 32]).unwrap(),
+            delta: keldra_index::v1::PreparedQueryFieldDelta {
+                presence: keldra_index::v1::QueryDocumentGate {
+                    document,
+                    material_source_version: version,
+                    current_source_version: version,
+                    live: true,
+                    source_path: None,
+                    result_path: None,
+                    result_version: 0,
+                },
+                doc_value: None,
+                terms: Vec::new(),
+                points: Vec::new(),
+            },
         }
     }
 
@@ -1640,6 +1695,58 @@ mod tests {
             1,
             10_001,
             10_000,
+            pending,
+            keldra_index::v1::QueryBlockLimits::default_for_memory(),
+            credits,
+        )
+        .unwrap();
+        assert!(!artifacts.artifacts().blocks.is_empty());
+    }
+
+    #[test]
+    fn repeated_unpublished_document_preparation_keeps_only_the_latest_query_delta() {
+        let document =
+            keldra_index::v1::StableDocumentKey::derive([9; 32], "objects/a", 0).unwrap();
+        let mut pending = PreparedQueryMutationBatch::default();
+        let mut first = query_update(document, "objects/a", 1);
+        first.fields.push(query_field_update(document, 1));
+        merge_query(&mut pending, first).unwrap();
+        let mut second = query_update(document, "objects/a", 2);
+        second.fields.push(query_field_update(document, 2));
+        merge_query(&mut pending, second).unwrap();
+
+        let membership = pending.membership.as_ref().unwrap();
+        assert_eq!(membership.gates.len(), 1);
+        assert_eq!(membership.gates[0].current_source_version, 2);
+        assert_eq!(pending.fields.len(), 1);
+        assert_eq!(pending.fields[0].delta.presence.current_source_version, 2);
+
+        let bytes = 1024 * 1024;
+        let memory = IndexingMemoryCredits::new(
+            bytes,
+            IndexingMemoryLimits {
+                hot_payload_bytes: bytes,
+                worker_scratch_bytes: bytes,
+                prepared_rows_bytes: bytes,
+                replay_input_bytes: bytes,
+                projection_accumulator_bytes: bytes,
+                seal_scratch_bytes: bytes,
+                ordering_catalog_bytes: bytes,
+            },
+        )
+        .unwrap();
+        let credits = QueryBlockCredits::from_pipeline_permit(
+            memory
+                .acquire(IndexingMemoryStage::OrderingCatalog, bytes)
+                .unwrap(),
+        );
+        let artifacts = keldra_index::v1::prepare_projection_query_run(
+            partition(),
+            [6; 32],
+            1,
+            1,
+            3,
+            2,
             pending,
             keldra_index::v1::QueryBlockLimits::default_for_memory(),
             credits,
