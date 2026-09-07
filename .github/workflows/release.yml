@@ -96,7 +96,7 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.96.0
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Install system build dependencies
         run: |
