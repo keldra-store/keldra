@@ -388,6 +388,42 @@ async fn evaluates_typed_updates_copy_views_and_outputs() {
 }
 
 #[tokio::test]
+async fn produced_bundle_participants_are_sorted_by_expanded_path() {
+    let definition = definition();
+    assert_eq!(
+        definition
+            .documents
+            .iter()
+            .map(|document| document.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["account", "summary", "ledger"]
+    );
+    let engine = AtomicProgramEngine::new(definition, TestReader::new(snapshot())).unwrap();
+
+    let bundle = engine
+        .prepare(&context(), &invocation())
+        .await
+        .unwrap()
+        .release();
+    let participant_paths = bundle
+        .participants
+        .iter()
+        .map(|participant| participant.path.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        participant_paths,
+        vec![path("account"), path("ledger/event-7"), path("summary")]
+    );
+    assert!(
+        bundle
+            .participants
+            .windows(2)
+            .all(|pair| pair[0].path < pair[1].path)
+    );
+}
+
+#[tokio::test]
 async fn canonicalized_prepare_reads_and_writes_the_physical_target() {
     let logical = path("summary");
     let canonical = path("canonical-summary");

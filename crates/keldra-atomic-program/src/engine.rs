@@ -332,7 +332,7 @@ where
             outputs: outputs.clone(),
         };
 
-        let participants = working
+        let mut participants = working
             .into_iter()
             .map(|document| AtomicParticipant {
                 path: document.path,
@@ -342,7 +342,8 @@ where
                     content_type: document.current_content_type,
                 }),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        participants.sort_by(|left, right| left.path.cmp(&right.path));
 
         Ok(Box::new(AtomicWriteBundle {
             participants,
