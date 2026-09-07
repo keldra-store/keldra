@@ -116,7 +116,7 @@ async fn transfer_scope(
             joining.node_id,
             &joining.address,
             &scope,
-            &selected.manifest,
+            &selected.state,
         )
         .await?;
     Ok(())
@@ -131,6 +131,6 @@ async fn read_candidate(
     peers
         .authz_realm_manifest(node, address, scope)
         .await?
-        .map(AuthzRealmReplicaCandidate::from_manifest)
+        .map(AuthzRealmReplicaCandidate::from_state)
         .transpose()
 }

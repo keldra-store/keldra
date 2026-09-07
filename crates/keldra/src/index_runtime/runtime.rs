@@ -1,4 +1,4 @@
-//! Construction of the format-v6 index producer and query runtime.
+//! Construction of the format-v1 index producer and query runtime.
 
 use std::sync::Arc;
 
@@ -28,11 +28,11 @@ use super::hot_ingress::HotProjectionIngress;
 use super::publication::{IndexArtifactCoordinator, IndexArtifactRouter};
 use super::query_budget::IndexQueryMemoryBudget;
 use super::scanner::ClusterIndexScanner;
-use super::v6_catalog_lifecycle::V6CatalogLifecycleTask;
-use super::v6_consumer::V6IndexProducerTask;
-use super::v6_publication::V6ProjectionPublisher;
-use super::v6_query_runtime::V6LocalIndexQueryExecutor;
-use super::v6_retention::V6IndexRetentionTask;
+use super::v1_catalog_lifecycle::V1CatalogLifecycleTask;
+use super::v1_consumer::V1IndexProducerTask;
+use super::v1_publication::V1ProjectionPublisher;
+use super::v1_query_runtime::V1LocalIndexQueryExecutor;
+use super::v1_retention::V1IndexRetentionTask;
 use super::working_memory::{IndexWorkingMemory, WorkingMemoryAccount, WorkingMemoryPermit};
 
 pub(crate) struct RunningIndexRuntime {
@@ -44,10 +44,10 @@ pub(crate) struct RunningIndexRuntime {
     pub(crate) artifact_router: IndexArtifactRouter,
     _definition_coordination: DefinitionCoordinationTask,
     _pipeline_memory: WorkingMemoryPermit,
-    _producer: V6IndexProducerTask,
-    _v6_catalog_lifecycle: V6CatalogLifecycleTask,
-    _v6_retention: V6IndexRetentionTask,
-    _v6_telemetry_summary: tokio::task::JoinHandle<()>,
+    _producer: V1IndexProducerTask,
+    _v1_catalog_lifecycle: V1CatalogLifecycleTask,
+    _v1_retention: V1IndexRetentionTask,
+    _v1_telemetry_summary: tokio::task::JoinHandle<()>,
     _catalog_router_sync: tokio::task::JoinHandle<()>,
 }
 
@@ -66,7 +66,7 @@ pub(crate) async fn start(
     derived_checkpoints: DerivedCheckpointPublisher,
     startup_scan_evidence: StartupScanEvidence,
 ) -> Result<RunningIndexRuntime> {
-    let v6_telemetry_summary = super::v6_telemetry::start_summary_task();
+    let v1_telemetry_summary = super::v1_telemetry::start_summary_task();
     tracing::info!("index runtime starts from sparse assigned-definition state");
     let scanner = ClusterIndexScanner::new(
         decisions.clone(),
@@ -110,21 +110,21 @@ pub(crate) async fn start(
         objects.clone(),
         cluster_peers.clone(),
     );
-    let v6_publisher =
-        V6ProjectionPublisher::new(store.clone(), reader.clone(), artifact_router.clone());
-    let v6_catalog_lifecycle = V6CatalogLifecycleTask::start(
+    let v1_publisher =
+        V1ProjectionPublisher::new(store.clone(), reader.clone(), artifact_router.clone());
+    let v1_catalog_lifecycle = V1CatalogLifecycleTask::start(
         catalog.clone(),
         journal.clone(),
         artifact_router.clone(),
-        v6_publisher.clone(),
+        v1_publisher.clone(),
     );
-    let v6_retention = V6IndexRetentionTask::start(
+    let v1_retention = V1IndexRetentionTask::start(
         local_node,
         store.clone(),
         catalog.clone(),
         journal.clone(),
         derived_checkpoints.clone(),
-        v6_publisher.clone(),
+        v1_publisher.clone(),
     );
     let working_memory = IndexWorkingMemory::from_config(config)
         .context("validate aggregate index working-memory budget")?;
@@ -135,7 +135,7 @@ pub(crate) async fn start(
             pipeline_memory,
         )
         .await
-        .context("reserve format-v6 indexing pipeline memory")?;
+        .context("reserve format-v1 indexing pipeline memory")?;
     let hot_ingress = HotProjectionIngress::new(pipeline_memory / 4)
         .map_err(anyhow::Error::msg)
         .context("initialize bounded TypedJson hot ingress")?;
@@ -149,11 +149,11 @@ pub(crate) async fn start(
         .map_err(anyhow::Error::msg)
         .context("install TypedJson hot ingress on object mutation coordinators")?;
     let query_budget = IndexQueryMemoryBudget::from_shared(working_memory.clone());
-    let local_queries: Arc<dyn LocalIndexQueryExecutor> = Arc::new(V6LocalIndexQueryExecutor::new(
+    let local_queries: Arc<dyn LocalIndexQueryExecutor> = Arc::new(V1LocalIndexQueryExecutor::new(
         decisions.clone(),
         reader.clone(),
         catalog.clone(),
-        v6_publisher.clone(),
+        v1_publisher.clone(),
         query_budget,
     ));
     let queries: Arc<dyn IndexQueryExecutor> = Arc::new(DistributedIndexQueryExecutor::new(
@@ -163,7 +163,7 @@ pub(crate) async fn start(
         local_queries.clone(),
     ));
 
-    let producer = V6IndexProducerTask::start(
+    let producer = V1IndexProducerTask::start(
         local_node,
         decisions.clone(),
         catalog.clone(),
@@ -172,11 +172,11 @@ pub(crate) async fn start(
         reader.clone(),
         cpu,
         hot_ingress,
-        v6_publisher,
+        v1_publisher,
         config,
     )
     .map_err(anyhow::Error::msg)
-    .context("start format-v6 index producer")?;
+    .context("start format-v1 index producer")?;
 
     Ok(RunningIndexRuntime {
         definitions: Arc::new(DistributedIndexDefinitionLister::new(object_lister)),
@@ -188,9 +188,9 @@ pub(crate) async fn start(
         _definition_coordination: definition_coordination,
         _pipeline_memory: pipeline_memory_permit,
         _producer: producer,
-        _v6_catalog_lifecycle: v6_catalog_lifecycle,
-        _v6_retention: v6_retention,
-        _v6_telemetry_summary: v6_telemetry_summary,
+        _v1_catalog_lifecycle: v1_catalog_lifecycle,
+        _v1_retention: v1_retention,
+        _v1_telemetry_summary: v1_telemetry_summary,
         _catalog_router_sync: catalog_router_sync,
     })
 }
@@ -201,8 +201,14 @@ fn start_catalog_router_sync(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut changes = catalog.subscribe();
-        let refresh = || match catalog.hot_router_snapshot() {
-            Ok((generation, routes)) => ingress.replace_compiled_catalog(generation, routes),
+        let refresh = || match catalog.physical_snapshot() {
+            Ok(snapshot) => {
+                if !ingress.replace_compiled_catalog(snapshot) {
+                    tracing::warn!(
+                        "hot index router exceeded its bounded memory; journal replay remains active"
+                    );
+                }
+            }
             Err(error) => tracing::error!(%error, "active physical catalog router refresh failed"),
         };
         refresh();

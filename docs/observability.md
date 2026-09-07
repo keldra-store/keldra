@@ -20,8 +20,9 @@ OpenTelemetry worker, or make a collector connection.
 
 Observability configuration is read once at process startup. Enabling,
 disabling, or changing the endpoint requires a restart. There is no metrics
-listener, diagnostics listener, public observability RPC, or administration
-API.
+listener, diagnostics listener, or public observability RPC. The existing
+protected cluster-capabilities administration response includes a bounded
+point-in-time physical-storage view for operators.
 
 ## Resource and bounds
 
@@ -80,9 +81,9 @@ the bounded
 `compaction.lane_limit_reason=configured|workers|budget|ranges` value. Index,
 tenant, and bucket IDs are deliberately absent from metrics.
 
-The v6 Typed JSON pipeline emits one structured summary every ten seconds on
-the `keldra::index_runtime::v6_summary` target. Every field is prefixed
-`keldra_index_v6_`. The live counters cover source rows/bytes; hot raw hits,
+The v1 Typed JSON pipeline emits one structured summary every ten seconds on
+the `keldra::index_runtime::v1_summary` target. Every field is prefixed
+`keldra_index_v1_`. The live counters cover source rows/bytes; hot raw hits,
 prepared hits, misses, and evictions; payload parsed, selected, extracted,
 prepared, projected, sealed, published, and checkpointed rows/bytes; catalog
 directory publications and activations; and stage CPU and queue-wait
@@ -121,7 +122,7 @@ larger than wall-clock duration; it is a saturation signal, not elapsed time.
 
 Partition-local baseline and journal catch-up expose overlap-safe active
 counters, records and bytes, elapsed time, last-progress age, source reads,
-failures, and selected recovery actions. Publication exposes the v6 partition
+failures, and selected recovery actions. Publication exposes the v1 partition
 root/current revision, checkpoint, presence, age, freshness, source lag,
 partition-local CAS result, fence result, segment and head-delta bytes, and
 duration. Query materialization separately reports family-directory generation,
@@ -175,17 +176,25 @@ uses only closed operation and outcome labels. A failed attempt while the
 previous grant remains valid is an informational
 `renewal_failed_lease_valid` outcome; only the absence of a valid fence is
 warned as `fence_unavailable`. The missed-deadline counter increments once when
-an unavailable transition is observed between renewal attempts. The legacy
-`keldra_serving_fence_renewals_total` remains an alias for attempts; use
-`keldra_serving_fence_renewal_successes_total` for successful grants.
+an unavailable transition is observed between renewal attempts.
 
 A ten-second runtime sampler exports process RSS/virtual memory/thread count,
 cgroup current/limit/peak memory and pressure/OOM events, and RocksDB block
 cache, table-reader, memtable, flush, compaction, pending-byte, delayed-write,
-and stall state. It also reports source-journal occupancy and per-consumer lag,
-plus mutation-receipt occupancy and projected capacity. Collection runs on a
-blocking worker and optional kernel or RocksDB properties fail independently,
-so telemetry sampling cannot stall or fail the storage path.
+and stall state. Node-local physical gauges separately report live payload blob
+bytes, garbage payload blob bytes, payload SST bytes, non-payload
+metadata/index SST bytes, and WAL bytes. It also reports source-journal
+occupancy and per-consumer lag, plus mutation-receipt occupancy and projected
+capacity. Collection runs on a blocking worker and optional kernel or RocksDB
+properties fail independently, so telemetry sampling cannot stall or fail the
+storage path. Cluster physical totals in the protected administration response
+sum the reported ACTIVE node stores and therefore include replicas; they are
+not unique-content totals and are never attributed to tenants.
+The same protected response performs an independent point-in-time scan of
+current heads and aggregates only the node recorded as each head's source
+owner. It reports exact tenant and cluster visible-file counts only with full
+ACTIVE-source coverage; otherwise their state is `unavailable`. Replica copies
+and overlapping accounting definitions are never summed.
 
 `keldra.index.partition_pipeline` and `keldra.index.compaction` are
 phase-lifetime spans. They contain stable numeric recipe, partition, tenant,

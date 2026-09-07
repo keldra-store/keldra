@@ -28,7 +28,7 @@ pub(crate) use credential_record::{StoredApplicationCredential, StoredCredential
 pub const SYSTEM_BOOTSTRAP_VERSION: u16 = 1;
 pub const SYSTEM_SCHEMA_ID: &str = "keldra-system";
 const SYSTEM_BOOTSTRAP_MARKER_KEY: &[u8] = b"system_bootstrap_complete";
-pub(crate) const CREDENTIAL_FORMAT_VERSION: u16 = 2;
+pub(crate) const CREDENTIAL_FORMAT_VERSION: u16 = 1;
 pub(crate) const APPLICATION_FORMAT_VERSION: u16 = 1;
 pub(crate) const PROVISIONING_FORMAT_VERSION: u16 = 1;
 const MIN_CLIENT_SECRET_BYTES: usize = 32;

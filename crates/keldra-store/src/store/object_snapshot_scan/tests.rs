@@ -114,6 +114,41 @@ async fn stable_prefix_pages_are_sorted_bounded_and_scope_the_cursor() {
 }
 
 #[tokio::test]
+async fn source_owned_logical_file_count_excludes_deleted_heads() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    put_at(&store, "docs/a", b"a", "put-a", 1).await;
+    put_at(&store, "docs/b", b"b", "put-b", 2).await;
+    store
+        .coordinate_object_mutation(
+            BatchOperation::Delete(delete("docs/b", "delete-b")),
+            context(3),
+        )
+        .await
+        .unwrap();
+    let (tenant_id, _) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+
+    let counts = store
+        .source_owned_logical_file_counts(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            |_, _, _| true,
+        )
+        .unwrap();
+    assert_eq!(counts.visible_file_count, 1);
+    assert_eq!(counts.tenant_visible_file_counts.len(), 1);
+    assert_eq!(counts.tenant_visible_file_counts[&tenant_id], 1);
+    let replica_counts = store
+        .source_owned_logical_file_counts(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            |_, _, _| false,
+        )
+        .unwrap();
+    assert_eq!(replica_counts, SourceOwnedLogicalFileCounts::default());
+}
+
+#[tokio::test]
 async fn exact_current_snapshot_never_decodes_retained_history() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))

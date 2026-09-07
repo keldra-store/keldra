@@ -23,14 +23,10 @@ pub enum ProgramBundleAuthority {
         kind: u16,
         contract_version: u16,
     },
-    LegacyProgramOnly {
-        program_path_hash: [u8; 32],
-        program_hash: [u8; 32],
-    },
 }
 
 impl ProgramBundleAuthority {
-    pub fn validate(self, allow_legacy: bool) -> Result<(), &'static str> {
+    pub fn validate(self) -> Result<(), &'static str> {
         match self {
             Self::StoredProgram {
                 program_path_hash,
@@ -40,10 +36,6 @@ impl ProgramBundleAuthority {
                 kind,
                 contract_version,
             } if kind != 0 && contract_version != 0 => Ok(()),
-            Self::LegacyProgramOnly {
-                program_path_hash,
-                program_hash,
-            } if allow_legacy && program_path_hash != [0; 32] && program_hash != [0; 32] => Ok(()),
             _ => Err("atomic bundle authority is malformed"),
         }
     }
@@ -237,13 +229,27 @@ impl ProgramParticipantManifest {
             }
         }
         for governance in &self.governance {
-            if governance.tenant_id == 0 || governance.bucket_id == 0 {
+            if governance.tenant.is_empty()
+                || governance.bucket.is_empty()
+                || governance.tenant_id == 0
+                || governance.bucket_id == 0
+            {
                 return Err("atomic governance participant is malformed".into());
             }
             governance
                 .policy
                 .validate()
                 .map_err(|error| error.to_string())?;
+        }
+        if self.objects.iter().any(|object| {
+            !self.governance.iter().any(|governance| {
+                governance.tenant == object.path.tenant
+                    && governance.bucket == object.path.bucket
+                    && governance.tenant_id == object.tenant_id
+                    && governance.bucket_id == object.bucket_id
+            })
+        }) {
+            return Err("atomic object participant has no matching governance".into());
         }
         Ok(())
     }
@@ -267,6 +273,11 @@ pub struct ProgramPathReservation {
     pub nomination_log_index: u64,
     pub placement: PlacementLogId,
     pub participant: ProgramObjectParticipant,
+    /// The bucket governance resolved by its complete logical-record group and
+    /// sealed in the participant manifest. Exact-path replicas are not
+    /// necessarily bucket-record replicas, so they must never infer this from
+    /// replica-local column families.
+    pub governance: ProgramGovernanceParticipant,
     pub state: ProgramReservationState,
 }
 
@@ -466,41 +477,65 @@ impl Store {
         source: &AtomicWriteBundle,
         alias_bindings: &[ProgramAliasBinding],
         alias_registry_transitions: &[StoredProgramAliasRegistryTransition],
+        authoritative_governance: Option<&BTreeMap<(String, String), ProgramGovernanceParticipant>>,
     ) -> Result<ProgramParticipantManifest, ProgramStoreError> {
         let write_paths = source
-            .writes
-            .iter()
-            .map(|write| write.path.clone())
+            .writes()
+            .map(|(participant, _)| participant.path.clone())
             .collect::<BTreeSet<_>>();
         let delete_paths = source
-            .writes
-            .iter()
-            .filter(|write| write.value.is_none())
-            .map(|write| write.path.clone())
+            .writes()
+            .filter(|(_, write)| write.value.is_none())
+            .map(|(participant, _)| participant.path.clone())
             .collect::<BTreeSet<_>>();
-        let mut objects = Vec::with_capacity(source.head_preconditions.len() * 2);
+        let mut objects = Vec::with_capacity(source.participants.len() * 2);
         let mut governance_by_bucket = BTreeMap::new();
-        for precondition in &source.head_preconditions {
-            let identity = self
-                .resolve_bucket_identity(&precondition.path.tenant, &precondition.path.bucket)
-                .map_err(program_mutation_error)?;
-            governance_by_bucket
-                .entry((
-                    precondition.path.tenant.clone(),
-                    precondition.path.bucket.clone(),
-                ))
-                .or_insert(ProgramGovernanceParticipant {
-                    tenant: precondition.path.tenant.clone(),
-                    bucket: precondition.path.bucket.clone(),
-                    tenant_id: identity.tenant_id.0,
-                    bucket_id: identity.bucket_id.0,
-                    policy: self
-                        .bucket_policy(&precondition.path.tenant, &precondition.path.bucket)
-                        .map_err(program_mutation_error)?,
-                    versioning: self
-                        .bucket_versioning(&precondition.path.tenant, &precondition.path.bucket)
-                        .map_err(program_mutation_error)?,
-                });
+        for precondition in &source.participants {
+            let bucket_key = (
+                precondition.path.tenant.clone(),
+                precondition.path.bucket.clone(),
+            );
+            let governance = match authoritative_governance {
+                Some(authoritative) => {
+                    authoritative.get(&bucket_key).cloned().ok_or_else(|| {
+                        ProgramStoreError::InvalidBundle(
+                            "distributed participant has no authoritative bucket governance".into(),
+                        )
+                    })?
+                }
+                None => {
+                    let identity = self
+                        .resolve_bucket_identity(
+                            &precondition.path.tenant,
+                            &precondition.path.bucket,
+                        )
+                        .map_err(program_mutation_error)?;
+                    ProgramGovernanceParticipant {
+                        tenant: precondition.path.tenant.clone(),
+                        bucket: precondition.path.bucket.clone(),
+                        tenant_id: identity.tenant_id.0,
+                        bucket_id: identity.bucket_id.0,
+                        policy: self
+                            .bucket_policy(&precondition.path.tenant, &precondition.path.bucket)
+                            .map_err(program_mutation_error)?,
+                        versioning: self
+                            .bucket_versioning(&precondition.path.tenant, &precondition.path.bucket)
+                            .map_err(program_mutation_error)?,
+                    }
+                }
+            };
+            if governance.tenant != precondition.path.tenant
+                || governance.bucket != precondition.path.bucket
+            {
+                return Err(ProgramStoreError::InvalidBundle(
+                    "authoritative bucket governance names another bucket".into(),
+                ));
+            }
+            let identity = crate::key::BucketIdentity {
+                tenant_id: crate::key::TenantId(governance.tenant_id),
+                bucket_id: crate::key::BucketId(governance.bucket_id),
+            };
+            governance_by_bucket.entry(bucket_key).or_insert(governance);
             let binding = alias_bindings
                 .iter()
                 .find(|binding| binding.canonical_path == precondition.path);
@@ -551,12 +586,29 @@ impl Store {
             let Some(descriptor) = &binding.descriptor_version else {
                 continue;
             };
-            let identity = self
-                .resolve_bucket_identity(
-                    &binding.requested_path.tenant,
-                    &binding.requested_path.bucket,
-                )
-                .map_err(program_mutation_error)?;
+            let bucket_key = (
+                binding.requested_path.tenant.clone(),
+                binding.requested_path.bucket.clone(),
+            );
+            let identity = match authoritative_governance {
+                Some(authoritative) => {
+                    let governance = authoritative.get(&bucket_key).ok_or_else(|| {
+                        ProgramStoreError::InvalidBundle(
+                            "alias participant has no authoritative bucket governance".into(),
+                        )
+                    })?;
+                    crate::key::BucketIdentity {
+                        tenant_id: crate::key::TenantId(governance.tenant_id),
+                        bucket_id: crate::key::BucketId(governance.bucket_id),
+                    }
+                }
+                None => self
+                    .resolve_bucket_identity(
+                        &binding.requested_path.tenant,
+                        &binding.requested_path.bucket,
+                    )
+                    .map_err(program_mutation_error)?,
+            };
             objects.push(ProgramObjectParticipant {
                 tenant_id: identity.tenant_id.0,
                 bucket_id: identity.bucket_id.0,
@@ -583,6 +635,13 @@ impl Store {
             });
         }
         objects.sort_by(|left, right| left.path.cmp(&right.path));
+        if authoritative_governance
+            .is_some_and(|authoritative| authoritative.len() != governance_by_bucket.len())
+        {
+            return Err(ProgramStoreError::InvalidBundle(
+                "authoritative governance contains an unrelated bucket".into(),
+            ));
+        }
         let manifest = ProgramParticipantManifest {
             format: PROGRAM_PARTICIPANT_MANIFEST_FORMAT,
             objects,
@@ -614,12 +673,6 @@ impl StoredPreparedBundle {
             nomination_log_index,
             placement,
         )?;
-        if matches!(
-            self.authority,
-            ProgramBundleAuthority::LegacyProgramOnly { .. }
-        ) {
-            return Ok(Vec::new());
-        }
         self.participant_manifest
             .validate()
             .map_err(ProgramStoreError::InvalidBundle)?;
@@ -627,26 +680,45 @@ impl StoredPreparedBundle {
             .participant_manifest
             .hash()
             .map_err(ProgramStoreError::InvalidBundle)?;
-        let common = |participant| ProgramPathReservation {
-            format: PROGRAM_PATH_RESERVATION_FORMAT,
-            begin_cursor,
-            invocation_id,
-            bundle_hash: bundle_hash.0,
-            participant_manifest_hash: manifest_hash,
-            authority: self.authority,
-            executor_node_id,
-            nomination_log_index,
-            placement,
-            participant,
-            state: ProgramReservationState::Prepared,
+        let common = |participant: ProgramObjectParticipant| {
+            let governance = self
+                .participant_manifest
+                .governance
+                .iter()
+                .find(|governance| {
+                    governance.tenant == participant.path.tenant
+                        && governance.bucket == participant.path.bucket
+                        && governance.tenant_id == participant.tenant_id
+                        && governance.bucket_id == participant.bucket_id
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    ProgramStoreError::InvalidBundle(
+                        "object participant has no matching bucket governance".into(),
+                    )
+                })?;
+            Ok::<_, ProgramStoreError>(ProgramPathReservation {
+                format: PROGRAM_PATH_RESERVATION_FORMAT,
+                begin_cursor,
+                invocation_id,
+                bundle_hash: bundle_hash.0,
+                participant_manifest_hash: manifest_hash,
+                authority: self.authority,
+                executor_node_id,
+                nomination_log_index,
+                placement,
+                participant,
+                governance,
+                state: ProgramReservationState::Prepared,
+            })
         };
         let mut reservations = self
             .participant_manifest
             .objects
             .iter()
             .cloned()
-            .map(|participant| ProgramReservation::Object(common(participant)))
-            .collect::<Vec<_>>();
+            .map(|participant| common(participant).map(ProgramReservation::Object))
+            .collect::<Result<Vec<_>, _>>()?;
         reservations.extend(self.participant_manifest.governance.iter().cloned().map(
             |participant| {
                 ProgramReservation::Governance(ProgramGovernanceReservation {
@@ -667,6 +739,33 @@ impl StoredPreparedBundle {
         reservations.sort_by_key(ProgramReservation::path);
         Ok(reservations)
     }
+}
+
+pub(super) fn prepared_preconditions(
+    source: &AtomicWriteBundle,
+    alias_bindings: &[ProgramAliasBinding],
+) -> Vec<HeadPrecondition> {
+    let mut preconditions = source
+        .participants
+        .iter()
+        .map(|participant| HeadPrecondition {
+            path: participant.path.clone(),
+            expected: participant.expected.clone(),
+        })
+        .collect::<Vec<_>>();
+    preconditions.extend(alias_bindings.iter().filter_map(|binding| {
+        binding
+            .descriptor_version
+            .as_ref()
+            .map(|version| HeadPrecondition {
+                path: binding.requested_path.clone(),
+                expected: ObservedHead::Version {
+                    version: version.id.0.to_string(),
+                },
+            })
+    }));
+    preconditions.sort_by(|left, right| left.path.cmp(&right.path));
+    preconditions
 }
 
 fn validate_reservation_inputs(

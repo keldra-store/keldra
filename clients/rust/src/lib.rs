@@ -133,9 +133,30 @@ pub async fn connect(
 pub async fn connect_channel(
     endpoint: impl AsRef<str>,
 ) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(Endpoint::from_shared(endpoint.as_ref().to_owned())?
-        .connect()
-        .await?)
+    let endpoint = Endpoint::from_shared(endpoint.as_ref().to_owned())?;
+    validate_transport_endpoint(&endpoint)?;
+    Ok(endpoint.connect().await?)
+}
+
+fn validate_transport_endpoint(
+    endpoint: &Endpoint,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let uri = endpoint.uri();
+    if uri.scheme_str() == Some("https") {
+        return Ok(());
+    }
+    let loopback = uri
+        .host()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback());
+    if uri.scheme_str() == Some("http") && loopback {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "Keldra credentials and bearer tokens require HTTPS; plaintext HTTP is allowed only for a numeric loopback address",
+    )
+    .into())
 }
 
 /// Exchanges one durable application credential for a short-lived bearer
@@ -217,8 +238,25 @@ mod tests {
     use super::{
         MAX_MESSAGE_BYTES, RawAdministrationClient, RawAuthzClient, RawClient, RawIndexClient,
         RawPersonalDbClient, administration_client, authz_client, index_client, object_client,
-        personaldb_client,
+        personaldb_client, validate_transport_endpoint,
     };
+
+    #[test]
+    fn transport_rejects_non_loopback_plaintext() {
+        assert!(
+            validate_transport_endpoint(&Endpoint::from_static("https://keldra.example")).is_ok()
+        );
+        assert!(
+            validate_transport_endpoint(&Endpoint::from_static("http://127.0.0.1:50051")).is_ok()
+        );
+        assert!(validate_transport_endpoint(&Endpoint::from_static("http://[::1]:50051")).is_ok());
+        assert!(
+            validate_transport_endpoint(&Endpoint::from_static("http://10.0.0.4:50051")).is_err()
+        );
+        assert!(
+            validate_transport_endpoint(&Endpoint::from_static("http://localhost:50051")).is_err()
+        );
+    }
 
     #[test]
     fn versioning_defaults_to_unversioned_and_delete_operations_stay_distinct() {

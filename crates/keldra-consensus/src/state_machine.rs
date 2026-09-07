@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use openraft::LogId;
 use serde::{Deserialize, Serialize};
@@ -6,8 +7,8 @@ use thiserror::Error;
 
 use crate::{
     ATOMIC_REPLAY_RETENTION_MILLIS, AbortPreparedBatch, ApplyResult, AtomicBundleAuthority,
-    BeginBatch, BeginResult, ClusterControlState, Command, CommitBatch, CommitPreparedBatch,
-    CommitResult, CommittedBatch, CommittedInvocation, ExecutorNomination, InvocationId,
+    BeginBatch, BeginResult, ClusterControlState, Command, CommitPreparedBatch, CommitResult,
+    CommittedBatch, CommittedInvocation, ExecutorNomination, InvocationId,
     MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS, NodeId, PreparedBatch,
     SYSTEM_BOOTSTRAP_VERSION, codec,
     types::{ClusterId, MAX_RAFT_NODE_ID, SystemBootstrapState},
@@ -31,7 +32,7 @@ pub struct StateMachine {
     pub(crate) cluster_control: ClusterControlState,
     executor: Option<ExecutorNomination>,
     preparing_batch: Option<PreparedBatch>,
-    committed_invocations: BTreeMap<u64, CommittedInvocation>,
+    committed_invocations: Arc<BTreeMap<u64, CommittedInvocation>>,
     committed_invocation_bytes: u64,
     last_commit_cursor: Option<u64>,
     finalized_through: Option<u64>,
@@ -57,98 +58,11 @@ impl StateMachine {
             cluster_control: ClusterControlState::default(),
             executor: None,
             preparing_batch: None,
-            committed_invocations: BTreeMap::new(),
+            committed_invocations: Arc::new(BTreeMap::new()),
             committed_invocation_bytes,
             last_commit_cursor: None,
             finalized_through: None,
         })
-    }
-
-    /// Convert the exact state-machine body written by Keldra 0.5.0.
-    ///
-    /// Snapshot decoding owns the legacy wire type; this constructor only
-    /// supplies the two fields introduced after that release.
-    pub(crate) fn from_v050_snapshot(
-        max_commit_entries: u32,
-        max_commit_bytes: u64,
-        executor: Option<ExecutorNomination>,
-        committed_invocations: BTreeMap<u64, CommittedInvocation>,
-        committed_invocation_bytes: u64,
-        last_commit_cursor: Option<u64>,
-        finalized_through: Option<u64>,
-    ) -> Self {
-        Self {
-            max_commit_entries,
-            max_commit_bytes,
-            cluster_id: None,
-            system_bootstrap: SystemBootstrapState::Missing,
-            cluster_control: ClusterControlState::default(),
-            executor,
-            preparing_batch: None,
-            committed_invocations,
-            committed_invocation_bytes,
-            last_commit_cursor,
-            finalized_through,
-        }
-    }
-
-    /// Convert the version-one enveloped snapshot written before bounded
-    /// cluster-control state was introduced.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_pre_cluster_control_snapshot(
-        max_commit_entries: u32,
-        max_commit_bytes: u64,
-        cluster_id: Option<ClusterId>,
-        system_bootstrap: SystemBootstrapState,
-        executor: Option<ExecutorNomination>,
-        committed_invocations: BTreeMap<u64, CommittedInvocation>,
-        committed_invocation_bytes: u64,
-        last_commit_cursor: Option<u64>,
-        finalized_through: Option<u64>,
-    ) -> Self {
-        Self {
-            max_commit_entries,
-            max_commit_bytes,
-            cluster_id,
-            system_bootstrap,
-            cluster_control: ClusterControlState::default(),
-            executor,
-            preparing_batch: None,
-            committed_invocations,
-            committed_invocation_bytes,
-            last_commit_cursor,
-            finalized_through,
-        }
-    }
-
-    /// Convert the exact version-two enveloped snapshot written before active
-    /// placement changes carried their own committed Raft log ID.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_v2_snapshot(
-        max_commit_entries: u32,
-        max_commit_bytes: u64,
-        cluster_id: Option<ClusterId>,
-        system_bootstrap: SystemBootstrapState,
-        cluster_control: ClusterControlState,
-        executor: Option<ExecutorNomination>,
-        committed_invocations: BTreeMap<u64, CommittedInvocation>,
-        committed_invocation_bytes: u64,
-        last_commit_cursor: Option<u64>,
-        finalized_through: Option<u64>,
-    ) -> Self {
-        Self {
-            max_commit_entries,
-            max_commit_bytes,
-            cluster_id,
-            system_bootstrap,
-            cluster_control,
-            executor,
-            preparing_batch: None,
-            committed_invocations,
-            committed_invocation_bytes,
-            last_commit_cursor,
-            finalized_through,
-        }
     }
 
     pub fn max_commit_entries(&self) -> u32 {
@@ -255,45 +169,11 @@ impl StateMachine {
             Command::NominateExecutor { executor } => {
                 self.nominate_executor(*executor, committed_log_index)
             }
-            Command::CommitBatch(batch) => self.commit_legacy_batch(committed_log_index, *batch),
-            Command::BeginBatch(batch) => {
-                self.require_generalized_atomic_capability()?;
-                self.begin_batch(committed_log_index, *batch)
-            }
+            Command::BeginBatch(batch) => self.begin_batch(committed_log_index, *batch),
             Command::CommitPreparedBatch(batch) => {
-                self.require_generalized_atomic_capability()?;
                 self.commit_prepared_batch(committed_log_index, *batch)
             }
-            Command::AbortPreparedBatch(batch) => {
-                self.require_generalized_atomic_capability()?;
-                self.abort_prepared_batch(*batch)
-            }
-            Command::UpdateNodeCapabilities {
-                format_version,
-                node_id,
-                expected_protocol,
-                expected_storage,
-                replacement_protocol,
-                replacement_storage,
-            } => self.update_node_capabilities(
-                *format_version,
-                *node_id,
-                *expected_protocol,
-                *expected_storage,
-                *replacement_protocol,
-                *replacement_storage,
-            ),
-            Command::ActivateClusterCapabilities {
-                format_version,
-                protocol_version,
-                storage_format,
-                expected_active_placement_log_id,
-            } => self.activate_cluster_capabilities(
-                *format_version,
-                *protocol_version,
-                *storage_format,
-                *expected_active_placement_log_id,
-            ),
+            Command::AbortPreparedBatch(batch) => self.abort_prepared_batch(*batch),
             Command::FinalizedThrough {
                 executor,
                 nomination_log_index,
@@ -396,19 +276,6 @@ impl StateMachine {
         }
     }
 
-    fn require_generalized_atomic_capability(&self) -> Result<(), ApplyError> {
-        if self.cluster_control.active_protocol_version() >= 2
-            && self.cluster_control.active_storage_format() >= 2
-        {
-            Ok(())
-        } else {
-            Err(ApplyError::GeneralizedAtomicCapabilityInactive {
-                active_protocol: self.cluster_control.active_protocol_version(),
-                active_storage: self.cluster_control.active_storage_format(),
-            })
-        }
-    }
-
     fn initialize_cluster(&mut self, cluster_id: ClusterId) -> Result<ApplyResult, ApplyError> {
         validate_cluster_id(cluster_id)?;
         if let Some(current) = self.cluster_id {
@@ -424,8 +291,8 @@ impl StateMachine {
         }
 
         self.cluster_id = Some(cluster_id);
-        self.cluster_control.active_protocol_version = 2;
-        self.cluster_control.active_storage_format = 2;
+        self.cluster_control.active_protocol_version = 1;
+        self.cluster_control.active_storage_format = 1;
         Ok(ApplyResult::ClusterInitialized { cluster_id })
     }
 
@@ -540,72 +407,6 @@ impl StateMachine {
         }))
     }
 
-    fn commit_legacy_batch(
-        &mut self,
-        committed_log_index: u64,
-        legacy: CommitBatch,
-    ) -> Result<ApplyResult, ApplyError> {
-        validate_legacy_commit_batch(legacy)?;
-        self.require_executor(legacy.executor, legacy.nomination_log_index)?;
-        let batch = BeginBatch {
-            executor: legacy.executor,
-            nomination_log_index: legacy.nomination_log_index,
-            authority: AtomicBundleAuthority::LegacyProgramOnly {
-                program_path_hash: legacy.program_path_hash,
-                program_hash: legacy.program_hash,
-            },
-            invocation_id: legacy.invocation_id,
-            input_fingerprint: legacy.input_fingerprint,
-            bundle_ref: legacy.bundle_ref,
-            bundle_hash: legacy.bundle_hash,
-            durability_class: legacy.durability_class,
-            durability_evidence_hash: legacy.durability_evidence_hash,
-            participant_manifest_hash: crate::ParticipantManifestHash(legacy.bundle_hash.0),
-            proposal_at_unix_millis: legacy.proposal_at_unix_millis,
-            replay_expires_at_unix_millis: legacy.replay_expires_at_unix_millis,
-        };
-        let expired = self.expired_finalized_cursors(legacy.proposal_at_unix_millis);
-        self.prune_committed_invocations(&expired)?;
-        if let Some(invocation) = self
-            .committed_invocations
-            .values()
-            .find(|entry| entry.invocation_id == legacy.invocation_id)
-            .copied()
-        {
-            let invocation = replay(invocation, batch)?;
-            return Ok(ApplyResult::BatchCommitted(CommitResult {
-                invocation,
-                replayed: true,
-            }));
-        }
-        if let Some(prepared) = self.preparing_batch {
-            return Err(ApplyError::BatchPreparationInProgress {
-                begin_cursor: prepared.begin_cursor,
-            });
-        }
-        self.preparing_batch = Some(PreparedBatch {
-            begin_cursor: committed_log_index,
-            request: batch,
-        });
-        let result = self.commit_prepared_batch(
-            committed_log_index,
-            CommitPreparedBatch {
-                executor: legacy.executor,
-                nomination_log_index: legacy.nomination_log_index,
-                begin_cursor: committed_log_index,
-                invocation_id: legacy.invocation_id,
-                participant_manifest_hash: crate::ParticipantManifestHash(legacy.bundle_hash.0),
-            },
-        );
-        if result.is_err() {
-            // CommitBatch is the released single-command lifecycle. A failed
-            // commit must not leave behind preparation state that only the new
-            // multi-command lifecycle knows how to recover or abort.
-            self.preparing_batch = None;
-        }
-        result
-    }
-
     fn commit_prepared_batch(
         &mut self,
         committed_log_index: u64,
@@ -654,7 +455,6 @@ impl StateMachine {
                 begin_cursor: prepared.begin_cursor,
                 authority: batch.authority,
                 bundle_ref: batch.bundle_ref,
-                bundle_hash: batch.bundle_hash,
                 durability_class: batch.durability_class,
                 durability_evidence_hash: batch.durability_evidence_hash,
                 participant_manifest_hash: batch.participant_manifest_hash,
@@ -692,8 +492,7 @@ impl StateMachine {
             });
         }
 
-        self.committed_invocations
-            .insert(committed_log_index, invocation);
+        Arc::make_mut(&mut self.committed_invocations).insert(committed_log_index, invocation);
         self.committed_invocation_bytes = next_replay_bytes;
         self.last_commit_cursor = Some(committed_log_index);
         self.preparing_batch = None;
@@ -778,8 +577,7 @@ impl StateMachine {
 
     fn prune_committed_invocations(&mut self, cursors: &[u64]) -> Result<(), ApplyError> {
         for cursor in cursors {
-            let invocation = self
-                .committed_invocations
+            let invocation = Arc::make_mut(&mut self.committed_invocations)
                 .remove(cursor)
                 .ok_or(ApplyError::CommittedInvocationAccountingCorrupt)?;
             self.committed_invocation_bytes = self
@@ -842,43 +640,8 @@ mod capability_tests {
             )
             .unwrap();
 
-        assert_eq!(state.cluster_control().active_protocol_version(), 2);
-        assert_eq!(state.cluster_control().active_storage_format(), 2);
-    }
-
-    #[test]
-    fn generalized_lifecycle_fails_closed_before_cluster_activation() {
-        let mut state = StateMachine::new(4, 64 * 1024).unwrap();
-        let request = BeginBatch {
-            executor: NodeId(1),
-            nomination_log_index: 1,
-            authority: AtomicBundleAuthority::BuiltInObjectTransaction {
-                kind: 1,
-                contract_version: 1,
-            },
-            invocation_id: InvocationId([1; 32]),
-            input_fingerprint: crate::InvocationFingerprint([2; 32]),
-            bundle_ref: crate::BundleRef {
-                hash: [3; 32],
-                length: 1,
-            },
-            bundle_hash: crate::BundleHash([3; 32]),
-            durability_class: crate::DurabilityClass([4; 32]),
-            durability_evidence_hash: crate::DurabilityEvidenceHash([5; 32]),
-            participant_manifest_hash: crate::ParticipantManifestHash([6; 32]),
-            proposal_at_unix_millis: 1,
-            replay_expires_at_unix_millis: 1 + ATOMIC_REPLAY_RETENTION_MILLIS,
-        };
-        assert!(matches!(
-            state.apply(
-                LogId::new(CommittedLeaderId::new(1, 1), 1),
-                &Command::BeginBatch(request),
-            ),
-            Err(ApplyError::GeneralizedAtomicCapabilityInactive {
-                active_protocol: 1,
-                active_storage: 1,
-            })
-        ));
+        assert_eq!(state.cluster_control().active_protocol_version(), 1);
+        assert_eq!(state.cluster_control().active_storage_format(), 1);
     }
 }
 
@@ -919,14 +682,8 @@ fn validate_begin_batch(batch: BeginBatch) -> Result<(), ApplyError> {
     if batch.input_fingerprint.0 == [0; 32] {
         return Err(ApplyError::InvalidInvocationFingerprint);
     }
-    if batch.bundle_ref.hash == [0; 32]
-        || batch.bundle_ref.length == 0
-        || batch.bundle_ref.hash != batch.bundle_hash.0
-    {
+    if batch.bundle_ref.hash == [0; 32] || batch.bundle_ref.length == 0 {
         return Err(ApplyError::InvalidBundleRef);
-    }
-    if batch.bundle_hash.0 == [0; 32] {
-        return Err(ApplyError::InvalidBundleHash);
     }
     if batch.durability_class.0 == [0; 32] {
         return Err(ApplyError::InvalidDurabilityClass);
@@ -936,42 +693,6 @@ fn validate_begin_batch(batch: BeginBatch) -> Result<(), ApplyError> {
     }
     if batch.participant_manifest_hash.0 == [0; 32] {
         return Err(ApplyError::InvalidParticipantManifestHash);
-    }
-    if batch.proposal_at_unix_millis == 0 {
-        return Err(ApplyError::InvalidProposalTime);
-    }
-    if batch
-        .proposal_at_unix_millis
-        .checked_add(ATOMIC_REPLAY_RETENTION_MILLIS)
-        != Some(batch.replay_expires_at_unix_millis)
-    {
-        return Err(ApplyError::InvalidReplayExpiry);
-    }
-    Ok(())
-}
-
-fn validate_legacy_commit_batch(batch: CommitBatch) -> Result<(), ApplyError> {
-    validate_node(batch.executor)?;
-    if batch.program_path_hash.0 == [0; 32] || batch.program_hash.0 == [0; 32] {
-        return Err(ApplyError::InvalidBundleAuthority);
-    }
-    if batch.invocation_id.0 == [0; 32] {
-        return Err(ApplyError::InvalidInvocationId);
-    }
-    if batch.input_fingerprint.0 == [0; 32] {
-        return Err(ApplyError::InvalidInvocationFingerprint);
-    }
-    if batch.bundle_ref.hash == [0; 32] || batch.bundle_ref.length == 0 {
-        return Err(ApplyError::InvalidBundleRef);
-    }
-    if batch.bundle_hash.0 == [0; 32] {
-        return Err(ApplyError::InvalidBundleHash);
-    }
-    if batch.durability_class.0 == [0; 32] {
-        return Err(ApplyError::InvalidDurabilityClass);
-    }
-    if batch.durability_evidence_hash.0 == [0; 32] {
-        return Err(ApplyError::InvalidDurabilityEvidenceHash);
     }
     if batch.proposal_at_unix_millis == 0 {
         return Err(ApplyError::InvalidProposalTime);
@@ -1051,23 +772,12 @@ pub enum ApplyError {
     InvalidInvocationFingerprint,
     #[error("bundle reference must be non-zero")]
     InvalidBundleRef,
-    #[error("bundle hash must be non-zero")]
-    InvalidBundleHash,
     #[error("durability class must be non-zero")]
     InvalidDurabilityClass,
     #[error("durability evidence hash must be non-zero")]
     InvalidDurabilityEvidenceHash,
     #[error("participant manifest hash must be non-zero")]
     InvalidParticipantManifestHash,
-    #[error(
-        "generalized atomic lifecycle requires selected capability 2/2; active protocol/storage is {active_protocol}/{active_storage}"
-    )]
-    GeneralizedAtomicCapabilityInactive {
-        active_protocol: u16,
-        active_storage: u16,
-    },
-    #[error("legacy atomic commit batch is malformed")]
-    InvalidLegacyCommitBatch,
     #[error("commit proposal time must be non-zero")]
     InvalidProposalTime,
     #[error("commit replay expiry must be exactly 24 hours after proposal time")]
@@ -1146,18 +856,6 @@ pub enum ApplyError {
     InvalidStorageWeight,
     #[error("capability range {min}..={max} is invalid")]
     InvalidCapabilityRange { min: u16, max: u16 },
-    #[error("node {node_id:?} capability CAS does not match its committed descriptor")]
-    NodeCapabilityCasMismatch { node_id: NodeId },
-    #[error("node {node_id:?} capability support may only expand")]
-    NodeCapabilitiesRegressed { node_id: NodeId },
-    #[error("activated cluster capability versions must be non-zero")]
-    InvalidActivatedCapabilities,
-    #[error("cluster capability activation requires no membership or atomic transition")]
-    ClusterCapabilitiesNotQuiescent,
-    #[error("cluster capability activation placement fence does not match")]
-    ClusterCapabilityPlacementMismatch,
-    #[error("activated cluster capabilities may not regress")]
-    ClusterCapabilitiesRegressed,
     #[error("an ACTIVE node does not advertise the requested cluster capability")]
     ActiveNodeLacksCapability,
     #[error("peer SPKI SHA-256 fingerprint must be non-zero")]

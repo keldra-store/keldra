@@ -470,8 +470,8 @@ impl DefinitionCoordinationTask {
         journal: std::sync::Arc<IndexEventJournal>,
     ) -> Self {
         let mut tasks = Vec::new();
-        // TypedJson v6 has one all-source catalog feed, not index definition
-        // assignment delivery. `V6IndexCatalog` is exclusively owned by that
+        // TypedJson v1 has one all-source catalog feed, not index definition
+        // assignment delivery. `V1IndexCatalog` is exclusively owned by that
         // feed's baseline/replay checkpoint below.
         for kind in [DefinitionKind::Accounting] {
             tasks.push(tokio::spawn(run_source_delivery(
@@ -1864,7 +1864,7 @@ mod tests {
             40,
             50,
             Some(DefinitionCheckpoint {
-                consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
+                consumer_kind: DefinitionConsumerKind::V1IndexCatalog,
                 source_id: source,
                 next_offset: 47,
                 observed_fence: PlacementLogId { term: 2, index: 9 },
@@ -1906,7 +1906,7 @@ mod tests {
         for checkpoint in [
             None,
             Some(DefinitionCheckpoint {
-                consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
+                consumer_kind: DefinitionConsumerKind::V1IndexCatalog,
                 source_id: source,
                 next_offset: 20,
                 observed_fence: PlacementLogId { term: 3, index: 4 },
@@ -1947,7 +1947,7 @@ mod tests {
         assert_eq!(checkpoint.next_offset, 42);
         assert_eq!(
             checkpoint.consumer_kind,
-            DefinitionConsumerKind::V6IndexCatalog
+            DefinitionConsumerKind::V1IndexCatalog
         );
     }
 

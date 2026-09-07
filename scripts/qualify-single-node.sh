@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Single-node release qualification for non-index storage, authentication,
 # accounting, PersonalDB, S3, Git, and public-read behavior. Indexing is
-# qualified separately by scripts/qualify-index-v6-ssd-scale.sh.
+# qualified separately by scripts/qualify-index-v1-ssd-scale.sh.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
 requested_image="${KELDRA_IMAGE:-keldra:0.17.0}"
@@ -102,9 +102,9 @@ if [[ "${server_version}" != "keldra-server 0.17.0" \
   echo "client: ${client_version}" >&2
   exit 2
 fi
-qualification_dir="$(mktemp -d /var/tmp/keldra-v090-single-qualification.XXXXXX)"
+qualification_dir="$(mktemp -d /var/tmp/keldra-v1-single-qualification.XXXXXX)"
 qualification_suffix="${qualification_dir##*.}"
-container_name="keldra-v090-single-${qualification_suffix}"
+container_name="keldra-v1-single-${qualification_suffix}"
 data_dir="${qualification_dir}/data"
 signing_key="${qualification_dir}/token-signing-key"
 KELDRA_QUALIFICATION_STATE_DIR="${qualification_dir}"
@@ -129,7 +129,7 @@ cleanup() {
   if ((container_started == 1)); then
     docker rm --force "${container_name}" >/dev/null 2>&1 || true
   fi
-  if [[ "${qualification_dir}" == /var/tmp/keldra-v090-single-qualification.* ]]; then
+  if [[ "${qualification_dir}" == /var/tmp/keldra-v1-single-qualification.* ]]; then
     docker run --rm --user 0 \
       --volume "${qualification_dir}:/qualification" \
       "${image_id}" rm -rf \
@@ -578,7 +578,7 @@ public_endpoint="$(published_endpoint 50051 public)"
 restart_probe_bucket="large-single-${$}"
 
 echo "[keldra-single-qualification] node ready public=${public_endpoint}"
-echo "[keldra-single-qualification] indexing is qualified separately by scripts/qualify-index-v6-ssd-scale.sh"
+echo "[keldra-single-qualification] indexing is qualified separately by scripts/qualify-index-v1-ssd-scale.sh"
 
 run_large_object_qualification
 run_public_read_qualification

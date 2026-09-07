@@ -20,27 +20,6 @@ message PeerContext {
   uint32 remaining_deadline_millis = 7;
 }
 
-message UpdateLocalCapabilitiesRequest {
-  PeerContext peer = 1;
-  uint32 expected_protocol_min = 2;
-  uint32 expected_protocol_max = 3;
-  uint32 expected_storage_min = 4;
-  uint32 expected_storage_max = 5;
-  uint32 replacement_protocol_min = 6;
-  uint32 replacement_protocol_max = 7;
-  uint32 replacement_storage_min = 8;
-  uint32 replacement_storage_max = 9;
-}
-
-message LocalCapabilitiesUpdated {
-  uint32 schema_version = 1;
-  uint64 node_id = 2;
-  uint32 protocol_min = 3;
-  uint32 protocol_max = 4;
-  uint32 storage_min = 5;
-  uint32 storage_max = 6;
-}
-
 message LogicalRecordReadRequest {
   PeerContext peer = 1;
   bytes id_json = 2;
@@ -139,7 +118,7 @@ message RealmCandidateReadRequest {
 message RealmCandidate {
   uint32 schema_version = 1;
   bool present = 2;
-  bytes manifest_json = 3;
+  bytes state_json = 3;
 }
 
 message RealmAggregateReadRequest {
@@ -728,33 +707,6 @@ message IndexArtifactDeleted {
   bool replayed = 3;
 }
 
-// Every retained descriptor beneath one exact format-v4 Keldra-owned index
-// artifact prefix. The server derives the prefix from index_id; peers cannot
-// widen it.
-message IndexArtifactHeads {
-  uint64 tenant_id = 1;
-  uint64 bucket_id = 2;
-  uint64 index_id = 3;
-}
-
-// A bounded format-v4 index-maintenance scan. Pages are retained
-// `(path, version)` records and the scope is always one exact index ID.
-message ScanIndexHeadsRequest {
-  PeerContext peer = 1;
-  optional string cursor = 2;
-  IndexArtifactHeads artifacts = 4;
-}
-
-message IndexHeadScanPage {
-  uint32 schema_version = 1;
-  uint64 source_node_id = 2;
-  bytes source_epoch = 3;
-  uint64 placement_term = 4;
-  uint64 placement_index = 5;
-  repeated bytes heads_json = 6;
-  optional string next_cursor = 7;
-}
-
 // Begin one gap-free, ephemeral rebuild cursor. The small acknowledgement
 // contains only the snapshot identity and captured source tail.
 message IndexSourceSnapshotBegin {
@@ -1000,13 +952,32 @@ message AccountingMatcherCacheInvalidated {
   uint32 schema_version = 1;
 }
 
+message NodeStorageObservationRequest {
+  PeerContext peer = 1;
+}
+
+message NodeStorageObservationResponse {
+  uint32 schema_version = 1;
+  uint64 node_id = 2;
+  uint64 refreshed_at_unix_millis = 3;
+  optional uint64 live_payload_blob_bytes = 4;
+  optional uint64 garbage_payload_blob_bytes = 5;
+  optional uint64 payload_sst_bytes = 6;
+  optional uint64 metadata_index_sst_bytes = 7;
+  optional uint64 wal_bytes = 8;
+  optional uint64 source_visible_file_count = 9;
+  repeated TenantVisibleFileCount tenant_visible_file_counts = 10;
+}
+
+message TenantVisibleFileCount {
+  uint64 tenant_id = 1;
+  uint64 visible_file_count = 2;
+}
+
 // This service is installed only on Keldra's mandatory-mTLS peer listener.
 // It exposes typed logical operations, never RocksDB keys, column-family
 // values, or a generic public-method tunnel.
 service ClusterPeer {
-  // One ACTIVE mTLS-authenticated node may attest only its own expanded
-  // support range. The current Raft leader commits the exact CAS update.
-  rpc UpdateLocalCapabilities(UpdateLocalCapabilitiesRequest) returns (LocalCapabilitiesUpdated);
   rpc ResolveTenantName(ResolveTenantNameRequest) returns (ResolveTenantNameResult);
   rpc ResolveBucketName(ResolveBucketNameRequest) returns (ResolveBucketNameResult);
   rpc ReadLogicalRecord(LogicalRecordReadRequest) returns (LogicalRecordCandidate);
@@ -1026,6 +997,7 @@ service ClusterPeer {
   rpc ListLocalObjects(LocalListRequest) returns (LocalListPage);
   rpc GetWatchStatus(WatchStatusRequest) returns (WatchStatus);
   rpc ReadWatchPage(WatchPageRequest) returns (WatchPage);
+  rpc GetNodeStorageObservation(NodeStorageObservationRequest) returns (NodeStorageObservationResponse);
 
   rpc RoutePutEnd(RoutePutEndRequest) returns (keldra.v1.MutationReceipt);
   rpc RouteDelete(RouteDeleteRequest) returns (keldra.v1.MutationReceipt);
@@ -1077,7 +1049,6 @@ service ClusterPeer {
   rpc PublishIndexArtifacts(PublishIndexArtifactsRequest) returns (IndexArtifactsPublished);
   rpc CommitGuardedIndexArtifact(CommitGuardedIndexArtifactRequest) returns (IndexArtifactPublished);
   rpc DeleteIndexArtifact(DeleteIndexArtifactRequest) returns (IndexArtifactDeleted);
-  rpc ScanIndexHeads(ScanIndexHeadsRequest) returns (IndexHeadScanPage);
   rpc ScanIndexSourceSnapshot(stream IndexSourceSnapshotRequest) returns (stream IndexSourceSnapshotResponse);
   rpc ScanRetainedSourceSnapshot(stream RetainedSourceSnapshotRequest) returns (stream RetainedSourceSnapshotResponse);
   rpc RouteIndexQuery(RouteIndexQueryRequest) returns (RoutedIndexQueryResponse);

@@ -82,8 +82,8 @@ pub(crate) async fn ensure_genesis_identity(decisions: &DecisionRaft) -> Result<
 
 /// Bind the startup-selected immutable erasure geometry to this cluster.
 ///
-/// Genesis and an in-place 0.5.0 upgrade bind an absent value exactly once.
-/// Every later restart must present the already committed profile.
+/// Genesis binds an absent value exactly once. Every later restart must
+/// present the already committed profile.
 pub(crate) async fn ensure_erasure_code_profile(
     decisions: &DecisionRaft,
     requested: ErasureProfile,
@@ -121,8 +121,8 @@ pub(crate) async fn ensure_erasure_code_profile(
 }
 
 /// Bind the operator-selected JWT material to this cluster without retaining
-/// the secret. An absent value is the released-0.5.0 migration case; every
-/// later startup must match the first committed fingerprint.
+/// the secret. Genesis binds the absent value; every later startup must match
+/// the first committed fingerprint.
 pub(crate) async fn ensure_jwt_signing_key_fingerprint(
     decisions: &DecisionRaft,
     requested: JwtSigningKeyFingerprint,
@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_absent_jwt_fingerprint_is_bound_and_restarts_fail_closed() {
+    async fn genesis_jwt_fingerprint_is_bound_and_restarts_fail_closed() {
         let temporary = tempfile::tempdir().unwrap();
         let expected = JwtSigningKeyFingerprint([21; 32]);
         let mismatch = JwtSigningKeyFingerprint([22; 32]);
@@ -484,7 +484,7 @@ mod tests {
                 .cluster_control()
                 .jwt_signing_key_fingerprint(),
             None,
-            "released 0.5.0 state has no JWT fingerprint"
+            "genesis state has no JWT fingerprint"
         );
         ensure_jwt_signing_key_fingerprint(&decisions, expected)
             .await
@@ -557,8 +557,8 @@ mod tests {
                     current_peer_spki_sha256: PeerSpkiSha256([1; 32]),
                     overlap_peer_spki_sha256: None,
                     join_capability_hash: Some(JoinCapabilityHash([2; 32])),
-                    supported_protocol: CapabilityRange { min: 1, max: 2 },
-                    supported_storage_format: CapabilityRange { min: 1, max: 2 },
+                    supported_protocol: CapabilityRange { min: 1, max: 1 },
+                    supported_storage_format: CapabilityRange { min: 1, max: 1 },
                 },
             })
             .await
@@ -583,7 +583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_local_marker_is_migrated_once_and_restart_is_idempotent() {
+    async fn local_first_bootstrap_recovers_missing_raft_marker_and_restart_is_idempotent() {
         let temporary = tempfile::tempdir().unwrap();
         let initial_store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await

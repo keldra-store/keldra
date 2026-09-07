@@ -14,7 +14,8 @@ cargo add tokio --features macros,rt-multi-thread
 
 ## Connect and read an object head
 
-Set `KELDRA_ENDPOINT`, `KELDRA_CLIENT_ID`, and `KELDRA_CLIENT_SECRET`, then run:
+Set `KELDRA_ENDPOINT`, `KELDRA_CLIENT_ID`, and
+`KELDRA_CLIENT_SECRET_FILE` (a mode-`0600` file), then run:
 
 ```rust,no_run
 use keldra::v1::{HeadObjectRequest, ObjectAddress, object_head};
@@ -24,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = keldra::connect_with_credentials(
         std::env::var("KELDRA_ENDPOINT")?,
         std::env::var("KELDRA_CLIENT_ID")?,
-        std::env::var("KELDRA_CLIENT_SECRET")?,
+        std::fs::read_to_string(std::env::var("KELDRA_CLIENT_SECRET_FILE")?)?,
     )
     .await?;
 
@@ -109,9 +110,9 @@ client.unlink_object(UnlinkObjectRequest {
 # }
 ```
 
-Clone and link require cluster protocol/storage capability `2/2`. Operators must
+Clone and link require cluster protocol/storage capability `1/1`. Operators must
 start 0.17 on fresh authoritative and derived-index volumes and confirm that the
-fresh cluster reports active capability `2/2` before applications invoke them.
+fresh cluster reports active capability `1/1` before applications invoke them.
 
 ## Define a typed index safely
 

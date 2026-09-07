@@ -19,8 +19,8 @@ use tokio_stream::StreamExt as _;
 use crate::authentication::{JwtManager, RequestRateLimits};
 use crate::authorization::ObjectPermission;
 use crate::distributed_control_plane::DistributedControlPlane;
+use crate::object_service::{GatewayIdentity, GatewayObjectAdapter};
 use crate::serving_fence::ServingAuthority;
-use crate::v05::{GatewayIdentity, GatewayObjectAdapter};
 
 const OCI_PLUGIN_ID: &str = "oci@1";
 const OCI_BINDING_PATH: &str = "_keldra/plugins/oci@1";
@@ -76,6 +76,16 @@ impl PluginGatewayConfig {
                     && endpoint.query().is_none()
                     && matches!(endpoint.path(), "" | "/"),
                 "HTTP plugin endpoint must be an HTTP origin without a path or query"
+            );
+            let host = endpoint
+                .host()
+                .ok_or_else(|| anyhow::anyhow!("HTTP plugin endpoint has no host"))?;
+            let numeric_host = host.trim_start_matches('[').trim_end_matches(']');
+            anyhow::ensure!(
+                numeric_host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback()),
+                "HTTP plugin endpoints must use a numeric loopback address because Keldra forwards scoped bearer credentials over this connection"
             );
             anyhow::ensure!(
                 parsed.insert(id.to_owned(), endpoint).is_none(),
@@ -773,6 +783,29 @@ mod tests {
             (target.bucket.as_str(), target.tenant.as_str()),
             ("images", "acme")
         );
+    }
+
+    #[test]
+    fn cleartext_plugin_origin_must_be_numeric_loopback() {
+        for endpoint in [
+            "oci@1=http://10.0.0.8:9000",
+            "oci@1=http://plugins.example.test:9000",
+            "oci@1=http://localhost:9000",
+        ] {
+            let error = PluginGatewayConfig::new(
+                Some("keldra.test".into()),
+                Some("https".into()),
+                [endpoint.into()],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("numeric loopback"));
+        }
+        PluginGatewayConfig::new(
+            Some("keldra.test".into()),
+            Some("https".into()),
+            ["oci@1=http://[::1]:9000".into()],
+        )
+        .unwrap();
     }
 
     #[test]

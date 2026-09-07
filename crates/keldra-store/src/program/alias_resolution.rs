@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use keldra_atomic_program::VersionedWrite;
+use keldra_atomic_program::AtomicParticipant;
 
 use super::*;
 
@@ -127,12 +127,13 @@ impl Store {
 }
 
 pub(super) fn stored_alias_delete_binding<'a>(
-    write: &VersionedWrite,
+    participant: &AtomicParticipant,
     alias_bindings: &'a [ProgramAliasBinding],
 ) -> Option<&'a ProgramAliasBinding> {
-    write.value.is_none().then(|| {
+    participant.write.as_ref()?.value.is_none().then(|| {
         alias_bindings.iter().find(|binding| {
-            binding.requested_path != binding.canonical_path && binding.canonical_path == write.path
+            binding.requested_path != binding.canonical_path
+                && binding.canonical_path == participant.path
         })
     })?
 }
@@ -142,8 +143,8 @@ pub(super) fn stored_alias_registry_transitions(
     alias_bindings: &[ProgramAliasBinding],
 ) -> Result<Vec<StoredProgramAliasRegistryTransition>, ProgramStoreError> {
     let mut transitions = Vec::new();
-    for write in &source.writes {
-        let Some(binding) = stored_alias_delete_binding(write, alias_bindings) else {
+    for (participant, _) in source.writes() {
+        let Some(binding) = stored_alias_delete_binding(participant, alias_bindings) else {
             continue;
         };
         let expected = binding.alias_registry.clone().ok_or_else(|| {

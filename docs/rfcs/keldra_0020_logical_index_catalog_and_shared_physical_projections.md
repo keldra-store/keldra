@@ -62,7 +62,7 @@ admission before durable catalog or physical state is created. Each kind returns
 only after it implements this same partition-owned pipeline; none retains or
 falls back to the removed builder architecture.
 
-The canonical durable format and namespace are v6 partition roots, currents,
+The canonical durable format and namespace are v1 partition roots, currents,
 segments, head deltas, and checkpoints. This is a clean break. There are no
 legacy readers, migrations, format converters, dual writers, compatibility
 shims, feature flags selecting the old builder path, or mixed old/new
@@ -513,7 +513,7 @@ For immutable `SourceId { source_node, source_epoch }`, its ACTIVE source node
 is the producer, preserving normal payload locality. If that node has left the
 current placement, the producer is rank zero from the existing capacity-weighted
 `FutureIndex` HRW ranking over the domain-separated canonical key
-`keldra/v6/source-producer/v1 || tenant_id || bucket_id || source_node ||
+`keldra/v1/source-producer/v1 || tenant_id || bucket_id || source_node ||
 source_epoch`. Logical definitions and physical families are deliberately not
 inputs, so every family follows one source handoff. The partition identity
 records both immutable source identity and this fenced producer identity.
@@ -652,7 +652,7 @@ object floor of approximately 1 KiB and a pathological 96 KiB source-object
 cell reflecting the production large-object failure shape. The latter is D1/P1
 at the maximum resource cell, not a multiplier on logical catalog or physical
 recipe cardinality. Reports distinguish accepted source bytes/s from
-prepared/projected bytes/s; the latter is read only from a v6 runtime counter,
+prepared/projected bytes/s; the latter is read only from a v1 runtime counter,
 never estimated from payload length.
 
 The first SSD floor for small-object projection is 10,000 accepted and indexed
@@ -711,7 +711,7 @@ Implementation removes, rather than wraps:
 - per-definition or per-family journal rescans and checkpoints;
 - historical projected-state streams used to rediscover predecessor state;
 - global/per-family manifest CAS on the normal partition flush path;
-- the format-v4 assembler bridge as a separately scheduled indexing path;
+- the assembler bridge as a separately scheduled indexing path;
 - dual writers, old-format readers, converters, migrations, feature flags, and
   fallback query/index paths;
 - compatibility tests whose only purpose is preserving removed architecture;
@@ -729,7 +729,7 @@ introduce a second journal, share data across authorization authorities, adopt
 Lucene or RocksDB as the public index format, require query fanout, or promise
 that increasing CPU always helps after another measured resource saturates.
 
-It also does not preserve the seven v4-only index kinds in the current supported
+It also does not preserve the superseded index kinds in the current supported
 surface. Their component semantics remain design input, but availability waits
 for a partition-pipeline implementation and its full correctness qualification.
 

@@ -27,7 +27,6 @@ use super::{
     definition_path, outbound_source_path,
 };
 
-const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const BASELINE_FRAME_BYTES: u64 = 512 * 1024;
 const CATALOG_HANDOFF_PAGE: usize = 256;
 const MAX_ACTIVE_ACCOUNTING_WORKERS: usize = 64;
@@ -216,11 +215,6 @@ impl AccountingScheduler {
         if self.queued.insert(identity) {
             self.ready.push_back(identity);
         }
-    }
-
-    fn delay(&mut self, identity: AccountingIdentity, duration: Duration) {
-        let due = Instant::now() + duration;
-        self.due.insert(identity, due);
     }
 
     fn wait_for_baseline(&mut self, identity: AccountingIdentity) {
@@ -540,6 +534,7 @@ async fn run_quantum(
                 .await
             {
                 Ok(Some(page)) => {
+                    let before_page = through.clone();
                     if let Err(error) = apply_page(definition, &mut snapshot, &page) {
                         return (
                             WorkerPhase::AwaitBaseline,
@@ -547,8 +542,15 @@ async fn run_quantum(
                         );
                     }
                     through = page.through;
-                    if let Err(error) =
-                        publish_snapshot(definition, dependencies, &snapshot, &through).await
+                    // The event reader holds the prior atomic watermark until
+                    // every source reaches the captured vector. Keep partial
+                    // pages only in this worker's disposable memory so no
+                    // externally visible rollup can represent half an atomic
+                    // program. Ordinary pages with an unchanged watermark keep
+                    // their normal incremental publication behavior.
+                    if accounting_page_is_publishable(&before_page, &captured, &through)
+                        && let Err(error) =
+                            publish_snapshot(definition, dependencies, &snapshot, &through).await
                     {
                         return (WorkerPhase::Recover, QuantumSchedule::Retry(error));
                     }
@@ -699,6 +701,14 @@ fn apply_page(
     Ok(())
 }
 
+fn accounting_page_is_publishable(
+    before: &IndexBarrier,
+    captured: &IndexBarrier,
+    after: &IndexBarrier,
+) -> bool {
+    before.atomic == captured.atomic || after.atomic == captured.atomic
+}
+
 async fn publish_snapshot(
     definition: &LoadedAccountingDefinition,
     dependencies: &AccountingBuilderDependencies,
@@ -716,8 +726,9 @@ async fn publish_snapshot(
     let rollup = StoredAccountingRollup::new(
         definition.stored.accounting_id,
         definition.version.0,
-        snapshot.logical_stored_bytes(),
-        snapshot.object_count(),
+        snapshot.billable_logical_bytes(),
+        snapshot.retained_non_billable_logical_bytes(),
+        snapshot.visible_file_count(),
         inbound,
         outbound,
         true,
@@ -948,12 +959,55 @@ mod tests {
     }
 
     #[test]
+    fn atomic_transition_pages_publish_only_after_the_complete_vector_promotes() {
+        let before = barrier(5);
+        let mut captured = before.clone();
+        captured.atomic = AtomicProgramWatermark::new(Some(8), Some(8), 0);
+        captured.sources.get_mut(&NodeId(4)).unwrap().next_offset = 9;
+        captured.sources.insert(
+            NodeId(5),
+            IndexSourceCursor {
+                source: SourceId {
+                    node_id: 5,
+                    source_epoch: [7; 32],
+                },
+                next_offset: 9,
+            },
+        );
+
+        let mut first_source_only = before.clone();
+        first_source_only.sources = captured.sources.clone();
+        first_source_only
+            .sources
+            .get_mut(&NodeId(5))
+            .unwrap()
+            .next_offset = 5;
+        assert!(!accounting_page_is_publishable(
+            &before,
+            &captured,
+            &first_source_only
+        ));
+
+        let mut complete = captured.clone();
+        complete.sources = captured.sources.clone();
+        assert!(accounting_page_is_publishable(
+            &first_source_only,
+            &captured,
+            &complete
+        ));
+        assert!(accounting_page_is_publishable(
+            &complete, &complete, &complete
+        ));
+    }
+
+    #[test]
     fn compatible_complete_rollup_resumes_without_a_baseline() {
         let definition = definition();
         let rollup = StoredAccountingRollup::new(
             definition.stored.accounting_id,
             definition.version.0,
             90,
+            7,
             3,
             4,
             5,
@@ -965,8 +1019,9 @@ mod tests {
         let (snapshot, through) = resume_rollup(&definition, &rollup, &barrier(12))
             .unwrap()
             .expect("compatible rollup must resume");
-        assert_eq!(snapshot.logical_stored_bytes(), 90);
-        assert_eq!(snapshot.object_count(), 3);
+        assert_eq!(snapshot.billable_logical_bytes(), 90);
+        assert_eq!(snapshot.retained_non_billable_logical_bytes(), 7);
+        assert_eq!(snapshot.visible_file_count(), 3);
         assert_eq!(through.sources[&NodeId(4)].next_offset, 9);
     }
 
@@ -977,6 +1032,7 @@ mod tests {
             definition.stored.accounting_id,
             definition.version.0,
             90,
+            7,
             3,
             4,
             5,
@@ -1030,15 +1086,6 @@ mod tests {
         assert!(event_requires_baseline(&IndexEventError::SourceHistoryGap(
             NodeId(4)
         )));
-    }
-
-    #[test]
-    fn delayed_active_lease_wakes_at_its_retry_deadline() {
-        let now = Instant::now();
-        let mut scheduler = AccountingScheduler::default();
-        scheduler.delay((1, 2, 3), RETRY_INTERVAL);
-        let wake = next_scheduler_wake_std(&scheduler, now);
-        assert!(wake >= now && wake <= Instant::now() + RETRY_INTERVAL);
     }
 
     #[test]

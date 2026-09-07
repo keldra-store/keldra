@@ -97,9 +97,9 @@ impl AuthzReplicaTransport for ClusterPeerTransport {
             .await?
             .into_inner();
         require_response_schema(response.schema_version)?;
-        let manifest = decode_optional(response.present, &response.manifest_json)?;
-        manifest
-            .map(AuthzRealmReplicaCandidate::from_manifest)
+        let state = decode_optional(response.present, &response.state_json)?;
+        state
+            .map(AuthzRealmReplicaCandidate::from_state)
             .transpose()
     }
 
@@ -144,14 +144,14 @@ impl AuthzReplicaTransport for ClusterPeerTransport {
                     stable_tenant_id,
                     scope_json: encode_json(scope)?,
                     present: true,
-                    manifest_json: encode_json(&winner.manifest)?,
+                    manifest_json: first.manifest_json.clone(),
                     offset: 0,
                     content: Vec::new(),
                     end: false,
                 })
                 .await
                 .map_err(|_| Status::cancelled("realm install stream closed"))?;
-            let expected_bytes = winner.manifest.encoded_bytes;
+            let expected_bytes = observed.transfer_manifest()?.encoded_bytes;
             Some(tokio::spawn(async move {
                 forward_source_stream(source_stream, sender, expected_bytes).await
             }))

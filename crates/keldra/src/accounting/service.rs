@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use keldra_api::v1::accounting_service_server::AccountingService;
 use keldra_api::v1::{
-    AccountingDefinition, AccountingFreshness, AccountingSnapshot, DisableAccountingRequest,
-    DisableAccountingResponse, EnableAccountingRequest, GetAccountingRequest,
+    AccountingByteMeasurement, AccountingDefinition, AccountingFreshness, AccountingLogicalUsage,
+    AccountingMeasurementState, AccountingSnapshot, AccountingTrafficUsage,
+    DisableAccountingRequest, DisableAccountingResponse, EnableAccountingRequest,
+    GetAccountingRequest,
 };
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{DefinitionKind, ObjectKey, Store};
@@ -25,7 +27,7 @@ use crate::distributed_list::OriginalBearer;
 use crate::index_runtime::placement::{IndexIdentity, IndexPlacement};
 use crate::index_service::validate_command_id;
 use crate::logical_name_resolution::LogicalNameResolver;
-use crate::v05::{deadline_remaining, request_deadline, run_request_until};
+use crate::object_service::{deadline_remaining, request_deadline, run_request_until};
 
 use super::manager::{read_rollup, read_traffic_source_versioned};
 use super::{
@@ -276,14 +278,29 @@ impl AccountingServiceImpl {
             }
             _ => Ok(AccountingSnapshot {
                 definition: Some(definition.stored.to_api(definition.version)?),
-                logical_stored_bytes: 0,
-                object_count: 0,
-                accepted_inbound_bytes: 0,
-                served_outbound_bytes: 0,
-                freshness: Some(AccountingFreshness {
-                    refreshed_at: Some(std::time::SystemTime::now().into()),
-                    sources: Vec::new(),
-                    complete: false,
+                logical: Some(AccountingLogicalUsage {
+                    billable_logical_bytes: Some(AccountingByteMeasurement {
+                        state: AccountingMeasurementState::Present.into(),
+                        bytes: 0,
+                    }),
+                    retained_non_billable_logical_bytes: Some(AccountingByteMeasurement {
+                        state: AccountingMeasurementState::Present.into(),
+                        bytes: 0,
+                    }),
+                    visible_file_count: Some(keldra_api::v1::AccountingCountMeasurement {
+                        state: AccountingMeasurementState::Present.into(),
+                        count: 0,
+                    }),
+                    freshness: Some(AccountingFreshness {
+                        refreshed_at: Some(std::time::SystemTime::now().into()),
+                        sources: Vec::new(),
+                        complete: false,
+                    }),
+                }),
+                traffic: Some(AccountingTrafficUsage::default()),
+                tenant_physical_bytes: Some(AccountingByteMeasurement {
+                    state: AccountingMeasurementState::Unsupported.into(),
+                    bytes: 0,
                 }),
             }),
         }

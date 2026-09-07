@@ -124,7 +124,7 @@ struct Arguments {
     #[arg(long, env = "KELDRA_PUBLIC_SCHEME", default_value = "https")]
     public_scheme: String,
 
-    /// Installed HTTP plugin origin in name@version=http://host:port form.
+    /// Installed local HTTP plugin origin in name@version=http://loopback:port form.
     #[arg(
         long = "http-plugin",
         env = "KELDRA_HTTP_PLUGINS",
@@ -191,7 +191,7 @@ struct Arguments {
     )]
     rate_limit_keyed_cleanup_interval: NonZeroU64,
 
-    /// Bounded CPU workers in the partition-owned v6 index pipeline (default: 4).
+    /// Bounded CPU workers in the partition-owned v1 index pipeline (default: 4).
     #[arg(
         long,
         env = "KELDRA_INDEXING_CORES",
@@ -211,12 +211,12 @@ struct Arguments {
     #[arg(long, env = "KELDRA_INDEX_PIPELINE_MEMORY_BYTES")]
     index_pipeline_memory_bytes: Option<u64>,
 
-    /// Hard aggregate heap ceiling shared by queries and the v6 pipeline.
+    /// Hard aggregate heap ceiling shared by queries and the v1 pipeline.
     /// Absent uses their checked sum.
     #[arg(long, env = "KELDRA_INDEX_WORKING_MEMORY_BYTES")]
     index_working_memory_bytes: Option<u64>,
 
-    /// Maximum v6 LSM runs retained in one level before compaction (default: 64).
+    /// Maximum v1 LSM runs retained in one level before compaction (default: 64).
     #[arg(
         long,
         env = "KELDRA_INDEX_LSM_MAX_RUNS_PER_LEVEL",
@@ -224,7 +224,7 @@ struct Arguments {
     )]
     index_lsm_max_runs_per_level: u32,
 
-    /// Maximum v6 LSM unmerged bytes in one level (default: 1 GiB).
+    /// Maximum v1 LSM unmerged bytes in one level (default: 1 GiB).
     #[arg(
         long,
         env = "KELDRA_INDEX_LSM_MAX_UNMERGED_BYTES_PER_LEVEL",
@@ -232,7 +232,7 @@ struct Arguments {
     )]
     index_lsm_max_unmerged_bytes_per_level: u64,
 
-    /// Accounted v6 active-partition RAM which freezes a non-empty segment (default: 16 MiB).
+    /// Accounted v1 active-partition RAM which freezes a non-empty segment (default: 16 MiB).
     #[arg(
         long = "index-flush-bytes",
         env = "KELDRA_INDEX_FLUSH_BYTES",
@@ -465,7 +465,7 @@ impl Arguments {
 
     fn index_runtime_config(&self) -> Result<IndexRuntimeConfig> {
         let mut config = IndexRuntimeConfig::new(self.indexing_cores)
-            .context("validate v6 index runtime configuration")?
+            .context("validate v1 index runtime configuration")?
             .with_query_memory_bytes(self.index_query_memory_bytes)
             .and_then(|config| {
                 config.with_flush_boundaries(
@@ -480,20 +480,20 @@ impl Arguments {
                     self.index_lsm_max_unmerged_bytes_per_level,
                 )
             })
-            .context("validate v6 index runtime configuration")?;
+            .context("validate v1 index runtime configuration")?;
         if let Some(bytes) = self.index_pipeline_memory_bytes {
             config = config
                 .with_pipeline_memory_bytes(bytes)
-                .context("validate v6 indexing pipeline memory configuration")?;
+                .context("validate v1 indexing pipeline memory configuration")?;
         }
         if let Some(bytes) = self.index_working_memory_bytes {
             config = config
                 .with_working_memory_bytes(bytes)
-                .context("validate v6 aggregate index working-memory configuration")?;
+                .context("validate v1 aggregate index working-memory configuration")?;
         }
         config
             .working_memory_bytes()
-            .context("validate v6 aggregate index working-memory configuration")?;
+            .context("validate v1 aggregate index working-memory configuration")?;
         Ok(config)
     }
 }
@@ -758,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn index_runtime_accepts_the_complete_v6_operator_matrix() {
+    fn index_runtime_accepts_the_complete_v1_operator_matrix() {
         let config = parse(&[
             "--indexing-cores",
             "6",
@@ -793,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn index_runtime_rejects_zero_and_out_of_range_v6_limits() {
+    fn index_runtime_rejects_zero_and_out_of_range_v1_limits() {
         for extra in [
             vec!["--indexing-cores", "0"],
             vec!["--index-pipeline-memory-bytes", "0"],
@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn help_exposes_only_the_v6_index_controls() {
+    fn help_exposes_only_the_v1_index_controls() {
         let help = Arguments::command().render_long_help().to_string();
         for live in [
             "--indexing-cores",

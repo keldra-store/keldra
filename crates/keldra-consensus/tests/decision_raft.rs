@@ -3,12 +3,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use keldra_consensus::{
-    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, BundleHash, BundleRef,
-    CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, Command, CommitBatch,
-    DecisionRaft, DecisionRaftError, DurabilityClass, DurabilityEvidenceHash, ErasureCodeProfile,
-    InMemoryPeerTransport, InvocationFingerprint, InvocationId, JoinCapabilityHash,
-    JwtSigningKeyFingerprint, MembershipTransitionKind, NodeDescriptor, NodeId, NodeState,
-    PeerAddress, PeerNode, PeerSpkiSha256, ProgramHash, ProgramPathHash,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, AtomicBundleAuthority, BeginBatch,
+    BeginResult, BundleRef, CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, Command,
+    CommitPreparedBatch, DecisionRaft, DecisionRaftError, DurabilityClass, DurabilityEvidenceHash,
+    ErasureCodeProfile, InMemoryPeerTransport, InvocationFingerprint, InvocationId,
+    JoinCapabilityHash, JwtSigningKeyFingerprint, MembershipTransitionKind, NodeDescriptor, NodeId,
+    NodeState, ParticipantManifestHash, PeerAddress, PeerNode, PeerSpkiSha256, ProgramHash,
+    ProgramPathHash,
 };
 
 fn joining_descriptor(node_id: u64) -> NodeDescriptor {
@@ -20,26 +21,29 @@ fn joining_descriptor(node_id: u64) -> NodeDescriptor {
         current_peer_spki_sha256: PeerSpkiSha256([node_id as u8; 32]),
         overlap_peer_spki_sha256: None,
         join_capability_hash: Some(JoinCapabilityHash([(node_id + 32) as u8; 32])),
-        supported_protocol: CapabilityRange { min: 1, max: 2 },
-        supported_storage_format: CapabilityRange { min: 1, max: 2 },
+        supported_protocol: CapabilityRange { min: 1, max: 1 },
+        supported_storage_format: CapabilityRange { min: 1, max: 1 },
     }
 }
 
-fn batch(nomination_log_index: u64, id: u8) -> CommitBatch {
-    CommitBatch {
+fn batch(nomination_log_index: u64, id: u8) -> BeginBatch {
+    let bundle_hash = [id.wrapping_add(3); 32];
+    BeginBatch {
         executor: NodeId(1),
         nomination_log_index,
-        program_path_hash: ProgramPathHash([3; 32]),
-        program_hash: ProgramHash([4; 32]),
+        authority: AtomicBundleAuthority::StoredProgram {
+            program_path_hash: ProgramPathHash([3; 32]),
+            program_hash: ProgramHash([4; 32]),
+        },
         invocation_id: InvocationId([id; 32]),
         input_fingerprint: InvocationFingerprint([id.wrapping_add(1); 32]),
         bundle_ref: BundleRef {
-            hash: [id.wrapping_add(2); 32],
+            hash: bundle_hash,
             length: u64::from(id) + 1,
         },
-        bundle_hash: BundleHash([id.wrapping_add(3); 32]),
         durability_class: DurabilityClass([2; 32]),
         durability_evidence_hash: DurabilityEvidenceHash([id.wrapping_add(4); 32]),
+        participant_manifest_hash: ParticipantManifestHash([id.wrapping_add(5); 32]),
         proposal_at_unix_millis: 1_000 + u64::from(id),
         replay_expires_at_unix_millis: 1_000 + u64::from(id) + ATOMIC_REPLAY_RETENTION_MILLIS,
     }
@@ -70,43 +74,6 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn released_one_node_address_migrates_once_before_descriptor_admission() {
-    let directory = tempfile::tempdir().unwrap();
-    let raft = open(directory.path()).await;
-    raft.ensure_one_node().await.unwrap();
-    raft.wait_for_leader(Duration::from_secs(5)).await.unwrap();
-    raft.submit(Command::InitializeCluster {
-        cluster_id: ClusterId([31; 16]),
-    })
-    .await
-    .unwrap();
-
-    raft.migrate_released_single_node_address("127.0.0.1:50052")
-        .await
-        .unwrap();
-    // A response lost after the membership entry commits is an exact retry.
-    raft.migrate_released_single_node_address("127.0.0.1:50052")
-        .await
-        .unwrap();
-
-    let mut descriptor = joining_descriptor(1);
-    descriptor.peer_address = PeerAddress("127.0.0.1:50052".into());
-    raft.submit(Command::BeginAddNode {
-        format_version: CLUSTER_CONTROL_COMMAND_VERSION,
-        descriptor,
-    })
-    .await
-    .unwrap();
-    assert!(
-        raft.migrate_released_single_node_address("127.0.0.1:50053")
-            .await
-            .is_err()
-    );
-
-    raft.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -239,8 +206,21 @@ async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snap
     assert_eq!(nomination.nomination_log_index, nominated.log_index);
 
     let first_batch = batch(nomination.nomination_log_index, 10);
+    let begun = raft.submit(Command::BeginBatch(first_batch)).await.unwrap();
+    let ApplyResult::BatchBegun(BeginResult::Prepared {
+        batch: prepared, ..
+    }) = begun.result
+    else {
+        panic!("begin returned the wrong domain result")
+    };
     let committed = raft
-        .submit(Command::CommitBatch(first_batch))
+        .submit(Command::CommitPreparedBatch(CommitPreparedBatch {
+            executor: first_batch.executor,
+            nomination_log_index: first_batch.nomination_log_index,
+            begin_cursor: prepared.begin_cursor,
+            invocation_id: first_batch.invocation_id,
+            participant_manifest_hash: first_batch.participant_manifest_hash,
+        }))
         .await
         .unwrap();
     let ApplyResult::BatchCommitted(first) = committed.result else {
@@ -270,12 +250,10 @@ async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snap
         Some(first.invocation)
     );
 
-    let replayed = raft
-        .submit(Command::CommitBatch(first_batch))
-        .await
-        .unwrap();
+    let replayed = raft.submit(Command::BeginBatch(first_batch)).await.unwrap();
     assert!(replayed.log_index > committed.log_index);
-    let ApplyResult::BatchCommitted(replayed_result) = replayed.result else {
+    let ApplyResult::BatchBegun(BeginResult::AlreadyCommitted(replayed_result)) = replayed.result
+    else {
         panic!("retry returned the wrong domain result")
     };
     assert!(replayed_result.replayed);
@@ -286,8 +264,25 @@ async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snap
     );
 
     let second_batch = batch(nomination.nomination_log_index, 20);
+    let second_begun = raft
+        .submit(Command::BeginBatch(second_batch))
+        .await
+        .unwrap();
+    let ApplyResult::BatchBegun(BeginResult::Prepared {
+        batch: second_prepared,
+        ..
+    }) = second_begun.result
+    else {
+        panic!("second begin returned the wrong domain result")
+    };
     let second_committed = raft
-        .submit(Command::CommitBatch(second_batch))
+        .submit(Command::CommitPreparedBatch(CommitPreparedBatch {
+            executor: second_batch.executor,
+            nomination_log_index: second_batch.nomination_log_index,
+            begin_cursor: second_prepared.begin_cursor,
+            invocation_id: second_batch.invocation_id,
+            participant_manifest_hash: second_batch.participant_manifest_hash,
+        }))
         .await
         .unwrap();
     let ApplyResult::BatchCommitted(second) = second_committed.result else {

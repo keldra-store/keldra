@@ -15,10 +15,11 @@ use std::sync::Arc;
 
 use keldra_consensus::{ClusterId, NodeId};
 use keldra_store::{
-    BlobRef, DestinationReferenceArtifact, DestinationReferenceDelta, ErasureProfile, LocalChange,
-    MAX_INBOUND_OBJECT_LINKS, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChangeKind,
-    ObjectMutation, PlacementLogId, ReferenceDeltaApplied, ReferenceDeltaBatch, ReferenceProof,
-    ReferenceProofMutation, RetainedVersionDeleteMutation, ShardIdentity, SourceId, Store,
+    AtomicBatchMutation, BlobRef, DestinationReferenceArtifact, DestinationReferenceDelta,
+    ErasureProfile, LocalChange, MAX_ATOMIC_BATCH_MUTATIONS, MAX_INBOUND_OBJECT_LINKS,
+    MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChangeKind, ObjectMutation, PlacementLogId,
+    ReferenceDeltaApplied, ReferenceDeltaBatch, ReferenceProof, ReferenceProofMutation,
+    RetainedVersionDeleteMutation, ShardIdentity, SourceId, Store,
 };
 use thiserror::Error;
 
@@ -31,10 +32,6 @@ use crate::placement::{PlacementKind, PlacementNode};
 pub(crate) enum ReferenceCommitDisposition {
     /// The event selected the committed head, or is proven to be its ancestor.
     CommittedOrAncestor,
-    /// A legacy one-node event applied its reference effects in the same local
-    /// RocksDB batch as the journal append. Advancing the destination cursor
-    /// must not replay those effects.
-    AlreadyAppliedLocally,
 }
 
 /// Exact-path quorum proof. Missing lineage must return an error; delivery may
@@ -204,66 +201,218 @@ impl QuorumReferenceCommitAuthority {
             }));
         }
 
-        let LocalChange::ObjectHead(alias) = change else {
-            return Ok(None);
-        };
-        let Some(canonical_path) = alias.canonical_path.as_deref() else {
-            return Ok(None);
-        };
-        // One validated object mutation owns the canonical event followed by
-        // its sorted, bounded alias expansion. The primary proof retains that
-        // exact snapshot, so recovery can derive an alias without creating a
-        // second proof format or treating the alias as self-authoritative.
-        let maximum_distance = alias
-            .offset
-            .saturating_sub(1)
-            .min(MAX_INBOUND_OBJECT_LINKS as u64);
-        for distance in 1..=maximum_distance {
-            let primary_offset = alias.offset - distance;
-            let Some(expected) = self
-                .source
-                .read_reference_proof(source, primary_offset)
-                .map_err(|error| format!("source reference proof is unavailable: {error}"))?
-            else {
-                continue;
-            };
-            let ReferenceProofMutation::Object(mutation) = &expected.mutation else {
-                continue;
-            };
-            let Some(snapshot) = mutation.alias_snapshot.as_ref() else {
-                continue;
-            };
-            let Ok(alias_index) = usize::try_from(distance - 1) else {
-                continue;
-            };
-            let deleted = matches!(alias.kind, ObjectHeadChangeKind::Delete);
-            if expected.source_id == source
-                && expected.offset() == primary_offset
-                && mutation.tenant_id == alias.tenant_id
-                && mutation.bucket_id == alias.bucket_id
-                && mutation.exact_path == canonical_path
-                && mutation.version.id == alias.path_version
-                && mutation.version.deleted == deleted
-                && alias.program_commit_cursor.is_none()
-                && alias.reference_deltas.is_empty()
-                && alias.accounting_transition.is_none()
-                && alias.definition_transition.is_none()
-                && snapshot
-                    .registry
-                    .aliases
-                    .get(alias_index)
-                    .map(String::as_str)
-                    == Some(alias.exact_path.as_str())
-            {
-                return Ok(Some(SourceReferenceProof {
-                    expected,
-                    tenant_id: alias.tenant_id,
-                    bucket_id: alias.bucket_id,
-                    exact_path: canonical_path.to_owned(),
-                }));
+        match change {
+            LocalChange::ObjectHead(alias) => {
+                let Some(canonical_path) = alias.canonical_path.as_deref() else {
+                    return Ok(None);
+                };
+                // One validated object mutation owns the canonical event followed by
+                // its sorted, bounded alias expansion. The primary proof retains that
+                // exact snapshot, so recovery can derive an alias without creating a
+                // second proof format or treating the alias as self-authoritative.
+                let maximum_distance = alias
+                    .offset
+                    .saturating_sub(1)
+                    .min(MAX_INBOUND_OBJECT_LINKS as u64);
+                for distance in 1..=maximum_distance {
+                    let primary_offset = alias.offset - distance;
+                    let Some(expected) = self
+                        .source
+                        .read_reference_proof(source, primary_offset)
+                        .map_err(|error| {
+                        format!("source reference proof is unavailable: {error}")
+                    })?
+                    else {
+                        continue;
+                    };
+                    let ReferenceProofMutation::Object(mutation) = &expected.mutation else {
+                        continue;
+                    };
+                    let Some(snapshot) = mutation.alias_snapshot.as_ref() else {
+                        continue;
+                    };
+                    let Ok(alias_index) = usize::try_from(distance - 1) else {
+                        continue;
+                    };
+                    let deleted = matches!(alias.kind, ObjectHeadChangeKind::Delete);
+                    if expected.source_id == source
+                        && expected.offset() == primary_offset
+                        && mutation.tenant_id == alias.tenant_id
+                        && mutation.bucket_id == alias.bucket_id
+                        && mutation.exact_path == canonical_path
+                        && mutation.version.id == alias.path_version
+                        && mutation.version.deleted == deleted
+                        && alias.program_commit_cursor.is_none()
+                        && alias.reference_deltas.is_empty()
+                        && alias.accounting_transition.is_none()
+                        && alias.definition_transition.is_none()
+                        && snapshot
+                            .registry
+                            .aliases
+                            .get(alias_index)
+                            .map(String::as_str)
+                            == Some(alias.exact_path.as_str())
+                    {
+                        return Ok(Some(SourceReferenceProof {
+                            expected,
+                            tenant_id: alias.tenant_id,
+                            bucket_id: alias.bucket_id,
+                            exact_path: canonical_path.to_owned(),
+                        }));
+                    }
+                }
             }
+            LocalChange::RetainedVersionDeleted(alias) => {
+                let Some(canonical_path) = alias.canonical_path.as_deref() else {
+                    return Ok(None);
+                };
+                // A retained-version deletion seals the same sorted alias
+                // expansion into its typed mutation, so every derived wake is
+                // proven by the canonical event immediately preceding it.
+                let maximum_distance = alias
+                    .offset
+                    .saturating_sub(1)
+                    .min(MAX_INBOUND_OBJECT_LINKS as u64);
+                for distance in 1..=maximum_distance {
+                    let primary_offset = alias.offset - distance;
+                    let Some(expected) = self
+                        .source
+                        .read_reference_proof(source, primary_offset)
+                        .map_err(|error| {
+                        format!("source reference proof is unavailable: {error}")
+                    })?
+                    else {
+                        continue;
+                    };
+                    let ReferenceProofMutation::RetainedVersionDelete(mutation) =
+                        &expected.mutation
+                    else {
+                        continue;
+                    };
+                    let Ok(alias_index) = usize::try_from(distance - 1) else {
+                        continue;
+                    };
+                    if expected.source_id == source
+                        && expected.offset() == primary_offset
+                        && mutation.tenant_id == alias.tenant_id
+                        && mutation.bucket_id == alias.bucket_id
+                        && mutation.exact_path == canonical_path
+                        && mutation.target.id == alias.deleted_version
+                        && mutation
+                            .replacement_tombstone
+                            .as_ref()
+                            .map(|replacement| replacement.id)
+                            == alias.resulting_head_version
+                        && alias.reference_deltas.is_empty()
+                        && alias.accounting_transition.is_none()
+                        && mutation.alias_paths.get(alias_index).map(String::as_str)
+                            == Some(alias.exact_path.as_str())
+                    {
+                        return Ok(Some(SourceReferenceProof {
+                            expected,
+                            tenant_id: alias.tenant_id,
+                            bucket_id: alias.bucket_id,
+                            exact_path: canonical_path.to_owned(),
+                        }));
+                    }
+                }
+            }
+            _ => return Ok(None),
         }
         Ok(None)
+    }
+
+    /// Atomic publication appends its logical alias wakes and the complete
+    /// batch descriptor in one synced source-journal write. Program aliases
+    /// deliberately have no standalone object proof: the immediately
+    /// following publication is their sealed local commit evidence.
+    fn atomic_publication_proves_alias(
+        &self,
+        source: SourceId,
+        change: &LocalChange,
+    ) -> Result<bool, String> {
+        let LocalChange::ObjectHead(alias) = change else {
+            return Ok(false);
+        };
+        let (Some(cursor), Some(canonical_path)) =
+            (alias.program_commit_cursor, alias.canonical_path.as_ref())
+        else {
+            return Ok(false);
+        };
+        if !alias.reference_deltas.is_empty()
+            || alias.accounting_transition.is_some()
+            || alias.definition_transition.is_some()
+        {
+            return Ok(false);
+        }
+        let local_source = self
+            .source
+            .local_watch_status()
+            .map_err(|error| format!("local source identity is unavailable: {error}"))?
+            .source_id;
+        if local_source != source {
+            return Ok(false);
+        }
+        if self
+            .source
+            .read_local_change(alias.offset)
+            .map_err(|error| format!("atomic alias journal evidence is unavailable: {error}"))?
+            .as_ref()
+            != Some(change)
+        {
+            return Ok(false);
+        }
+
+        let mut aliases = vec![AtomicBatchMutation {
+            tenant_id: alias.tenant_id,
+            bucket_id: alias.bucket_id,
+            exact_path: alias.exact_path.clone(),
+            canonical_path: Some(canonical_path.clone()),
+            path_version: alias.path_version,
+            deleted: matches!(alias.kind, ObjectHeadChangeKind::Delete),
+            source_id: source,
+            source_journal_position: alias.offset,
+        }];
+        for distance in 1..=MAX_ATOMIC_BATCH_MUTATIONS as u64 {
+            let Some(offset) = alias.offset.checked_add(distance) else {
+                return Ok(false);
+            };
+            let Some(following) = self
+                .source
+                .read_local_change(offset)
+                .map_err(|error| format!("atomic publication evidence is unavailable: {error}"))?
+            else {
+                return Ok(false);
+            };
+            match following {
+                LocalChange::ObjectHead(next)
+                    if next.program_commit_cursor == Some(cursor)
+                        && next.canonical_path.is_some()
+                        && next.reference_deltas.is_empty()
+                        && next.accounting_transition.is_none()
+                        && next.definition_transition.is_none() =>
+                {
+                    aliases.push(AtomicBatchMutation {
+                        tenant_id: next.tenant_id,
+                        bucket_id: next.bucket_id,
+                        exact_path: next.exact_path,
+                        canonical_path: next.canonical_path,
+                        path_version: next.path_version,
+                        deleted: matches!(next.kind, ObjectHeadChangeKind::Delete),
+                        source_id: source,
+                        source_journal_position: next.offset,
+                    });
+                }
+                LocalChange::AtomicBatchPublished(batch) => {
+                    return Ok(batch.cursor == cursor
+                        && aliases
+                            .iter()
+                            .all(|alias| batch.mutations.binary_search(alias).is_ok()));
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn with_redrive(
@@ -361,6 +510,9 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
         source: SourceId,
         change: &LocalChange,
     ) -> Result<ReferenceCommitDisposition, String> {
+        if self.atomic_publication_proves_alias(source, change)? {
+            return Ok(ReferenceCommitDisposition::CommittedOrAncestor);
+        }
         let started = self
             .placement
             .current()
@@ -398,22 +550,6 @@ impl ReferenceCommitAuthority for QuorumReferenceCommitAuthority {
             ));
         }
         let Some(expected) = expected else {
-            let local_source = self
-                .source
-                .local_watch_status()
-                .map_err(|error| format!("local source identity is unavailable: {error}"))?
-                .source_id;
-            let only_active_source = started.active_node_ids().as_slice()
-                == [NodeId(u64::from(source.node_id))]
-                && local_source == source;
-            if only_active_source
-                && matches!(
-                    change,
-                    LocalChange::ObjectHead(_) | LocalChange::RetainedVersionDeleted(_)
-                )
-            {
-                return Ok(ReferenceCommitDisposition::AlreadyAppliedLocally);
-            }
             return Err("source reference proof is missing".to_owned());
         };
 
@@ -732,23 +868,15 @@ impl ReferenceDelivery {
                 routed.push((change.offset(), BTreeMap::new()));
                 continue;
             }
-            let disposition = if !object_metadata || change.offset() <= visibility_through {
-                ReferenceCommitDisposition::CommittedOrAncestor
-            } else {
-                match self.commits.classify(status.source_id, &change).await {
-                    Ok(disposition) => disposition,
-                    Err(message) => {
-                        blocked = Some(ReferenceDeliveryError::CommitProof {
-                            offset: change.offset(),
-                            message,
-                        });
-                        break;
-                    }
-                }
-            };
-            if disposition == ReferenceCommitDisposition::AlreadyAppliedLocally {
-                routed.push((change.offset(), BTreeMap::new()));
-                continue;
+            if object_metadata
+                && change.offset() > visibility_through
+                && let Err(message) = self.commits.classify(status.source_id, &change).await
+            {
+                blocked = Some(ReferenceDeliveryError::CommitProof {
+                    offset: change.offset(),
+                    message,
+                });
+                break;
             }
             if change.reference_deltas().is_empty() {
                 routed.push((change.offset(), BTreeMap::new()));

@@ -19,7 +19,8 @@ use keldra_store::{
     BatchOperation, BlobRef, CloneRequest, CoordinatedObjectMutation,
     CoordinatedRetainedVersionDelete, DefinitionMutationIntent, DeleteRetainedVersionOutcome,
     Durability, ErasureProfile, MutationError, MutationReceipt, ObjectKey,
-    ObjectMutationGovernance, PublishRequest, PutRequest, Store, VersionId,
+    ObjectMutationGovernance, PublishRequest, PutRequest, SourceJournalSettlement, Store,
+    VersionId,
 };
 use tonic::Status;
 
@@ -235,7 +236,7 @@ impl ObjectDistribution {
     /// Publish one bounded set of independently receipted objects whose exact
     /// paths select the same metadata replica group under `placement`.
     /// Payload preparation and metadata quorum rules remain identical to the
-    /// unary path; only coordinator persistence is physically grouped.
+    /// unary path; coordinator persistence and each replica RPC are grouped.
     pub(crate) async fn publish_many_from_source_with_governance(
         &self,
         requests: Vec<PublishRequest>,
@@ -380,48 +381,22 @@ impl ObjectDistribution {
                         .await
                 }
                 .map_err(mutation_status)?;
+                let replicated = completion
+                    .replicate_mutation_group_batch(
+                        &completion_placement,
+                        &completion_group,
+                        &coordinated,
+                        SourceJournalSettlement::RequiredAfterQuorum,
+                    )
+                    .await;
                 let mut outcomes = Vec::with_capacity(coordinated.len());
-                let mut quorum_proven_positions = Vec::new();
-                for coordinated in coordinated {
-                    let outcome = match coordinated {
-                        Err(error) => Err(mutation_status(error)),
-                        Ok(coordinated) => {
-                            let replayed = coordinated.receipt.replayed;
-                            if let Some((source, positions)) = completion
-                                .replicate_without_settlement(
-                                    &completion_placement,
-                                    &completion_group,
-                                    &coordinated,
-                                )
-                                .await?
-                                && !replayed
-                            {
-                                quorum_proven_positions
-                                    .extend(positions.into_iter().map(|offset| (source, offset)));
-                            }
-                            Ok(coordinated)
-                        }
+                for (coordinated, replicated) in coordinated.into_iter().zip(replicated) {
+                    let outcome = match (coordinated, replicated) {
+                        (Err(error), _) => Err(mutation_status(error)),
+                        (Ok(_), Err(error)) => Err(error),
+                        (Ok(coordinated), Ok(())) => Ok(coordinated),
                     };
                     outcomes.push(outcome);
-                }
-                if let Some((source, _)) = quorum_proven_positions.first().copied()
-                    && let Err(error) = completion
-                        .store
-                        .settle_source_journal_positions_if_contiguous(
-                            source,
-                            &quorum_proven_positions
-                                .iter()
-                                .map(|(_, offset)| *offset)
-                                .collect::<Vec<_>>(),
-                        )
-                        .await
-                {
-                    tracing::warn!(
-                        source = ?source,
-                        count = quorum_proven_positions.len(),
-                        %error,
-                        "grouped metadata quorum succeeded but source settlement failed"
-                    );
                 }
                 Ok::<_, Status>(outcomes)
             })
@@ -1307,15 +1282,26 @@ impl ObjectDistribution {
         // the same mutation through the replica apply path adds no durability.
         let mut durable = locally_durable_object_replicas(group.replicas(), self.local_node)?;
         let mut failures = Vec::new();
+        let mut replicas = tokio::task::JoinSet::new();
         for node in remote_object_replica_nodes(group.replicas(), self.local_node) {
-            let address = placement.address(node).ok_or_else(|| {
-                Status::unavailable(format!("ACTIVE node {} has no peer address", node.0))
+            let Some(address) = placement.address(node).map(|address| address.0.clone()) else {
+                failures.push(format!("node {} has no peer address", node.0));
+                continue;
+            };
+            let peers = self.peers.clone();
+            let mutation = mutation.clone();
+            replicas.spawn(async move {
+                (
+                    node,
+                    peers.apply_object_mutation(node, &address, &mutation).await,
+                )
+            });
+        }
+        while let Some(result) = replicas.join_next().await {
+            let (node, result) = result.map_err(|error| {
+                Status::internal(format!("join metadata replica task: {error}"))
             })?;
-            match self
-                .peers
-                .apply_object_mutation(node, &address.0, mutation)
-                .await
-            {
+            match result {
                 Ok(applied) if applied.version == coordinated.receipt.version => {
                     durable.push(node);
                 }
@@ -1362,20 +1348,33 @@ impl ObjectDistribution {
             Ok(_) => failures.push("local replica returned another deletion outcome".into()),
             Err(error) => failures.push(format!("local replica: {error}")),
         }
+        let mut replicas = tokio::task::JoinSet::new();
         for node in group
             .replicas()
             .iter()
             .copied()
             .filter(|node| *node != self.local_node)
         {
-            let address = placement.address(node).ok_or_else(|| {
-                Status::unavailable(format!("ACTIVE node {} has no peer address", node.0))
+            let Some(address) = placement.address(node).map(|address| address.0.clone()) else {
+                failures.push(format!("node {} has no peer address", node.0));
+                continue;
+            };
+            let peers = self.peers.clone();
+            let mutation = mutation.clone();
+            replicas.spawn(async move {
+                (
+                    node,
+                    peers
+                        .apply_retained_version_delete(node, &address, &mutation)
+                        .await,
+                )
+            });
+        }
+        while let Some(result) = replicas.join_next().await {
+            let (node, result) = result.map_err(|error| {
+                Status::internal(format!("join metadata replica task: {error}"))
             })?;
-            match self
-                .peers
-                .apply_retained_version_delete(node, &address.0, mutation)
-                .await
-            {
+            match result {
                 Ok(applied) if applied.outcome == coordinated.outcome => durable.push(node),
                 Ok(_) => {
                     failures.push(format!("node {} returned another deletion outcome", node.0))
@@ -1384,17 +1383,15 @@ impl ObjectDistribution {
             }
         }
         if group.is_acknowledged_by(&durable) {
+            let positions = retained_delete_journal_positions(mutation)?;
             if let Err(error) = self
                 .store
-                .settle_source_journal_position_if_contiguous(
-                    mutation.stamp.source_id,
-                    mutation.stamp.source_journal_position,
-                )
+                .settle_source_journal_positions_if_contiguous(mutation.stamp.source_id, &positions)
                 .await
             {
                 tracing::warn!(
                     source = ?mutation.stamp.source_id,
-                    offset = mutation.stamp.source_journal_position,
+                    offsets = ?positions,
                     %error,
                     "retained-version metadata quorum succeeded but direct source settlement failed"
                 );
@@ -1487,7 +1484,23 @@ pub(super) fn mutation_journal_positions(
         .collect()
 }
 
-fn object_placement_key(tenant_id: u64, bucket_id: u64, path: &str) -> Vec<u8> {
+fn retained_delete_journal_positions(
+    mutation: &keldra_store::RetainedVersionDeleteMutation,
+) -> Result<Vec<u64>, Status> {
+    (0..=mutation.alias_paths.len())
+        .map(|offset| {
+            mutation
+                .stamp
+                .source_journal_position
+                .checked_add(offset as u64)
+                .ok_or_else(|| {
+                    Status::data_loss("retained-version deletion journal range is exhausted")
+                })
+        })
+        .collect()
+}
+
+pub(crate) fn object_placement_key(tenant_id: u64, bucket_id: u64, path: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(16 + path.len());
     key.extend_from_slice(&tenant_id.to_be_bytes());
     key.extend_from_slice(&bucket_id.to_be_bytes());

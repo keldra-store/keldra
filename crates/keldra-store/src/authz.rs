@@ -309,6 +309,9 @@ pub enum AuthzConsistency {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealmSnapshot {
     pub scope: AuthzScope,
+    /// Exact revision of this realm's binding and tuple aggregate.
+    pub realm_revision: AuthzRevision,
+    /// Current tenant-wide authorization revision used for consistency tokens.
     pub revision: AuthzRevision,
     pub binding: RealmBinding,
     pub schema: Schema,
@@ -408,42 +411,6 @@ pub enum AuthzStoreError {
     Storage(String),
 }
 
-#[derive(Clone)]
-pub struct AuthzRepository {
-    db: Arc<DB>,
-    write_lock: Arc<Mutex<()>>,
-    sync_writes: bool,
-    limits: AuthzStoreLimits,
-}
-
-impl fmt::Debug for AuthzRepository {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AuthzRepository")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Store {
-    pub fn authz(&self) -> AuthzRepository {
-        AuthzRepository {
-            db: self.db.clone(),
-            write_lock: self.authz_write_lock.clone(),
-            sync_writes: self.sync_writes,
-            limits: AuthzStoreLimits::default(),
-        }
-    }
-
-    pub fn authz_with_limits(&self, limits: AuthzStoreLimits) -> AuthzRepository {
-        AuthzRepository {
-            db: self.db.clone(),
-            write_lock: self.authz_write_lock.clone(),
-            sync_writes: self.sync_writes,
-            limits,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StoredSchema {
     pub(crate) schema_ref: SchemaRef,
@@ -457,6 +424,7 @@ struct StoredTuple {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredTupleReceipt {
     format: u16,
     operation_id: String,
@@ -464,10 +432,17 @@ struct StoredTupleReceipt {
     expires_at_unix_millis: u64,
     fingerprint: [u8; 32],
     receipt: TupleBatchReceipt,
-    /// Present only for coordinator-produced 0.5.1 realm mutations. Released
-    /// 0.5.0 receipts decode with this absent and remain valid local receipts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Coordinator mutation evidence when the operation used replication.
+    #[serde(deserialize_with = "deserialize_required_option")]
     realm_mutation: Option<AuthzRealmMutation>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 const STORED_TUPLE_RECEIPT_FORMAT: u16 = 1;
@@ -500,11 +475,12 @@ impl AuthzRepository {
 
     pub fn get_binding(&self, scope: &AuthzScope) -> Result<Option<RealmBinding>, AuthzStoreError> {
         scope.validate()?;
-        let binding = self.read_json::<RealmBinding>(CF_AUTHZ_BINDINGS, &binding_key(scope))?;
-        if let Some(binding) = binding.as_ref() {
-            validate_binding(binding, scope)?;
-        }
-        Ok(binding)
+        self.read_json::<replication::StoredRealmBinding>(CF_AUTHZ_BINDINGS, &binding_key(scope))?
+            .map(|stored| {
+                validate_stored_realm_binding(&stored, scope)?;
+                Ok(stored.binding)
+            })
+            .transpose()
     }
 
     pub fn get_schema(
@@ -714,7 +690,12 @@ impl AuthzRepository {
         batch.put_cf(
             self.cf(CF_AUTHZ_BINDINGS)?,
             binding_key,
-            encode_json(&binding)?,
+            encode_json(&replication::StoredRealmBinding {
+                format: replication::STORED_REALM_BINDING_FORMAT,
+                binding: binding.clone(),
+                mutation_stamp: None,
+                revision: authz_revision,
+            })?,
         );
         self.stage_tenant_revision(batch, &request.scope.storage_tenant, authz_revision)?;
         Ok(BoundRealm {
@@ -938,7 +919,12 @@ impl AuthzRepository {
         batch.put_cf(
             self.cf(CF_AUTHZ_BINDINGS)?,
             binding_key(&request.scope),
-            encode_json(&updated_binding)?,
+            encode_json(&replication::StoredRealmBinding {
+                format: replication::STORED_REALM_BINDING_FORMAT,
+                binding: updated_binding,
+                mutation_stamp: None,
+                revision: authz_revision,
+            })?,
         );
         self.stage_tenant_revision(batch, &request.scope.storage_tenant, authz_revision)?;
         if let Some(operation_id) = request.operation_id.as_deref() {
@@ -1118,6 +1104,14 @@ impl AuthzRepository {
         scope: &AuthzScope,
         consistency: AuthzConsistency,
     ) -> Result<RealmSnapshot, AuthzStoreError> {
+        self.read_realm_snapshot(scope, consistency)
+    }
+
+    fn read_realm_snapshot(
+        &self,
+        scope: &AuthzScope,
+        consistency: AuthzConsistency,
+    ) -> Result<RealmSnapshot, AuthzStoreError> {
         scope.validate()?;
         let snapshot = self.db.snapshot();
         let stored_revision = snapshot
@@ -1137,42 +1131,22 @@ impl AuthzRepository {
             }
             Some(revision) => revision,
         };
-        match consistency {
-            AuthzConsistency::Latest => {}
-            AuthzConsistency::AtLeast(required) if revision < required => {
-                return Err(AuthzStoreError::RevisionNotAvailable {
-                    required,
-                    current: revision,
-                });
-            }
-            AuthzConsistency::Exact(requested) if requested < revision => {
-                return Err(AuthzStoreError::RevisionExpired {
-                    requested,
-                    current: revision,
-                });
-            }
-            AuthzConsistency::Exact(required) if required > revision => {
-                return Err(AuthzStoreError::RevisionNotAvailable {
-                    required,
-                    current: revision,
-                });
-            }
-            AuthzConsistency::AtLeast(_) | AuthzConsistency::Exact(_) => {}
-        }
-        let binding = snapshot
+        require_consistency(revision, consistency)?;
+        let stored_binding = snapshot
             .get_cf(self.cf(CF_AUTHZ_BINDINGS)?, binding_key(scope))
             .map_err(storage_error)?
-            .map(|bytes| decode_json::<RealmBinding>(&bytes))
+            .map(|bytes| decode_json::<replication::StoredRealmBinding>(&bytes))
             .transpose()?
             .ok_or_else(|| {
                 AuthzStoreError::MissingBinding(scope.storage_tenant.clone(), scope.realm.clone())
             })?;
-        validate_binding(&binding, scope)?;
-        if binding.authz_revision > revision {
+        validate_stored_realm_binding(&stored_binding, scope)?;
+        if stored_binding.revision > revision {
             return Err(AuthzStoreError::Storage(
                 "persisted realm binding is ahead of the tenant authorization revision".into(),
             ));
         }
+        let binding = stored_binding.binding;
         let stored_schema = snapshot
             .get_cf(
                 self.cf(CF_AUTHZ_SCHEMAS)?,
@@ -1219,6 +1193,7 @@ impl AuthzRepository {
         }
         Ok(RealmSnapshot {
             scope: scope.clone(),
+            realm_revision: stored_binding.revision,
             revision,
             binding,
             schema: stored_schema.schema,
@@ -1249,21 +1224,143 @@ impl AuthzRepository {
                 self.limits.max_checks_per_batch
             )));
         }
-        let snapshot = self.realm_snapshot(scope, consistency)?;
-        let authorization = Authorization::new(
-            scope.realm.clone(),
-            snapshot.schema,
-            snapshot.tuples,
-            self.limits.evaluator,
-        )?;
-        let allowed = checks
-            .iter()
-            .map(|check| authorization.check(check))
-            .collect::<Result<Vec<_>, _>>()?;
+        if let Some((authorization, revision)) = self.cached_authorization(scope, consistency)? {
+            return Ok(AuthzBatchCheck {
+                revision,
+                allowed: authorization.check_many(checks)?,
+            });
+        }
+        let snapshot = self.read_realm_snapshot(scope, consistency)?;
+        let cache_key = CompiledAuthorizationKey {
+            scope: scope.clone(),
+            realm_revision: snapshot.realm_revision,
+            binding_generation: snapshot.binding.generation,
+            schema_ref: snapshot.binding.schema_ref.clone(),
+            limits: self.limits.evaluator,
+        };
+        let authorization = self
+            .compiled_cache
+            .lock()
+            .map_err(|_| AuthzStoreError::Storage("authorization cache lock poisoned".into()))?
+            .get(&cache_key);
+        let authorization = match authorization {
+            Some(authorization) => authorization,
+            None => {
+                let authorization = Arc::new(Authorization::new(
+                    scope.realm.clone(),
+                    snapshot.schema,
+                    snapshot.tuples,
+                    self.limits.evaluator,
+                )?);
+                self.compiled_cache
+                    .lock()
+                    .map_err(|_| {
+                        AuthzStoreError::Storage("authorization cache lock poisoned".into())
+                    })?
+                    .insert(cache_key, authorization.clone());
+                authorization
+            }
+        };
+        let allowed = authorization.check_many(checks)?;
         Ok(AuthzBatchCheck {
             revision: snapshot.revision,
             allowed,
         })
+    }
+
+    /// Read a snapshot and validate it through the same disposable compiled
+    /// projection used by checks. Keeping snapshot creation inside the
+    /// repository prevents callers from injecting an untrusted cache entry.
+    pub fn validated_realm_snapshot(
+        &self,
+        scope: &AuthzScope,
+        consistency: AuthzConsistency,
+    ) -> Result<RealmSnapshot, AuthzStoreError> {
+        let snapshot = self.read_realm_snapshot(scope, consistency)?;
+        self.cache_realm_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn cache_realm_snapshot(&self, snapshot: &RealmSnapshot) -> Result<(), AuthzStoreError> {
+        let cache_key = CompiledAuthorizationKey {
+            scope: snapshot.scope.clone(),
+            realm_revision: snapshot.realm_revision,
+            binding_generation: snapshot.binding.generation,
+            schema_ref: snapshot.binding.schema_ref.clone(),
+            limits: self.limits.evaluator,
+        };
+        if self
+            .compiled_cache
+            .lock()
+            .map_err(|_| AuthzStoreError::Storage("authorization cache lock poisoned".into()))?
+            .get(&cache_key)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let authorization = Arc::new(Authorization::new(
+            snapshot.scope.realm.clone(),
+            snapshot.schema.clone(),
+            snapshot.tuples.iter().cloned(),
+            self.limits.evaluator,
+        )?);
+        self.compiled_cache
+            .lock()
+            .map_err(|_| AuthzStoreError::Storage("authorization cache lock poisoned".into()))?
+            .insert(cache_key, authorization);
+        Ok(())
+    }
+
+    /// Probe the disposable compiled view using only point reads from one
+    /// RocksDB snapshot. A hit avoids schema and tuple scans entirely while
+    /// the revision/generation/schema key keeps RocksDB authoritative.
+    fn cached_authorization(
+        &self,
+        scope: &AuthzScope,
+        consistency: AuthzConsistency,
+    ) -> Result<Option<(Arc<Authorization>, AuthzRevision)>, AuthzStoreError> {
+        scope.validate()?;
+        let snapshot = self.db.snapshot();
+        let revision = snapshot
+            .get_cf(
+                self.cf(CF_AUTHZ_TENANTS)?,
+                tenant_revision_key(&scope.storage_tenant),
+            )
+            .map_err(storage_error)?
+            .map(|bytes| decode_json::<AuthzRevision>(&bytes))
+            .transpose()?
+            .unwrap_or(AuthzRevision::ZERO);
+        if revision == AuthzRevision::ZERO {
+            return Ok(None);
+        }
+        require_consistency(revision, consistency)?;
+        let Some(stored_binding) = snapshot
+            .get_cf(self.cf(CF_AUTHZ_BINDINGS)?, binding_key(scope))
+            .map_err(storage_error)?
+            .map(|bytes| decode_json::<replication::StoredRealmBinding>(&bytes))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        validate_stored_realm_binding(&stored_binding, scope)?;
+        if stored_binding.revision > revision {
+            return Err(AuthzStoreError::Storage(
+                "persisted realm binding is ahead of the tenant authorization revision".into(),
+            ));
+        }
+        let key = CompiledAuthorizationKey {
+            scope: scope.clone(),
+            realm_revision: stored_binding.revision,
+            binding_generation: stored_binding.binding.generation,
+            schema_ref: stored_binding.binding.schema_ref,
+            limits: self.limits.evaluator,
+        };
+        let cached = self
+            .compiled_cache
+            .lock()
+            .map_err(|_| AuthzStoreError::Storage("authorization cache lock poisoned".into()))?
+            .get(&key);
+        Ok(cached.map(|authorization| (authorization, revision)))
     }
 
     fn require_schema(
@@ -1359,7 +1456,7 @@ impl AuthzRepository {
                 .read_json::<SchemaRef>(CF_AUTHZ_SCHEMAS, &digest_key)?
                 .is_some()
             || self
-                .read_json::<RealmBinding>(CF_AUTHZ_BINDINGS, &binding_key)?
+                .read_json::<replication::StoredRealmBinding>(CF_AUTHZ_BINDINGS, &binding_key)?
                 .is_some()
         {
             return Err(AuthzStoreError::InvalidInput(
@@ -1414,7 +1511,12 @@ impl AuthzRepository {
         batch.put_cf(
             self.cf(CF_AUTHZ_BINDINGS)?,
             binding_key,
-            encode_json(&binding)?,
+            encode_json(&replication::StoredRealmBinding {
+                format: replication::STORED_REALM_BINDING_FORMAT,
+                binding,
+                mutation_stamp: None,
+                revision: AuthzRevision(3),
+            })?,
         );
         batch.put_cf(
             self.cf(CF_AUTHZ_TUPLES)?,
@@ -1602,6 +1704,37 @@ fn validate_binding(
     Ok(())
 }
 
+fn validate_stored_realm_binding(
+    stored: &replication::StoredRealmBinding,
+    expected_scope: &AuthzScope,
+) -> Result<(), AuthzStoreError> {
+    validate_binding(&stored.binding, expected_scope)?;
+    if stored.format != replication::STORED_REALM_BINDING_FORMAT
+        || stored.revision == AuthzRevision::ZERO
+        || stored.binding.authz_revision > stored.revision
+    {
+        return Err(AuthzStoreError::Storage(
+            "persisted authorization realm binding envelope is invalid".into(),
+        ));
+    }
+    if let Some(stamp) = stored.mutation_stamp
+        && (stamp.format != AUTHZ_REALM_MUTATION_STAMP_FORMAT
+            || stamp.mutation_fingerprint == [0; 32]
+            || stamp.predecessor_revision.is_some_and(|predecessor| {
+                predecessor == AuthzRevision::ZERO || predecessor >= stored.revision
+            })
+            || stamp.serving_fence_term == 0
+            || stamp.source_id.node_id == 0
+            || stamp.source_id.source_epoch == [0; 32]
+            || stamp.source_journal_position == 0)
+    {
+        return Err(AuthzStoreError::Storage(
+            "persisted authorization realm mutation lineage is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_tuple_receipt(
     receipt: &TupleBatchReceipt,
     request: &TupleBatchRequest,
@@ -1690,6 +1823,34 @@ fn require_revision(
         return Err(AuthzStoreError::RevisionConflict { expected, current });
     }
     Ok(())
+}
+
+fn require_consistency(
+    revision: AuthzRevision,
+    consistency: AuthzConsistency,
+) -> Result<(), AuthzStoreError> {
+    match consistency {
+        AuthzConsistency::Latest => Ok(()),
+        AuthzConsistency::AtLeast(required) if revision < required => {
+            Err(AuthzStoreError::RevisionNotAvailable {
+                required,
+                current: revision,
+            })
+        }
+        AuthzConsistency::Exact(requested) if requested < revision => {
+            Err(AuthzStoreError::RevisionExpired {
+                requested,
+                current: revision,
+            })
+        }
+        AuthzConsistency::Exact(required) if required > revision => {
+            Err(AuthzStoreError::RevisionNotAvailable {
+                required,
+                current: revision,
+            })
+        }
+        AuthzConsistency::AtLeast(_) | AuthzConsistency::Exact(_) => Ok(()),
+    }
 }
 
 fn next_revision(current: AuthzRevision) -> Result<AuthzRevision, AuthzStoreError> {
@@ -1818,6 +1979,11 @@ fn receipt_key(
 
 #[cfg(test)]
 mod tests;
+
+mod repository;
+pub use repository::AuthzRepository;
+pub(crate) use repository::CompiledAuthorizationCache;
+use repository::CompiledAuthorizationKey;
 
 mod catalogue;
 pub use catalogue::*;

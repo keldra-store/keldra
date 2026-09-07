@@ -170,22 +170,14 @@ ordinary mutation; it is no longer required merely to participate in a
 program. Reserved Keldra paths remain unavailable except for exact internal
 records derived and validated by a built-in capability.
 
-The released 0.14 cluster- and data-peer schemas are version 3 while this
-capability uses exact schema 4 for both. Keldra 0.15 is also a clean storage
-break under KELDRA-0018: nodes start on fresh authoritative volumes, and neither
-mixed-binary operation nor an in-place 0.14 volume upgrade is supported. After
-every fresh node runs the new binary, the cluster remains selected at protocol
-and storage version 1. Each ACTIVE node then attests its expanded `1..=2`
-support over mTLS to the Raft leader. An authorized operator inspects
-`GetClusterCapabilities`; only when it reports no blocking ACTIVE nodes and a
-quiescent atomic tail may the operator call `ActivateClusterCapabilities` with
-the reported exact placement fence. Clone, link, and generalized path
-reservations fail closed until Raft selects protocol and storage version 2.
-New JOINING nodes likewise send their running binary's protocol and storage
-ranges in the authenticated join request. The leader requires those ranges to
-match the committed JOINING descriptor before handoff/promotion, and Raft
-deterministically rechecks that the descriptor contains the selected pair in
-the same `CompleteMembershipTransition(Add)` apply that makes the node ACTIVE.
+Keldra is pre-1.0 and this capability is part of the sole current protocol and
+storage format, both identified as v1. Nodes start on fresh authoritative
+volumes; mixed-binary operation and in-place upgrades from earlier releases are
+unsupported. Every ACTIVE or JOINING node attests exact `1..=1` protocol and
+storage support over mTLS, and Raft verifies that support before activation or
+promotion. Clone, link, and generalized path reservations are therefore
+available at the baseline `1/1` capability and require no predecessor-capability
+activation or migration path.
 
 A committed descriptor without its inbound registration, or an inbound entry
 without its descriptor, is data loss. Reads and repair fail closed rather than

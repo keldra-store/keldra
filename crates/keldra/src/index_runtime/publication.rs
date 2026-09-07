@@ -1,7 +1,7 @@
 //! Narrow ordinary-object publication boundary for index commits.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use keldra_consensus::NodeId;
 use keldra_store::{
@@ -19,13 +19,8 @@ use crate::object_distribution::ObjectDistribution;
 use super::placement::{IndexIdentity, IndexPlacement};
 
 mod paths;
-mod v6_batch;
-use paths::{ArtifactPathKind, immutable_content_hash_from_path, parse_artifact_path};
-pub(crate) use paths::{
-    artifact_hash_from_path, artifact_path, current_path, index_definition_name,
-    is_index_recovery_path, is_manifest_artifact_path, manifest_hash_from_path, manifest_path,
-    rebuild_path,
-};
+mod v1_batch;
+use paths::{ArtifactPathKind, parse_artifact_path};
 
 const INDEX_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.index-artifact";
 const ACCOUNTING_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.accounting+json";
@@ -56,10 +51,6 @@ impl DefinitionVersionGuard {
             ));
         }
         let valid_path = match (artifact_kind, self.kind) {
-            (
-                ArtifactPathKind::Current | ArtifactPathKind::RebuildMutable,
-                DefinitionKind::Index,
-            ) => index_definition_name(&self.exact_path).is_some(),
             (ArtifactPathKind::AccountingMutable, DefinitionKind::Accounting) => {
                 crate::accounting::definition_path(request.index_id)
                     .ok()
@@ -162,7 +153,7 @@ impl IndexArtifactDelete {
                 | ArtifactPathKind::ProjectionImmutable
         ) {
             return Err(Status::failed_precondition(
-                "v6 projection artifact reclamation requires partition-directory reachability proof",
+                "v1 projection artifact reclamation requires partition-directory reachability proof",
             ));
         }
         validate_definition_intent(
@@ -194,11 +185,8 @@ impl IndexArtifactPublish {
         }
         let kind = parse_artifact_path(&self.exact_path, self.index_id)?;
         let expected_content_hash = match kind {
-            ArtifactPathKind::Immutable => {
-                immutable_content_hash_from_path(self.index_id, &self.exact_path)
-            }
             ArtifactPathKind::ProjectionImmutable => {
-                keldra_index::v6::parse_projection_artifact_path(&self.exact_path)
+                keldra_index::v1::parse_projection_artifact_path(&self.exact_path)
                     .ok()
                     .and_then(|parsed| parsed.content_hash)
             }
@@ -218,10 +206,7 @@ impl IndexArtifactPublish {
         if self.admission.is_publication_progress() {
             let eligible = matches!(
                 kind,
-                ArtifactPathKind::Current
-                    | ArtifactPathKind::RebuildMutable
-                    | ArtifactPathKind::Immutable
-                    | ArtifactPathKind::ProjectionCurrent
+                ArtifactPathKind::ProjectionCurrent
                     | ArtifactPathKind::ProjectionCatalogMutable
                     | ArtifactPathKind::ProjectionImmutable
             ) || (kind == ArtifactPathKind::AccountingMutable
@@ -236,44 +221,31 @@ impl IndexArtifactPublish {
             }
         }
         match (kind, self.expected_version) {
-            (ArtifactPathKind::Current, Some(VersionId(0))) => Err(Status::invalid_argument(
-                "index current-pointer expected version must be non-zero",
-            )),
             (
                 ArtifactPathKind::ProjectionCurrent | ArtifactPathKind::ProjectionCatalogMutable,
                 Some(VersionId(0)),
             ) => Err(Status::invalid_argument(
                 "projection current-pointer expected version must be non-zero",
             )),
-            (ArtifactPathKind::RebuildMutable, Some(VersionId(0))) => Err(
-                Status::invalid_argument("index rebuild-root expected version must be non-zero"),
-            ),
             (ArtifactPathKind::AccountingMutable, Some(VersionId(0))) => Err(
                 Status::invalid_argument("accounting artifact expected version must be non-zero"),
             ),
             (
-                ArtifactPathKind::Current
-                | ArtifactPathKind::ProjectionCurrent
+                ArtifactPathKind::ProjectionCurrent
                 | ArtifactPathKind::ProjectionCatalogMutable
-                | ArtifactPathKind::RebuildMutable
                 | ArtifactPathKind::AccountingMutable,
                 _,
             )
-            | (ArtifactPathKind::Immutable | ArtifactPathKind::ProjectionImmutable, None) => {
-                Ok(kind)
-            }
-            (ArtifactPathKind::Immutable | ArtifactPathKind::ProjectionImmutable, Some(_)) => Err(
-                Status::invalid_argument("immutable index commit artifacts cannot be replaced"),
-            ),
+            | (ArtifactPathKind::ProjectionImmutable, None) => Ok(kind),
+            (ArtifactPathKind::ProjectionImmutable, Some(_)) => Err(Status::invalid_argument(
+                "immutable index commit artifacts cannot be replaced",
+            )),
         }?;
-        let guard_required = matches!(
-            kind,
-            ArtifactPathKind::Current | ArtifactPathKind::RebuildMutable
-        ) || (kind == ArtifactPathKind::AccountingMutable
+        let guard_required = kind == ArtifactPathKind::AccountingMutable
             && crate::accounting::current_path(self.index_id)
                 .ok()
                 .as_deref()
-                == Some(self.exact_path.as_str()));
+                == Some(self.exact_path.as_str());
         match (guard_required, self.definition_guard.as_ref()) {
             (true, Some(guard)) => guard.validate(self, kind)?,
             (false, None) => {}
@@ -312,13 +284,13 @@ fn artifact_placement_identity(
 fn projection_partition_owner(
     path: &str,
     placement: &ClusterPlacement,
-) -> Result<Option<keldra_index::v6::ProjectionPartitionIdentity>, Status> {
-    if !path.starts_with("_keldra/index-projections/v6/") {
+) -> Result<Option<keldra_index::v1::ProjectionPartitionIdentity>, Status> {
+    if !path.starts_with("_keldra/index-projections/v1/") {
         return Ok(None);
     }
-    match keldra_index::v6::parse_projection_artifact_path(path) {
+    match keldra_index::v1::parse_projection_artifact_path(path) {
         Ok(artifact) => {
-            if artifact.kind != keldra_index::v6::ProjectionArtifactKind::Current {
+            if artifact.kind != keldra_index::v1::ProjectionArtifactKind::Current {
                 return Ok(None);
             }
             let partition = artifact.partition.ok_or_else(|| {
@@ -333,7 +305,7 @@ fn projection_partition_owner(
             }
             Ok(Some(partition))
         }
-        Err(_) if keldra_index::v6::parse_projection_catalog_path(path).is_ok() => Ok(None),
+        Err(_) if keldra_index::v1::parse_projection_catalog_path(path).is_ok() => Ok(None),
         Err(error) => Err(Status::invalid_argument(error.to_string())),
     }
 }
@@ -674,7 +646,7 @@ impl IndexArtifactCoordinator {
         if let Some(partition) = projection_partition_owner(&request.exact_path, &placement)? {
             let source = SourceId {
                 node_id: u16::try_from(partition.source_node).map_err(|_| {
-                    Status::data_loss("v6 projection partition source node exceeds SourceId range")
+                    Status::data_loss("v1 projection partition source node exceeds SourceId range")
                 })?,
                 source_epoch: partition.source_epoch,
             };
@@ -718,34 +690,26 @@ impl IndexArtifactCoordinator {
         }
         let mode = match (kind, request.expected_version) {
             (
-                ArtifactPathKind::Current
-                | ArtifactPathKind::ProjectionCurrent
+                ArtifactPathKind::ProjectionCurrent
                 | ArtifactPathKind::ProjectionCatalogMutable
-                | ArtifactPathKind::RebuildMutable
                 | ArtifactPathKind::AccountingMutable,
                 Some(version),
             ) => PutMode::PutIfVersion(version),
             (
-                ArtifactPathKind::Current
-                | ArtifactPathKind::ProjectionCurrent
+                ArtifactPathKind::ProjectionCurrent
                 | ArtifactPathKind::ProjectionCatalogMutable
-                | ArtifactPathKind::RebuildMutable
-                | ArtifactPathKind::Immutable
                 | ArtifactPathKind::ProjectionImmutable
                 | ArtifactPathKind::AccountingMutable,
                 None,
             ) => PutMode::PutIfAbsent,
-            (ArtifactPathKind::Immutable | ArtifactPathKind::ProjectionImmutable, Some(_)) => {
+            (ArtifactPathKind::ProjectionImmutable, Some(_)) => {
                 unreachable!("validated above")
             }
         };
         let content_type = match kind {
             ArtifactPathKind::AccountingMutable => ACCOUNTING_ARTIFACT_CONTENT_TYPE,
-            ArtifactPathKind::Current
-            | ArtifactPathKind::ProjectionCurrent
+            ArtifactPathKind::ProjectionCurrent
             | ArtifactPathKind::ProjectionCatalogMutable
-            | ArtifactPathKind::RebuildMutable
-            | ArtifactPathKind::Immutable
             | ArtifactPathKind::ProjectionImmutable => INDEX_ARTIFACT_CONTENT_TYPE,
         };
         let derived_progress = request.admission.is_publication_progress();
@@ -828,7 +792,7 @@ pub(crate) struct IndexArtifactRouter {
     coordinator: IndexArtifactCoordinator,
     objects: ObjectDistribution,
     peers: ClusterPeerTransport,
-    current_mutations: Arc<Mutex<BTreeMap<u64, Arc<tokio::sync::Mutex<()>>>>>,
+    current_mutations: Arc<Mutex<BTreeMap<u64, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 pub(crate) struct IndexCurrentMutationGuard {
@@ -868,10 +832,14 @@ impl IndexArtifactRouter {
             let mut gates = self.current_mutations.lock().map_err(|_| {
                 Status::internal("index current-mutation gate registry is poisoned")
             })?;
-            gates
-                .entry(index_id)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+            if let Some(gate) = gates.get(&index_id).and_then(Weak::upgrade) {
+                gate
+            } else {
+                gates.retain(|_, gate| gate.strong_count() > 0);
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(index_id, Arc::downgrade(&gate));
+                gate
+            }
         };
         Ok(IndexCurrentMutationGuard {
             index_id,
@@ -893,7 +861,7 @@ impl IndexArtifactRouter {
             .await
     }
 
-    /// Publish bounded v6 content-addressed artifacts through their ordinary
+    /// Publish bounded v1 content-addressed artifacts through their ordinary
     /// object coordinators. Immutable paths may originate on any ACTIVE node;
     /// one captured placement fence covers every local or remote subgroup.
     pub(crate) async fn publish_immutable_many(
@@ -910,7 +878,7 @@ impl IndexArtifactRouter {
         for (index, request) in requests.into_iter().enumerate() {
             if request.validate()? != ArtifactPathKind::ProjectionImmutable {
                 return Err(Status::invalid_argument(
-                    "v6 grouped publication accepts projection immutable artifacts only",
+                    "v1 grouped publication accepts projection immutable artifacts only",
                 ));
             }
             self.require_local_builder_for_kind(
@@ -1172,7 +1140,7 @@ impl IndexArtifactRouter {
         if let Some(partition) = projection_partition_owner(exact_path, &placement)? {
             let source = SourceId {
                 node_id: u16::try_from(partition.source_node).map_err(|_| {
-                    Status::data_loss("v6 projection partition source node exceeds SourceId range")
+                    Status::data_loss("v1 projection partition source node exceeds SourceId range")
                 })?,
                 source_epoch: partition.source_epoch,
             };
@@ -1330,7 +1298,7 @@ impl IndexArtifactPublication for IndexArtifactCoordinator {
         placement: ClusterPlacement,
         requests: Vec<IndexArtifactPublish>,
     ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status> {
-        self.publish_v6_immutable_many(authenticated_builder, placement, requests)
+        self.publish_v1_immutable_many(authenticated_builder, placement, requests)
             .await
     }
 
@@ -1513,21 +1481,15 @@ fn artifact_durability(kind: ArtifactPathKind, active_nodes: usize) -> Durabilit
         // Once more than one node is ACTIVE, keep the stronger request and let
         // the ordinary object path fail closed unless its exact requirements
         // can be met.
-        ArtifactPathKind::Current
-        | ArtifactPathKind::ProjectionCurrent
+        ArtifactPathKind::ProjectionCurrent
         | ArtifactPathKind::ProjectionCatalogMutable
-        | ArtifactPathKind::RebuildMutable
-        | ArtifactPathKind::Immutable
         | ArtifactPathKind::ProjectionImmutable
             if active_nodes == 1 =>
         {
             Durability::Local
         }
-        ArtifactPathKind::Current
-        | ArtifactPathKind::ProjectionCurrent
+        ArtifactPathKind::ProjectionCurrent
         | ArtifactPathKind::ProjectionCatalogMutable
-        | ArtifactPathKind::RebuildMutable
-        | ArtifactPathKind::Immutable
         | ArtifactPathKind::ProjectionImmutable => Durability::Replicated,
     }
 }
@@ -1587,63 +1549,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "legacy v4 publication path removed by the format-v6-only contract"]
-    fn progress_admission_is_explicit_and_limited_to_complete_derived_artifacts() {
-        let mut manifest = artifact_publish(manifest_path(7, [3; 32]), None);
-        manifest.admission = DerivedArtifactAdmission::PublicationProgress;
-        assert_eq!(manifest.validate().unwrap(), ArtifactPathKind::Immutable);
-
-        let mut outbound =
-            artifact_publish(crate::accounting::outbound_source_path(7, 1).unwrap(), None);
-        outbound.admission = DerivedArtifactAdmission::PublicationProgress;
-        assert!(outbound.validate().is_err());
-    }
-
-    #[test]
-    #[ignore = "legacy v4 Current guard removed by the format-v6-only contract"]
-    fn current_publication_requires_its_exact_typed_definition_guard() {
-        let current = current_path(7);
-        assert!(artifact_publish(current.clone(), None).validate().is_err());
-
-        let valid = DefinitionVersionGuard {
-            kind: DefinitionKind::Index,
-            exact_path: "_keldra/indices/v4/definitions/search".into(),
-            expected_version: VersionId(9),
-        };
-        assert_eq!(
-            artifact_publish(current.clone(), Some(valid.clone()))
-                .validate()
-                .unwrap(),
-            ArtifactPathKind::Current
-        );
-
-        let mut wrong_kind = valid.clone();
-        wrong_kind.kind = DefinitionKind::Accounting;
-        assert!(
-            artifact_publish(current.clone(), Some(wrong_kind))
-                .validate()
-                .is_err()
-        );
-
-        let mut zero_version = valid;
-        zero_version.expected_version = VersionId(0);
-        assert!(
-            artifact_publish(current, Some(zero_version))
-                .validate()
-                .is_err()
-        );
-    }
-
-    #[test]
-    #[ignore = "superseded by format-v6 publication path coverage"]
-    fn v6_projection_paths_bind_full_partition_routing_hash_and_cas_shape() {
+    fn v1_projection_paths_bind_full_partition_routing_hash_and_cas_shape() {
         let family = [7; 32];
         let partition =
-            keldra_index::v6::ProjectionPartitionIdentity::new(family, 3, [4; 32], 5, 6, 8)
+            keldra_index::v1::ProjectionPartitionIdentity::new(family, 3, [4; 32], 5, 6, 8)
                 .unwrap();
-        let routing = keldra_index::v6::projection_routing_id(partition);
+        let routing = keldra_index::v1::projection_routing_id(partition);
         let mut immutable = artifact_publish(
-            keldra_index::v6::projection_pack_path(partition, [3; 32]),
+            keldra_index::v1::projection_pack_path(partition, [3; 32]),
             None,
         );
         immutable.index_id = routing;
@@ -1659,7 +1572,7 @@ mod tests {
         assert!(immutable.validate().is_err());
 
         let mut current =
-            artifact_publish(keldra_index::v6::projection_current_path(partition), None);
+            artifact_publish(keldra_index::v1::projection_current_path(partition), None);
         current.index_id = routing;
         assert_eq!(
             current.validate().unwrap(),
@@ -1672,27 +1585,6 @@ mod tests {
         );
         current.expected_version = Some(VersionId(0));
         assert!(current.validate().is_err());
-    }
-
-    #[test]
-    #[ignore = "legacy v4 artifact batching removed by the format-v6-only contract"]
-    fn multiple_artifacts_share_one_bounded_grouped_mutation() {
-        let first = artifact_publish(artifact_path(7, [3; 32]), None);
-        let mut second = artifact_publish(artifact_path(7, [5; 32]), None);
-        second.blob.hash = [5; 32];
-        let batches = bounded_artifact_batches(vec![(0, first), (1, second)]).unwrap();
-
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].len(), 2);
-        assert!(
-            validate_immutable_batch(
-                &batches[0]
-                    .iter()
-                    .map(|(_, request)| request.clone())
-                    .collect::<Vec<_>>()
-            )
-            .is_ok()
-        );
     }
 
     #[test]

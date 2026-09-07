@@ -23,6 +23,7 @@ use crate::payload_placement::{PayloadPlacement, select_payload_placement};
 use crate::placement::PlacementNode;
 
 pub(crate) const PAYLOAD_READ_FRAME_BYTES: usize = 64 * 1024;
+const MAX_SMALL_READ_CONCURRENCY: usize = 8;
 
 /// The immutable placement inputs used for one read attempt.
 pub(crate) trait PayloadReadPlacementView: Send + Sync {
@@ -281,7 +282,7 @@ impl DistributedPayloadReader {
         Err(PayloadReadError::Unavailable {
             kind: "complete copy",
             required: 1,
-            summary: StateSummary::from_states(&states),
+            summary: StateSummary::from_states(states.iter().copied()),
         })
     }
 
@@ -296,60 +297,126 @@ impl DistributedPayloadReader {
     where
         W: Write + Send + 'static,
     {
-        let mut valid = None;
-        let mut states = Vec::with_capacity(candidates.len());
-        for owner in candidates {
-            let Some(address) = placement.address(*owner) else {
-                states.push(OwnerState::Unavailable);
-                continue;
-            };
-            let mut bytes = Vec::with_capacity(reference.length as usize);
-            let mut bounded = FrameBoundedWriter::new(&mut bytes, reference.length);
-            let fetched = self
-                .transport
-                .get_small(placement.fence(), *owner, address, reference, &mut bounded)
-                .await;
-            let violated = bounded.violated;
-            drop(bounded);
-            let state = classify_small_fetch(reference, fetched, violated, &bytes)?;
-            if valid.is_none() && state == OwnerState::Healthy {
-                valid = Some(bytes.clone());
-            }
-            states.push(state);
-        }
-        let bytes = valid.ok_or_else(|| PayloadReadError::Unavailable {
-            kind: "small copy",
-            required: 1,
-            summary: StateSummary::from_states(&states),
-        })?;
+        // An owner that loses the race to the first verified copy was not
+        // observed unhealthy. Keep unobserved candidates out of the report and
+        // repair set rather than manufacturing an unavailable result for them.
+        let mut states = vec![None; candidates.len()];
+        let selected_count = selected_owners.len();
+        let bytes = match self
+            .fetch_small_candidates(
+                placement,
+                reference,
+                candidates,
+                0..selected_count,
+                &mut states,
+            )
+            .await?
+        {
+            Some(bytes) => bytes,
+            None => self
+                .fetch_small_candidates(
+                    placement,
+                    reference,
+                    candidates,
+                    selected_count..candidates.len(),
+                    &mut states,
+                )
+                .await?
+                .ok_or_else(|| PayloadReadError::Unavailable {
+                    kind: "small copy",
+                    required: 1,
+                    summary: StateSummary::from_states(states.iter().flatten().copied()),
+                })?,
+        };
         write_bounded(&mut output, &bytes)?;
         output.flush().map_err(PayloadReadError::Output)?;
 
-        let mut report = PayloadReadReport::new(&states);
-        for owner in selected_owners {
+        let mut report = PayloadReadReport::from_states(states.iter().flatten().copied());
+        let mut repairs = tokio::task::JoinSet::new();
+        for owner in selected_owners.iter().copied() {
             let index = candidates
                 .iter()
-                .position(|candidate| candidate == owner)
+                .position(|candidate| *candidate == owner)
                 .expect("selected small owner is included in read candidates");
-            let state = states[index];
+            let Some(state) = states[index] else {
+                continue;
+            };
             if !state.needs_repair() {
                 continue;
             }
             report.repairs_attempted += 1;
-            let Some(address) = placement.address(*owner) else {
+            let Some(address) = placement.address(owner).map(str::to_owned) else {
                 report.repairs_failed += 1;
                 continue;
             };
-            match self
-                .transport
-                .put_small(placement.fence(), *owner, address, reference, &bytes)
-                .await
-            {
+            let transport = self.transport.clone();
+            let reference = reference.clone();
+            let bytes = bytes.clone();
+            let fence = placement.fence();
+            repairs.spawn(async move {
+                transport
+                    .put_small(fence, owner, &address, &reference, &bytes)
+                    .await
+            });
+        }
+        while let Some(repaired) = repairs.join_next().await {
+            match repaired.map_err(|error| PayloadReadError::Task(error.to_string()))? {
                 Ok(()) => report.repairs_completed += 1,
                 Err(_) => report.repairs_failed += 1,
             }
         }
         Ok(report)
+    }
+
+    async fn fetch_small_candidates(
+        &self,
+        placement: &(impl PayloadReadPlacementView + ?Sized),
+        reference: &BlobRef,
+        candidates: &[NodeId],
+        indices: std::ops::Range<usize>,
+        states: &mut [Option<OwnerState>],
+    ) -> Result<Option<Vec<u8>>, PayloadReadError> {
+        let mut pending = indices
+            .filter_map(|index| match placement.address(candidates[index]) {
+                Some(address) => Some((index, candidates[index], address.to_owned())),
+                None => {
+                    states[index] = Some(OwnerState::Unavailable);
+                    None
+                }
+            })
+            .collect::<std::collections::VecDeque<_>>();
+        let mut reads = tokio::task::JoinSet::new();
+        let fence = placement.fence();
+        loop {
+            while reads.len() < MAX_SMALL_READ_CONCURRENCY {
+                let Some((index, owner, address)) = pending.pop_front() else {
+                    break;
+                };
+                let transport = self.transport.clone();
+                let reference = reference.clone();
+                reads.spawn(async move {
+                    let mut bytes = Vec::with_capacity(reference.length as usize);
+                    let mut bounded = FrameBoundedWriter::new(&mut bytes, reference.length);
+                    let fetched = transport
+                        .get_small(fence, owner, &address, &reference, &mut bounded)
+                        .await;
+                    let violated = bounded.violated;
+                    drop(bounded);
+                    let state = classify_small_fetch(&reference, fetched, violated, &bytes)?;
+                    Ok::<_, PayloadReadError>((index, state, bytes))
+                });
+            }
+            let Some(joined) = reads.join_next().await else {
+                return Ok(None);
+            };
+            let (index, state, bytes) =
+                joined.map_err(|error| PayloadReadError::Task(error.to_string()))??;
+            states[index] = Some(state);
+            if state == OwnerState::Healthy {
+                reads.abort_all();
+                return Ok(Some(bytes));
+            }
+        }
     }
 
     async fn read_large<W>(
@@ -370,7 +437,7 @@ impl DistributedPayloadReader {
             let unavailable = PayloadReadError::Unavailable {
                 kind: "shard",
                 required,
-                summary: StateSummary::from_states(&states),
+                summary: StateSummary::from_states(states.iter().copied()),
             };
             let mut seen = HashSet::with_capacity(placement.placement_nodes().len());
             let complete_candidates = placement
@@ -724,7 +791,7 @@ pub(crate) struct StateSummary {
 }
 
 impl StateSummary {
-    fn from_states(states: &[OwnerState]) -> Self {
+    fn from_states(states: impl IntoIterator<Item = OwnerState>) -> Self {
         let mut summary = Self::default();
         for state in states {
             match state {
@@ -748,6 +815,10 @@ pub(crate) struct PayloadReadReport {
 
 impl PayloadReadReport {
     fn new(states: &[OwnerState]) -> Self {
+        Self::from_states(states.iter().copied())
+    }
+
+    fn from_states(states: impl IntoIterator<Item = OwnerState>) -> Self {
         Self {
             sources: StateSummary::from_states(states),
             ..Self::default()

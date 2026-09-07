@@ -227,7 +227,7 @@ mod tests {
             "_keldra/programs/nested/import_osv@1",
             "_keldra/programs/import_osv@1@copy",
             index_definition.as_str(),
-            "_keldra/indices/v3/7/current",
+            "_keldra/index-projections/v1/family/partitions",
             "_keldra/internal/00",
             "objects/_keldra/meta.json",
         ] {
@@ -266,6 +266,12 @@ mod tests {
         mark_index(&mut request);
         let access = access_for(&request);
         assert!(require_key(&access, &key(&definition_path("by-path").unwrap())).is_ok());
-        assert!(require_key(&access, &key("_keldra/indices/v4/7/current")).is_ok());
+        assert!(
+            require_key(
+                &access,
+                &key("_keldra/index-projections/v1/family/partitions")
+            )
+            .is_ok()
+        );
     }
 }

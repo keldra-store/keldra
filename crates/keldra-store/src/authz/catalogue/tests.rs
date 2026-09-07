@@ -155,7 +155,7 @@ async fn conflicting_schema_publication_replay_fails_closed() {
 }
 
 #[tokio::test]
-async fn legacy_schema_revision_decodes_and_survives_catalogue_handoff() {
+async fn v1_schema_revision_requires_explicit_publication_lineage() {
     let (_root, source, replica) = stores().await;
     let source = source.authz();
     let published = source
@@ -180,6 +180,17 @@ async fn legacy_schema_revision_decodes_and_survives_catalogue_handoff() {
         .unwrap()
         .unwrap();
     assert_eq!(catalogue.schemas[0].publication_mutation, None);
+    let encoded = serde_json::to_value(&catalogue).unwrap();
+    assert_eq!(
+        encoded["schemas"][0]["publication_mutation"],
+        serde_json::Value::Null
+    );
+    let mut missing_lineage = encoded;
+    missing_lineage["schemas"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("publication_mutation");
+    assert!(serde_json::from_value::<AuthzSchemaCatalogue>(missing_lineage).is_err());
     let replica = replica.authz();
     replica
         .install_quorum_reconciled_authz_schema_catalogue(&tenant(), Some(&catalogue))
@@ -255,6 +266,40 @@ async fn catalogue_revision_tracks_realm_changes_without_copying_realm_data() {
         .unwrap();
     assert_eq!(catalogue.authz_revision, AuthzRevision(2));
     assert_eq!(catalogue.schemas.len(), 1);
+}
+
+#[tokio::test]
+async fn catalogue_export_snapshot_excludes_a_concurrent_publication() {
+    let (_root, source, _replica) = stores().await;
+    let repository = source.authz();
+    let first = repository
+        .publish_schema(request("documents", schema("document"), 0))
+        .unwrap();
+    let snapshot = repository.db.snapshot();
+
+    let writer = repository.clone();
+    let second =
+        std::thread::spawn(move || writer.publish_schema(request("notes", schema("note"), 1)))
+            .join()
+            .unwrap()
+            .unwrap();
+    assert_eq!(second.authz_revision, AuthzRevision(2));
+
+    let catalogue = repository
+        .export_authz_schema_catalogue_from_snapshot(&snapshot, &tenant())
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalogue.authz_revision, AuthzRevision(1));
+    assert_eq!(catalogue.schemas.len(), 1);
+    assert_eq!(catalogue.schemas[0].schema_ref, first.schema_ref);
+
+    drop(snapshot);
+    let current = repository
+        .export_authz_schema_catalogue(&tenant())
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.authz_revision, AuthzRevision(2));
+    assert_eq!(current.schemas.len(), 2);
 }
 
 #[tokio::test]

@@ -18,8 +18,7 @@ pub const SMALL_BLOB_MAX_BYTES: usize = 64 * 1024;
 pub struct VersionId(pub u64);
 
 pub const MUTATION_STAMP_FORMAT: u16 = 1;
-pub const LEGACY_OBJECT_MUTATION_FORMAT: u16 = 2;
-pub const OBJECT_MUTATION_FORMAT: u16 = 3;
+pub const OBJECT_MUTATION_FORMAT: u16 = 1;
 pub const RETAINED_VERSION_DELETE_FORMAT: u16 = 1;
 pub const MAX_OBJECT_MUTATION_REFERENCE_DELTAS: usize = 2;
 pub const MAX_CONTENT_TYPE_BYTES: usize = 512;
@@ -152,8 +151,8 @@ pub struct PlacementLogId {
     pub index: u64,
 }
 
-/// Bounded lineage attached to every distributed 0.5.1 object-head candidate.
-/// A missing stamp is reserved for an authoritative 0.5.0 committed baseline.
+/// Bounded lineage attached to every distributed object-head candidate.
+/// Local-only heads have no peer mutation stamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutationStamp {
     pub format: u16,
@@ -161,7 +160,7 @@ pub struct MutationStamp {
     /// Raft cursor for an explicitly atomic-program mutation. Ordinary object
     /// mutations leave this absent. Readers use it only as a visibility fence;
     /// it is not a second commit record.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub program_commit_cursor: Option<u64>,
     pub mutation_fingerprint: [u8; 32],
     pub active_placement_log_id: PlacementLogId,
@@ -174,8 +173,8 @@ pub struct MutationStamp {
 pub struct Head {
     pub version: VersionId,
     pub deleted: bool,
-    /// Released 0.5.0 heads omit this field and remain committed baselines.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Local-only heads represent the absence of peer lineage explicitly.
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub mutation_stamp: Option<MutationStamp>,
 }
 
@@ -188,7 +187,6 @@ pub struct Version {
     pub committed_at_unix_millis: u64,
     /// True only for a version produced by the sealed built-in link-descriptor
     /// authority. Released descriptors omit this field and remain ordinary.
-    #[serde(default, skip_serializing_if = "is_false")]
     pub protected_link_descriptor: bool,
 }
 
@@ -237,8 +235,8 @@ impl PutMode {
 }
 
 /// Per-request durability for ordinary object mutations. Local is deliberately
-/// the default fast path. Replicated is retained in the stable API but cannot
-/// be satisfied by the single-node 0.5.0 store.
+/// the default fast path; replicated durability requires distributed
+/// coordination.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Durability {
@@ -351,6 +349,9 @@ pub struct ObjectMutation {
     pub format: u16,
     pub tenant_id: u64,
     pub bucket_id: u64,
+    /// Authoritative bucket versioning resolved before exact-path evaluation.
+    /// Replica owners must not infer it from replica-local bucket records.
+    pub versioning: ObjectVersioning,
     pub exact_path: String,
     pub command_id: String,
     pub input_fingerprint: [u8; 32],
@@ -358,11 +359,11 @@ pub struct ObjectMutation {
     pub receipt_expires_at_unix_millis: u64,
     pub stamp: MutationStamp,
     pub reference_deltas: Vec<ReferenceDelta>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub accounting_transition: Option<crate::AccountingHeadTransition>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub definition_transition: Option<DefinitionTransition>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub alias_snapshot: Option<ObjectAliasSnapshot>,
 }
 
@@ -373,20 +374,19 @@ impl ObjectMutation {
 
     pub fn computed_fingerprint(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(match self.format {
-            LEGACY_OBJECT_MUTATION_FORMAT => b"keldra.object-mutation.v2",
-            _ => b"keldra.object-mutation.v3",
-        });
+        hasher.update(b"keldra.object-mutation.v1");
         hash_u16(&mut hasher, self.format);
         hash_u64(&mut hasher, self.tenant_id);
         hash_u64(&mut hasher, self.bucket_id);
+        hasher.update(&[match self.versioning {
+            ObjectVersioning::Unversioned => 0,
+            ObjectVersioning::Enabled => 1,
+        }]);
         hash_bytes(&mut hasher, self.exact_path.as_bytes());
         hash_bytes(&mut hasher, self.command_id.as_bytes());
         hasher.update(&self.input_fingerprint);
         hash_version(&mut hasher, &self.version);
-        if self.format == OBJECT_MUTATION_FORMAT {
-            hasher.update(&[u8::from(self.version.protected_link_descriptor)]);
-        }
+        hasher.update(&[u8::from(self.version.protected_link_descriptor)]);
         hash_u64(&mut hasher, self.receipt_expires_at_unix_millis);
         hash_u16(&mut hasher, self.stamp.format);
         hash_optional_version(&mut hasher, self.stamp.predecessor_version);
@@ -406,6 +406,7 @@ impl ObjectMutation {
             hasher.update(b"keldra.accounting-head-transition.v1");
             hash_optional_u64(&mut hasher, transition.previous_live_length);
             hash_optional_u64(&mut hasher, transition.current_live_length);
+            hash_u64(&mut hasher, transition.logical_bytes_removed);
         }
         match self.definition_transition.as_ref() {
             Some(transition) => {
@@ -437,24 +438,11 @@ impl ObjectMutation {
     }
 
     pub fn validate(&self) -> Result<(), MutationError> {
-        if !matches!(
-            self.format,
-            LEGACY_OBJECT_MUTATION_FORMAT | OBJECT_MUTATION_FORMAT
-        ) {
+        if self.format != OBJECT_MUTATION_FORMAT {
             return Err(MutationError::InvalidObjectMutation(format!(
                 "unsupported object mutation format {}",
                 self.format
             )));
-        }
-        if self.format == LEGACY_OBJECT_MUTATION_FORMAT && self.alias_snapshot.is_some() {
-            return Err(MutationError::InvalidObjectMutation(
-                "legacy object mutation carries an alias snapshot".into(),
-            ));
-        }
-        if self.format == OBJECT_MUTATION_FORMAT && self.alias_snapshot.is_none() {
-            return Err(MutationError::InvalidObjectMutation(
-                "alias-aware object mutation is missing its alias snapshot".into(),
-            ));
         }
         if self.stamp.format != MUTATION_STAMP_FORMAT {
             return Err(MutationError::InvalidObjectMutation(format!(
@@ -546,7 +534,12 @@ impl ObjectMutation {
             let current_live_length = self.version.blob.as_ref().map(|blob| blob.length);
             if transition.current_live_length != current_live_length
                 || (self.stamp.predecessor_version.is_none()
-                    && transition.previous_live_length.is_some())
+                    && (transition.previous_live_length.is_some()
+                        || transition.logical_bytes_removed != 0))
+                || (self.versioning == ObjectVersioning::Enabled
+                    && transition.logical_bytes_removed != 0)
+                || (transition.logical_bytes_removed != 0
+                    && transition.previous_live_length != Some(transition.logical_bytes_removed))
             {
                 return Err(MutationError::InvalidObjectMutation(
                     "accounting head-transition does not match mutation lineage".into(),
@@ -637,6 +630,10 @@ pub struct RetainedVersionDeleteMutation {
     pub expected_head: Head,
     pub target: Version,
     pub replacement_tombstone: Option<Version>,
+    /// Sorted logical aliases that named this canonical retained lineage when
+    /// the deletion committed. The source journal uses this sealed registry
+    /// snapshot to wake every accounting scope affected by the deletion.
+    pub alias_paths: Vec<String>,
     pub stamp: MutationStamp,
     pub reference_deltas: Vec<ReferenceDelta>,
 }
@@ -663,6 +660,10 @@ impl RetainedVersionDeleteMutation {
             None => {
                 hasher.update(&[0]);
             }
+        }
+        hash_u64(&mut hasher, self.alias_paths.len() as u64);
+        for alias in &self.alias_paths {
+            hash_bytes(&mut hasher, alias.as_bytes());
         }
         hash_u16(&mut hasher, self.stamp.format);
         hash_optional_version(&mut hasher, self.stamp.predecessor_version);
@@ -706,6 +707,20 @@ impl RetainedVersionDeleteMutation {
                 "ordinary retained-version deletion names a protected link descriptor".into(),
             ));
         }
+        if self.alias_paths.len() > crate::MAX_INBOUND_OBJECT_LINKS
+            || self.alias_paths.iter().enumerate().any(|(index, alias)| {
+                validate_exact_path(alias).is_err()
+                    || crate::key::contains_reserved_keldra_segment(alias)
+                    || alias == &self.exact_path
+                    || self.alias_paths[..index]
+                        .last()
+                        .is_some_and(|previous| previous >= alias)
+            })
+        {
+            return Err(MutationError::InvalidObjectMutation(
+                "retained-version deletion alias paths are malformed".into(),
+            ));
+        }
         if self.expected_head.version.0 == 0
             || self.stamp.format != MUTATION_STAMP_FORMAT
             || self.stamp.predecessor_version != Some(self.expected_head.version)
@@ -714,6 +729,11 @@ impl RetainedVersionDeleteMutation {
             || self.stamp.source_id.node_id == 0
             || self.stamp.source_id.source_epoch == [0; 32]
             || self.stamp.source_journal_position == 0
+            || self
+                .stamp
+                .source_journal_position
+                .checked_add(self.alias_paths.len() as u64)
+                .is_none()
         {
             return Err(MutationError::InvalidObjectMutation(
                 "retained-version deletion lineage or source is malformed".into(),
@@ -727,6 +747,7 @@ impl RetainedVersionDeleteMutation {
                     || self.target.deleted
                     || !replacement.deleted
                     || replacement.id <= self.expected_head.version
+                    || !self.alias_paths.is_empty()
                 {
                     return Err(MutationError::InvalidObjectMutation(
                         "current-version deletion replacement is malformed".into(),
@@ -795,10 +816,8 @@ pub enum DeleteRetainedVersionOutcome {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketPolicy {
     /// Canonical prefixes whose matching paths can be created exactly once.
-    #[serde(default)]
     pub immutable_prefixes: Vec<String>,
     /// Canonical prefixes writable only through an invoked atomic program.
-    #[serde(default)]
     pub program_only_prefixes: Vec<String>,
 }
 
@@ -1034,8 +1053,12 @@ pub(crate) fn validate_version_descriptor(version: &Version) -> Result<(), Mutat
     Ok(())
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 fn hash_blob(hasher: &mut blake3::Hasher, blob: &BlobRef) {

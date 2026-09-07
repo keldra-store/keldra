@@ -128,7 +128,7 @@ placement and never changes authoritative payload placement.
 The protected internal namespace is:
 
 ```text
-_keldra/git/v2/repos/<repository_id>/
+_keldra/git/v1/repos/<repository_id>/
   current
   packs/<pack_id>
   batches/<batch_id>
@@ -681,7 +681,7 @@ cache state, group configuration, and observed bottleneck.
 
 The minimum coherent implementation lands in this order:
 
-1. canonical v2 current, pack, batch, and checkpoint records;
+1. canonical v1 current, pack, batch, and checkpoint records;
 2. immutable artifact publication and exact current-pointer CAS;
 3. per-repository actors and removal of the process-wide Git lock;
 4. streaming native Git quarantine and pack validation;

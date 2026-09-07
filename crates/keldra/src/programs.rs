@@ -13,8 +13,8 @@ use keldra_atomic_program::{
 };
 use keldra_consensus::{
     ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, AtomicBundleAuthority, BeginBatch,
-    BundleHash, BundleRef, Command, CommitPreparedBatch, CommittedBatch, CommittedInvocation,
-    DecisionRaft, DecisionRaftError, DurabilityClass, DurabilityEvidenceHash, ExecutorNomination,
+    BundleRef, Command, CommitPreparedBatch, CommittedBatch, CommittedInvocation, DecisionRaft,
+    DecisionRaftError, DurabilityClass, DurabilityEvidenceHash, ExecutorNomination,
     InvocationFingerprint, InvocationId, NodeId, ParticipantManifestHash,
     ProgramHash as DecisionProgramHash, ProgramPathHash,
 };
@@ -46,6 +46,27 @@ enum ProgramRuntimeTopology {
     Clustered,
 }
 const ATOMIC_VISIBILITY_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Governance records and exact object paths have intentionally different
+/// placement authorities. Keeping this mapping shared by the executor and peer
+/// admission prevents either side from accepting a reservation on the wrong
+/// replica group.
+pub(crate) fn reservation_placement(
+    reservation: &ProgramReservation,
+) -> (crate::placement::PlacementKind, Vec<u8>) {
+    let (tenant_id, bucket_id) = reservation.stable_bucket_ids();
+    let mut key = Vec::with_capacity(16 + reservation.path().path.len());
+    key.extend_from_slice(&tenant_id.to_be_bytes());
+    key.extend_from_slice(&bucket_id.to_be_bytes());
+    let kind = match reservation {
+        ProgramReservation::Object(value) => {
+            key.extend_from_slice(value.participant.path.path.as_bytes());
+            crate::placement::PlacementKind::Object
+        }
+        ProgramReservation::Governance(_) => crate::placement::PlacementKind::TenantOrBucketRecord,
+    };
+    (kind, key)
+}
 
 #[derive(Clone)]
 pub(crate) struct ProgramCoordinator {
@@ -328,6 +349,7 @@ impl ProgramCoordinator {
         objects: crate::object_distribution::ObjectDistribution,
         peers: crate::cluster_peer::ClusterPeerTransport,
         names: crate::logical_name_resolution::LogicalNameResolver,
+        governance: crate::bucket_governance::BucketGovernance,
     ) -> Result<()> {
         self.distributed
             .set(DistributedPrograms::new(
@@ -337,6 +359,7 @@ impl ProgramCoordinator {
                 objects,
                 peers,
                 names,
+                governance,
             ))
             .map_err(|_| anyhow::anyhow!("distributed atomic programs were installed twice"))?;
         if self
@@ -428,7 +451,6 @@ impl ProgramCoordinator {
             durability_class,
             ProgramRuntimeTopology::OneNode,
         )?;
-        self.require_generalized_atomic_paths()?;
         let nomination = self.current_nomination()?;
         tracing::Span::current().record("nomination.log_index", nomination.nomination_log_index);
 
@@ -600,10 +622,9 @@ impl ProgramCoordinator {
                     invocation_id: consensus_invocation_id,
                     input_fingerprint: InvocationFingerprint(fingerprint),
                     bundle_ref: BundleRef {
-                        hash: prepared.bundle.hash,
+                        hash: prepared.bundle.hash.0,
                         length: prepared.bundle.length,
                     },
-                    bundle_hash: BundleHash(prepared.hash.0),
                     durability_class: DurabilityClass(
                         ProgramDurabilityClassHash::for_class(durability_class).0,
                     ),
@@ -635,7 +656,7 @@ impl ProgramCoordinator {
                 .reservations(
                     prepared_batch.begin_cursor,
                     consensus_invocation_id.0,
-                    prepared.hash,
+                    prepared.bundle.hash,
                     self.node.0,
                     nomination.nomination_log_index,
                     mutation_context.active_placement_log_id,
@@ -857,13 +878,11 @@ fn program_commit(previous_commit_cursor: Option<u64>, committed: CommittedBatch
         commit_cursor: committed.commit_cursor,
         begin_cursor: committed.begin_cursor,
         bundle_ref: PreparedBundleRef {
-            hash: committed.bundle_ref.hash,
+            hash: PreparedBundleHash(committed.bundle_ref.hash),
             length: committed.bundle_ref.length,
         },
-        bundle_hash: PreparedBundleHash(committed.bundle_hash.0),
         program_hash: ProgramHash(match committed.authority {
-            AtomicBundleAuthority::StoredProgram { program_hash, .. }
-            | AtomicBundleAuthority::LegacyProgramOnly { program_hash, .. } => program_hash.0,
+            AtomicBundleAuthority::StoredProgram { program_hash, .. } => program_hash.0,
             AtomicBundleAuthority::BuiltInObjectTransaction { .. } => [0; 32],
         }),
         authority: store_bundle_authority(committed.authority),
@@ -891,13 +910,6 @@ pub(crate) fn store_bundle_authority(authority: AtomicBundleAuthority) -> Progra
             kind,
             contract_version,
         },
-        AtomicBundleAuthority::LegacyProgramOnly {
-            program_path_hash,
-            program_hash,
-        } => ProgramBundleAuthority::LegacyProgramOnly {
-            program_path_hash: program_path_hash.0,
-            program_hash: program_hash.0,
-        },
     }
 }
 
@@ -919,9 +931,6 @@ pub(crate) fn decision_bundle_authority(
             kind,
             contract_version,
         },
-        ProgramBundleAuthority::LegacyProgramOnly { .. } => {
-            unreachable!("new atomic preparation cannot use legacy authority")
-        }
     }
 }
 
@@ -993,9 +1002,6 @@ fn require_same_invocation(
         AtomicBundleAuthority::StoredProgram {
             program_path_hash: committed_path,
             program_hash: committed_program,
-        } | AtomicBundleAuthority::LegacyProgramOnly {
-            program_path_hash: committed_path,
-            program_hash: committed_program,
         } if committed_path == ProgramPathHash(program_path_hash)
             && committed_program == DecisionProgramHash(program_hash)
     );
@@ -1014,9 +1020,6 @@ fn require_result_matches_consensus(
     let receipt_fingerprint = decode_fingerprint(&result.receipt.input_fingerprint)?;
     let committed_path = match invocation.committed_batch.authority {
         AtomicBundleAuthority::StoredProgram {
-            program_path_hash, ..
-        }
-        | AtomicBundleAuthority::LegacyProgramOnly {
             program_path_hash, ..
         } => program_path_hash.0,
         AtomicBundleAuthority::BuiltInObjectTransaction { .. } => [0; 32],
@@ -1045,8 +1048,7 @@ fn invoked_result(
         executor_nomination_log_index: invocation.committed_batch.nomination_log_index,
         commit_log_index: invocation.committed_batch.commit_cursor,
         program_hash: match invocation.committed_batch.authority {
-            AtomicBundleAuthority::StoredProgram { program_hash, .. }
-            | AtomicBundleAuthority::LegacyProgramOnly { program_hash, .. } => program_hash.0,
+            AtomicBundleAuthority::StoredProgram { program_hash, .. } => program_hash.0,
             AtomicBundleAuthority::BuiltInObjectTransaction { .. } => [0; 32],
         },
         published_versions: result.published_versions,

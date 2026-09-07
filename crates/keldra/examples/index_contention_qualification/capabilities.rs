@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Instant, sleep};
 
-const INDEX_NAME: &str = "v6-capabilities";
+const INDEX_NAME: &str = "v1-capabilities";
 
 #[derive(Serialize)]
 pub(super) struct CapabilityReport {
@@ -35,7 +35,7 @@ pub(super) async fn run(
 ) -> Result<CapabilityReport> {
     ensure!(
         config.endpoints.len() == 1,
-        "v6 capability preflight requires one endpoint"
+        "v1 capability preflight requires one endpoint"
     );
     let channel = connect_channel(&config.endpoints[0])
         .await
@@ -105,7 +105,7 @@ pub(super) async fn run(
                 .analyzer(TextAnalyzer::UnicodeAlphanumericLowercase)
                 .full_text(),
         )
-        .finish("create-v6-capability-index")?;
+        .finish("create-v1-capability-index")?;
     let mut client = index_client(channel, &token)?;
     tokio::time::timeout(config.request_timeout, client.create_index(request))
         .await
@@ -226,7 +226,7 @@ pub(super) async fn run(
     ensure!(aggregate.value_json.as_deref() == Some(b"6".as_slice()));
 
     Ok(CapabilityReport {
-        schema: "keldra.index-v6-capability-qualification.v1",
+        schema: "keldra.index-v1-capability-qualification.v1",
         started_unix_milliseconds,
         completed_unix_milliseconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
         result: "pass",

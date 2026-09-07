@@ -2,12 +2,13 @@
 
 use super::*;
 use keldra_store::{
-    AuthzRealmCursor, AuthzRealmKeyPage, AuthzRealmTransferManifest, AuthzSchemaCatalogue,
-    AuthzScope, BlobReader, DefinitionAssignmentCursor, DefinitionAssignmentMutation,
-    DefinitionAssignmentPage, DefinitionCheckpoint, DefinitionConsumerKind, DefinitionKind,
-    DefinitionLocatorCursor, DefinitionLocatorPage, JournalRoute, LocalChangePage,
-    LogicalRecordCandidate, LogicalRecordCursor, LogicalRecordExport, LogicalRecordExportPage,
-    LogicalRecordId, MAX_DEFINITION_STATE_SCAN_RECORDS, ObjectRecordCursor, ObjectRecordExport,
+    AuthzRealmCursor, AuthzRealmKeyPage, AuthzRealmState, AuthzRealmTransferManifest,
+    AuthzSchemaCatalogue, AuthzScope, BlobReader, DefinitionAssignmentCursor,
+    DefinitionAssignmentMutation, DefinitionAssignmentPage, DefinitionCheckpoint,
+    DefinitionConsumerKind, DefinitionKind, DefinitionLocatorCursor, DefinitionLocatorPage,
+    JournalRoute, LocalChangePage, LogicalRecordCandidate, LogicalRecordCursor,
+    LogicalRecordExport, LogicalRecordExportPage, LogicalRecordId,
+    MAX_DEFINITION_STATE_SCAN_RECORDS, ObjectRecordCursor, ObjectRecordExport,
     ObjectRecordExportPage, OversizeLocalChange, PayloadArtifactCursor, PayloadArtifactSnapshot,
     PayloadArtifactSnapshotPage, RoutedLocalChangePage, StorageTenantId,
 };
@@ -19,6 +20,8 @@ mod definition_coordination;
 mod derived_consumer;
 
 use definition_coordination::*;
+
+const MAX_CACHED_PEER_CHANNELS: usize = 256;
 
 #[derive(Clone)]
 #[allow(
@@ -166,6 +169,12 @@ impl DataPeerTransport {
         };
         let channel = Endpoint::from_static("http://keldra-peer.invalid")
             .connect_with_connector_lazy(connector);
+        while channels.len() >= MAX_CACHED_PEER_CHANNELS {
+            let Some(expired) = channels.keys().next().copied() else {
+                break;
+            };
+            channels.remove(&expired);
+        }
         channels.insert(target.0, (address.to_owned(), channel.clone()));
         Ok(channel)
     }
@@ -931,6 +940,39 @@ impl DataPeerTransport {
             .map(Response::into_inner)
     }
 
+    pub(crate) async fn complete_source_state(
+        &self,
+        target: NodeId,
+        address: &str,
+        fence: keldra_store::PlacementLogId,
+        reference: &BlobRef,
+    ) -> Result<keldra_store::PayloadArtifactState, Status> {
+        if reference.length <= keldra_store::SMALL_BLOB_MAX_BYTES as u64 {
+            return Err(Status::invalid_argument(
+                "complete-source state requires a large blob",
+            ));
+        }
+        let response = self
+            .client(target, address)?
+            .get_complete_source_state(wire::CompleteSourceStateRequest {
+                peer: Some(self.context()),
+                blob: Some(wire_blob(reference)),
+                placement_fence_term: fence.term,
+                placement_fence_index: fence.index,
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        match wire::CompleteCopyState::try_from(response.state) {
+            Ok(wire::CompleteCopyState::Missing) => Ok(keldra_store::PayloadArtifactState::Missing),
+            Ok(wire::CompleteCopyState::Valid) => Ok(keldra_store::PayloadArtifactState::Valid),
+            Ok(wire::CompleteCopyState::Corrupt) => Ok(keldra_store::PayloadArtifactState::Corrupt),
+            Ok(wire::CompleteCopyState::Unspecified) | Err(_) => Err(Status::data_loss(
+                "complete-source state response is unspecified or unknown",
+            )),
+        }
+    }
+
     pub(crate) async fn shard_exists(
         &self,
         target: NodeId,
@@ -1382,7 +1424,7 @@ impl DataPeerTransport {
         target: NodeId,
         address: &str,
         scope: &AuthzScope,
-    ) -> Result<Option<AuthzRealmTransferManifest>, Status> {
+    ) -> Result<Option<AuthzRealmState>, Status> {
         let response = self
             .client(target, address)?
             .read_authz_realm_manifest(wire::AuthzRealmRequest {
@@ -1394,13 +1436,13 @@ impl DataPeerTransport {
             .into_inner();
         require_response_schema(response.schema_version)?;
         match response.present {
-            true if response.manifest_json.is_empty() => Err(Status::data_loss(
-                "present authorization realm omitted its manifest",
+            true if response.state_json.is_empty() => Err(Status::data_loss(
+                "present authorization realm omitted its state",
             )),
-            true => decode_typed(&response.manifest_json).map(Some),
-            false if response.manifest_json.is_empty() => Ok(None),
+            true => decode_typed(&response.state_json).map(Some),
+            false if response.state_json.is_empty() => Ok(None),
             false => Err(Status::data_loss(
-                "absent authorization realm returned a manifest",
+                "absent authorization realm returned state",
             )),
         }
     }
@@ -1431,7 +1473,7 @@ impl DataPeerTransport {
         target: NodeId,
         target_address: &str,
         scope: &AuthzScope,
-        expected: &AuthzRealmTransferManifest,
+        expected: &AuthzRealmState,
     ) -> Result<bool, Status> {
         let mut source_stream = self
             .client(source, source_address)?
@@ -1453,7 +1495,7 @@ impl DataPeerTransport {
                 require_response_schema(frame.schema_version)?;
                 if first {
                     let observed: AuthzRealmTransferManifest = decode_typed(&frame.manifest_json)?;
-                    if observed != expected
+                    if &observed.state() != &expected
                         || frame.offset != 0
                         || !frame.content.is_empty()
                         || frame.end

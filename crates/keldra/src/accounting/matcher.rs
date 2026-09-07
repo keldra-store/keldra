@@ -34,16 +34,6 @@ pub(crate) struct AccountingMatcherConfig {
     pub(crate) max_bytes: u64,
 }
 
-impl AccountingMatcherConfig {
-    pub(crate) fn new(max_buckets: usize, max_definitions: usize, max_bytes: u64) -> Option<Self> {
-        (max_buckets != 0 && max_definitions != 0 && max_bytes != 0).then_some(Self {
-            max_buckets,
-            max_definitions,
-            max_bytes,
-        })
-    }
-}
-
 impl Default for AccountingMatcherConfig {
     fn default() -> Self {
         Self {
@@ -543,7 +533,11 @@ mod tests {
 
     #[test]
     fn cache_eviction_obeys_shared_bucket_and_byte_bounds() {
-        let config = AccountingMatcherConfig::new(1, 10, 20).unwrap();
+        let config = AccountingMatcherConfig {
+            max_buckets: 1,
+            max_definitions: 10,
+            max_bytes: 20,
+        };
         let mut cache = MatcherCache::default();
         let routes = || MatcherRoutes {
             by_prefix: BTreeMap::new(),
@@ -567,7 +561,11 @@ mod tests {
 
     #[test]
     fn cache_eviction_obeys_the_shared_definition_bound() {
-        let config = AccountingMatcherConfig::new(10, 1, 1_024).unwrap();
+        let config = AccountingMatcherConfig {
+            max_buckets: 10,
+            max_definitions: 1,
+            max_bytes: 1_024,
+        };
         let routes = || MatcherRoutes {
             by_prefix: BTreeMap::new(),
             definition_count: 1,

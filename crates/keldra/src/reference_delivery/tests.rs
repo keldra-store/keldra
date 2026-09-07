@@ -6,9 +6,12 @@ use keldra_atomic_program::{ObjectPath, ObservedHead};
 use keldra_store::{
     BatchOperation, BlobReferenceState, BucketPolicy, DeleteRequest, Durability,
     LogicalRecordMutationContext, LogicalRecordValue, ObjectHeadChangeKind, ObjectKey,
-    ObjectMutationContext, PlacementLogId, Precondition, PreparedBundleHash,
-    ProgramBundleAuthority, ProgramHash, ProgramPathStage, PublishRequest, PutMode, PutRequest,
-    ReferenceDelta, StorageTenantId, StoreOptions, Version, VersionId, WatchRetention,
+    ObjectMutationContext, ObjectVersioning, PROGRAM_PATH_RESERVATION_FORMAT, PlacementLogId,
+    Precondition, PreparedBundleHash, ProgramBundleAuthority, ProgramGovernanceParticipant,
+    ProgramHash, ProgramObjectParticipant, ProgramParticipantIntent, ProgramPathCondition,
+    ProgramPathReservation, ProgramPathStage, ProgramReservation, ProgramReservationState,
+    PublishRequest, PutMode, PutRequest, ReferenceDelta, StorageTenantId, StoreOptions, Version,
+    VersionId, WatchRetention,
 };
 use tempfile::TempDir;
 
@@ -1412,17 +1415,28 @@ async fn program_proof_waits_for_nominated_executor_completion() {
     let payload = source.stage_blob(b"program payload").await.unwrap();
     let path = node_one_coordinator_path("managed/result");
     let stage = ProgramPathStage {
-        format: 2,
+        format: 1,
         begin_cursor: 41,
         bundle_hash: PreparedBundleHash([0x11; 32]),
         program_hash: ProgramHash([0x22; 32]),
-        authority: ProgramBundleAuthority::LegacyProgramOnly {
+        authority: ProgramBundleAuthority::StoredProgram {
             program_path_hash: [0x33; 32],
             program_hash: [0x22; 32],
         },
         participant_manifest_hash: [0x44; 32],
         tenant_id: 1,
         bucket_id: 1,
+        governance: ProgramGovernanceParticipant {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            tenant_id: 1,
+            bucket_id: 1,
+            policy: BucketPolicy {
+                program_only_prefixes: vec!["managed".into()],
+                ..BucketPolicy::default()
+            },
+            versioning: ObjectVersioning::Unversioned,
+        },
         path: ObjectPath::new("tenant", "bucket", path).unwrap(),
         expected: ObservedHead::NeverExisted,
         previous_version: None,
@@ -1435,6 +1449,39 @@ async fn program_proof_waits_for_nominated_executor_completion() {
             protected_link_descriptor: false,
         },
     };
+    let reservation = ProgramReservation::Object(ProgramPathReservation {
+        format: PROGRAM_PATH_RESERVATION_FORMAT,
+        begin_cursor: stage.begin_cursor,
+        invocation_id: [0x55; 32],
+        bundle_hash: stage.bundle_hash.0,
+        participant_manifest_hash: stage.participant_manifest_hash,
+        authority: stage.authority,
+        executor_node_id: 1,
+        nomination_log_index: 1,
+        placement: PlacementLogId { term: 1, index: 1 },
+        participant: ProgramObjectParticipant {
+            tenant_id: stage.tenant_id,
+            bucket_id: stage.bucket_id,
+            path: stage.path.clone(),
+            condition: ProgramPathCondition::Head(stage.expected.clone()),
+            alias_registry: None,
+            intent: ProgramParticipantIntent {
+                read: true,
+                put: true,
+                delete: false,
+            },
+        },
+        governance: stage.governance.clone(),
+        state: ProgramReservationState::Prepared,
+    });
+    source
+        .reserve_program_participant(&reservation)
+        .await
+        .unwrap();
+    source
+        .commit_program_participant(&reservation, 42)
+        .await
+        .unwrap();
     let finalized = source
         .coordinate_program_path_finalization(
             stage,
@@ -1477,7 +1524,13 @@ async fn program_proof_waits_for_nominated_executor_completion() {
     assert!(peers.applies.lock().expect("test apply lock").is_empty());
 
     stores.stores[&NodeId(2)]
-        .apply_program_path_finalization_replica(&finalized.mutation)
+        .apply_program_path_finalization_replica(
+            &finalized.mutation,
+            ObjectMutationContext {
+                active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                serving_fence_term: 1,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1548,16 +1601,16 @@ async fn one_of_one_exact_proof_is_committed() {
 }
 
 #[tokio::test]
-async fn one_node_proofless_object_event_is_already_applied_locally() {
+async fn one_node_proofless_object_event_is_rejected() {
     let stores = TestStores::open(&[1]).await;
     let source = stores.stores[&NodeId(1)].clone();
     source
         .put(PutRequest {
-            key: ObjectKey::new("tenant", "bucket", "legacy-inline").unwrap(),
-            bytes: b"legacy inline reference".to_vec(),
+            key: ObjectKey::new("tenant", "bucket", "proofless").unwrap(),
+            bytes: b"proofless reference".to_vec(),
             content_type: None,
             mode: PutMode::PutIfAbsent,
-            command_id: Some("legacy-inline".into()),
+            command_id: Some("proofless".into()),
             durability: Durability::Local,
         })
         .await
@@ -1570,7 +1623,7 @@ async fn one_node_proofless_object_event_is_already_applied_locally() {
         .find(|change| {
             matches!(
                 change,
-                LocalChange::ObjectHead(change) if change.exact_path == "legacy-inline"
+                LocalChange::ObjectHead(change) if change.exact_path == "proofless"
             )
         })
         .unwrap();
@@ -1588,9 +1641,9 @@ async fn one_node_proofless_object_event_is_already_applied_locally() {
     )
     .classify(source_id, &change)
     .await
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(result, ReferenceCommitDisposition::AlreadyAppliedLocally);
+    assert_eq!(result, "source reference proof is missing");
 
     let distributed_error = QuorumReferenceCommitAuthority::new(
         source,

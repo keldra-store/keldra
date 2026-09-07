@@ -1,8 +1,12 @@
+use keldra_atomic_program::{
+    AtomicParticipant, AtomicWriteBundle, CommandReceipt, StoredValue, VersionedWrite,
+};
 use keldra_store::{
     OBJECT_ALIAS_REGISTRY_FORMAT, OBJECT_MUTATION_FORMAT, ObjectAliasRegistry, ObjectAliasSnapshot,
-    PROGRAM_PATH_RESERVATION_FORMAT, ProgramAliasRegistryCondition, ProgramAliasRegistryStage,
-    ProgramObjectParticipant, ProgramParticipantIntent, ProgramPathCondition,
-    ProgramPathReservation, ProgramReservation, ProgramReservationState,
+    PROGRAM_PATH_RESERVATION_FORMAT, ProgramAliasBinding, ProgramAliasRegistryCondition,
+    ProgramAliasRegistryStage, ProgramObjectParticipant, ProgramParticipantIntent,
+    ProgramPathCondition, ProgramPathReservation, ProgramReservation, ProgramReservationState,
+    SealedAtomicBatchPublication, path_stage_from_prepared,
 };
 
 use super::*;
@@ -57,6 +61,10 @@ async fn alias_proof_fixture() -> (ProofFixture, Vec<LocalChange>, String) {
     });
     mutation.stamp.mutation_fingerprint = mutation.computed_fingerprint();
     proof.mutation_fingerprint = mutation.stamp.mutation_fingerprint;
+    let LocalChange::ObjectHead(primary) = &mut proof.change else {
+        panic!("canonical replacement proof changed event kind");
+    };
+    primary.accounting_transition = None;
     source
         .delete_reference_proof_if_matches(&original)
         .await
@@ -90,6 +98,110 @@ async fn alias_proof_fixture() -> (ProofFixture, Vec<LocalChange>, String) {
             source,
             source_id,
             change,
+            proof,
+        },
+        alias_changes,
+        canonical_path,
+    )
+}
+
+async fn retained_alias_proof_fixture() -> (ProofFixture, Vec<LocalChange>, String) {
+    let stores = TestStores::open(&[1]).await;
+    let source = stores.stores[&NodeId(1)].clone();
+    source
+        .enable_bucket_versioning("tenant", "bucket")
+        .await
+        .expect("enable versioning for retained deletion");
+    let canonical_path = node_one_coordinator_path("retained-alias-proof");
+    let key = ObjectKey::new("tenant", "bucket", &canonical_path).expect("canonical test key");
+    publish(
+        &source,
+        &canonical_path,
+        b"retained predecessor",
+        "retained-alias-predecessor",
+    )
+    .await;
+    let predecessor = source
+        .current_version_metadata(&key)
+        .await
+        .unwrap()
+        .expect("retained predecessor");
+    publish(
+        &source,
+        &canonical_path,
+        b"retained current",
+        "retained-alias-current",
+    )
+    .await;
+
+    let coordinated = source
+        .coordinate_retained_version_delete(
+            &key,
+            predecessor.id,
+            keldra_store::ObjectMutationGovernance {
+                tenant_id: 1,
+                bucket_id: 1,
+                versioning: ObjectVersioning::Enabled,
+                policy: BucketPolicy::default(),
+            },
+            ObjectMutationContext {
+                active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                serving_fence_term: 1,
+            },
+        )
+        .await
+        .expect("coordinate retained deletion");
+    let mutation = coordinated
+        .mutation
+        .expect("new retained deletion mutation");
+    let source_id = mutation.stamp.source_id;
+    let original = source
+        .read_reference_proof(source_id, mutation.stamp.source_journal_position)
+        .unwrap()
+        .expect("canonical retained deletion proof");
+    let mut proof = original.clone();
+    let aliases = node_two_coordinator_paths("aliases/retained-recovery", 2);
+    let ReferenceProofMutation::RetainedVersionDelete(mutation) = &mut proof.mutation else {
+        panic!("retained deletion must have a typed retained proof");
+    };
+    mutation.alias_paths = aliases.clone();
+    mutation.stamp.mutation_fingerprint = mutation.computed_fingerprint();
+    proof.mutation_fingerprint = mutation.stamp.mutation_fingerprint;
+    let primary = {
+        let LocalChange::RetainedVersionDeleted(primary) = &mut proof.change else {
+            panic!("retained deletion proof changed event kind");
+        };
+        primary.accounting_transition = None;
+        primary.clone()
+    };
+    source
+        .delete_reference_proof_if_matches(&original)
+        .await
+        .unwrap();
+    source
+        .install_quorum_reconciled_reference_proof(&proof)
+        .await
+        .unwrap();
+
+    let alias_changes = aliases
+        .iter()
+        .enumerate()
+        .map(|(index, alias)| {
+            let mut alias_change = primary.clone();
+            alias_change.offset = primary.offset + 1 + index as u64;
+            alias_change.exact_path = alias.clone();
+            alias_change.canonical_path = Some(canonical_path.clone());
+            alias_change.reference_deltas.clear();
+            alias_change.accounting_transition = None;
+            LocalChange::RetainedVersionDeleted(alias_change)
+        })
+        .collect();
+    (
+        ProofFixture {
+            _stores: stores,
+            source,
+            source_id,
+            change: proof.change.clone(),
             proof,
         },
         alias_changes,
@@ -132,6 +244,14 @@ async fn install_alias_registry(store: &Store, canonical_path: &str, aliases: &[
                 put: true,
                 delete: false,
             },
+        },
+        governance: ProgramGovernanceParticipant {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            tenant_id: 1,
+            bucket_id: 1,
+            policy: BucketPolicy::default(),
+            versioning: ObjectVersioning::Unversioned,
         },
         state: ProgramReservationState::Prepared,
     });
@@ -183,6 +303,29 @@ fn object_mutation(proof: &ReferenceProof) -> &ObjectMutation {
 #[tokio::test]
 async fn alias_events_use_the_exact_canonical_primary_quorum_proof() {
     let (fixture, aliases, canonical_path) = alias_proof_fixture().await;
+    let peers = Arc::new(TestProofPeers::default());
+    peers.respond(NodeId(2), Ok(Some(fixture.proof.clone())));
+    let authority = fixture.authority(TestPlacement::new(placement(&[1, 2], 9)), peers.clone());
+
+    for alias in &aliases {
+        assert_eq!(
+            authority.classify(fixture.source_id, alias).await.unwrap(),
+            ReferenceCommitDisposition::CommittedOrAncestor
+        );
+    }
+
+    let reads = peers.reads.lock().unwrap();
+    assert_eq!(reads.len(), aliases.len());
+    for (_, _, request) in reads.iter() {
+        assert_eq!(request.offset, fixture.proof.offset());
+        assert_eq!(request.exact_path, canonical_path);
+        assert_eq!(request.placement_fence.index, 9);
+    }
+}
+
+#[tokio::test]
+async fn retained_alias_wakes_use_the_exact_canonical_delete_quorum_proof() {
+    let (fixture, aliases, canonical_path) = retained_alias_proof_fixture().await;
     let peers = Arc::new(TestProofPeers::default());
     peers.respond(NodeId(2), Ok(Some(fixture.proof.clone())));
     let authority = fixture.authority(TestPlacement::new(placement(&[1, 2], 9)), peers.clone());
@@ -386,4 +529,267 @@ async fn restart_settles_real_alias_expansion_across_page_boundaries() {
     let recovered = reopened.local_watch_status().unwrap();
     assert_eq!(recovered.settled_through, recovered.tail);
     assert!(recovered.settled_through >= alias_events[1].offset);
+}
+
+#[tokio::test]
+async fn restart_settles_atomic_publication_aliases_across_page_boundaries() {
+    let directories = (0..3)
+        .map(|_| tempfile::tempdir().expect("test directory"))
+        .collect::<Vec<_>>();
+    let mut stores = open_paths(&[1, 2, 3], &directories, None).await;
+    let source = stores[&NodeId(1)].clone();
+    let canonical_path = node_one_coordinator_path("canonical/atomic-alias");
+    let aliases = node_two_coordinator_paths("aliases/atomic-alias", 2);
+    let canonical_key =
+        ObjectKey::new("tenant", "bucket", &canonical_path).expect("canonical test key");
+
+    publish(
+        &source,
+        &canonical_path,
+        b"atomic alias predecessor",
+        "atomic-alias-predecessor",
+    )
+    .await;
+    let source_id = source.local_watch_status().unwrap().source_id;
+    let initial = source
+        .scan_local_changes(0, 32)
+        .unwrap()
+        .into_iter()
+        .find(|change| {
+            matches!(change, LocalChange::ObjectHead(head) if head.exact_path == canonical_path)
+        })
+        .expect("initial canonical journal event");
+    let initial_proof = source
+        .read_reference_proof(source_id, initial.offset())
+        .unwrap()
+        .expect("initial canonical proof");
+    for node in [NodeId(2), NodeId(3)] {
+        stores[&node]
+            .apply_object_mutation_replica(object_mutation(&initial_proof))
+            .await
+            .expect("replicate canonical predecessor");
+    }
+    for store in stores.values() {
+        install_alias_registry(store, &canonical_path, &aliases).await;
+    }
+
+    let predecessor = source
+        .current_version_metadata(&canonical_key)
+        .await
+        .unwrap()
+        .expect("canonical predecessor metadata");
+    let registry = source
+        .object_alias_registry(1, 1, &canonical_path)
+        .unwrap()
+        .expect("canonical alias registry");
+    let canonical = ObjectPath::new("tenant", "bucket", &canonical_path).unwrap();
+    let expected = ObservedHead::Version {
+        version: predecessor.id.0.to_string(),
+    };
+    let bundle = AtomicWriteBundle {
+        participants: vec![AtomicParticipant {
+            path: canonical.clone(),
+            expected,
+            write: Some(VersionedWrite {
+                value: Some(StoredValue::Opaque(b"atomic alias replacement".to_vec())),
+                content_type: Some("application/octet-stream".into()),
+            }),
+        }],
+        receipt: CommandReceipt {
+            program_path_hash: [0x51; 32],
+            command_id: "atomic-alias-publication".into(),
+            input_fingerprint: hex::encode([0x52; 32]),
+            outputs: BTreeMap::new(),
+        },
+    };
+    let governance: BTreeMap<(String, String), ProgramGovernanceParticipant> = BTreeMap::from([(
+        ("tenant".into(), "bucket".into()),
+        ProgramGovernanceParticipant {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            tenant_id: 1,
+            bucket_id: 1,
+            policy: BucketPolicy::default(),
+            versioning: ObjectVersioning::Unversioned,
+        },
+    )]);
+    let previous_versions = BTreeMap::from([(canonical.clone(), predecessor.clone())]);
+    let alias_bindings = vec![ProgramAliasBinding {
+        requested_path: canonical.clone(),
+        canonical_path: canonical,
+        descriptor_version: None,
+        descriptor_bytes: None,
+        canonical_version: Some(predecessor),
+        alias_registry: Some(registry),
+    }];
+    let prepared = source
+        .prepare_distributed_program_bundle_with_aliases(
+            ProgramHash([0x53; 32]),
+            &bundle,
+            &previous_versions,
+            &alias_bindings,
+            &governance,
+        )
+        .await
+        .expect("prepare alias-aware atomic bundle");
+    let record = source
+        .prepared_program_record(&prepared)
+        .await
+        .expect("load prepared atomic record");
+    let begin_cursor = 71;
+    let commit_cursor = 72;
+    let stage = path_stage_from_prepared(
+        &prepared,
+        &record,
+        record.writes().first().expect("one prepared write"),
+        begin_cursor,
+    )
+    .expect("seal atomic path stage");
+    let context = ObjectMutationContext {
+        active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+        serving_fence_term: 1,
+    };
+    let reservations = record
+        .reservations(
+            begin_cursor,
+            [0x54; 32],
+            prepared.bundle.hash,
+            1,
+            1,
+            context.active_placement_log_id,
+        )
+        .expect("seal atomic participant reservations");
+    for store in stores.values() {
+        for reservation in &reservations {
+            store
+                .reserve_program_participant(reservation)
+                .await
+                .expect("reserve atomic participant");
+            store
+                .commit_program_participant(reservation, commit_cursor)
+                .await
+                .expect("commit atomic participant");
+        }
+    }
+    let finalized = source
+        .coordinate_program_path_finalization(stage.clone(), commit_cursor, context)
+        .await
+        .expect("finalize atomic canonical path")
+        .mutation;
+    for node in [NodeId(2), NodeId(3)] {
+        stores[&node]
+            .apply_program_path_finalization_replica(&finalized, context)
+            .await
+            .expect("replicate atomic canonical finalization");
+    }
+    let publication = SealedAtomicBatchPublication::from_prepared(
+        commit_cursor,
+        prepared.bundle,
+        &record,
+        &[stage],
+        &[finalized],
+        &[],
+    )
+    .expect("seal complete atomic publication");
+    assert!(
+        source
+            .publish_atomic_batch(publication)
+            .await
+            .expect("publish complete atomic batch")
+    );
+
+    let changes = source.scan_local_changes(0, 64).unwrap();
+    let alias_events = changes
+        .iter()
+        .filter_map(|change| match change {
+            LocalChange::ObjectHead(head)
+                if head.program_commit_cursor == Some(commit_cursor)
+                    && head.canonical_path.as_deref() == Some(canonical_path.as_str()) =>
+            {
+                Some(head)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        alias_events
+            .iter()
+            .map(|change| change.exact_path.as_str())
+            .collect::<Vec<_>>(),
+        aliases.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    let publication = changes
+        .iter()
+        .find_map(|change| match change {
+            LocalChange::AtomicBatchPublished(batch) if batch.cursor == commit_cursor => {
+                Some(batch)
+            }
+            _ => None,
+        })
+        .expect("complete atomic publication journal event");
+    assert_eq!(publication.offset, alias_events[1].offset + 1);
+    assert!(matches!(
+        source.read_local_change(alias_events[0].offset).unwrap(),
+        Some(LocalChange::ObjectHead(_))
+    ));
+    assert!(matches!(
+        source.read_local_change(publication.offset).unwrap(),
+        Some(LocalChange::AtomicBatchPublished(_))
+    ));
+    let before_restart = source.local_watch_status().unwrap();
+    assert!(before_restart.settled_through < alias_events[0].offset);
+    let first_alias_offset = alias_events[0].offset;
+    let publication_offset = publication.offset;
+
+    drop(source);
+    drop(stores.remove(&NodeId(1)).expect("source store"));
+    let reopened = Store::open(StoreOptions::new(directories[0].path(), 1))
+        .await
+        .expect("reopen source store");
+    stores.insert(NodeId(1), reopened.clone());
+    let stores = Arc::new(stores);
+    let peers = Arc::new(StoreMetadataPeers::new(stores.clone()));
+    let current = TestPlacement::new(placement(&[1, 2, 3], 1));
+    let authority = Arc::new(QuorumReferenceCommitAuthority::new(
+        reopened.clone(),
+        Arc::new(current.clone()),
+        peers,
+    ));
+    let reopened_alias = reopened
+        .read_local_change(first_alias_offset)
+        .unwrap()
+        .expect("reopened atomic alias event");
+    assert_eq!(
+        authority
+            .classify(source_id, &reopened_alias)
+            .await
+            .unwrap(),
+        ReferenceCommitDisposition::CommittedOrAncestor
+    );
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let destinations = Arc::new(TestDestinations::new(stores.clone(), order.clone()));
+    let payloads = Arc::new(TestPayloads::new(reopened.clone(), stores, order));
+    let runner = ReferenceDelivery::new(
+        reopened.clone(),
+        Arc::new(current),
+        authority,
+        destinations,
+        payloads,
+        ErasureProfile::default(),
+    )
+    .with_page_size(1);
+
+    for _ in 0..64 {
+        let progress = runner
+            .deliver_once()
+            .await
+            .expect("recover one bounded atomic journal page");
+        let status = reopened.local_watch_status().unwrap();
+        if status.settled_through == status.tail && progress.reference_safe_through == status.tail {
+            break;
+        }
+    }
+    let recovered = reopened.local_watch_status().unwrap();
+    assert_eq!(recovered.settled_through, recovered.tail);
+    assert!(recovered.settled_through >= publication_offset);
 }

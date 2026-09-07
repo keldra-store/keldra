@@ -7,6 +7,7 @@ use std::marker::PhantomData;
 
 use jiff::Timestamp;
 use jiff::fmt::strtime::{self, BrokenDownTime};
+use keldra_api::typed_json::validate_typed_json_specification;
 use keldra_api::v1::index_field::FieldType;
 use keldra_api::v1::index_specification::Specification;
 use keldra_api::v1::{
@@ -865,51 +866,54 @@ fn validate_definition(
         return Err(IndexDefinitionError::InvalidCommandId);
     }
 
+    let specification = TypedJsonIndexSpec {
+        fields: builder.fields.clone(),
+        physical_order: builder.physical_order.clone(),
+    };
+    if validate_typed_json_specification(&specification).is_err() {
+        // Preserve the SDK's established diagnostic variants while the shared
+        // API validator remains the sole accept/reject authority.
+        return Err(diagnose_invalid_specification(&specification));
+    }
+    Ok(())
+}
+
+fn diagnose_invalid_specification(specification: &TypedJsonIndexSpec) -> IndexDefinitionError {
     let mut names = BTreeSet::new();
-    for field in &builder.fields {
+    for field in &specification.fields {
         if field.name.is_empty() || field.name.contains('\0') {
-            return Err(IndexDefinitionError::InvalidFieldName(field.name.clone()));
+            return IndexDefinitionError::InvalidFieldName(field.name.clone());
         }
         if !field.json_pointer.is_empty()
             && (!field.json_pointer.starts_with('/') || field.json_pointer.contains('\0'))
         {
-            return Err(IndexDefinitionError::InvalidJsonPointer(
-                field.json_pointer.clone(),
-            ));
+            return IndexDefinitionError::InvalidJsonPointer(field.json_pointer.clone());
         }
         if !names.insert(field.name.as_str()) {
-            return Err(IndexDefinitionError::DuplicateFieldName(field.name.clone()));
+            return IndexDefinitionError::DuplicateFieldName(field.name.clone());
         }
     }
-
     let mut ordered = BTreeSet::new();
-    for order in &builder.physical_order {
+    for order in &specification.physical_order {
         if !ordered.insert(order.field.as_str()) {
-            return Err(IndexDefinitionError::DuplicatePhysicalOrder(
-                order.field.clone(),
-            ));
+            return IndexDefinitionError::DuplicatePhysicalOrder(order.field.clone());
         }
-        if !names.contains(order.field.as_str()) {
-            return Err(IndexDefinitionError::UnknownPhysicalOrderField(
-                order.field.clone(),
-            ));
-        }
-        let field = builder
+        let Some(field) = specification
             .fields
             .iter()
             .find(|field| field.name == order.field)
-            .expect("field-name set and field list agree");
+        else {
+            return IndexDefinitionError::UnknownPhysicalOrderField(order.field.clone());
+        };
         if field.cardinality != IndexFieldCardinality::Single as i32
             || !field
                 .capabilities
                 .contains(&(IndexFieldCapability::Order as i32))
         {
-            return Err(IndexDefinitionError::UnorderablePhysicalOrderField(
-                order.field.clone(),
-            ));
+            return IndexDefinitionError::UnorderablePhysicalOrderField(order.field.clone());
         }
     }
-    Ok(())
+    IndexDefinitionError::InvalidFieldName("invalid Typed JSON protobuf contract".into())
 }
 
 #[cfg(test)]

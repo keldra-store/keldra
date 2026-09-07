@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -8,23 +8,26 @@ use keldra_atomic_program::{
     ProgramSnapshot, StateReader, StoredValue, VersionedDocument,
 };
 use keldra_consensus::{
-    ATOMIC_REPLAY_RETENTION_MILLIS, AtomicBundleAuthority, BeginBatch, BeginResult, BundleHash,
-    BundleRef, Command, CommitPreparedBatch, CommittedInvocation, DurabilityClass,
-    DurabilityEvidenceHash, ExecutorNomination, InvocationFingerprint, NodeId,
-    ParticipantManifestHash, PreparedBatch,
+    ATOMIC_REPLAY_RETENTION_MILLIS, AtomicBundleAuthority, BeginBatch, BeginResult, BundleRef,
+    Command, CommitPreparedBatch, CommittedInvocation, DurabilityClass, DurabilityEvidenceHash,
+    ExecutorNomination, InvocationFingerprint, NodeId, ParticipantManifestHash, PreparedBatch,
 };
 use keldra_store::{
     BlobRef, BuiltInObjectTransactionPlan, ObjectMutationContext, PlacementLogId,
     PreparedBundleHash, PreparedBundleRef, PreparedProgramBundle, PreparedProgramRecord,
-    ProgramAliasBinding, ProgramAliasRegistryMutation, ProgramAliasRegistryStage, ProgramHash,
-    ProgramPathMutation, ProgramPathStage, ProgramReservation, SealedAtomicBatchPublication, Store,
-    Version, alias_registry_stages_from_prepared, path_stage_from_prepared,
+    ProgramAliasBinding, ProgramAliasRegistryMutation, ProgramAliasRegistryStage,
+    ProgramGovernanceParticipant, ProgramHash, ProgramPathMutation, ProgramPathStage,
+    ProgramReservation, SealedAtomicBatchPublication, Store, Version,
+    alias_registry_stages_from_prepared, path_stage_from_prepared,
 };
 use tonic::Status;
+
+const MAX_PARALLEL_PROGRAM_IO: usize = 8;
 
 use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::ClusterPeerTransport;
 use crate::logical_name_resolution::LogicalNameResolver;
+use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::object_distribution::ObjectDistribution;
 
 impl super::ProgramCoordinator {
@@ -89,7 +92,6 @@ impl super::ProgramCoordinator {
             durability_class,
             super::ProgramRuntimeTopology::Clustered,
         )?;
-        self.require_generalized_atomic_paths()?;
         let nomination = self.current_nomination()?;
         let distributed = self.distributed()?.clone();
         let expected_hash = ProgramHash(expected_program_hash);
@@ -192,10 +194,9 @@ impl super::ProgramCoordinator {
                 invocation_id: consensus_invocation_id,
                 input_fingerprint: InvocationFingerprint(fingerprint),
                 bundle_ref: BundleRef {
-                    hash: prepared.prepared.bundle.hash,
+                    hash: prepared.prepared.bundle.hash.0,
                     length: prepared.prepared.bundle.length,
                 },
-                bundle_hash: BundleHash(prepared.prepared.hash.0),
                 durability_class: DurabilityClass(
                     keldra_store::ProgramDurabilityClassHash::for_class(durability_class).0,
                 ),
@@ -238,7 +239,7 @@ impl super::ProgramCoordinator {
             .reservations(
                 prepared_batch.begin_cursor,
                 consensus_invocation_id.0,
-                prepared.prepared.hash,
+                prepared.prepared.bundle.hash,
                 self.node.0,
                 nomination.nomination_log_index,
                 distributed
@@ -292,7 +293,6 @@ impl super::ProgramCoordinator {
                 SealedAtomicBatchPublication::from_prepared(
                     committed.invocation.committed_batch.commit_cursor,
                     prepared.prepared.bundle,
-                    prepared.prepared.hash,
                     &prepared.record,
                     &stages.paths,
                     &finalized.paths,
@@ -358,7 +358,7 @@ impl super::ProgramCoordinator {
                 .reservations(
                     prepared_batch.begin_cursor,
                     prepared_batch.request.invocation_id.0,
-                    prepared.hash,
+                    prepared.bundle.hash,
                     nomination.executor.0,
                     nomination.nomination_log_index,
                     distributed
@@ -422,7 +422,7 @@ impl super::ProgramCoordinator {
                 .reservations(
                     invocation.committed_batch.begin_cursor,
                     invocation.invocation_id.0,
-                    PreparedBundleHash(invocation.committed_batch.bundle_hash.0),
+                    PreparedBundleHash(invocation.committed_batch.bundle_ref.hash),
                     nomination.executor.0,
                     nomination.nomination_log_index,
                     distributed
@@ -455,10 +455,9 @@ impl super::ProgramCoordinator {
                     SealedAtomicBatchPublication::from_prepared(
                         invocation.committed_batch.commit_cursor,
                         PreparedBundleRef {
-                            hash: invocation.committed_batch.bundle_ref.hash,
+                            hash: PreparedBundleHash(invocation.committed_batch.bundle_ref.hash),
                             length: invocation.committed_batch.bundle_ref.length,
                         },
-                        PreparedBundleHash(invocation.committed_batch.bundle_hash.0),
                         &record,
                         &stages.paths,
                         &finalized.paths,
@@ -511,6 +510,7 @@ pub(super) struct DistributedPrograms {
     objects: ObjectDistribution,
     peers: ClusterPeerTransport,
     names: LogicalNameResolver,
+    governance: crate::bucket_governance::BucketGovernance,
 }
 
 pub(super) struct PreparedDistributedInvocation {
@@ -549,6 +549,7 @@ impl DistributedPrograms {
             .prepared_program_record(&prepared)
             .await
             .map_err(super::program_store_status)?;
+        let mut blobs = Vec::new();
         for write in record.writes() {
             if let Some(reference) = write.version().blob.as_ref() {
                 let staged_source = plan.writes.iter().find_map(|planned| {
@@ -558,14 +559,7 @@ impl DistributedPrograms {
                     Some(keldra_store::BuiltInWritePayload::StagedReference {
                         upload_source_node_id,
                         ..
-                    }) => {
-                        self.objects
-                            .prepare_program_blob_from_source(
-                                reference,
-                                NodeId(*upload_source_node_id),
-                            )
-                            .await?;
-                    }
+                    }) => blobs.push((reference.clone(), Some(NodeId(*upload_source_node_id)))),
                     // The exact retained source reservation keeps the already
                     // published same-bucket payload alive until the
                     // destination reference increment commits.
@@ -574,13 +568,36 @@ impl DistributedPrograms {
                         keldra_store::BuiltInWritePayload::Inline { .. }
                         | keldra_store::BuiltInWritePayload::Tombstone,
                     )
-                    | None => self.objects.prepare_program_blob(reference).await?,
+                    | None => blobs.push((reference.clone(), None)),
                 }
             }
         }
-        self.objects
-            .prepare_program_blob(&BlobRef::from(prepared.bundle))
-            .await?;
+        blobs.push((BlobRef::from(prepared.bundle), None));
+        let mut blobs = blobs.into_iter();
+        let mut preparations = tokio::task::JoinSet::new();
+        loop {
+            while preparations.len() < MAX_PARALLEL_PROGRAM_IO {
+                let Some((reference, source)) = blobs.next() else {
+                    break;
+                };
+                let objects = self.objects.clone();
+                preparations.spawn(async move {
+                    if let Some(source) = source {
+                        objects
+                            .prepare_program_blob_from_source(&reference, source)
+                            .await
+                    } else {
+                        objects.prepare_program_blob(&reference).await
+                    }
+                });
+            }
+            let Some(completed) = preparations.join_next().await else {
+                break;
+            };
+            completed.map_err(|error| {
+                Status::internal(format!("built-in blob preparation task failed: {error}"))
+            })??;
+        }
         prepared
             .attest_remote_durability(durability_class)
             .map_err(super::program_store_status)?;
@@ -597,27 +614,21 @@ impl DistributedPrograms {
             AtomicBundleAuthority::BuiltInObjectTransaction { .. } => {
                 keldra_consensus::ProgramHash([0; 32])
             }
-            AtomicBundleAuthority::LegacyProgramOnly { .. } => {
-                return Err(Status::data_loss(
-                    "legacy authority cannot own a preparing transaction",
-                ));
-            }
         };
         let bundle = PreparedBundleRef {
-            hash: batch.bundle_ref.hash,
+            hash: PreparedBundleHash(batch.bundle_ref.hash),
             length: batch.bundle_ref.length,
         };
         let bytes = self.reader.read_blob_bytes(&BlobRef::from(bundle)).await?;
         let record = PreparedProgramRecord::decode_distributed(
             &bytes,
             bundle,
-            PreparedBundleHash(batch.bundle_hash.0),
             ProgramHash(decision_program_hash.0),
         )
         .map_err(super::program_store_status)?;
         if record.authority() != super::store_bundle_authority(batch.authority)
             || record
-                .participant_manifest_hash(PreparedBundleHash(batch.bundle_hash.0))
+                .participant_manifest_hash()
                 .map_err(super::program_store_status)?
                 != batch.participant_manifest_hash.0
         {
@@ -627,7 +638,6 @@ impl DistributedPrograms {
         }
         Ok((
             PreparedProgramBundle {
-                hash: PreparedBundleHash(batch.bundle_hash.0),
                 source_bundle_hash: record.source_bundle_hash(),
                 program_hash: ProgramHash(decision_program_hash.0),
                 authority: record.authority(),
@@ -656,6 +666,7 @@ impl DistributedPrograms {
         objects: ObjectDistribution,
         peers: ClusterPeerTransport,
         names: LogicalNameResolver,
+        governance: crate::bucket_governance::BucketGovernance,
     ) -> Self {
         Self {
             local_node,
@@ -664,6 +675,7 @@ impl DistributedPrograms {
             objects,
             peers,
             names,
+            governance,
         }
     }
 
@@ -907,6 +919,45 @@ impl DistributedPrograms {
             .await
             .map_err(super::engine_status)?;
         let previous = evaluator.previous_versions()?;
+        let mut buckets = BTreeSet::new();
+        for precondition in &lease.bundle().participants {
+            buckets.insert((
+                precondition.path.tenant.clone(),
+                precondition.path.bucket.clone(),
+            ));
+        }
+        let mut governance = BTreeMap::new();
+        let mut buckets = buckets.into_iter();
+        let mut resolutions = tokio::task::JoinSet::new();
+        loop {
+            while resolutions.len() < MAX_PARALLEL_PROGRAM_IO {
+                let Some((tenant, bucket)) = buckets.next() else {
+                    break;
+                };
+                let resolver = self.governance.clone();
+                resolutions.spawn(async move {
+                    let resolved = resolver.resolve(&tenant, &bucket).await?;
+                    Ok::<_, Status>((tenant, bucket, resolved))
+                });
+            }
+            let Some(completed) = resolutions.join_next().await else {
+                break;
+            };
+            let (tenant, bucket, resolved) = completed.map_err(|error| {
+                Status::internal(format!("program governance task failed: {error}"))
+            })??;
+            governance.insert(
+                (tenant.clone(), bucket.clone()),
+                ProgramGovernanceParticipant {
+                    tenant,
+                    bucket,
+                    tenant_id: resolved.tenant_id,
+                    bucket_id: resolved.bucket_id,
+                    policy: resolved.policy,
+                    versioning: resolved.versioning,
+                },
+            );
+        }
         let mut prepared = self
             .store
             .prepare_distributed_program_bundle_with_aliases(
@@ -914,6 +965,7 @@ impl DistributedPrograms {
                 lease.bundle(),
                 &previous,
                 alias_bindings,
+                &governance,
             )
             .await
             .map_err(super::program_store_status)?;
@@ -923,14 +975,27 @@ impl DistributedPrograms {
             .await
             .map_err(super::program_store_status)?;
 
-        for write in record.writes() {
-            if let Some(reference) = write.version().blob.as_ref() {
-                self.objects.prepare_program_blob(reference).await?;
+        let mut blobs = record
+            .writes()
+            .iter()
+            .filter_map(|write| write.version().blob.clone())
+            .collect::<Vec<_>>();
+        blobs.push(BlobRef::from(prepared.bundle));
+        let mut blobs = blobs.into_iter();
+        let mut preparations = tokio::task::JoinSet::new();
+        loop {
+            while preparations.len() < MAX_PARALLEL_PROGRAM_IO {
+                let Some(reference) = blobs.next() else { break };
+                let objects = self.objects.clone();
+                preparations.spawn(async move { objects.prepare_program_blob(&reference).await });
             }
+            let Some(completed) = preparations.join_next().await else {
+                break;
+            };
+            completed.map_err(|error| {
+                Status::internal(format!("program blob preparation task failed: {error}"))
+            })??;
         }
-        self.objects
-            .prepare_program_blob(&BlobRef::from(prepared.bundle))
-            .await?;
         prepared
             .attest_remote_durability(durability_class)
             .map_err(super::program_store_status)?;
@@ -952,17 +1017,25 @@ impl DistributedPrograms {
     ) -> Result<DistributedProgramStages, Status> {
         let mut stages = Vec::with_capacity(record.writes().len());
         for write in record.writes() {
-            let (tenant_id, bucket_id) = self
-                .names
-                .resolve_bucket_ids(&write.path().tenant, &write.path().bucket)
-                .await?;
             stages.push(
-                path_stage_from_prepared(prepared, write, begin_cursor, tenant_id, bucket_id)
+                path_stage_from_prepared(prepared, record, write, begin_cursor)
                     .map_err(super::program_store_status)?,
             );
         }
-        for stage in &stages {
-            self.stage_path(stage, nomination, budget).await?;
+        let mut pending = stages.iter().cloned();
+        let mut staging = tokio::task::JoinSet::new();
+        loop {
+            while staging.len() < MAX_PARALLEL_PROGRAM_IO {
+                let Some(stage) = pending.next() else { break };
+                let programs = self.clone();
+                staging.spawn(async move { programs.stage_path(&stage, nomination, budget).await });
+            }
+            let Some(completed) = staging.join_next().await else {
+                break;
+            };
+            completed.map_err(|error| {
+                Status::internal(format!("program path staging task failed: {error}"))
+            })??;
         }
         Ok(DistributedProgramStages {
             paths: stages,
@@ -985,26 +1058,51 @@ impl DistributedPrograms {
         )?;
         let expected = stage.blob_ref().map_err(super::program_store_status)?;
         let mut durable = Vec::new();
-        for node in group.replicas().iter().copied() {
-            let result = if node == self.local_node {
-                self.store
-                    .persist_program_path_stage(stage)
-                    .await
-                    .map_err(super::program_store_status)
-            } else {
-                let address = placement.address(node).ok_or_else(|| {
-                    Status::unavailable(format!("ACTIVE node {} has no peer address", node.0))
-                })?;
-                self.peers
-                    .stage_program_path(
-                        node,
-                        &address.0,
-                        nomination.nomination_log_index,
-                        stage,
-                        budget,
-                    )
-                    .await
+        let mut pending = group.replicas().iter().copied();
+        let mut operations = tokio::task::JoinSet::new();
+        loop {
+            while operations.len() < MAX_PARALLEL_PROGRAM_IO {
+                let Some(node) = pending.next() else { break };
+                let programs = self.clone();
+                let stage = stage.clone();
+                let address = (node != self.local_node)
+                    .then(|| placement.address(node).cloned())
+                    .flatten()
+                    .map(|address| address.0);
+                operations.spawn(async move {
+                    let result = if node == programs.local_node {
+                        programs
+                            .store
+                            .persist_program_path_stage(&stage)
+                            .await
+                            .map_err(super::program_store_status)
+                    } else {
+                        let address = address.ok_or_else(|| {
+                            Status::unavailable(format!(
+                                "ACTIVE node {} has no peer address",
+                                node.0
+                            ))
+                        })?;
+                        programs
+                            .peers
+                            .stage_program_path(
+                                node,
+                                &address,
+                                nomination.nomination_log_index,
+                                &stage,
+                                budget,
+                            )
+                            .await
+                    };
+                    Ok::<_, Status>((node, result))
+                });
+            }
+            let Some(completed) = operations.join_next().await else {
+                break;
             };
+            let (node, result) = completed.map_err(|error| {
+                Status::internal(format!("program stage task failed: {error}"))
+            })??;
             match result {
                 Ok(reference) if reference == expected => durable.push(node),
                 Ok(_) => tracing::warn!(node_id = node.0, "program stage identity mismatch"),
@@ -1090,75 +1188,103 @@ impl DistributedPrograms {
         budget: Duration,
     ) -> Result<(), Status> {
         let placement = self.objects.current_program_placement()?;
-        let (tenant_id, bucket_id) = reservation.stable_bucket_ids();
-        let path = reservation.path();
-        let group = self
-            .objects
-            .program_replica_group(tenant_id, bucket_id, &path.path)?;
+        let group = reservation_group(&placement, reservation)?;
         let mut acknowledged = Vec::new();
         let mut first_terminal_error = None;
         let mut terminal_rejections = 0_usize;
-        for node in group.replicas().iter().copied() {
-            let result = if node == self.local_node {
-                match commit_or_release {
-                    None => self.store.reserve_program_participant(reservation).await,
-                    Some(Some(cursor)) => self
-                        .store
-                        .commit_program_participant(reservation, cursor)
-                        .await
-                        .map(|_| ()),
-                    Some(None) => {
-                        self.store
-                            .release_program_participant(reservation, finalized_commit_cursor)
-                            .await
-                    }
-                }
-                .map_err(super::mutation_status)
-            } else {
-                let address = placement.address(node).ok_or_else(|| {
-                    Status::unavailable(format!(
-                        "ACTIVE reservation replica {} has no peer address",
-                        node.0
-                    ))
-                })?;
-                match commit_or_release {
-                    None => {
-                        self.peers
-                            .reserve_program_participant(
-                                node,
-                                &address.0,
-                                nomination.nomination_log_index,
-                                reservation,
-                                budget,
-                            )
-                            .await
-                    }
-                    Some(Some(cursor)) => {
-                        self.peers
-                            .commit_program_participant(
-                                node,
-                                &address.0,
-                                nomination.nomination_log_index,
-                                cursor,
-                                reservation,
-                                budget,
-                            )
-                            .await
-                    }
-                    Some(None) => {
-                        self.peers
-                            .release_program_participant(
-                                node,
-                                &address.0,
-                                nomination.nomination_log_index,
-                                finalized_commit_cursor,
-                                reservation,
-                                budget,
-                            )
-                            .await
-                    }
-                }
+        let mut pending = group.replicas().iter().copied();
+        let mut operations = tokio::task::JoinSet::new();
+        loop {
+            while operations.len() < MAX_PARALLEL_PROGRAM_IO {
+                let Some(node) = pending.next() else { break };
+                let programs = self.clone();
+                let reservation = reservation.clone();
+                let address = (node != self.local_node)
+                    .then(|| placement.address(node).cloned())
+                    .flatten()
+                    .map(|address| address.0);
+                operations.spawn(async move {
+                    let result = if node == programs.local_node {
+                        match commit_or_release {
+                            None => {
+                                programs
+                                    .store
+                                    .reserve_program_participant(&reservation)
+                                    .await
+                            }
+                            Some(Some(cursor)) => programs
+                                .store
+                                .commit_program_participant(&reservation, cursor)
+                                .await
+                                .map(|_| ()),
+                            Some(None) => {
+                                programs
+                                    .store
+                                    .release_program_participant(
+                                        &reservation,
+                                        finalized_commit_cursor,
+                                    )
+                                    .await
+                            }
+                        }
+                        .map_err(super::mutation_status)
+                    } else {
+                        let address = address.ok_or_else(|| {
+                            Status::unavailable(format!(
+                                "ACTIVE reservation replica {} has no peer address",
+                                node.0
+                            ))
+                        })?;
+                        match commit_or_release {
+                            None => {
+                                programs
+                                    .peers
+                                    .reserve_program_participant(
+                                        node,
+                                        &address,
+                                        nomination.nomination_log_index,
+                                        &reservation,
+                                        budget,
+                                    )
+                                    .await
+                            }
+                            Some(Some(cursor)) => {
+                                programs
+                                    .peers
+                                    .commit_program_participant(
+                                        node,
+                                        &address,
+                                        nomination.nomination_log_index,
+                                        cursor,
+                                        &reservation,
+                                        budget,
+                                    )
+                                    .await
+                            }
+                            Some(None) => {
+                                programs
+                                    .peers
+                                    .release_program_participant(
+                                        node,
+                                        &address,
+                                        nomination.nomination_log_index,
+                                        finalized_commit_cursor,
+                                        &reservation,
+                                        budget,
+                                    )
+                                    .await
+                            }
+                        }
+                    };
+                    Ok::<_, Status>((node, result))
+                });
+            }
+            let Some(completed) = operations.join_next().await else {
+                break;
             };
+            let (node, result) = completed.map_err(|error| {
+                Status::internal(format!("atomic reservation task failed: {error}"))
+            })??;
             match result {
                 Ok(()) => acknowledged.push(node),
                 Err(error) => {
@@ -1224,6 +1350,9 @@ impl DistributedPrograms {
         budget: Duration,
     ) -> Result<DistributedProgramFinalizations, Status> {
         let mut paths = Vec::with_capacity(stages.paths.len());
+        // Path finalization mutates shared reference/accounting state. Preserve
+        // its established participant order; only each path's independent
+        // replica application is concurrent below.
         for stage in &stages.paths {
             paths.push(
                 self.finalize_path(stage, commit_cursor, nomination, budget)
@@ -1288,34 +1417,55 @@ impl DistributedPrograms {
         };
         require_mutation(&mutation, stage, commit_cursor, coordinator)?;
         let mut durable = vec![coordinator];
-        for replica in group
+        let mut pending = group
             .replicas()
             .iter()
             .copied()
-            .filter(|replica| *replica != coordinator)
-        {
-            let result = if replica == self.local_node {
-                self.store
-                    .apply_program_path_finalization_replica(&mutation)
-                    .await
-                    .map_err(super::program_store_status)
-            } else {
-                let address = placement.address(replica).ok_or_else(|| {
-                    Status::unavailable(format!(
-                        "ACTIVE path replica {} has no peer address",
-                        replica.0
-                    ))
-                })?;
-                self.peers
-                    .apply_program_path_finalization(
-                        replica,
-                        &address.0,
-                        nomination.nomination_log_index,
-                        &mutation,
-                        budget,
-                    )
-                    .await
+            .filter(|replica| *replica != coordinator);
+        let mut applications = tokio::task::JoinSet::new();
+        loop {
+            while applications.len() < MAX_PARALLEL_PROGRAM_IO {
+                let Some(replica) = pending.next() else { break };
+                let programs = self.clone();
+                let mutation = mutation.clone();
+                let address = (replica != self.local_node)
+                    .then(|| placement.address(replica).cloned())
+                    .flatten()
+                    .map(|address| address.0);
+                applications.spawn(async move {
+                    let result = if replica == programs.local_node {
+                        programs
+                            .store
+                            .apply_program_path_finalization_replica(&mutation, mutation_context)
+                            .await
+                            .map_err(super::program_store_status)
+                    } else {
+                        let address = address.ok_or_else(|| {
+                            Status::unavailable(format!(
+                                "ACTIVE path replica {} has no peer address",
+                                replica.0
+                            ))
+                        })?;
+                        programs
+                            .peers
+                            .apply_program_path_finalization(
+                                replica,
+                                &address,
+                                nomination.nomination_log_index,
+                                &mutation,
+                                budget,
+                            )
+                            .await
+                    };
+                    Ok::<_, Status>((replica, result))
+                });
+            }
+            let Some(completed) = applications.join_next().await else {
+                break;
             };
+            let (replica, result) = completed.map_err(|error| {
+                Status::internal(format!("program replica finalization task failed: {error}"))
+            })??;
             match result {
                 Ok(applied) if applied.version == stage.version.id => durable.push(replica),
                 Ok(_) => tracing::warn!(node_id = replica.0, "program replica version mismatch"),
@@ -1388,36 +1538,60 @@ impl DistributedPrograms {
             ));
         }
         let mut durable = vec![coordinator];
-        for replica in group
+        let mut pending = group
             .replicas()
             .iter()
             .copied()
-            .filter(|replica| *replica != coordinator)
-        {
-            let result = if replica == self.local_node {
-                self.store
-                    .apply_program_alias_registry_finalization_replica(&mutation, mutation_context)
-                    .await
-                    .map(|_| ())
-                    .map_err(super::program_store_status)
-            } else {
-                let address = placement.address(replica).ok_or_else(|| {
-                    Status::unavailable(format!(
-                        "ACTIVE alias target replica {} has no peer address",
-                        replica.0
-                    ))
-                })?;
-                self.peers
-                    .apply_program_alias_registry_finalization(
-                        replica,
-                        &address.0,
-                        nomination.nomination_log_index,
-                        &mutation,
-                        budget,
-                    )
-                    .await
-                    .map(|_| ())
+            .filter(|replica| *replica != coordinator);
+        let mut applications = tokio::task::JoinSet::new();
+        loop {
+            while applications.len() < MAX_PARALLEL_PROGRAM_IO {
+                let Some(replica) = pending.next() else { break };
+                let programs = self.clone();
+                let mutation = mutation.clone();
+                let address = (replica != self.local_node)
+                    .then(|| placement.address(replica).cloned())
+                    .flatten()
+                    .map(|address| address.0);
+                applications.spawn(async move {
+                    let result = if replica == programs.local_node {
+                        programs
+                            .store
+                            .apply_program_alias_registry_finalization_replica(
+                                &mutation,
+                                mutation_context,
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(super::program_store_status)
+                    } else {
+                        let address = address.ok_or_else(|| {
+                            Status::unavailable(format!(
+                                "ACTIVE alias target replica {} has no peer address",
+                                replica.0
+                            ))
+                        })?;
+                        programs
+                            .peers
+                            .apply_program_alias_registry_finalization(
+                                replica,
+                                &address,
+                                nomination.nomination_log_index,
+                                &mutation,
+                                budget,
+                            )
+                            .await
+                            .map(|_| ())
+                    };
+                    Ok::<_, Status>((replica, result))
+                });
+            }
+            let Some(completed) = applications.join_next().await else {
+                break;
             };
+            let (replica, result) = completed.map_err(|error| {
+                Status::internal(format!("alias replica finalization task failed: {error}"))
+            })??;
             match result {
                 Ok(()) => durable.push(replica),
                 Err(error) => tracing::warn!(
@@ -1448,27 +1622,25 @@ impl DistributedPrograms {
     ) -> Result<(PreparedProgramRecord, DistributedProgramStages), Status> {
         let batch = invocation.committed_batch;
         let decision_program_hash = match batch.authority {
-            AtomicBundleAuthority::StoredProgram { program_hash, .. }
-            | AtomicBundleAuthority::LegacyProgramOnly { program_hash, .. } => program_hash,
+            AtomicBundleAuthority::StoredProgram { program_hash, .. } => program_hash,
             AtomicBundleAuthority::BuiltInObjectTransaction { .. } => {
                 keldra_consensus::ProgramHash([0; 32])
             }
         };
         let bundle = PreparedBundleRef {
-            hash: batch.bundle_ref.hash,
+            hash: PreparedBundleHash(batch.bundle_ref.hash),
             length: batch.bundle_ref.length,
         };
         let bytes = self.reader.read_blob_bytes(&BlobRef::from(bundle)).await?;
         let record = PreparedProgramRecord::decode_distributed(
             &bytes,
             bundle,
-            PreparedBundleHash(batch.bundle_hash.0),
             ProgramHash(decision_program_hash.0),
         )
         .map_err(super::program_store_status)?;
         if record.authority() != super::store_bundle_authority(batch.authority)
             || record
-                .participant_manifest_hash(PreparedBundleHash(batch.bundle_hash.0))
+                .participant_manifest_hash()
                 .map_err(super::program_store_status)?
                 != batch.participant_manifest_hash.0
         {
@@ -1477,7 +1649,6 @@ impl DistributedPrograms {
             ));
         }
         let prepared = PreparedProgramBundle {
-            hash: PreparedBundleHash(batch.bundle_hash.0),
             source_bundle_hash: record.source_bundle_hash(),
             program_hash: ProgramHash(decision_program_hash.0),
             authority: super::store_bundle_authority(batch.authority),
@@ -1497,19 +1668,9 @@ impl DistributedPrograms {
         };
         let mut stages = Vec::with_capacity(record.writes().len());
         for write in record.writes() {
-            let (tenant_id, bucket_id) = self
-                .names
-                .resolve_bucket_ids(&write.path().tenant, &write.path().bucket)
-                .await?;
             stages.push(
-                path_stage_from_prepared(
-                    &prepared,
-                    write,
-                    batch.begin_cursor,
-                    tenant_id,
-                    bucket_id,
-                )
-                .map_err(super::program_store_status)?,
+                path_stage_from_prepared(&prepared, &record, write, batch.begin_cursor)
+                    .map_err(super::program_store_status)?,
             );
         }
         let alias_registries =
@@ -1531,6 +1692,20 @@ fn terminal_rejections_make_threshold_impossible(
     required: usize,
 ) -> bool {
     replicas.saturating_sub(terminal_rejections) < required
+}
+
+fn reservation_group(
+    placement: &crate::cluster_placement::ClusterPlacement,
+    reservation: &ProgramReservation,
+) -> Result<MutableRecordReplicaGroup, Status> {
+    let (kind, key) = super::reservation_placement(reservation);
+    MutableRecordReplicaGroup::select(
+        kind,
+        placement.cluster_id(),
+        &key,
+        placement.placement_nodes(),
+    )
+    .ok_or_else(|| Status::unavailable("cluster has no active reservation metadata owner"))
 }
 
 fn distributed_canonical_authorization(
@@ -1600,15 +1775,29 @@ impl StateReader for DistributedStateReader {
     async fn read_snapshot(&self, paths: &[ObjectPath]) -> Result<ProgramSnapshot, String> {
         let mut documents = BTreeMap::new();
         let mut versions = BTreeMap::new();
-        for path in paths {
-            let key = keldra_store::ObjectKey::new(&path.tenant, &path.bucket, &path.path)
-                .map_err(|error| error.to_string())?;
-            let Some(mut object) = self
-                .reader
-                .open(&key, None)
-                .await
-                .map_err(|error| error.to_string())?
-            else {
+        let mut paths = paths.iter().cloned();
+        let mut reads = tokio::task::JoinSet::new();
+        loop {
+            while reads.len() < MAX_PARALLEL_PROGRAM_IO {
+                let Some(path) = paths.next() else { break };
+                let reader = self.reader.clone();
+                reads.spawn(async move {
+                    let key = keldra_store::ObjectKey::new(&path.tenant, &path.bucket, &path.path)
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>((
+                        path,
+                        reader
+                            .open(&key, None)
+                            .await
+                            .map_err(|error| error.to_string())?,
+                    ))
+                });
+            }
+            let Some(completed) = reads.join_next().await else {
+                break;
+            };
+            let (path, object) = completed.map_err(|error| error.to_string())??;
+            let Some(mut object) = object else {
                 continue;
             };
             let value = if object.version.deleted {
@@ -1649,7 +1838,7 @@ impl StateReader for DistributedStateReader {
                     content_type: object.version.content_type.clone(),
                 },
             );
-            versions.insert(path.clone(), object.version);
+            versions.insert(path, object.version);
         }
         *self
             .snapshots
@@ -1713,8 +1902,7 @@ pub(super) fn result_from_record(
         executor_nomination_log_index: invocation.committed_batch.nomination_log_index,
         commit_log_index: invocation.committed_batch.commit_cursor,
         program_hash: match invocation.committed_batch.authority {
-            AtomicBundleAuthority::StoredProgram { program_hash, .. }
-            | AtomicBundleAuthority::LegacyProgramOnly { program_hash, .. } => program_hash.0,
+            AtomicBundleAuthority::StoredProgram { program_hash, .. } => program_hash.0,
             AtomicBundleAuthority::BuiltInObjectTransaction { .. } => [0; 32],
         },
         published_versions,

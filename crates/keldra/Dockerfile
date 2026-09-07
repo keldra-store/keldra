@@ -1,8 +1,14 @@
 # syntax=docker/dockerfile:1.7
 
+# Release automation supplies digest-pinned values for both arguments. Tagged
+# defaults keep ordinary local development usable; they are rejected by the
+# release input contract.
+ARG KELDRA_RUST_BUILDER_IMAGE=rust:1.96-trixie
+ARG KELDRA_RUNTIME_IMAGE=debian:trixie-slim
+
 # Build inside the requested image platform. An amd64 image is compiled in the
 # amd64 trixie builder and an arm64 image is compiled in the arm64 builder.
-FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder
+FROM --platform=$TARGETPLATFORM ${KELDRA_RUST_BUILDER_IMAGE} AS builder
 ARG TARGETARCH
 ARG CARGO_BUILD_JOBS=1
 
@@ -28,18 +34,19 @@ COPY . .
 RUN --mount=type=cache,id=keldra-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=keldra-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=keldra-cargo-target-${TARGETARCH}-release,target=/usr/src/keldra/target,sharing=locked \
+    CARGO_TARGET_DIR=/usr/src/keldra/target \
     cargo build --release --locked --jobs "${CARGO_BUILD_JOBS}" \
         -p keldra-server --bin keldra-server \
         -p keldra-cli --bin keldra \
     && mkdir -p /usr/local/keldra-build \
     && cp \
-        target/release/keldra-server \
-        target/release/keldra \
+        /usr/src/keldra/target/release/keldra-server \
+        /usr/src/keldra/target/release/keldra \
         /usr/local/keldra-build/
 
 # Rust tooling is deliberately absent from the matching target-platform
 # runtime image.
-FROM --platform=$TARGETPLATFORM debian:trixie-slim
+FROM --platform=$TARGETPLATFORM ${KELDRA_RUNTIME_IMAGE}
 ARG KELDRA_SOURCE_REVISION=unknown
 
 LABEL org.opencontainers.image.revision="${KELDRA_SOURCE_REVISION}"
@@ -60,7 +67,6 @@ RUN useradd --uid 10001 --no-create-home --home-dir /var/lib/keldra --shell /usr
 COPY --from=builder /usr/local/keldra-build/keldra-server /usr/local/bin/keldra-server
 COPY --from=builder /usr/local/keldra-build/keldra /usr/local/bin/keldra
 COPY --from=builder /usr/src/keldra/LICENSE /usr/share/doc/keldra/LICENSE
-COPY --from=builder /usr/src/keldra/docs/dependency-licenses.md /usr/share/doc/keldra/dependency-licenses.md
 
 ENV KELDRA_LISTEN=0.0.0.0:50051 \
     KELDRA_DATA_DIR=/var/lib/keldra \

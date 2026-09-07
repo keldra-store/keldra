@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use keldra_atomic_program::MAX_OBJECT_PATH_BYTES;
@@ -7,7 +7,11 @@ use tokio::sync::{mpsc, oneshot};
 use rocksdb::{Direction, IteratorMode};
 use serde::{Deserialize, Serialize};
 
-use super::{CF_HEADS, CF_METADATA, CF_VERSIONS, Store, StoredVersion};
+use super::object_alias_registry::decode_registry;
+use super::{
+    CF_HEADS, CF_METADATA, CF_OBJECT_ALIAS_REGISTRIES, CF_VERSIONS, Store, StoredVersion,
+    StoredVersionRetention,
+};
 use crate::key::{BucketId, BucketIdentity, TenantId};
 use crate::watch::{LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_OFFSET_KEY};
 use crate::{Head, ObjectKey, SourceId, Version, VersionId};
@@ -34,12 +38,32 @@ pub struct RetainedObjectSnapshot {
     pub exact_path: String,
     pub version: Version,
     pub current_head: RetainedHeadState,
+    /// True only for a descriptor retained by bucket versioning, independently
+    /// of source-journal evidence that temporarily keeps unversioned history.
+    pub user_retained: bool,
+    /// Number of visible canonical/alias names in the requested logical scope
+    /// that resolve to this canonical retained lineage. Ordinary descriptor
+    /// exports use one; accounting scans compute the bounded value from the
+    /// target-local alias registry held by the same RocksDB snapshot.
+    pub scope_name_count: u32,
 }
 
 impl RetainedObjectSnapshot {
     pub fn validate(&self) -> Result<(), ObjectSnapshotError> {
         if self.tenant_id == 0 || self.bucket_id == 0 {
             return Err(invalid_snapshot("stable IDs must be non-zero"));
+        }
+        if self.scope_name_count == 0
+            || usize::try_from(self.scope_name_count).map_or(true, |count| {
+                count
+                    > crate::MAX_INBOUND_OBJECT_LINKS
+                        .saturating_add(1)
+                        .min(crate::MAX_ATOMIC_BATCH_MUTATIONS)
+            })
+        {
+            return Err(invalid_snapshot(
+                "retained descriptor logical name count is malformed",
+            ));
         }
         ObjectKey::new("typed", "retained", &self.exact_path)
             .map_err(|error| invalid_snapshot(error.to_string()))?;
@@ -139,6 +163,14 @@ pub struct RetainedObjectSnapshotPage {
 
 enum RetainedSnapshotCommand {
     Pull(oneshot::Sender<Result<Option<RetainedObjectSnapshotFrame>, ObjectSnapshotError>>),
+}
+
+type RetainedRecordFilter = Arc<dyn Fn(&RetainedObjectSnapshot) -> bool + Send + Sync + 'static>;
+type LogicalNameFilter = Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>;
+
+enum RetainedSnapshotScope {
+    CanonicalPrefix(String),
+    LogicalNames(LogicalNameFilter),
 }
 
 /// Credit-driven stream over one held RocksDB snapshot. Each pull decodes at
@@ -307,7 +339,60 @@ impl Store {
             bucket_id: BucketId(bucket_id),
         };
         let prefix = identity.head_key(path_prefix);
-        let path_prefix = path_prefix.to_owned();
+        self.start_retained_object_snapshot_scan_inner(
+            identity,
+            prefix,
+            RetainedSnapshotScope::CanonicalPrefix(path_prefix.to_owned()),
+            max_records,
+            max_bytes,
+            Arc::new(include),
+        )
+        .await
+    }
+
+    /// Captures every canonical descriptor in the bucket and annotates each
+    /// returned lineage with the number of canonical/alias names selected by
+    /// `includes_name`. Alias registries and descriptors are read from one
+    /// RocksDB snapshot, so accounting never joins independently timed views.
+    pub async fn start_logical_retained_object_snapshot_scan<F, N>(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        path_prefix: &str,
+        max_records: u32,
+        max_bytes: u64,
+        include: F,
+        includes_name: N,
+    ) -> Result<RetainedObjectSnapshotScan, ObjectSnapshotError>
+    where
+        F: Fn(&RetainedObjectSnapshot) -> bool + Send + Sync + 'static,
+        N: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        validate_request(tenant_id, bucket_id, path_prefix, max_records, max_bytes)?;
+        let identity = BucketIdentity {
+            tenant_id: TenantId(tenant_id),
+            bucket_id: BucketId(bucket_id),
+        };
+        self.start_retained_object_snapshot_scan_inner(
+            identity,
+            identity.head_key(""),
+            RetainedSnapshotScope::LogicalNames(Arc::new(includes_name)),
+            max_records,
+            max_bytes,
+            Arc::new(include),
+        )
+        .await
+    }
+
+    async fn start_retained_object_snapshot_scan_inner(
+        &self,
+        identity: BucketIdentity,
+        prefix: Vec<u8>,
+        scope: RetainedSnapshotScope,
+        max_records: u32,
+        max_bytes: u64,
+        include: RetainedRecordFilter,
+    ) -> Result<RetainedObjectSnapshotScan, ObjectSnapshotError> {
         let store = self.clone();
         let (commands, receiver) = mpsc::channel(1);
         let (ready, captured) = oneshot::channel();
@@ -323,7 +408,7 @@ impl Store {
                     store,
                     identity,
                     prefix,
-                    path_prefix,
+                    scope,
                     max_records,
                     max_bytes,
                     include,
@@ -347,19 +432,17 @@ impl Store {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_retained_worker<F>(
+fn run_retained_worker(
     store: Store,
     identity: BucketIdentity,
     prefix: Vec<u8>,
-    path_prefix: String,
+    scope: RetainedSnapshotScope,
     max_records: u32,
     max_bytes: u64,
-    include: F,
+    include: RetainedRecordFilter,
     ready: oneshot::Sender<Result<(SourceId, u64), ObjectSnapshotError>>,
     mut commands: mpsc::Receiver<RetainedSnapshotCommand>,
-) where
-    F: Fn(&RetainedObjectSnapshot) -> bool,
-{
+) {
     let snapshot = store.db.snapshot();
     let capture = capture_source(&store, &snapshot);
     if ready.send(capture.clone()).is_err() || capture.is_err() {
@@ -373,24 +456,31 @@ fn run_retained_worker<F>(
         Ok(column) => column,
         Err(_) => return,
     };
+    let alias_registries = match store.cf(CF_OBJECT_ALIAS_REGISTRIES).map_err(object_storage) {
+        Ok(column) => column,
+        Err(_) => return,
+    };
     let mut iterator =
         snapshot.iterator_cf(versions, IteratorMode::From(&prefix, Direction::Forward));
     let mut pending = None;
     let mut cached_head = None;
+    let mut cached_scope_name_count = None;
     let mut exhausted = false;
     while let Some(RetainedSnapshotCommand::Pull(response)) = commands.blocking_recv() {
         let frame = pull_retained_frame(
             &mut iterator,
             &snapshot,
             heads,
+            alias_registries,
             identity,
             &prefix,
-            &path_prefix,
+            &scope,
             max_records,
             max_bytes,
-            &include,
+            include.as_ref(),
             &mut pending,
             &mut cached_head,
+            &mut cached_scope_name_count,
             &mut exhausted,
         );
         let failed = frame.is_err();
@@ -401,22 +491,23 @@ fn run_retained_worker<F>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pull_retained_frame<F, I>(
+fn pull_retained_frame<I>(
     iterator: &mut I,
     snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
     heads: &rocksdb::ColumnFamily,
+    alias_registries: &rocksdb::ColumnFamily,
     identity: BucketIdentity,
     prefix: &[u8],
-    path_prefix: &str,
+    scope: &RetainedSnapshotScope,
     max_records: u32,
     max_bytes: u64,
-    include: &F,
+    include: &(dyn Fn(&RetainedObjectSnapshot) -> bool + Send + Sync),
     pending: &mut Option<RetainedObjectSnapshot>,
     cached_head: &mut Option<(Vec<u8>, RetainedHeadState)>,
+    cached_scope_name_count: &mut Option<(Vec<u8>, u32)>,
     exhausted: &mut bool,
 ) -> Result<Option<RetainedObjectSnapshotFrame>, ObjectSnapshotError>
 where
-    F: Fn(&RetainedObjectSnapshot) -> bool,
     I: Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>>,
 {
     if *exhausted && pending.is_none() {
@@ -437,9 +528,26 @@ where
                     *exhausted = true;
                     break None;
                 }
-                let record =
+                let mut record =
                     decode_retained_record(identity, &key, &encoded, snapshot, heads, cached_head)?;
-                if path_is_within_prefix(&record.exact_path, path_prefix) && include(&record) {
+                let in_scope = match scope {
+                    RetainedSnapshotScope::CanonicalPrefix(path_prefix) => {
+                        path_is_within_prefix(&record.exact_path, path_prefix)
+                    }
+                    RetainedSnapshotScope::LogicalNames(includes_name) => {
+                        record.scope_name_count = logical_scope_name_count(
+                            snapshot,
+                            alias_registries,
+                            identity,
+                            &record.exact_path,
+                            includes_name.as_ref(),
+                            cached_scope_name_count,
+                        )?;
+                        record.scope_name_count != 0
+                    }
+                };
+                if in_scope && include(&record) {
+                    record.validate()?;
                     break Some(record);
                 }
             },
@@ -503,9 +611,9 @@ fn decode_retained_record(
     let key_version = VersionId(u64::from_be_bytes(
         key[key.len() - 8..].try_into().expect("fixed slice"),
     ));
-    let version = StoredVersion::decode(encoded)
-        .map_err(object_storage)?
-        .version;
+    let stored = StoredVersion::decode(encoded).map_err(object_storage)?;
+    let user_retained = stored.retention == StoredVersionRetention::UserRetained;
+    let version = stored.version;
     if version.id != key_version {
         return Err(object_storage(
             "retained version key and descriptor disagree",
@@ -533,9 +641,42 @@ fn decode_retained_record(
         exact_path,
         version,
         current_head,
+        user_retained,
+        scope_name_count: 1,
     };
     record.validate()?;
     Ok(record)
+}
+
+fn logical_scope_name_count(
+    snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
+    alias_registries: &rocksdb::ColumnFamily,
+    identity: BucketIdentity,
+    canonical_path: &str,
+    includes_name: &(dyn Fn(&str) -> bool + Send + Sync),
+    cached: &mut Option<(Vec<u8>, u32)>,
+) -> Result<u32, ObjectSnapshotError> {
+    let head_key = identity.head_key(canonical_path);
+    if let Some((cached_key, count)) = cached
+        && cached_key == &head_key
+    {
+        return Ok(*count);
+    }
+    let mut count = u32::from(includes_name(canonical_path));
+    if let Some(encoded) = snapshot
+        .get_cf(alias_registries, &head_key)
+        .map_err(object_storage)?
+    {
+        let registry = decode_registry(&encoded).map_err(object_storage)?;
+        registry.validate(canonical_path).map_err(object_storage)?;
+        for alias in &registry.aliases {
+            count = count
+                .checked_add(u32::from(includes_name(alias)))
+                .ok_or_else(|| object_storage("retained logical name count overflow"))?;
+        }
+    }
+    *cached = Some((head_key, count));
+    Ok(count)
 }
 
 fn validate_version_key(key: &[u8]) -> Result<&[u8], ObjectSnapshotError> {

@@ -34,8 +34,8 @@ use crate::distributed_control_plane::DistributedControlPlane;
 use crate::distributed_list::{DistributedObjectLister, OriginalBearer};
 use crate::logical_name_resolution::LogicalNameResolver;
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
+use crate::object_service::{deadline_remaining, request_deadline};
 use crate::placement::PlacementKind;
-use crate::v05::{deadline_remaining, request_deadline};
 
 use super::authorization::{
     GroupPermission, ensure_realm, group_resource, realm_scope, role_relation,

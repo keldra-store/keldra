@@ -7,7 +7,7 @@ use crate::placement::PlacementKind;
 
 const QUERY_REPLICA_LIMIT: usize = 3;
 const PROJECTION_PARTITION_ID: u64 = 1;
-const SOURCE_PRODUCER_DOMAIN: &[u8] = b"keldra/v6/source-producer/v1\0";
+const SOURCE_PRODUCER_DOMAIN: &[u8] = b"keldra/v1/source-producer/v1\0";
 
 /// Stable identity used for index placement. Mutable names never participate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -116,7 +116,7 @@ impl IndexPlacement {
     }
 }
 
-/// Deterministic v6 producer authority for one immutable source incarnation.
+/// Deterministic v1 producer authority for one immutable source incarnation.
 /// While the originating source remains ACTIVE it produces locally. Once it
 /// leaves placement, capacity-weighted HRW elects one successor from a key
 /// that deliberately excludes logical definitions and physical families, so

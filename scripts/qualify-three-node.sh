@@ -4,13 +4,31 @@ set -Eeuo pipefail
 # Three-node release qualification for cluster formation, peer authentication,
 # replicated/erasure payload durability, object semantics, accounting,
 # PersonalDB, S3, and Git. Indexing is qualified separately by
-# scripts/qualify-index-v6-ssd-scale.sh on the attested SSD kit.
+# scripts/qualify-index-v1-ssd-scale.sh on the attested SSD kit.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-three-node-phases.sh"
+source "${repo_root}/scripts/qualification-disk-ledger.sh"
 compose_file="${repo_root}/tests/cluster/docker-compose.yml"
 start_node="${repo_root}/tests/cluster/start-node.sh"
-requested_image="${KELDRA_IMAGE:-keldra:0.17.0}"
+workspace_version="$(
+  python3 -c '
+import re, pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r"(?ms)^\[workspace\.package\].*?^version\s*=\s*\"([^\"]+)\"", text)
+if match is None:
+    raise SystemExit("workspace package version is missing")
+print(match.group(1))
+' "${repo_root}/Cargo.toml"
+)"
+qualification_version="${KELDRA_QUALIFICATION_VERSION:-${workspace_version}}"
+if [[ ! "${qualification_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z._-]+)?$ ]] \
+  || [[ "${qualification_version}" != "${workspace_version}" ]]
+then
+  echo "qualification version ${qualification_version} does not match workspace version ${workspace_version}" >&2
+  exit 2
+fi
+requested_image="${KELDRA_IMAGE:-keldra:${qualification_version}}"
 qualification_mode="${KELDRA_QUALIFICATION_MODE:-smoke}"
 case "${qualification_mode}" in
   release|smoke) ;;
@@ -149,20 +167,26 @@ client_version="$(
   docker run --rm --platform "${KELDRA_DOCKER_PLATFORM}" \
     "${image_id}" keldra --version
 )"
-if [[ "${server_version}" != "keldra-server 0.17.0" \
-  || "${client_version}" != "keldra 0.17.0" ]]; then
-  echo "qualification requires the exact Keldra 0.17.0 image" >&2
+if [[ "${server_version}" != "keldra-server ${qualification_version}" \
+  || "${client_version}" != "keldra ${qualification_version}" ]]; then
+  echo "qualification requires the exact Keldra ${qualification_version} image" >&2
   echo "server: ${server_version}" >&2
   echo "client: ${client_version}" >&2
   exit 2
 fi
 export KELDRA_IMAGE="${image_id}"
-export KELDRA_QUALIFICATION_PROJECT="${KELDRA_QUALIFICATION_PROJECT:-keldra-v090-${$}}"
-export KELDRA_QUALIFICATION_DIR="$(mktemp -d /var/tmp/keldra-v090-qualification.XXXXXX)"
+export KELDRA_QUALIFICATION_PROJECT="${KELDRA_QUALIFICATION_PROJECT:-keldra-v1-${$}}"
+export KELDRA_QUALIFICATION_DIR="$(mktemp -d /var/tmp/keldra-v1-qualification.XXXXXX)"
 export KELDRA_QUALIFICATION_START_NODE="${start_node}"
 qualification_suffix="${KELDRA_QUALIFICATION_DIR##*.}"
 KELDRA_QUALIFICATION_STATE_DIR="${KELDRA_QUALIFICATION_DIR}/artifacts"
 keep="${KELDRA_QUALIFICATION_KEEP:-0}"
+qualification_disk_budget_bytes="${KELDRA_QUALIFICATION_DISK_BUDGET_BYTES:-21474836480}"
+qualification_disk_ledger="${KELDRA_QUALIFICATION_DISK_LEDGER:-${KELDRA_QUALIFICATION_DIR}.disk-ledger.jsonl}"
+qualification_disk_ledger_init \
+  "${KELDRA_QUALIFICATION_PROJECT}" "${KELDRA_QUALIFICATION_DIR}" \
+  "${qualification_disk_budget_bytes}" "${qualification_disk_ledger}"
+qualification_disk_ledger_event own compose-project "${KELDRA_QUALIFICATION_PROJECT}"
 compose() {
   docker compose \
     --project-name "${KELDRA_QUALIFICATION_PROJECT}" \
@@ -193,11 +217,15 @@ cleanup() {
     compose logs --no-color >&2 || true
   fi
   if [[ "${keep}" == "1" ]]; then
+    qualification_disk_ledger_event retain compose-project "${KELDRA_QUALIFICATION_PROJECT}"
+    qualification_disk_ledger_event retain run-root "${KELDRA_QUALIFICATION_DIR}"
     echo "[keldra-qualification] retained project ${KELDRA_QUALIFICATION_PROJECT}" >&2
     echo "[keldra-qualification] retained files ${KELDRA_QUALIFICATION_DIR}" >&2
   else
+    qualification_disk_ledger_event cleanup compose-project "${KELDRA_QUALIFICATION_PROJECT}"
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-    if [[ "${KELDRA_QUALIFICATION_DIR}" == /var/tmp/keldra-v090-qualification.* ]]; then
+    if [[ "${KELDRA_QUALIFICATION_DIR}" == /var/tmp/keldra-v1-qualification.* ]]; then
+      qualification_disk_ledger_event cleanup run-root "${KELDRA_QUALIFICATION_DIR}"
       docker run --rm --user 0 \
         --volume "${KELDRA_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" rm -rf \
@@ -212,6 +240,7 @@ cleanup() {
       status=1
     fi
   fi
+  qualification_disk_ledger_finish "exit-${status}"
   exit "${status}"
 }
 trap cleanup EXIT
@@ -229,7 +258,6 @@ for required in \
   provision-tenant \
   create-bucket \
   get-cluster-capabilities \
-  activate-cluster-capabilities \
   clone-object \
   link-object \
   unlink-object
@@ -240,18 +268,18 @@ do
   fi
 done
 
-qualify_generalized_object_paths() {
+qualify_object_paths() {
   local capabilities=""
   local attempt
   for attempt in $(seq 1 60); do
     capabilities="$(run_bootstrap_cli keldra-1 get-cluster-capabilities 2>/dev/null || true)"
-    if grep -Eq 'active_protocol=2 active_storage=2 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
+    if grep -Eq '^active_protocol=1 active_storage=1 placement_term=[1-9][0-9]* placement_index=[1-9][0-9]*$' <<<"${capabilities}"; then
       break
     fi
     sleep 1
   done
-  if ! grep -Eq 'active_protocol=2 active_storage=2 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
-    echo "three-node cluster did not start with active capability 2/2: ${capabilities}" >&2
+  if ! grep -Eq '^active_protocol=1 active_storage=1 placement_term=[1-9][0-9]* placement_index=[1-9][0-9]*$' <<<"${capabilities}"; then
+    echo "three-node cluster did not start with active capability 1/1: ${capabilities}" >&2
     return 1
   fi
 
@@ -312,7 +340,7 @@ qualify_generalized_object_paths() {
       --output /qualification/artifacts/link-clone-read.txt
   cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/link-source.txt" \
     "${KELDRA_QUALIFICATION_DIR}/artifacts/link-clone-read.txt"
-  echo "[keldra-qualification] capability 2/2 clone and protected-link paths passed across three nodes"
+  echo "[keldra-qualification] capability 1/1 clone and protected-link paths passed across three nodes"
 }
 for directory in node-1 node-2 node-3 artifacts; do
   mkdir "${KELDRA_QUALIFICATION_DIR}/${directory}"
@@ -788,14 +816,14 @@ echo "[keldra-qualification] three-node 2+1 reads preserved both large object he
 start_release_source_journal_phase "${release_source_journal_max_entries}"
 
 echo "[keldra-qualification] three-node cluster is ACTIVE"
-qualify_generalized_object_paths
+qualify_object_paths
 
 public_endpoints=()
 for node in keldra-1 keldra-2 keldra-3; do
   public_endpoints+=("$(public_endpoint_for "${node}")")
 done
 
-echo "[keldra-qualification] indexing is qualified separately by scripts/qualify-index-v6-ssd-scale.sh"
+echo "[keldra-qualification] indexing is qualified separately by scripts/qualify-index-v1-ssd-scale.sh"
 
 accounting_secret=qualification-accounting-secret-000000000000000000000
 provision_tenant qaccounting qaccounting-client "${accounting_secret}"
@@ -1007,6 +1035,7 @@ for node in keldra-1 keldra-2 keldra-3; do
 done
 echo "[keldra-qualification] rolling populated restart preserved replicated objects"
 assert_zero_accounting_traffic_drops
+qualification_disk_ledger_check
 
 if [[ "${qualification_mode}" == "release" ]]; then
   echo "[keldra-qualification] PASS non-index release phases image=${image_id} platform=${KELDRA_DOCKER_PLATFORM}"

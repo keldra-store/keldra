@@ -3,7 +3,8 @@ use super::evaluation_telemetry::{EvaluationSubphase, EvaluationSubphaseMetrics}
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_helpers::{
     definition_mutation_error, definition_receipt_matches_intent, exact_version_key,
-    fail_unresolved_prepared, is_mutation_capacity, live_version_length, mutation_capacity_kind,
+    fail_unresolved_prepared, head_accounting_transition, is_mutation_capacity,
+    mutation_capacity_kind, validate_accounting_transition, version_retention,
 };
 use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::{DistributedEvaluationContext, EvaluatedOperation};
@@ -687,6 +688,7 @@ impl Store {
         let primary_receipt_key = receipt_key(identity, &mutation.command_id);
         let _commit_guard = self.lock_commit("object_mutation_replica").await;
         self.require_unreserved_object_locked(identity, &mutation.exact_path, None)?;
+        let retention = version_retention(mutation.versioning);
         let now = now_unix_millis()?;
         let retained_identical_receipt = if let Some(existing) =
             self.read_stored_receipt(&primary_receipt_key)?
@@ -800,6 +802,7 @@ impl Store {
                 ),
                 None => None,
             };
+            validate_accounting_transition(mutation, predecessor.as_ref())?;
             if predecessor
                 .as_ref()
                 .is_some_and(|version| version.protected_link_descriptor)
@@ -823,13 +826,11 @@ impl Store {
                 }
             }
         }
-
         if let Some(existing) = self.stored_version_by_key(&encoded_version_key)?
             && existing.version != mutation.version
         {
             return Err(MutationError::ObjectMutationConflict);
         }
-
         let mut receipt_status = self.mutation_receipt_status()?;
         let initial_receipt_status = receipt_status;
         let pruned = self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
@@ -839,9 +840,7 @@ impl Store {
         {
             return Err(MutationError::ObjectMutationConflict);
         }
-
         if !already_applied {
-            let retention = self.version_retention_for_bucket(identity)?;
             if let Some(predecessor) = mutation.stamp.predecessor_version {
                 let predecessor_key =
                     exact_version_key(identity, &mutation.exact_path, predecessor);
@@ -947,7 +946,6 @@ impl Store {
             replayed: already_applied,
         })
     }
-
     pub(crate) fn stage_local_changes(
         &self,
         batch: &mut WriteBatch,
@@ -973,7 +971,6 @@ impl Store {
         {
             return Ok(());
         }
-
         let journal = self.cf(CF_LOCAL_INVALIDATIONS)?;
         let metadata = self.cf(CF_METADATA)?;
         let mut status = self
@@ -1057,7 +1054,6 @@ impl Store {
                 })?;
             appended.push_back((status.tail, encoded));
         }
-
         if admission == SourceJournalAdmission::Bounded {
             let appended_entries = status
                 .retained_entries
@@ -1116,7 +1112,6 @@ impl Store {
         }
         Ok(())
     }
-
     pub(crate) fn notify_local_invalidations(&self) {
         self.observe_source_journal_progress_debt();
         self.watch_notify.send_replace(());
@@ -1701,10 +1696,9 @@ impl Store {
             committed_at_unix_millis: now_unix_millis,
             protected_link_descriptor: false,
         };
-        let accounting_transition = AccountingHeadTransition::new(
-            current_version.as_ref().and_then(live_version_length),
-            live_version_length(&version),
-        );
+        let retention = version_retention(versioning);
+        let accounting_transition =
+            head_accounting_transition(current_version.as_ref(), &version, retention);
         let definition_transition = definition_intent.map(|intent| DefinitionTransition {
             kind: intent.kind,
             tenant_id: operation.identity().tenant_id.0,
@@ -1771,13 +1765,10 @@ impl Store {
                             .command_id()
                             .ok_or(MutationError::InvalidCommandId)?;
                         let mut mutation = ObjectMutation {
-                            format: if alias_snapshot.is_some() {
-                                OBJECT_MUTATION_FORMAT
-                            } else {
-                                crate::LEGACY_OBJECT_MUTATION_FORMAT
-                            },
+                            format: OBJECT_MUTATION_FORMAT,
                             tenant_id: operation.identity().tenant_id.0,
                             bucket_id: operation.identity().bucket_id.0,
+                            versioning,
                             exact_path: key.path().to_owned(),
                             command_id: command_id.to_owned(),
                             input_fingerprint: fingerprint,
@@ -1812,10 +1803,6 @@ impl Store {
             version: id,
             deleted,
             mutation_stamp: object_mutation.as_ref().map(|mutation| mutation.stamp),
-        };
-        let retention = match versioning {
-            ObjectVersioning::Unversioned => StoredVersionRetention::JournalPending,
-            ObjectVersioning::Enabled => StoredVersionRetention::UserRetained,
         };
         let encoded_version = serde_json::to_vec(&StoredVersion::new(version.clone(), retention))
             .map_err(storage_error)?;

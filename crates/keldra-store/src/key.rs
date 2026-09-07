@@ -6,9 +6,8 @@ use thiserror::Error;
 
 use crate::authz::StorageTenantId;
 
-/// Persisted object-key encoding. The first byte of every identity-derived key
-/// makes later, explicit format migrations possible without guessing how an
-/// existing key was encoded.
+/// Persisted v1 object-key encoding. The first byte makes the active format
+/// explicit and fail-closed.
 pub(crate) const STORAGE_KEY_FORMAT_VERSION: u8 = 0x01;
 pub(crate) const TENANT_NAME_TYPE: u8 = 0x01;
 pub(crate) const BUCKET_NAME_TYPE: u8 = 0x02;

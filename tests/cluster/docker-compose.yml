@@ -1,4 +1,4 @@
-name: ${KELDRA_QUALIFICATION_PROJECT:-keldra-v6-qualification}
+name: ${KELDRA_QUALIFICATION_PROJECT:-keldra-v1-qualification}
 
 x-keldra-environment: &keldra-environment
   RUST_LOG: ${KELDRA_QUALIFICATION_RUST_LOG:-info,keldra::index_runtime::retention=debug,keldra::observability::runtime=debug}

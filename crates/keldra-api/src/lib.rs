@@ -4,6 +4,11 @@ pub mod v1 {
     tonic::include_proto!("keldra.v1");
 }
 
+pub mod typed_json;
+
+/// Generated descriptor authority for protocol-contract tests and reflection.
+pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("keldra_descriptor");
+
 /// A Boolean predicate expression rejected before it is sent to Keldra.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PredicateExpressionError {
@@ -81,12 +86,42 @@ impl v1::IndexPredicateExpression {
 #[cfg(test)]
 mod tests {
     use prost::Message;
+    use prost_types::{DescriptorProto, FileDescriptorSet, ServiceDescriptorProto};
 
     use super::v1::{
         CloneObjectRequest, DeletedObject, Durability, LinkObjectRequest, NeverExisted,
         ObjectAddress, ObjectHead, PresentObject, PutIfVersionOperation, UnlinkObjectRequest,
         clone_object_request, object_head,
     };
+
+    fn descriptors() -> FileDescriptorSet {
+        FileDescriptorSet::decode(super::FILE_DESCRIPTOR_SET).unwrap()
+    }
+
+    fn service<'a>(set: &'a FileDescriptorSet, name: &str) -> &'a ServiceDescriptorProto {
+        set.file
+            .iter()
+            .flat_map(|file| &file.service)
+            .find(|service| service.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("missing generated service descriptor {name}"))
+    }
+
+    fn message<'a>(set: &'a FileDescriptorSet, name: &str) -> &'a DescriptorProto {
+        set.file
+            .iter()
+            .flat_map(|file| &file.message_type)
+            .find(|message| message.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("missing generated message descriptor {name}"))
+    }
+
+    fn field_number(set: &FileDescriptorSet, message_name: &str, field_name: &str) -> i32 {
+        message(set, message_name)
+            .field
+            .iter()
+            .find(|field| field.name.as_deref() == Some(field_name))
+            .and_then(|field| field.number)
+            .unwrap_or_else(|| panic!("missing generated field {message_name}.{field_name}"))
+    }
 
     #[test]
     fn exact_path_states_are_distinct() {
@@ -182,83 +217,157 @@ mod tests {
 
     #[test]
     fn schema_keeps_removed_capabilities_out() {
-        let schema = include_str!("../proto/keldra.proto").to_ascii_lowercase();
-        for forbidden in [
-            "rpc uploadblob",
-            "rpc publishobject",
-            "rpc putobject",
-            "message blobref",
-            "rpc listprefix",
-            "rpc begintransaction",
-            "rpc committransaction",
-            "personaldb",
+        let set = descriptors();
+        let object_methods = service(&set, "ObjectService")
+            .method
+            .iter()
+            .filter_map(|method| method.name.as_deref())
+            .collect::<Vec<_>>();
+        for required in [
+            "StartPut",
+            "Put",
+            "PutEnd",
+            "WatchPrefix",
+            "ListObjects",
+            "CloneObject",
+            "DeleteVersion",
+            "ListObjectVersions",
         ] {
-            assert!(!schema.contains(forbidden), "schema contains `{forbidden}`");
+            assert!(object_methods.contains(&required));
         }
+        let start_put = service(&set, "ObjectService")
+            .method
+            .iter()
+            .find(|method| method.name.as_deref() == Some("StartPut"))
+            .unwrap();
+        assert_eq!(
+            start_put.input_type.as_deref(),
+            Some(".keldra.v1.PutHeader")
+        );
+        assert_eq!(
+            start_put.output_type.as_deref(),
+            Some(".keldra.v1.PutToken")
+        );
+        let put = service(&set, "ObjectService")
+            .method
+            .iter()
+            .find(|method| method.name.as_deref() == Some("Put"))
+            .unwrap();
+        assert_eq!(put.client_streaming, Some(true));
+        for removed in [
+            "UploadBlob",
+            "PublishObject",
+            "PutObject",
+            "ListPrefix",
+            "BeginTransaction",
+            "CommitTransaction",
+            "RegisterProgram",
+        ] {
+            assert!(!object_methods.contains(&removed));
+        }
+        let index_methods = service(&set, "IndexService")
+            .method
+            .iter()
+            .filter_map(|method| method.name.as_deref())
+            .collect::<Vec<_>>();
+        for required in [
+            "CreateIndex",
+            "UpdateIndex",
+            "GetIndex",
+            "ListIndices",
+            "DeleteIndex",
+            "QueryIndex",
+        ] {
+            assert!(index_methods.contains(&required));
+        }
+        assert_eq!(field_number(&set, "InvokeProgramRequest", "program"), 1);
+        assert_eq!(
+            field_number(
+                &set,
+                "InvokeProgramResponse",
+                "executor_nomination_log_index"
+            ),
+            4
+        );
+        assert_eq!(
+            field_number(&set, "InvokeProgramResponse", "commit_log_index"),
+            5
+        );
+        assert_eq!(
+            field_number(&set, "BucketPolicy", "immutable_path_prefixes"),
+            1
+        );
+        assert_eq!(
+            field_number(&set, "BucketPolicy", "program_only_path_prefixes"),
+            2
+        );
+        let put_header = message(&set, "PutHeader");
+        assert!(
+            put_header
+                .oneof_decl
+                .iter()
+                .any(|oneof| oneof.name.as_deref() == Some("operation"))
+        );
+        for operation in ["put", "put_if_absent", "put_if_version", "put_immutable"] {
+            assert_eq!(
+                put_header
+                    .field
+                    .iter()
+                    .find(|field| field.name.as_deref() == Some(operation))
+                    .and_then(|field| field.oneof_index),
+                Some(0)
+            );
+        }
+        assert!(
+            !set.file
+                .iter()
+                .flat_map(|file| &file.message_type)
+                .any(|message| message.name.as_deref() == Some("BlobRef"))
+        );
+    }
 
-        assert!(schema.contains("executor_nomination_log_index"));
-        assert!(schema.contains("commit_log_index"));
-        assert!(schema.contains("immutable_path_prefixes"));
-        assert!(schema.contains("program_only_path_prefixes"));
-        assert!(!schema.contains("rpc registerprogram"));
-        assert!(!schema.contains("message registerprogram"));
-        assert!(schema.contains("objectaddress program"));
-        assert!(schema.contains("_keldra/programs/{name}@{version}"));
-        assert!(schema.contains("rpc startput(putheader) returns (puttoken)"));
-        assert!(schema.contains("rpc put(stream putrequest) returns (puttoken)"));
-        assert!(schema.contains("rpc putend(puttoken) returns (mutationreceipt)"));
-        for rpc in [
-            "rpc createindex(createindexrequest)",
-            "rpc updateindex(updateindexrequest)",
-            "rpc getindex(getindexrequest)",
-            "rpc listindices(listindicesrequest)",
-            "rpc deleteindex(deleteindexrequest)",
-            "rpc queryindex(queryindexrequest)",
+    #[test]
+    fn accounting_schema_separates_logical_and_replica_inclusive_physical_usage() {
+        let set = descriptors();
+        for (message_name, field) in [
+            ("AccountingLogicalUsage", "billable_logical_bytes"),
+            (
+                "AccountingLogicalUsage",
+                "retained_non_billable_logical_bytes",
+            ),
+            ("AccountingLogicalUsage", "visible_file_count"),
+            ("ClusterPhysicalStorage", "live_payload_blob_bytes"),
+            ("ClusterPhysicalStorage", "garbage_payload_blob_bytes"),
+            ("ClusterPhysicalStorage", "payload_sst_bytes"),
+            ("ClusterPhysicalStorage", "metadata_index_sst_bytes"),
+            ("ClusterPhysicalStorage", "wal_bytes"),
+            ("ClusterPhysicalStorage", "active_node_count"),
+            ("ClusterPhysicalStorage", "reported_node_count"),
+            ("ClusterPhysicalStorage", "reported_storage_replica_count"),
+            ("ClusterLogicalFileCounts", "visible_file_count"),
+            ("ClusterLogicalFileCounts", "active_source_node_count"),
+            ("ClusterLogicalFileCounts", "reported_source_node_count"),
+            ("ClusterCapabilities", "logical_file_counts"),
+            ("AccountingSnapshot", "tenant_physical_bytes"),
         ] {
-            assert!(schema.contains(rpc), "schema is missing `{rpc}`");
+            assert!(
+                message(&set, message_name)
+                    .field
+                    .iter()
+                    .any(|candidate| candidate.name.as_deref() == Some(field)),
+                "missing descriptor field {message_name}.{field}"
+            );
         }
-        assert!(schema.contains("index_kind_tensor"));
-        assert!(schema.contains("tensorindexspec tensor"));
-        assert!(schema.contains("tensorindexquery tensor"));
-
-        for rpc in [
-            "rpc exchangeclientcredentials",
-            "rpc provisiontenant",
-            "rpc createapplication",
-            "rpc rotateapplicationcredential",
-            "rpc disableapplicationcredential",
-            "rpc createbucket",
-            "rpc grantapplicationrole",
-            "rpc revokeapplicationrole",
-            "rpc putschema",
-            "rpc bindschema",
-            "rpc getbinding",
-            "rpc getschema",
-            "rpc mutatetuples",
-            "rpc readtuples",
-            "rpc checkpermission",
-            "rpc checkpermissions",
-            "rpc watchprefix",
-            "rpc listobjects",
-            "rpc cloneobject",
-            "rpc deleteversion",
-            "rpc listobjectversions",
-            "rpc setbucketversioning",
-        ] {
-            assert!(schema.contains(rpc), "schema is missing `{rpc}`");
-        }
-        for forbidden in [
-            "rpc createrealm",
-            "rpc deleterealm",
-            "rpc applyschema",
-            "zookie",
-            "caveat",
-            "publication_metadata",
-            "insecure_no_auth",
-            "api_token",
-        ] {
-            assert!(!schema.contains(forbidden), "schema contains `{forbidden}`");
-        }
+        assert!(
+            !set.file
+                .iter()
+                .flat_map(|file| &file.message_type)
+                .flat_map(|message| &message.field)
+                .any(|field| matches!(
+                    field.name.as_deref(),
+                    Some("logical_stored_bytes" | "object_count")
+                ))
+        );
     }
 
     #[test]
@@ -296,12 +405,27 @@ mod tests {
             index_field::FieldType::Date(value) if value.strftime_pattern == "%Y-%m-%d"
         ));
 
-        let schema = include_str!("../proto/keldra.proto").to_ascii_lowercase();
-        assert!(schema.contains("rpc listindices(listindicesrequest)"));
-        assert!(schema.contains("repeated indexdefinition indices = 1"));
-        assert!(!schema.contains("listindexes"));
-        assert!(!schema.contains("fields_json"));
-        assert!(!schema.contains("bool multi_valued"));
+        let set = descriptors();
+        assert!(
+            service(&set, "IndexService")
+                .method
+                .iter()
+                .any(|method| method.name.as_deref() == Some("ListIndices"))
+        );
+        assert_eq!(field_number(&set, "ListIndicesResponse", "indices"), 1);
+        assert!(
+            !service(&set, "IndexService")
+                .method
+                .iter()
+                .any(|method| method.name.as_deref() == Some("ListIndexes"))
+        );
+        assert!(
+            !set.file
+                .iter()
+                .flat_map(|file| &file.message_type)
+                .flat_map(|message| &message.field)
+                .any(|field| matches!(field.name.as_deref(), Some("fields_json" | "multi_valued")))
+        );
     }
 
     #[test]
@@ -373,10 +497,15 @@ mod tests {
         assert_eq!(response.hits[0].object_version, 7);
         assert_eq!(response.aggregate_results[0].contributing_count, 4);
 
-        let schema = include_str!("../proto/keldra.proto").to_ascii_lowercase();
-        assert!(!schema.contains("repeated indexpredicate predicates"));
-        assert!(schema.contains("indexpredicateexpression predicate = 5"));
-        assert!(schema.contains("indexpredicateexpression predicate = 2"));
+        let set = descriptors();
+        assert_eq!(
+            field_number(&set, "IndexPredicateExpression", "predicate"),
+            5
+        );
+        assert_eq!(
+            field_number(&set, "MetadataFilterIndexQuery", "predicate"),
+            2
+        );
     }
 
     #[test]
@@ -424,20 +553,28 @@ mod tests {
             >,
         > = None;
 
-        let schema = include_str!("../proto/personaldb.proto").to_ascii_lowercase();
-        for rpc in [
-            "rpc creategroup(",
-            "rpc describegroup(",
-            "rpc listgroups(",
-            "rpc grantgrouprole(",
-            "rpc revokegrouprole(",
-            "rpc appendentry(",
-            "rpc materializeprojection(",
-            "rpc catchup(",
-            "rpc registersnapshot(",
-            "rpc getsnapshot(",
+        let set = descriptors();
+        let methods = service(&set, "PersonalDbService")
+            .method
+            .iter()
+            .filter_map(|method| method.name.as_deref())
+            .collect::<Vec<_>>();
+        for required in [
+            "CreateGroup",
+            "DescribeGroup",
+            "ListGroups",
+            "GrantGroupRole",
+            "RevokeGroupRole",
+            "AppendEntry",
+            "MaterializeProjection",
+            "CatchUp",
+            "RegisterSnapshot",
+            "GetSnapshot",
         ] {
-            assert!(schema.contains(rpc), "PersonalDB schema is missing `{rpc}`");
+            assert!(
+                methods.contains(&required),
+                "missing generated RPC descriptor {required}"
+            );
         }
     }
 

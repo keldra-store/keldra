@@ -73,7 +73,7 @@ impl IndexRequestContext {
     }
 
     pub(crate) fn remaining(&self) -> Result<std::time::Duration, Status> {
-        crate::v05::deadline_remaining(self.deadline)
+        crate::object_service::deadline_remaining(self.deadline)
     }
 }
 

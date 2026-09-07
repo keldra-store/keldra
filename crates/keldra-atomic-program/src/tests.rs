@@ -260,11 +260,10 @@ fn snapshot() -> ProgramSnapshot {
 
 fn write_json<'a>(bundle: &'a AtomicWriteBundle, key: &str) -> &'a Value {
     let write = bundle
-        .writes
-        .iter()
-        .find(|write| write.path.path == key)
+        .writes()
+        .find(|(participant, _)| participant.path.path == key)
         .unwrap();
-    match write.value.as_ref().unwrap() {
+    match write.1.value.as_ref().unwrap() {
         StoredValue::Json(value) => value,
         StoredValue::Opaque(_) => panic!("expected JSON write"),
     }
@@ -369,8 +368,8 @@ async fn evaluates_typed_updates_copy_views_and_outputs() {
         .release();
 
     assert_eq!(reader_handle.reads.load(Ordering::SeqCst), 1);
-    assert_eq!(bundle.head_preconditions.len(), 3);
-    assert_eq!(bundle.writes.len(), 3);
+    assert_eq!(bundle.participants.len(), 3);
+    assert_eq!(bundle.writes().count(), 3);
 
     assert_eq!(
         write_json(&bundle, "account"),
@@ -381,9 +380,8 @@ async fn evaluates_typed_updates_copy_views_and_outputs() {
         &json!({"balance_before": 100, "balance_after": 75})
     );
     assert_eq!(write_json(&bundle, "summary"), &json!({"last_balance": 75}));
-    assert_eq!(bundle.outputs["balance"], json!(75));
-    assert_eq!(bundle.outputs["original_balance"], json!(100));
-    assert_eq!(bundle.receipt.outputs, bundle.outputs);
+    assert_eq!(bundle.receipt.outputs["balance"], json!(75));
+    assert_eq!(bundle.receipt.outputs["original_balance"], json!(100));
 
     let requested = reader_handle.requested.lock().unwrap().clone();
     assert!(requested.windows(2).all(|pair| pair[0] < pair[1]));
@@ -411,7 +409,11 @@ async fn canonicalized_prepare_reads_and_writes_the_physical_target() {
         .unwrap()
         .release();
     assert!(requested.lock().unwrap().contains(&canonical));
-    assert!(bundle.writes.iter().any(|write| write.path == canonical));
+    assert!(
+        bundle
+            .writes()
+            .any(|(participant, _)| participant.path == canonical)
+    );
 }
 
 #[tokio::test]
@@ -447,7 +449,7 @@ async fn accepts_any_bounded_path_matching_the_registered_template() {
         .insert("entry".into(), "remote".into());
 
     let lease = engine.prepare(&context(), &invocation).await.unwrap();
-    assert_eq!(lease.bundle().writes.len(), 3);
+    assert_eq!(lease.bundle().writes().count(), 3);
     assert_eq!(reader_handle.reads.load(Ordering::SeqCst), 1);
 }
 
@@ -514,12 +516,11 @@ async fn recreating_a_tombstone_preserves_its_version_as_the_cas_boundary() {
         .unwrap()
         .release();
     let ledger = bundle
-        .writes
-        .iter()
-        .find(|write| write.path.path == "ledger/event-7")
+        .writes()
+        .find(|(participant, _)| participant.path.path == "ledger/event-7")
         .unwrap();
     assert_eq!(
-        ledger.expected,
+        ledger.0.expected,
         ObservedHead::Version {
             version: "deleted-6".into()
         }
@@ -798,4 +799,33 @@ fn invocation_input_json_rejects_misspelled_top_level_and_nested_fields() {
     let error = serde_json::from_value::<ProgramInput>(nested).unwrap_err();
     assert!(error.to_string().contains("unknown field"));
     assert!(error.to_string().contains("versoin"));
+}
+
+#[test]
+fn atomic_bundle_has_one_clean_v1_participant_representation() {
+    let bundle = AtomicWriteBundle {
+        participants: vec![AtomicParticipant {
+            path: path("one"),
+            expected: ObservedHead::NeverExisted,
+            write: Some(VersionedWrite {
+                value: Some(StoredValue::Json(json!({"value": 1}))),
+                content_type: Some("application/json".into()),
+            }),
+        }],
+        receipt: CommandReceipt {
+            program_path_hash: [1; 32],
+            command_id: "command".into(),
+            input_fingerprint: "input".into(),
+            outputs: BTreeMap::new(),
+        },
+    };
+    let value = serde_json::to_value(&bundle).unwrap();
+    assert!(value.get("participants").is_some());
+    assert!(value.get("head_preconditions").is_none());
+    assert!(value.get("writes").is_none());
+    assert!(value.get("outputs").is_none());
+
+    let mut legacy = value;
+    legacy["writes"] = json!([]);
+    assert!(serde_json::from_value::<AtomicWriteBundle>(legacy).is_err());
 }

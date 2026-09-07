@@ -6,7 +6,7 @@ by KELDRA-0020 and implementation in progress.
 > Historical evidence note: references below to v4/v5 artifacts, builders,
 > definition-local manifests, and their telemetry describe the superseded
 > system that established the redesign requirement. They are retained as
-> evidence, not supported v6 behavior or a fallback. The clean-break v6
+> evidence, not supported v1 behavior or a fallback. The clean-break v1
 > architecture uses partition-owned memory-first pipelines, shared physical
 > recipes, partition roots/checkpoints, and no legacy reader or builder path.
 

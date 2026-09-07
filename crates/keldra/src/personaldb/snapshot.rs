@@ -16,7 +16,7 @@ use tonic::{Request, Status};
 use super::authorization::GroupPermission;
 use crate::authentication::Caller;
 use crate::distributed_list::OriginalBearer;
-use crate::v05::{deadline_remaining, request_deadline};
+use crate::object_service::{deadline_remaining, request_deadline};
 
 use super::model::{
     GroupScope, protocol_status, snapshot_bytes_path, snapshot_manifest_path, storage_command_id,

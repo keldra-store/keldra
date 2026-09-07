@@ -475,7 +475,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         && publication_visibility_samples_complete
         && publication_visibility_p99_passed;
     let report = Report {
-        schema: "keldra.index-contention-qualification.v2",
+        schema: "keldra.index-contention-qualification.v1",
         started_unix_milliseconds,
         completed_unix_milliseconds: unix_millis()?,
         result: if correctness_passed && workload_passed && responsiveness_passed {

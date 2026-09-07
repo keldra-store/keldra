@@ -16,7 +16,7 @@ use time::{Date, Month, PrimitiveDateTime, Time};
 
 use super::{S3Error, S3State};
 use crate::authentication::Caller;
-use crate::v05::GatewayIdentity;
+use crate::object_service::GatewayIdentity;
 
 const MAX_CLOCK_SKEW: Duration = Duration::from_secs(15 * 60);
 

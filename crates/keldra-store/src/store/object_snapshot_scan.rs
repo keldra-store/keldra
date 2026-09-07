@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +14,10 @@ use super::{
     CF_HEADS, CF_METADATA, CF_OBJECT_ALIAS_REGISTRIES, CF_VERSIONS, MAX_OBJECT_RECORD_EXPORT_BYTES,
     MAX_OBJECT_RECORD_EXPORT_RECORDS, StoredVersion,
 };
-use crate::key::{BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TenantId};
+use crate::key::{
+    BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TenantId,
+    contains_reserved_keldra_segment,
+};
 use crate::watch::{LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_OFFSET_KEY};
 use crate::{
     Head, MAX_CONTENT_TYPE_BYTES, MUTATION_STAMP_FORMAT, ObjectAliasRegistry, ObjectKey, SourceId,
@@ -25,6 +29,7 @@ use super::object_snapshot::ObjectSnapshotError;
 const CURRENT_HEAD_CURSOR_FORMAT: u8 = 1;
 const CURRENT_HEAD_CURSOR_EXACT_PATH_DOMAIN: u8 = 0;
 const MAX_CURRENT_HEAD_CURSOR_KEY_BYTES: usize = 16 * 1024;
+const MAX_LOGICAL_FILE_COUNT_TENANTS: usize = 65_536;
 /// Internal snapshot frames are byte-bounded first. This larger record cap
 /// avoids turning a 16 MiB frame of small descriptors into 1,000-record RPCs.
 pub const MAX_CURRENT_HEAD_SNAPSHOT_RECORDS: u32 = 65_536;
@@ -42,8 +47,22 @@ pub struct CurrentObjectSnapshot {
     pub exact_path: String,
     pub head: Head,
     pub version: Version,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub alias_registry: Option<ObjectAliasRegistry>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceOwnedLogicalFileCounts {
+    pub visible_file_count: u64,
+    pub tenant_visible_file_counts: BTreeMap<u64, u64>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 impl CurrentObjectSnapshot {
@@ -227,6 +246,87 @@ impl CurrentObjectSnapshotScan {
 }
 
 impl Store {
+    /// Counts tenant-visible logical names selected by the caller's committed
+    /// ownership view. The one RocksDB snapshot prevents concurrent mutations
+    /// from moving a name between pages, and ownership filtering prevents
+    /// replica copies from inflating a cluster sum.
+    pub fn source_owned_logical_file_counts(
+        &self,
+        deadline: std::time::Instant,
+        owns: impl Fn(u64, u64, &str) -> bool,
+    ) -> Result<SourceOwnedLogicalFileCounts, ObjectSnapshotError> {
+        let snapshot = self.db.snapshot();
+        let heads_cf = self.cf(CF_HEADS).map_err(object_storage)?;
+        let versions_cf = self.cf(CF_VERSIONS).map_err(object_storage)?;
+        let aliases_cf = self
+            .cf(CF_OBJECT_ALIAS_REGISTRIES)
+            .map_err(object_storage)?;
+        let prefix = [STORAGE_KEY_FORMAT_VERSION];
+        let mut counts = SourceOwnedLogicalFileCounts::default();
+
+        for item in snapshot.iterator_cf(heads_cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            if std::time::Instant::now() >= deadline {
+                return Err(object_storage(
+                    "logical file count scan exceeded its operational deadline",
+                ));
+            }
+            let (key, encoded_head) = item.map_err(object_storage)?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if key.len() <= BucketIdentity::ENCODED_BYTES {
+                return Err(object_storage("current head key is malformed"));
+            }
+            let identity = BucketIdentity::decode(&key[..BucketIdentity::ENCODED_BYTES])
+                .map_err(object_storage)?;
+            let record = decode_current_head(
+                identity,
+                &key,
+                &encoded_head,
+                &snapshot,
+                versions_cf,
+                aliases_cf,
+            )?;
+            if record.head.deleted
+                || record.version.protected_link_descriptor
+                || contains_reserved_keldra_segment(&record.exact_path)
+                || !owns(record.tenant_id, record.bucket_id, &record.exact_path)
+            {
+                continue;
+            }
+            let visible_names = 1_u64
+                .checked_add(
+                    record
+                        .alias_registry
+                        .as_ref()
+                        .map_or(0, |registry| registry.aliases.len() as u64),
+                )
+                .ok_or_else(|| object_storage("logical file count overflow"))?;
+            counts.visible_file_count = counts
+                .visible_file_count
+                .checked_add(visible_names)
+                .ok_or_else(|| object_storage("logical file count overflow"))?;
+            if !counts
+                .tenant_visible_file_counts
+                .contains_key(&record.tenant_id)
+                && counts.tenant_visible_file_counts.len() == MAX_LOGICAL_FILE_COUNT_TENANTS
+            {
+                return Err(object_storage(
+                    "logical file count tenant cardinality exceeds the operational response bound",
+                ));
+            }
+            let tenant = counts
+                .tenant_visible_file_counts
+                .entry(record.tenant_id)
+                .or_default();
+            *tenant = tenant
+                .checked_add(visible_names)
+                .ok_or_else(|| object_storage("tenant logical file count overflow"))?;
+        }
+        Ok(counts)
+    }
+
     /// Reads one exact current head and its immutable descriptor by stable
     /// storage identity. Historical descriptors are not iterated or decoded.
     pub fn export_current_object_snapshot(

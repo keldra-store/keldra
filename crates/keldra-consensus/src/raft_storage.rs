@@ -18,7 +18,7 @@ const CF_LOG: &str = "raft_log";
 const CF_META: &str = "raft_meta";
 const CF_APPLIED: &str = "applied_journal";
 
-const KEY_STORAGE_CONFIG: &[u8] = b"storage-config-v2";
+const KEY_STORAGE_CONFIG: &[u8] = b"storage-config-v1";
 const KEY_LOCAL_NODE_ID: &[u8] = b"local-node-id";
 const KEY_VOTE: &[u8] = b"vote";
 const KEY_LAST_LOG_ID: &[u8] = b"last-log-id";
@@ -226,13 +226,21 @@ impl DurableStore {
         let log_cf = self.cf(CF_LOG)?;
         let meta_cf = self.cf(CF_META)?;
         let mut batch = WriteBatch::default();
-        for entry in self.scan_logs(from..)? {
-            batch.delete_cf(log_cf, log_key(entry.log_id.index));
+        let last_log_id = self.last_log_id()?;
+        if let Some(last) = last_log_id.filter(|last| last.index >= from) {
+            batch.delete_range_cf(
+                log_cf,
+                log_key(from).to_vec(),
+                log_range_end_inclusive(last.index),
+            );
         }
         let previous = if from == 0 {
             None
         } else {
-            self.scan_logs(from - 1..from)?.into_iter().next()
+            self.db
+                .get_cf(log_cf, log_key(from - 1))?
+                .map(|bytes| codec::decode_record::<RaftEntry>(&bytes))
+                .transpose()?
         };
         if let Some(previous) = previous {
             batch.put_cf(
@@ -263,9 +271,11 @@ impl DurableStore {
         let log_cf = self.cf(CF_LOG)?;
         let meta_cf = self.cf(CF_META)?;
         let mut batch = WriteBatch::default();
-        for entry in self.scan_logs(..=through.index)? {
-            batch.delete_cf(log_cf, log_key(entry.log_id.index));
-        }
+        batch.delete_range_cf(
+            log_cf,
+            log_key(0).to_vec(),
+            log_range_end_inclusive(through.index),
+        );
         batch.put_cf(
             meta_cf,
             KEY_LAST_PURGED_LOG_ID,
@@ -338,11 +348,17 @@ impl DurableStore {
             codec::wrap_record(&snapshot.data)?,
         );
 
-        let through = snapshot.meta.last_log_id.map(|log_id| log_id.index);
-        for entry in self.scan_applied()? {
-            if clear_all_applied || through.is_some_and(|index| entry.log_id.index <= index) {
-                batch.delete_cf(applied_cf, log_key(entry.log_id.index));
-            }
+        let through = if clear_all_applied {
+            Some(u64::MAX)
+        } else {
+            snapshot.meta.last_log_id.map(|log_id| log_id.index)
+        };
+        if let Some(through) = through {
+            batch.delete_range_cf(
+                applied_cf,
+                log_key(0).to_vec(),
+                log_range_end_inclusive(through),
+            );
         }
         self.sync_write(batch)
     }
@@ -399,6 +415,17 @@ fn log_key(index: u64) -> [u8; 8] {
     index.to_be_bytes()
 }
 
+fn log_range_end_inclusive(index: u64) -> Vec<u8> {
+    match index.checked_add(1) {
+        Some(exclusive) => log_key(exclusive).to_vec(),
+        None => {
+            let mut after_maximum = log_key(u64::MAX).to_vec();
+            after_maximum.push(0);
+            after_maximum
+        }
+    }
+}
+
 fn uncompressed_options() -> Options {
     let mut options = Options::default();
     options.set_compression_type(DBCompressionType::None);
@@ -432,22 +459,6 @@ mod tests {
 
     use super::*;
 
-    const LEGACY_STORAGE_CONFIG: &[u8] = &[
-        0x04, 0x00, 0x00, 0x00, // max_commit_entries
-        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // max_commit_bytes
-    ];
-    const LEGACY_LOG_ID: &[u8] = &[
-        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader term
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader node id
-        0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log index
-    ];
-    const LEGACY_BLANK_LOG_ENTRY: &[u8] = &[
-        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader term
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader node id
-        0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log index
-        0x00, 0x00, 0x00, 0x00, // EntryPayload::Blank
-    ];
-
     fn config() -> StorageConfig {
         StorageConfig {
             max_commit_entries: 4,
@@ -460,41 +471,6 @@ mod tests {
             log_id: LogId::new(CommittedLeaderId::new(term, 1), index),
             payload: EntryPayload::Blank,
         }
-    }
-
-    #[test]
-    fn released_raw_records_open_without_migration() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = DurableStore::open(directory.path(), config(), 1).unwrap();
-        let mut legacy = WriteBatch::default();
-        legacy.put_cf(
-            store.cf(CF_META).unwrap(),
-            KEY_STORAGE_CONFIG,
-            LEGACY_STORAGE_CONFIG,
-        );
-        legacy.put_cf(store.cf(CF_META).unwrap(), KEY_LAST_LOG_ID, LEGACY_LOG_ID);
-        legacy.put_cf(
-            store.cf(CF_LOG).unwrap(),
-            log_key(11),
-            LEGACY_BLANK_LOG_ENTRY,
-        );
-        legacy.delete_cf(store.cf(CF_META).unwrap(), KEY_LOCAL_NODE_ID);
-        store.sync_write(legacy).unwrap();
-        drop(store);
-
-        let reopened = DurableStore::open(directory.path(), config(), 9).unwrap();
-        assert_eq!(
-            reopened.last_log_id().unwrap(),
-            Some(LogId::new(CommittedLeaderId::new(7, 1), 11))
-        );
-        assert_eq!(
-            reopened.scan_logs(11..12).unwrap(),
-            vec![blank_entry(7, 11)]
-        );
-        assert_eq!(
-            reopened.read_meta::<u64>(KEY_LOCAL_NODE_ID).unwrap(),
-            Some(9)
-        );
     }
 
     #[test]
@@ -568,5 +544,47 @@ mod tests {
         ));
 
         drop(DurableStore::open(directory.path(), config(), 17).unwrap());
+    }
+
+    #[test]
+    fn log_cleanup_range_endpoints_are_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(directory.path(), config(), 1).unwrap();
+        let entries = [blank_entry(1, 0), blank_entry(1, 1), blank_entry(1, 2)];
+        store.append_logs(&entries).unwrap();
+
+        store.truncate_logs(2).unwrap();
+        assert_eq!(store.scan_logs(..).unwrap(), entries[..2]);
+        assert_eq!(store.last_log_id().unwrap(), Some(entries[1].log_id));
+
+        store
+            .append_logs(std::slice::from_ref(&entries[2]))
+            .unwrap();
+        store.purge_logs(entries[1].log_id).unwrap();
+        assert_eq!(store.scan_logs(..).unwrap(), entries[2..]);
+        assert_eq!(store.last_purged_log_id().unwrap(), Some(entries[1].log_id));
+        assert_eq!(store.last_log_id().unwrap(), Some(entries[2].log_id));
+
+        store.append_applied(&entries).unwrap();
+        let snapshot = DurableSnapshot {
+            meta: SnapshotMeta {
+                last_log_id: Some(entries[1].log_id),
+                last_membership: StoredMembership::default(),
+                snapshot_id: "range-cleanup".into(),
+            },
+            data: b"snapshot".to_vec(),
+        };
+        store.save_snapshot(&snapshot, false).unwrap();
+        assert_eq!(store.scan_applied().unwrap(), entries[2..]);
+        store.save_snapshot(&snapshot, true).unwrap();
+        assert!(store.scan_applied().unwrap().is_empty());
+
+        assert_eq!(
+            log_range_end_inclusive(u64::MAX),
+            [u8::MAX; 8]
+                .into_iter()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>()
+        );
     }
 }

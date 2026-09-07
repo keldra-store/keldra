@@ -1,4 +1,4 @@
-//! Durable all-source progress for the v6 catalog feed.
+//! Durable all-source progress for the v1 catalog feed.
 
 use keldra_store::{DefinitionCheckpoint, DefinitionConsumerKind, Store};
 use tonic::Status;
@@ -16,7 +16,7 @@ pub(super) async fn persist(
 ) -> Result<(), Status> {
     for source in barrier.sources.values().copied() {
         let checkpoint = DefinitionCheckpoint {
-            consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
+            consumer_kind: DefinitionConsumerKind::V1IndexCatalog,
             source_id: source.source,
             next_offset: source.next_offset,
             observed_fence: barrier.fence,
@@ -29,6 +29,6 @@ pub(super) async fn persist(
         .map_err(join_status)?
         .map_err(internal_status)?;
     }
-    super::super::v6_telemetry::global().record_catalog_checkpoint(replayed_rows, replayed_bytes);
+    super::super::v1_telemetry::global().record_catalog_checkpoint(replayed_rows, replayed_bytes);
     Ok(())
 }

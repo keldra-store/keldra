@@ -11,9 +11,10 @@ use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{ChildStdin, Command};
+use tokio::sync::Semaphore;
 
-use super::{GitError, Target};
-use crate::v05::GatewayIdentity;
+use super::{GIT_PROCESS_TIMEOUT, GitError, Target};
+use crate::object_service::GatewayIdentity;
 
 const MAX_CGI_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CGI_ERROR_BYTES: u64 = 64 * 1024;
@@ -32,7 +33,12 @@ pub(super) async fn execute(
     content_type: Option<&str>,
     content_length: Option<u64>,
     body: Body,
+    process_admission: Arc<Semaphore>,
 ) -> Result<ExecutedGit, GitError> {
+    let process_permit = process_admission
+        .acquire_owned()
+        .await
+        .map_err(|_| GitError::internal("Git process admission is closed"))?;
     let root = repository
         .parent()
         .ok_or_else(|| GitError::internal("Git cache repository has no parent"))?;
@@ -81,9 +87,9 @@ pub(super) async fn execute(
     ));
 
     if !target.operation.streams_response() {
-        let output = child
-            .wait_with_output()
+        let output = tokio::time::timeout(GIT_PROCESS_TIMEOUT, child.wait_with_output())
             .await
+            .map_err(|_| GitError::internal("git-http-backend exceeded its operation deadline"))?
             .map_err(|error| GitError::internal(format!("wait for git-http-backend: {error}")))?;
         pump.await
             .map_err(|error| GitError::internal(format!("join Git request stream: {error}")))??;
@@ -108,7 +114,10 @@ pub(super) async fn execute(
         .stderr
         .take()
         .ok_or_else(|| GitError::internal("git-http-backend stderr is unavailable"))?;
-    let (status, headers, prefix) = read_cgi_head(&mut stdout).await?;
+    let (status, headers, prefix) =
+        tokio::time::timeout(GIT_PROCESS_TIMEOUT, read_cgi_head(&mut stdout))
+            .await
+            .map_err(|_| GitError::internal("git-http-backend exceeded its header deadline"))??;
     let error_output = tokio::spawn(async move {
         let mut bytes = Vec::new();
         stderr
@@ -118,42 +127,63 @@ pub(super) async fn execute(
         Ok::<_, io::Error>(bytes)
     });
     let stream = async_stream::stream! {
+        let _process_permit = process_permit;
+        let deadline = tokio::time::Instant::now() + GIT_PROCESS_TIMEOUT;
         if !prefix.is_empty() {
             yield Ok::<Bytes, io::Error>(prefix);
         }
         let mut buffer = vec![0_u8; 1024 * 1024];
         loop {
-            match stdout.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(read) => yield Ok(Bytes::copy_from_slice(&buffer[..read])),
-                Err(error) => {
+            match tokio::time::timeout_at(deadline, stdout.read(&mut buffer)).await {
+                Err(_) => {
+                    pump.abort();
+                    error_output.abort();
+                    yield Err(io::Error::new(io::ErrorKind::TimedOut, "git-http-backend exceeded its operation deadline"));
+                    return;
+                }
+                Ok(Ok(0)) => break,
+                Ok(Ok(read)) => yield Ok(Bytes::copy_from_slice(&buffer[..read])),
+                Ok(Err(error)) => {
+                    pump.abort();
+                    error_output.abort();
                     yield Err(error);
                     return;
                 }
             }
         }
-        let request_result = match pump.await {
-            Ok(result) => result.map_err(|error| io::Error::other(error.message)),
-            Err(error) => Err(io::Error::other(format!("join Git request stream: {error}"))),
+        let request_result = match tokio::time::timeout_at(deadline, pump).await {
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "Git request stream exceeded its operation deadline")),
+            Ok(Ok(result)) => result.map_err(|error| io::Error::other(error.message)),
+            Ok(Err(error)) => Err(io::Error::other(format!("join Git request stream: {error}"))),
         };
         if let Err(error) = request_result {
             yield Err(error);
             return;
         }
-        let process_status = match child.wait().await {
-            Ok(status) => status,
-            Err(error) => {
+        let process_status = match tokio::time::timeout_at(deadline, child.wait()).await {
+            Err(_) => {
+                error_output.abort();
+                yield Err(io::Error::new(io::ErrorKind::TimedOut, "git-http-backend exceeded its operation deadline"));
+                return;
+            }
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                error_output.abort();
                 yield Err(error);
                 return;
             }
         };
-        let stderr = match error_output.await {
-            Ok(Ok(stderr)) => stderr,
-            Ok(Err(error)) => {
+        let stderr = match tokio::time::timeout_at(deadline, error_output).await {
+            Err(_) => {
+                yield Err(io::Error::new(io::ErrorKind::TimedOut, "Git error stream exceeded its operation deadline"));
+                return;
+            }
+            Ok(Ok(Ok(stderr))) => stderr,
+            Ok(Ok(Err(error))) => {
                 yield Err(error);
                 return;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 yield Err(io::Error::other(format!("join Git error stream: {error}")));
                 return;
             }

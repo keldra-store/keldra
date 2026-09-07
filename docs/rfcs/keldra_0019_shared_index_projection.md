@@ -3,7 +3,7 @@
 Status: Superseded by KELDRA-0020
 
 Historical-only: this design must not remain wired as a fallback, feature flag,
-configuration mode, or compatibility path. V6 has no definition-local
+configuration mode, or compatibility path. V1 has no definition-local
 assembler or external builder; only Typed JSON returns in the initial clean
 break, through the partition-owned pipeline.
 

@@ -51,7 +51,7 @@ fn keys_are_versioned_fixed_width_and_big_endian() {
         [STORAGE_KEY_FORMAT_VERSION, b'C', 1, 0x12, 0x34]
     );
     assert_eq!(
-        checkpoint_key(DefinitionConsumerKind::V6IndexCatalog, 0x1234).unwrap(),
+        checkpoint_key(DefinitionConsumerKind::V1IndexCatalog, 0x1234).unwrap(),
         [STORAGE_KEY_FORMAT_VERSION, b'C', 3, 0x12, 0x34]
     );
     assert_eq!(
@@ -150,7 +150,7 @@ fn value_codecs_reject_unknown_versions_and_identity_mismatches() {
     );
 
     let checkpoint = DefinitionCheckpoint {
-        consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
+        consumer_kind: DefinitionConsumerKind::V1IndexCatalog,
         source_id: SourceId {
             node_id: 4,
             source_epoch: [8; 32],
@@ -287,7 +287,7 @@ async fn assignment_page_and_checkpoint_commit_and_page_together() {
 async fn identical_empty_checkpoint_page_is_a_storage_no_op() {
     let (_temporary, store) = store().await;
     let checkpoint = DefinitionCheckpoint {
-        consumer_kind: DefinitionConsumerKind::V6IndexCatalog,
+        consumer_kind: DefinitionConsumerKind::V1IndexCatalog,
         source_id: SourceId {
             node_id: 4,
             source_epoch: [8; 32],
@@ -322,7 +322,7 @@ async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() 
         tenant_id: 7,
         bucket_id: 9,
         definition_id: 11,
-        definition_path: "_keldra/indices/v6/definitions/example".into(),
+        definition_path: "_keldra/indices/v1/definitions/example".into(),
         object_version: VersionId(13),
         observed_fence: fence(17),
         rank: 0,
@@ -382,7 +382,7 @@ async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() 
     assert_eq!(due.definition_object_version, VersionId(14));
     assert_eq!(
         due.definition_path,
-        "_keldra/indices/v6/definitions/example"
+        "_keldra/indices/v1/definitions/example"
     );
     assert!(due.due_at_unix_millis > 0);
     assert_eq!(
@@ -391,6 +391,57 @@ async fn definition_delete_is_delivered_distinctly_and_removes_the_assignment() 
             .unwrap(),
         Some(checkpoint)
     );
+}
+
+#[tokio::test]
+async fn one_assignment_batch_stages_only_its_final_index_deletion() {
+    let (_temporary, store) = store().await;
+    let deletion = |version, observed_fence| {
+        DefinitionAssignmentMutation::Delete(DefinitionDeletion {
+            kind: DefinitionKind::Index,
+            tenant_id: 7,
+            bucket_id: 9,
+            definition_id: 11,
+            definition_path: "_keldra/indices/v1/definitions/example".into(),
+            object_version: VersionId(version),
+            observed_fence,
+            rank: 0,
+        })
+    };
+    let earlier = deletion(14, fence(18));
+    let final_deletion = deletion(15, fence(19));
+    let guard = store.definition_state_lock.lock().unwrap();
+    let mut batch = WriteBatch::default();
+    let mut clock_calls = 0;
+
+    let changed = store
+        .stage_assignment_mutations_with_clock(
+            &mut batch,
+            &[earlier.clone(), final_deletion.clone()],
+            || {
+                let due_at = 100 + clock_calls;
+                clock_calls += 1;
+                Ok(due_at)
+            },
+        )
+        .unwrap();
+    store.db.write(batch).unwrap();
+    drop(guard);
+
+    assert_eq!(changed, [earlier, final_deletion]);
+    assert_eq!(
+        clock_calls, 1,
+        "one identity must receive one final due time"
+    );
+    let due = store
+        .oldest_deleted_definition_cleanup()
+        .unwrap()
+        .expect("the final deletion must schedule cleanup");
+    assert_eq!(due.definition_object_version, VersionId(15));
+    assert_eq!(due.due_at_unix_millis, 100);
+    assert!(store.deleted_definition_cleanup_matches(&due).unwrap());
+    assert!(store.complete_deleted_definition_cleanup(&due).unwrap());
+    assert_eq!(store.oldest_deleted_definition_cleanup().unwrap(), None);
 }
 
 #[tokio::test]

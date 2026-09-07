@@ -402,6 +402,6 @@ qualify_no_event_membership_cutover() {
   save_log_suffix "${node}" "${membership_cutover_source_log_start}" "${evidence}"
   preserve_qualification_log \
     "${evidence}" \
-    "/var/tmp/keldra-v090-three-membership-no-event-${qualification_suffix}-${node}.log"
+    "/var/tmp/keldra-v1-three-membership-no-event-${qualification_suffix}-${node}.log"
   echo "[keldra-qualification] cutover advanced derived consumers through source ${node_id} tail ${membership_cutover_source_tail} under the new fence; the next ordinary write advanced it to ${tail}"
 }

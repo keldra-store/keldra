@@ -3,7 +3,7 @@
 > Historical evidence note: the D1--D64 builder, format-v5, manifest, and
 > per-definition publication descriptions below explain the superseded runtime
 > measured during the KELDRA-0020 investigation. They are not production
-> guidance for v6. The current harness separates logical definitions with
+> guidance for v1. The current harness separates logical definitions with
 > `KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX` from physical recipes with
 > `KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT`, and controls the pipeline
 > through `KELDRA_INDEXING_CORES` and `KELDRA_INDEX_PIPELINE_MEMORY_BYTES`. It
@@ -19,13 +19,13 @@ the single-node API through
 `192.168.64.3`, while the driver is built and run over SSH on
 `zcourts@192.168.64.1` from `/Users/zcourts/projects/keldra/keldra`. Keldra is
 never run as a native macOS server. The measured D/P details that follow are
-historical Docker evidence; current v6 release qualification is the direct SSD
+historical Docker evidence; current v1 release qualification is the direct SSD
 kit runner described below.
 
 ## Historical Docker comparison evidence
 
 The Docker and split-topology commands in this section preserve evidence from
-the superseded external-builder architecture. They are not v6 release
+the superseded external-builder architecture. They are not v1 release
 qualification and must not be used to set current throughput or correctness
 claims. The retained single-node and three-node wrappers now execute only their
 non-index release phases, so the command blocks below are archival evidence,
@@ -42,9 +42,9 @@ KELDRA_INDEX_CONTENTION_TOPOLOGY=single \
   ./scripts/qualify-index-contention.sh
 ```
 
-## Current v6 SSD qualification
+## Current v1 SSD qualification
 
-For the v6 SSD matrix, use `scripts/qualify-index-v6-ssd-scale.sh` on the SSD
+For the v1 SSD matrix, use `scripts/qualify-index-v1-ssd-scale.sh` on the SSD
 host. It is a direct binary-kit runbook, not a Docker wrapper: install the
 attested `keldra-server`, `keldra`, and `index-contention-qualification`
 binaries, this runner, `SOURCE_COMMIT`, `HARNESS_COMMIT`, and
@@ -56,7 +56,7 @@ per worker. Sustained defaults run three non-duplicating axes: the P1 logical
 ladder D1,D64,D1K,D10K,D250K at the largest resource cell; the D64 physical
 ladder P1,P4,P16,P64 at that same resource cell; and D64/P1 with W1,W2,W4,W8
 at 128/256 MiB per worker. The D250K catalog cell uses one configurable offered
-rate (`KELDRA_V6_SCALE_CATALOG_RATE`) rather than repeating the expensive
+rate (`KELDRA_V1_SCALE_CATALOG_RATE`) rather than repeating the expensive
 admission step at every rate; `qualify-index-catalog.sh` provides the separate
 create/restart catalog qualification. This avoids an uninformative full
 Cartesian product while varying each independent cause:
@@ -65,11 +65,15 @@ Cartesian product while varying each independent cause:
 ~/keldra_experiments/kit/
   SOURCE_COMMIT                         # exact 40-hex server revision
   HARNESS_COMMIT                        # exact 40-hex harness revision
+  CATALOG_HARNESS_COMMIT                # exact 40-hex catalog harness revision
   SHA256SUMS                            # sha256sum --check manifest for this kit
-  qualify-index-v6-ssd-scale.sh         # this exact runner
+  qualify-index-v1-ssd-scale.sh         # this exact runner
+  qualify-index-catalog.sh              # exact restart/catalog runner
+  qualification-disk-ledger.sh          # bounded owned-disk helper
   bin/keldra-server
   bin/keldra
   bin/index-contention-qualification
+  bin/index-catalog-qualification
 ```
 
 The controller creates that kit from one validated revision, writes its hash
@@ -78,7 +82,7 @@ fetch source during qualification.
 
 ```bash
 cd ~/keldra_experiments/kit
-KELDRA_V6_SCALE_MODE=sustained ./qualify-index-v6-ssd-scale.sh
+KELDRA_V1_SCALE_MODE=sustained ./qualify-index-v1-ssd-scale.sh
 ```
 
 Each offered-rate cell starts with fresh durable state and walks the ascending
@@ -87,11 +91,11 @@ open-loop rate ladder (smoke: 100, 1,000; sustained: 1,000, 5,000, 10,000,
 capacity-limit result, but treats correctness/workload failure as a failed run,
 not a capacity figure. A sustainable cell requires the public correctness and
 responsiveness gates plus a concurrent-phase source-lag slope no greater than
-`KELDRA_V6_SCALE_MAX_LAG_SLOPE_RECORDS_PER_SECOND` (default 1). The small
+`KELDRA_V1_SCALE_MAX_LAG_SLOPE_RECORDS_PER_SECOND` (default 1). The small
 object floor uses at least 1 KiB payloads. Sustained mode additionally runs a
 96 KiB pathological source-object stream at D1/P1 and the largest resource
 cell; it deliberately does not multiply that payload into D/P scale. Configure
-both through `KELDRA_V6_SCALE_OBJECT_SIZE_MATRIX`.
+both through `KELDRA_V1_SCALE_OBJECT_SIZE_MATRIX`.
 
 Before any performance cell, a separate fresh-state public-API preflight proves
 exact and range predicates, explicit ordering, facets, aggregates, and
@@ -109,8 +113,8 @@ definitions created/s, and recipe-spanning qualified-activation seconds, so
 D250K catalog admission is never folded into steady ingestion. The runner never estimates projected-byte
 throughput from input payload size. A development record may explicitly mark
 that value `null`, with its missing telemetry provenance, but it is not
-qualification evidence. A final v6 qualification requires two
-concurrent-phase `keldra_index_v6_summary` samples and derives source,
+qualification evidence. A final v1 qualification requires two
+concurrent-phase `keldra_index_v1_summary` samples and derives source,
 selected, prepared, projected, sealed, and checkpointed rows/bytes per second
 from their cumulative counters. Every required rate must be positive; missing,
 malformed, unchanged, or regressing summary evidence fails the cell. Raw driver
@@ -157,7 +161,7 @@ The evidence records all three settings. A result at one intensity must not be
 compared with another intensity as a before/after performance claim.
 
 The default mutation workload, `material-change`, changes an indexed generation
-on every update. The v6 projection-preserving head-delta path is qualified
+on every update. The v1 projection-preserving head-delta path is qualified
 separately with:
 
 ```bash
@@ -201,7 +205,7 @@ KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=1000 \
 Omit the variable or set it to `disabled` for the saturated-queue workload.
 Matrix entries may be any unique integer from 1 through 250,000. Physical
 recipes are independently bounded to 64. `1,4,16,64` remains the historical
-comparison matrix; v6 qualification separates D cardinality from P physical
+comparison matrix; v1 qualification separates D cardinality from P physical
 work rather than treating either as a proxy for the other.
 
 For supplementary three-node Docker evidence, use:
@@ -271,8 +275,8 @@ correctness, workload validity, and the configured responsiveness gate.
 
 The Docker contention wrapper defaults to the shared checkout release evidence
 directory and may be redirected with `KELDRA_INDEX_CONTENTION_EVIDENCE_ROOT`.
-For every remote v6 run, use the direct SSD runner above: it has no such
-override and writes only to `~/keldra_experiments/results/index-v6-scale/`.
+For every remote v1 run, use the direct SSD runner above: it has no such
+override and writes only to `~/keldra_experiments/results/index-v1-scale/`.
 The stable `latest` symlink identifies the active or most recent run.
 
 Monitor an active run without reading credentials or attaching to the workload:

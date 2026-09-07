@@ -1,8 +1,9 @@
 use keldra_consensus::{
-    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, AtomicBundleAuthority, BundleHash,
-    BundleRef, Command, CommitBatch, CommitResult, DurabilityClass, DurabilityEvidenceHash,
-    ExecutorNomination, InvocationFingerprint, InvocationId, MAX_COMMITTED_INVOCATION_BYTES,
-    MAX_COMMITTED_INVOCATIONS, NodeId, ProgramHash, ProgramPathHash, StateMachine,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, AtomicBundleAuthority, BeginBatch,
+    BeginResult, BundleRef, Command, CommitPreparedBatch, CommitResult, DurabilityClass,
+    DurabilityEvidenceHash, ExecutorNomination, InvocationFingerprint, InvocationId,
+    MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS, NodeId, ParticipantManifestHash,
+    ProgramHash, ProgramPathHash, StateMachine,
 };
 use openraft::{CommittedLeaderId, LogId};
 
@@ -37,21 +38,24 @@ fn batch(
     program: Program,
     invocation: u8,
     input: u8,
-) -> CommitBatch {
-    CommitBatch {
+) -> BeginBatch {
+    let bundle_hash = [invocation.wrapping_add(2).max(1); 32];
+    BeginBatch {
         executor,
         nomination_log_index,
-        program_path_hash: program.path_hash,
-        program_hash: program.object_hash,
+        authority: AtomicBundleAuthority::StoredProgram {
+            program_path_hash: program.path_hash,
+            program_hash: program.object_hash,
+        },
         invocation_id: InvocationId([invocation; 32]),
         input_fingerprint: InvocationFingerprint([input; 32]),
         bundle_ref: BundleRef {
-            hash: [invocation.wrapping_add(1).max(1); 32],
+            hash: bundle_hash,
             length: u64::from(invocation) + 1,
         },
-        bundle_hash: BundleHash([invocation.wrapping_add(2).max(1); 32]),
         durability_class: DurabilityClass([2; 32]),
         durability_evidence_hash: DurabilityEvidenceHash([invocation.wrapping_add(3).max(1); 32]),
+        participant_manifest_hash: ParticipantManifestHash([invocation.wrapping_add(4).max(1); 32]),
         proposal_at_unix_millis: 1_000 + u64::from(invocation),
         replay_expires_at_unix_millis: 1_000
             + u64::from(invocation)
@@ -72,9 +76,22 @@ fn nominate(state: &mut StateMachine, log_index: u64, executor: NodeId) -> Execu
 fn commit(
     state: &mut StateMachine,
     log_index: u64,
-    batch: CommitBatch,
+    batch: BeginBatch,
 ) -> Result<CommitResult, ApplyError> {
-    let result = state.apply(log_id(log_index), &Command::CommitBatch(batch))?;
+    let result = state.apply(log_id(log_index), &Command::BeginBatch(batch))?;
+    if let ApplyResult::BatchBegun(BeginResult::AlreadyCommitted(result)) = result {
+        return Ok(result);
+    }
+    let result = state.apply(
+        log_id(log_index),
+        &Command::CommitPreparedBatch(CommitPreparedBatch {
+            executor: batch.executor,
+            nomination_log_index: batch.nomination_log_index,
+            begin_cursor: log_index,
+            invocation_id: batch.invocation_id,
+            participant_manifest_hash: batch.participant_manifest_hash,
+        }),
+    )?;
     let ApplyResult::BatchCommitted(result) = result else {
         unreachable!()
     };
@@ -327,7 +344,7 @@ fn commit_is_fenced_by_the_current_executor_and_pins_an_external_program() {
     assert_eq!(state.last_commit_cursor(), Some(7));
     assert_eq!(
         committed.invocation.committed_batch.authority,
-        AtomicBundleAuthority::LegacyProgramOnly {
+        AtomicBundleAuthority::StoredProgram {
             program_path_hash: code.path_hash,
             program_hash: code.object_hash,
         }

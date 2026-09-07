@@ -1,0 +1,275 @@
+name: Keldra v1 Index Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Candidate tag to build and qualify exactly
+        required: true
+        type: string
+      ssd_runner:
+        description: JSON label array for the attested SSD qualification runner
+        required: true
+        default: '["self-hosted","linux","x64","keldra-index-ssd"]'
+        type: string
+      rotational_runner:
+        description: JSON label array for the attested rotational qualification runner
+        required: true
+        default: '["self-hosted","linux","x64","keldra-index-rotational"]'
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: keldra-v1-index-acceptance-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    name: Resolve v1 index candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.candidate.outputs.version }}
+      commit: ${{ steps.candidate.outputs.commit }}
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Resolve exact candidate
+        id: candidate
+        env:
+          VERSION: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z._-]+)?$ ]] || exit 2
+          commit="$(git rev-parse --verify "refs/tags/${VERSION}^{commit}")"
+          test "$commit" = "$(git rev-parse --verify HEAD^{commit})"
+          manifest_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          test "$manifest_version" = "$VERSION"
+          printf 'version=%s\ncommit=%s\n' "$VERSION" "$commit" >>"$GITHUB_OUTPUT"
+
+  build-kit:
+    name: Build exact v1 index qualification kit
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.candidate.outputs.commit }}
+
+      - name: Use runner-local Cargo target
+        run: printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/keldra-cargo-target" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake jq libclang-dev pkg-config protobuf-compiler
+
+      - name: Build candidate-bound qualification binaries
+        env:
+          SOURCE_COMMIT: ${{ needs.candidate.outputs.commit }}
+          KIT_ROOT: ${{ runner.temp }}/keldra-v1-index-kit
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --jobs "$CARGO_BUILD_JOBS" \
+            --package keldra-server \
+            --bin keldra-server \
+            --example index_contention_qualification \
+            --example index_catalog_qualification
+          cargo build --release --locked --jobs "$CARGO_BUILD_JOBS" \
+            --package keldra-cli --bin keldra
+          target="$(cargo metadata --quiet --locked --no-deps --format-version 1 | jq -er '.target_directory')"
+          install -d -m 0755 "$KIT_ROOT/bin"
+          install -m 0755 "$target/release/keldra-server" "$KIT_ROOT/bin/keldra-server"
+          install -m 0755 "$target/release/keldra" "$KIT_ROOT/bin/keldra"
+          install -m 0755 "$target/release/examples/index_contention_qualification" "$KIT_ROOT/bin/index-contention-qualification"
+          install -m 0755 "$target/release/examples/index_catalog_qualification" "$KIT_ROOT/bin/index-catalog-qualification"
+          install -m 0755 scripts/qualify-index-v1-ssd-scale.sh "$KIT_ROOT/qualify-index-v1-ssd-scale.sh"
+          install -m 0755 scripts/qualify-index-catalog.sh "$KIT_ROOT/qualify-index-catalog.sh"
+          install -m 0644 scripts/qualification-disk-ledger.sh "$KIT_ROOT/qualification-disk-ledger.sh"
+          printf '%s\n' "$SOURCE_COMMIT" >"$KIT_ROOT/SOURCE_COMMIT"
+          printf '%s\n' "$SOURCE_COMMIT" >"$KIT_ROOT/HARNESS_COMMIT"
+          printf '%s\n' "$SOURCE_COMMIT" >"$KIT_ROOT/CATALOG_HARNESS_COMMIT"
+          (
+            cd "$KIT_ROOT"
+            sha256sum SOURCE_COMMIT HARNESS_COMMIT CATALOG_HARNESS_COMMIT \
+              qualify-index-v1-ssd-scale.sh qualify-index-catalog.sh qualification-disk-ledger.sh \
+              bin/keldra-server bin/keldra bin/index-contention-qualification \
+              bin/index-catalog-qualification >SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Upload exact candidate kit
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: keldra-v1-index-kit
+          path: ${{ runner.temp }}/keldra-v1-index-kit
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  qualify-scale:
+    name: Run accepted v1 sustained shard ${{ matrix.shard }} (${{ matrix.storage_class }})
+    needs: [candidate, build-kit]
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        storage_class: [ssd, rotational]
+    runs-on: ${{ fromJSON(matrix.storage_class == 'ssd' && inputs.ssd_runner || inputs.rotational_runner) }}
+    timeout-minutes: 360
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.candidate.outputs.commit }}
+
+      - name: Download exact candidate kit
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: keldra-v1-index-kit
+          path: ${{ runner.temp }}/keldra-v1-index-kit
+
+      - name: Restore executable modes on the verified kit
+        run: |
+          chmod 0755 \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/qualify-index-v1-ssd-scale.sh" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/qualify-index-catalog.sh" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/bin/keldra-server" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/bin/keldra" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/bin/index-contention-qualification" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/bin/index-catalog-qualification"
+
+      - name: Run one exact sustained configuration axis
+        env:
+          KELDRA_V1_ACCEPTANCE_STORAGE_CLASS: ${{ matrix.storage_class }}
+          KELDRA_V1_ACCEPTANCE_GATE: index-v1-sustained
+          KELDRA_V1_ACCEPTANCE_SHARD_INDEX: ${{ matrix.shard }}
+          KELDRA_V1_ACCEPTANCE_SHARD_COUNT: '16'
+          KELDRA_V1_ACCEPTANCE_VERSION: ${{ needs.candidate.outputs.version }}
+          KELDRA_V1_ACCEPTANCE_COMMIT: ${{ needs.candidate.outputs.commit }}
+          KELDRA_V1_ACCEPTANCE_KIT_ROOT: ${{ runner.temp }}/keldra-v1-index-kit
+          KELDRA_V1_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/keldra-v1-index-part
+        run: ./scripts/qualify-index-v1-accepted-host.sh
+
+      - name: Upload exact sustained shard evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: keldra-v1-index-part-${{ matrix.storage_class }}-scale-${{ matrix.shard }}
+          path: ${{ runner.temp }}/keldra-v1-index-part
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  qualify-catalog:
+    name: Run accepted Catalog-250K gate (${{ matrix.storage_class }})
+    needs: [candidate, build-kit]
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        storage_class: [ssd, rotational]
+    runs-on: ${{ fromJSON(matrix.storage_class == 'ssd' && inputs.ssd_runner || inputs.rotational_runner) }}
+    timeout-minutes: 360
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.candidate.outputs.commit }}
+
+      - name: Download exact candidate kit
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: keldra-v1-index-kit
+          path: ${{ runner.temp }}/keldra-v1-index-kit
+
+      - name: Restore executable modes on the verified kit
+        run: |
+          chmod 0755 \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/qualify-index-v1-ssd-scale.sh" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/qualify-index-catalog.sh" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/bin/keldra-server" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/bin/keldra" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/bin/index-contention-qualification" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/bin/index-catalog-qualification"
+
+      - name: Run exact Catalog-250K gate
+        env:
+          KELDRA_V1_ACCEPTANCE_STORAGE_CLASS: ${{ matrix.storage_class }}
+          KELDRA_V1_ACCEPTANCE_GATE: catalog-250k
+          KELDRA_V1_ACCEPTANCE_VERSION: ${{ needs.candidate.outputs.version }}
+          KELDRA_V1_ACCEPTANCE_COMMIT: ${{ needs.candidate.outputs.commit }}
+          KELDRA_V1_ACCEPTANCE_KIT_ROOT: ${{ runner.temp }}/keldra-v1-index-kit
+          KELDRA_V1_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/keldra-v1-index-part
+        run: ./scripts/qualify-index-v1-accepted-host.sh
+
+      - name: Upload exact catalog evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: keldra-v1-index-part-${{ matrix.storage_class }}-catalog
+          path: ${{ runner.temp }}/keldra-v1-index-part
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  accept:
+    name: Accept exact SSD and rotational v1 index evidence
+    needs: [candidate, qualify-scale, qualify-catalog]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.candidate.outputs.commit }}
+
+      - name: Download every exact host part
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: keldra-v1-index-part-*
+          path: ${{ runner.temp }}/keldra-v1-index-parts
+
+      - name: Bind accepted v1 index record
+        env:
+          VERSION: ${{ needs.candidate.outputs.version }}
+          COMMIT: ${{ needs.candidate.outputs.commit }}
+          ROOT: ${{ runner.temp }}/keldra-v1-index-parts
+          OUTPUT: ${{ runner.temp }}/accepted-v1-index.json
+        run: |
+          set -euo pipefail
+          part_arguments=()
+          while IFS= read -r part; do
+            directory="$(dirname "$part")"
+            expected="$(jq -r '.evidence_bundle_sha256' "$part")"
+            actual="sha256:$(sha256sum "${directory}/evidence.tar" | awk '{print $1}')"
+            test "$actual" = "$expected"
+            part_arguments+=(--part "$part")
+          done < <(find "$ROOT" -mindepth 2 -maxdepth 2 -name part-result.json -type f | sort)
+          test "${#part_arguments[@]}" = 68
+          ./scripts/release-record.py accept-index \
+            --version "$VERSION" --commit "$COMMIT" \
+            "${part_arguments[@]}" --output "$OUTPUT"
+
+      - name: Upload accepted v1 index record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: keldra-accepted-v1-index
+          path: ${{ runner.temp }}/accepted-v1-index.json
+          if-no-files-found: error
+          retention-days: 30

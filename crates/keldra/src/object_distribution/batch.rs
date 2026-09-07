@@ -636,7 +636,7 @@ impl ObjectDistribution {
             .await
     }
 
-    async fn replicate_mutation_group_batch(
+    pub(super) async fn replicate_mutation_group_batch(
         &self,
         placement: &ClusterPlacement,
         group: &MutableRecordReplicaGroup,
@@ -965,7 +965,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_node_coordinated_bulk_heads_are_v6_baseline_eligible() {
+    async fn single_node_coordinated_bulk_heads_are_v1_baseline_eligible() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await

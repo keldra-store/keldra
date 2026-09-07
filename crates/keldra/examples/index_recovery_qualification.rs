@@ -45,7 +45,7 @@ const MEMBERSHIP_FIXTURES: usize = 16;
 const PRESSURE_PATH_SELECTION_ATTEMPTS: usize = 32;
 const PRESSURE_PATH_SELECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const INDEX_NAME: &str = "paths";
-const STATE_SCHEMA: &str = "keldra.index-recovery-qualification.v3";
+const STATE_SCHEMA: &str = "keldra.index-recovery-qualification.v1";
 
 struct RecoveryDocument {
     source_path: &'static str,

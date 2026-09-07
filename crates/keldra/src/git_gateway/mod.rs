@@ -13,8 +13,8 @@ use tokio_stream::StreamExt as _;
 
 use crate::authentication::{JwtManager, RequestRateLimits};
 use crate::distributed_control_plane::DistributedControlPlane;
+use crate::object_service::GatewayObjectAdapter;
 use crate::serving_fence::ServingAuthority;
-use crate::v05::GatewayObjectAdapter;
 
 mod auth;
 mod backend;
@@ -22,6 +22,8 @@ pub(crate) mod cache;
 mod model;
 mod repository;
 mod storage;
+
+const GIT_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 pub(crate) struct GitGatewayState {
@@ -33,7 +35,9 @@ pub(crate) struct GitGatewayState {
     pub(crate) mutation_admission: crate::mutation_admission::MutationAdmission,
     pub(crate) cache_root: PathBuf,
     pub(crate) repository_locks: Arc<cache::RepositoryLocks>,
+    pub(crate) repository_cache: Arc<cache::RepositoryCache>,
     pub(crate) basic_tokens: Arc<std::sync::Mutex<HashMap<[u8; 32], String>>>,
+    pub(crate) git_processes: Arc<tokio::sync::Semaphore>,
 }
 
 pub(crate) fn router(state: GitGatewayState) -> Router {
@@ -140,6 +144,7 @@ async fn handle(
         content_type.as_deref(),
         content_length,
         body,
+        state.git_processes.clone(),
     )
     .await
     {
@@ -148,13 +153,28 @@ async fn handle(
     };
     let response = executed.response;
     if target.operation.mutates_repository() && response.status().is_success() {
-        match repository::publish(&storage, &materialized).await {
+        match repository::publish(&state, &storage, &materialized).await {
             Ok(true) => repository::spawn_compaction(state.clone(), storage.clone()),
             Ok(false) => {}
             Err(error) => return error.into_response(),
         }
     }
-    let keepalive = target.operation.streams_response().then_some(materialized);
+    let keepalive = if target.operation.streams_response() {
+        Some(materialized)
+    } else {
+        // receive-pack can grow the disposable materialization after its
+        // admission-time size check. Release the repository pin and restore
+        // the process cache budget before returning the buffered response.
+        drop(materialized);
+        if let Err(error) = state
+            .repository_cache
+            .reconcile(&state.cache_root, &state.repository_locks)
+            .await
+        {
+            tracing::warn!(%error, "Git repository cache cleanup will retry");
+        }
+        None
+    };
     let ingress = state.objects.clone();
     let ingress_key = key.clone();
     let egress = state.objects.clone();

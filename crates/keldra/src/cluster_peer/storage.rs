@@ -14,6 +14,7 @@ use crate::authentication::Caller;
 use crate::distributed_list::{LocalListQuery, OriginalBearer, OwnedListPage};
 use crate::distributed_watch::{DistributedWatchScope, filter_public_changes};
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
+use crate::object_distribution::object_placement_key;
 use crate::placement::PlacementKind;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -31,62 +32,71 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
     type ScanIndexSourceSnapshotStream = super::index_snapshot::IndexSourceSnapshotRpcStream;
     type ScanRetainedSourceSnapshotStream = super::index_snapshot::RetainedSourceSnapshotRpcStream;
 
-    async fn update_local_capabilities(
+    async fn get_node_storage_observation(
         &self,
-        request: Request<wire::UpdateLocalCapabilitiesRequest>,
-    ) -> Result<Response<wire::LocalCapabilitiesUpdated>, Status> {
+        request: Request<wire::NodeStorageObservationRequest>,
+    ) -> Result<Response<wire::NodeStorageObservationResponse>, Status> {
         let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
-        let source = admitted.authenticated.node_id;
-        if self.decisions.current_leader() != Some(self.local_node.0) {
-            let hint = self
-                .decisions
-                .current_leader()
-                .map_or_else(|| "unknown".into(), |node| node.to_string());
-            return Err(Status::unavailable(format!(
-                "local capability attestation must be sent to current leader node {hint}"
-            )));
-        }
-        let value = request.into_inner();
-        let expected_protocol =
-            capability_range(value.expected_protocol_min, value.expected_protocol_max)?;
-        let expected_storage =
-            capability_range(value.expected_storage_min, value.expected_storage_max)?;
-        let replacement_protocol = capability_range(
-            value.replacement_protocol_min,
-            value.replacement_protocol_max,
-        )?;
-        let replacement_storage =
-            capability_range(value.replacement_storage_min, value.replacement_storage_max)?;
-        let committed = self
-            .decisions
-            .submit(keldra_consensus::Command::UpdateNodeCapabilities {
-                format_version: keldra_consensus::CLUSTER_CONTROL_COMMAND_VERSION,
-                node_id: source,
-                expected_protocol,
-                expected_storage,
-                replacement_protocol,
-                replacement_storage,
-            })
-            .await
-            .map_err(capability_decision_status)?;
-        let keldra_consensus::ApplyResult::NodeCapabilitiesUpdated(descriptor) = committed.result
-        else {
-            return Err(Status::internal(
-                "local capability update returned an unexpected result",
-            ));
+        let store = self.store.clone();
+        let timeout = admitted.timeout;
+        let deadline = std::time::Instant::now() + timeout;
+        let placement = admitted.placement;
+        let local_node = self.local_node;
+        let (metrics, logical_counts) = bounded_blocking(timeout, move || {
+            Ok::<_, Status>((
+                store.metadata_runtime_metrics(),
+                store.source_owned_logical_file_counts(
+                    deadline,
+                    |tenant_id, bucket_id, exact_path| {
+                        placement
+                            .rank(
+                                PlacementKind::Object,
+                                &object_placement_key(tenant_id, bucket_id, exact_path),
+                            )
+                            .first()
+                            .copied()
+                            == Some(local_node)
+                    },
+                ),
+            ))
+        })
+        .await?;
+        let refreshed_at_unix_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Status::internal("system clock predates Unix epoch"))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| Status::internal("system clock exceeds physical metric range"))?;
+        let (source_visible_file_count, tenant_visible_file_counts) = match logical_counts {
+            Ok(counts) => (
+                Some(counts.visible_file_count),
+                counts
+                    .tenant_visible_file_counts
+                    .into_iter()
+                    .map(
+                        |(tenant_id, visible_file_count)| wire::TenantVisibleFileCount {
+                            tenant_id,
+                            visible_file_count,
+                        },
+                    )
+                    .collect(),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "source-owned logical file count observation is unavailable");
+                (None, Vec::new())
+            }
         };
-        if descriptor.node_id != source {
-            return Err(Status::internal(
-                "local capability update returned another node descriptor",
-            ));
-        }
-        Ok(Response::new(wire::LocalCapabilitiesUpdated {
+        Ok(Response::new(wire::NodeStorageObservationResponse {
             schema_version: CLUSTER_PEER_SCHEMA_VERSION,
-            node_id: source.0,
-            protocol_min: u32::from(descriptor.supported_protocol.min),
-            protocol_max: u32::from(descriptor.supported_protocol.max),
-            storage_min: u32::from(descriptor.supported_storage_format.min),
-            storage_max: u32::from(descriptor.supported_storage_format.max),
+            node_id: self.local_node.0,
+            refreshed_at_unix_millis,
+            live_payload_blob_bytes: metrics.payload_live_blob_bytes,
+            garbage_payload_blob_bytes: metrics.payload_garbage_blob_bytes,
+            payload_sst_bytes: metrics.payload_sst_bytes,
+            metadata_index_sst_bytes: metrics.non_payload_metadata_index_sst_bytes,
+            wal_bytes: metrics.total_wal_bytes,
+            source_visible_file_count,
+            tenant_visible_file_counts,
         }))
     }
 
@@ -116,13 +126,6 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::DeleteIndexArtifactRequest>,
     ) -> Result<Response<wire::IndexArtifactDeleted>, Status> {
         self.delete_index_artifact_call(request).await
-    }
-
-    async fn scan_index_heads(
-        &self,
-        request: Request<wire::ScanIndexHeadsRequest>,
-    ) -> Result<Response<wire::IndexHeadScanPage>, Status> {
-        self.scan_index_heads_call(request).await
     }
 
     async fn scan_index_source_snapshot(
@@ -1081,33 +1084,6 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
     }
 }
 
-fn capability_range(min: u32, max: u32) -> Result<keldra_consensus::CapabilityRange, Status> {
-    let min = u16::try_from(min)
-        .map_err(|_| Status::invalid_argument("capability minimum exceeds u16"))?;
-    let max = u16::try_from(max)
-        .map_err(|_| Status::invalid_argument("capability maximum exceeds u16"))?;
-    if min == 0 || min > max {
-        return Err(Status::invalid_argument("capability range is invalid"));
-    }
-    Ok(keldra_consensus::CapabilityRange { min, max })
-}
-
-fn capability_decision_status(error: keldra_consensus::DecisionRaftError) -> Status {
-    use keldra_consensus::DecisionRaftError;
-    match error {
-        DecisionRaftError::ForwardToLeader { .. }
-        | DecisionRaftError::Unavailable(_)
-        | DecisionRaftError::LeaderTimeout => Status::unavailable(error.to_string()),
-        DecisionRaftError::Rejected(_) | DecisionRaftError::Configuration(_) => {
-            Status::failed_precondition(error.to_string())
-        }
-        DecisionRaftError::InvalidNodeId => Status::invalid_argument(error.to_string()),
-        DecisionRaftError::Storage(_)
-        | DecisionRaftError::SnapshotTimeout
-        | DecisionRaftError::StatePoisoned => Status::internal(error.to_string()),
-    }
-}
-
 fn watch_caller(storage_tenant: &str, application_id: &str) -> Result<Caller, Status> {
     let storage_tenant = StorageTenantId::parse(storage_tenant)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -1286,14 +1262,6 @@ pub(super) fn object_coordinator(
         )
         .into_iter()
         .next()
-}
-
-fn object_placement_key(tenant_id: u64, bucket_id: u64, path: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(16 + path.len());
-    key.extend_from_slice(&tenant_id.to_be_bytes());
-    key.extend_from_slice(&bucket_id.to_be_bytes());
-    key.extend_from_slice(path.as_bytes());
-    key
 }
 
 fn logical_placement_key(id: &LogicalRecordId) -> Result<(PlacementKind, Vec<u8>), Status> {

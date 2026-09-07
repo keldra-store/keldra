@@ -7,7 +7,7 @@ use keldra_api::v1::{
     DisableAccountingResponse, EnableAccountingRequest, GetAccountingRequest, LinkObjectRequest,
     MutationReceipt, PutToken, SetBucketPolicyRequest, UnlinkObjectRequest,
 };
-use keldra_consensus::{CapabilityRange, DecisionRaft, NodeId};
+use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
     AuthzSchemaPublicationMutation, DefinitionKind, DefinitionMutationIntent, LogicalRecordApplied,
     LogicalRecordCandidate, LogicalRecordId, LogicalRecordMutation, LogicalRecordSnapshotApplied,
@@ -50,41 +50,29 @@ pub(crate) struct ClusterPeerTransport {
 }
 
 impl ClusterPeerTransport {
-    pub(crate) async fn update_local_capabilities(
+    pub(crate) async fn node_storage_observation(
         &self,
-        leader: NodeId,
+        target: NodeId,
         address: &str,
-        expected_protocol: CapabilityRange,
-        expected_storage: CapabilityRange,
-        replacement_protocol: CapabilityRange,
-        replacement_storage: CapabilityRange,
-    ) -> Result<(CapabilityRange, CapabilityRange), Status> {
-        let placement = self.placement()?;
+        fence: PlacementLogId,
+    ) -> Result<wire::NodeStorageObservationResponse, Status> {
+        let mut request = Request::new(wire::NodeStorageObservationRequest {
+            peer: Some(self.context(fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
+        });
+        request.set_timeout(MAX_CLUSTER_OPERATION_TIME);
         let response = self
-            .client(leader, address)?
-            .update_local_capabilities(wire::UpdateLocalCapabilitiesRequest {
-                peer: Some(self.context(placement.fence(), 0, MAX_CLUSTER_OPERATION_TIME)?),
-                expected_protocol_min: u32::from(expected_protocol.min),
-                expected_protocol_max: u32::from(expected_protocol.max),
-                expected_storage_min: u32::from(expected_storage.min),
-                expected_storage_max: u32::from(expected_storage.max),
-                replacement_protocol_min: u32::from(replacement_protocol.min),
-                replacement_protocol_max: u32::from(replacement_protocol.max),
-                replacement_storage_min: u32::from(replacement_storage.min),
-                replacement_storage_max: u32::from(replacement_storage.max),
-            })
+            .client(target, address)?
+            .get_node_storage_observation(request)
             .await?
             .into_inner();
         require_response_schema(response.schema_version)?;
-        if response.node_id != self.data.peer_identity().1.0 {
+        if response.node_id != target.0 {
             return Err(Status::data_loss(
-                "capability attestation returned another node",
+                "physical storage response belongs to another node",
             ));
         }
-        Ok((
-            wire_capability_range(response.protocol_min, response.protocol_max)?,
-            wire_capability_range(response.storage_min, response.storage_max)?,
-        ))
+        validate_logical_file_counts(&response)?;
+        Ok(response)
     }
 
     pub(crate) async fn route_enable_accounting(
@@ -350,68 +338,6 @@ impl ClusterPeerTransport {
             .into_inner();
         require_response_schema(response.schema_version)?;
         nonzero_artifact_outcome(response.version, response.replayed)
-    }
-
-    pub(crate) async fn scan_index_heads(
-        &self,
-        target: NodeId,
-        address: &str,
-        scope: super::IndexHeadScanScope,
-        cursor: Option<&keldra_store::ObjectRecordCursor>,
-    ) -> Result<super::IndexHeadScanPage, Status> {
-        let placement = self.placement()?;
-        let fence = placement.fence();
-        let artifacts = wire::IndexArtifactHeads {
-            tenant_id: scope.tenant_id,
-            bucket_id: scope.bucket_id,
-            index_id: scope.index_id,
-        };
-        let response = self
-            .client(target, address)?
-            .scan_index_heads(wire::ScanIndexHeadsRequest {
-                peer: Some(self.context(fence, 0, MAX_CLUSTER_OPERATION_TIME)?),
-                cursor: cursor.map(|cursor| cursor.as_token().to_owned()),
-                artifacts: Some(artifacts),
-            })
-            .await?
-            .into_inner();
-        require_response_schema(response.schema_version)?;
-        if response.source_node_id != target.0
-            || response.placement_term != fence.term
-            || response.placement_index != fence.index
-        {
-            return Err(Status::data_loss(
-                "index head scan source or placement fence differs from the request",
-            ));
-        }
-        let source_epoch: [u8; 32] = response
-            .source_epoch
-            .try_into()
-            .map_err(|_| Status::data_loss("index head scan source epoch has the wrong length"))?;
-        let source_node = u16::try_from(response.source_node_id)
-            .map_err(|_| Status::data_loss("index head scan source node exceeds u16"))?;
-        let heads = response
-            .heads_json
-            .iter()
-            .map(|encoded| decode_json::<super::IndexCurrentHead>(encoded))
-            .collect::<Result<Vec<_>, _>>()?;
-        for head in &heads {
-            validate_index_head(head)?;
-        }
-        let next_cursor = response
-            .next_cursor
-            .map(keldra_store::ObjectRecordCursor::from_token)
-            .transpose()
-            .map_err(|error| Status::data_loss(error.to_string()))?;
-        Ok(super::IndexHeadScanPage {
-            source: SourceId {
-                node_id: source_node,
-                source_epoch,
-            },
-            placement_fence: fence,
-            heads,
-            next_cursor,
-        })
     }
 
     pub(crate) async fn scan_index_source_snapshot(
@@ -1395,6 +1321,40 @@ impl ClusterPeerTransport {
     }
 }
 
+fn validate_logical_file_counts(
+    response: &wire::NodeStorageObservationResponse,
+) -> Result<(), Status> {
+    let Some(expected_total) = response.source_visible_file_count else {
+        if response.tenant_visible_file_counts.is_empty() {
+            return Ok(());
+        }
+        return Err(Status::data_loss(
+            "logical file count response has tenant counts without a total",
+        ));
+    };
+    let mut previous_tenant = None;
+    let mut observed_total = 0_u64;
+    for tenant in &response.tenant_visible_file_counts {
+        if tenant.tenant_id == 0
+            || previous_tenant.is_some_and(|previous| previous >= tenant.tenant_id)
+        {
+            return Err(Status::data_loss(
+                "logical file count response has unordered or zero tenant identity",
+            ));
+        }
+        previous_tenant = Some(tenant.tenant_id);
+        observed_total = observed_total
+            .checked_add(tenant.visible_file_count)
+            .ok_or_else(|| Status::data_loss("logical file count response overflow"))?;
+    }
+    if observed_total != expected_total {
+        return Err(Status::data_loss(
+            "logical file count response total disagrees with tenant counts",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn wire_index_artifact_publish(
     request: &IndexArtifactPublish,
     peer: Option<wire::PeerContext>,
@@ -1785,38 +1745,6 @@ pub(super) fn decode_indexed_artifact_outcomes(
             outcome.ok_or_else(|| Status::data_loss("index artifact outcome is missing"))
         })
         .collect()
-}
-
-fn validate_index_head(head: &super::IndexCurrentHead) -> Result<(), Status> {
-    if head.tenant_id == 0
-        || head.bucket_id == 0
-        || head.exact_path.is_empty()
-        || head.head.version.0 == 0
-        || head.version.id.0 == 0
-        || head.version.id > head.head.version
-        || head.versions.len() != 1
-        || head.versions.first() != Some(&head.version)
-        || (head.head.version == head.version.id && head.head.deleted != head.version.deleted)
-        || head.version.deleted != head.version.blob.is_none()
-    {
-        return Err(Status::data_loss(
-            "index head scan returned an invalid retained descriptor",
-        ));
-    }
-    Ok(())
-}
-
-fn wire_capability_range(min: u32, max: u32) -> Result<CapabilityRange, Status> {
-    let min =
-        u16::try_from(min).map_err(|_| Status::data_loss("capability minimum exceeds u16"))?;
-    let max =
-        u16::try_from(max).map_err(|_| Status::data_loss("capability maximum exceeds u16"))?;
-    if min == 0 || min > max {
-        return Err(Status::data_loss(
-            "capability response contains an invalid range",
-        ));
-    }
-    Ok(CapabilityRange { min, max })
 }
 
 pub(super) fn add_bearer_and_timeout<T>(

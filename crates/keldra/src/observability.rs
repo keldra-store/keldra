@@ -373,14 +373,14 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(target: "keldra::index_runtime::cpu", "normal CPU chunk");
             tracing::warn!(target: "keldra::index_runtime::cpu", "failed CPU chunk");
-            tracing::debug!(target: "keldra::index_runtime::v6_consumer", "producer progress");
+            tracing::debug!(target: "keldra::index_runtime::v1_consumer", "producer progress");
         });
 
         assert_eq!(
             *recorded.lock().unwrap(),
             vec![
                 ("keldra::index_runtime::cpu", tracing::Level::WARN),
-                ("keldra::index_runtime::v6_consumer", tracing::Level::DEBUG),
+                ("keldra::index_runtime::v1_consumer", tracing::Level::DEBUG),
             ]
         );
     }

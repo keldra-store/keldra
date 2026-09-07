@@ -1,4 +1,4 @@
-//! Versioned compact encoding for authoritative source-journal transitions.
+//! Compact v1 encoding for authoritative source-journal transitions.
 //!
 //! The fixed header retains the exact bare-`LocalChange` JSON byte length used
 //! by the existing peer protocol. Readers can therefore enforce page budgets
@@ -16,8 +16,7 @@ use crate::{
 };
 
 const MAGIC: &[u8; 4] = b"ANVJ";
-const FORMAT: u16 = 6;
-const LEGACY_FORMAT: u16 = 5;
+const FORMAT: u16 = 1;
 const RESERVED: u8 = 0;
 const HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 8 + 8;
 
@@ -79,7 +78,7 @@ pub(crate) fn decode_local_change_with_length(
         return Err(malformed("magic is invalid"));
     }
     let format = input.u16()?;
-    if format != FORMAT && format != LEGACY_FORMAT {
+    if format != FORMAT {
         return Err(LocalChangeCodecError::UnsupportedFormat(format));
     }
     let kind = input.u8()?;
@@ -94,7 +93,7 @@ pub(crate) fn decode_local_change_with_length(
     if body_bytes != input.remaining() {
         return Err(malformed("body length disagrees with the record length"));
     }
-    let change = decode_body(format, kind, &mut input)?;
+    let change = decode_body(kind, &mut input)?;
     input.finish()?;
     Ok(DecodedLocalChange {
         change,
@@ -136,6 +135,7 @@ fn encode_body(change: &LocalChange) -> Result<(u8, Vec<u8>), LocalChangeCodecEr
             put_u64(&mut body, change.tenant_id);
             put_u64(&mut body, change.bucket_id);
             put_string(&mut body, &change.exact_path)?;
+            put_optional_string(&mut body, change.canonical_path.as_deref())?;
             put_u64(&mut body, change.deleted_version.0);
             put_optional_u64(
                 &mut body,
@@ -182,15 +182,6 @@ fn encode_body(change: &LocalChange) -> Result<(u8, Vec<u8>), LocalChangeCodecEr
             body.extend_from_slice(&change.bundle_hash.0);
             put_u64(
                 &mut body,
-                u64::try_from(change.affected_routes.len())
-                    .map_err(|_| malformed("atomic route count is exhausted"))?,
-            );
-            for route in &change.affected_routes {
-                put_u64(&mut body, route.tenant_id);
-                put_u64(&mut body, route.bucket_id);
-            }
-            put_u64(
-                &mut body,
                 u64::try_from(change.mutations.len())
                     .map_err(|_| malformed("atomic mutation count is exhausted"))?,
             );
@@ -210,22 +201,14 @@ fn encode_body(change: &LocalChange) -> Result<(u8, Vec<u8>), LocalChangeCodecEr
     }
 }
 
-fn decode_body(
-    format: u16,
-    kind: u8,
-    input: &mut Input<'_>,
-) -> Result<LocalChange, LocalChangeCodecError> {
+fn decode_body(kind: u8, input: &mut Input<'_>) -> Result<LocalChange, LocalChangeCodecError> {
     match kind {
         OBJECT_HEAD => Ok(LocalChange::ObjectHead(ObjectHeadChange {
             offset: input.u64()?,
             tenant_id: input.u64()?,
             bucket_id: input.u64()?,
             exact_path: input.string()?,
-            canonical_path: if format >= FORMAT {
-                input.optional_string()?
-            } else {
-                None
-            },
+            canonical_path: input.optional_string()?,
             path_version: VersionId(input.u64()?),
             kind: match input.u8()? {
                 PUT => ObjectHeadChangeKind::Put,
@@ -243,6 +226,7 @@ fn decode_body(
                 tenant_id: input.u64()?,
                 bucket_id: input.u64()?,
                 exact_path: input.string()?,
+                canonical_path: input.optional_string()?,
                 deleted_version: VersionId(input.u64()?),
                 resulting_head_version: input.optional_u64()?.map(VersionId),
                 reference_deltas: input.reference_deltas()?,
@@ -281,20 +265,6 @@ fn decode_body(
             let offset = input.u64()?;
             let cursor = input.u64()?;
             let bundle_hash = crate::PreparedBundleHash(input.array()?);
-            let route_count = input.length_count("atomic route", 16)?;
-            if route_count > super::MAX_ATOMIC_BATCH_MUTATIONS {
-                return Err(malformed("atomic route count exceeds the format bound"));
-            }
-            let mut affected_routes = Vec::new();
-            affected_routes
-                .try_reserve_exact(route_count)
-                .map_err(|_| malformed("atomic route allocation failed"))?;
-            for _ in 0..route_count {
-                affected_routes.push(super::AtomicBatchRoute {
-                    tenant_id: input.u64()?,
-                    bucket_id: input.u64()?,
-                });
-            }
             // tenant + bucket + string length + version + deleted + source + position
             let mutation_count = input.length_count("atomic mutation", 75)?;
             if mutation_count > super::MAX_ATOMIC_BATCH_MUTATIONS {
@@ -309,11 +279,7 @@ fn decode_body(
                     tenant_id: input.u64()?,
                     bucket_id: input.u64()?,
                     exact_path: input.string()?,
-                    canonical_path: if format >= FORMAT {
-                        input.optional_string()?
-                    } else {
-                        None
-                    },
+                    canonical_path: input.optional_string()?,
                     path_version: VersionId(input.u64()?),
                     deleted: match input.u8()? {
                         0 => false,
@@ -331,7 +297,6 @@ fn decode_body(
                 offset,
                 cursor,
                 bundle_hash,
-                affected_routes,
                 mutations,
             };
             change.validate().map_err(malformed)?;
@@ -361,9 +326,10 @@ fn put_accounting_transition(output: &mut Vec<u8>, transition: Option<Accounting
     match transition {
         Some(transition) => {
             put_u8(output, 1);
-            put_u8(output, AccountingHeadTransition::FORMAT);
+            put_u8(output, transition.format());
             put_optional_u64(output, transition.previous_live_length);
             put_optional_u64(output, transition.current_live_length);
+            put_u64(output, transition.logical_bytes_removed);
         }
         None => put_u8(output, 0),
     }
@@ -567,13 +533,15 @@ impl<'a> Input<'a> {
         match self.u8()? {
             0 => Ok(None),
             1 => {
-                let format = self.u8()?;
-                if format != AccountingHeadTransition::FORMAT {
+                if self.u8()? != AccountingHeadTransition::FORMAT {
                     return Err(malformed("accounting transition format is unsupported"));
                 }
+                let previous_live_length = self.optional_u64()?;
+                let current_live_length = self.optional_u64()?;
                 Ok(Some(AccountingHeadTransition::new(
-                    self.optional_u64()?,
-                    self.optional_u64()?,
+                    previous_live_length,
+                    current_live_length,
+                    self.u64()?,
                 )))
             }
             _ => Err(malformed("accounting transition tag is invalid")),
@@ -640,7 +608,7 @@ mod tests {
                 },
                 change: 1,
             }],
-            Some(AccountingHeadTransition::new(None, Some(1_024))),
+            Some(AccountingHeadTransition::new(None, Some(1_024), 0)),
             Some(DefinitionTransition {
                 kind: DefinitionKind::Index,
                 tenant_id: 11,
@@ -675,11 +643,20 @@ mod tests {
                 VersionId(40),
                 Some(VersionId(41)),
                 Vec::new(),
-                Some(AccountingHeadTransition::new(Some(10), Some(12))),
+                Some(AccountingHeadTransition::new(Some(10), Some(12), 10)),
             ),
-            LocalChange::aggregate_changed(9, AggregateKind::LogicalRecord, vec![1, 2, 3], 4),
+            LocalChange::alias_retained_version_deleted(
+                9,
+                11,
+                12,
+                "documents/alias".into(),
+                "documents/target".into(),
+                VersionId(40),
+                None,
+            ),
+            LocalChange::aggregate_changed(10, AggregateKind::LogicalRecord, vec![1, 2, 3], 4),
             LocalChange::content_lifecycle_changed(
-                10,
+                11,
                 vec![4, 5, 6],
                 5,
                 vec![ReferenceDelta {
@@ -692,13 +669,9 @@ mod tests {
                 None,
             ),
             LocalChange::atomic_batch_published(
-                11,
+                12,
                 73,
                 crate::PreparedBundleHash([7; 32]),
-                vec![crate::AtomicBatchRoute {
-                    tenant_id: 11,
-                    bucket_id: 12,
-                }],
                 vec![crate::AtomicBatchMutation {
                     tenant_id: 11,
                     bucket_id: 12,
@@ -736,7 +709,7 @@ mod tests {
             b'V',
             b'J', // magic
             0,
-            6, // format
+            1, // format
             AGGREGATE_CHANGED,
             0, // reserved
             0,
@@ -791,11 +764,11 @@ mod tests {
     #[test]
     fn malformed_headers_lengths_tags_and_utf8_fail_closed() {
         let encoded = encode_local_change(&object_change()).unwrap();
-        let mut old_format = encoded.clone();
-        old_format[5] = 4;
+        let mut unsupported_format = encoded.clone();
+        unsupported_format[5] = 2;
         assert!(matches!(
-            decode_local_change(&old_format),
-            Err(LocalChangeCodecError::UnsupportedFormat(4))
+            decode_local_change(&unsupported_format),
+            Err(LocalChangeCodecError::UnsupportedFormat(2))
         ));
         let mutations: [fn(&mut Vec<u8>); 4] = [
             |bytes| bytes[0] ^= 1,
@@ -821,52 +794,52 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v5_object_head_decodes_without_canonical_path() {
-        let change = object_change();
-        let mut encoded = encode_local_change(&change).unwrap();
-        encoded[5] = LEGACY_FORMAT as u8;
-        let path_length = match &change {
-            LocalChange::ObjectHead(change) => change.exact_path.len(),
-            _ => unreachable!(),
-        };
-        let canonical_marker = HEADER_BYTES + 8 + 8 + 8 + 8 + path_length;
-        assert_eq!(encoded.remove(canonical_marker), 0);
-        let body_length = u64::from_be_bytes(encoded[8..16].try_into().unwrap()) - 1;
-        encoded[8..16].copy_from_slice(&body_length.to_be_bytes());
-        assert_eq!(decode_local_change(&encoded).unwrap(), change);
-    }
-
-    #[test]
-    fn legacy_v5_atomic_batch_decodes_without_canonical_paths() {
+    fn v1_atomic_batch_serializes_mutations_without_a_route_list() {
         let change = LocalChange::atomic_batch_published(
             11,
             73,
             crate::PreparedBundleHash([7; 32]),
-            vec![crate::AtomicBatchRoute {
-                tenant_id: 11,
-                bucket_id: 12,
-            }],
-            vec![crate::AtomicBatchMutation {
-                tenant_id: 11,
-                bucket_id: 12,
-                exact_path: "documents/two".into(),
-                canonical_path: None,
-                path_version: VersionId(42),
-                deleted: false,
-                source_id: crate::SourceId {
-                    node_id: 3,
-                    source_epoch: [9; 32],
+            vec![
+                crate::AtomicBatchMutation {
+                    tenant_id: 11,
+                    bucket_id: 12,
+                    exact_path: "documents/one".into(),
+                    canonical_path: None,
+                    path_version: VersionId(41),
+                    deleted: false,
+                    source_id: crate::SourceId {
+                        node_id: 3,
+                        source_epoch: [9; 32],
+                    },
+                    source_journal_position: 16,
                 },
-                source_journal_position: 17,
-            }],
+                crate::AtomicBatchMutation {
+                    tenant_id: 11,
+                    bucket_id: 12,
+                    exact_path: "documents/two".into(),
+                    canonical_path: None,
+                    path_version: VersionId(42),
+                    deleted: false,
+                    source_id: crate::SourceId {
+                        node_id: 3,
+                        source_epoch: [9; 32],
+                    },
+                    source_journal_position: 17,
+                },
+            ],
         );
-        let mut encoded = encode_local_change(&change).unwrap();
-        encoded[5] = LEGACY_FORMAT as u8;
-        let path_length = "documents/two".len();
-        let canonical_marker = HEADER_BYTES + 8 + 8 + 32 + 8 + 16 + 8 + 8 + 8 + 8 + path_length;
-        assert_eq!(encoded.remove(canonical_marker), 0);
-        let body_length = u64::from_be_bytes(encoded[8..16].try_into().unwrap()) - 1;
-        encoded[8..16].copy_from_slice(&body_length.to_be_bytes());
+
+        let encoded = encode_local_change(&change).unwrap();
+        assert_eq!(u16::from_be_bytes(encoded[4..6].try_into().unwrap()), 1);
+        let mutation_count_offset = HEADER_BYTES + 8 + 8 + 32;
+        assert_eq!(
+            u64::from_be_bytes(
+                encoded[mutation_count_offset..mutation_count_offset + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            2
+        );
         assert_eq!(decode_local_change(&encoded).unwrap(), change);
     }
 }

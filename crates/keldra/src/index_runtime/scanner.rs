@@ -1,13 +1,12 @@
 //! Fenced, pull-based cluster scans for cold discovery and rebuilds.
 
 use keldra_consensus::{DecisionRaft, NodeId};
-use keldra_store::{ObjectRecordCursor, PlacementLogId, RetainedObjectSnapshot, SourceId};
+use keldra_store::{PlacementLogId, RetainedObjectSnapshot, SourceId};
 use std::collections::{BTreeMap, VecDeque};
 use tonic::Status;
 
 use crate::cluster_peer::{
-    ClusterPeerTransport, IndexCurrentHead, IndexHeadScanPage, IndexHeadScanScope,
-    IndexSourceSnapshot, IndexSourceSnapshotHead, RetainedSourceSnapshot,
+    ClusterPeerTransport, IndexSourceSnapshot, IndexSourceSnapshotHead, RetainedSourceSnapshot,
 };
 use crate::cluster_placement::ClusterPlacement;
 use crate::startup_scan_evidence::{StartupScanEvidence, StartupScanExtent, StartupScanKind};
@@ -30,61 +29,6 @@ impl ClusterIndexScanner {
             peers,
             startup_scan_evidence,
         }
-    }
-
-    /// Begin a scan without fetching a page. The caller can therefore obtain
-    /// its memory permit before every `next_page` call.
-    pub(crate) fn begin(&self, scope: IndexHeadScanScope) -> Result<ClusterIndexScan, Status> {
-        self.startup_scan_evidence
-            .record(StartupScanKind::IndexArtifacts, StartupScanExtent::Scoped);
-        let placement = self.placement()?;
-        let fence = placement.fence();
-        let nodes = placement
-            .active_node_ids()
-            .into_iter()
-            .map(|node| {
-                let address = placement
-                    .address(node)
-                    .ok_or_else(|| Status::unavailable("ACTIVE index scan source has no address"))?
-                    .0
-                    .clone();
-                Ok(ScanNode { node, address })
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-        Ok(ClusterIndexScan {
-            scanner: self.clone(),
-            scope,
-            fence,
-            nodes,
-            node_index: 0,
-            cursor: None,
-            finished: false,
-        })
-    }
-
-    /// Resume one persisted per-definition maintenance cursor. A placement
-    /// change invalidates the cursor and makes the caller restart from the
-    /// beginning; cursor state is never reinterpreted under another fence.
-    pub(crate) fn begin_at(
-        &self,
-        scope: IndexHeadScanScope,
-        expected_fence: PlacementLogId,
-        node: NodeId,
-        cursor: Option<ObjectRecordCursor>,
-    ) -> Result<ClusterIndexScan, Status> {
-        let mut scan = self.begin(scope)?;
-        if scan.fence != expected_fence {
-            return Err(Status::aborted(
-                "persisted index scan cursor belongs to another placement fence",
-            ));
-        }
-        scan.node_index = scan
-            .nodes
-            .iter()
-            .position(|source| source.node == node)
-            .ok_or_else(|| Status::aborted("persisted index scan source is no longer ACTIVE"))?;
-        scan.cursor = cursor;
-        Ok(scan)
     }
 
     /// Open one snapshot-bound current-head stream for every ACTIVE source.
@@ -196,6 +140,77 @@ impl ClusterIndexScanner {
             snapshots,
             buffers,
             ended,
+            max_frame_bytes,
+            previous_path: None,
+            finished: false,
+        })
+    }
+
+    /// Open one snapshot for one exact ACTIVE source incarnation.
+    ///
+    /// Partition backfills already have a source-partition identity.  Opening
+    /// every ACTIVE source and discarding all but that partition multiplies a
+    /// full rebuild by the cluster size, so keep the same fenced peer primitive
+    /// but address only the source the partition owns.
+    pub(crate) async fn begin_exact_source_snapshot(
+        &self,
+        source: SourceId,
+        tenant_id: u64,
+        bucket_id: u64,
+        path_prefix: String,
+        resume_after_path: Option<String>,
+        max_frame_bytes: u64,
+    ) -> Result<ClusterIndexSourceSnapshot, Status> {
+        self.startup_scan_evidence
+            .record(StartupScanKind::ObjectHeads, StartupScanExtent::Scoped);
+        if max_frame_bytes < 16 * 1024 {
+            return Err(Status::resource_exhausted(
+                "configured index source quantum cannot fund one bounded frame",
+            ));
+        }
+        let placement = self.placement()?;
+        let fence = placement.fence();
+        let node = NodeId(u64::from(source.node_id));
+        if !placement.active_node_ids().contains(&node) {
+            return Err(Status::unavailable(
+                "requested index snapshot source is not ACTIVE",
+            ));
+        }
+        let address = placement
+            .address(node)
+            .ok_or_else(|| Status::unavailable("ACTIVE index snapshot source has no address"))?
+            .0
+            .clone();
+        let snapshot = self
+            .peers
+            .scan_index_source_snapshot(
+                node,
+                &address,
+                tenant_id,
+                bucket_id,
+                path_prefix,
+                resume_after_path,
+                max_frame_bytes,
+            )
+            .await?;
+        if snapshot.placement_fence() != fence || snapshot.source() != source {
+            return Err(Status::data_loss(
+                "index source snapshot identity or placement fence is inconsistent",
+            ));
+        }
+        self.require_fence(fence)?;
+        let checkpoint = IndexSnapshotSourceCheckpoint {
+            node,
+            source,
+            captured_tail: snapshot.captured_tail(),
+        };
+        Ok(ClusterIndexSourceSnapshot {
+            scanner: self.clone(),
+            fence,
+            checkpoints: vec![checkpoint],
+            snapshots: vec![snapshot],
+            buffers: vec![VecDeque::new()],
+            ended: vec![false],
             max_frame_bytes,
             previous_path: None,
             finished: false,
@@ -499,88 +514,6 @@ fn take_canonical_head(
         head,
         encoded_bytes,
     })
-}
-
-struct ScanNode {
-    node: NodeId,
-    address: String,
-}
-
-/// Sequential page cursor over all ACTIVE sources.
-///
-/// Sequential fetch is intentional: it prevents one page per node being held
-/// while the builder is waiting for its aggregate memory budget.
-pub(crate) struct ClusterIndexScan {
-    scanner: ClusterIndexScanner,
-    scope: IndexHeadScanScope,
-    fence: keldra_store::PlacementLogId,
-    nodes: Vec<ScanNode>,
-    node_index: usize,
-    cursor: Option<ObjectRecordCursor>,
-    finished: bool,
-}
-
-impl ClusterIndexScan {
-    pub(crate) fn checkpoint(
-        &self,
-    ) -> Option<(PlacementLogId, NodeId, Option<ObjectRecordCursor>)> {
-        (!self.finished)
-            .then(|| {
-                self.nodes
-                    .get(self.node_index)
-                    .map(|node| (self.fence, node.node, self.cursor.clone()))
-            })
-            .flatten()
-    }
-
-    pub(crate) async fn next_page(&mut self) -> Result<Option<Vec<IndexCurrentHead>>, Status> {
-        if self.finished {
-            return Ok(None);
-        }
-        loop {
-            let Some(source) = self.nodes.get(self.node_index) else {
-                self.scanner.require_fence(self.fence)?;
-                self.finished = true;
-                return Ok(None);
-            };
-            let IndexHeadScanPage {
-                heads,
-                next_cursor,
-                placement_fence,
-                ..
-            } = self
-                .scanner
-                .peers
-                .scan_index_heads(
-                    source.node,
-                    &source.address,
-                    self.scope.clone(),
-                    self.cursor.as_ref(),
-                )
-                .await?;
-            if placement_fence != self.fence {
-                return Err(Status::unavailable(
-                    "index scan source used another placement fence",
-                ));
-            }
-            match next_cursor {
-                Some(next) if self.cursor.as_ref().is_some_and(|current| current == &next) => {
-                    return Err(Status::data_loss(
-                        "index scan source returned a non-advancing cursor",
-                    ));
-                }
-                Some(next) => self.cursor = Some(next),
-                None => {
-                    self.node_index += 1;
-                    self.cursor = None;
-                }
-            }
-            self.scanner.require_fence(self.fence)?;
-            if !heads.is_empty() {
-                return Ok(Some(heads));
-            }
-        }
-    }
 }
 
 #[cfg(test)]

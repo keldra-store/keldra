@@ -339,7 +339,12 @@ impl Store {
                     "reference-proof prune key disagrees with its value".into(),
                 ));
             }
-            if proof.offset() > through_inclusive {
+            // Alias journal entries immediately follow their canonical
+            // mutation but intentionally reuse its typed proof. Keep that
+            // proof until the caller's settled floor covers the complete
+            // sealed fanout; otherwise a page boundary could prune the sole
+            // recovery authority while a later alias offset is still due.
+            if reference_proof_required_through(&proof)? > through_inclusive {
                 break;
             }
 
@@ -559,6 +564,29 @@ impl Store {
     }
 }
 
+fn reference_proof_required_through(
+    proof: &ReferenceProof,
+) -> Result<u64, ReferenceProofPruneError> {
+    let derived_aliases = match &proof.mutation {
+        ReferenceProofMutation::Object(mutation) => mutation
+            .alias_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.registry.aliases.len()),
+        ReferenceProofMutation::RetainedVersionDelete(mutation) => mutation.alias_paths.len(),
+        ReferenceProofMutation::ProgramPath(_) => 0,
+    };
+    let derived_aliases = u64::try_from(derived_aliases).map_err(|_| {
+        ReferenceProofPruneError::Storage(
+            "reference-proof alias fanout does not fit the source offset".into(),
+        )
+    })?;
+    proof.offset().checked_add(derived_aliases).ok_or_else(|| {
+        ReferenceProofPruneError::Storage(
+            "reference-proof alias fanout exhausts the source offset".into(),
+        )
+    })
+}
+
 fn export_storage(error: impl std::fmt::Display) -> ReferenceProofExportError {
     ReferenceProofExportError::Storage(error.to_string())
 }
@@ -594,7 +622,7 @@ fn proof_for_mutation(mutation: &ObjectMutation) -> Result<ReferenceProof, Mutat
             mutation.version.id,
             mutation.version.deleted,
             mutation.reference_deltas.clone(),
-            mutation.accounting_transition,
+            object_mutation_accounting_transition(mutation),
             mutation.definition_transition.clone(),
         ),
         ReferenceProofMutation::Object(mutation.clone()),
@@ -621,14 +649,10 @@ fn proof_for_retained_delete(
                 .as_ref()
                 .map(|replacement| replacement.id),
             mutation.reference_deltas.clone(),
-            Some(if mutation.replacement_tombstone.is_some() {
-                AccountingHeadTransition::new(
-                    mutation.target.blob.as_ref().map(|blob| blob.length),
-                    None,
-                )
-            } else {
-                AccountingHeadTransition::new(None, None)
-            }),
+            mutation
+                .alias_paths
+                .is_empty()
+                .then(|| retained_delete_accounting_transition(mutation)),
         ),
         ReferenceProofMutation::RetainedVersionDelete(mutation.clone()),
     );
@@ -650,14 +674,7 @@ fn proof_for_program_path(mutation: &crate::ProgramPathMutation) -> Result<Refer
             mutation.stage.version.deleted,
             Some(mutation.commit_cursor),
             mutation.reference_deltas.clone(),
-            Some(AccountingHeadTransition::new(
-                mutation
-                    .stage
-                    .previous_version
-                    .as_ref()
-                    .and_then(|version| version.blob.as_ref().map(|blob| blob.length)),
-                mutation.stage.version.blob.as_ref().map(|blob| blob.length),
-            )),
+            Some(mutation.accounting_transition),
             None,
         ),
         ReferenceProofMutation::ProgramPath(mutation.clone()),
@@ -701,7 +718,7 @@ fn validate_stored_proof(proof: &ReferenceProof) -> Result<(), String> {
                 mutation.version.id,
                 mutation.version.deleted,
                 mutation.reference_deltas.clone(),
-                mutation.accounting_transition,
+                object_mutation_accounting_transition(mutation),
                 mutation.definition_transition.clone(),
             )
         }
@@ -726,14 +743,10 @@ fn validate_stored_proof(proof: &ReferenceProof) -> Result<(), String> {
                     .as_ref()
                     .map(|replacement| replacement.id),
                 mutation.reference_deltas.clone(),
-                Some(if mutation.replacement_tombstone.is_some() {
-                    AccountingHeadTransition::new(
-                        mutation.target.blob.as_ref().map(|blob| blob.length),
-                        None,
-                    )
-                } else {
-                    AccountingHeadTransition::new(None, None)
-                }),
+                mutation
+                    .alias_paths
+                    .is_empty()
+                    .then(|| retained_delete_accounting_transition(mutation)),
             )
         }
         ReferenceProofMutation::ProgramPath(mutation) => {
@@ -755,14 +768,7 @@ fn validate_stored_proof(proof: &ReferenceProof) -> Result<(), String> {
                 mutation.stage.version.deleted,
                 Some(mutation.commit_cursor),
                 mutation.reference_deltas.clone(),
-                Some(AccountingHeadTransition::new(
-                    mutation
-                        .stage
-                        .previous_version
-                        .as_ref()
-                        .and_then(|version| version.blob.as_ref().map(|blob| blob.length)),
-                    mutation.stage.version.blob.as_ref().map(|blob| blob.length),
-                )),
+                Some(mutation.accounting_transition),
                 None,
             )
         }
@@ -818,6 +824,27 @@ fn validate_stored_proof(proof: &ReferenceProof) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn object_mutation_accounting_transition(
+    mutation: &ObjectMutation,
+) -> Option<AccountingHeadTransition> {
+    if mutation.alias_snapshot.is_some() {
+        None
+    } else {
+        mutation.accounting_transition
+    }
+}
+
+fn retained_delete_accounting_transition(
+    mutation: &RetainedVersionDeleteMutation,
+) -> AccountingHeadTransition {
+    let target_length = mutation.target.blob.as_ref().map(|blob| blob.length);
+    AccountingHeadTransition::new(
+        mutation.replacement_tombstone.as_ref().and(target_length),
+        None,
+        target_length.unwrap_or(0),
+    )
 }
 
 #[cfg(test)]

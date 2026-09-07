@@ -1028,15 +1028,15 @@ async fn distributed_metadata_coordination_retains_only_awaiting_source_content(
             .await
             .unwrap();
         let mutation = coordinated.mutation.unwrap();
-        assert_eq!(mutation.format, crate::LEGACY_OBJECT_MUTATION_FORMAT);
+        assert_eq!(mutation.format, crate::OBJECT_MUTATION_FORMAT);
         assert!(mutation.alias_snapshot.is_none());
-        let legacy_wire = serde_json::to_vec(&mutation).unwrap();
-        let legacy_wire_text = String::from_utf8_lossy(&legacy_wire);
-        assert!(!legacy_wire_text.contains("alias_snapshot"));
-        assert!(!legacy_wire_text.contains("protected_link_descriptor"));
-        let decoded_legacy: ObjectMutation = serde_json::from_slice(&legacy_wire).unwrap();
-        decoded_legacy.validate().unwrap();
-        assert_eq!(decoded_legacy, mutation);
+        let wire = serde_json::to_vec(&mutation).unwrap();
+        let wire_text = String::from_utf8_lossy(&wire);
+        assert!(wire_text.contains("alias_snapshot"));
+        assert!(wire_text.contains("protected_link_descriptor"));
+        let decoded: ObjectMutation = serde_json::from_slice(&wire).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, mutation);
         let reference = mutation.version.blob.as_ref().unwrap();
         assert_eq!(
             mutation.reference_deltas,
@@ -1468,7 +1468,7 @@ async fn first_typed_mutation_accepts_an_unstamped_050_baseline() {
             "upgrade",
             b"baseline",
             Precondition::Absent,
-            "legacy-command",
+            "malformed-command",
         ))
         .await
         .unwrap();

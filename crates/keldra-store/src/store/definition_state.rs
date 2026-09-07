@@ -21,7 +21,7 @@ const ASSIGNMENT_DOMAIN: u8 = b'A';
 const CHECKPOINT_DOMAIN: u8 = b'C';
 const RECONCILIATION_DOMAIN: u8 = b'R';
 const VALUE_FORMAT: u8 = 1;
-const LOCATOR_VALUE_FORMAT: u8 = 2;
+const LOCATOR_VALUE_FORMAT: u8 = 1;
 const LOCATOR_KEY_FIXED_BYTES: usize = 1 + 1 + 1 + 8 + 8;
 const ASSIGNMENT_KEY_BYTES: usize = 1 + 1 + 1 + 8 + 8 + 8;
 const CHECKPOINT_KEY_BYTES: usize = 1 + 1 + 1 + 2;
@@ -484,8 +484,21 @@ impl Store {
         batch: &mut WriteBatch,
         mutations: &[DefinitionAssignmentMutation],
     ) -> Result<Vec<DefinitionAssignmentMutation>, DefinitionStateError> {
+        self.stage_assignment_mutations_with_clock(batch, mutations, now_unix_millis)
+    }
+
+    fn stage_assignment_mutations_with_clock(
+        &self,
+        batch: &mut WriteBatch,
+        mutations: &[DefinitionAssignmentMutation],
+        mut clock: impl FnMut() -> Result<u64, DefinitionStateError>,
+    ) -> Result<Vec<DefinitionAssignmentMutation>, DefinitionStateError> {
         let mut changed = Vec::new();
         let mut pending = BTreeMap::<Vec<u8>, PendingAssignment>::new();
+        // A RocksDB WriteBatch has no read-your-writes view. Retain the final
+        // accepted mutation for each assignment identity and stage at most one
+        // deletion-due replacement after the assignment state is known.
+        let mut final_mutations = BTreeMap::<Vec<u8>, &DefinitionAssignmentMutation>::new();
         for mutation in mutations {
             let (kind, tenant_id, bucket_id, definition_id) = mutation.identity();
             let key = assignment_key(kind, tenant_id, bucket_id, definition_id)?;
@@ -501,22 +514,6 @@ impl Store {
             let state = pending.get_mut(key.as_slice()).expect("inserted above");
             if state.is_newer_than(mutation) {
                 continue;
-            }
-            if let DefinitionAssignmentMutation::Delete(deletion) = mutation
-                && deletion.kind == DefinitionKind::Index
-            {
-                self.stage_deleted_definition_cleanup(
-                    batch,
-                    &DeletedDefinitionCleanup {
-                        tenant_id: deletion.tenant_id,
-                        bucket_id: deletion.bucket_id,
-                        index_id: deletion.definition_id,
-                        definition_path: deletion.definition_path.clone(),
-                        definition_object_version: deletion.object_version,
-                        due_at_unix_millis: now_unix_millis()?,
-                    },
-                )
-                .map_err(retention_due_state)?;
             }
             match mutation {
                 DefinitionAssignmentMutation::Upsert(assignment)
@@ -543,6 +540,30 @@ impl Store {
                 | DefinitionAssignmentMutation::Remove { .. } => {}
             }
             state.accept(mutation);
+            final_mutations.insert(key.to_vec(), mutation);
+        }
+        let mut final_deletions = final_mutations.into_values().filter_map(|mutation| {
+            let DefinitionAssignmentMutation::Delete(deletion) = mutation else {
+                return None;
+            };
+            (deletion.kind == DefinitionKind::Index).then_some(deletion)
+        });
+        if let Some(first) = final_deletions.next() {
+            let due_at_unix_millis = clock()?;
+            for deletion in std::iter::once(first).chain(final_deletions) {
+                self.stage_deleted_definition_cleanup(
+                    batch,
+                    &DeletedDefinitionCleanup {
+                        tenant_id: deletion.tenant_id,
+                        bucket_id: deletion.bucket_id,
+                        index_id: deletion.definition_id,
+                        definition_path: deletion.definition_path.clone(),
+                        definition_object_version: deletion.object_version,
+                        due_at_unix_millis,
+                    },
+                )
+                .map_err(retention_due_state)?;
+            }
         }
         Ok(changed)
     }

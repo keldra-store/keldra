@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem::size_of;
+use std::sync::Arc;
 
 use crate::{
     AllowedSubject, AuthorizationError, AuthorizationLimits, NamespaceDefinition,
@@ -22,7 +24,7 @@ pub(crate) enum CompiledRelation {
         allowed_subjects: BTreeSet<AllowedSubject>,
     },
     Permission {
-        rules: Vec<RewriteRule>,
+        rules: Arc<[RewriteRule]>,
     },
 }
 
@@ -53,6 +55,37 @@ impl CompiledSchema {
         let compiled = Self { namespaces };
         compiled.validate_references()?;
         Ok(compiled)
+    }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        let mut bytes = 0usize;
+        for (namespace_name, namespace) in &self.namespaces {
+            bytes = bytes
+                .saturating_add(size_of::<(String, CompiledNamespace)>())
+                .saturating_add(namespace_name.len());
+            for (relation_name, relation) in &namespace.relations {
+                bytes = bytes
+                    .saturating_add(size_of::<(String, CompiledRelation)>())
+                    .saturating_add(relation_name.len());
+                match relation {
+                    CompiledRelation::Direct { allowed_subjects } => {
+                        for allowed in allowed_subjects {
+                            bytes = bytes
+                                .saturating_add(size_of::<AllowedSubject>())
+                                .saturating_add(allowed_subject_bytes(allowed));
+                        }
+                    }
+                    CompiledRelation::Permission { rules } => {
+                        for rule in rules.iter() {
+                            bytes = bytes
+                                .saturating_add(size_of::<RewriteRule>())
+                                .saturating_add(rewrite_rule_bytes(rule));
+                        }
+                    }
+                }
+            }
+        }
+        bytes
     }
 
     pub(crate) fn relation(&self, namespace: &str, relation: &str) -> Option<&CompiledRelation> {
@@ -132,7 +165,7 @@ impl CompiledSchema {
                     CompiledRelation::Permission { rules } => rules,
                 };
 
-                for rule in rules {
+                for rule in rules.iter() {
                     match rule {
                         RewriteRule::Inherit { relation } => {
                             self.require_schema_relation(namespace_name, relation, "inherited")?;
@@ -192,6 +225,47 @@ impl CompiledSchema {
             ))
         })
     }
+}
+
+fn allowed_subject_bytes(subject: &AllowedSubject) -> usize {
+    match subject {
+        AllowedSubject::AnyObject { namespace } | AllowedSubject::SameResourceId { namespace } => {
+            namespace.len()
+        }
+        AllowedSubject::AnyUserset {
+            namespace,
+            relation,
+        } => namespace.len().saturating_add(relation.len()),
+        AllowedSubject::Exact { subject } => match subject {
+            TupleSubject::Object(object) => object_ref_bytes(object),
+            TupleSubject::Userset(userset) => {
+                object_ref_bytes(&userset.object).saturating_add(userset.relation.len())
+            }
+        },
+        AllowedSubject::Public => 0,
+    }
+}
+
+fn rewrite_rule_bytes(rule: &RewriteRule) -> usize {
+    match rule {
+        RewriteRule::Inherit { relation } => relation.len(),
+        RewriteRule::TupleToUserset {
+            tuple_relation,
+            target_relation,
+        } => tuple_relation.len().saturating_add(target_relation.len()),
+    }
+}
+
+fn object_ref_bytes(object: &crate::ObjectRef) -> usize {
+    let id_bytes = match &object.id {
+        crate::ObjectId::Opaque(id) => id.len(),
+        crate::ObjectId::ExactPath(path) => path
+            .tenant
+            .len()
+            .saturating_add(path.bucket.len())
+            .saturating_add(path.path.len()),
+    };
+    object.namespace.len().saturating_add(id_bytes)
 }
 
 fn tuple_target(allowed: &AllowedSubject) -> Option<(&str, Option<&str>)> {
@@ -290,7 +364,7 @@ fn compile_relation(
                 }
             }
             Ok(CompiledRelation::Permission {
-                rules: canonical.into_iter().collect(),
+                rules: canonical.into_iter().collect::<Vec<_>>().into(),
             })
         }
     }

@@ -253,8 +253,6 @@ async fn renewal_loop(
                         fence.outcome = "renewed",
                         monotonic_counter.keldra_serving_fence_renewal_attempts_total = 1_u64,
                         monotonic_counter.keldra_serving_fence_renewal_successes_total = 1_u64,
-                        // Compatibility alias: in 0.8.1 this counted attempts.
-                        monotonic_counter.keldra_serving_fence_renewals_total = 1_u64,
                         monotonic_counter.keldra_serving_fence_missed_deadlines_total =
                             u64::from(missed_deadline),
                         monotonic_counter.keldra_serving_fence_membership_progress_total =
@@ -292,8 +290,6 @@ async fn renewal_loop(
                         operation = "serving_fence_renewal",
                         fence.outcome = outcome,
                         monotonic_counter.keldra_serving_fence_renewal_attempts_total = 1_u64,
-                        // Compatibility alias: in 0.8.1 this counted attempts.
-                        monotonic_counter.keldra_serving_fence_renewals_total = 1_u64,
                         monotonic_counter.keldra_serving_fence_failures_total = 1_u64,
                         monotonic_counter.keldra_serving_fence_missed_deadlines_total =
                             u64::from(missed_deadline),
@@ -505,8 +501,8 @@ mod tests {
             current_peer_spki_sha256: PeerSpkiSha256([1; 32]),
             overlap_peer_spki_sha256: None,
             join_capability_hash: Some(JoinCapabilityHash([2; 32])),
-            supported_protocol: CapabilityRange { min: 1, max: 2 },
-            supported_storage_format: CapabilityRange { min: 1, max: 2 },
+            supported_protocol: CapabilityRange { min: 1, max: 1 },
+            supported_storage_format: CapabilityRange { min: 1, max: 1 },
         };
         let begun = raft
             .submit(Command::BeginAddNode {
@@ -617,11 +613,11 @@ mod tests {
             current_peer_spki_sha256: PeerSpkiSha256([3; 32]),
             overlap_peer_spki_sha256: None,
             join_capability_hash: Some(JoinCapabilityHash([4; 32])),
-            supported_protocol: CapabilityRange { min: 1, max: 2 },
-            supported_storage_format: CapabilityRange { min: 1, max: 2 },
+            supported_protocol: CapabilityRange { min: 1, max: 1 },
+            supported_storage_format: CapabilityRange { min: 1, max: 1 },
         };
         let mut changed_leader_state = raft.state().unwrap();
-        changed_leader_state
+        Arc::make_mut(&mut changed_leader_state)
             .apply(
                 second,
                 &Command::BeginAddNode {
@@ -630,7 +626,7 @@ mod tests {
                 },
             )
             .unwrap();
-        changed_leader_state
+        Arc::make_mut(&mut changed_leader_state)
             .apply(
                 second,
                 &Command::CompleteMembershipTransition {

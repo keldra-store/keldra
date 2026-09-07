@@ -12,7 +12,7 @@ pub(crate) use codec::{
     encoded_change_len,
 };
 
-/// Release defaults for the one source-local 0.5.0 invalidation journal.
+/// Defaults for one source-local invalidation journal.
 pub const DEFAULT_WATCH_MAX_ENTRIES: u64 = 1_000_000;
 pub const DEFAULT_WATCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -34,7 +34,7 @@ pub(crate) const LOCAL_INVALIDATION_TOKEN_KEY: &[u8] = b"local_invalidation_toke
 
 const WATCH_TOKEN_FORMAT: u16 = 1;
 const WATCH_TOKEN_MAX_ENCODED_BYTES: usize = 16 * 1024;
-const REFERENCE_PROOF_FORMAT: u16 = 2;
+const REFERENCE_PROOF_FORMAT: u16 = 1;
 const REFERENCE_PROOF_NAMESPACE: u8 = 0xff;
 pub(crate) const REFERENCE_PROOF_KEY_BYTES: usize =
     1 + 1 + size_of::<u16>() + size_of::<[u8; 32]>() + size_of::<u64>();
@@ -220,25 +220,44 @@ pub enum ObjectHeadChangeKind {
     Delete,
 }
 
-/// Compact evidence needed by aggregate consumers to advance exact current-
-/// head totals without retaining one entry per object path. Released journal
-/// records omit this field; consumers must rescan and rebase when they meet
-/// such an entry rather than guessing its transition.
+/// Compact evidence needed by aggregate consumers to advance logical retained
+/// bytes and live object count without retaining one entry per object path.
+/// Exact accounting effects carried by one journal transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountingHeadTransition {
     format: u8,
     pub previous_live_length: Option<u64>,
     pub current_live_length: Option<u64>,
+    /// Logical payload bytes removed by the mutation, independently of when
+    /// the physical content reference is released and garbage-collected.
+    pub logical_bytes_removed: u64,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 impl AccountingHeadTransition {
     pub const FORMAT: u8 = 1;
 
-    pub fn new(previous_live_length: Option<u64>, current_live_length: Option<u64>) -> Self {
+    pub(crate) const fn format(self) -> u8 {
+        self.format
+    }
+
+    pub fn new(
+        previous_live_length: Option<u64>,
+        current_live_length: Option<u64>,
+        logical_bytes_removed: u64,
+    ) -> Self {
         Self {
             format: Self::FORMAT,
             previous_live_length,
             current_live_length,
+            logical_bytes_removed,
         }
     }
 
@@ -260,7 +279,7 @@ pub struct ObjectHeadChange {
     pub exact_path: String,
     /// Canonical object path when `exact_path` is a transparent logical alias.
     /// Physical object-head changes leave this absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub canonical_path: Option<String>,
     pub path_version: VersionId,
     pub kind: ObjectHeadChangeKind,
@@ -272,11 +291,10 @@ pub struct ObjectHeadChange {
     /// Exact logical content-reference effects selected by this mutation.
     /// Public watches ignore these; peer replication consumes them from the
     /// same ordered source journal.
-    #[serde(default)]
     pub reference_deltas: Vec<ReferenceDelta>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub accounting_transition: Option<AccountingHeadTransition>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub definition_transition: Option<DefinitionTransition>,
 }
 
@@ -288,11 +306,15 @@ pub struct RetainedVersionDeletedChange {
     pub tenant_id: u64,
     pub bucket_id: u64,
     pub exact_path: String,
+    /// Canonical retained lineage when `exact_path` is an alias-scoped wake.
+    /// The canonical event carries mutation proof/effects and leaves this
+    /// absent; derived alias events are committed immediately after it.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub canonical_path: Option<String>,
     pub deleted_version: VersionId,
     pub resulting_head_version: Option<VersionId>,
-    #[serde(default)]
     pub reference_deltas: Vec<ReferenceDelta>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub accounting_transition: Option<AccountingHeadTransition>,
 }
 
@@ -321,8 +343,8 @@ pub struct ContentLifecycleChanged {
     pub offset: u64,
     pub blob_identity: Vec<u8>,
     pub revision: u64,
-    #[serde(default)]
     pub reference_deltas: Vec<ReferenceDelta>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub accounting_transition: Option<ContentAccountingTransition>,
 }
 
@@ -346,7 +368,7 @@ pub struct AtomicBatchMutation {
     pub bucket_id: u64,
     pub exact_path: String,
     /// Canonical object path when `exact_path` is a transparent logical alias.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub canonical_path: Option<String>,
     pub path_version: VersionId,
     pub deleted: bool,
@@ -364,28 +386,37 @@ pub struct AtomicBatchPublished {
     pub offset: u64,
     pub cursor: u64,
     pub bundle_hash: crate::PreparedBundleHash,
-    pub affected_routes: Vec<AtomicBatchRoute>,
     pub mutations: Vec<AtomicBatchMutation>,
 }
 
 impl AtomicBatchPublished {
+    /// Sorted unique tenant/bucket routes affected by this publication.
+    ///
+    /// `mutations` is validated in strict sort order, so equal routes are
+    /// contiguous and can be deduplicated in one pass without allocation.
+    pub fn routes(&self) -> impl Iterator<Item = AtomicBatchRoute> + '_ {
+        let mut previous = None;
+        self.mutations.iter().filter_map(move |mutation| {
+            let route = AtomicBatchRoute {
+                tenant_id: mutation.tenant_id,
+                bucket_id: mutation.bucket_id,
+            };
+            if previous == Some(route) {
+                None
+            } else {
+                previous = Some(route);
+                Some(route)
+            }
+        })
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.offset == 0
             || self.cursor == 0
             || self.bundle_hash.0 == [0; 32]
-            || self.affected_routes.is_empty()
             || self.mutations.is_empty()
-            || self.affected_routes.len() > MAX_ATOMIC_BATCH_MUTATIONS
             || self.mutations.len() > MAX_ATOMIC_BATCH_MUTATIONS
-            || !self
-                .affected_routes
-                .windows(2)
-                .all(|pair| pair[0] < pair[1])
             || !self.mutations.windows(2).all(|pair| pair[0] < pair[1])
-            || self
-                .affected_routes
-                .iter()
-                .any(|route| route.tenant_id == 0 || route.bucket_id == 0)
             || self.mutations.iter().any(|mutation| {
                 mutation.tenant_id == 0
                     || mutation.bucket_id == 0
@@ -398,13 +429,6 @@ impl AtomicBatchPublished {
                     || mutation.source_id.node_id == 0
                     || mutation.source_id.source_epoch == [0; 32]
                     || mutation.source_journal_position == 0
-                    || self
-                        .affected_routes
-                        .binary_search(&AtomicBatchRoute {
-                            tenant_id: mutation.tenant_id,
-                            bucket_id: mutation.bucket_id,
-                        })
-                        .is_err()
             })
         {
             Err("atomic batch publication is malformed")
@@ -600,10 +624,33 @@ impl LocalChange {
             tenant_id,
             bucket_id,
             exact_path,
+            canonical_path: None,
             deleted_version,
             resulting_head_version,
             reference_deltas,
             accounting_transition,
+        })
+    }
+
+    pub(crate) fn alias_retained_version_deleted(
+        offset: u64,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: String,
+        canonical_path: String,
+        deleted_version: VersionId,
+        resulting_head_version: Option<VersionId>,
+    ) -> Self {
+        Self::RetainedVersionDeleted(RetainedVersionDeletedChange {
+            offset,
+            tenant_id,
+            bucket_id,
+            exact_path,
+            canonical_path: Some(canonical_path),
+            deleted_version,
+            resulting_head_version,
+            reference_deltas: Vec::new(),
+            accounting_transition: None,
         })
     }
 
@@ -641,14 +688,12 @@ impl LocalChange {
         offset: u64,
         cursor: u64,
         bundle_hash: crate::PreparedBundleHash,
-        affected_routes: Vec<AtomicBatchRoute>,
         mutations: Vec<AtomicBatchMutation>,
     ) -> Self {
         Self::AtomicBatchPublished(AtomicBatchPublished {
             offset,
             cursor,
             bundle_hash,
-            affected_routes,
             mutations,
         })
     }
@@ -901,9 +946,50 @@ mod tests {
         );
         let encoded = encode_local_change(&expected).unwrap();
         assert_eq!(&encoded[..4], b"ANVJ");
-        assert_eq!(u16::from_be_bytes(encoded[4..6].try_into().unwrap()), 6);
+        assert_eq!(u16::from_be_bytes(encoded[4..6].try_into().unwrap()), 1);
         assert_eq!(encoded[6], 1);
         assert_eq!(decode_local_change(&encoded).unwrap(), expected);
+    }
+
+    #[test]
+    fn atomic_batch_routes_are_derived_once_from_sorted_mutations() {
+        let change = AtomicBatchPublished {
+            offset: 1,
+            cursor: 2,
+            bundle_hash: crate::PreparedBundleHash([3; 32]),
+            mutations: vec![
+                atomic_mutation(11, 12, "documents/a", 1),
+                atomic_mutation(11, 12, "documents/b", 2),
+                atomic_mutation(11, 13, "documents/a", 3),
+                atomic_mutation(12, 1, "documents/a", 4),
+            ],
+        };
+
+        assert_eq!(
+            change.routes().collect::<Vec<_>>(),
+            vec![
+                AtomicBatchRoute {
+                    tenant_id: 11,
+                    bucket_id: 12,
+                },
+                AtomicBatchRoute {
+                    tenant_id: 11,
+                    bucket_id: 13,
+                },
+                AtomicBatchRoute {
+                    tenant_id: 12,
+                    bucket_id: 1,
+                },
+            ]
+        );
+        assert_eq!(change.validate(), Ok(()));
+
+        let mut unsorted = change;
+        unsorted.mutations.swap(0, 1);
+        assert_eq!(
+            unsorted.validate(),
+            Err("atomic batch publication is malformed")
+        );
     }
 
     #[test]
@@ -920,10 +1006,31 @@ mod tests {
             None,
         );
         let mut encoded = encode_local_change(&change).unwrap();
-        encoded[5] = 4;
+        encoded[5] = 2;
         assert!(matches!(
             decode_local_change(&encoded),
-            Err(codec::LocalChangeCodecError::UnsupportedFormat(4))
+            Err(codec::LocalChangeCodecError::UnsupportedFormat(2))
         ));
+    }
+
+    fn atomic_mutation(
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: &str,
+        source_journal_position: u64,
+    ) -> AtomicBatchMutation {
+        AtomicBatchMutation {
+            tenant_id,
+            bucket_id,
+            exact_path: exact_path.into(),
+            canonical_path: None,
+            path_version: VersionId(source_journal_position),
+            deleted: false,
+            source_id: SourceId {
+                node_id: 1,
+                source_epoch: [2; 32],
+            },
+            source_journal_position,
+        }
     }
 }

@@ -16,14 +16,15 @@ use super::{
     StoredTupleReceipt, TupleBatchReceipt, TupleBatchRequest, TupleMutation, TupleMutationKind,
     binding_key, canonical_schema, current_unix_millis, encode_json, receipt_key,
     receipt_record_bytes, schema_digest_key, schema_revision_key, storage_error, tuple_fingerprint,
-    tuple_key, validate_binding, validate_principal, validate_stored_schema,
-    validate_stored_tuple_receipt_shape,
+    tuple_key, validate_binding, validate_principal, validate_stored_realm_binding,
+    validate_stored_schema, validate_stored_tuple_receipt_shape,
 };
 use crate::store::{CF_AUTHZ_BINDINGS, CF_AUTHZ_RECEIPTS, CF_AUTHZ_SCHEMAS, CF_AUTHZ_TUPLES};
 use crate::{PlacementLogId, SourceId};
 
 pub const AUTHZ_REALM_MUTATION_FORMAT: u16 = 1;
 pub const AUTHZ_REALM_MUTATION_STAMP_FORMAT: u16 = 1;
+pub(super) const STORED_REALM_BINDING_FORMAT: u16 = 1;
 
 /// Consensus-derived values attached to a mutation by the current realm
 /// coordinator. Source position assignment and journal append remain the
@@ -38,8 +39,10 @@ pub struct AuthzRealmMutationContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthzRealmMutationStamp {
     pub format: u16,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
     pub predecessor_revision: Option<AuthzRevision>,
     pub mutation_fingerprint: [u8; 32],
     pub active_placement_log_id: PlacementLogId,
@@ -91,6 +94,7 @@ impl AuthzRealmChange {
 /// One bounded typed result for the complete `(storage_tenant, realm)`
 /// aggregate. Raw column-family operations and Raft payloads are absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthzRealmMutation {
     pub format: u16,
     pub scope: AuthzScope,
@@ -250,8 +254,7 @@ pub enum CoordinatedAuthzRealmResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatedAuthzRealmMutation {
     pub result: CoordinatedAuthzRealmResult,
-    /// `None` only for a released local receipt or semantic binding replay
-    /// that predates typed realm mutation storage.
+    /// Semantic replays that produced no new coordinator mutation carry none.
     pub mutation: Option<AuthzRealmMutation>,
 }
 
@@ -261,17 +264,16 @@ pub struct ReplicaAuthzRealmMutationApplied {
     pub replayed: bool,
 }
 
-/// Stored binding envelope. Flattening preserves the released binding JSON
-/// shape: old values decode with no stamp, and old `RealmBinding` readers
-/// ignore the additional field on 0.5.1 values.
+/// Versioned binding envelope written atomically with the exact realm revision
+/// and optional coordinator lineage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct StoredRealmBinding {
-    #[serde(flatten)]
+    pub format: u16,
     pub binding: RealmBinding,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "super::deserialize_required_option")]
     pub mutation_stamp: Option<AuthzRealmMutationStamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aggregate_revision: Option<AuthzRevision>,
+    pub revision: AuthzRevision,
 }
 
 impl AuthzRepository {
@@ -308,10 +310,7 @@ impl AuthzRepository {
         }
         let stored_schema =
             self.require_schema(&request.scope.storage_tenant, &request.schema_ref)?;
-        let predecessor_revision = predecessor
-            .as_ref()
-            .map(|stored| self.stored_realm_revision(&request.scope, stored))
-            .transpose()?;
+        let predecessor_revision = predecessor.as_ref().map(Self::stored_realm_revision);
         let mut mutation = AuthzRealmMutation {
             format: AUTHZ_REALM_MUTATION_FORMAT,
             scope: request.scope,
@@ -375,7 +374,7 @@ impl AuthzRepository {
                 request.scope.realm.clone(),
             )
         })?;
-        let predecessor_revision = self.stored_realm_revision(&request.scope, &predecessor)?;
+        let predecessor_revision = Self::stored_realm_revision(&predecessor);
         let receipt = self.prepare_tuple_batch(&request, batch)?;
         if receipt.replayed {
             let mutation = self
@@ -454,10 +453,7 @@ impl AuthzRepository {
                 replayed: true,
             });
         }
-        let current_revision = current
-            .as_ref()
-            .map(|stored| self.stored_realm_revision(&mutation.scope, stored))
-            .transpose()?;
+        let current_revision = current.as_ref().map(Self::stored_realm_revision);
         validate_predecessor(current.as_ref(), current_revision, mutation)?;
 
         let mut batch = WriteBatch::default();
@@ -567,23 +563,13 @@ impl AuthzRepository {
         let stored: Option<StoredRealmBinding> =
             self.read_json(CF_AUTHZ_BINDINGS, &binding_key(scope))?;
         if let Some(stored) = stored.as_ref() {
-            validate_binding(&stored.binding, scope)?;
+            validate_stored_realm_binding(stored, scope)?;
         }
         Ok(stored)
     }
 
-    fn stored_realm_revision(
-        &self,
-        scope: &AuthzScope,
-        stored: &StoredRealmBinding,
-    ) -> Result<AuthzRevision, AuthzStoreError> {
-        match (stored.aggregate_revision, stored.mutation_stamp) {
-            (Some(revision), Some(_)) if revision != AuthzRevision::ZERO => Ok(revision),
-            (None, None) => self.tenant_revision(&scope.storage_tenant),
-            _ => Err(AuthzStoreError::Storage(
-                "persisted authorization realm lineage is inconsistent".into(),
-            )),
-        }
+    fn stored_realm_revision(stored: &StoredRealmBinding) -> AuthzRevision {
+        stored.revision
     }
 
     fn stage_stamped_binding(
@@ -595,9 +581,10 @@ impl AuthzRepository {
             self.cf(CF_AUTHZ_BINDINGS)?,
             binding_key(&mutation.scope),
             encode_json(&StoredRealmBinding {
+                format: STORED_REALM_BINDING_FORMAT,
                 binding: mutation.change.binding().clone(),
                 mutation_stamp: Some(mutation.stamp),
-                aggregate_revision: Some(mutation.revision()),
+                revision: mutation.revision(),
             })?,
         );
         Ok(())

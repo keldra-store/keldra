@@ -9,12 +9,12 @@ use crate::store::{
     VERSION_HIGH_WATERMARK_KEY, version_key,
 };
 use crate::{
-    MUTATION_STAMP_FORMAT, MutationStamp, ObjectMutationContext, ReferenceProof,
+    MUTATION_STAMP_FORMAT, MutationStamp, ObjectMutationContext, ObjectVersioning, ReferenceProof,
     ReferenceProofMutation, SourceId,
 };
 
-pub const PROGRAM_PATH_STAGE_FORMAT: u16 = 2;
-pub const PROGRAM_PATH_MUTATION_FORMAT: u16 = 3;
+pub const PROGRAM_PATH_STAGE_FORMAT: u16 = 1;
+pub const PROGRAM_PATH_MUTATION_FORMAT: u16 = 1;
 pub const PROGRAM_ALIAS_REGISTRY_STAGE_FORMAT: u16 = 1;
 pub const PROGRAM_ALIAS_REGISTRY_MUTATION_FORMAT: u16 = 1;
 
@@ -33,6 +33,10 @@ pub struct ProgramPathStage {
     pub participant_manifest_hash: [u8; 32],
     pub tenant_id: u64,
     pub bucket_id: u64,
+    /// Authoritative bucket governance sealed by the complete logical-record
+    /// group in the participant manifest. Exact-path replicas are deliberately
+    /// independent of replica-local bucket records.
+    pub governance: ProgramGovernanceParticipant,
     pub path: ObjectPath,
     pub expected: ObservedHead,
     pub previous_version: Option<Version>,
@@ -55,8 +59,7 @@ impl ProgramPathStage {
 
     pub fn validate(&self) -> Result<(), ProgramStoreError> {
         let valid_program_hash = match self.authority {
-            ProgramBundleAuthority::StoredProgram { .. }
-            | ProgramBundleAuthority::LegacyProgramOnly { .. } => self.program_hash.0 != [0; 32],
+            ProgramBundleAuthority::StoredProgram { .. } => self.program_hash.0 != [0; 32],
             ProgramBundleAuthority::BuiltInObjectTransaction { .. } => {
                 self.program_hash.0 == [0; 32]
             }
@@ -68,6 +71,10 @@ impl ProgramPathStage {
             || self.participant_manifest_hash == [0; 32]
             || self.tenant_id == 0
             || self.bucket_id == 0
+            || self.governance.tenant != self.path.tenant
+            || self.governance.bucket != self.path.bucket
+            || self.governance.tenant_id != self.tenant_id
+            || self.governance.bucket_id != self.bucket_id
             || self.version.id.0 == 0
             || self.version.deleted != self.version.blob.is_none()
             || self.version.deleted && self.version.content_type.is_some()
@@ -82,11 +89,12 @@ impl ProgramPathStage {
             ));
         }
         self.authority
-            .validate(matches!(
-                self.authority,
-                ProgramBundleAuthority::LegacyProgramOnly { .. }
-            ))
+            .validate()
             .map_err(|message| ProgramStoreError::InvalidBundle(message.into()))?;
+        self.governance
+            .policy
+            .validate()
+            .map_err(|error| ProgramStoreError::InvalidBundle(error.to_string()))?;
         ObjectKey::new(&self.path.tenant, &self.path.bucket, &self.path.path)
             .map_err(|error| ProgramStoreError::InvalidBundle(error.to_string()))?;
         match (&self.expected, &self.previous_version) {
@@ -113,6 +121,7 @@ pub struct ProgramPathMutation {
     pub stage: ProgramPathStage,
     pub stamp: MutationStamp,
     pub reference_deltas: Vec<ReferenceDelta>,
+    pub accounting_transition: AccountingHeadTransition,
 }
 
 impl ProgramPathMutation {
@@ -125,11 +134,22 @@ impl ProgramPathMutation {
         let mut canonical = self.clone();
         canonical.stamp.mutation_fingerprint = [0; 32];
         let encoded = serde_json::to_vec(&canonical).map_err(program_storage_error)?;
-        Ok(tagged_hash(b"keldra.program-path-mutation.v2", &encoded))
+        Ok(tagged_hash(b"keldra.program-path-mutation.v1", &encoded))
     }
 
     pub fn validate(&self) -> Result<(), ProgramStoreError> {
         self.stage.validate()?;
+        self.accounting_transition
+            .validate()
+            .map_err(|error| ProgramStoreError::InvalidBundle(error.into()))?;
+        let previous_live_length = self
+            .stage
+            .previous_version
+            .as_ref()
+            .and_then(live_version_length);
+        let retention = stage_retention(&self.stage);
+        let permitted_reference_deltas = permitted_reference_delta_variants(&self.stage)?;
+        let expected_accounting_transition = stage_accounting_transition(&self.stage, retention);
         if self.format != PROGRAM_PATH_MUTATION_FORMAT
             || self.commit_cursor == 0
             || self.stamp.format != MUTATION_STAMP_FORMAT
@@ -151,6 +171,14 @@ impl ProgramPathMutation {
                 .reference_deltas
                 .iter()
                 .any(|delta| !matches!(delta.change, -1 | 1))
+            || !permitted_reference_deltas.contains(&self.reference_deltas)
+            || self.accounting_transition.previous_live_length != previous_live_length
+            || self.accounting_transition.current_live_length
+                != live_version_length(&self.stage.version)
+            || (self.accounting_transition.logical_bytes_removed != 0
+                && self.accounting_transition.logical_bytes_removed
+                    != previous_live_length.unwrap_or(0))
+            || self.accounting_transition != expected_accounting_transition
             || self.stamp.mutation_fingerprint != self.computed_fingerprint()?
         {
             return Err(ProgramStoreError::InvalidBundle(
@@ -212,7 +240,7 @@ impl ProgramAliasRegistryStage {
             ));
         }
         self.authority
-            .validate(false)
+            .validate()
             .map_err(|message| ProgramStoreError::InvalidBundle(message.into()))?;
         ObjectKey::new(&self.target.tenant, &self.target.bucket, &self.target.path)
             .map_err(|error| ProgramStoreError::InvalidBundle(error.to_string()))?;
@@ -261,47 +289,12 @@ impl StoredPreparedBundle {
     pub fn decode_distributed(
         bytes: &[u8],
         bundle: PreparedBundleRef,
-        bundle_hash: PreparedBundleHash,
         program_hash: ProgramHash,
     ) -> Result<Self, ProgramStoreError> {
-        if bytes.len() as u64 != bundle.length
-            || bundle.hash != bundle_hash.0
-            || *blake3::hash(bytes).as_bytes() != bundle.hash
-        {
+        if bytes.len() as u64 != bundle.length || *blake3::hash(bytes).as_bytes() != bundle.hash.0 {
             return Err(ProgramStoreError::PreparedBundleMismatch);
         }
-        let record: Self = match serde_json::from_slice(bytes) {
-            Ok(record) => record,
-            Err(_) => {
-                let legacy: LegacyStoredPreparedBundleV4 =
-                    serde_json::from_slice(bytes).map_err(program_storage_error)?;
-                if legacy.format != LEGACY_PREPARED_BUNDLE_FORMAT {
-                    return Err(ProgramStoreError::InvalidBundle(
-                        "unsupported prepared record format".into(),
-                    ));
-                }
-                Self {
-                    format: legacy.format,
-                    source_bundle_hash: legacy.source_bundle_hash,
-                    program_hash: legacy.program_hash,
-                    authority: ProgramBundleAuthority::LegacyProgramOnly {
-                        program_path_hash: legacy.receipt.program_path_hash,
-                        program_hash: legacy.program_hash.0,
-                    },
-                    participant_manifest: ProgramParticipantManifest {
-                        format: PROGRAM_PARTICIPANT_MANIFEST_FORMAT,
-                        objects: Vec::new(),
-                        governance: Vec::new(),
-                    },
-                    builtin_plan: None,
-                    alias_bindings: Vec::new(),
-                    alias_registry_transitions: Vec::new(),
-                    preconditions: legacy.preconditions,
-                    writes: legacy.writes,
-                    receipt: legacy.receipt,
-                }
-            }
-        };
+        let record: Self = serde_json::from_slice(bytes).map_err(program_storage_error)?;
         validate_prepared_record(&record)?;
         if record.program_hash != program_hash {
             return Err(ProgramStoreError::PreparedBundleMismatch);
@@ -473,20 +466,10 @@ impl StoredPreparedBundle {
         &self.participant_manifest
     }
 
-    pub fn participant_manifest_hash(
-        &self,
-        bundle_hash: PreparedBundleHash,
-    ) -> Result<[u8; 32], ProgramStoreError> {
-        if matches!(
-            self.authority,
-            ProgramBundleAuthority::LegacyProgramOnly { .. }
-        ) {
-            Ok(bundle_hash.0)
-        } else {
-            self.participant_manifest
-                .hash()
-                .map_err(ProgramStoreError::InvalidBundle)
-        }
+    pub fn participant_manifest_hash(&self) -> Result<[u8; 32], ProgramStoreError> {
+        self.participant_manifest
+            .hash()
+            .map_err(ProgramStoreError::InvalidBundle)
     }
 }
 
@@ -610,20 +593,13 @@ impl Store {
             self.validate_program_path_policy(&stage)?;
             let identity = stage_identity(&stage);
             let key = stage_key(&stage)?;
-            if !matches!(
-                stage.authority,
-                ProgramBundleAuthority::LegacyProgramOnly { .. }
-            ) {
-                self.require_committed_program_reservation_locked(
-                    identity,
-                    key.path(),
-                    stage.begin_cursor,
-                    commit_cursor,
-                    context.serving_fence_term,
-                    context.active_placement_log_id,
-                )
-                .map_err(program_mutation_error)?;
-            }
+            self.require_committed_program_path_stage_reservation_locked(
+                &stage,
+                commit_cursor,
+                context.serving_fence_term,
+                context.active_placement_log_id,
+            )
+            .map_err(program_mutation_error)?;
             let current = self
                 .head_by_storage_key(&identity.head_key(key.path()))
                 .map_err(program_mutation_error)?;
@@ -637,15 +613,7 @@ impl Store {
                     .ok_or_else(|| ProgramStoreError::CommitCorruption {
                         cursor: commit_cursor,
                     })?;
-                let mut mutation = self.program_path_mutation(
-                    stage.clone(),
-                    commit_cursor,
-                    context,
-                    stamp.source_id,
-                    stamp.source_journal_position,
-                )?;
-                mutation.stamp = stamp;
-                mutation.validate()?;
+                let mutation = replayed_program_path_mutation(stage.clone(), commit_cursor, stamp)?;
                 return Ok(CoordinatedProgramPathFinalization {
                     mutation,
                     replayed: true,
@@ -685,25 +653,22 @@ impl Store {
     pub async fn apply_program_path_finalization_replica(
         &self,
         mutation: &ProgramPathMutation,
+        context: ObjectMutationContext,
     ) -> Result<ReplicaProgramPathApplied, ProgramStoreError> {
         mutation.validate()?;
         self.persist_program_path_stage(&mutation.stage).await?;
         let _commit_guard = self.lock_commit("distributed_program").await;
         self.validate_program_path_policy(&mutation.stage)?;
-        if !matches!(
-            mutation.stage.authority,
-            ProgramBundleAuthority::LegacyProgramOnly { .. }
-        ) {
-            self.require_committed_program_reservation_locked(
-                stage_identity(&mutation.stage),
-                &mutation.stage.path.path,
-                mutation.stage.begin_cursor,
-                mutation.commit_cursor,
-                mutation.stamp.serving_fence_term,
-                mutation.stamp.active_placement_log_id,
-            )
-            .map_err(program_mutation_error)?;
-        }
+        // Committed reservations follow the current recovery executor. The
+        // sealed mutation stamp remains the original coordinator's immutable
+        // replay provenance and may carry an older nomination.
+        self.require_committed_program_path_stage_reservation_locked(
+            &mutation.stage,
+            mutation.commit_cursor,
+            context.serving_fence_term,
+            context.active_placement_log_id,
+        )
+        .map_err(program_mutation_error)?;
         self.apply_program_path_mutation_locked(mutation, false)
     }
 
@@ -715,7 +680,9 @@ impl Store {
         source_id: SourceId,
         source_journal_position: u64,
     ) -> Result<ProgramPathMutation, ProgramStoreError> {
-        let reference_deltas = self.program_path_reference_deltas(&stage)?;
+        let retention = stage_retention(&stage);
+        let reference_deltas = self.current_program_path_reference_deltas(&stage)?;
+        let accounting_transition = stage_accounting_transition(&stage, retention);
         let mut mutation = ProgramPathMutation {
             format: PROGRAM_PATH_MUTATION_FORMAT,
             commit_cursor,
@@ -731,21 +698,19 @@ impl Store {
             },
             stage,
             reference_deltas,
+            accounting_transition,
         };
         mutation.set_fingerprint()?;
         mutation.validate()?;
         Ok(mutation)
     }
 
-    fn program_path_reference_deltas(
+    fn current_program_path_reference_deltas(
         &self,
         stage: &ProgramPathStage,
     ) -> Result<Vec<ReferenceDelta>, ProgramStoreError> {
         let mut deltas = reference_deltas(stage)?;
-        if self
-            .version_retention_for_bucket(stage_identity(stage))
-            .map_err(program_mutation_error)?
-            == StoredVersionRetention::JournalPending
+        if stage_retention(stage) == StoredVersionRetention::JournalPending
             && let Some(previous) = stage.previous_version.as_ref()
         {
             let identity = stage_identity(stage);
@@ -774,12 +739,7 @@ impl Store {
         mutation.validate()?;
         let stage = &mutation.stage;
         let identity = stage_identity(stage);
-        let expected_reference_deltas = self.program_path_reference_deltas(stage)?;
-        if mutation.reference_deltas != expected_reference_deltas {
-            return Err(ProgramStoreError::InvalidBundle(
-                "distributed program path mutation disagrees with local bucket versioning".into(),
-            ));
-        }
+        let retention = stage_retention(stage);
         let key = stage_key(stage)?;
         let encoded_head_key = identity.head_key(key.path());
         let current = self
@@ -808,9 +768,6 @@ impl Store {
 
         let mut batch = WriteBatch::default();
         let encoded_version_key = version_key(identity, &key, stage.version.id);
-        let retention = self
-            .version_retention_for_bucket(identity)
-            .map_err(program_mutation_error)?;
         let encoded_version =
             serde_json::to_vec(&StoredVersion::new(stage.version.clone(), retention))
                 .map_err(program_storage_error)?;
@@ -832,6 +789,10 @@ impl Store {
                 .stored_version_by_key(&predecessor_key)
                 .map_err(program_mutation_error)?
             {
+                // The sealed fingerprint chooses the reference delta. This
+                // replica-local marker controls only descriptor cleanup: a
+                // pending proof or journal record retires it later, while an
+                // already released descriptor can disappear now.
                 match stored.retention {
                     StoredVersionRetention::JournalPending
                         if retention == StoredVersionRetention::UserRetained =>
@@ -892,7 +853,7 @@ impl Store {
                     deleted: stage.version.deleted,
                     program_commit_cursor: Some(mutation.commit_cursor),
                     reference_deltas: mutation.reference_deltas.clone(),
-                    accounting_transition: Some(stage_accounting_transition(stage)),
+                    accounting_transition: Some(mutation.accounting_transition),
                     definition_transition: None,
                 }],
                 LocalReferenceEffects::Deferred,
@@ -923,11 +884,7 @@ impl Store {
                 path: stage.path.clone(),
             });
         }
-        let policy = self
-            .bucket_policy_by_key(&stage_identity(stage).encode())
-            .map_err(program_mutation_error)?
-            .unwrap_or_default();
-        if policy.is_immutable(&stage.path.path)
+        if stage.governance.policy.is_immutable(&stage.path.path)
             && (stage.version.deleted || !matches!(stage.expected, ObservedHead::NeverExisted))
         {
             return Err(ProgramStoreError::Immutable {
@@ -992,6 +949,74 @@ fn reference_deltas(stage: &ProgramPathStage) -> Result<Vec<ReferenceDelta>, Pro
     Ok(deltas)
 }
 
+fn stage_retention(stage: &ProgramPathStage) -> StoredVersionRetention {
+    match stage.governance.versioning {
+        ObjectVersioning::Unversioned => StoredVersionRetention::JournalPending,
+        ObjectVersioning::Enabled => StoredVersionRetention::UserRetained,
+    }
+}
+
+/// A coordinator can select only the ordinary publication delta or the same
+/// publication combined with retirement of a journal-released predecessor.
+/// The latter descriptor is intentionally deleted by first application, so an
+/// exact replay identifies the original choice through the stored fingerprint
+/// rather than mutable predecessor state.
+fn permitted_reference_delta_variants(
+    stage: &ProgramPathStage,
+) -> Result<Vec<Vec<ReferenceDelta>>, ProgramStoreError> {
+    let ordinary = reference_deltas(stage)?;
+    let mut variants = vec![ordinary.clone()];
+    if stage_retention(stage) == StoredVersionRetention::JournalPending
+        && let Some(previous_blob) = stage
+            .previous_version
+            .as_ref()
+            .and_then(|version| version.blob.clone())
+    {
+        let mut released = ordinary;
+        released.push(ReferenceDelta {
+            blob: previous_blob,
+            change: -1,
+        });
+        if released.len() == 2 && released[0].blob == released[1].blob {
+            released.clear();
+        }
+        if !variants.contains(&released) {
+            variants.push(released);
+        }
+    }
+    Ok(variants)
+}
+
+fn replayed_program_path_mutation(
+    stage: ProgramPathStage,
+    commit_cursor: u64,
+    stamp: MutationStamp,
+) -> Result<ProgramPathMutation, ProgramStoreError> {
+    let accounting_transition = stage_accounting_transition(&stage, stage_retention(&stage));
+    let mut matched = None;
+    for reference_deltas in permitted_reference_delta_variants(&stage)? {
+        let candidate = ProgramPathMutation {
+            format: PROGRAM_PATH_MUTATION_FORMAT,
+            commit_cursor,
+            stage: stage.clone(),
+            stamp,
+            reference_deltas,
+            accounting_transition,
+        };
+        if candidate.computed_fingerprint()? == stamp.mutation_fingerprint {
+            candidate.validate()?;
+            if matched.replace(candidate).is_some() {
+                return Err(ProgramStoreError::CommitCorruption {
+                    cursor: commit_cursor,
+                });
+            }
+        }
+    }
+    matched.ok_or(ProgramStoreError::CommitCorruption {
+        cursor: commit_cursor,
+    })
+}
+
 fn program_reference_proof(
     mutation: &ProgramPathMutation,
 ) -> Result<ReferenceProof, ProgramStoreError> {
@@ -1008,20 +1033,29 @@ fn program_reference_proof(
             mutation.stage.version.deleted,
             Some(mutation.commit_cursor),
             mutation.reference_deltas.clone(),
-            Some(stage_accounting_transition(&mutation.stage)),
+            Some(mutation.accounting_transition),
             None,
         ),
         ReferenceProofMutation::ProgramPath(mutation.clone()),
     ))
 }
 
-fn stage_accounting_transition(stage: &ProgramPathStage) -> AccountingHeadTransition {
+fn stage_accounting_transition(
+    stage: &ProgramPathStage,
+    retention: StoredVersionRetention,
+) -> AccountingHeadTransition {
+    let previous_live_length = stage
+        .previous_version
+        .as_ref()
+        .and_then(live_version_length);
     AccountingHeadTransition::new(
-        stage
-            .previous_version
-            .as_ref()
-            .and_then(|version| version.blob.as_ref().map(|blob| blob.length)),
-        stage.version.blob.as_ref().map(|blob| blob.length),
+        previous_live_length,
+        live_version_length(&stage.version),
+        if retention == StoredVersionRetention::JournalPending {
+            previous_live_length.unwrap_or(0)
+        } else {
+            0
+        },
     )
 }
 
@@ -1029,20 +1063,60 @@ fn stage_accounting_transition(stage: &ProgramPathStage) -> AccountingHeadTransi
 /// authoritative snapshot used by the evaluator.
 pub fn path_stage_from_prepared(
     prepared: &PreparedProgramBundle,
+    record: &PreparedProgramRecord,
     write: &PreparedVersionWrite,
     begin_cursor: u64,
-    tenant_id: u64,
-    bucket_id: u64,
 ) -> Result<ProgramPathStage, ProgramStoreError> {
+    if record.authority() != prepared.authority
+        || record.participant_manifest_hash()? != prepared.participant_manifest_hash
+        || !record.writes().contains(write)
+    {
+        return Err(ProgramStoreError::PreparedBundleMismatch);
+    }
+    let (tenant_id, bucket_id, governance) = {
+        let participant = record
+            .participant_manifest()
+            .objects
+            .iter()
+            .find(|participant| participant.path == *write.path())
+            .ok_or_else(|| {
+                ProgramStoreError::InvalidBundle(
+                    "prepared write has no matching object participant".into(),
+                )
+            })?;
+        if participant.condition.observed_head().as_ref() != Some(write.expected()) {
+            return Err(ProgramStoreError::InvalidBundle(
+                "prepared write disagrees with its participant condition".into(),
+            ));
+        }
+        let governance = record
+            .participant_manifest()
+            .governance
+            .iter()
+            .find(|governance| {
+                governance.tenant == write.path().tenant
+                    && governance.bucket == write.path().bucket
+                    && governance.tenant_id == participant.tenant_id
+                    && governance.bucket_id == participant.bucket_id
+            })
+            .cloned()
+            .ok_or_else(|| {
+                ProgramStoreError::InvalidBundle(
+                    "prepared write has no matching authoritative governance".into(),
+                )
+            })?;
+        (participant.tenant_id, participant.bucket_id, governance)
+    };
     let stage = ProgramPathStage {
         format: PROGRAM_PATH_STAGE_FORMAT,
         begin_cursor,
-        bundle_hash: prepared.hash,
+        bundle_hash: prepared.bundle.hash,
         program_hash: prepared.program_hash,
         authority: prepared.authority,
         participant_manifest_hash: prepared.participant_manifest_hash,
         tenant_id,
         bucket_id,
+        governance,
         path: write.path.clone(),
         expected: write.expected.clone(),
         previous_version: write.previous_version.clone(),
@@ -1064,7 +1138,7 @@ pub fn alias_registry_stages_from_prepared(
             let stage = ProgramAliasRegistryStage {
                 format: PROGRAM_ALIAS_REGISTRY_STAGE_FORMAT,
                 begin_cursor,
-                bundle_hash: prepared.hash,
+                bundle_hash: prepared.bundle.hash,
                 program_hash: prepared.program_hash,
                 authority: prepared.authority,
                 participant_manifest_hash: prepared.participant_manifest_hash,

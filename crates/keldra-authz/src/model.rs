@@ -253,12 +253,12 @@ impl ObjectRef {
 
     pub fn is_anonymous(&self) -> bool {
         self.namespace == PUBLIC_SUBJECT_NAMESPACE
-            && self.id == ObjectId::Opaque(ANONYMOUS_SUBJECT_ID.to_owned())
+            && matches!(&self.id, ObjectId::Opaque(id) if id == ANONYMOUS_SUBJECT_ID)
     }
 
     pub fn is_public(&self) -> bool {
         self.namespace == PUBLIC_SUBJECT_NAMESPACE
-            && self.id == ObjectId::Opaque(PUBLIC_SUBJECT_ID.to_owned())
+            && matches!(&self.id, ObjectId::Opaque(id) if id == PUBLIC_SUBJECT_ID)
     }
 }
 

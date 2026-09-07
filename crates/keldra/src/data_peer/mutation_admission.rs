@@ -455,9 +455,10 @@ mod tests {
 
     fn mutation(path: String, fence: PlacementLogId, coordinator: NodeId) -> ObjectMutation {
         ObjectMutation {
-            format: keldra_store::LEGACY_OBJECT_MUTATION_FORMAT,
+            format: keldra_store::OBJECT_MUTATION_FORMAT,
             tenant_id: 1,
             bucket_id: 2,
+            versioning: keldra_store::ObjectVersioning::Unversioned,
             exact_path: path,
             command_id: "command".into(),
             input_fingerprint: [1; 32],

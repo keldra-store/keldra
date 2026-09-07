@@ -9,7 +9,7 @@
 //! Body field map:
 //!
 //! ```text
-//! mutation: format:u16, tenant:u64, bucket:u64, path:str, command:str,
+//! mutation: format:u16, tenant:u64, bucket:u64, versioning:u8, path:str, command:str,
 //!   input_fingerprint:[32], version, receipt_expiry:u64, stamp,
 //!   reference_deltas:vec, accounting:opt, definition:opt, alias_snapshot:opt
 //! version: id:u64, blob:opt(hash:[32], length:u64), content_type:opt(str),
@@ -18,7 +18,8 @@
 //!   mutation_fingerprint:[32], placement_term:u64, placement_index:u64,
 //!   serving_fence_term:u64, source_node:u16, source_epoch:[32], position:u64
 //! reference_delta: blob(hash:[32], length:u64), change:i64
-//! accounting: format:u8, previous_live_length:opt(u64), current_live_length:opt(u64)
+//! accounting: format:u8, previous_live_length:opt(u64),
+//!   current_live_length:opt(u64), logical_bytes_removed:u64
 //! definition: kind:u8 (index=1, accounting=2), tenant:u64, bucket:u64,
 //!   definition_id:u64, path:str, object_version:u64,
 //!   operation:u8 (upsert=1, delete=2)
@@ -32,7 +33,7 @@ use super::*;
 use crate::{
     DefinitionKind, DefinitionOperation, MAX_CONTENT_TYPE_BYTES, MAX_INBOUND_OBJECT_LINKS,
     MAX_OBJECT_MUTATION_REFERENCE_DELTAS, MutationStamp, ObjectAliasRegistry, ObjectAliasSnapshot,
-    ObjectMutation, PlacementLogId,
+    ObjectMutation, ObjectVersioning, PlacementLogId,
 };
 
 const MAGIC: &[u8; 4] = b"KOMU";
@@ -66,6 +67,7 @@ pub(crate) fn encode_object_mutation(
     put_u16(&mut body, mutation.format);
     put_u64(&mut body, mutation.tenant_id);
     put_u64(&mut body, mutation.bucket_id);
+    put_object_versioning(&mut body, mutation.versioning);
     put_string(&mut body, &mutation.exact_path)?;
     put_string(&mut body, &mutation.command_id)?;
     body.extend_from_slice(&mutation.input_fingerprint);
@@ -128,6 +130,7 @@ pub(crate) fn decode_object_mutation(
         format: input.u16()?,
         tenant_id: input.u64()?,
         bucket_id: input.u64()?,
+        versioning: input.object_versioning()?,
         exact_path: input.string("exact path", keldra_atomic_program::MAX_OBJECT_PATH_BYTES)?,
         command_id: input.string("command ID", MAX_COMMAND_ID_BYTES)?,
         input_fingerprint: input.array()?,
@@ -181,6 +184,7 @@ fn put_accounting_transition(output: &mut Vec<u8>, transition: Option<Accounting
             put_u8(output, AccountingHeadTransition::FORMAT);
             put_optional_u64(output, transition.previous_live_length);
             put_optional_u64(output, transition.current_live_length);
+            put_u64(output, transition.logical_bytes_removed);
         }
         None => put_u8(output, 0),
     }
@@ -287,6 +291,16 @@ fn put_string(output: &mut Vec<u8>, value: &str) -> Result<(), ObjectMutationCod
 
 fn put_bool(output: &mut Vec<u8>, value: bool) {
     put_u8(output, u8::from(value));
+}
+
+fn put_object_versioning(output: &mut Vec<u8>, versioning: ObjectVersioning) {
+    put_u8(
+        output,
+        match versioning {
+            ObjectVersioning::Unversioned => 0,
+            ObjectVersioning::Enabled => 1,
+        },
+    );
 }
 
 fn put_u8(output: &mut Vec<u8>, value: u8) {
@@ -398,6 +412,14 @@ impl<'a> Input<'a> {
         }
     }
 
+    fn object_versioning(&mut self) -> Result<ObjectVersioning, ObjectMutationCodecError> {
+        match self.u8()? {
+            0 => Ok(ObjectVersioning::Unversioned),
+            1 => Ok(ObjectVersioning::Enabled),
+            _ => Err(malformed("object versioning is invalid")),
+        }
+    }
+
     fn optional_u64(&mut self, field: &str) -> Result<Option<u64>, ObjectMutationCodecError> {
         match self.u8()? {
             0 => Ok(None),
@@ -484,6 +506,7 @@ impl<'a> Input<'a> {
                 Ok(Some(AccountingHeadTransition::new(
                     self.optional_u64("previous live length")?,
                     self.optional_u64("current live length")?,
+                    self.u64()?,
                 )))
             }
             _ => Err(malformed("accounting transition option tag is invalid")),
@@ -578,10 +601,7 @@ fn malformed(message: impl Into<String>) -> ObjectMutationCodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        LEGACY_OBJECT_MUTATION_FORMAT, MUTATION_STAMP_FORMAT, OBJECT_ALIAS_REGISTRY_FORMAT,
-        OBJECT_MUTATION_FORMAT,
-    };
+    use crate::{MUTATION_STAMP_FORMAT, OBJECT_ALIAS_REGISTRY_FORMAT, OBJECT_MUTATION_FORMAT};
 
     fn base_mutation(format: u16) -> ObjectMutation {
         let predecessor = Version {
@@ -599,6 +619,7 @@ mod tests {
             format,
             tenant_id: 11,
             bucket_id: 12,
+            versioning: ObjectVersioning::Unversioned,
             exact_path: "documents/one".into(),
             command_id: "command-1".into(),
             input_fingerprint: [1; 32],
@@ -643,7 +664,7 @@ mod tests {
                     change: 1,
                 },
             ],
-            accounting_transition: Some(AccountingHeadTransition::new(Some(90), Some(1_024))),
+            accounting_transition: Some(AccountingHeadTransition::new(Some(90), Some(1_024), 90)),
             definition_transition: None,
             alias_snapshot: (format == OBJECT_MUTATION_FORMAT).then_some(ObjectAliasSnapshot {
                 registry: ObjectAliasRegistry {
@@ -662,9 +683,10 @@ mod tests {
 
     fn golden_mutation() -> ObjectMutation {
         let mut mutation = ObjectMutation {
-            format: LEGACY_OBJECT_MUTATION_FORMAT,
+            format: OBJECT_MUTATION_FORMAT,
             tenant_id: 1,
             bucket_id: 2,
+            versioning: ObjectVersioning::Unversioned,
             exact_path: "a".into(),
             command_id: "b".into(),
             input_fingerprint: [0; 32],
@@ -707,10 +729,11 @@ mod tests {
             b'K', b'O', b'M', b'U', // magic
             0, 1, // codec format
             0, 0, // flags
-            0, 0, 0, 205, // body bytes
-            0, 2, // semantic mutation format
+            0, 0, 0, 206, // body bytes
+            0, 1, // semantic mutation format
             0, 0, 0, 0, 0, 0, 0, 1, // tenant
             0, 0, 0, 0, 0, 0, 0, 2, // bucket
+            0, // unversioned
             0, 0, 0, 1, b'a', // exact path
             0, 0, 0, 1, b'b', // command ID
         ];
@@ -750,8 +773,8 @@ mod tests {
     }
 
     #[test]
-    fn semantic_formats_two_and_three_round_trip() {
-        for format in [LEGACY_OBJECT_MUTATION_FORMAT, OBJECT_MUTATION_FORMAT] {
+    fn semantic_format_v1_round_trips() {
+        for format in [OBJECT_MUTATION_FORMAT] {
             let mutation = base_mutation(format);
             let encoded = encode_object_mutation(&mutation).unwrap();
             assert_eq!(decode_object_mutation(&encoded).unwrap(), mutation);
@@ -759,8 +782,77 @@ mod tests {
     }
 
     #[test]
+    fn logical_removal_round_trips_and_is_covered_by_the_mutation_fingerprint() {
+        let mutation = base_mutation(OBJECT_MUTATION_FORMAT);
+        let encoded = encode_object_mutation(&mutation).unwrap();
+        assert_eq!(
+            decode_object_mutation(&encoded)
+                .unwrap()
+                .accounting_transition
+                .unwrap()
+                .logical_bytes_removed,
+            90
+        );
+
+        let mut changed = mutation.clone();
+        changed
+            .accounting_transition
+            .as_mut()
+            .unwrap()
+            .logical_bytes_removed = 0;
+        assert_ne!(
+            changed.computed_fingerprint(),
+            mutation.computed_fingerprint()
+        );
+        changed.set_computed_fingerprint();
+        changed.validate().unwrap();
+        assert_ne!(encode_object_mutation(&changed).unwrap(), encoded);
+    }
+
+    #[test]
+    fn sealed_versioning_round_trips_and_is_covered_by_the_mutation_fingerprint() {
+        let mutation = base_mutation(OBJECT_MUTATION_FORMAT);
+        let encoded = encode_object_mutation(&mutation).unwrap();
+        assert_eq!(
+            decode_object_mutation(&encoded).unwrap().versioning,
+            ObjectVersioning::Unversioned
+        );
+
+        let mut changed = mutation.clone();
+        changed.versioning = ObjectVersioning::Enabled;
+        assert_ne!(
+            changed.computed_fingerprint(),
+            mutation.computed_fingerprint()
+        );
+        changed.reference_deltas.remove(0);
+        changed
+            .accounting_transition
+            .as_mut()
+            .unwrap()
+            .logical_bytes_removed = 0;
+        changed.set_computed_fingerprint();
+        changed.validate().unwrap();
+        assert_ne!(encode_object_mutation(&changed).unwrap(), encoded);
+    }
+
+    #[test]
+    fn serialized_mutations_fail_closed_without_valid_sealed_versioning() {
+        let mutation = base_mutation(OBJECT_MUTATION_FORMAT);
+        let mut missing = serde_json::to_value(&mutation).unwrap();
+        missing.as_object_mut().unwrap().remove("versioning");
+        assert!(serde_json::from_value::<ObjectMutation>(missing).is_err());
+
+        let mut invalid = serde_json::to_value(&mutation).unwrap();
+        invalid
+            .as_object_mut()
+            .unwrap()
+            .insert("versioning".into(), serde_json::json!("unknown"));
+        assert!(serde_json::from_value::<ObjectMutation>(invalid).is_err());
+    }
+
+    #[test]
     fn optional_and_enum_shapes_round_trip() {
-        let mut mutation = base_mutation(LEGACY_OBJECT_MUTATION_FORMAT);
+        let mut mutation = base_mutation(OBJECT_MUTATION_FORMAT);
         mutation.exact_path = "_keldra/indexes/17".into();
         mutation.version = Version {
             id: VersionId(41),
@@ -771,7 +863,7 @@ mod tests {
             protected_link_descriptor: false,
         };
         mutation.reference_deltas.truncate(1);
-        mutation.accounting_transition = Some(AccountingHeadTransition::new(Some(90), None));
+        mutation.accounting_transition = Some(AccountingHeadTransition::new(Some(90), None, 90));
         mutation.definition_transition = Some(DefinitionTransition {
             kind: DefinitionKind::Index,
             tenant_id: 11,
@@ -790,7 +882,7 @@ mod tests {
 
     #[test]
     fn every_definition_enum_tag_round_trips() {
-        let mut mutation = base_mutation(LEGACY_OBJECT_MUTATION_FORMAT);
+        let mut mutation = base_mutation(OBJECT_MUTATION_FORMAT);
         mutation.exact_path = "_keldra/accounting/18".into();
         mutation.definition_transition = Some(DefinitionTransition {
             kind: DefinitionKind::Accounting,
@@ -810,7 +902,7 @@ mod tests {
 
     #[test]
     fn malformed_headers_lengths_tags_and_trailing_bytes_are_rejected() {
-        let mutation = base_mutation(LEGACY_OBJECT_MUTATION_FORMAT);
+        let mutation = base_mutation(OBJECT_MUTATION_FORMAT);
         let encoded = encode_object_mutation(&mutation).unwrap();
 
         for length in 0..encoded.len() {
@@ -825,10 +917,10 @@ mod tests {
         assert!(decode_object_mutation(&bad_magic).is_err());
 
         let mut bad_format = encoded.clone();
-        bad_format[5] = 2;
+        bad_format[5] = 4;
         assert_eq!(
             decode_object_mutation(&bad_format),
-            Err(ObjectMutationCodecError::UnsupportedFormat(2))
+            Err(ObjectMutationCodecError::UnsupportedFormat(4))
         );
 
         let mut bad_flags = encoded.clone();
@@ -840,14 +932,19 @@ mod tests {
         assert!(decode_object_mutation(&trailing).is_err());
 
         let mut bad_path_length = encoded.clone();
-        // Header + format + tenant + bucket is the exact-path length field.
-        bad_path_length[30..34].copy_from_slice(&u32::MAX.to_be_bytes());
+        // Header + format + tenant + bucket + versioning is the exact-path length field.
+        bad_path_length[31..35].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(decode_object_mutation(&bad_path_length).is_err());
+
+        let mut bad_versioning = encoded.clone();
+        // The versioning tag immediately follows format, tenant, and bucket.
+        bad_versioning[30] = 2;
+        assert!(decode_object_mutation(&bad_versioning).is_err());
     }
 
     #[test]
     fn count_bounds_are_checked_before_allocation() {
-        let mutation = base_mutation(LEGACY_OBJECT_MUTATION_FORMAT);
+        let mutation = base_mutation(OBJECT_MUTATION_FORMAT);
         let mut encoded = encode_object_mutation(&mutation).unwrap();
         let first_delta_hash = encoded
             .windows(32)
@@ -886,7 +983,7 @@ mod tests {
 
     #[test]
     fn semantic_validation_runs_after_decode() {
-        let mutation = base_mutation(LEGACY_OBJECT_MUTATION_FORMAT);
+        let mutation = base_mutation(OBJECT_MUTATION_FORMAT);
         let mut encoded = encode_object_mutation(&mutation).unwrap();
         // The semantic mutation format is the first body field.
         encoded[HEADER_BYTES..HEADER_BYTES + 2].copy_from_slice(&99_u16.to_be_bytes());

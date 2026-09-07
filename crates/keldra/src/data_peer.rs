@@ -602,6 +602,40 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
             .await?;
         Ok(Response::new(stream_blob(reader)))
     }
+    async fn get_complete_source_state(
+        &self,
+        mut request: Request<wire::CompleteSourceStateRequest>,
+    ) -> Result<Response<wire::CompleteSourceState>, Status> {
+        let peer = request.get_ref().peer.clone();
+        self.authorize(&mut request, peer.as_ref(), PeerRpcKind::StateTransfer)?;
+        let reference = parse_blob(request.get_ref().blob.as_ref())?;
+        require_large_blob(&reference, self.max_blob_bytes)?;
+        let fence = keldra_store::PlacementLogId {
+            term: request.get_ref().placement_fence_term,
+            index: request.get_ref().placement_fence_index,
+        };
+        self.mutation_admission.require_fence(fence)?;
+        let metadata = request.metadata().clone();
+        let store = self.store.clone();
+        let state = self
+            .bounded(&metadata, async move {
+                store
+                    .complete_copy_state(&reference)
+                    .await
+                    .map_err(map_payload_error)
+            })
+            .await?;
+        self.mutation_admission.require_fence(fence)?;
+        let state = match state {
+            keldra_store::PayloadArtifactState::Missing => wire::CompleteCopyState::Missing,
+            keldra_store::PayloadArtifactState::Valid => wire::CompleteCopyState::Valid,
+            keldra_store::PayloadArtifactState::Corrupt => wire::CompleteCopyState::Corrupt,
+        };
+        Ok(Response::new(wire::CompleteSourceState {
+            schema_version: DATA_PEER_SCHEMA_VERSION,
+            state: state as i32,
+        }))
+    }
     async fn put_complete_source(
         &self,
         request: Request<Streaming<wire::CompleteSourcePutFrame>>,
@@ -1018,150 +1052,9 @@ mod tests {
     use super::*;
     use crate::node_identity;
 
-    struct TestPins {
-        cluster_id: ClusterId,
-        nodes: RwLock<BTreeMap<NodeId, (CommittedPeerPins, NodeState)>>,
-    }
+    mod support;
 
-    impl TestPins {
-        fn new(cluster_id: ClusterId) -> Self {
-            Self {
-                cluster_id,
-                nodes: RwLock::new(BTreeMap::new()),
-            }
-        }
-
-        fn install(&self, node_id: NodeId, pin: PeerSpkiSha256, state: NodeState) {
-            self.nodes.write().unwrap().insert(
-                node_id,
-                (
-                    CommittedPeerPins {
-                        current: pin,
-                        overlap: None,
-                    },
-                    state,
-                ),
-            );
-        }
-
-        fn set_state(&self, node_id: NodeId, state: NodeState) {
-            self.nodes.write().unwrap().get_mut(&node_id).unwrap().1 = state;
-        }
-
-        fn remove(&self, node_id: NodeId) {
-            self.nodes.write().unwrap().remove(&node_id);
-        }
-    }
-
-    impl CommittedPeerPinProvider for TestPins {
-        fn connection_pins(&self, node_id: NodeId) -> Option<CommittedPeerPins> {
-            self.nodes.read().ok()?.get(&node_id).map(|(pins, _)| *pins)
-        }
-
-        fn authorized_rpc_pins(
-            &self,
-            cluster_id: ClusterId,
-            node_id: NodeId,
-            kind: PeerRpcKind,
-        ) -> Option<CommittedPeerPins> {
-            if cluster_id != self.cluster_id {
-                return None;
-            }
-            let nodes = self.nodes.read().ok()?;
-            let (pins, state) = nodes.get(&node_id)?;
-            let allowed = match kind {
-                PeerRpcKind::JoinControl => matches!(state, NodeState::Active | NodeState::Joining),
-                _ => *state == NodeState::Active,
-            };
-            allowed.then_some(*pins)
-        }
-    }
-
-    fn identity(cluster_id: ClusterId, node_id: NodeId) -> Arc<PeerTlsIdentity> {
-        let identity = node_identity::generate(cluster_id, node_id).unwrap();
-        let peer = identity.presented_peer_identity();
-        Arc::new(
-            PeerTlsIdentity::from_pem(
-                peer.certificate_pem().as_bytes(),
-                peer.private_key_pem().as_bytes(),
-            )
-            .unwrap(),
-        )
-    }
-
-    async fn start_server(
-        identity: Arc<PeerTlsIdentity>,
-        pins: Arc<TestPins>,
-        store: Store,
-    ) -> (
-        std::net::SocketAddr,
-        tokio::sync::oneshot::Sender<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let acceptor = PeerTlsAcceptor::new(&identity, PeerTlsConfig::default()).unwrap();
-        let incoming = TcpIncoming::from(listener)
-            .then(move |stream| {
-                let acceptor = acceptor.clone();
-                async move {
-                    let stream = stream.map_err(PeerTlsError::Io)?;
-                    acceptor.accept(stream).await
-                }
-            })
-            .filter_map(|result| result.ok().map(Ok::<_, std::io::Error>));
-        let service = DataPeerService::new_test(
-            store,
-            pins.clone(),
-            pins.cluster_id,
-            NodeId(1),
-            [NodeId(1), NodeId(2)],
-            ErasureProfile::default(),
-            Duration::from_secs(30),
-            16 * 1024 * 1024,
-        )
-        .unwrap()
-        .into_server();
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            Server::builder()
-                .add_service(service)
-                .serve_with_incoming_shutdown(incoming, async move {
-                    let _ = stopped.await;
-                })
-                .await
-                .unwrap();
-        });
-        (address, shutdown, task)
-    }
-
-    async fn collect_content(mut stream: Streaming<wire::ContentFrame>) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        while let Some(frame) = stream.message().await.unwrap() {
-            assert_eq!(frame.schema_version, DATA_PEER_SCHEMA_VERSION);
-            assert_eq!(frame.offset, bytes.len() as u64);
-            bytes.extend_from_slice(&frame.content);
-            if frame.end {
-                return bytes;
-            }
-        }
-        panic!("peer content stream ended without an end frame");
-    }
-
-    fn shard_frame(
-        transport: &DataPeerTransport,
-        identity: &ShardIdentity,
-        offset: u64,
-        content: &[u8],
-        end: bool,
-    ) -> wire::ShardPutFrame {
-        wire::ShardPutFrame {
-            shard: Some(wire_shard(transport.context(), identity)),
-            offset,
-            content: content.to_vec(),
-            end,
-        }
-    }
+    use support::*;
 
     #[test]
     fn joining_callers_have_only_join_control_authority() {
@@ -1335,6 +1228,15 @@ mod tests {
         derived_consumer::denied_test_call!(client, peer, require_denied);
         require_denied!(client.small_content_exists(content()), "SmallContentExists");
         require_denied!(client.get_small_content(content()), "GetSmallContent");
+        require_denied!(
+            client.get_complete_source_state(wire::CompleteSourceStateRequest {
+                peer: Some(peer.clone()),
+                blob: None,
+                placement_fence_term: 0,
+                placement_fence_index: 0,
+            }),
+            "GetCompleteSourceState"
+        );
         require_denied!(
             client.put_small_content(tokio_stream::iter([wire::SmallContentPutFrame {
                 peer: Some(peer.clone()),
@@ -1510,7 +1412,7 @@ mod tests {
             "InstallPayloadLifecycle"
         );
         assert_eq!(
-            denied, 51,
+            denied, 52,
             "the DataPeer RPC list changed without updating this test"
         );
     }
@@ -1855,6 +1757,14 @@ mod tests {
             PeerTlsConnector::new(client_id, pins, PeerTlsConfig::default()).unwrap(),
         )
         .unwrap();
+        let placement_fence = keldra_store::PlacementLogId { term: 1, index: 1 };
+        assert_eq!(
+            transport
+                .complete_source_state(NodeId(1), &address, placement_fence, &reference)
+                .await
+                .unwrap(),
+            keldra_store::PayloadArtifactState::Missing
+        );
 
         assert_eq!(
             transport
@@ -1862,6 +1772,26 @@ mod tests {
                 .await
                 .unwrap(),
             CompleteCopySealOutcome::Created
+        );
+        assert_eq!(
+            transport
+                .complete_source_state(NodeId(1), &address, placement_fence, &reference)
+                .await
+                .unwrap(),
+            keldra_store::PayloadArtifactState::Valid
+        );
+        assert_eq!(
+            transport
+                .complete_source_state(
+                    NodeId(1),
+                    &address,
+                    keldra_store::PlacementLogId { term: 1, index: 0 },
+                    &reference,
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
         );
         assert_eq!(
             transport

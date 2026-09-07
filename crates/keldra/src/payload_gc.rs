@@ -327,7 +327,14 @@ impl PayloadGarbageCollector {
         let result = if small {
             PayloadArtifactPeers::small_exists(&self.peers, owner, &address.0, blob).await
         } else {
-            PayloadArtifactPeers::complete_exists(&self.peers, owner, &address.0, blob).await
+            PayloadArtifactPeers::complete_exists(
+                &self.peers,
+                owner,
+                &address.0,
+                placement.fence(),
+                blob,
+            )
+            .await
         };
         result.map_err(|error| PayloadGcError::Peer(error.to_string()))
     }

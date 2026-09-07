@@ -26,35 +26,6 @@ pub(crate) struct AccountingTrafficConfig {
     pub(crate) flush_batches: usize,
 }
 
-impl AccountingTrafficConfig {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        max_pending_batches: usize,
-        max_pending_entries: usize,
-        max_pending_bytes: u64,
-        max_batch_entries: usize,
-        max_batch_bytes: u64,
-        flush_batches: usize,
-    ) -> Option<Self> {
-        (max_pending_batches != 0
-            && max_pending_entries != 0
-            && max_pending_bytes != 0
-            && max_batch_entries != 0
-            && max_batch_entries <= MAX_ACCOUNTING_TRAFFIC_ENTRIES
-            && max_batch_bytes != 0
-            && max_batch_bytes <= MAX_ACCOUNTING_TRAFFIC_LOGICAL_BYTES
-            && flush_batches != 0)
-            .then_some(Self {
-                max_pending_batches,
-                max_pending_entries,
-                max_pending_bytes,
-                max_batch_entries,
-                max_batch_bytes,
-                flush_batches,
-            })
-    }
-}
-
 impl Default for AccountingTrafficConfig {
     fn default() -> Self {
         Self {
@@ -338,17 +309,6 @@ pub(crate) struct TrafficBatchId {
     pub(crate) sequence: u64,
 }
 
-impl TrafficBatchId {
-    pub(crate) fn stable_string(self) -> String {
-        format!(
-            "accounting-traffic-{}-{}-{}",
-            self.source_node.0,
-            hex::encode(&self.source_epoch[..8]),
-            self.sequence
-        )
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TrafficEntry {
     pub(crate) path: String,
@@ -508,7 +468,14 @@ mod tests {
 
     #[test]
     fn queue_capacity_drops_without_displacing_acknowledged_order() {
-        let config = AccountingTrafficConfig::new(1, 1, 64, 1, 64, 1).unwrap();
+        let config = AccountingTrafficConfig {
+            max_pending_batches: 1,
+            max_pending_entries: 1,
+            max_pending_bytes: 64,
+            max_batch_entries: 1,
+            max_batch_bytes: 64,
+            flush_batches: 1,
+        };
         let meter = meter(config);
         meter.record_inbound(11, 12, "a", 5);
         meter.record_inbound(11, 12, "b", 7);

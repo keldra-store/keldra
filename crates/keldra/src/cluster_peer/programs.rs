@@ -226,10 +226,14 @@ impl ClusterPeerService {
             deadline,
         )
         .await?;
+        let context = ObjectMutationContext {
+            active_placement_log_id: admitted.placement.fence(),
+            serving_fence_term: nomination.nomination_log_index,
+        };
         let store = self.store.clone();
         let applied = tokio::time::timeout(remaining(deadline)?, async move {
             store
-                .apply_program_path_finalization_replica(&mutation)
+                .apply_program_path_finalization_replica(&mutation, context)
                 .await
         })
         .await
@@ -413,11 +417,6 @@ impl ClusterPeerService {
             .decisions
             .state()
             .map_err(|_| Status::unavailable("atomic reservation authority is unavailable"))?;
-        if !crate::cluster_capabilities::generalized_atomic_paths_active(&state) {
-            return Err(Status::failed_precondition(
-                "generalized atomic path reservations are not active for this cluster",
-            ));
-        }
         match operation {
             ReservationOperation::Reserve => {
                 let preparing_matches = state
@@ -559,7 +558,7 @@ impl ClusterPeerService {
                     .map_err(|_| Status::unavailable("atomic commit state is unavailable"))?;
                 if let Some(invocation) = state.committed_invocation(commit_cursor) {
                     let batch = invocation.committed_batch;
-                    if batch.bundle_hash.0 != bundle_hash.0
+                    if batch.bundle_ref.hash != bundle_hash.0
                         || batch.begin_cursor != begin_cursor
                         || super::super::programs::store_bundle_authority(batch.authority)
                             != authority
@@ -636,7 +635,7 @@ fn reservation_identity(reservation: &ProgramReservation) -> ReservationIdentity
 fn reservation_matches_prepared(reservation: ReservationIdentity, prepared: PreparedBatch) -> bool {
     reservation.begin_cursor == prepared.begin_cursor
         && reservation.invocation_id == prepared.request.invocation_id.0
-        && reservation.bundle_hash == prepared.request.bundle_hash.0
+        && reservation.bundle_hash == prepared.request.bundle_ref.hash
         && reservation.participant_manifest_hash == prepared.request.participant_manifest_hash.0
         && reservation.authority
             == super::super::programs::store_bundle_authority(prepared.request.authority)
@@ -651,7 +650,7 @@ fn reservation_matches_committed(
     let committed = invocation.committed_batch;
     reservation.begin_cursor == committed.begin_cursor
         && reservation.invocation_id == invocation.invocation_id.0
-        && reservation.bundle_hash == committed.bundle_hash.0
+        && reservation.bundle_hash == committed.bundle_ref.hash
         && reservation.participant_manifest_hash == committed.participant_manifest_hash.0
         && reservation.authority
             == super::super::programs::store_bundle_authority(committed.authority)
@@ -661,14 +660,9 @@ fn reservation_group(
     placement: &ClusterPlacement,
     reservation: &ProgramReservation,
 ) -> Result<MutableRecordReplicaGroup, Status> {
-    let (tenant_id, bucket_id) = reservation.stable_bucket_ids();
-    let path = reservation.path();
-    let mut key = Vec::with_capacity(16 + path.path.len());
-    key.extend_from_slice(&tenant_id.to_be_bytes());
-    key.extend_from_slice(&bucket_id.to_be_bytes());
-    key.extend_from_slice(path.path.as_bytes());
+    let (kind, key) = crate::programs::reservation_placement(reservation);
     MutableRecordReplicaGroup::select(
-        PlacementKind::Object,
+        kind,
         placement.cluster_id(),
         &key,
         placement.placement_nodes(),

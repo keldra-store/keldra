@@ -75,6 +75,7 @@ impl PayloadReadPlacementView for TestPlacement {
 #[derive(Clone, Debug)]
 enum Artifact {
     Bytes(Vec<u8>),
+    DelayedBytes(Vec<u8>),
     Missing,
     Unavailable,
     OversizedFrame(Vec<u8>),
@@ -135,6 +136,9 @@ impl PayloadReadTransport for FakeTransport {
                 .cloned()
                 .unwrap_or(Artifact::Missing)
         };
+        if matches!(artifact, Artifact::DelayedBytes(_)) {
+            tokio::task::yield_now().await;
+        }
         stream_artifact(artifact, destination)
     }
 
@@ -203,7 +207,7 @@ fn stream_artifact(
     destination: &mut (dyn Write + Send),
 ) -> Result<(), PayloadReadTransportError> {
     match artifact {
-        Artifact::Bytes(bytes) => {
+        Artifact::Bytes(bytes) | Artifact::DelayedBytes(bytes) => {
             for frame in bytes.chunks(7 * 1024) {
                 destination
                     .write_all(frame)
@@ -336,7 +340,7 @@ async fn small_read_uses_a_verified_owner_and_repairs_a_missing_copy() {
     let reference = reference(&bytes);
     let owners = small_owners(&placement, profile, &reference);
     let transport = FakeTransport::default();
-    transport.set_small(owners[0], Artifact::Bytes(bytes.clone()));
+    transport.set_small(owners[0], Artifact::DelayedBytes(bytes.clone()));
     transport.set_small(owners[1], Artifact::Missing);
     let output = CapturedOutput::default();
 
@@ -347,10 +351,13 @@ async fn small_read_uses_a_verified_owner_and_repairs_a_missing_copy() {
 
     assert_eq!(output.bytes(), bytes);
     assert_eq!(report.sources.healthy, 1);
-    assert_eq!(report.sources.missing, 2);
+    assert_eq!(report.sources.missing, 1);
+    assert_eq!(report.sources.unavailable, 0);
     assert_eq!(report.repairs_attempted, 1);
     assert_eq!(report.repairs_completed, 1);
-    assert_eq!(transport.state.lock().unwrap().small_puts, [owners[1]]);
+    let state = transport.state.lock().unwrap();
+    assert_eq!(state.small_puts, [owners[1]]);
+    assert!(state.gets.iter().all(|node| owners.contains(node)));
 }
 
 #[tokio::test]

@@ -560,7 +560,7 @@ async fn local_cluster_listing_uses_stable_ids_and_excludes_non_owned_heads() {
 }
 
 #[tokio::test]
-async fn internal_index_definition_listing_is_v6_and_bucket_scoped() {
+async fn internal_index_definition_listing_is_v1_and_bucket_scoped() {
     let (_temporary, store) = store().await;
     let definition = format!("{INDEX_DEFINITION_PREFIX}search");
     store
@@ -568,7 +568,7 @@ async fn internal_index_definition_listing_is_v6_and_bucket_scoped() {
             &definition,
             b"definition",
             Precondition::Absent,
-            "v6-definition",
+            "v1-definition",
         ))
         .await
         .unwrap();

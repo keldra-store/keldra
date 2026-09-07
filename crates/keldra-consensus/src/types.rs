@@ -186,8 +186,7 @@ impl ClusterControlState {
 
     /// Exact committed Raft log identity of the latest active-placement change.
     ///
-    /// `None` is fail-closed legacy state: no placement generation may be
-    /// inferred from a snapshot's unrelated last-applied log index.
+    /// `None` means no placement generation has been committed yet.
     pub fn active_placement_log_id(&self) -> Option<LogId<u64>> {
         self.active_placement_log_id
     }
@@ -231,10 +230,6 @@ pub struct BundleRef {
     pub length: u64,
 }
 
-/// Content identity used to verify an externally stored prepared bundle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct BundleHash(pub [u8; 32]);
-
 /// Content identity for a durability policy defined outside consensus.
 ///
 /// The exact meaning and evidence requirements belong to the durability
@@ -269,12 +264,6 @@ pub enum AtomicBundleAuthority {
     BuiltInObjectTransaction {
         kind: u16,
         contract_version: u16,
-    },
-    /// Upgrade-only identity for a batch committed before durable path
-    /// reservations existed. New BeginBatch validation never admits it.
-    LegacyProgramOnly {
-        program_path_hash: ProgramPathHash,
-        program_hash: ProgramHash,
     },
 }
 
@@ -338,7 +327,6 @@ pub struct BeginBatch {
     pub invocation_id: InvocationId,
     pub input_fingerprint: InvocationFingerprint,
     pub bundle_ref: BundleRef,
-    pub bundle_hash: BundleHash,
     pub durability_class: DurabilityClass,
     pub durability_evidence_hash: DurabilityEvidenceHash,
     pub participant_manifest_hash: ParticipantManifestHash,
@@ -346,24 +334,6 @@ pub struct BeginBatch {
     /// prunes the same replay entries.
     pub proposal_at_unix_millis: u64,
     /// Exactly `proposal_at_unix_millis + ATOMIC_REPLAY_RETENTION_MILLIS`.
-    pub replay_expires_at_unix_millis: u64,
-}
-
-/// Released pre-reservation command retained at its original enum
-/// discriminant so an upgrade can replay an existing applied-state journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitBatch {
-    pub executor: NodeId,
-    pub nomination_log_index: u64,
-    pub program_path_hash: ProgramPathHash,
-    pub program_hash: ProgramHash,
-    pub invocation_id: InvocationId,
-    pub input_fingerprint: InvocationFingerprint,
-    pub bundle_ref: BundleRef,
-    pub bundle_hash: BundleHash,
-    pub durability_class: DurabilityClass,
-    pub durability_evidence_hash: DurabilityEvidenceHash,
-    pub proposal_at_unix_millis: u64,
     pub replay_expires_at_unix_millis: u64,
 }
 
@@ -403,7 +373,6 @@ pub struct CommittedBatch {
     pub begin_cursor: u64,
     pub authority: AtomicBundleAuthority,
     pub bundle_ref: BundleRef,
-    pub bundle_hash: BundleHash,
     pub durability_class: DurabilityClass,
     pub durability_evidence_hash: DurabilityEvidenceHash,
     pub participant_manifest_hash: ParticipantManifestHash,
@@ -444,10 +413,7 @@ pub enum Command {
     /// Nominate one current voter or learner. Membership eligibility is checked
     /// by the OpenRaft adapter because the pure state machine does not own a
     /// second cluster-membership model.
-    NominateExecutor {
-        executor: NodeId,
-    },
-    CommitBatch(CommitBatch),
+    NominateExecutor { executor: NodeId },
     /// Advance only the external recoverable-finalization watermark. Replay
     /// entries remain until a later BeginBatch deterministically expires them.
     FinalizedThrough {
@@ -455,13 +421,10 @@ pub enum Command {
         nomination_log_index: u64,
         through_commit_cursor: u64,
     },
-    /// Set the stable cluster identity exactly once. This variant is appended
-    /// to preserve all command discriminants released in Keldra 0.5.0.
-    InitializeCluster {
-        cluster_id: ClusterId,
-    },
+    /// Set the stable cluster identity exactly once.
+    InitializeCluster { cluster_id: ClusterId },
     /// Record that the nominated executor has durably written the protected
-    /// system identity. This variant is appended for 0.5.0 compatibility.
+    /// system identity.
     CompleteSystemBootstrap {
         executor: NodeId,
         nomination_log_index: u64,
@@ -536,22 +499,6 @@ pub enum Command {
     CommitPreparedBatch(CommitPreparedBatch),
     /// Deterministically abandon an uncommitted preparation.
     AbortPreparedBatch(AbortPreparedBatch),
-    /// Monotonically expand one committed node's supported capabilities.
-    UpdateNodeCapabilities {
-        format_version: u16,
-        node_id: NodeId,
-        expected_protocol: CapabilityRange,
-        expected_storage: CapabilityRange,
-        replacement_protocol: CapabilityRange,
-        replacement_storage: CapabilityRange,
-    },
-    /// Activate one capability pair after a quiesced all-node proof.
-    ActivateClusterCapabilities {
-        format_version: u16,
-        protocol_version: u16,
-        storage_format: u16,
-        expected_active_placement_log_id: LogId<u64>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,26 +506,13 @@ pub enum ApplyResult {
     ExecutorNominated(ExecutorNomination),
     BatchBegun(BeginResult),
     BatchCommitted(CommitResult),
-    BatchAborted {
-        begin_cursor: u64,
-    },
-    NodeCapabilitiesUpdated(NodeDescriptor),
-    ClusterCapabilitiesActivated {
-        protocol_version: u16,
-        storage_format: u16,
-    },
-    FinalizationAdvanced {
-        through_commit_cursor: u64,
-    },
-    ClusterInitialized {
-        cluster_id: ClusterId,
-    },
+    BatchAborted { begin_cursor: u64 },
+    FinalizationAdvanced { through_commit_cursor: u64 },
+    ClusterInitialized { cluster_id: ClusterId },
     SystemBootstrapCompleted(SystemBootstrapState),
     MembershipTransitionBegun(MembershipTransition),
     MembershipTransitionAdvanced(MembershipTransition),
-    MembershipTransitionFinished {
-        started_log_index: u64,
-    },
+    MembershipTransitionFinished { started_log_index: u64 },
     PeerSpkiChanged(NodeDescriptor),
     JwtSigningKeyFingerprintBound(JwtSigningKeyFingerprint),
     ErasureCodeProfileBound(ErasureCodeProfile),

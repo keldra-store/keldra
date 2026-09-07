@@ -14,7 +14,6 @@ impl ProgramCoordinator {
                 "built-in replay batch exceeds the atomic mutation bound",
             ));
         }
-        self.require_generalized_atomic_paths()?;
         let nomination = self.current_nomination()?;
         if nomination.executor != self.node {
             return Err(Status::failed_precondition(
@@ -88,7 +87,6 @@ impl ProgramCoordinator {
         invocation_id: [u8; 32],
         input_fingerprint: [u8; 32],
     ) -> Result<Option<InvokedProgramResult>, Status> {
-        self.require_generalized_atomic_paths()?;
         let nomination = self.current_nomination()?;
         if nomination.executor != self.node {
             return Err(Status::failed_precondition(
@@ -151,7 +149,6 @@ impl ProgramCoordinator {
         durability_class: &str,
         budget: Duration,
     ) -> Result<InvokedProgramResult, Status> {
-        self.require_generalized_atomic_paths()?;
         let nomination = self.current_nomination()?;
         let clustered = self.is_clustered()?;
         if !clustered
@@ -242,10 +239,9 @@ impl ProgramCoordinator {
                 invocation_id,
                 input_fingerprint: InvocationFingerprint(input_fingerprint),
                 bundle_ref: BundleRef {
-                    hash: prepared.bundle.hash,
+                    hash: prepared.bundle.hash.0,
                     length: prepared.bundle.length,
                 },
-                bundle_hash: BundleHash(prepared.hash.0),
                 durability_class: DurabilityClass(
                     ProgramDurabilityClassHash::for_class(durability_class).0,
                 ),
@@ -274,7 +270,7 @@ impl ProgramCoordinator {
             .reservations(
                 prepared_batch.begin_cursor,
                 invocation_id.0,
-                prepared.hash,
+                prepared.bundle.hash,
                 self.node.0,
                 nomination.nomination_log_index,
                 mutation_context.active_placement_log_id,
@@ -351,7 +347,6 @@ impl ProgramCoordinator {
                     keldra_store::SealedAtomicBatchPublication::from_prepared(
                         commit_cursor,
                         prepared.bundle,
-                        prepared.hash,
                         &record,
                         &stages.paths,
                         &finalized.paths,

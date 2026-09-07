@@ -39,16 +39,6 @@ fn atomic_batch_routes_once_to_each_affected_bucket() {
         77,
         crate::PreparedBundleHash([7; 32]),
         vec![
-            crate::AtomicBatchRoute {
-                tenant_id: 1,
-                bucket_id: 2,
-            },
-            crate::AtomicBatchRoute {
-                tenant_id: 3,
-                bucket_id: 4,
-            },
-        ],
-        vec![
             crate::AtomicBatchMutation {
                 tenant_id: 1,
                 bucket_id: 2,
@@ -104,7 +94,7 @@ fn atomic_batch_routes_once_to_each_affected_bucket() {
         panic!("atomic batch projection changed the event kind");
     };
     assert_eq!(
-        projected_batch.affected_routes,
+        projected_batch.routes().collect::<Vec<_>>(),
         vec![crate::AtomicBatchRoute {
             tenant_id: 3,
             bucket_id: 4,

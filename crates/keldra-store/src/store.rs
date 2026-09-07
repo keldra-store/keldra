@@ -206,6 +206,7 @@ pub struct MetadataRuntimeMetrics {
     pub payload_live_blob_bytes: Option<u64>,
     pub payload_garbage_blob_bytes: Option<u64>,
     pub payload_sst_bytes: Option<u64>,
+    pub non_payload_metadata_index_sst_bytes: Option<u64>,
     pub mutation_receipt_entries: Option<u64>,
     pub mutation_receipt_bytes: Option<u64>,
     pub mutation_receipt_max_entries: u64,
@@ -289,6 +290,7 @@ pub(crate) enum PendingLocalChange {
     RetainedVersionDeleted {
         identity: BucketIdentity,
         exact_path: String,
+        canonical_path: Option<String>,
         deleted_version: VersionId,
         resulting_head_version: Option<VersionId>,
         reference_deltas: Vec<ReferenceDelta>,
@@ -308,7 +310,6 @@ pub(crate) enum PendingLocalChange {
     AtomicBatchPublished {
         cursor: u64,
         bundle_hash: crate::PreparedBundleHash,
-        affected_routes: Vec<crate::AtomicBatchRoute>,
         mutations: Vec<crate::AtomicBatchMutation>,
     },
 }
@@ -388,6 +389,8 @@ pub struct Store {
     single_node_group_commit: single_node_group_commit::SingleNodeGroupCommit,
     pub(crate) policy_gate: Arc<tokio::sync::RwLock<()>>,
     pub(crate) authz_write_lock: Arc<std::sync::Mutex<()>>,
+    pub(crate) authz_compiled_cache:
+        Arc<std::sync::Mutex<crate::authz::CompiledAuthorizationCache>>,
     pub(crate) bucket_options_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) definition_state_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) node_id: u16,
@@ -443,27 +446,6 @@ pub struct OpenedObject {
 pub struct ListObjectsPage {
     pub paths: Vec<String>,
     pub has_more: bool,
-}
-
-impl BatchGetSelection {
-    /// Sum of the declared lengths of structurally valid, present payloads.
-    ///
-    /// Missing versions, tombstones, selection errors and malformed version
-    /// descriptors contribute no bytes. Those retain their existing per-item
-    /// outcomes when the selection is materialised.
-    pub fn declared_present_payload_bytes(&self) -> u64 {
-        self.entries.iter().fold(0_u64, |total, (_, selected)| {
-            let length = match selected {
-                Ok(Some(version)) => match (&version.blob, version.deleted) {
-                    (Some(blob), false) => blob.length,
-                    (None, true) => 0,
-                    _ => 0,
-                },
-                Ok(None) | Err(_) => 0,
-            };
-            total.saturating_add(length)
-        })
-    }
 }
 
 impl std::fmt::Debug for Store {
@@ -611,19 +593,27 @@ struct StoredReceipt {
     version: VersionId,
     deleted: bool,
     expires_at_unix_millis: u64,
-    /// Present for 0.5.1 distributed object mutations and bounded by this
-    /// receipt's existing expiry. Released 0.5.0 receipts decode as `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Present for distributed object mutations and bounded by this receipt's
+    /// existing expiry. Source-local receipts represent absence explicitly.
+    #[serde(deserialize_with = "deserialize_required_option")]
     object_mutation: Option<crate::model::ObjectMutation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     definition_transition: Option<DefinitionTransition>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 pub(crate) type PendingBlobReferences = BTreeMap<Vec<u8>, BlobReferenceState>;
 
 impl Store {
     /// Allocate one node-scoped Snowflake identity for an ordinary derived
-    /// object such as a v6 index artifact. A durable publication made
+    /// object such as a v1 index artifact. A durable publication made
     /// afterward advances the same persisted high-water mark, so an identity
     /// lost before publication is harmless and a published identity cannot be
     /// reused after restart.
@@ -700,9 +690,9 @@ impl Store {
             "payload_blob_bytes",
             &mut metrics,
         );
-        metrics.payload_live_blob_bytes = self.payload_cf_property(
+        let payload_blob_file_bytes = self.payload_cf_property(
             "rocksdb.live-blob-file-size",
-            "payload_live_blob_bytes",
+            "payload_blob_file_bytes",
             &mut metrics,
         );
         metrics.payload_garbage_blob_bytes = self.payload_cf_property(
@@ -710,50 +700,78 @@ impl Store {
             "payload_garbage_blob_bytes",
             &mut metrics,
         );
+        metrics.payload_live_blob_bytes =
+            match (payload_blob_file_bytes, metrics.payload_garbage_blob_bytes) {
+                (Some(blob_file_bytes), Some(garbage_bytes)) => {
+                    match blob_file_bytes.checked_sub(garbage_bytes) {
+                        Some(live_bytes) => Some(live_bytes),
+                        None => {
+                            metrics.note_failure(
+                                "RocksDB payload garbage bytes exceed live blob-file bytes".into(),
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
         metrics.payload_sst_bytes = self.payload_cf_property(
             "rocksdb.live-sst-files-size",
             "payload_sst_bytes",
             &mut metrics,
         );
+        metrics.non_payload_metadata_index_sst_bytes = self.column_family_property_sum(
+            properties::LIVE_SST_FILES_SIZE,
+            "non_payload_metadata_index_sst_bytes",
+            Some(CF_PAYLOAD_ARTIFACTS),
+            &mut metrics,
+        );
         let value = self.column_family_property_sum(
             properties::CUR_SIZE_ACTIVE_MEM_TABLE,
             "active_memtable_bytes",
+            None,
             &mut metrics,
         );
         metrics.active_memtable_bytes = value;
         let value = self.column_family_property_sum(
             properties::CUR_SIZE_ALL_MEM_TABLES,
             "all_memtable_bytes",
+            None,
             &mut metrics,
         );
         metrics.all_memtable_bytes = value;
         let value = self.column_family_property_sum(
             properties::ESTIMATE_TABLE_READERS_MEM,
             "table_reader_bytes",
+            None,
             &mut metrics,
         );
         metrics.table_reader_bytes = value;
         let value = self.column_family_property_sum(
             properties::ESTIMATE_PENDING_COMPACTION_BYTES,
             "pending_compaction_bytes",
+            None,
             &mut metrics,
         );
         metrics.pending_compaction_bytes = value;
         let value = self.column_family_property_sum(
             properties::NUM_IMMUTABLE_MEM_TABLE,
             "immutable_memtables",
+            None,
             &mut metrics,
         );
         metrics.immutable_memtables = value;
         let value = self.column_family_property_sum(
             properties::COMPACTION_PENDING,
             "compaction_pending_column_families",
+            None,
             &mut metrics,
         );
         metrics.compaction_pending_column_families = value;
         let value = self.column_family_property_sum(
             properties::MEM_TABLE_FLUSH_PENDING,
             "flush_pending_column_families",
+            None,
             &mut metrics,
         );
         metrics.flush_pending_column_families = value;
@@ -837,42 +855,6 @@ impl Store {
                 None
             }
         }
-    }
-
-    fn column_family_property_sum(
-        &self,
-        property: &rocksdb::properties::PropName,
-        signal: &'static str,
-        metrics: &mut MetadataRuntimeMetrics,
-    ) -> Option<u64> {
-        let mut total = 0_u64;
-        for name in
-            std::iter::once(DEFAULT_COLUMN_FAMILY_NAME).chain(COLUMN_FAMILIES.iter().copied())
-        {
-            let Some(column_family) = self.db.cf_handle(name) else {
-                metrics.note_failure(format!("missing metadata column family {name}"));
-                return None;
-            };
-            let value = match self.db.property_int_value_cf(column_family, property) {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    metrics.note_unavailable(signal);
-                    return None;
-                }
-                Err(error) => {
-                    metrics.note_failure(format!(
-                        "read RocksDB property {signal} for {name}: {error}"
-                    ));
-                    return None;
-                }
-            };
-            let Some(next) = total.checked_add(value) else {
-                metrics.note_failure(format!("RocksDB metric {signal} overflowed u64"));
-                return None;
-            };
-            total = next;
-        }
-        Some(total)
     }
 
     pub async fn open(options: StoreOptions) -> Result<Self> {
@@ -1029,6 +1011,9 @@ impl Store {
             ),
             policy_gate: Arc::new(tokio::sync::RwLock::new(())),
             authz_write_lock: Arc::new(std::sync::Mutex::new(())),
+            authz_compiled_cache: Arc::new(std::sync::Mutex::new(
+                crate::authz::CompiledAuthorizationCache::default(),
+            )),
             bucket_options_lock: Arc::new(std::sync::Mutex::new(())),
             definition_state_lock: Arc::new(std::sync::Mutex::new(())),
             node_id: options.node_id,
@@ -1490,6 +1475,7 @@ mod receipt_codec;
 mod reference_deltas;
 mod reference_proofs;
 mod retained_snapshot_scan;
+mod runtime_metrics;
 mod shards;
 mod source_journal_preflight;
 mod source_version_retention;
@@ -1504,7 +1490,7 @@ pub use object_snapshot::{
 pub use object_snapshot_scan::{
     CurrentHeadCursor, CurrentObjectSnapshot, CurrentObjectSnapshotFrame,
     CurrentObjectSnapshotPage, CurrentObjectSnapshotScan, MAX_CURRENT_HEAD_SNAPSHOT_BYTES,
-    MAX_CURRENT_HEAD_SNAPSHOT_RECORDS,
+    MAX_CURRENT_HEAD_SNAPSHOT_RECORDS, SourceOwnedLogicalFileCounts,
 };
 pub use payload::{
     CompleteCopySealOutcome, LocalPayloadPresence, PayloadArtifactState, PayloadStoreError,
@@ -1996,3 +1982,5 @@ fn storage_error(error: impl std::fmt::Display) -> MutationError {
 
 #[cfg(test)]
 mod tests;
+
+mod batch_get_selection;

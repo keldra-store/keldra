@@ -66,7 +66,7 @@ cargo package --locked -p keldra
 
 ## Release
 
-### Initialize 0.17 at capability 2/2
+### Initialize 0.17 at capability 1/1
 
 Keldra 0.17 changes the cluster/data-peer protocols and introduces a clean-break
 storage format and index architecture. Every 0.17 node must use fresh
@@ -74,10 +74,10 @@ authoritative and derived-index volumes; mixed 0.16/0.17 operation and in-place
 upgrades from any earlier Keldra release are unsupported.
 
 1. Initialize a fresh 0.17 cluster. Fresh clusters start with protocol/storage
-   capability `2/2`, regardless of node count. If application data must move
+   capability `1/1`, regardless of node count. If application data must move
    from an older cluster, import it through the public API as new writes.
-2. Inspect cluster capabilities and require active and target protocol/storage
-   capability `2/2` with no blocking ACTIVE node IDs.
+2. Inspect cluster capabilities and require active protocol/storage capability
+   `1/1`.
 3. Smoke clone independence, link write-through, target-delete fencing, unlink,
    and date queries before admitting production traffic.
 
@@ -99,26 +99,19 @@ git tag 0.17.0 "$validated_commit"
 git push origin refs/tags/0.17.0
 ```
 
-The tag-triggered workflow reruns the static, Rust, and per-architecture image
-gates, then publishes the single multi-architecture image for the repository
-and creates the GitHub release. Do not publish
-public architecture-specific or `v`-prefixed image tags.
+Run the `Keldra Release` workflow manually with tag `0.17.0` and digest-pinned
+`rust:1.96-trixie` and `debian:trixie-slim` image references. The workflow
+reruns the static and Rust gates, builds both image architectures, qualifies the
+exact amd64 candidate across three nodes, and creates an immutable release
+record before publication.
 
-Publish the crates from the same validated commit. `keldra` depends on
-the exact `keldra-api` release, so publish and verify the API crate before the
-client crate:
-
-```sh
-cargo publish --locked -p keldra-api
-cargo info keldra-api@0.17.0
-
-cargo publish --locked -p keldra
-cargo info keldra@0.17.0
-```
-
-Do not publish `keldra` until `cargo info keldra-api@0.17.0` resolves from
-crates.io. After both commands succeed, run both `cargo info` checks again and
-confirm that each reports version `0.17.0` from crates.io.
+Publication verifies that record, publishes `keldra-api` before the exact-version
+`keldra` client, publishes the single multi-architecture image, and creates the
+GitHub release. Do not publish the crates manually or create public
+architecture-specific or `v`-prefixed image tags. If publication fails after
+qualification, use `Resume Keldra Release Publication` with the original tag,
+commit, source run, and expected image digest rather than moving the tag or
+rebuilding a different candidate.
 
 Use Cargo's shared target directory and locking. Do not create ad-hoc target
 directories unless the task explicitly requires isolation.

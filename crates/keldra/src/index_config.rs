@@ -1,6 +1,6 @@
-//! Startup configuration for the format-v6 TypedJson index runtime.
+//! Startup configuration for the format-v1 TypedJson index runtime.
 //!
-//! The v6 runtime has one bounded, partition-owned pipeline. A logical
+//! The v1 runtime has one bounded, partition-owned pipeline. A logical
 //! definition neither owns a worker nor changes any of these budgets.
 
 use std::num::{NonZeroU32, NonZeroU64};
@@ -181,7 +181,7 @@ fn positive_u64(
 impl Default for IndexRuntimeConfig {
     fn default() -> Self {
         Self::new(Self::DEFAULT_INDEXING_CORES)
-            .expect("the built-in v6 index configuration is valid")
+            .expect("the built-in v1 index configuration is valid")
     }
 }
 
@@ -189,9 +189,9 @@ impl Default for IndexRuntimeConfig {
 pub enum IndexRuntimeConfigError {
     #[error("indexing core count must be greater than zero")]
     ZeroIndexingCores,
-    #[error("default v6 pipeline memory calculation overflows u64")]
+    #[error("default v1 pipeline memory calculation overflows u64")]
     PipelineMemoryBytesOverflow,
-    #[error("v6 pipeline memory bytes must be greater than zero")]
+    #[error("v1 pipeline memory bytes must be greater than zero")]
     ZeroPipelineMemoryBytes,
     #[error("index query memory bytes must be greater than zero")]
     ZeroQueryMemoryBytes,
@@ -201,15 +201,15 @@ pub enum IndexRuntimeConfigError {
     WorkingMemoryBelowMandatoryMinimum { configured: u64, minimum: u64 },
     #[error("aggregate index working-memory sum overflows u64")]
     WorkingMemoryBytesOverflow,
-    #[error("v6 segment flush byte target must be greater than zero")]
+    #[error("v1 segment flush byte target must be greater than zero")]
     ZeroFlushBytes,
-    #[error("v6 segment flush maximum age milliseconds must be greater than zero")]
+    #[error("v1 segment flush maximum age milliseconds must be greater than zero")]
     ZeroFlushMaxAgeMillis,
-    #[error("v6 segment flush operation limit must be greater than zero")]
+    #[error("v1 segment flush operation limit must be greater than zero")]
     ZeroFlushOperations,
-    #[error("v6 LSM maximum runs per level must be greater than zero")]
+    #[error("v1 LSM maximum runs per level must be greater than zero")]
     ZeroLsmRunsPerLevel,
-    #[error("v6 LSM maximum unmerged bytes per level must be greater than zero")]
+    #[error("v1 LSM maximum unmerged bytes per level must be greater than zero")]
     ZeroLsmUnmergedBytesPerLevel,
 }
 
@@ -218,7 +218,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_bind_one_v6_pipeline_per_configured_core() {
+    fn defaults_bind_one_v1_pipeline_per_configured_core() {
         let config = IndexRuntimeConfig::default();
         assert_eq!(config.indexing_cores(), 4);
         assert_eq!(config.pipeline_memory_bytes(), 1024 * 1024 * 1024);
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_memory_cannot_starve_v6_pipeline() {
+    fn aggregate_memory_cannot_starve_v1_pipeline() {
         assert!(matches!(
             IndexRuntimeConfig::default().with_working_memory_bytes(1024),
             Err(IndexRuntimeConfigError::WorkingMemoryBelowMandatoryMinimum { .. })

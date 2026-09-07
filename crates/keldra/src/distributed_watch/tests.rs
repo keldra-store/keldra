@@ -571,6 +571,7 @@ fn public_filter_keeps_only_matching_object_heads() {
             tenant_id: 11,
             bucket_id: 22,
             exact_path: "docs/old".into(),
+            canonical_path: None,
             deleted_version: VersionId(1),
             resulting_head_version: Some(VersionId(2)),
             reference_deltas: Vec::new(),

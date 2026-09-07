@@ -1,7 +1,7 @@
 //! Shared pure helpers for mutation admission and evaluation.
 
 use super::*;
-use crate::{DefinitionMutationIntent, DefinitionStateError, DefinitionTransition};
+use crate::{DefinitionMutationIntent, DefinitionStateError, DefinitionTransition, ObjectMutation};
 
 pub(super) fn is_mutation_capacity(error: &MutationError) -> bool {
     mutation_capacity_kind(error).is_some()
@@ -32,6 +32,48 @@ pub(super) fn live_version_length(version: &Version) -> Option<u64> {
     (!version.deleted)
         .then(|| version.blob.as_ref().map(|blob| blob.length))
         .flatten()
+}
+
+pub(super) fn version_retention(versioning: ObjectVersioning) -> StoredVersionRetention {
+    match versioning {
+        ObjectVersioning::Unversioned => StoredVersionRetention::JournalPending,
+        ObjectVersioning::Enabled => StoredVersionRetention::UserRetained,
+    }
+}
+
+pub(super) fn head_accounting_transition(
+    predecessor: Option<&Version>,
+    current: &Version,
+    retention: StoredVersionRetention,
+) -> AccountingHeadTransition {
+    let previous_live_length = predecessor.and_then(live_version_length);
+    AccountingHeadTransition::new(
+        previous_live_length,
+        live_version_length(current),
+        if retention == StoredVersionRetention::JournalPending {
+            previous_live_length.unwrap_or(0)
+        } else {
+            0
+        },
+    )
+}
+
+pub(super) fn validate_accounting_transition(
+    mutation: &ObjectMutation,
+    predecessor: Option<&Version>,
+) -> Result<(), MutationError> {
+    let expected = head_accounting_transition(
+        predecessor,
+        &mutation.version,
+        version_retention(mutation.versioning),
+    );
+    if mutation.accounting_transition == Some(expected) {
+        Ok(())
+    } else {
+        Err(MutationError::InvalidObjectMutation(
+            "accounting head-transition disagrees with predecessor or bucket versioning".into(),
+        ))
+    }
 }
 
 pub(super) fn definition_receipt_matches_intent(

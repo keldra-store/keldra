@@ -124,7 +124,7 @@ object state and authorization before returning results.
 ### 4.1 Fresh cluster
 
 A fresh cluster starts with one Raft voter and records the current Keldra 0.17
-protocol and storage capability, currently `2/2`. This is independent of node
+protocol and storage capability, currently `1/1`. This is independent of node
 count: a one-node cluster does not start in a legacy capability mode and does
 not require a later activation ceremony.
 
@@ -279,7 +279,7 @@ been proven reference-safe.
 
 ## 10. Atomic programs
 
-Atomic programs reserve and validate their object paths using capability 2/2.
+Atomic programs reserve and validate their object paths using capability 1/1.
 Raft owns only the compact decision, executor nomination, limits, and bounded
 replay evidence. The object changes themselves use the ordinary authoritative
 object and journal storage paths.
@@ -299,7 +299,7 @@ An index definition is an authorized ordinary Keldra object. Compatible logical
 TypedJson definitions within one tenant, bucket, and source scope are compiled
 into shared physical recipes and one projection family.
 
-The v6 index pipeline consumes authoritative journal order and exact retained
+The v1 index pipeline consumes authoritative journal order and exact retained
 object versions. Its bounded in-memory preparation cache and hot-ingress path
 are accelerators; the journal is the replay path. Immutable segments, head
 deltas, roots, and checkpoints are durable performance artifacts but remain
@@ -351,7 +351,7 @@ background movement cannot silently weaken object authority or durability.
 - The current public cluster workflow supports adding and preparing nodes; a
   complete operator-facing remove/reweight workflow is not yet shipped.
 - One membership transition is processed at a time.
-- TypedJson is the implemented v6 index kind for this release.
+- TypedJson is the implemented v1 index kind for this release.
 - Keldra 0.17 requires fresh storage; there is no in-place compatibility path
   from earlier versions.
 

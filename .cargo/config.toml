@@ -1,2 +1,6 @@
 [env]
 RUST_MIN_STACK = { value = "8388608", force = true }
+
+[build]
+jobs = 2
+target-dir = "/home/zcourts/projects/projects/build/debian1/keldra"

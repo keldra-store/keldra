@@ -9,9 +9,9 @@ use std::{
 };
 
 use openraft::{
-    AnyError, BasicNode, ChangeMembers, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState,
-    OptionalSend, RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError,
-    StorageIOError, StoredMembership, Vote,
+    AnyError, BasicNode, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState, OptionalSend,
+    RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError,
+    StoredMembership, Vote,
     error::{CheckIsLeaderError, ClientWriteError, InitializeError, RaftError},
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ApplyError, ApplyResult, Command, CommittedInvocation, ExecutorNomination, StateMachine, codec,
+    ApplyError, ApplyResult, Command, StateMachine, codec,
     peer::{PeerNetworkFactory, PeerTransport, UnreachablePeerTransport},
     raft_storage::{DurableSnapshot, DurableStorageError, DurableStore, RaftEntry, StorageConfig},
     types::{MAX_RAFT_NODE_ID, MembershipTransitionKind, NodeState},
@@ -34,8 +34,8 @@ const SAME_PROCESS_LOCK_MAX_RETRIES: usize = 100;
 const SAME_PROCESS_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-// The response is part of OpenRaft's persisted protocol. Boxing one variant
-// merely to reduce the enum's stack size would change its released encoding.
+// The response is part of the v1 OpenRaft persisted protocol. Boxing one
+// variant would change its encoding.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum DecisionApplyResult {
     Applied(ApplyResult),
@@ -53,306 +53,19 @@ openraft::declare_raft_types!(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MachineState {
-    decisions: StateMachine,
+    decisions: Arc<StateMachine>,
     last_applied_log_id: Option<LogId<u64>>,
     membership: StoredMembership<u64, BasicNode>,
     snapshot_generation: u64,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-struct LegacyCommittedBatch {
-    commit_cursor: u64,
-    executor: crate::NodeId,
-    nomination_log_index: u64,
-    program_path_hash: crate::ProgramPathHash,
-    program_hash: crate::ProgramHash,
-    bundle_ref: crate::BundleRef,
-    bundle_hash: crate::BundleHash,
-    durability_class: crate::DurabilityClass,
-    durability_evidence_hash: crate::DurabilityEvidenceHash,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-struct LegacyCommittedInvocation {
-    invocation_id: crate::InvocationId,
-    input_fingerprint: crate::InvocationFingerprint,
-    proposal_at_unix_millis: u64,
-    replay_expires_at_unix_millis: u64,
-    committed_batch: LegacyCommittedBatch,
-}
-
-fn migrate_legacy_invocations(
-    legacy: BTreeMap<u64, LegacyCommittedInvocation>,
-) -> BTreeMap<u64, CommittedInvocation> {
-    legacy
-        .into_iter()
-        .map(|(cursor, invocation)| {
-            let batch = invocation.committed_batch;
-            (
-                cursor,
-                CommittedInvocation {
-                    invocation_id: invocation.invocation_id,
-                    input_fingerprint: invocation.input_fingerprint,
-                    proposal_at_unix_millis: invocation.proposal_at_unix_millis,
-                    replay_expires_at_unix_millis: invocation.replay_expires_at_unix_millis,
-                    committed_batch: crate::CommittedBatch {
-                        commit_cursor: batch.commit_cursor,
-                        executor: batch.executor,
-                        nomination_log_index: batch.nomination_log_index,
-                        begin_cursor: batch.commit_cursor,
-                        authority: crate::AtomicBundleAuthority::LegacyProgramOnly {
-                            program_path_hash: batch.program_path_hash,
-                            program_hash: batch.program_hash,
-                        },
-                        bundle_ref: batch.bundle_ref,
-                        bundle_hash: batch.bundle_hash,
-                        durability_class: batch.durability_class,
-                        durability_evidence_hash: batch.durability_evidence_hash,
-                        participant_manifest_hash: crate::ParticipantManifestHash(
-                            batch.bundle_hash.0,
-                        ),
-                    },
-                },
-            )
-        })
-        .collect()
-}
-
-/// Exact state-machine layout in version-one enveloped snapshots.
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyStateMachinePreClusterControl {
-    max_commit_entries: u32,
-    max_commit_bytes: u64,
-    cluster_id: Option<crate::ClusterId>,
-    system_bootstrap: crate::SystemBootstrapState,
-    executor: Option<ExecutorNomination>,
-    committed_invocations: BTreeMap<u64, LegacyCommittedInvocation>,
-    committed_invocation_bytes: u64,
-    last_commit_cursor: Option<u64>,
-    finalized_through: Option<u64>,
-}
-
-/// Exact outer layout in version-one enveloped snapshots.
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyMachineStatePreClusterControl {
-    decisions: LegacyStateMachinePreClusterControl,
-    last_applied_log_id: Option<LogId<u64>>,
-    membership: StoredMembership<u64, BasicNode>,
-    snapshot_generation: u64,
-}
-
-/// Exact cluster-control layout in unreleased version-two snapshots.
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyClusterControlStateV2 {
-    nodes: BTreeMap<crate::NodeId, crate::NodeDescriptor>,
-    used_node_ids: crate::UsedNodeIds,
-    transition: Option<crate::MembershipTransition>,
-    jwt_signing_key_fingerprint: Option<crate::JwtSigningKeyFingerprint>,
-    erasure_code_profile: Option<crate::ErasureCodeProfile>,
-}
-
-/// Exact state-machine layout in unreleased version-two snapshots.
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyStateMachineV2 {
-    max_commit_entries: u32,
-    max_commit_bytes: u64,
-    cluster_id: Option<crate::ClusterId>,
-    system_bootstrap: crate::SystemBootstrapState,
-    cluster_control: LegacyClusterControlStateV2,
-    executor: Option<ExecutorNomination>,
-    committed_invocations: BTreeMap<u64, LegacyCommittedInvocation>,
-    committed_invocation_bytes: u64,
-    last_commit_cursor: Option<u64>,
-    finalized_through: Option<u64>,
-}
-
-/// Exact outer layout in unreleased version-two snapshots.
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyMachineStateV2 {
-    decisions: LegacyStateMachineV2,
-    last_applied_log_id: Option<LogId<u64>>,
-    membership: StoredMembership<u64, BasicNode>,
-    snapshot_generation: u64,
-}
-
-/// Exact released version-three snapshot, before durable atomic preparation.
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyClusterControlStateV3 {
-    nodes: BTreeMap<crate::NodeId, crate::NodeDescriptor>,
-    used_node_ids: crate::UsedNodeIds,
-    transition: Option<crate::MembershipTransition>,
-    jwt_signing_key_fingerprint: Option<crate::JwtSigningKeyFingerprint>,
-    erasure_code_profile: Option<crate::ErasureCodeProfile>,
-    active_placement_log_id: Option<LogId<u64>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyStateMachineV3 {
-    max_commit_entries: u32,
-    max_commit_bytes: u64,
-    cluster_id: Option<crate::ClusterId>,
-    system_bootstrap: crate::SystemBootstrapState,
-    cluster_control: LegacyClusterControlStateV3,
-    executor: Option<ExecutorNomination>,
-    committed_invocations: BTreeMap<u64, LegacyCommittedInvocation>,
-    committed_invocation_bytes: u64,
-    last_commit_cursor: Option<u64>,
-    finalized_through: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyMachineStateV3 {
-    decisions: LegacyStateMachineV3,
-    last_applied_log_id: Option<LogId<u64>>,
-    membership: StoredMembership<u64, BasicNode>,
-    snapshot_generation: u64,
-}
-
-/// Exact state-machine layout written by Keldra 0.5.0 snapshots.
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyStateMachineV050 {
-    max_commit_entries: u32,
-    max_commit_bytes: u64,
-    executor: Option<ExecutorNomination>,
-    committed_invocations: BTreeMap<u64, LegacyCommittedInvocation>,
-    committed_invocation_bytes: u64,
-    last_commit_cursor: Option<u64>,
-    finalized_through: Option<u64>,
-}
-
-/// Exact outer state layout written by Keldra 0.5.0 snapshots.
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyMachineStateV050 {
-    decisions: LegacyStateMachineV050,
-    last_applied_log_id: Option<LogId<u64>>,
-    membership: StoredMembership<u64, BasicNode>,
-    snapshot_generation: u64,
-}
-
-impl From<LegacyMachineStateV050> for MachineState {
-    fn from(legacy: LegacyMachineStateV050) -> Self {
-        let decisions = legacy.decisions;
-        let committed_invocations = migrate_legacy_invocations(decisions.committed_invocations);
-        let committed_invocation_bytes = codec::encoded_len(&committed_invocations)
-            .expect("migrated bounded invocation map remains encodable");
-        Self {
-            decisions: StateMachine::from_v050_snapshot(
-                decisions.max_commit_entries,
-                decisions.max_commit_bytes,
-                decisions.executor,
-                committed_invocations,
-                committed_invocation_bytes,
-                decisions.last_commit_cursor,
-                decisions.finalized_through,
-            ),
-            last_applied_log_id: legacy.last_applied_log_id,
-            membership: legacy.membership,
-            snapshot_generation: legacy.snapshot_generation,
-        }
-    }
-}
-
-impl From<LegacyMachineStatePreClusterControl> for MachineState {
-    fn from(legacy: LegacyMachineStatePreClusterControl) -> Self {
-        let decisions = legacy.decisions;
-        let committed_invocations = migrate_legacy_invocations(decisions.committed_invocations);
-        let committed_invocation_bytes = codec::encoded_len(&committed_invocations)
-            .expect("migrated bounded invocation map remains encodable");
-        Self {
-            decisions: StateMachine::from_pre_cluster_control_snapshot(
-                decisions.max_commit_entries,
-                decisions.max_commit_bytes,
-                decisions.cluster_id,
-                decisions.system_bootstrap,
-                decisions.executor,
-                committed_invocations,
-                committed_invocation_bytes,
-                decisions.last_commit_cursor,
-                decisions.finalized_through,
-            ),
-            last_applied_log_id: legacy.last_applied_log_id,
-            membership: legacy.membership,
-            snapshot_generation: legacy.snapshot_generation,
-        }
-    }
-}
-
-impl From<LegacyMachineStateV2> for MachineState {
-    fn from(legacy: LegacyMachineStateV2) -> Self {
-        let decisions = legacy.decisions;
-        let cluster_control = decisions.cluster_control;
-        let committed_invocations = migrate_legacy_invocations(decisions.committed_invocations);
-        let committed_invocation_bytes = codec::encoded_len(&committed_invocations)
-            .expect("migrated bounded invocation map remains encodable");
-        Self {
-            decisions: StateMachine::from_v2_snapshot(
-                decisions.max_commit_entries,
-                decisions.max_commit_bytes,
-                decisions.cluster_id,
-                decisions.system_bootstrap,
-                crate::ClusterControlState {
-                    nodes: cluster_control.nodes,
-                    used_node_ids: cluster_control.used_node_ids,
-                    transition: cluster_control.transition,
-                    jwt_signing_key_fingerprint: cluster_control.jwt_signing_key_fingerprint,
-                    erasure_code_profile: cluster_control.erasure_code_profile,
-                    active_placement_log_id: None,
-                    active_protocol_version: 1,
-                    active_storage_format: 1,
-                },
-                decisions.executor,
-                committed_invocations,
-                committed_invocation_bytes,
-                decisions.last_commit_cursor,
-                decisions.finalized_through,
-            ),
-            last_applied_log_id: legacy.last_applied_log_id,
-            membership: legacy.membership,
-            snapshot_generation: legacy.snapshot_generation,
-        }
-    }
-}
-
-impl From<LegacyMachineStateV3> for MachineState {
-    fn from(legacy: LegacyMachineStateV3) -> Self {
-        let decisions = legacy.decisions;
-        let cluster_control = decisions.cluster_control;
-        let committed_invocations = migrate_legacy_invocations(decisions.committed_invocations);
-        let committed_invocation_bytes = codec::encoded_len(&committed_invocations)
-            .expect("migrated bounded invocation map remains encodable");
-        Self {
-            decisions: StateMachine::from_v2_snapshot(
-                decisions.max_commit_entries,
-                decisions.max_commit_bytes,
-                decisions.cluster_id,
-                decisions.system_bootstrap,
-                crate::ClusterControlState {
-                    nodes: cluster_control.nodes,
-                    used_node_ids: cluster_control.used_node_ids,
-                    transition: cluster_control.transition,
-                    jwt_signing_key_fingerprint: cluster_control.jwt_signing_key_fingerprint,
-                    erasure_code_profile: cluster_control.erasure_code_profile,
-                    active_placement_log_id: cluster_control.active_placement_log_id,
-                    active_protocol_version: 1,
-                    active_storage_format: 1,
-                },
-                decisions.executor,
-                committed_invocations,
-                committed_invocation_bytes,
-                decisions.last_commit_cursor,
-                decisions.finalized_through,
-            ),
-            last_applied_log_id: legacy.last_applied_log_id,
-            membership: legacy.membership,
-            snapshot_generation: legacy.snapshot_generation,
-        }
-    }
 }
 
 impl MachineState {
     fn new(config: StorageConfig) -> Result<Self, ApplyError> {
         Ok(Self {
-            decisions: StateMachine::new(config.max_commit_entries, config.max_commit_bytes)?,
+            decisions: Arc::new(StateMachine::new(
+                config.max_commit_entries,
+                config.max_commit_bytes,
+            )?),
             last_applied_log_id: None,
             membership: StoredMembership::default(),
             snapshot_generation: 0,
@@ -373,7 +86,7 @@ impl MachineState {
     fn validate_cluster_membership(&self) -> Result<(), String> {
         let cluster = self.decisions.cluster_control();
         if cluster.nodes().is_empty() {
-            // Released 0.5.0 state has OpenRaft membership but no descriptors.
+            // Genesis has OpenRaft membership before descriptor admission.
             if cluster.transition().is_some() {
                 return Err("membership transition has no admitted node descriptor".into());
             }
@@ -704,23 +417,22 @@ struct OpenRaftSnapshotBuilder {
 
 impl RaftSnapshotBuilder<DecisionRaftConfig> for OpenRaftSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<DecisionRaftConfig>, StorageError<u64>> {
-        let mut current = self.machine.lock().map_err(|_| {
-            storage_error(
-                ErrorSubject::StateMachine,
-                ErrorVerb::Read,
-                "state lock poisoned",
-            )
-        })?;
-        let mut snapshot_state = current.clone();
-        snapshot_state.snapshot_generation = snapshot_state.snapshot_generation.saturating_add(1);
+        let snapshot_state = {
+            let mut current = self.machine.lock().map_err(|_| {
+                storage_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Read,
+                    "state lock poisoned",
+                )
+            })?;
+            current.snapshot_generation = current.snapshot_generation.saturating_add(1);
+            current.clone()
+        };
         snapshot_state
             .validate_cluster_membership()
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
-        let data =
-            codec::encode_record_at_version(&snapshot_state, codec::SNAPSHOT_RECORD_FORMAT_V4)
-                .map_err(|error| {
-                    storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
-                })?;
+        let data = codec::encode_record(&snapshot_state)
+            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
         let meta = SnapshotMeta {
             last_log_id: snapshot_state.last_applied_log_id,
             last_membership: snapshot_state.membership.clone(),
@@ -732,19 +444,16 @@ impl RaftSnapshotBuilder<DecisionRaftConfig> for OpenRaftSnapshotBuilder {
                 snapshot_state.snapshot_generation
             ),
         };
+        let durable = DurableSnapshot {
+            meta: meta.clone(),
+            data,
+        };
         self.store
-            .save_snapshot(
-                &DurableSnapshot {
-                    meta: meta.clone(),
-                    data: data.clone(),
-                },
-                false,
-            )
+            .save_snapshot(&durable, false)
             .map_err(write_error)?;
-        current.snapshot_generation = snapshot_state.snapshot_generation;
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(Cursor::new(durable.data)),
         })
     }
 }
@@ -777,6 +486,19 @@ impl RaftStateMachine<DecisionRaftConfig> for OpenRaftStateMachine {
         I::IntoIter: OptionalSend,
     {
         let entries = entries.into_iter().collect::<Vec<_>>();
+        {
+            let current = self.machine.lock().map_err(|_| {
+                storage_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Read,
+                    "state lock poisoned",
+                )
+            })?;
+            validate_applied_entry_sequence(current.last_applied_log_id, &entries).map_err(
+                |error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error),
+            )?;
+        }
+        self.store.append_applied(&entries).map_err(write_error)?;
         let mut current = self.machine.lock().map_err(|_| {
             storage_error(
                 ErrorSubject::StateMachine,
@@ -784,15 +506,12 @@ impl RaftStateMachine<DecisionRaftConfig> for OpenRaftStateMachine {
                 "state lock poisoned",
             )
         })?;
-        let mut next = current.clone();
         let mut responses = Vec::with_capacity(entries.len());
         for entry in &entries {
-            responses.push(apply_entry(&mut next, entry).map_err(|error| {
+            responses.push(apply_entry(&mut current, entry).map_err(|error| {
                 storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error)
             })?);
         }
-        self.store.append_applied(&entries).map_err(write_error)?;
-        *current = next;
         Ok(responses)
     }
 
@@ -841,13 +560,6 @@ impl RaftStateMachine<DecisionRaftConfig> for OpenRaftStateMachine {
             )
         })?;
 
-        let mut current = self.machine.lock().map_err(|_| {
-            storage_error(
-                ErrorSubject::StateMachine,
-                ErrorVerb::Write,
-                "state lock poisoned",
-            )
-        })?;
         self.store
             .save_snapshot(
                 &DurableSnapshot {
@@ -857,6 +569,13 @@ impl RaftStateMachine<DecisionRaftConfig> for OpenRaftStateMachine {
                 true,
             )
             .map_err(write_error)?;
+        let mut current = self.machine.lock().map_err(|_| {
+            storage_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                "state lock poisoned",
+            )
+        })?;
         *current = state;
         Ok(())
     }
@@ -889,8 +608,8 @@ pub struct DecisionRaft {
 impl DecisionRaft {
     /// Open a Raft node with no reachable peers.
     ///
-    /// This remains the small convenience used by the one-node 0.5.0 server
-    /// and focused storage tests. Multi-node callers use
+    /// This is the small convenience used by fresh one-node startup and
+    /// focused storage tests. Multi-node callers use
     /// [`Self::open_with_transport`].
     pub async fn open(
         path: impl AsRef<Path>,
@@ -1048,69 +767,6 @@ impl DecisionRaft {
         }
     }
 
-    /// Replace the synthetic address written by the released 0.5.0 one-node
-    /// bootstrap before admitting that same node's 0.5.1 descriptor.
-    ///
-    /// This is deliberately not a general address-update API. It accepts only
-    /// the sole local voter, no learners, no cluster descriptors, and the exact
-    /// `keldra-local://N` predecessor. An idempotent retry after the membership
-    /// entry commits accepts the requested address.
-    pub async fn migrate_released_single_node_address(
-        &self,
-        peer_address: impl Into<String>,
-    ) -> Result<(), DecisionRaftError> {
-        let peer_address = peer_address.into();
-        if peer_address.is_empty() {
-            return Err(DecisionRaftError::Configuration(
-                "replacement peer address must not be empty".into(),
-            ));
-        }
-
-        let current_address = {
-            let machine = self
-                .machine
-                .lock()
-                .map_err(|_| DecisionRaftError::StatePoisoned)?;
-            if !machine.decisions.cluster_control().nodes().is_empty() {
-                return Err(DecisionRaftError::Configuration(
-                    "released address migration is forbidden after node admission".into(),
-                ));
-            }
-            let membership = machine.membership.membership();
-            let voters = membership.voter_ids().collect::<Vec<_>>();
-            let nodes = membership.nodes().collect::<Vec<_>>();
-            if voters != [self.node_id] || nodes.len() != 1 || nodes[0].0 != &self.node_id {
-                return Err(DecisionRaftError::Configuration(
-                    "released address migration requires the sole local voter and no learners"
-                        .into(),
-                ));
-            }
-            nodes[0].1.addr.clone()
-        };
-
-        if current_address == peer_address {
-            return Ok(());
-        }
-        let expected = format!("keldra-local://{}", self.node_id);
-        if current_address != expected {
-            return Err(DecisionRaftError::Configuration(format!(
-                "released address migration expected {expected:?}, found {current_address:?}"
-            )));
-        }
-
-        self.raft
-            .change_membership(
-                ChangeMembers::SetNodes(BTreeMap::from([(
-                    self.node_id,
-                    BasicNode::new(peer_address),
-                )])),
-                true,
-            )
-            .await
-            .map(|_| ())
-            .map_err(map_client_write_error)
-    }
-
     pub async fn submit(&self, command: Command) -> Result<CommittedDecision, DecisionRaftError> {
         let response = self
             .raft
@@ -1129,10 +785,10 @@ impl DecisionRaft {
         }
     }
 
-    pub fn state(&self) -> Result<StateMachine, DecisionRaftError> {
+    pub fn state(&self) -> Result<Arc<StateMachine>, DecisionRaftError> {
         self.machine
             .lock()
-            .map(|state| state.decisions.clone())
+            .map(|state| Arc::clone(&state.decisions))
             .map_err(|_| DecisionRaftError::StatePoisoned)
     }
 
@@ -1271,21 +927,9 @@ fn load_machine(store: &DurableStore) -> Result<MachineState, DecisionRaftError>
     Ok(state)
 }
 
-/// Decode current snapshots and explicitly migrate released predecessors.
+/// Decode the single fresh-volume v1 snapshot shape.
 fn decode_machine_snapshot(data: &[u8]) -> Result<MachineState, codec::CodecError> {
-    let (version, payload) = codec::record_version_and_payload(data)?;
-    match version {
-        None => codec::decode::<LegacyMachineStateV050>(payload).map(Into::into),
-        Some(1) => codec::decode::<LegacyMachineStatePreClusterControl>(payload).map(Into::into),
-        Some(codec::SNAPSHOT_RECORD_FORMAT_V2) => {
-            codec::decode::<LegacyMachineStateV2>(payload).map(Into::into)
-        }
-        Some(codec::SNAPSHOT_RECORD_FORMAT_V3) => {
-            codec::decode::<LegacyMachineStateV3>(payload).map(Into::into)
-        }
-        Some(codec::SNAPSHOT_RECORD_FORMAT_V4) => codec::decode(payload),
-        Some(version) => Err(codec::CodecError::UnsupportedRecordVersion(version)),
-    }
+    codec::decode_record(data)
 }
 
 fn apply_entry(
@@ -1307,7 +951,7 @@ fn apply_entry(
         }
         EntryPayload::Normal(command) => {
             match validate_membership_command(&state.membership, &state.decisions, command)
-                .and_then(|()| state.decisions.apply(entry.log_id, command))
+                .and_then(|()| Arc::make_mut(&mut state.decisions).apply(entry.log_id, command))
             {
                 Ok(result) => DecisionApplyResult::Applied(result),
                 Err(error) => DecisionApplyResult::Rejected(error),
@@ -1316,6 +960,20 @@ fn apply_entry(
     };
     state.last_applied_log_id = Some(entry.log_id);
     Ok(response)
+}
+
+fn validate_applied_entry_sequence(
+    last_applied_log_id: Option<LogId<u64>>,
+    entries: &[RaftEntry],
+) -> Result<(), &'static str> {
+    let mut expected = last_applied_log_id.map_or(0, |log_id| log_id.index.saturating_add(1));
+    for entry in entries {
+        if entry.log_id.index != expected {
+            return Err("applied-state journal is not consecutive");
+        }
+        expected = expected.saturating_add(1);
+    }
+    Ok(())
 }
 
 fn validate_membership_command(
@@ -1337,7 +995,6 @@ fn validate_membership_command(
     }
     let executor = match command {
         Command::NominateExecutor { executor } => Some(*executor),
-        Command::CommitBatch(batch) => Some(batch.executor),
         Command::BeginBatch(batch) => Some(batch.executor),
         Command::CommitPreparedBatch(batch) => Some(batch.executor),
         Command::AbortPreparedBatch(batch) => Some(batch.executor),
@@ -1353,9 +1010,7 @@ fn validate_membership_command(
         | Command::ClearPeerSpkiOverlap { .. }
         | Command::BindJwtSigningKeyFingerprint { .. }
         | Command::BindErasureCodeProfile { .. }
-        | Command::RefreshJoiningNodePreparation { .. }
-        | Command::UpdateNodeCapabilities { .. }
-        | Command::ActivateClusterCapabilities { .. } => None,
+        | Command::RefreshJoiningNodePreparation { .. } => None,
     };
     if let Some(executor) = executor
         && membership.membership().get_node(&executor.0).is_none()
@@ -1571,7 +1226,7 @@ mod open_tests {
 }
 
 #[cfg(test)]
-mod snapshot_compatibility_tests {
+mod snapshot_format_tests {
     use std::collections::BTreeSet;
 
     use openraft::Membership;
@@ -1588,188 +1243,26 @@ mod snapshot_compatibility_tests {
     }
 
     #[test]
-    fn snapshot_wire_migrates_raw_v050_and_enveloped_pre_cluster_control_state() {
-        let config = StorageConfig {
+    fn snapshot_wire_accepts_only_the_current_v1_envelope() {
+        let current = MachineState::new(StorageConfig {
             max_commit_entries: 4,
             max_commit_bytes: 64 * 1024,
-        };
-        let empty_invocations = BTreeMap::new();
-        let legacy = LegacyMachineStateV050 {
-            decisions: LegacyStateMachineV050 {
-                max_commit_entries: config.max_commit_entries,
-                max_commit_bytes: config.max_commit_bytes,
-                executor: None,
-                committed_invocation_bytes: codec::encoded_len(&empty_invocations).unwrap(),
-                committed_invocations: empty_invocations,
-                last_commit_cursor: None,
-                finalized_through: None,
-            },
-            last_applied_log_id: None,
-            membership: StoredMembership::default(),
-            snapshot_generation: 7,
-        };
+        })
+        .unwrap();
+        let encoded = codec::encode_record(&current).unwrap();
+        assert_eq!(decode_machine_snapshot(&encoded).unwrap(), current);
 
-        let legacy_raw = codec::encode(&legacy).unwrap();
-        assert_eq!(codec::record_payload(&legacy_raw).unwrap(), legacy_raw);
-        let migrated = decode_machine_snapshot(&legacy_raw).unwrap();
-        assert_eq!(migrated.snapshot_generation, 7);
-        assert_eq!(migrated.decisions.cluster_id(), None);
+        let raw = codec::encode(&current).unwrap();
         assert_eq!(
-            migrated.decisions.system_bootstrap(),
-            crate::SystemBootstrapState::Missing
-        );
-        assert_eq!(
-            migrated
-                .decisions
-                .cluster_control()
-                .active_placement_log_id(),
-            None
+            decode_machine_snapshot(&raw),
+            Err(codec::CodecError::InvalidRecord("magic is invalid"))
         );
 
-        let pre_cluster_control = LegacyMachineStatePreClusterControl {
-            decisions: LegacyStateMachinePreClusterControl {
-                max_commit_entries: config.max_commit_entries,
-                max_commit_bytes: config.max_commit_bytes,
-                cluster_id: Some(crate::ClusterId([9; 16])),
-                system_bootstrap: crate::SystemBootstrapState::Missing,
-                executor: None,
-                committed_invocations: BTreeMap::new(),
-                committed_invocation_bytes: codec::encoded_len(
-                    &BTreeMap::<u64, CommittedInvocation>::new(),
-                )
-                .unwrap(),
-                last_commit_cursor: None,
-                finalized_through: None,
-            },
-            last_applied_log_id: None,
-            membership: StoredMembership::default(),
-            snapshot_generation: 8,
-        };
-        let pre_cluster_control_record = codec::encode_record(&pre_cluster_control).unwrap();
-        let migrated = decode_machine_snapshot(&pre_cluster_control_record).unwrap();
-        assert_eq!(migrated.snapshot_generation, 8);
-        assert_eq!(
-            migrated.decisions.cluster_id(),
-            Some(crate::ClusterId([9; 16]))
-        );
-        assert!(migrated.decisions.cluster_control().nodes().is_empty());
-        assert_eq!(
-            migrated
-                .decisions
-                .cluster_control()
-                .active_placement_log_id(),
-            None
-        );
-
-        let v2_last_applied = LogId::new(openraft::CommittedLeaderId::new(3, 1), 73);
-        let v2 = LegacyMachineStateV2 {
-            decisions: LegacyStateMachineV2 {
-                max_commit_entries: config.max_commit_entries,
-                max_commit_bytes: config.max_commit_bytes,
-                cluster_id: Some(crate::ClusterId([7; 16])),
-                system_bootstrap: crate::SystemBootstrapState::Missing,
-                cluster_control: LegacyClusterControlStateV2 {
-                    nodes: BTreeMap::new(),
-                    used_node_ids: crate::UsedNodeIds::default(),
-                    transition: None,
-                    jwt_signing_key_fingerprint: None,
-                    erasure_code_profile: None,
-                },
-                executor: None,
-                committed_invocations: BTreeMap::new(),
-                committed_invocation_bytes: codec::encoded_len(
-                    &BTreeMap::<u64, CommittedInvocation>::new(),
-                )
-                .unwrap(),
-                last_commit_cursor: None,
-                finalized_through: None,
-            },
-            last_applied_log_id: Some(v2_last_applied),
-            membership: StoredMembership::default(),
-            snapshot_generation: 9,
-        };
-        let v2_record =
-            codec::encode_record_at_version(&v2, codec::SNAPSHOT_RECORD_FORMAT_V2).unwrap();
-        let migrated = decode_machine_snapshot(&v2_record).unwrap();
-        assert_eq!(migrated.last_applied_log_id, Some(v2_last_applied));
-        assert_eq!(
-            migrated
-                .decisions
-                .cluster_control()
-                .active_placement_log_id(),
-            None,
-            "v2 migration must not invent placement lineage from last_applied"
-        );
-
-        let v3_placement = LogId::new(openraft::CommittedLeaderId::new(9, 3), 41);
-        let v3 = LegacyMachineStateV3 {
-            decisions: LegacyStateMachineV3 {
-                max_commit_entries: config.max_commit_entries,
-                max_commit_bytes: config.max_commit_bytes,
-                cluster_id: Some(crate::ClusterId([8; 16])),
-                system_bootstrap: crate::SystemBootstrapState::Missing,
-                cluster_control: LegacyClusterControlStateV3 {
-                    nodes: BTreeMap::new(),
-                    used_node_ids: crate::UsedNodeIds::default(),
-                    transition: None,
-                    jwt_signing_key_fingerprint: None,
-                    erasure_code_profile: None,
-                    active_placement_log_id: Some(v3_placement),
-                },
-                executor: None,
-                committed_invocations: BTreeMap::new(),
-                committed_invocation_bytes: codec::encoded_len(&BTreeMap::<
-                    u64,
-                    LegacyCommittedInvocation,
-                >::new())
-                .unwrap(),
-                last_commit_cursor: None,
-                finalized_through: None,
-            },
-            last_applied_log_id: Some(v3_placement),
-            membership: StoredMembership::default(),
-            snapshot_generation: 10,
-        };
-        let v3_record =
-            codec::encode_record_at_version(&v3, codec::SNAPSHOT_RECORD_FORMAT_V3).unwrap();
-        let decoded = decode_machine_snapshot(&v3_record).unwrap();
-        assert_eq!(
-            decoded
-                .decisions
-                .cluster_control()
-                .active_protocol_version(),
-            1
-        );
-        assert_eq!(
-            decoded.decisions.cluster_control().active_storage_format(),
-            1
-        );
-        let placement = decoded
-            .decisions
-            .cluster_control()
-            .active_placement_log_id()
-            .unwrap();
-        assert_eq!(placement.leader_id.term, 9);
-        assert_eq!(placement.index, 41);
-
-        let current = MachineState::new(config).unwrap();
-        let unsupported =
-            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V4 + 1)
-                .unwrap();
+        let unsupported = codec::encode_record_at_version(&current, 2).unwrap();
         assert_eq!(
             decode_machine_snapshot(&unsupported),
-            Err(codec::CodecError::UnsupportedRecordVersion(
-                codec::SNAPSHOT_RECORD_FORMAT_V4 + 1
-            ))
+            Err(codec::CodecError::UnsupportedRecordVersion(2))
         );
-
-        let mut malformed_current =
-            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V4).unwrap();
-        malformed_current.pop();
-        assert!(matches!(
-            decode_machine_snapshot(&malformed_current),
-            Err(codec::CodecError::InvalidRecord(_))
-        ));
     }
 
     #[test]
@@ -1779,8 +1272,7 @@ mod snapshot_compatibility_tests {
             max_commit_bytes: 64 * 1024,
         };
         let mut state = MachineState::new(config).unwrap();
-        state
-            .decisions
+        Arc::make_mut(&mut state.decisions)
             .apply(
                 LogId::new(openraft::CommittedLeaderId::new(1, 1), 0),
                 &Command::InitializeCluster {
@@ -1788,8 +1280,7 @@ mod snapshot_compatibility_tests {
                 },
             )
             .unwrap();
-        state
-            .decisions
+        Arc::make_mut(&mut state.decisions)
             .apply(
                 LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
                 &Command::BeginAddNode {
@@ -1802,15 +1293,14 @@ mod snapshot_compatibility_tests {
                         current_peer_spki_sha256: crate::PeerSpkiSha256([1; 32]),
                         overlap_peer_spki_sha256: None,
                         join_capability_hash: Some(crate::JoinCapabilityHash([2; 32])),
-                        supported_protocol: crate::CapabilityRange { min: 1, max: 2 },
-                        supported_storage_format: crate::CapabilityRange { min: 1, max: 2 },
+                        supported_protocol: crate::CapabilityRange { min: 1, max: 1 },
+                        supported_storage_format: crate::CapabilityRange { min: 1, max: 1 },
                     },
                 },
             )
             .unwrap();
         for log_index in [2, 3] {
-            state
-                .decisions
+            Arc::make_mut(&mut state.decisions)
                 .apply(
                     LogId::new(openraft::CommittedLeaderId::new(1, 1), log_index),
                     &Command::CompleteMembershipTransition {

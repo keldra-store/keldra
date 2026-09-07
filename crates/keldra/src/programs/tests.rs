@@ -19,6 +19,8 @@ use serde_json::json;
 
 use super::*;
 
+mod renomination;
+
 fn counter_definition() -> ProgramDefinition {
     let counter = DocumentRef::one("counter");
     ProgramDefinition {
@@ -225,10 +227,9 @@ async fn commit_prepared_for_recovery(
             invocation_id,
             input_fingerprint: InvocationFingerprint(fingerprint),
             bundle_ref: BundleRef {
-                hash: prepared.bundle.hash,
+                hash: prepared.bundle.hash.0,
                 length: prepared.bundle.length,
             },
-            bundle_hash: BundleHash(prepared.hash.0),
             durability_class: DurabilityClass(
                 ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS).0,
             ),
@@ -253,7 +254,7 @@ async fn commit_prepared_for_recovery(
         .reservations(
             batch.begin_cursor,
             invocation_id.0,
-            prepared.hash,
+            prepared.bundle.hash,
             1,
             nomination.nomination_log_index,
             placement,
@@ -334,8 +335,8 @@ async fn commit_test_active_placement(decisions: &DecisionRaft) {
                 current_peer_spki_sha256: PeerSpkiSha256([1; 32]),
                 overlap_peer_spki_sha256: None,
                 join_capability_hash: Some(JoinCapabilityHash([2; 32])),
-                supported_protocol: CapabilityRange { min: 1, max: 2 },
-                supported_storage_format: CapabilityRange { min: 1, max: 2 },
+                supported_protocol: CapabilityRange { min: 1, max: 1 },
+                supported_storage_format: CapabilityRange { min: 1, max: 1 },
             },
         })
         .await
@@ -349,21 +350,6 @@ async fn commit_test_active_placement(decisions: &DecisionRaft) {
             .await
             .unwrap();
     }
-    let placement = decisions
-        .state()
-        .unwrap()
-        .cluster_control()
-        .active_placement_log_id()
-        .unwrap();
-    decisions
-        .submit(Command::ActivateClusterCapabilities {
-            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
-            protocol_version: 2,
-            storage_format: 2,
-            expected_active_placement_log_id: placement,
-        })
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
@@ -865,7 +851,6 @@ fn committed_batch_mapping_retains_every_storage_identity() {
             hash: [3; 32],
             length: 33,
         },
-        bundle_hash: BundleHash([4; 32]),
         durability_class: DurabilityClass([5; 32]),
         durability_evidence_hash: DurabilityEvidenceHash([6; 32]),
         participant_manifest_hash: ParticipantManifestHash([7; 32]),
@@ -878,10 +863,9 @@ fn committed_batch_mapping_retains_every_storage_identity() {
             commit_cursor: 12,
             begin_cursor: committed.begin_cursor,
             bundle_ref: PreparedBundleRef {
-                hash: [3; 32],
+                hash: PreparedBundleHash([3; 32]),
                 length: 33,
             },
-            bundle_hash: PreparedBundleHash([4; 32]),
             program_hash: ProgramHash([2; 32]),
             authority: store_bundle_authority(committed.authority),
             participant_manifest_hash: committed.participant_manifest_hash.0,
@@ -907,7 +891,6 @@ fn prepared_replay_result_must_match_the_committed_invocation() {
             hash: [3; 32],
             length: 33,
         },
-        bundle_hash: BundleHash([4; 32]),
         durability_class: DurabilityClass([5; 32]),
         durability_evidence_hash: DurabilityEvidenceHash([6; 32]),
         participant_manifest_hash: ParticipantManifestHash([7; 32]),

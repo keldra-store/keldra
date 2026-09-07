@@ -1,16 +1,27 @@
 # Keldra known limitations
 
-## Current v6 index boundary
+## Coupled operator-secret lifecycle
+
+One immutable operator secret currently derives the JWT signing key, the key
+that encrypts durable application credentials, and the PersonalDB protocol
+signing identities. Domain separation prevents literal key reuse, but compromise
+or rotation of that one root affects all three authorities together. Keldra has
+no online rotation flow for this root: replacing it would require coordinated
+JWT rollover, durable credential re-encryption, and PersonalDB trust migration.
+This coupled lifecycle is an explicitly accepted pre-1.0 limitation; the
+authorities are not split in 0.17.0.
+
+## Current v1 index boundary
 
 Keldra 0.17 starts on fresh authoritative and derived-index volumes. The
 partition-owned Typed JSON pipeline, logical catalog, recovery, root-vector
 query cut, retention, and materialization contracts are specified by
 [KELDRA-0020](rfcs/keldra_0020_logical_index_catalog_and_shared_physical_projections.md).
-Its active operational evidence and configuration are the v6 SSD runbook in
+Its active operational evidence and configuration are the v1 SSD runbook in
 [index contention qualification](qualification/index-contention.md) and the
-v6 metrics in [observability](observability.md).
+v1 metrics in [observability](observability.md).
 
-| Area | Current v6 boundary |
+| Area | Current v1 boundary |
 | --- | --- |
 | Index surface | Typed JSON fields can declare exact, prefix, range, order, facet, aggregate, and full-text capabilities. |
 | Resource scaling | Indexing uses one aggregate memory-first pipeline per node, controlled by `KELDRA_INDEX_PIPELINE_MEMORY_BYTES` and `KELDRA_INDEXING_CORES`. `KELDRA_INDEX_WORKING_MEMORY_BYTES` must admit that pipeline plus `KELDRA_INDEX_QUERY_MEMORY_BYTES`. Memory is not reserved per logical definition. The sizing baseline is 256 MiB per indexing core; operators should change it only with workload evidence. |
@@ -18,15 +29,9 @@ v6 metrics in [observability](observability.md).
 | Catalog scale | Logical definitions are compact catalog rows. Equivalent definitions share a physical recipe, extraction, and immutable segment work. Distinct physical recipes still require distinct projection and segment output, so P rather than logical definition count D is the steady-state indexing multiplier. |
 | Query materialization | Queries execute against an exact published root vector for one atomic cut. A cold query node may need to fetch and materialize immutable blocks before execution, increasing first-query latency without weakening cut consistency or the authoritative object/version check. |
 | Backpressure | Source journals remain bounded durable recovery authority. If indexing cannot advance its durable checkpoint before retained evidence reaches the configured journal capacity, ingress can be backpressured rather than silently dropping index work. |
-| Qualification | Throughput and catch-up claims require `scripts/qualify-index-v6-ssd-scale.sh` on the attested SSD kit. The ordinary single-node and three-node wrappers intentionally contain no index phase. Sustained qualification covers D1/D64/D1K/D10K/D250K, P1/P4/P16/P64, worker/memory scaling, and 1 KiB plus 96 KiB objects. |
+| Qualification | Throughput and catch-up claims require `scripts/qualify-index-v1-ssd-scale.sh` on the attested SSD kit. The ordinary single-node and three-node wrappers intentionally contain no index phase. Sustained qualification covers D1/D64/D1K/D10K/D250K, P1/P4/P16/P64, worker/memory scaling, and 1 KiB plus 96 KiB objects. |
 
-## Capabilities introduced in 0.5.x
-
-The following limits are grouped by the release which introduced each
-capability. Unless a newer section above explicitly replaces one, they remain
-the current boundary.
-
-## Usage accounting in 0.5.3
+## Usage accounting
 
 Accounting transfer totals describe payload bytes accepted for upload and
 selected for download; they are not wire-exact cancellation counters. A native
@@ -43,13 +48,6 @@ accounting prefix is discovered asynchronously on other nodes, so traffic sent
 there immediately after `EnableAccounting` can also precede the local meter.
 The returned freshness structure describes object-journal coverage; it does
 not claim wire-exact transfer capture.
-
-An accounting worker uses a bounded-memory current-head scan only for its
-initial baseline or after retained journal evidence is unavailable. The 0.5.3
-scan is paged rather than one cluster-wide snapshot. Sustained writes racing a
-cold multi-page baseline can therefore require a later operator restart during
-a quiet interval to establish an exact base. The steady-state path is ordered,
-incremental, and does not retain one in-memory entry per object.
 
 ## Request deadline coverage
 
@@ -74,17 +72,27 @@ back to a one-candidate scan so a continuation never exposes an unauthorized
 position. A large, heavily filtered cold query can therefore exhaust its
 configured query request budget; the transport timeout is safely retryable.
 
-## Minimum PersonalDB surface in 0.5.3
+## PersonalDB surface
 
-PersonalDB 0.5.3 provides source, standalone and bounded mirror-projection
+PersonalDB provides source, standalone and bounded mirror-projection
 groups; predecessor-linked append and catch-up; explicit projection
 materialisation; snapshots; signed protocol evidence; and tenant-scoped group
 roles. Projection materialisation supports only the deterministic mirror mode
 in this release. More specialised application projections remain future
 capabilities.
 
+Keldra-owned persisted and private-wire formats are v1-only. PersonalDB's
+public signed evidence is defined by the independently versioned published
+`personaldb-protocol` 0.2.2 package, whose canonical evidence types are named
+`LogEntryCoreV2`, `CommitCertificateV2`, and `CommittedHeadV2`; that package
+does not expose equivalent v1 evidence types. Keldra therefore preserves those
+external public evidence names and bytes rather than silently forking or
+relabeling another protocol. This is an external protocol-version exception to
+the Keldra-internal clean-break rule, not a retained Keldra legacy decoder or
+an old-volume migration path.
+
 Client proposal, voter acknowledgement and admission evidence is retained in
-each witnessed commit certificate, but 0.5.3 only checks that those opaque
+each witnessed commit certificate, but Keldra only checks that those opaque
 values are present. It does not yet evaluate an application-specific voter or
 admission trust policy before witnessing the commit.
 
@@ -116,25 +124,10 @@ After metadata quorum is available again, retrying the unknown-outcome
 operation with the same command ID allows the deterministic candidate to
 complete. Restoring a replica that holds the required lineage can likewise
 provide the missing proof. If neither the original candidate nor a
-quorum-proven valid successor can be recovered, Keldra 0.6.0 has no unsafe
+quorum-proven valid successor can be recovered, Keldra has no unsafe
 operator bypass; automatic lineage reconciliation for that case is deferred.
 
-## Legacy one-node reference journal recovery
-
-The upgrade recovery path accepts a proofless 0.5.3 object-head event only when
-its source is local and that source is still the sole committed ACTIVE node. It
-recognizes that the one-node fast path already applied the reference effect and
-advances the cursor without applying the count again. Every other missing-proof
-case continues to fail closed.
-
-Consequently, an existing one-node installation must complete startup reference
-reconciliation before beginning an online ADD. Once it has, large objects use
-complete replicas while membership is undersized and the normal typed handoff
-supports online growth from one to two to three ACTIVE nodes. Skipping that
-ordered recovery boundary is unsupported; it does not cause Keldra to infer or
-weaken reference-proof semantics.
-
-## Online ADD boundaries in 0.5.4
+## Online ADD boundaries
 
 An online ADD briefly pauses mutable public and peer operations for the final
 handoff snapshot. A large upload may finish sending its bytes before that
@@ -143,7 +136,7 @@ cutover. Retrying the upload after the membership operation completes is safe;
 unpublished prepared bytes remain subject to the ordinary 24-hour GC grace.
 
 ADD copies the new metadata replica set but does not proactively remove every
-former metadata replica in 0.5.4. Those extra records are not authoritative and
+former metadata replica. Those extra records are not authoritative and
 do not affect reads or quorum decisions, but consume additional disk
 proportional to moved records until a later maintenance capability retires
 them.
@@ -170,34 +163,34 @@ Applications that require this maintenance operation should defer it while a
 cluster has exactly two ACTIVE nodes; a later capability can add explicit
 lineage for retained-history maintenance.
 
-## First custom-realm binding in a multi-node 0.5.1 cluster
+## First custom-realm binding in a multi-node cluster
 
 The first schema binding for a custom Zanzibar realm must atomically create
-the realm binding and its protected-system ownership grant. Keldra 0.5.1 keeps
+the realm binding and its protected-system ownership grant. Keldra keeps
 that guarantee on a one-node cluster, but rejects the first binding with
 `UNAVAILABLE` when more than one node is active. Existing realms can be
 rebound and used normally across the cluster. A later capability must add one
 bounded cross-Zanzibar operation before enabling first binding on multi-node
-clusters; 0.5.1 does not weaken the atomic ownership guarantee.
+clusters; this does not weaken the atomic ownership guarantee.
 
 ## Cluster lifecycle operations
 
 Keldra supports genesis, authorized node preparation, learner catch-up, typed
 ownership handoff, and online ADD activation for ordinary cluster formation.
 The bounded Raft state machine also validates removal, capacity-reweight, and
-peer-certificate-overlap transitions, but 0.5.4 does not expose public
+peer-certificate-overlap transitions, but Keldra does not expose public
 operations that start those transitions because their corresponding online
 ownership handoff and live TLS-reload orchestration are not yet complete.
 Operators must not submit those internal Raft commands directly.
 
-There is no public drain or detailed cluster-health RPC in 0.5.4. Public
+There is no public drain or detailed cluster-health RPC. Public
 listener availability is the readiness boundary: Keldra binds it only after
 membership, serving-fence, bootstrap, authorization, atomic recovery, and
 ordered reference startup checks complete. Normal process termination stops
 the public listener before the peer runtime and flushes the local store; it
 does not remove the node from committed membership.
 
-## Transient reference-delivery cursor skew in 0.5.1
+## Transient reference-delivery cursor skew
 
 Under concurrent cluster activity, ordered reference delivery can transiently
 observe a destination cursor one position beyond the source-tail snapshot and
@@ -208,16 +201,16 @@ persistent condition can delay reference-count convergence and eventually
 apply bounded-journal write backpressure; it does not weaken `LOCAL` or
 `REPLICATED` acknowledgement guarantees.
 
-## Tenant schema catalogue handoff in 0.5.1
+## Tenant schema catalogue handoff
 
 Node admission transfers each tenant's complete Zanzibar schema catalogue as
 one typed private handoff unit; individual `TenantSchema` records are discovery
-keys and are never independently repaired. The 0.5.1 private typed-message
+keys and are never independently repaired. The private typed-message
 limit bounds one encoded catalogue to 16 MiB. Admission fails closed if a
 catalogue exceeds that size. A later release can stream unusually large
 catalogues without changing their storage format or quorum semantics.
 
-## Coordinator error detail in 0.5.1
+## Coordinator error detail
 
 Bulk writes correctly reject failed preconditions, but a per-item failure that
 crosses the object-coordinator boundary is reported as `INVALID` rather than
@@ -227,17 +220,16 @@ request retain their normal success or failure outcomes.
 Deleting the current tombstone of a versioned object correctly returns
 `FAILED_PRECONDITION` and leaves that tombstone unchanged, but the coordinator
 path does not preserve the `CURRENT_TOMBSTONE_VERSION_CANNOT_BE_DELETED` text
-prefix. Clients must use the gRPC status code rather than matching that text in
-0.5.1.
+prefix. Clients must use the gRPC status code rather than matching that text.
 
 ## Per-object user metadata
 
-Keldra 0.5.0 accepts the bounded `content_type` header but does not accept
+Keldra accepts the bounded `content_type` header but does not accept
 arbitrary caller-defined metadata on an object version. Applications that need
 descriptive or index input fields must currently carry them in their payload or
 in an application-owned manifest.
 
-## S3 gateway surface in 0.5.3
+## S3 gateway surface
 
 The shared public listener implements path-style CreateBucket, HeadBucket,
 PutObject, GetObject, HeadObject, DeleteObject and ListObjectsV2 alongside the
@@ -253,14 +245,12 @@ S3 client uses ordinary `/bucket/key` path-style requests. An unsigned public
 read has no credential from which to derive a tenant and therefore uses
 `/tenant/bucket/key`; public ListObjectsV2 similarly uses `/tenant/bucket`.
 
-SigV4 verification needs plaintext-equivalent signing material, whereas
-pre-0.5.3 Keldra credentials intentionally retained only an Argon2id verifier.
-New and rotated credentials contain an AES-256-GCM envelope in their existing
+SigV4 verification needs plaintext-equivalent signing material. Credentials
+contain an AES-256-GCM envelope in their existing
 replicated credential record. Its key is domain-separated from the cluster JWT
 signing material and its associated data binds tenant, application and client
-identity. Existing credentials continue to work unchanged with gRPC but must
-be rotated once before S3 use. Keldra never stores this material in a separate
-column family or side plane.
+identity. Keldra never stores this material in a separate column family or side
+plane.
 
 PutObject accepts a signed SHA-256 payload or the fully chained
 `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` aws-chunked form and verifies the decoded
@@ -276,7 +266,7 @@ Bearer authentication accepts a normal Keldra access token. Pulls may omit
 credentials only when current Zanzibar policy permits anonymous reads for the
 bucket. Every push is Zanzibar-authorized. Immutable Git packs, reference
 batches, and checkpoints are ordinary objects below the protected
-`_keldra/git/v2` namespace; one exact-version CAS of the small `current` object
+`_keldra/git/v1` namespace; one exact-version CAS of the small `current` object
 publishes a complete generation. Native bare repositories under
 `KELDRA_CACHE_DIR` are disposable persistent materializations and recover from
 the current checkpoint plus its bounded batch tail when their cache is absent.
@@ -308,7 +298,7 @@ unusually long delay in staging, waiting for the commit gate, or recovering an
 earlier commit therefore reduces the effective post-commit replay and recovery
 retention by the length of that delay.
 
-The normal path is expected to take milliseconds. Keldra 0.5.0 does not refresh
+The normal path is expected to take milliseconds. Keldra does not refresh
 the prepared blobs immediately before `CommitBatch`, and it does not add a
 special lease, side store, or second lifecycle clock for atomic programs.
 
@@ -316,21 +306,21 @@ special lease, side store, or second lifecycle clock for atomic programs.
 
 A version-enabled `PROGRAM_ONLY` path retains its historical payload versions.
 Path policy correctly prohibits the ordinary `DeleteVersion` API from mutating
-that path, and the 0.5.0 atomic-program DSL has no operation for deleting one
+that path, and the atomic-program DSL has no operation for deleting one
 exact retained version. Operators therefore cannot permanently prune that
-history in Keldra 0.5.0.
+history in Keldra.
 
-## Fixed accounting traffic bounds in 0.7.0
+## Fixed accounting traffic bounds
 
 The process-local accounting traffic queue, per-bucket matcher cache, and
-traffic-batch limits use fixed bounded defaults in 0.7.0. A
+traffic-batch limits use fixed bounded defaults. A
 sustained ingress rate above those bounds can drop bandwidth-accounting entries;
 Keldra reports the dropped batches and bytes, and stored-byte and object-count
 accounting remains exact. Operators can reduce the risk by sizing or scaling
 ingress nodes so the supported workload records zero drops. Runtime and startup
 configuration for these bounds is deferred to a later release.
 
-The 0.7.0 bandwidth matcher loads one bucket's sparse accounting-definition
+The bandwidth matcher loads one bucket's sparse accounting-definition
 locators only on a cache miss. Definition delivery invalidates that exact
 bucket synchronously, while true-gap reconciliation clears disposable matcher
 caches before its checkpoint advances; there is no periodic matcher rescan. A
@@ -342,10 +332,10 @@ byte and object-count rollups remain exact, and all ordinary object and
 authorization behavior is unaffected. Operators should use coarse path
 accounting boundaries and monitor the accounting drop metrics.
 
-## Fixed maintenance budgets in 0.7.0
+## Fixed maintenance budgets
 
 Blob collection and former-placement retirement use fixed bounded work budgets
-in 0.7.0. Each hourly cycle advances through 100 ms-spaced bounded ticks until
+in the current release. Each hourly cycle advances through 100 ms-spaced bounded ticks until
 it completes. If sustained churn or slow health probes outpace that bounded
 progress, disk reclamation can lag and local storage can temporarily grow.
 Object availability, reference safety, and acknowledged durability are
@@ -353,12 +343,15 @@ unaffected because maintenance fails closed. Operators should monitor and
 provision disk headroom for high-churn deployments; startup configuration for
 the maintenance budgets and cadence is deferred.
 
-## Accounting baseline restart after a terminal stream failure in 0.7.0
+## Accounting baseline restart after a terminal stream failure
 
-A first accounting build or genuine retained-journal gap consumes a scoped,
-snapshot-bound baseline stream. If that stream ends with a terminal peer error,
-its held RocksDB snapshots cannot be resumed, so Keldra restarts the baseline for
-that same accounting path scope. The last complete rollup remains readable;
-ordinary restarts resume valid rollups, and no unrelated object heads or startup
+A first accounting build or genuine retained-journal gap consumes a
+snapshot-bound baseline stream. Each source scans the bucket's canonical
+retained descriptors so a matching alias can account for a canonical target
+outside the requested prefix; only lineages with visible names in that logical
+scope are returned. If that stream ends with a terminal peer error, its held
+RocksDB snapshots cannot be resumed, so Keldra restarts the baseline for that
+same accounting path scope. The last complete rollup remains readable;
+ordinary restarts resume valid rollups, and no unrelated payloads or startup
 inventory are scanned. Operators can retry after peer health returns. A
 resumable cross-node snapshot protocol is deferred.

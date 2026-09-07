@@ -67,7 +67,7 @@ image_gates() (
   local scratch
   scratch="$(mktemp -d)"
   chmod 0755 "${scratch}"
-  local container="keldra-v09-smoke-${$}"
+  local container="keldra-v1-smoke-${$}"
   cleanup_image_gate() {
     docker rm --force "${container}" >/dev/null 2>&1 || true
     docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
@@ -83,8 +83,8 @@ image_gates() (
   chmod 0600 "${scratch}/signing-key"
   docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
     chown 10001:10001 /smoke/signing-key
-  printf 'keldra-0.1-smoke\n' >"${scratch}/payload"
-  printf 'keldra-0.16-linked-update\n' >"${scratch}/replacement"
+  printf 'keldra-v1-smoke\n' >"${scratch}/payload"
+  printf 'keldra-v1-linked-update\n' >"${scratch}/replacement"
   chmod 0444 "${scratch}/payload"
   chmod 0444 "${scratch}/replacement"
   docker run --detach --name "${container}" \
@@ -138,13 +138,13 @@ image_gates() (
         --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
         get-cluster-capabilities 2>/dev/null || true
     )"
-    if grep -Eq 'active_protocol=2 active_storage=2 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
+    if grep -Eq '^active_protocol=1 active_storage=1 placement_term=[1-9][0-9]* placement_index=[1-9][0-9]*$' <<<"${capabilities}"; then
       break
     fi
     sleep 1
   done
-  if ! grep -Eq 'active_protocol=2 active_storage=2 target_protocol=2 target_storage=2 .*ready=true quiescent=true blocking_active_nodes=none' <<<"${capabilities}"; then
-    echo "Keldra did not start with active capability 2/2: ${capabilities}" >&2
+  if ! grep -Eq '^active_protocol=1 active_storage=1 placement_term=[1-9][0-9]* placement_index=[1-9][0-9]*$' <<<"${capabilities}"; then
+    echo "Keldra did not start with active capability 1/1: ${capabilities}" >&2
     return 1
   fi
 
@@ -181,7 +181,7 @@ image_gates() (
       keldra --endpoint http://127.0.0.1:50051 \
       get smoke objects hello
   )"
-  if [[ "${value}" != 'keldra-0.1-smoke' ]]; then
+  if [[ "${value}" != 'keldra-v1-smoke' ]]; then
     echo "image smoke read returned unexpected bytes" >&2
     return 1
   fi
@@ -265,9 +265,9 @@ image_gates() (
       --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
       "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects cloned
   )"
-  if [[ "${canonical_value}" != 'keldra-0.16-linked-update' \
+  if [[ "${canonical_value}" != 'keldra-v1-linked-update' \
     || "${linked_value}" != "${canonical_value}" \
-    || "${clone_value}" != 'keldra-0.1-smoke' ]]; then
+    || "${clone_value}" != 'keldra-v1-smoke' ]]; then
     echo "clone independence or link write-through changed" >&2
     return 1
   fi
@@ -311,7 +311,7 @@ image_gates() (
       --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
       "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects cloned
   )"
-  if [[ "${clone_value}" != 'keldra-0.1-smoke' ]]; then
+  if [[ "${clone_value}" != 'keldra-v1-smoke' ]]; then
     echo "clone did not survive canonical target deletion" >&2
     return 1
   fi

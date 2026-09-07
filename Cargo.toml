@@ -35,6 +35,12 @@ rust-version = "1.96.0"
 # checked out and released on its own.
 keldra = { path = "clients/rust" }
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.ci]
 inherits = "dev"
 debug = 0

@@ -190,18 +190,6 @@ pub(super) fn validate_builtin_record(
 }
 
 fn validate_stored_alias_bindings(record: &StoredPreparedBundle) -> Result<(), ProgramStoreError> {
-    if matches!(
-        record.authority,
-        ProgramBundleAuthority::LegacyProgramOnly { .. }
-    ) {
-        return if record.alias_bindings.is_empty() && record.alias_registry_transitions.is_empty() {
-            Ok(())
-        } else {
-            Err(ProgramStoreError::InvalidBundle(
-                "legacy record carries alias bindings".into(),
-            ))
-        };
-    }
     if record.alias_bindings.is_empty() {
         return if record.alias_registry_transitions.is_empty() {
             Ok(())
@@ -1260,7 +1248,6 @@ pub(super) fn validate_atomic_delivery_bound(
             crate::MAX_ATOMIC_BATCH_MUTATIONS
         )));
     }
-    let mut affected_routes = Vec::with_capacity(mutation_count);
     let mut mutations = Vec::with_capacity(mutation_count);
     for (index, write) in record
         .writes
@@ -1274,10 +1261,6 @@ pub(super) fn validate_atomic_delivery_bound(
         let tenant_id = u64::MAX.checked_sub(ordinal).ok_or_else(|| {
             ProgramStoreError::InvalidBundle("atomic batch route identity is exhausted".into())
         })?;
-        affected_routes.push(crate::AtomicBatchRoute {
-            tenant_id,
-            bucket_id: u64::MAX,
-        });
         mutations.push(crate::AtomicBatchMutation {
             tenant_id,
             bucket_id: u64::MAX,
@@ -1294,10 +1277,6 @@ pub(super) fn validate_atomic_delivery_bound(
         });
     }
     for alias in aliases {
-        affected_routes.push(crate::AtomicBatchRoute {
-            tenant_id: alias.identity.tenant_id.0,
-            bucket_id: alias.identity.bucket_id.0,
-        });
         mutations.push(crate::AtomicBatchMutation {
             tenant_id: alias.identity.tenant_id.0,
             bucket_id: alias.identity.bucket_id.0,
@@ -1312,14 +1291,11 @@ pub(super) fn validate_atomic_delivery_bound(
             source_journal_position: u64::MAX,
         });
     }
-    affected_routes.sort_unstable();
-    affected_routes.dedup();
     mutations.sort_unstable();
     let event = crate::LocalChange::atomic_batch_published(
         u64::MAX,
         u64::MAX,
         PreparedBundleHash([u8::MAX; 32]),
-        affected_routes,
         mutations,
     );
     let bytes = crate::watch::encoded_change_len(&event).map_err(program_storage_error)?;
@@ -1336,16 +1312,16 @@ pub(super) fn conservative_atomic_source_journal_changes(
     source: &AtomicWriteBundle,
     alias_bindings: &[ProgramAliasBinding],
 ) -> Result<Vec<crate::LocalChange>, ProgramStoreError> {
-    if source.writes.is_empty() {
+    let writes = source.writes().collect::<Vec<_>>();
+    if writes.is_empty() {
         return Ok(Vec::new());
     }
     let alias_count = alias_bindings
         .iter()
         .filter(|binding| {
             source
-                .writes
-                .iter()
-                .any(|write| write.path == binding.canonical_path)
+                .writes()
+                .any(|(participant, _)| participant.path == binding.canonical_path)
         })
         .map(|binding| {
             binding
@@ -1354,13 +1330,9 @@ pub(super) fn conservative_atomic_source_journal_changes(
                 .map_or(0, |registry| registry.aliases.len())
         })
         .sum::<usize>();
-    let mutation_count = source
-        .writes
-        .len()
-        .checked_add(alias_count)
-        .ok_or_else(|| {
-            ProgramStoreError::InvalidBundle("atomic batch count is exhausted".into())
-        })?;
+    let mutation_count = writes.len().checked_add(alias_count).ok_or_else(|| {
+        ProgramStoreError::InvalidBundle("atomic batch count is exhausted".into())
+    })?;
     if mutation_count > crate::MAX_ATOMIC_BATCH_MUTATIONS {
         return Err(ProgramStoreError::InvalidBundle(format!(
             "atomic batch has {mutation_count} physical and alias writes; maximum is {}",
@@ -1371,9 +1343,8 @@ pub(super) fn conservative_atomic_source_journal_changes(
         ProgramStoreError::InvalidBundle("atomic batch count is exhausted".into())
     })?;
     let mut changes = Vec::with_capacity(capacity);
-    let mut routes = Vec::with_capacity(source.writes.len());
-    let mut mutations = Vec::with_capacity(source.writes.len());
-    for (index, write) in source.writes.iter().enumerate() {
+    let mut mutations = Vec::with_capacity(writes.len());
+    for (index, (participant, _)) in writes.into_iter().enumerate() {
         let ordinal = u64::try_from(index).map_err(|_| {
             ProgramStoreError::InvalidBundle("atomic batch write count is exhausted".into())
         })?;
@@ -1389,7 +1360,7 @@ pub(super) fn conservative_atomic_source_journal_changes(
             u64::MAX,
             tenant_id,
             bucket_id,
-            write.path.path.clone(),
+            participant.path.path.clone(),
             VersionId(u64::MAX),
             false,
             Some(u64::MAX),
@@ -1406,17 +1377,14 @@ pub(super) fn conservative_atomic_source_journal_changes(
             Some(AccountingHeadTransition::new(
                 Some(u64::MAX),
                 Some(u64::MAX),
+                u64::MAX,
             )),
             None,
         ));
-        routes.push(crate::AtomicBatchRoute {
-            tenant_id,
-            bucket_id,
-        });
         mutations.push(crate::AtomicBatchMutation {
             tenant_id,
             bucket_id,
-            exact_path: write.path.path.clone(),
+            exact_path: participant.path.path.clone(),
             canonical_path: None,
             path_version: VersionId(u64::MAX),
             deleted: false,
@@ -1429,9 +1397,8 @@ pub(super) fn conservative_atomic_source_journal_changes(
     }
     for binding in alias_bindings.iter().filter(|binding| {
         source
-            .writes
-            .iter()
-            .any(|write| write.path == binding.canonical_path)
+            .writes()
+            .any(|(participant, _)| participant.path == binding.canonical_path)
     }) {
         for requested_path in binding
             .alias_registry
@@ -1448,10 +1415,6 @@ pub(super) fn conservative_atomic_source_journal_changes(
                 false,
                 Some(u64::MAX),
             ));
-            routes.push(crate::AtomicBatchRoute {
-                tenant_id: u64::MAX,
-                bucket_id: u64::MAX,
-            });
             mutations.push(crate::AtomicBatchMutation {
                 tenant_id: u64::MAX,
                 bucket_id: u64::MAX,
@@ -1467,13 +1430,11 @@ pub(super) fn conservative_atomic_source_journal_changes(
             });
         }
     }
-    routes.sort_unstable();
     mutations.sort_unstable();
     changes.push(crate::LocalChange::atomic_batch_published(
         u64::MAX,
         u64::MAX,
         PreparedBundleHash([u8::MAX; 32]),
-        routes,
         mutations,
     ));
     Ok(changes)

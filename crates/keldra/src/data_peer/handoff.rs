@@ -458,16 +458,14 @@ pub(super) async fn read_authz_realm_manifest(
     authorize_realm(service, &mut request, HandoffTarget::AnyNode)?;
     let scope: AuthzScope = decode_typed(&request.get_ref().scope_json)?;
     let repository = service.store.authz();
-    let manifest = tokio::task::spawn_blocking(move || {
-        repository.export_authz_realm_stream(&scope, io::sink())
-    })
-    .await
-    .map_err(join_status)?
-    .map_err(authz_status)?;
+    let state = tokio::task::spawn_blocking(move || repository.authz_realm_state(&scope))
+        .await
+        .map_err(join_status)?
+        .map_err(authz_status)?;
     Ok(Response::new(wire::AuthzRealmManifest {
         schema_version: DATA_PEER_SCHEMA_VERSION,
-        present: manifest.is_some(),
-        manifest_json: manifest
+        present: state.is_some(),
+        state_json: state
             .as_ref()
             .map(encode_typed)
             .transpose()?
@@ -501,13 +499,28 @@ pub(super) async fn get_authz_realm(
     let scope: AuthzScope = decode_typed(&request.get_ref().scope_json)?;
     let repository = service.store.authz();
     let manifest_scope = scope.clone();
-    let manifest = tokio::task::spawn_blocking(move || {
-        repository.export_authz_realm_stream(&manifest_scope, io::sink())
+    let prepared = tokio::task::spawn_blocking(move || {
+        let mut spool = crate::authz_distribution::AuthzTransferSpool::new().map_err(|error| {
+            AuthzRealmSnapshotError::Store(AuthzStoreError::Storage(format!(
+                "authorization spool failed: {error}"
+            )))
+        })?;
+        let Some(manifest) = repository.export_authz_realm_stream(&manifest_scope, &mut spool)?
+        else {
+            return Ok::<_, AuthzRealmSnapshotError>(None);
+        };
+        spool.rewind().map_err(|error| {
+            AuthzRealmSnapshotError::Store(AuthzStoreError::Storage(format!(
+                "authorization spool rewind failed: {error}"
+            )))
+        })?;
+        Ok::<_, AuthzRealmSnapshotError>(Some((spool, manifest)))
     })
     .await
     .map_err(join_status)?
-    .map_err(authz_status)?
-    .ok_or_else(|| Status::not_found("authorization realm is absent"))?;
+    .map_err(authz_status)?;
+    let (mut spool, manifest) =
+        prepared.ok_or_else(|| Status::not_found("authorization realm is absent"))?;
     let manifest_json = encode_typed(&manifest)?;
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
     sender
@@ -520,19 +533,16 @@ pub(super) async fn get_authz_realm(
         }))
         .await
         .map_err(|_| Status::cancelled("authorization realm stream closed"))?;
-    let repository = service.store.authz();
     tokio::task::spawn_blocking(move || {
         let mut writer = RealmFrameWriter::new(sender);
-        let observed = repository.export_authz_realm_stream(&scope, &mut writer);
-        match observed {
-            Ok(Some(observed)) if observed == manifest => writer.finish(),
-            Ok(Some(_)) => writer.fail(Status::unavailable(
-                "authorization realm changed during handoff export",
+        match io::copy(&mut spool, &mut writer) {
+            Ok(copied) if copied == manifest.encoded_bytes => writer.finish(),
+            Ok(_) => writer.fail(Status::data_loss(
+                "authorization spool length disagrees with its manifest",
             )),
-            Ok(None) => writer.fail(Status::not_found(
-                "authorization realm disappeared during handoff export",
-            )),
-            Err(error) => writer.fail(authz_status(error)),
+            Err(error) => writer.fail(Status::internal(format!(
+                "authorization spool read failed: {error}"
+            ))),
         }
     });
     Ok(Response::new(Box::pin(

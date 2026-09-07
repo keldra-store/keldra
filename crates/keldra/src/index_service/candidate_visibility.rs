@@ -1,6 +1,6 @@
 //! Mandatory Zanzibar and exact-current validation for index candidates.
 //!
-//! Format-v4 query plans call this boundary before admitting arbitrary-order
+//! Format-v1 query plans call this boundary before admitting arbitrary-order
 //! candidates to a top-K heap and while refilling a physically ordered page.
 //! Keeping the operation inside the executor makes it impossible for another
 //! query surface to omit authorization or liveness as optional post-processing.
@@ -181,7 +181,7 @@ impl IndexCandidateVisibility for AuthorizedCurrentCandidates {
                 &sources,
                 self.tenant_id,
                 self.bucket_id,
-                crate::v05::deadline_remaining(self.deadline)?,
+                crate::object_service::deadline_remaining(self.deadline)?,
             )
             .await?;
         let result_snapshots = if results == sources {
@@ -192,7 +192,7 @@ impl IndexCandidateVisibility for AuthorizedCurrentCandidates {
                     &results,
                     self.tenant_id,
                     self.bucket_id,
-                    crate::v05::deadline_remaining(self.deadline)?,
+                    crate::object_service::deadline_remaining(self.deadline)?,
                 )
                 .await?
         };

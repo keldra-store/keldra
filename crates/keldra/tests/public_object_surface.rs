@@ -17,19 +17,18 @@ use keldra_api::v1::put_header::Operation as PutOperationValue;
 use keldra_api::v1::watch_message::Message as WatchMessageValue;
 use keldra_api::v1::watch_prefix_request::Start as WatchStart;
 use keldra_api::v1::{
-    ActivateClusterCapabilitiesRequest, ApplicationRoleRequest, BatchGetRequest,
-    BucketApplicationRole, BucketApplicationRoleTarget, BucketPolicy, BulkOperation,
-    BulkPutRequest, BulkWriteRequest, CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest,
-    DeleteVersionRequest, DisableAccountingRequest, Durability, EnableAccountingRequest,
-    GetAccountingRequest, GetClusterCapabilitiesRequest, GetIndexRequest, GetObjectRequest,
-    HeadObjectRequest, IndexField, IndexFieldCapability, IndexFieldCardinality, IndexQuery,
-    IndexSpecification, InvokeProgramRequest, KeywordIndexField, ListObjectVersionsRequest,
-    ListObjectsRequest, MutationFailureCode, ObjectAddress,
-    ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PutHeader, PutIfAbsentOperation,
-    PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest, PutToken,
-    QueryIndexRequest, ReadFailureCode, RebuildIndexRequest, SetBucketPolicyRequest,
-    SetBucketVersioningRequest, TypedJsonIndexSpec, UpdateIndexRequest, WatchNow,
-    WatchPrefixRequest, WatchStateHint,
+    AccountingMeasurementState, ApplicationRoleRequest, BatchGetRequest, BucketApplicationRole,
+    BucketApplicationRoleTarget, BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest,
+    CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
+    DisableAccountingRequest, Durability, EnableAccountingRequest, GetAccountingRequest,
+    GetClusterCapabilitiesRequest, GetIndexRequest, GetObjectRequest, HeadObjectRequest,
+    IndexField, IndexFieldCapability, IndexFieldCardinality, IndexQuery, IndexSpecification,
+    InvokeProgramRequest, KeywordIndexField, ListObjectVersionsRequest, ListObjectsRequest,
+    MutationFailureCode, ObjectAddress, ObjectVersioning as ApiObjectVersioning, PathIndexQuery,
+    PutHeader, PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation,
+    PutRequest, PutToken, QueryIndexRequest, ReadFailureCode, RebuildIndexRequest,
+    SetBucketPolicyRequest, SetBucketVersioningRequest, TypedJsonIndexSpec, UpdateIndexRequest,
+    WatchNow, WatchPrefixRequest, WatchStateHint,
 };
 use keldra_authz::ObjectRef;
 use keldra_store::{
@@ -329,13 +328,26 @@ async fn public_accounting_lifecycle_materializes_scalar_usage() {
             .await
             .unwrap()
             .into_inner();
-        if snapshot.object_count == 1
-            && snapshot.logical_stored_bytes == payload.len() as u64
-            && snapshot.accepted_inbound_bytes >= payload.len() as u64
-            && snapshot
-                .freshness
+        if snapshot.logical.as_ref().is_some_and(|logical| {
+            logical
+                .visible_file_count
                 .as_ref()
-                .is_some_and(|value| value.complete)
+                .is_some_and(|measurement| {
+                    measurement.state == AccountingMeasurementState::Present as i32
+                        && measurement.count == 1
+                })
+                && logical
+                    .billable_logical_bytes
+                    .as_ref()
+                    .is_some_and(|measurement| measurement.bytes == payload.len() as u64)
+                && logical
+                    .freshness
+                    .as_ref()
+                    .is_some_and(|value| value.complete)
+        }) && snapshot
+            .traffic
+            .as_ref()
+            .is_some_and(|traffic| traffic.accepted_inbound_bytes >= payload.len() as u64)
         {
             break;
         }
@@ -345,6 +357,32 @@ async fn public_accounting_lifecycle_materializes_scalar_usage() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    let operational = AdministrationServiceClient::new(fixture.channel.clone())
+        .get_cluster_capabilities(authorized(
+            GetClusterCapabilitiesRequest {},
+            &fixture.system_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .logical_file_counts
+        .expect("protected operational response omitted logical file counts");
+    assert_eq!(operational.active_source_node_count, 1);
+    assert_eq!(operational.reported_source_node_count, 1);
+    assert!(
+        operational
+            .visible_file_count
+            .as_ref()
+            .is_some_and(|count| {
+                count.state == AccountingMeasurementState::Present as i32 && count.count >= 1
+            })
+    );
+    assert!(operational.tenants.iter().any(|tenant| {
+        tenant.visible_file_count.as_ref().is_some_and(|count| {
+            count.state == AccountingMeasurementState::Present as i32 && count.count >= 1
+        })
+    }));
 
     let disabled = accounting
         .disable_accounting(authorized(
@@ -603,7 +641,6 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
             .await,
     );
 
-    fixture.activate_cluster_capabilities().await;
     let rebuilt = indexes
         .rebuild_index(authorized(
             RebuildIndexRequest {
@@ -1620,40 +1657,6 @@ impl Fixture {
             system_token,
             server,
         }
-    }
-
-    async fn activate_cluster_capabilities(&self) {
-        let mut administration = AdministrationServiceClient::new(self.channel.clone());
-        let status = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let status = administration
-                    .get_cluster_capabilities(authorized(
-                        GetClusterCapabilitiesRequest {},
-                        &self.system_token,
-                    ))
-                    .await
-                    .unwrap()
-                    .into_inner();
-                if status.ready_for_target_activation {
-                    break status;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("cluster capability advertisement did not become ready");
-        administration
-            .activate_cluster_capabilities(authorized(
-                ActivateClusterCapabilitiesRequest {
-                    protocol_version: status.target_protocol_version,
-                    storage_format: status.target_storage_format,
-                    expected_placement_term: status.active_placement_term,
-                    expected_placement_index: status.active_placement_index,
-                },
-                &self.system_token,
-            ))
-            .await
-            .unwrap();
     }
 
     async fn stop(self) {

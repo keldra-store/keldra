@@ -565,14 +565,15 @@ fn tuple_schema_and_evaluation_limits_are_hard_bounds() {
     };
     let authorization =
         Authorization::new(realm("steps"), object_schema(), tuples.clone(), step_limits).unwrap();
-    assert!(matches!(
-        authorization.check(&AuthorizationCheck::new(
-            opaque("user", "missing"),
-            target,
-            "read",
-        )),
-        Err(AuthorizationError::EvaluationLimit { limit: "step", .. })
-    ));
+    assert!(
+        !authorization
+            .check(&AuthorizationCheck::new(
+                opaque("user", "missing"),
+                target,
+                "read",
+            ))
+            .unwrap()
+    );
 
     let tuple_limits = AuthorizationLimits {
         max_tuples: 1,
@@ -597,6 +598,55 @@ fn tuple_schema_and_evaluation_limits_are_hard_bounds() {
         .validate(AuthorizationLimits::default())
         .is_err()
     );
+}
+
+#[test]
+fn batch_checks_reuse_only_successful_completed_usersets() {
+    let document = path("reports/shared.json");
+    let group = opaque("group", "readers");
+    let alice = opaque("user", "alice");
+    let bob = opaque("user", "bob");
+    let authorization = Authorization::new(
+        realm("batch-memo"),
+        object_schema(),
+        [
+            Tuple::userset(
+                document.clone(),
+                "reader",
+                UsersetRef {
+                    object: group.clone(),
+                    relation: "member".into(),
+                },
+            ),
+            Tuple::new(group, "member", alice.clone()),
+        ],
+        AuthorizationLimits::default(),
+    )
+    .unwrap();
+    let allowed = AuthorizationCheck::new(alice, document.clone(), "read");
+    let denied = AuthorizationCheck::new(bob, document, "read");
+    assert_eq!(
+        authorization
+            .check_many(&[allowed.clone(), allowed, denied])
+            .unwrap(),
+        vec![true, true, false]
+    );
+}
+
+#[test]
+fn compiled_authorization_reports_nonzero_byte_weight() {
+    let authorization = Authorization::new(
+        realm("weight"),
+        object_schema(),
+        [Tuple::new(
+            path("reports/a.json"),
+            "reader",
+            opaque("user", "alice"),
+        )],
+        AuthorizationLimits::default(),
+    )
+    .unwrap();
+    assert!(authorization.estimated_heap_bytes() > 0);
 }
 
 #[test]

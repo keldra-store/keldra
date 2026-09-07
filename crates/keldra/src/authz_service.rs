@@ -2,7 +2,7 @@
 
 use keldra_api::v1 as api;
 use keldra_api::v1::authz_service_server::AuthzService;
-use keldra_authz::{Authorization, ObjectRef, Tuple, TupleSubject};
+use keldra_authz::{ObjectRef, Tuple, TupleSubject};
 use keldra_store::{
     AuthzRepository, AuthzRevision, AuthzStoreError, BindSchemaRequest, ProtectedRealmOwnership,
     PublishSchemaRequest, SchemaId, StorageTenantId, TupleBatchRequest, TupleMutation,
@@ -331,13 +331,7 @@ impl AuthzService for AuthzServiceImpl {
                 )?,
                 "tuple read is not authorized",
             )?;
-            let snapshot = repository.realm_snapshot(&scope, consistency)?;
-            Authorization::new(
-                scope.realm.clone(),
-                snapshot.schema.clone(),
-                snapshot.tuples.iter().cloned(),
-                repository.limits().evaluator,
-            )?;
+            let snapshot = repository.validated_realm_snapshot(&scope, consistency)?;
             Ok((snapshot.tuples, snapshot.revision))
         })
         .await?;

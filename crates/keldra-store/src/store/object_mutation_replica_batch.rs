@@ -1,5 +1,6 @@
 //! Ordered replica application for one exact metadata replica group.
 
+use super::mutation_helpers::{validate_accounting_transition, version_retention};
 use super::*;
 use crate::{ObjectMutation, ReplicaObjectMutationApplied};
 
@@ -42,6 +43,7 @@ impl Store {
                 tenant_id: TenantId(mutation.tenant_id),
                 bucket_id: BucketId(mutation.bucket_id),
             };
+            let retention = version_retention(mutation.versioning);
             self.require_unreserved_object_locked(identity, &mutation.exact_path, None)?;
             let encoded_head_key = identity.head_key(&mutation.exact_path);
             let encoded_version_key =
@@ -169,6 +171,7 @@ impl Store {
                         "replicated predecessor references a missing version descriptor".into(),
                     ));
                 }
+                validate_accounting_transition(mutation, predecessor.as_ref())?;
                 if predecessor
                     .as_ref()
                     .is_some_and(|version| version.protected_link_descriptor)
@@ -210,7 +213,6 @@ impl Store {
             }
 
             if !already_applied {
-                let retention = self.version_retention_for_bucket(identity)?;
                 if let Some(predecessor) = mutation.stamp.predecessor_version {
                     let predecessor_key =
                         replica_version_key(identity, &mutation.exact_path, predecessor);
@@ -373,6 +375,13 @@ mod tests {
     }
 
     async fn mutations(operations: Vec<BatchOperation>) -> Vec<ObjectMutation> {
+        mutations_with_versioning(operations, ObjectVersioning::Unversioned).await
+    }
+
+    async fn mutations_with_versioning(
+        operations: Vec<BatchOperation>,
+        versioning: ObjectVersioning,
+    ) -> Vec<ObjectMutation> {
         let temporary = tempfile::tempdir().unwrap();
         let source = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
@@ -381,7 +390,7 @@ mod tests {
         let governance = ObjectMutationGovernance {
             tenant_id,
             bucket_id,
-            versioning: source.bucket_versioning("tenant", "bucket").unwrap(),
+            versioning,
             policy: source.bucket_policy("tenant", "bucket").unwrap(),
         };
         let context = ObjectMutationContext {
@@ -397,6 +406,73 @@ mod tests {
             result.push(coordinated.mutation.unwrap());
         }
         result
+    }
+
+    #[tokio::test]
+    async fn replicas_use_sealed_versioning_without_bucket_options() {
+        let mutations = mutations_with_versioning(
+            vec![put("same", "first"), put("same", "second")],
+            ObjectVersioning::Enabled,
+        )
+        .await;
+        assert!(
+            mutations
+                .iter()
+                .all(|mutation| mutation.versioning == ObjectVersioning::Enabled)
+        );
+        let identity = BucketIdentity {
+            tenant_id: TenantId(mutations[0].tenant_id),
+            bucket_id: BucketId(mutations[0].bucket_id),
+        };
+
+        let unary_dir = tempfile::tempdir().unwrap();
+        let unary = Store::open(StoreOptions::new(unary_dir.path(), 2))
+            .await
+            .unwrap();
+        assert_eq!(
+            unary.bucket_versioning_by_key(&identity.encode()).unwrap(),
+            ObjectVersioning::Unversioned
+        );
+        for mutation in &mutations {
+            unary.apply_object_mutation_replica(mutation).await.unwrap();
+        }
+        assert_eq!(
+            unary
+                .stored_version_by_key(&replica_version_key(
+                    identity,
+                    &mutations[0].exact_path,
+                    mutations[0].version.id,
+                ))
+                .unwrap()
+                .unwrap()
+                .retention,
+            StoredVersionRetention::UserRetained
+        );
+
+        let batch_dir = tempfile::tempdir().unwrap();
+        let batch = Store::open(StoreOptions::new(batch_dir.path(), 2))
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.bucket_versioning_by_key(&identity.encode()).unwrap(),
+            ObjectVersioning::Unversioned
+        );
+        batch
+            .apply_object_mutation_replica_batch(&mutations)
+            .await
+            .unwrap();
+        assert_eq!(
+            batch
+                .stored_version_by_key(&replica_version_key(
+                    identity,
+                    &mutations[0].exact_path,
+                    mutations[0].version.id,
+                ))
+                .unwrap()
+                .unwrap()
+                .retention,
+            StoredVersionRetention::UserRetained
+        );
     }
 
     #[tokio::test]
@@ -459,6 +535,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replicas_reject_transition_that_disagrees_with_pending_predecessor() {
+        let mut mutations = mutations(vec![put("same", "first"), put("same", "second")]).await;
+        let first = mutations.remove(0);
+        let mut second = mutations.remove(0);
+        second.accounting_transition = Some(crate::AccountingHeadTransition::new(
+            Some(0),
+            second.version.blob.as_ref().map(|blob| blob.length),
+            0,
+        ));
+        second.set_computed_fingerprint();
+        second.validate().unwrap();
+
+        let unary_dir = tempfile::tempdir().unwrap();
+        let unary = Store::open(StoreOptions::new(unary_dir.path(), 2))
+            .await
+            .unwrap();
+        unary.apply_object_mutation_replica(&first).await.unwrap();
+        assert!(matches!(
+            unary.apply_object_mutation_replica(&second).await,
+            Err(MutationError::InvalidObjectMutation(message))
+                if message.contains("predecessor or bucket versioning")
+        ));
+
+        let batch_dir = tempfile::tempdir().unwrap();
+        let batch = Store::open(StoreOptions::new(batch_dir.path(), 2))
+            .await
+            .unwrap();
+        assert!(matches!(
+            batch
+                .apply_object_mutation_replica_batch(&[first.clone(), second])
+                .await,
+            Err(MutationError::InvalidObjectMutation(message))
+                if message.contains("predecessor or bucket versioning")
+        ));
+        let identity = BucketIdentity {
+            tenant_id: TenantId(first.tenant_id),
+            bucket_id: BucketId(first.bucket_id),
+        };
+        assert!(
+            batch
+                .head_by_storage_key(&identity.head_key(&first.exact_path))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn repeated_path_observes_the_prior_staged_head() {
         let first = mutations(vec![put("same", "first")]).await.pop().unwrap();
         let source_dir = tempfile::tempdir().unwrap();
@@ -491,6 +614,7 @@ mod tests {
             accounting_transition: Some(crate::AccountingHeadTransition::new(
                 first.version.blob.as_ref().map(|blob| blob.length),
                 None,
+                first.version.blob.as_ref().map_or(0, |blob| blob.length),
             )),
             ..first.clone()
         };
@@ -580,6 +704,7 @@ mod tests {
             accounting_transition: Some(crate::AccountingHeadTransition::new(
                 first.version.blob.as_ref().map(|blob| blob.length),
                 None,
+                first.version.blob.as_ref().map_or(0, |blob| blob.length),
             )),
             ..first.clone()
         };

@@ -10,7 +10,7 @@ use super::boundary::{IndexPageCursor, IndexPageTokenBinding, IndexPageTokenCode
 
 pub(crate) const INDEX_PAGE_TOKEN_AUDIENCE: &str = "keldra-index-page";
 pub(crate) const INDEX_PAGE_TOKEN_PURPOSE: &str = "index-page";
-const INDEX_PAGE_TOKEN_FORMAT: u8 = 5;
+const INDEX_PAGE_TOKEN_FORMAT: u8 = 1;
 
 /// Strongly typed private JWT claims. There is deliberately no expiry: the
 /// referenced immutable revision, definition version, and exact Zanzibar
@@ -230,6 +230,18 @@ mod tests {
         let signature = token.iter().rposition(|byte| *byte == b'.').unwrap() + 1;
         token[signature] = if token[signature] == b'a' { b'b' } else { b'a' };
         assert!(manager.decode(&caller, &token, binding()).is_err());
+    }
+
+    #[test]
+    fn page_token_rejects_non_v1_format() {
+        let manager = JwtManager::new(KEY).unwrap();
+        let caller = caller("tenant-a", "app-a");
+        let expected = binding();
+        let mut claims = IndexPageTokenClaims::new(&caller, expected, &cursor());
+        claims.format = 0;
+        let token = manager.seal_index_page_token(&claims).unwrap();
+
+        assert!(manager.decode(&caller, &token, expected).is_err());
     }
 
     #[test]

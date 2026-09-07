@@ -4,17 +4,20 @@
 //! replica group. Raft contributes only ACTIVE membership and the serving
 //! fence; no realm, revision counter, or ownership decision is stored in it.
 
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use keldra_authz::{AuthorizationCheck, Schema};
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
-    AuthzConsistency, AuthzRealmAggregate, AuthzRealmMutation, AuthzRealmMutationContext,
-    AuthzRealmSnapshotApplied, AuthzRealmTransferManifest, AuthzRepository, AuthzRevision,
-    AuthzSchemaPublicationMutation, AuthzScope, AuthzStoreError, BindSchemaRequest,
-    CoordinatedAuthzRealmMutation, CoordinatedAuthzSchemaPublication, PlacementLogId,
-    PublishSchemaRequest, ReplicaAuthzRealmMutationApplied, ReplicaAuthzSchemaPublicationApplied,
-    SchemaRef, StorageTenantId, Store, TupleBatchRequest,
+    AUTHZ_REALM_STATE_FORMAT, AUTHZ_REALM_TRANSFER_MANIFEST_FORMAT, AuthzConsistency,
+    AuthzRealmMutation, AuthzRealmSnapshotApplied, AuthzRealmState, AuthzRealmTransferManifest,
+    AuthzRepository, AuthzRevision, AuthzSchemaPublicationMutation, AuthzScope, AuthzStoreError,
+    BindSchemaRequest, CoordinatedAuthzRealmMutation, CoordinatedAuthzSchemaPublication,
+    PlacementLogId, PublishSchemaRequest, ReplicaAuthzRealmMutationApplied,
+    ReplicaAuthzSchemaPublicationApplied, SchemaRef, StorageTenantId, Store, TupleBatchRequest,
 };
 use tonic::Status;
 
@@ -23,57 +26,179 @@ use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
 
-/// Exact identity and lineage summary for one complete streamed aggregate.
-/// The manifest hash covers the canonical aggregate bytes, including the
-/// stamp; the copied summary lets a failed quorum distinguish siblings/gaps
-/// without accepting either one.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AuthzRealmReplicaCandidate {
-    pub(crate) manifest: AuthzRealmTransferManifest,
-    pub(crate) predecessor_revision: Option<AuthzRevision>,
-    pub(crate) mutation_fingerprint: Option<[u8; 32]>,
+const AUTHZ_COORDINATOR_LANES: usize = 64;
+
+/// One private, stable copy of a realm stream while it is crossing a peer
+/// boundary. The file is removed after the network producer releases it.
+pub(crate) struct AuthzTransferSpool {
+    file: Option<File>,
+    path: PathBuf,
 }
 
+impl AuthzTransferSpool {
+    pub(crate) fn new() -> io::Result<Self> {
+        let directory = std::env::temp_dir();
+        for _ in 0..4 {
+            let path = directory.join(format!(
+                "keldra-authz-transfer-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        file: Some(file),
+                        path,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique authorization transfer spool",
+        ))
+    }
+
+    pub(crate) fn rewind(&mut self) -> io::Result<()> {
+        self.file_mut().seek(SeekFrom::Start(0)).map(|_| ())
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file
+            .as_mut()
+            .expect("authorization transfer spool file is present until drop")
+    }
+}
+
+impl Read for AuthzTransferSpool {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.file_mut().read(buffer)
+    }
+}
+
+impl Write for AuthzTransferSpool {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.file_mut().write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file_mut().flush()
+    }
+}
+
+impl Drop for AuthzTransferSpool {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Exact O(1) identity and lineage summary for one realm replica. Full-stream
+/// transfer evidence is attached only after bytes cross a peer boundary.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthzRealmReplicaCandidate {
+    pub(crate) state: AuthzRealmState,
+    transfer_manifest: Option<AuthzRealmTransferManifest>,
+}
+
+impl PartialEq for AuthzRealmReplicaCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.state == other.state
+    }
+}
+
+impl Eq for AuthzRealmReplicaCandidate {}
+
 impl AuthzRealmReplicaCandidate {
+    #[cfg(test)]
     pub(crate) fn from_aggregate(
-        aggregate: &AuthzRealmAggregate,
+        aggregate: &keldra_store::AuthzRealmAggregate,
         manifest: AuthzRealmTransferManifest,
     ) -> Result<Self, Status> {
-        if manifest.scope != aggregate.scope || manifest.revision != aggregate.revision {
+        let state = AuthzRealmState {
+            format: AUTHZ_REALM_STATE_FORMAT,
+            scope: aggregate.scope.clone(),
+            revision: aggregate.revision,
+            predecessor_revision: aggregate
+                .mutation_stamp
+                .and_then(|stamp| stamp.predecessor_revision),
+            mutation_fingerprint: aggregate
+                .mutation_stamp
+                .map(|stamp| stamp.mutation_fingerprint),
+            schema_ref: aggregate.binding.schema_ref.clone(),
+            binding_generation: aggregate.binding.generation,
+            tuple_count: aggregate.binding.tuple_count,
+        };
+        let candidate = Self::from_manifest(manifest)?;
+        if candidate.state != state {
             return Err(Status::data_loss(
                 "authorization realm manifest disagrees with its aggregate",
             ));
         }
-        Ok(Self {
-            predecessor_revision: manifest.predecessor_revision,
-            mutation_fingerprint: manifest.mutation_fingerprint,
-            manifest,
-        })
+        candidate.validate_for(&aggregate.scope)?;
+        Ok(candidate)
     }
 
-    pub(crate) fn from_manifest(manifest: AuthzRealmTransferManifest) -> Result<Self, Status> {
+    pub(crate) fn from_state(state: AuthzRealmState) -> Result<Self, Status> {
         let candidate = Self {
-            predecessor_revision: manifest.predecessor_revision,
-            mutation_fingerprint: manifest.mutation_fingerprint,
-            manifest,
+            state,
+            transfer_manifest: None,
         };
-        let scope = candidate.manifest.scope.clone();
+        let scope = candidate.state.scope.clone();
         candidate.validate_for(&scope)?;
         Ok(candidate)
     }
 
+    pub(crate) fn from_manifest(manifest: AuthzRealmTransferManifest) -> Result<Self, Status> {
+        if manifest.format != AUTHZ_REALM_TRANSFER_MANIFEST_FORMAT || manifest.encoded_bytes == 0 {
+            return Err(Status::data_loss(
+                "authorization transfer manifest has an invalid v1 envelope",
+            ));
+        }
+        let candidate = Self {
+            state: manifest.state(),
+            transfer_manifest: Some(manifest),
+        };
+        let scope = candidate.state.scope.clone();
+        candidate.validate_for(&scope)?;
+        Ok(candidate)
+    }
+
+    pub(crate) fn transfer_manifest(&self) -> Result<&AuthzRealmTransferManifest, Status> {
+        self.transfer_manifest.as_ref().ok_or_else(|| {
+            Status::failed_precondition("authorization candidate has no transfer manifest")
+        })
+    }
+
     pub(crate) fn validate_for(&self, scope: &AuthzScope) -> Result<(), Status> {
-        if self.manifest.scope != *scope || self.manifest.revision == AuthzRevision::ZERO {
+        if self.state.format != AUTHZ_REALM_STATE_FORMAT
+            || self.state.scope != *scope
+            || self.state.revision == AuthzRevision::ZERO
+            || self.state.binding_generation == 0
+            || self.state.schema_ref.schema_revision == 0
+        {
             return Err(Status::data_loss(
                 "authorization replica returned another realm or a zero revision",
             ));
         }
-        match (self.predecessor_revision, self.mutation_fingerprint) {
+        match (
+            self.state.predecessor_revision,
+            self.state.mutation_fingerprint,
+        ) {
             (None, None) => Ok(()),
             (predecessor, Some(fingerprint))
                 if fingerprint != [0; 32]
                     && predecessor.is_none_or(|revision| {
-                        revision != AuthzRevision::ZERO && revision < self.manifest.revision
+                        revision != AuthzRevision::ZERO && revision < self.state.revision
                     }) =>
             {
                 Ok(())
@@ -200,14 +325,19 @@ struct AuthzDistributionCore {
     local_node: NodeId,
     repository: AuthzRepository,
     peers: Arc<dyn AuthzReplicaTransport>,
-    /// Routing and fencing provide one active tenant-group coordinator. This
-    /// single local gate keeps reconcile/repair/mutate sequences ordered while
-    /// allowing independent fresh checks to reconcile and read concurrently,
-    /// without a per-tenant registry or distributed lock.
-    coordinator_serial: Arc<tokio::sync::RwLock<()>>,
+    /// Fixed tenant lanes retain same-tenant ordering without a growing lock
+    /// registry or process-wide head-of-line blocking between tenants.
+    coordinator_lanes: Arc<[tokio::sync::RwLock<()>; AUTHZ_COORDINATOR_LANES]>,
 }
 
 impl AuthzDistributionCore {
+    fn coordinator_lane(&self, stable_tenant_id: u64) -> &tokio::sync::RwLock<()> {
+        let mut hash = stable_tenant_id;
+        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^= hash >> 31;
+        &self.coordinator_lanes[(hash as usize) % AUTHZ_COORDINATOR_LANES]
+    }
     async fn replicate_schema_publication(
         &self,
         replicas: &TenantReplicaSet,
@@ -574,35 +704,10 @@ impl ZanzibarDistribution {
                 local_node,
                 repository,
                 peers,
-                coordinator_serial: Arc::new(tokio::sync::RwLock::new(())),
+                coordinator_lanes: Arc::new(std::array::from_fn(|_| tokio::sync::RwLock::new(()))),
             },
             mutation_admission,
         }
-    }
-
-    pub(crate) async fn bind_schema(
-        &self,
-        stable_tenant_id: u64,
-        request: BindSchemaRequest,
-        context: AuthzRealmMutationContext,
-    ) -> Result<CoordinatedAuthzRealmMutation, Status> {
-        let _serial = self.core.coordinator_serial.write().await;
-        let _permit = self.mutation_admission.enter()?;
-        let mut replicas = self.require_coordinator(stable_tenant_id)?;
-        self.require_context(&context, replicas.group.coordinator())?;
-        let scope = request.scope.clone();
-        self.core.reconcile(&replicas, &scope).await?;
-        replicas = self.require_coordinator(stable_tenant_id)?;
-        self.require_context(&context, replicas.group.coordinator())?;
-        let repository = self.core.repository.clone();
-        let coordinated = tokio::task::spawn_blocking(move || {
-            repository.coordinate_bind_schema_mutation(request, context)
-        })
-        .await
-        .map_err(|error| Status::internal(format!("authorization worker failed: {error}")))?
-        .map_err(authz_status)?;
-        self.core.replicate(&replicas, &scope, &coordinated).await?;
-        Ok(coordinated)
     }
 
     pub(crate) async fn bind_schema_journaled(
@@ -612,7 +717,7 @@ impl ZanzibarDistribution {
         request: BindSchemaRequest,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         loop {
-            let serial = self.core.coordinator_serial.write().await;
+            let serial = self.core.coordinator_lane(stable_tenant_id).write().await;
             let permit = self.mutation_admission.enter()?;
             let mut replicas = self.require_coordinator(stable_tenant_id)?;
             let serving = self.serving.mutation_context()?;
@@ -648,30 +753,6 @@ impl ZanzibarDistribution {
         }
     }
 
-    pub(crate) async fn publish_schema(
-        &self,
-        stable_tenant_id: u64,
-        request: PublishSchemaRequest,
-        context: AuthzRealmMutationContext,
-    ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
-        let _serial = self.core.coordinator_serial.write().await;
-        let _permit = self.mutation_admission.enter()?;
-        let replicas = self.require_coordinator(stable_tenant_id)?;
-        self.require_context(&context, replicas.group.coordinator())?;
-        let storage_tenant = request.storage_tenant.clone();
-        let repository = self.core.repository.clone();
-        let coordinated = tokio::task::spawn_blocking(move || {
-            repository.coordinate_schema_publication(request, context)
-        })
-        .await
-        .map_err(|error| Status::internal(format!("authorization worker failed: {error}")))?
-        .map_err(authz_status)?;
-        self.core
-            .replicate_schema_publication(&replicas, &storage_tenant, &coordinated)
-            .await?;
-        Ok(coordinated)
-    }
-
     pub(crate) async fn publish_schema_journaled(
         &self,
         stable_tenant_id: u64,
@@ -679,7 +760,7 @@ impl ZanzibarDistribution {
         request: PublishSchemaRequest,
     ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
         loop {
-            let serial = self.core.coordinator_serial.write().await;
+            let serial = self.core.coordinator_lane(stable_tenant_id).write().await;
             let permit = self.mutation_admission.enter()?;
             let replicas = self.require_coordinator(stable_tenant_id)?;
             let serving = self.serving.mutation_context()?;
@@ -714,7 +795,7 @@ impl ZanzibarDistribution {
         stable_tenant_id: u64,
         scope: &AuthzScope,
     ) -> Result<(), Status> {
-        let _serial = self.core.coordinator_serial.write().await;
+        let _serial = self.core.coordinator_lane(stable_tenant_id).write().await;
         let replicas = self.require_coordinator(stable_tenant_id)?;
         self.serving.mutation_context()?;
         if self.core.reconcile(&replicas, scope).await?.is_none() {
@@ -727,31 +808,6 @@ impl ZanzibarDistribution {
 
     pub(crate) fn repository(&self) -> &AuthzRepository {
         &self.core.repository
-    }
-
-    pub(crate) async fn mutate_tuples(
-        &self,
-        stable_tenant_id: u64,
-        request: TupleBatchRequest,
-        context: AuthzRealmMutationContext,
-    ) -> Result<CoordinatedAuthzRealmMutation, Status> {
-        let _serial = self.core.coordinator_serial.write().await;
-        let _permit = self.mutation_admission.enter()?;
-        let mut replicas = self.require_coordinator(stable_tenant_id)?;
-        self.require_context(&context, replicas.group.coordinator())?;
-        let scope = request.scope.clone();
-        self.core.reconcile(&replicas, &scope).await?;
-        replicas = self.require_coordinator(stable_tenant_id)?;
-        self.require_context(&context, replicas.group.coordinator())?;
-        let repository = self.core.repository.clone();
-        let coordinated = tokio::task::spawn_blocking(move || {
-            repository.coordinate_tuple_mutation(request, context)
-        })
-        .await
-        .map_err(|error| Status::internal(format!("authorization worker failed: {error}")))?
-        .map_err(authz_status)?;
-        self.core.replicate(&replicas, &scope, &coordinated).await?;
-        Ok(coordinated)
     }
 
     /// Coordinates a tuple mutation through the storage kernel boundary that
@@ -786,7 +842,7 @@ impl ZanzibarDistribution {
         restore_retained_precondition: bool,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         loop {
-            let serial = self.core.coordinator_serial.write().await;
+            let serial = self.core.coordinator_lane(stable_tenant_id).write().await;
             let permit = self.mutation_admission.enter()?;
             let mut replicas = self.require_coordinator(stable_tenant_id)?;
             let serving = self.serving.mutation_context()?;
@@ -849,7 +905,7 @@ impl ZanzibarDistribution {
         consistency: AuthzConsistency,
         check: AuthorizationCheck,
     ) -> Result<(bool, AuthzRevision, u64), Status> {
-        let _serial = self.core.coordinator_serial.read().await;
+        let _serial = self.core.coordinator_lane(stable_tenant_id).read().await;
         let (replicas, placement_fence) = self.require_read_replica(stable_tenant_id)?;
         let checked_scope = scope.clone();
         let (allowed, revision) = self
@@ -873,7 +929,7 @@ impl ZanzibarDistribution {
         consistency: AuthzConsistency,
         checks: Vec<AuthorizationCheck>,
     ) -> Result<(Vec<bool>, AuthzRevision, u64), Status> {
-        let _serial = self.core.coordinator_serial.read().await;
+        let _serial = self.core.coordinator_lane(stable_tenant_id).read().await;
         let (replicas, placement_fence) = self.require_read_replica(stable_tenant_id)?;
         let checked_scope = scope.clone();
         let (allowed, revision) = self
@@ -946,24 +1002,6 @@ impl ZanzibarDistribution {
         }
         Ok((replicas, placement.fence()))
     }
-
-    fn require_context(
-        &self,
-        context: &AuthzRealmMutationContext,
-        coordinator: NodeId,
-    ) -> Result<(), Status> {
-        let current = self.serving.mutation_context()?;
-        if coordinator != self.local_node
-            || context.active_placement_log_id != current.active_placement_log_id
-            || context.serving_fence_term != current.serving_fence_term
-            || u64::from(context.source_id.node_id) != self.local_node.0
-        {
-            return Err(Status::unavailable(
-                "authorization mutation context does not match the current coordinator fence",
-            ));
-        }
-        Ok(())
-    }
 }
 
 pub(crate) fn exact_quorum_candidate(
@@ -981,8 +1019,8 @@ pub(crate) fn exact_quorum_candidate(
         .collect::<Vec<_>>();
     let sibling = present.iter().enumerate().any(|(index, left)| {
         present[index + 1..].iter().any(|right| {
-            left.manifest.revision == right.manifest.revision
-                && left.mutation_fingerprint != right.mutation_fingerprint
+            left.state.revision == right.state.revision
+                && left.state.mutation_fingerprint != right.state.mutation_fingerprint
         })
     });
     let reason = if sibling { "sibling" } else { "lineage gap" };

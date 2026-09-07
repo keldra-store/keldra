@@ -11,10 +11,9 @@ pub(super) type AuthzRealmStream = std::pin::Pin<
     Box<dyn tokio_stream::Stream<Item = Result<wire::AuthzRealmFrame, Status>> + Send>,
 >;
 
-// 0.16.0 released schema 4. Bounded complete-record mutation reconciliation
-// requires the batch RPC added in 0.17.0, so mixed peers must fail closed
-// instead of silently falling back to the stream-exhausting unary fan-out.
-pub(crate) const DATA_PEER_SCHEMA_VERSION: u32 = 5;
+// Pre-1.0 releases take a clean protocol break. This release starts the
+// complete current data-peer contract at schema 1; mismatched peers fail closed.
+pub(crate) const DATA_PEER_SCHEMA_VERSION: u32 = 1;
 pub(crate) const DATA_PEER_FRAME_BYTES: usize = 64 * 1024;
 pub(super) const MAX_TYPED_MUTATION_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_OBJECT_MUTATION_BATCH_ITEMS: usize = 1_000;

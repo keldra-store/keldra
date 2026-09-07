@@ -1,7 +1,7 @@
 //! Canonical compilation of the public TypedJson definition contract.
 //!
 //! This module deliberately owns no segment-layout detail.  It converts the
-//! wire definition into the storage-neutral schema that both the v6 projector
+//! wire definition into the storage-neutral schema that both the v1 projector
 //! and eventual query materializer consume.
 
 use std::collections::BTreeSet;
@@ -19,7 +19,7 @@ use keldra_index::typed_json::{
 
 use super::date::validate_format;
 
-/// Compile the only public index kind supported by the partition-owned v6
+/// Compile the only public index kind supported by the partition-owned v1
 /// runtime.  Other kinds have already been rejected at API admission.
 pub(crate) fn compile_typed_json_schema(
     path_prefix: &str,

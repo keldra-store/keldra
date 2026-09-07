@@ -116,5 +116,13 @@ async fn configured_wal_target_and_payload_engine_properties_are_observable() {
     assert!(metrics.total_wal_bytes.is_some());
     assert!(metrics.payload_blob_files.is_some_and(|files| files >= 1));
     assert!(metrics.payload_blob_bytes.is_some_and(|bytes| bytes > 0));
+    let live_payload_bytes = metrics.payload_live_blob_bytes.unwrap();
+    let garbage_payload_bytes = metrics.payload_garbage_blob_bytes.unwrap();
+    assert!(
+        live_payload_bytes
+            .checked_add(garbage_payload_bytes)
+            .is_some_and(|bytes| bytes <= metrics.payload_blob_bytes.unwrap())
+    );
     assert!(metrics.payload_sst_bytes.is_some_and(|bytes| bytes > 0));
+    assert!(metrics.non_payload_metadata_index_sst_bytes.is_some());
 }

@@ -51,14 +51,14 @@ fn put_raw(store: &Store, cf: &'static str, key: &[u8], value: &[u8]) {
 }
 
 #[tokio::test]
-async fn released_raw_fixtures_have_frozen_baseline_evidence() {
+async fn v1_raw_fixtures_have_stable_baseline_evidence() {
     let root = tempfile::tempdir().unwrap();
     let store = open_store(&root, 1).await;
     let tenant = StorageTenantId::parse("acme").unwrap();
     let tenant_id = LogicalRecordId::TenantNameClaim {
         storage_tenant: tenant.clone(),
     };
-    // Released 0.5.0 name claims are one big-endian u64.
+    // V1 name claims are one big-endian u64.
     put_raw(
         &store,
         CF_NAMES,
@@ -70,7 +70,7 @@ async fn released_raw_fixtures_have_frozen_baseline_evidence() {
         baseline_hash,
     } = store.logical_record_candidate(&tenant_id).unwrap().unwrap()
     else {
-        panic!("released fixture must remain a baseline")
+        panic!("v1 fixture must remain a baseline")
     };
     assert_eq!(
         typed_value,
@@ -88,7 +88,7 @@ async fn released_raw_fixtures_have_frozen_baseline_evidence() {
         tenant_id: 7,
         bucket_id: 11,
     };
-    // Released 0.5.0 bucket versioning is one byte; 1 means enabled.
+    // V1 bucket versioning is one byte; 1 means enabled.
     put_raw(&store, CF_BUCKET_OPTIONS, &identity(7, 11).encode(), &[1]);
     let LogicalRecordCandidate::Baseline {
         typed_value,
@@ -98,7 +98,7 @@ async fn released_raw_fixtures_have_frozen_baseline_evidence() {
         .unwrap()
         .unwrap()
     else {
-        panic!("released fixture must remain a baseline")
+        panic!("v1 fixture must remain a baseline")
     };
     assert_eq!(
         typed_value,

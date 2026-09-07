@@ -21,12 +21,13 @@ use crate::authorization::{
 use crate::authz_distribution::ZanzibarDistribution;
 use crate::cluster_peer::ClusterPeerTransport;
 use crate::cluster_placement::ClusterPlacement;
-use crate::logical_name_resolution::LogicalNameResolver;
+use crate::logical_name_resolution::{LogicalNameResolution, LogicalNameResolver};
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::placement::PlacementKind;
 
 const AUTHORIZATION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTHORIZATION_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const NAME_RESOLUTION_CONCURRENCY: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StableBucketAuthorization {
@@ -231,17 +232,6 @@ impl AuthoritativeSystemAuthorization {
             .await
     }
 
-    /// Fresh check in one customer tenant's ordinary Zanzibar replica group.
-    pub(crate) async fn fresh_tenant_check(
-        &self,
-        stable_tenant_id: u64,
-        scope: AuthzScope,
-        check: AuthorizationCheck,
-    ) -> Result<FreshAuthorizationResult, Status> {
-        self.fresh_tenant_checks(stable_tenant_id, scope, vec![check])
-            .await
-    }
-
     pub(crate) async fn fresh_tenant_checks(
         &self,
         stable_tenant_id: u64,
@@ -267,30 +257,61 @@ impl AuthoritativeSystemAuthorization {
         &self,
         requests: &[(ObjectKey, ObjectPermission)],
     ) -> Result<Vec<StableBucketAuthorization>, Status> {
-        let mut buckets = BTreeMap::<(&str, &str), (u64, u64)>::new();
+        let mut unique = BTreeMap::<(String, String), ()>::new();
         for (key, _) in requests {
-            let identity = (key.tenant(), key.bucket());
-            if !buckets.contains_key(&identity) {
-                let resolved = self
-                    .names
-                    .resolve_bucket_ids(key.tenant(), key.bucket())
-                    .await?;
-                buckets.insert(identity, resolved);
-            }
+            unique.insert((key.tenant().to_owned(), key.bucket().to_owned()), ());
         }
-        Ok(buckets
+        let storage_tenant = unique
+            .keys()
+            .next()
+            .map(|(tenant, _)| tenant.clone())
+            .ok_or_else(|| Status::invalid_argument("authorization batch has no buckets"))?;
+        if unique.keys().any(|(tenant, _)| tenant != &storage_tenant) {
+            return Err(Status::permission_denied(
+                "authorization batch spans storage tenants",
+            ));
+        }
+        let parsed_tenant = keldra_store::StorageTenantId::parse(&storage_tenant)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let expected_tenant_id = self
+            .names
+            .resolve_tenant_id(&parsed_tenant)
+            .await?
+            .ok_or_else(|| Status::not_found("tenant does not exist"))?;
+        let mut pending = unique.into_keys();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut buckets = BTreeMap::new();
+        loop {
+            while tasks.len() < NAME_RESOLUTION_CONCURRENCY {
+                let Some((storage_tenant, bucket)) = pending.next() else {
+                    break;
+                };
+                let names = self.names.clone();
+                tasks.spawn(async move {
+                    let resolved = names.resolve_bucket_id(expected_tenant_id, &bucket).await;
+                    (storage_tenant, bucket, resolved)
+                });
+            }
+            let Some(joined) = tasks.join_next().await else {
+                break;
+            };
+            let (storage_tenant, bucket, resolved) = joined.map_err(|error| {
+                Status::internal(format!("name-resolution task failed: {error}"))
+            })?;
+            buckets.insert((storage_tenant, bucket), resolved);
+        }
+        buckets
             .into_iter()
-            .map(
-                |((storage_tenant, bucket), (expected_tenant_id, expected_bucket_id))| {
-                    StableBucketAuthorization {
-                        storage_tenant: storage_tenant.to_owned(),
-                        bucket: bucket.to_owned(),
-                        expected_tenant_id,
-                        expected_bucket_id,
-                    }
-                },
-            )
-            .collect())
+            .map(|((storage_tenant, bucket), expected_bucket_id)| {
+                Ok(StableBucketAuthorization {
+                    storage_tenant,
+                    bucket,
+                    expected_tenant_id,
+                    expected_bucket_id: expected_bucket_id?
+                        .ok_or_else(|| Status::not_found("bucket does not exist"))?,
+                })
+            })
+            .collect()
     }
 
     pub(crate) async fn fresh_system_checks(
@@ -519,15 +540,6 @@ impl crate::index_service::IndexAuthorization for AuthoritativeSystemAuthorizati
             revision: evidence.revision.0,
         })
     }
-}
-
-pub(crate) fn manage_system_check(subject: &ObjectRef) -> Result<AuthorizationCheck, Status> {
-    Ok(AuthorizationCheck::new(
-        subject.clone(),
-        ObjectRef::opaque("system", keldra_store::SYSTEM_STORAGE_TENANT_ID)
-            .map_err(crate::authz_api::authz_status)?,
-        "manage_system",
-    ))
 }
 
 #[cfg(test)]

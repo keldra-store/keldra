@@ -6,9 +6,6 @@ pub(crate) const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 
 const RECORD_MAGIC: &[u8; 8] = b"ANVLREC\0";
 const RECORD_FORMAT_V1: u8 = 1;
-pub(crate) const SNAPSHOT_RECORD_FORMAT_V2: u8 = 2;
-pub(crate) const SNAPSHOT_RECORD_FORMAT_V3: u8 = 3;
-pub(crate) const SNAPSHOT_RECORD_FORMAT_V4: u8 = 4;
 const RECORD_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
 const RECORD_HEADER_BYTES: usize = RECORD_MAGIC.len() + 1 + RECORD_LENGTH_BYTES;
 const MAX_RECORD_BYTES: usize = RECORD_HEADER_BYTES + MAX_ENCODED_BYTES;
@@ -63,14 +60,14 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError>
 
 /// Encode a value for durable consensus storage.
 ///
-/// `encode` remains the raw payload codec because state-machine accounting and
-/// compatibility fixtures depend on those exact bytes. Callers add this
-/// self-identifying envelope at each durable record or versioned wire boundary.
+/// `encode` remains the raw payload codec for in-memory size accounting.
+/// Durable records always use this self-identifying v1 envelope.
 pub(crate) fn encode_record<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, CodecError> {
     wrap_record(&encode(value)?)
 }
 
 /// Encode a value under an explicitly selected durable record format.
+#[cfg(test)]
 pub(crate) fn encode_record_at_version<T: Serialize + ?Sized>(
     value: &T,
     version: u8,
@@ -78,7 +75,7 @@ pub(crate) fn encode_record_at_version<T: Serialize + ?Sized>(
     wrap_record_at_version(&encode(value)?, version)
 }
 
-/// Decode a durable record, accepting the released 0.5.0 raw-bincode layout.
+/// Decode one durable v1 record.
 pub(crate) fn decode_record<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     decode(record_payload(bytes)?)
 }
@@ -102,27 +99,22 @@ fn wrap_record_at_version(payload: &[u8], version: u8) -> Result<Vec<u8>, CodecE
     Ok(record)
 }
 
-/// Return the unchanged payload from a current envelope or a bounded legacy
-/// 0.5.0 raw record.
+/// Return the unchanged payload from a v1 envelope.
 pub(crate) fn record_payload(bytes: &[u8]) -> Result<&[u8], CodecError> {
     let (version, payload) = record_version_and_payload(bytes)?;
     match version {
-        None | Some(RECORD_FORMAT_V1) => Ok(payload),
-        Some(version) => Err(CodecError::UnsupportedRecordVersion(version)),
+        RECORD_FORMAT_V1 => Ok(payload),
+        version => Err(CodecError::UnsupportedRecordVersion(version)),
     }
 }
 
-/// Return an envelope's explicit format and unchanged payload. Raw 0.5.0
-/// records have no version.
-pub(crate) fn record_version_and_payload(bytes: &[u8]) -> Result<(Option<u8>, &[u8]), CodecError> {
+/// Return an envelope's explicit format and unchanged payload.
+pub(crate) fn record_version_and_payload(bytes: &[u8]) -> Result<(u8, &[u8]), CodecError> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(CodecError::TooLarge);
     }
     if !bytes.starts_with(RECORD_MAGIC) {
-        if bytes.len() > MAX_ENCODED_BYTES {
-            return Err(CodecError::TooLarge);
-        }
-        return Ok((None, bytes));
+        return Err(CodecError::InvalidRecord("magic is invalid"));
     }
     if bytes.len() < RECORD_HEADER_BYTES {
         return Err(CodecError::InvalidRecord("truncated header"));
@@ -145,7 +137,7 @@ pub(crate) fn record_version_and_payload(bytes: &[u8]) -> Result<(Option<u8>, &[
             "payload length does not match header",
         ));
     }
-    Ok((Some(version), &bytes[RECORD_HEADER_BYTES..]))
+    Ok((version, &bytes[RECORD_HEADER_BYTES..]))
 }
 
 #[cfg(test)]
@@ -153,39 +145,11 @@ mod tests {
     use openraft::{CommittedLeaderId, EntryPayload, LogId};
 
     use crate::{
-        BundleHash, BundleRef, Command, CommitBatch, DurabilityClass, DurabilityEvidenceHash,
-        InvocationFingerprint, InvocationId, NodeId, ProgramHash, ProgramPathHash,
+        Command, NodeId,
         raft_storage::{RaftEntry, StorageConfig},
     };
 
     use super::*;
-
-    #[test]
-    fn commit_batch_is_a_small_fixed_identity_record() {
-        let command = Command::CommitBatch(CommitBatch {
-            executor: NodeId(1),
-            nomination_log_index: 2,
-            program_path_hash: ProgramPathHash([3; 32]),
-            program_hash: ProgramHash([4; 32]),
-            invocation_id: InvocationId([5; 32]),
-            input_fingerprint: InvocationFingerprint([6; 32]),
-            bundle_ref: BundleRef {
-                hash: [7; 32],
-                length: 17,
-            },
-            bundle_hash: BundleHash([8; 32]),
-            durability_class: DurabilityClass([9; 32]),
-            durability_evidence_hash: DurabilityEvidenceHash([10; 32]),
-            proposal_at_unix_millis: 1_000,
-            replay_expires_at_unix_millis: 1_000 + crate::ATOMIC_REPLAY_RETENTION_MILLIS,
-        });
-
-        // The type contains only fixed-size identities and cursors. This
-        // regression bound makes accidentally adding an object body, path
-        // inventory, program definition, or prepared bundle immediately
-        // visible in the consensus crate's tests.
-        assert!(encode(&command).unwrap().len() < 512);
-    }
 
     #[test]
     fn durable_record_envelope_preserves_the_raw_payload() {
@@ -203,36 +167,25 @@ mod tests {
     }
 
     #[test]
-    fn legacy_raw_storage_fixtures_remain_readable_and_frozen() {
-        const LEGACY_STORAGE_CONFIG: &[u8] = &[
+    fn raw_unenveloped_storage_records_are_rejected() {
+        const RAW_STORAGE_CONFIG: &[u8] = &[
             0x04, 0x00, 0x00, 0x00, // max_commit_entries
             0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // max_commit_bytes
         ];
-        const LEGACY_BLANK_LOG_ENTRY: &[u8] = &[
+        const RAW_BLANK_LOG_ENTRY: &[u8] = &[
             0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader term
             0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader node id
             0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log index
             0x00, 0x00, 0x00, 0x00, // EntryPayload::Blank
         ];
 
-        let config = StorageConfig {
-            max_commit_entries: 4,
-            max_commit_bytes: 65_536,
-        };
-        let entry = RaftEntry {
-            log_id: LogId::new(CommittedLeaderId::new(7, 1), 11),
-            payload: EntryPayload::Blank,
-        };
-
-        assert_eq!(encode(&config).unwrap(), LEGACY_STORAGE_CONFIG);
-        assert_eq!(encode(&entry).unwrap(), LEGACY_BLANK_LOG_ENTRY);
         assert_eq!(
-            decode_record::<StorageConfig>(LEGACY_STORAGE_CONFIG).unwrap(),
-            config
+            decode_record::<StorageConfig>(RAW_STORAGE_CONFIG),
+            Err(CodecError::InvalidRecord("magic is invalid"))
         );
         assert_eq!(
-            decode_record::<RaftEntry>(LEGACY_BLANK_LOG_ENTRY).unwrap(),
-            entry
+            decode_record::<RaftEntry>(RAW_BLANK_LOG_ENTRY),
+            Err(CodecError::InvalidRecord("magic is invalid"))
         );
     }
 
@@ -261,28 +214,11 @@ mod tests {
     }
 
     #[test]
-    fn released_command_discriminants_are_unchanged() {
+    fn v1_command_discriminants_are_stable() {
         let commands = [
             Command::NominateExecutor {
                 executor: NodeId(1),
             },
-            Command::CommitBatch(CommitBatch {
-                executor: NodeId(1),
-                nomination_log_index: 2,
-                program_path_hash: ProgramPathHash([3; 32]),
-                program_hash: ProgramHash([4; 32]),
-                invocation_id: InvocationId([5; 32]),
-                input_fingerprint: InvocationFingerprint([6; 32]),
-                bundle_ref: BundleRef {
-                    hash: [7; 32],
-                    length: 8,
-                },
-                bundle_hash: BundleHash([9; 32]),
-                durability_class: DurabilityClass([10; 32]),
-                durability_evidence_hash: DurabilityEvidenceHash([11; 32]),
-                proposal_at_unix_millis: 12,
-                replay_expires_at_unix_millis: 13,
-            }),
             Command::FinalizedThrough {
                 executor: NodeId(1),
                 nomination_log_index: 2,

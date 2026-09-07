@@ -13,25 +13,25 @@ rendezvous hashing.
 
 ## What is available
 
-| Capability | Release | Status |
-| --- | --- | --- |
-| Object storage | 0.10.0 | Streaming puts, deduplication, CAS, immutable puts, bulk writes, batch reads, deletes, optional version retention, prefix listing, and watches |
-| Authorization | 0.10.0 | Application credentials, short-lived JWTs, protected administration, Zanzibar schemas, tuples, roles, and checks |
-| Atomic programs | 0.10.0 | Explicitly selected, deterministic multi-path state transitions without routing ordinary uploads through a transaction system |
-| Distributed clusters | 0.10.0 | Any-node ingress, peer mTLS, replicated metadata, weighted placement, and 2+1 erasure-coded payload durability |
-| Materialized Typed JSON indices | 0.16.0 | Memory-first partition-owned projection, logical catalog sharing, immutable segment/root publication, and bounded query materialization |
-| Rust client | 0.10.0 | Credential exchange, authenticated clients, streaming upload helpers, and the complete generated gRPC API |
-| PersonalDB, public reads, accounting, S3 and Git | 0.10.0 | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
-| Online cluster growth | 0.10.0 | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
-| Shared public listener | 0.10.0 | Native gRPC, S3, Git, administrative APIs and configured HTTP plugins share one authorized public endpoint; peer mTLS remains isolated |
-| Memory-first index pipeline | 0.16.0 | Bounded hot ingress, shared physical recipe routing, partition-local segment/root publication, journal recovery, and CPU/memory-first catch-up |
-| Dates, zero-copy clones, and protected links | 0.15.0 | ISO 8601 or configured date parsing, independent clones sharing immutable payload bytes, and transparent mutable aliases with deletion fencing |
-| General atomic paths | 0.15.0 | Durable path reservations let authorized ordinary paths participate in bounded atomic programs without requiring `PROGRAM_ONLY` policy |
-| Java client | — | TODO |
-| Python client | — | TODO |
-| Node.js client | — | TODO |
-| Ruby client | — | TODO |
-| Authorized HTTP plugin broker | 0.10.0 | Host-routed private services receive short-lived, tenant/bucket/path-scoped object tokens after Zanzibar authorization |
+| Capability | Status |
+| --- | --- |
+| Object storage | Streaming puts, deduplication, CAS, immutable puts, bulk writes, batch reads, deletes, optional version retention, prefix listing, and watches |
+| Authorization | Application credentials, short-lived JWTs, protected administration, Zanzibar schemas, tuples, roles, and checks |
+| Atomic programs | Explicitly selected, deterministic multi-path state transitions without routing ordinary uploads through a transaction system |
+| Distributed clusters | Any-node ingress, peer mTLS, replicated metadata, weighted placement, and 2+1 erasure-coded payload durability |
+| Materialized Typed JSON indices | Memory-first partition-owned projection, logical catalog sharing, immutable segment/root publication, and bounded query materialization |
+| Rust client | Credential exchange, authenticated clients, streaming upload helpers, and the complete generated gRPC API |
+| PersonalDB, public reads, accounting, S3 and Git | Protocol-native PersonalDB groups and projections, authorized usage aggregates, opt-in anonymous reads, and standard S3/Git gateways |
+| Online cluster growth | Large objects use complete replicas below the configured erasure width, then move online to the fixed erasure profile as nodes join |
+| Shared public listener | Native gRPC, S3, Git, administrative APIs and configured HTTP plugins share one authorized public endpoint; peer mTLS remains isolated |
+| Memory-first index pipeline | Bounded hot ingress, shared physical recipe routing, partition-local segment/root publication, journal recovery, and CPU/memory-first catch-up |
+| Dates, zero-copy clones, and protected links | ISO 8601 or configured date parsing, independent clones sharing immutable payload bytes, and transparent mutable aliases with deletion fencing |
+| General atomic paths | Durable path reservations let authorized ordinary paths participate in bounded atomic programs without requiring `PROGRAM_ONLY` policy |
+| Java client | TODO |
+| Python client | TODO |
+| Node.js client | TODO |
+| Ruby client | TODO |
+| Authorized HTTP plugin broker | Host-routed private services receive short-lived, tenant/bucket/path-scoped object tokens after Zanzibar authorization |
 
 The published container is a single multi-platform image for Linux AMD64 and
 ARM64.
@@ -89,21 +89,26 @@ An application authenticates with a `client_id` and `client_secret`. Credential
 exchange returns a short-lived bearer token; the CLI and Rust client perform
 that exchange for you.
 
-Choose and retain a strong application secret:
+Choose and retain a strong application secret in a restrictive file, then copy
+that file into the local container used by these examples:
 
 ```sh
-export KELDRA_OWNER_SECRET="$(openssl rand -hex 32)"
+umask 077
+openssl rand -hex 32 | tr -d '\n' > keldra-data/owner.secret
+KELDRA_OWNER_SECRET="$(cat keldra-data/owner.secret)"
+docker compose -f crates/keldra/docker-compose.yml cp \
+  keldra-data/owner.secret keldra:/tmp/owner.secret
 ```
 
 Use the system credential to create tenant `example`, owner application
 `example-owner`, and client `example-client` in one operation:
 
 ```sh
-docker compose -f crates/keldra/docker-compose.yml exec \
-  -e KELDRA_NEW_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
+docker compose -f crates/keldra/docker-compose.yml exec keldra \
   keldra --endpoint http://127.0.0.1:50051 \
   --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
-  provision-tenant example example-owner example-client
+  provision-tenant example example-owner example-client \
+  --owner-client-secret-file /tmp/owner.secret
 ```
 
 The generated system credential should not remain on the server after you have
@@ -121,9 +126,9 @@ becomes its owner:
 
 ```sh
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e KELDRA_CLIENT_ID=example-client \
-  -e KELDRA_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
+  -e KELDRA_CLIENT_ID=example-client keldra \
   keldra --endpoint http://127.0.0.1:50051 \
+  --client-secret-file /tmp/owner.secret \
   create-bucket objects
 ```
 
@@ -139,16 +144,16 @@ docker compose -f crates/keldra/docker-compose.yml cp \
   keldra-data/hello.txt keldra:/tmp/hello.txt
 
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e KELDRA_CLIENT_ID=example-client \
-  -e KELDRA_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
+  -e KELDRA_CLIENT_ID=example-client keldra \
   keldra --endpoint http://127.0.0.1:50051 \
+  --client-secret-file /tmp/owner.secret \
   put example objects greetings/hello.txt /tmp/hello.txt \
   --content-type text/plain --command-id first-upload
 
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e KELDRA_CLIENT_ID=example-client \
-  -e KELDRA_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
+  -e KELDRA_CLIENT_ID=example-client keldra \
   keldra --endpoint http://127.0.0.1:50051 \
+  --client-secret-file /tmp/owner.secret \
   get example objects greetings/hello.txt
 ```
 
@@ -177,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut objects = keldra::connect_with_credentials(
         "http://127.0.0.1:50051",
         "example-client",
-        std::env::var("KELDRA_OWNER_SECRET")?,
+        std::fs::read_to_string("keldra-data/owner.secret")?,
     )
     .await?;
 
@@ -233,7 +238,7 @@ it, and the target cannot be deleted until every inbound link is removed.
 
 The complete Rust example is in
 [clients/rust/README.md](clients/rust/README.md#clone-bytes-or-link-a-mutable-name).
-Clone and link require cluster protocol/storage capability `2/2`; complete the
+Clone and link require the current cluster protocol/storage capability `1/1`; complete the
 fresh 0.17 bootstrap checks below before using them.
 
 ## Create a PersonalDB group
@@ -264,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let token = keldra::exchange_client_credentials(
         channel.clone(),
         "example-client",
-        std::env::var("KELDRA_OWNER_SECRET")?,
+        std::fs::read_to_string("keldra-data/owner.secret")?,
     )
     .await?;
     let mut personaldb = keldra::personaldb_client(channel, &token.access_token)?;
@@ -325,7 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let token = exchange_client_credentials(
         channel.clone(),
         "example-client",
-        std::env::var("KELDRA_OWNER_SECRET")?,
+        std::fs::read_to_string("keldra-data/owner.secret")?,
     )
     .await?;
     let mut accounting = AccountingServiceClient::with_interceptor(
@@ -350,13 +355,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .await?
         .into_inner();
+    let logical = usage.logical.expect("logical accounting is present");
+    let traffic = usage.traffic.expect("traffic accounting is present");
+    let files = logical
+        .visible_file_count
+        .expect("visible file count is supported");
+    let billable = logical
+        .billable_logical_bytes
+        .expect("billable logical bytes are supported");
+    let retained = logical
+        .retained_non_billable_logical_bytes
+        .expect("retained logical bytes are supported");
     println!(
-        "{} objects, {} stored bytes, {} bytes in, {} bytes out; freshness={:?}",
-        usage.object_count,
-        usage.logical_stored_bytes,
-        usage.accepted_inbound_bytes,
-        usage.served_outbound_bytes,
-        usage.freshness,
+        "{} visible files, {} billable bytes, {} retained bytes, {} bytes in, {} bytes out; freshness={:?}",
+        files.count,
+        billable.bytes,
+        retained.bytes,
+        traffic.accepted_inbound_bytes,
+        traffic.served_outbound_bytes,
+        logical.freshness,
     );
     Ok(())
 }
@@ -439,9 +456,9 @@ header:
 
 ```sh
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e KELDRA_CLIENT_ID=example-client \
-  -e KELDRA_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
+  -e KELDRA_CLIENT_ID=example-client keldra \
   keldra --endpoint http://127.0.0.1:50051 \
+  --client-secret-file /tmp/owner.secret \
   set-bucket-public-read objects enabled
 
 git clone --branch main "$KELDRA_GIT_URL" keldra-data/public-clone
@@ -506,9 +523,9 @@ A bucket owner can enable public reads with the CLI or
 
 ```sh
 docker compose -f crates/keldra/docker-compose.yml exec \
-  -e KELDRA_CLIENT_ID=example-client \
-  -e KELDRA_CLIENT_SECRET="$KELDRA_OWNER_SECRET" keldra \
+  -e KELDRA_CLIENT_ID=example-client keldra \
   keldra --endpoint http://127.0.0.1:50051 \
+  --client-secret-file /tmp/owner.secret \
   set-bucket-public-read objects enabled
 ```
 
@@ -564,7 +581,7 @@ contains a complete two-document program and invocation fixture.
 
 ## Create and query indices
 
-Typed JSON is the current materialized-index surface. The clean-break v6
+Typed JSON is the current materialized-index surface. The clean-break v1
 pipeline consumes each source partition in order, keeps bounded hot work in
 memory, shares extraction and physical recipes across logically equivalent
 definitions, and publishes immutable partition roots at durable checkpoints.
@@ -577,11 +594,11 @@ not a second authority.
 
 The current operational scale runbook is
 [index contention qualification](docs/qualification/index-contention.md). It
-defines the CPU- and memory-normalized SSD qualification and the v6 telemetry
+defines the CPU- and memory-normalized SSD qualification and the v1 telemetry
 required to claim ingestion/index catch-up. The architecture contract is
 [KELDRA-0020](docs/rfcs/keldra_0020_logical_index_catalog_and_shared_physical_projections.md).
 
-### Current v6 resource controls
+### Current v1 resource controls
 
 The indexing pipeline is CPU- and memory-scalable.
 `KELDRA_INDEXING_CORES` sets the process indexing-worker ceiling and
@@ -634,7 +651,7 @@ let channel = connect_channel("http://127.0.0.1:50051").await?;
 let token = exchange_client_credentials(
     channel.clone(),
     "example-client",
-    std::env::var("KELDRA_OWNER_SECRET")?,
+    std::fs::read_to_string("keldra-data/owner.secret")?,
 )
 .await?;
 let mut indices = index_client(channel, &token.access_token)?;
@@ -707,7 +724,7 @@ predicates, ordering, and facets, but not aggregates. Date predicate literals
 use the field's configured format, and facet bucket values are formatted back
 with that same format.
 
-The v6 public-API and SSD qualification constructs, populates, paginates,
+The v1 public-API and SSD qualification constructs, populates, paginates,
 updates, deletes, restart-recovers, and load-tests Typed JSON definitions. It
 exercises every field type and declared capability,
 including multi-valued exact/facet/aggregate semantics, fielded text and phrase
@@ -752,19 +769,17 @@ clusters are unsupported. If application data must move from an older cluster,
 keep that cluster separate and import the data through the public API as new
 writes.
 
-Fresh 0.17 clusters select protocol/storage capability `2/2` during bootstrap,
-including single-node clusters. Confirm that status reports active and target
-`2/2` before admitting production traffic. Capability activation remains an
-explicit, placement-fenced administration operation for a cluster that was
-deliberately initialized with an older selected capability.
+Fresh 0.17 clusters select protocol/storage capability `1/1` during bootstrap,
+including single-node clusters. Confirm that status reports active `1/1` before
+admitting production traffic. There is no predecessor capability mode or
+activation ceremony in the clean-break release.
 
 ```sh
 keldra --endpoint "$KELDRA_ENDPOINT" get-cluster-capabilities
 ```
 
 Supply the same system-operator credentials used for other protected
-administration commands. The status command prints the exact activation command
-when the cluster is ready.
+administration commands.
 
 Before admitting production traffic, smoke clone independence, link
 write-through, target-delete fencing, unlink, and date queries. Never start an
@@ -828,7 +843,7 @@ locks, and index files do not.
 
 Names resolve to stable numeric IDs, so renaming human-facing identifiers does
 not rewrite every storage key. Ordered per-node source journals feed watches,
-reference accounting, and each node's assigned v6 index partitions. Immutable
+reference accounting, and each node's assigned v1 index partitions. Immutable
 index artifacts are ordinary Keldra objects; local materialization is
 disposable acceleration, not another authoritative storage plane.
 
@@ -838,8 +853,7 @@ The architecture contracts live in
 clean-break native-segment index architecture is specified by
 [KELDRA-0014](docs/rfcs/keldra_0014_native_segment_indexes.md). The approved
 integrated payload layout, lifecycle, GC, replication boundary, and WAL
-contract—introduced in 0.15 and retained within 0.17's fresh-volume
-requirement—is specified by
+contract within 0.17's fresh-volume requirement is specified by
 [KELDRA-0018](docs/rfcs/keldra_0018_integrated_payload_storage.md).
 
 ## Build and qualify
@@ -858,10 +872,10 @@ KELDRA_IMAGE=keldra:local ./scripts/build-image.sh
 KELDRA_IMAGE=keldra:local ./scripts/release-gates.sh image
 # On the attested SSD binary kit; see docs/qualification/index-contention.md.
 cd ~/keldra_experiments/kit
-KELDRA_V6_SCALE_MODE=sustained ./qualify-index-v6-ssd-scale.sh
+KELDRA_V1_SCALE_MODE=sustained ./qualify-index-v1-ssd-scale.sh
 ```
 
-The v6 qualification kit verifies its source revision and checksums before
+The v1 qualification kit verifies its source revision and checksums before
 running. It records offered, accepted, source, selected, prepared, projected,
 sealed, and checkpointed throughput; source lag and drain; query latency; and
 CPU, RSS, WAL/store-write evidence under `~/keldra_experiments`. The

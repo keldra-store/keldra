@@ -334,8 +334,8 @@ impl Identity {
 #[cfg(test)]
 mod tests {
     use keldra_store::{
-        BlobRef, Head, LEGACY_OBJECT_MUTATION_FORMAT, MUTATION_STAMP_FORMAT, MutationStamp,
-        PlacementLogId, SourceId, Version, VersionId,
+        BlobRef, Head, MUTATION_STAMP_FORMAT, MutationStamp, OBJECT_MUTATION_FORMAT,
+        ObjectVersioning, PlacementLogId, SourceId, Version, VersionId,
     };
     use tonic::Code;
 
@@ -373,9 +373,10 @@ mod tests {
 
     fn receipt() -> ObjectMutation {
         ObjectMutation {
-            format: LEGACY_OBJECT_MUTATION_FORMAT,
+            format: OBJECT_MUTATION_FORMAT,
             tenant_id: 11,
             bucket_id: 22,
+            versioning: ObjectVersioning::Unversioned,
             exact_path: "objects/entry".into(),
             command_id: "command-1".into(),
             input_fingerprint: [1; 32],

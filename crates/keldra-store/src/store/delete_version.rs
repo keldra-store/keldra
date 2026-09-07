@@ -97,9 +97,8 @@ impl Store {
         if expected_head.version == version_id && target.deleted {
             return Err(MutationError::CurrentTombstoneCannotBeDeleted);
         }
-        if expected_head.version == version_id
-            && self.alias_registry_locked(identity, key.path())?.is_some()
-        {
+        let alias_registry = self.alias_registry_locked(identity, key.path())?;
+        if expected_head.version == version_id && alias_registry.is_some() {
             return Err(MutationError::ObjectHasInboundAliases);
         }
 
@@ -140,6 +139,9 @@ impl Store {
             expected_head,
             target,
             replacement_tombstone,
+            alias_paths: alias_registry
+                .map(|registry| registry.aliases)
+                .unwrap_or_default(),
             stamp: MutationStamp {
                 format: MUTATION_STAMP_FORMAT,
                 predecessor_version: Some(predecessor_version),
@@ -170,28 +172,43 @@ impl Store {
             )?;
         }
         self.stage_retained_version_delete(&mut batch, &mutation)?;
-        self.stage_local_changes(
-            &mut batch,
-            &[PendingLocalChange::RetainedVersionDeleted {
+        let mut changes = Vec::with_capacity(mutation.alias_paths.len().saturating_add(1));
+        changes.push(PendingLocalChange::RetainedVersionDeleted {
+            identity,
+            exact_path: key.path().to_owned(),
+            canonical_path: None,
+            deleted_version: version_id,
+            resulting_head_version: mutation
+                .replacement_tombstone
+                .as_ref()
+                .map(|version| version.id),
+            reference_deltas: mutation.reference_deltas.clone(),
+            accounting_transition: mutation.alias_paths.is_empty().then(|| {
+                AccountingHeadTransition::new(
+                    mutation
+                        .replacement_tombstone
+                        .as_ref()
+                        .and(mutation.target.blob.as_ref().map(|blob| blob.length)),
+                    None,
+                    mutation.target.blob.as_ref().map_or(0, |blob| blob.length),
+                )
+            }),
+        });
+        changes.extend(mutation.alias_paths.iter().cloned().map(|exact_path| {
+            PendingLocalChange::RetainedVersionDeleted {
                 identity,
-                exact_path: key.path().to_owned(),
+                exact_path,
+                canonical_path: Some(mutation.exact_path.clone()),
                 deleted_version: version_id,
                 resulting_head_version: mutation
                     .replacement_tombstone
                     .as_ref()
                     .map(|version| version.id),
-                reference_deltas: mutation.reference_deltas.clone(),
-                accounting_transition: Some(if mutation.replacement_tombstone.is_some() {
-                    AccountingHeadTransition::new(
-                        mutation.target.blob.as_ref().map(|blob| blob.length),
-                        None,
-                    )
-                } else {
-                    AccountingHeadTransition::new(None, None)
-                }),
-            }],
-            reference_effects,
-        )?;
+                reference_deltas: Vec::new(),
+                accounting_transition: None,
+            }
+        }));
+        self.stage_local_changes(&mut batch, &changes, reference_effects)?;
         if reference_effects == LocalReferenceEffects::Deferred {
             self.stage_retained_version_delete_reference_proof(&mut batch, &mutation)?;
         }
@@ -350,7 +367,7 @@ fn not_found() -> CoordinatedRetainedVersionDelete {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PlacementLogId;
+    use crate::{OBJECT_ALIAS_REGISTRY_FORMAT, ObjectAliasRegistry, PlacementLogId};
 
     async fn open(node: u16) -> (tempfile::TempDir, Store) {
         let temporary = tempfile::tempdir().unwrap();
@@ -373,6 +390,28 @@ mod tests {
             command_id: Some(command.into()),
             durability: Durability::Local,
         }
+    }
+
+    fn replace_alias_registry_for_test(
+        store: &Store,
+        identity: BucketIdentity,
+        expected: Option<&ObjectAliasRegistry>,
+        aliases: &[String],
+        commit_cursor: u64,
+    ) -> Option<ObjectAliasRegistry> {
+        let mut batch = WriteBatch::default();
+        let (_, replacement) = store
+            .stage_alias_registry_transition_locked(
+                &mut batch,
+                identity,
+                key().path(),
+                expected,
+                aliases,
+                commit_cursor,
+            )
+            .unwrap();
+        store.db.write(batch).unwrap();
+        replacement
     }
 
     #[tokio::test]
@@ -488,6 +527,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn noncurrent_delete_commutes_with_later_alias_registry_changes_on_replicas() {
+        let (_source_dir, source) = open(1).await;
+        let (_removed_dir, removed_replica) = open(2).await;
+        let (_added_dir, added_replica) = open(3).await;
+        source
+            .enable_bucket_versioning("tenant", "bucket")
+            .await
+            .unwrap();
+        let first = source
+            .put(put(b"first", PutMode::PutIfAbsent, "alias-first"))
+            .await
+            .unwrap();
+        source
+            .put(put(
+                b"second",
+                PutMode::PutIfVersion(first.version),
+                "alias-second",
+            ))
+            .await
+            .unwrap();
+        let (tenant_id, bucket_id) = source.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let identity = BucketIdentity {
+            tenant_id: TenantId(tenant_id),
+            bucket_id: BucketId(bucket_id),
+        };
+        let initial_aliases = vec!["aliases/a".to_owned()];
+        let initial = replace_alias_registry_for_test(&source, identity, None, &initial_aliases, 1)
+            .expect("initial alias registry");
+        let record = source
+            .export_object_path_record(tenant_id, bucket_id, key().path())
+            .unwrap()
+            .expect("source path snapshot");
+        for replica in [&removed_replica, &added_replica] {
+            replica
+                .install_quorum_reconciled_object_record(&ObjectRecordExport::ExactPath(
+                    record.clone(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mutation = source
+            .coordinate_retained_version_delete(
+                &key(),
+                first.version,
+                ObjectMutationGovernance {
+                    tenant_id,
+                    bucket_id,
+                    versioning: ObjectVersioning::Enabled,
+                    policy: BucketPolicy::default(),
+                },
+                ObjectMutationContext {
+                    active_placement_log_id: PlacementLogId { term: 4, index: 9 },
+                    serving_fence_term: 4,
+                },
+            )
+            .await
+            .unwrap()
+            .mutation
+            .expect("new retained delete");
+        assert_eq!(mutation.alias_paths, initial_aliases);
+
+        assert!(
+            replace_alias_registry_for_test(&removed_replica, identity, Some(&initial), &[], 2)
+                .is_none()
+        );
+        let expanded_aliases = vec!["aliases/a".to_owned(), "aliases/z".to_owned()];
+        let expanded = replace_alias_registry_for_test(
+            &added_replica,
+            identity,
+            Some(&initial),
+            &expanded_aliases,
+            2,
+        )
+        .expect("expanded alias registry");
+
+        for replica in [&removed_replica, &added_replica] {
+            let applied = replica
+                .apply_retained_version_delete_replica(&mutation)
+                .await
+                .unwrap();
+            assert!(!applied.replayed);
+            assert!(
+                replica
+                    .version_metadata_by_identity(identity, &key(), first.version)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            removed_replica
+                .object_alias_registry(tenant_id, bucket_id, key().path())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            added_replica
+                .object_alias_registry(tenant_id, bucket_id, key().path())
+                .unwrap(),
+            Some(expanded)
+        );
+    }
+
+    #[tokio::test]
     async fn local_delete_applies_its_reference_effect_and_cursor_atomically() {
         let (_source_dir, source) = open(1).await;
         source
@@ -567,5 +710,121 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_delete_seals_sorted_aliases_and_wakes_every_logical_name() {
+        let (_source_dir, source) = open(1).await;
+        source
+            .enable_bucket_versioning("tenant", "bucket")
+            .await
+            .unwrap();
+        let first = source
+            .put(put(b"first", PutMode::PutIfAbsent, "first"))
+            .await
+            .unwrap();
+        source
+            .put(put(
+                b"second",
+                PutMode::PutIfVersion(first.version),
+                "second",
+            ))
+            .await
+            .unwrap();
+        let (tenant_id, bucket_id) = source.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let identity = BucketIdentity {
+            tenant_id: TenantId(tenant_id),
+            bucket_id: BucketId(bucket_id),
+        };
+        let registry = ObjectAliasRegistry {
+            format: OBJECT_ALIAS_REGISTRY_FORMAT,
+            revision: 1,
+            aliases: vec!["aliases/a".into(), "aliases/z".into()],
+            program_commit_cursor: Some(1),
+        };
+        source
+            .db
+            .put_cf(
+                source.cf(CF_OBJECT_ALIAS_REGISTRIES).unwrap(),
+                identity.head_key(key().path()),
+                registry.canonical_bytes().unwrap(),
+            )
+            .unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: ObjectVersioning::Enabled,
+            policy: BucketPolicy::default(),
+        };
+        let context = ObjectMutationContext {
+            active_placement_log_id: PlacementLogId { term: 4, index: 9 },
+            serving_fence_term: 4,
+        };
+
+        let coordinated = source
+            .coordinate_retained_version_delete(&key(), first.version, governance, context)
+            .await
+            .unwrap();
+        let mutation = coordinated.mutation.unwrap();
+        assert_eq!(mutation.alias_paths, registry.aliases);
+        let proof = source
+            .read_reference_proof(
+                mutation.stamp.source_id,
+                mutation.stamp.source_journal_position,
+            )
+            .unwrap()
+            .unwrap();
+        let LocalChange::RetainedVersionDeleted(proof_change) = proof.change else {
+            panic!("retained deletion proof changed kind")
+        };
+        assert_eq!(proof_change.exact_path, key().path());
+        assert!(proof_change.accounting_transition.is_none());
+        assert_eq!(proof_change.reference_deltas, mutation.reference_deltas);
+
+        let changes = source
+            .scan_local_changes(0, 20)
+            .unwrap()
+            .into_iter()
+            .filter_map(|change| match change {
+                LocalChange::RetainedVersionDeleted(change) => Some(change),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(changes.len(), 3);
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.offset)
+                .collect::<Vec<_>>(),
+            [
+                mutation.stamp.source_journal_position,
+                mutation.stamp.source_journal_position + 1,
+                mutation.stamp.source_journal_position + 2,
+            ]
+        );
+        assert!(changes[0].canonical_path.is_none());
+        assert!(
+            changes[1..]
+                .iter()
+                .all(|change| change.canonical_path.as_deref() == Some("ledger/entry"))
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.exact_path.as_str())
+                .collect::<Vec<_>>(),
+            [key().path(), "aliases/a", "aliases/z"]
+        );
+        assert!(
+            changes
+                .iter()
+                .all(|change| change.accounting_transition.is_none())
+        );
+        assert_eq!(changes[0].reference_deltas, mutation.reference_deltas);
+        assert!(
+            changes[1..]
+                .iter()
+                .all(|change| change.reference_deltas.is_empty())
+        );
     }
 }

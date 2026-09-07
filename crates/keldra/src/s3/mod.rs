@@ -16,8 +16,8 @@ use tokio_stream::StreamExt as _;
 
 use crate::authentication::{JwtManager, RequestRateLimits};
 use crate::distributed_control_plane::DistributedControlPlane;
+use crate::object_service::{GatewayIdentity, GatewayObjectAdapter, GatewayPutMode};
 use crate::serving_fence::ServingAuthority;
-use crate::v05::{GatewayIdentity, GatewayObjectAdapter, GatewayPutMode};
 
 mod auth;
 mod aws_chunked;

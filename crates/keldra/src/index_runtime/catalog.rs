@@ -4,11 +4,11 @@
 //! changes mutate active state directly and broadcast only a best-effort wake;
 //! there is no bounded builder handoff or per-definition assignment queue.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use keldra_index::typed_json::{FieldId, FieldSchema, RecipeFingerprints, TypedJsonSchema};
-use keldra_index::v6::{
+use keldra_index::v1::{
     IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryPermit, IndexingMemoryStage,
 };
 use tonic::Status;
@@ -37,7 +37,7 @@ pub(crate) struct PhysicalRecipeIdentity {
     pub(crate) fingerprint: [u8; 32],
 }
 
-/// Exact format-v6 physical-family identity for one tenant/bucket source scope.
+/// Exact format-v1 physical-family identity for one tenant/bucket source scope.
 /// Field subsets sharing the same membership universe append to this family;
 /// different authorities or membership semantics never share it.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -67,6 +67,12 @@ impl CatalogDefinition {
         object_version: u64,
         stored: StoredIndexDefinition,
     ) -> Result<Self, Status> {
+        if tenant_id == 0 || bucket_id == 0 || object_version == 0 {
+            return Err(Status::data_loss(
+                "assigned index definition has a zero stable identity",
+            ));
+        }
+        definition_path(&stored.name)?;
         let specification = stored.specification()?;
         let schema = compile_typed_json_schema(
             &stored.path_prefix,
@@ -76,7 +82,7 @@ impl CatalogDefinition {
         .map_err(schema_status)?;
         let schema_fingerprint = schema.fingerprint().map_err(schema_status)?;
         let recipe_fingerprints = schema.recipe_fingerprints().map_err(schema_status)?;
-        let definition = Self {
+        Ok(Self {
             tenant_id,
             bucket_id,
             object_version,
@@ -84,9 +90,7 @@ impl CatalogDefinition {
             schema,
             schema_fingerprint,
             recipe_fingerprints,
-        };
-        definition.validate()?;
-        Ok(definition)
+        })
     }
 
     pub(crate) fn identity(&self) -> CatalogIdentity {
@@ -177,15 +181,13 @@ impl CatalogDefinition {
         self.physical_identity().definition_version
     }
 
-    pub(crate) fn validate(&self) -> Result<(), Status> {
+    #[cfg(test)]
+    fn validate(&self) -> Result<(), Status> {
         if self.tenant_id == 0 || self.bucket_id == 0 || self.object_version == 0 {
             return Err(Status::data_loss(
                 "assigned index definition has a zero stable identity",
             ));
         }
-        // `definition_path` is the sole canonical path/name validator. The
-        // assignment's exact path is checked before this value enters the
-        // catalog; this handoff intentionally stores only the validated name.
         definition_path(&self.stored.name)?;
         let specification = self.stored.specification()?;
         let expected_schema = compile_typed_json_schema(
@@ -269,6 +271,7 @@ pub(crate) struct PhysicalCatalogRecipe {
     pub(crate) content_type: Option<String>,
     template: Arc<TypedJsonSchema>,
     pub(crate) fields: BTreeMap<[u8; 32], Arc<FieldSchema>>,
+    pub(crate) selectors: Arc<[String]>,
     pub(crate) physical_generation: [u8; 32],
     references: usize,
     field_references: BTreeMap<[u8; 32], usize>,
@@ -293,6 +296,39 @@ impl PhysicalCatalogRecipe {
         schema.physical_order.clear();
         schema.canonicalize_physical_fields().map_err(schema_status)
     }
+
+    /// Rebuild one logical query schema from the interned physical fields and
+    /// compact public-name contract. The authoritative definition was already
+    /// compiled when this catalog generation committed, so query execution
+    /// does not parse and fingerprint the same definition again.
+    pub(crate) fn query_schema(
+        &self,
+        contract: &LogicalQueryContract,
+    ) -> Result<TypedJsonSchema, Status> {
+        let mut schema = (*self.template).clone();
+        schema.fields = contract
+            .public_fields
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (name, recipe))| {
+                let mut field = self
+                    .fields
+                    .get(recipe)
+                    .ok_or_else(|| {
+                        Status::data_loss("logical query field is absent from its physical family")
+                    })?
+                    .as_ref()
+                    .clone();
+                field.id = FieldId::new(u32::try_from(ordinal).map_err(|_| {
+                    Status::resource_exhausted("logical field catalog exceeds field ID capacity")
+                })?);
+                field.name.clone_from(name);
+                Ok(field)
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        schema.physical_order.clear();
+        Ok(schema)
+    }
 }
 
 #[derive(Clone)]
@@ -314,8 +350,18 @@ struct CatalogState {
     query_contracts: BTreeMap<[u8; 32], LogicalQueryContract>,
     generation: u64,
     physical_generation: [u8; 32],
+    published_physical: Arc<PhysicalCatalogSnapshot>,
     resident_bytes: usize,
     maximum_bytes: usize,
+}
+
+/// Immutable worker view published only after a committed physical-catalog
+/// change. Readers clone this `Arc`, never the complete recipe catalogue.
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicalCatalogSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) identity: [u8; 32],
+    pub(crate) recipes: Arc<[PhysicalCatalogRecipe]>,
 }
 
 impl Default for IndexCatalog {
@@ -357,15 +403,20 @@ impl IndexCatalog {
             .acquire(IndexingMemoryStage::OrderingCatalog, maximum_bytes)
             .map_err(|_| Status::resource_exhausted("active index catalog memory unavailable"))?;
         let (changes, _) = tokio::sync::broadcast::channel(1_024);
+        let empty_physical =
+            physical_catalog_generation(std::iter::empty::<&PhysicalCatalogRecipe>());
         Ok(Self {
             inner: Arc::new(Mutex::new(CatalogState {
                 bindings: BTreeMap::new(),
                 recipes: BTreeMap::new(),
                 query_contracts: BTreeMap::new(),
                 generation: 1,
-                physical_generation: physical_catalog_generation(std::iter::empty::<
-                    &PhysicalCatalogRecipe,
-                >()),
+                physical_generation: empty_physical,
+                published_physical: Arc::new(PhysicalCatalogSnapshot {
+                    generation: 1,
+                    identity: empty_physical,
+                    recipes: Arc::from(Vec::new()),
+                }),
                 resident_bytes: 0,
                 maximum_bytes,
             })),
@@ -374,7 +425,6 @@ impl IndexCatalog {
         })
     }
     pub(crate) fn upsert(&self, definition: CatalogDefinition) -> Result<(), Status> {
-        definition.validate()?;
         let identity = definition.identity();
         let mut state = self
             .inner
@@ -496,7 +546,8 @@ impl IndexCatalog {
         self.changes.subscribe()
     }
 
-    pub(crate) fn snapshot(
+    #[cfg(test)]
+    fn snapshot(
         &self,
     ) -> Result<
         (
@@ -521,38 +572,76 @@ impl IndexCatalog {
         ))
     }
 
+    pub(crate) fn physical_snapshot(&self) -> Result<Arc<PhysicalCatalogSnapshot>, Status> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| Status::internal("active index catalog lock is poisoned"))?
+            .published_physical
+            .clone())
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        identity: CatalogIdentity,
+    ) -> Result<
+        Option<(
+            LogicalCatalogBinding,
+            PhysicalCatalogRecipe,
+            LogicalQueryContract,
+        )>,
+        Status,
+    > {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| Status::internal("active index catalog lock is poisoned"))?;
+        let Some(binding) = state.bindings.get(&identity).cloned() else {
+            return Ok(None);
+        };
+        let recipe = state
+            .recipes
+            .get(&binding.family)
+            .cloned()
+            .ok_or_else(|| Status::data_loss("logical index has no physical v1 family"))?;
+        let contract = state
+            .query_contracts
+            .get(&binding.query_contract)
+            .cloned()
+            .ok_or_else(|| Status::data_loss("logical index has no query contract"))?;
+        Ok(Some((binding, recipe, contract)))
+    }
+
+    pub(crate) fn is_current(
+        &self,
+        identity: CatalogIdentity,
+        object_version: u64,
+        family: ProjectionFamilyIdentity,
+        physical_generation: [u8; 32],
+        membership_recipe: [u8; 32],
+    ) -> Result<bool, Status> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| Status::internal("active index catalog lock is poisoned"))?;
+        let Some(binding) = state.bindings.get(&identity) else {
+            return Ok(false);
+        };
+        let Some(recipe) = state.recipes.get(&family) else {
+            return Ok(false);
+        };
+        Ok(binding.object_version == object_version
+            && binding.family == family
+            && recipe.physical_generation == physical_generation
+            && recipe.membership_recipe == membership_recipe)
+    }
+
     pub(crate) fn resident_bytes(&self) -> Result<usize, Status> {
         Ok(self
             .inner
             .lock()
             .map_err(|_| Status::internal("active index catalog lock is poisoned"))?
             .resident_bytes)
-    }
-
-    pub(crate) fn hot_router_snapshot(
-        &self,
-    ) -> Result<([u8; 32], Vec<super::hot_ingress::CompiledHotRoute>), Status> {
-        let state = self
-            .inner
-            .lock()
-            .map_err(|_| Status::internal("active index catalog lock is poisoned"))?;
-        let routes = state
-            .recipes
-            .values()
-            .map(|recipe| super::hot_ingress::CompiledHotRoute {
-                tenant_id: recipe.family.tenant_id,
-                bucket_id: recipe.family.bucket_id,
-                path_prefix: recipe.path_prefix.clone(),
-                content_type: recipe.content_type.clone(),
-                pointers: recipe
-                    .template
-                    .fields
-                    .iter()
-                    .map(|field| field.source_selector.clone())
-                    .collect(),
-            })
-            .collect();
-        Ok((state.physical_generation, routes))
     }
 }
 
@@ -649,6 +738,8 @@ fn estimated_new_family_recipe_bytes(
                     + 128
                     + std::mem::size_of::<FieldSchema>()
                     + field.name.len()
+                    + field.source_selector.len()
+                    + std::mem::size_of::<String>()
                     + field.source_selector.len(),
             )
             .ok_or_else(|| Status::resource_exhausted("active index catalog size overflow"))?;
@@ -663,6 +754,11 @@ fn mark_catalog_changed(state: &mut CatalogState, physical_changed: bool) -> Res
         .ok_or_else(|| Status::resource_exhausted("active index catalog generation overflow"))?;
     if physical_changed {
         state.physical_generation = physical_catalog_generation(state.recipes.values());
+        state.published_physical = Arc::new(PhysicalCatalogSnapshot {
+            generation: state.generation,
+            identity: state.physical_generation,
+            recipes: Arc::from(state.recipes.values().cloned().collect::<Vec<_>>()),
+        });
     }
     Ok(())
 }
@@ -786,6 +882,7 @@ fn add_recipe_reference(
                 })?;
             let changed = recipe.fields.len() != old_fields;
             if changed {
+                recipe.selectors = recipe_selectors(&recipe.fields);
                 recipe.physical_generation = family_physical_generation(recipe);
             }
             return Ok(changed);
@@ -812,6 +909,7 @@ fn add_recipe_reference(
                     .zip(&definition.schema.fields)
                     .map(|(fingerprint, field)| (fingerprint, Arc::new(field.clone())))
                     .collect(),
+                selectors: Arc::from(Vec::new()),
                 physical_generation: [0; 32],
                 references: 1,
                 field_references: definition
@@ -822,6 +920,7 @@ fn add_recipe_reference(
                     .map(|fingerprint| (fingerprint, 1))
                     .collect(),
             };
+            recipe.selectors = recipe_selectors(&recipe.fields);
             recipe.physical_generation = family_physical_generation(&recipe);
             state.resident_bytes = state
                 .resident_bytes
@@ -866,6 +965,7 @@ fn remove_recipe_reference(state: &mut CatalogState, binding: &LogicalCatalogBin
             }
             let after = recipe_resident_bytes(recipe).unwrap_or(before);
             if recipe.fields.len() != old_fields {
+                recipe.selectors = recipe_selectors(&recipe.fields);
                 recipe.physical_generation = family_physical_generation(recipe);
             }
             state.resident_bytes = state
@@ -921,6 +1021,14 @@ fn recipe_resident_bytes(recipe: &PhysicalCatalogRecipe) -> Option<usize> {
                 .field_references
                 .len()
                 .checked_mul(std::mem::size_of::<([u8; 32], usize)>() + 64)?,
+        )?
+        .checked_add(
+            recipe
+                .selectors
+                .iter()
+                .try_fold(0usize, |bytes, selector| {
+                    bytes.checked_add(std::mem::size_of::<String>() + selector.capacity())
+                })?,
         )?;
     for field in recipe.fields.values() {
         bytes = bytes
@@ -928,6 +1036,17 @@ fn recipe_resident_bytes(recipe: &PhysicalCatalogRecipe) -> Option<usize> {
             .checked_add(field.source_selector.capacity())?;
     }
     Some(bytes)
+}
+
+fn recipe_selectors(fields: &BTreeMap<[u8; 32], Arc<FieldSchema>>) -> Arc<[String]> {
+    Arc::from(
+        fields
+            .values()
+            .map(|field| field.source_selector.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn family_physical_generation(recipe: &PhysicalCatalogRecipe) -> [u8; 32] {
@@ -1115,6 +1234,28 @@ mod tests {
     }
 
     #[test]
+    fn physical_recipe_reuses_its_compiled_selector_catalogue() {
+        let catalog = IndexCatalog::default();
+        catalog.upsert(definition(1, 2, 9)).unwrap();
+        let physical = catalog.physical_snapshot().unwrap();
+        assert_eq!(
+            physical.recipes[0].selectors.as_ref(),
+            ["/value".to_owned()]
+        );
+        let (_, recipe, contract) = catalog
+            .resolve(CatalogIdentity {
+                tenant_id: 1,
+                bucket_id: 2,
+                index_id: 9,
+            })
+            .unwrap()
+            .unwrap();
+        let query = recipe.query_schema(&contract).unwrap();
+        assert_eq!(query.fields[0].name, "value");
+        assert_eq!(query.fields[0].source_selector, "/value");
+    }
+
+    #[test]
     fn ordinary_definition_semantic_update_compiles_a_new_fingerprint() {
         let original = definition(1, 2, 9);
         let mut updated = original.stored.clone();
@@ -1258,6 +1399,26 @@ mod tests {
         let (_, alias_generation, _, families, _) = catalog.snapshot().unwrap();
         assert_eq!(alias_generation, second_generation);
         assert_eq!(families[0].fields.len(), 3);
+    }
+
+    #[test]
+    fn physical_snapshot_is_republished_only_when_the_family_recipe_changes() {
+        let catalog = IndexCatalog::default();
+        catalog.upsert(definition(1, 2, 9)).unwrap();
+        let first = catalog.physical_snapshot().unwrap();
+
+        // This logical alias references the same physical recipe. Workers keep
+        // sharing the already-published immutable snapshot.
+        catalog.upsert(definition(1, 2, 10)).unwrap();
+        let alias = catalog.physical_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&first, &alias));
+
+        catalog
+            .upsert(typed_definition(11, vec![keyword_field("other", "/other")]))
+            .unwrap();
+        let changed = catalog.physical_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&alias, &changed));
+        assert!(changed.generation > alias.generation);
     }
 
     #[test]

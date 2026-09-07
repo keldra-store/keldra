@@ -6,22 +6,28 @@ use std::error::Error;
 use std::io;
 use std::time::Duration;
 
+use keldra_storage::v1::accounting_service_client::AccountingServiceClient;
 use keldra_storage::v1::object_chunk::Value as ObjectChunkValue;
 use keldra_storage::v1::object_head::State as ObjectHeadState;
 use keldra_storage::v1::put_header::Operation as PutOperationValue;
 use keldra_storage::v1::{
-    BucketPolicy, CreateBucketRequest, Durability, GetObjectRequest, HeadObjectRequest,
+    AccountingMeasurementState, BucketPolicy, CreateBucketRequest, DisableAccountingRequest,
+    Durability, EnableAccountingRequest, GetAccountingRequest, GetObjectRequest, HeadObjectRequest,
     InvokeProgramRequest, ObjectAddress, ObjectVersioning, PutHeader, PutImmutableOperation,
     SetBucketPolicyRequest,
 };
 use keldra_storage::{
-    RawClient, administration_client, connect_channel, exchange_client_credentials, object_client,
-    put_chunks,
+    BearerToken, RawClient, administration_client, connect_channel, exchange_client_credentials,
+    object_client, put_chunks,
 };
 use serde_json::Value;
 use tokio::time::{Instant, sleep};
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
+use tonic::{Code, Status};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+type AccountingClient = AccountingServiceClient<InterceptedService<Channel, BearerToken>>;
 
 const PROGRAM_PATH: &str = "_keldra/programs/atomic-program-qualification@1";
 const PRIMARY_PATH: &str = "atomic/primary.json";
@@ -93,7 +99,16 @@ async fn main() -> TestResult<()> {
         })
         .await?;
 
+    let mut accounting = channels
+        .iter()
+        .cloned()
+        .map(|channel| accounting_client(channel, &token))
+        .collect::<Result<Vec<_>, _>>()?;
+    let accounting_definition = enable_atomic_accounting(&mut accounting[0], &bucket).await?;
+    wait_for_complete_accounting_zero(&mut accounting, &bucket).await?;
+
     let input = invocation_input(&tenant, &bucket);
+    let expected_accounting_bytes = expected_committed_payload_bytes()?;
     let first_invocation = objects.invoke_program(invocation(
         &tenant,
         &bucket,
@@ -102,9 +117,13 @@ async fn main() -> TestResult<()> {
         durability,
     ));
     let visibility = observe_all_or_nothing(channels.clone(), &token, &tenant, &bucket);
-    let (first, observed_pairs) = tokio::join!(first_invocation, visibility);
+    let accounting_visibility =
+        observe_atomic_accounting(&mut accounting, &bucket, expected_accounting_bytes);
+    let (first, observed_pairs, accounting_bytes) =
+        tokio::join!(first_invocation, visibility, accounting_visibility);
     let first = first?.into_inner();
     let observed_pairs = observed_pairs?;
+    let accounting_bytes = accounting_bytes?;
     if first.replayed {
         return Err(invalid(
             "first atomic invocation unexpectedly reported replay",
@@ -141,18 +160,237 @@ async fn main() -> TestResult<()> {
             "replayed atomic invocation returned different output or path receipts",
         ));
     }
+    let replay_accounting_bytes =
+        observe_atomic_accounting(&mut accounting, &bucket, expected_accounting_bytes).await?;
+    if replay_accounting_bytes != accounting_bytes {
+        return Err(invalid(
+            "replayed atomic invocation changed the logical accounting total",
+        ));
+    }
 
     for channel in channels.iter().skip(1) {
         let mut replica = object_client(channel.clone(), &token)?;
         verify_committed_pair_eventually(&mut replica, &tenant, &bucket, &first_receipts).await?;
     }
     verify_committed_pair_eventually(&mut objects, &tenant, &bucket, &first_receipts).await?;
+    disable_atomic_accounting(&mut accounting[0], &bucket, accounting_definition.version).await?;
 
     println!(
-        "atomic-program qualification passed on {} node(s): authenticated multi-object commit and deterministic replay verified",
-        endpoints.len()
+        "atomic-program qualification passed on {} node(s): authenticated multi-object commit, {accounting_bytes} atomic logical bytes, and deterministic replay verified",
+        endpoints.len(),
     );
     Ok(())
+}
+
+fn accounting_client(
+    channel: Channel,
+    token: &str,
+) -> Result<AccountingClient, tonic::metadata::errors::InvalidMetadataValue> {
+    Ok(
+        AccountingServiceClient::with_interceptor(channel, BearerToken::new(token)?)
+            .max_encoding_message_size(72 * 1024 * 1024)
+            .max_decoding_message_size(72 * 1024 * 1024),
+    )
+}
+
+async fn enable_atomic_accounting(
+    client: &mut AccountingClient,
+    bucket: &str,
+) -> TestResult<keldra_storage::v1::AccountingDefinition> {
+    let definition = client
+        .enable_accounting(EnableAccountingRequest {
+            bucket: bucket.into(),
+            path_prefix: "atomic".into(),
+            command_id: "atomic-program-qualification-accounting-enable".into(),
+        })
+        .await?
+        .into_inner();
+    if definition.accounting_id == 0 || definition.version == 0 {
+        return Err(invalid(
+            "atomic accounting definition returned an invalid identity",
+        ));
+    }
+    Ok(definition)
+}
+
+async fn disable_atomic_accounting(
+    client: &mut AccountingClient,
+    bucket: &str,
+    expected_version: u64,
+) -> TestResult<()> {
+    let outcome = client
+        .disable_accounting(DisableAccountingRequest {
+            bucket: bucket.into(),
+            path_prefix: "atomic".into(),
+            expected_version,
+            command_id: "atomic-program-qualification-accounting-disable".into(),
+        })
+        .await?
+        .into_inner();
+    if !outcome.disabled || outcome.tombstone_version == 0 {
+        return Err(invalid(
+            "atomic accounting disable returned an invalid outcome",
+        ));
+    }
+    Ok(())
+}
+
+async fn wait_for_complete_accounting_zero(
+    clients: &mut [AccountingClient],
+    bucket: &str,
+) -> TestResult<()> {
+    let deadline = Instant::now() + REPLICA_WAIT_LIMIT;
+    let mut last = String::new();
+    loop {
+        let mut all_zero = true;
+        for client in clients.iter_mut() {
+            match client
+                .get_accounting(GetAccountingRequest {
+                    bucket: bucket.into(),
+                    path_prefix: "atomic".into(),
+                })
+                .await
+            {
+                Ok(response) => {
+                    let snapshot = response.into_inner();
+                    let complete_zero = snapshot.logical.as_ref().is_some_and(|logical| {
+                        logical
+                            .visible_file_count
+                            .as_ref()
+                            .is_some_and(|measurement| {
+                                measurement.state == AccountingMeasurementState::Present as i32
+                                    && measurement.count == 0
+                            })
+                            && logical
+                                .billable_logical_bytes
+                                .as_ref()
+                                .is_some_and(|measurement| measurement.bytes == 0)
+                            && logical
+                                .freshness
+                                .as_ref()
+                                .is_some_and(|freshness| freshness.complete)
+                    });
+                    if !complete_zero {
+                        last = format!("latest atomic accounting snapshot: {snapshot:?}");
+                        all_zero = false;
+                    }
+                }
+                Err(status) if retryable_accounting(&status) => {
+                    last = status.to_string();
+                    all_zero = false;
+                }
+                Err(status) => return Err(status.into()),
+            }
+        }
+        if all_zero {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(format!(
+                "atomic accounting did not establish a complete zero baseline: {last}"
+            )));
+        }
+        sleep(REPLICA_POLL_INTERVAL).await;
+    }
+}
+
+async fn observe_atomic_accounting(
+    clients: &mut [AccountingClient],
+    bucket: &str,
+    expected_bytes: u64,
+) -> TestResult<u64> {
+    let deadline = Instant::now() + REPLICA_WAIT_LIMIT;
+    let mut last = String::new();
+    loop {
+        let mut full_bytes = vec![None; clients.len()];
+        for (position, client) in clients.iter_mut().enumerate() {
+            match client
+                .get_accounting(GetAccountingRequest {
+                    bucket: bucket.into(),
+                    path_prefix: "atomic".into(),
+                })
+                .await
+            {
+                Ok(response) => {
+                    let snapshot = response.into_inner();
+                    let Some(logical) = snapshot.logical.as_ref() else {
+                        return Err(invalid("atomic accounting omitted logical usage"));
+                    };
+                    let complete = logical
+                        .freshness
+                        .as_ref()
+                        .is_some_and(|freshness| freshness.complete);
+                    let bytes = logical
+                        .billable_logical_bytes
+                        .as_ref()
+                        .map(|measurement| measurement.bytes)
+                        .unwrap_or(u64::MAX);
+                    let file_count = logical
+                        .visible_file_count
+                        .as_ref()
+                        .filter(|measurement| {
+                            measurement.state == AccountingMeasurementState::Present as i32
+                        })
+                        .map(|measurement| measurement.count)
+                        .unwrap_or(u64::MAX);
+                    match (file_count, bytes) {
+                        (0, 0) => {
+                            last =
+                                "latest complete atomic accounting snapshot remained zero".into();
+                        }
+                        (2, bytes) if bytes == expected_bytes && complete => {
+                            full_bytes[position] = Some(bytes)
+                        }
+                        (2, bytes) if bytes == expected_bytes => {
+                            last = format!(
+                                "latest exact atomic accounting snapshot was incomplete: {snapshot:?}"
+                            );
+                        }
+                        (objects, bytes) => {
+                            return Err(invalid(format!(
+                                "complete accounting snapshot exposed a partial atomic commit: objects={objects} logical_bytes={bytes}"
+                            )));
+                        }
+                    }
+                }
+                Err(status) if retryable_accounting(&status) => last = status.to_string(),
+                Err(status) => return Err(status.into()),
+            }
+        }
+        if full_bytes.iter().all(Option::is_some) {
+            let expected = full_bytes[0].expect("checked above");
+            if full_bytes.iter().any(|bytes| *bytes != Some(expected)) {
+                return Err(invalid(format!(
+                    "atomic accounting endpoints disagreed on final logical bytes: {full_bytes:?}"
+                )));
+            }
+            return Ok(expected);
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(format!(
+                "atomic accounting did not converge to two objects on every endpoint: {last}"
+            )));
+        }
+        sleep(REPLICA_POLL_INTERVAL).await;
+    }
+}
+
+fn expected_committed_payload_bytes() -> TestResult<u64> {
+    let primary = serde_json::to_vec(&serde_json::json!({
+        "status": "primary-committed",
+    }))?;
+    let secondary = serde_json::to_vec(&serde_json::json!({
+        "status": "secondary-committed",
+    }))?;
+    u64::try_from(primary.len() + secondary.len())
+        .map_err(|_| invalid("atomic accounting payload length is exhausted"))
+}
+
+fn retryable_accounting(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::NotFound
+    )
 }
 
 fn invocation(

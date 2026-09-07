@@ -494,6 +494,21 @@ fn emit_rocksdb_metrics(
     if let Some(value) = rocksdb.background_errors {
         tracing::debug!(gauge.keldra_rocksdb_background_errors = value);
     }
+    if let Some(value) = rocksdb.payload_live_blob_bytes {
+        tracing::debug!(gauge.keldra_storage_live_payload_blob_bytes = value);
+    }
+    if let Some(value) = rocksdb.payload_garbage_blob_bytes {
+        tracing::debug!(gauge.keldra_storage_garbage_payload_blob_bytes = value);
+    }
+    if let Some(value) = rocksdb.payload_sst_bytes {
+        tracing::debug!(gauge.keldra_storage_payload_sst_bytes = value);
+    }
+    if let Some(value) = rocksdb.non_payload_metadata_index_sst_bytes {
+        tracing::debug!(gauge.keldra_storage_metadata_index_sst_bytes = value);
+    }
+    if let Some(value) = rocksdb.total_wal_bytes {
+        tracing::debug!(gauge.keldra_storage_wal_bytes = value);
+    }
     if rocksdb.write_stopped.is_some()
         || rocksdb.actual_delayed_write_rate_bytes_per_second.is_some()
     {

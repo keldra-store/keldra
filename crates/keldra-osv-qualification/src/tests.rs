@@ -153,9 +153,8 @@ struct CloneReferenceContent<'a> {
     source_record_id: &'a str,
     ecosystem: &'a str,
     package: &'a str,
-    normalised_ecosystem: &'a str,
-    normalised_package: &'a str,
     modified_at: &'a Option<String>,
+    modified_day: &'a str,
     published_at: &'a Option<String>,
     withdrawn: bool,
     aliases: &'a [String],
@@ -199,11 +198,6 @@ fn prepare_record_clone_reference(
         .as_object_mut()
         .context("OSV document must be a JSON object")?
         .insert("affected".into(), Value::Array(job.affected.clone()));
-    let normalised_ecosystem = job.ecosystem.trim().to_ascii_lowercase();
-    let normalised_package = normalize_package_name(&job.ecosystem, &job.package);
-    let record_identity_hash = digest_bytes(
-        format!("osv\0{source_record_id}\0{normalised_ecosystem}\0{normalised_package}").as_bytes(),
-    );
     let modified_at = string_field(document, "modified");
     let modified_day = timestamp_day(modified_at.as_deref());
     let published_at = string_field(document, "published");
@@ -214,33 +208,12 @@ fn prepare_record_clone_reference(
     let summary = string_field(document, "summary");
     let details = string_field(document, "details");
     let state = if withdrawn { "withdrawn" } else { "active" };
-    let content_sha256 = digest_bytes(&serde_json::to_vec(&CloneReferenceContent {
-        schema: "keldra.osv.source-record.v1",
-        source_id: "osv",
-        source_record_id,
-        ecosystem: &job.ecosystem,
-        package: &job.package,
-        normalised_ecosystem: &normalised_ecosystem,
-        normalised_package: &normalised_package,
-        modified_at: &modified_at,
-        published_at: &published_at,
-        withdrawn,
-        aliases: &aliases,
-        summary: &summary,
-        details: &details,
-        state,
-        document: &scoped_document,
-    })?);
     let record = OsvSourceRecord {
         schema: "keldra.osv.source-record.v1".into(),
         source_id: "osv".into(),
         source_record_id: source_record_id.into(),
-        record_identity_hash,
-        content_sha256,
         ecosystem: job.ecosystem.clone(),
         package: job.package.clone(),
-        normalised_ecosystem: normalised_ecosystem.clone(),
-        normalised_package,
         modified_at,
         modified_day: modified_day.clone(),
         published_at,
@@ -253,7 +226,7 @@ fn prepare_record_clone_reference(
     };
     Ok(PreparedRecord {
         encoded: serde_json::to_vec(&record)?,
-        normalised_ecosystem,
+        ecosystem: job.ecosystem.clone(),
         modified_day,
     })
 }
@@ -306,7 +279,7 @@ fn parallel_shard_compression_is_byte_identical_to_serial() {
 }
 
 #[test]
-fn shard_compression_flushes_a_partial_wave_in_submission_order() {
+fn shard_compression_flushes_partial_pool_work_in_submission_order() {
     let expected = test_shard_builders()
         .into_iter()
         .take(5)
@@ -319,7 +292,7 @@ fn shard_compression_flushes_a_partial_wave_in_submission_order() {
     for builder in builders.into_iter().take(5) {
         compressor.submit(builder).unwrap();
     }
-    assert_eq!(compressor.pending.len(), 2);
+    assert!(compressor.in_flight <= compressor.maximum_in_flight);
     compressor.finish().unwrap();
 
     let mut actual = Vec::new();
@@ -343,13 +316,13 @@ fn shard_compression_rejects_zero_workers() {
 }
 
 #[test]
-fn shard_compression_never_retains_more_than_one_bounded_wave() {
+fn shard_compression_in_flight_work_is_bounded() {
     let builders = test_shard_builders();
     let (sender, _receiver) = mpsc::channel(builders.len());
     let mut compressor = ShardCompressor::start(3, sender).unwrap();
     for builder in builders {
         compressor.submit(builder).unwrap();
-        assert!(compressor.pending.len() < compressor.worker_count);
+        assert!(compressor.in_flight <= compressor.maximum_in_flight);
     }
     compressor.finish().unwrap();
 }
@@ -360,7 +333,8 @@ fn shard_compression_reports_a_stopped_consumer_without_hanging() {
     let (sender, receiver) = mpsc::channel(1);
     drop(receiver);
     let mut compressor = ShardCompressor::start(1, sender).unwrap();
-    let error = compressor.submit(builder).unwrap_err();
+    compressor.submit(builder).unwrap();
+    let error = compressor.finish().unwrap_err();
     assert!(
         error
             .to_string()
@@ -441,35 +415,17 @@ fn exact_osv_transform_materialises_package_records() {
         .map(decode_record)
         .find(|record| record.ecosystem == "npm")
         .unwrap();
-    assert_eq!(npm.normalised_package, "example");
+    assert_eq!(npm.package, "example");
+    let npm_json = serde_json::to_value(&npm).unwrap();
+    assert!(npm_json.get("normalised_ecosystem").is_none());
+    assert!(npm_json.get("normalised_package").is_none());
     assert_eq!(npm.aliases, ["CVE-2026-1"]);
     assert_eq!(npm.modified_day, "2026-07-14");
     assert_eq!(npm.document["affected"].as_array().unwrap().len(), 2);
-    let content = CloneReferenceContent {
-        schema: "keldra.osv.source-record.v1",
-        source_id: "osv",
-        source_record_id: &npm.source_record_id,
-        ecosystem: &npm.ecosystem,
-        package: &npm.package,
-        normalised_ecosystem: &npm.normalised_ecosystem,
-        normalised_package: &npm.normalised_package,
-        modified_at: &npm.modified_at,
-        published_at: &npm.published_at,
-        withdrawn: npm.withdrawn,
-        aliases: &npm.aliases,
-        summary: &npm.summary,
-        details: &npm.details,
-        state: &npm.state,
-        document: &npm.document,
-    };
-    assert_eq!(
-        npm.content_sha256,
-        digest_bytes(&serde_json::to_vec(&content).unwrap())
-    );
 }
 
 #[test]
-fn streaming_content_digest_matches_materialised_json_bytes() {
+fn borrowed_canonical_content_matches_materialised_json() {
     let prepared = prepare_record_jobs(serde_json::json!({
         "z": 1.0,
         "published": "2026-07-13T12:00:00Z",
@@ -484,9 +440,8 @@ fn streaming_content_digest_matches_materialised_json_bytes() {
     }))
     .unwrap();
     let job = &prepared.jobs[0];
-    let normalised_ecosystem = job.ecosystem.trim().to_ascii_lowercase();
-    let normalised_package = normalize_package_name(&job.ecosystem, &job.package);
     let modified_at = string_field(&prepared.document, "modified");
+    let modified_day = timestamp_day(modified_at.as_deref());
     let published_at = string_field(&prepared.document, "published");
     let aliases = string_array(&prepared.document, "aliases");
     let summary = string_field(&prepared.document, "summary");
@@ -497,9 +452,8 @@ fn streaming_content_digest_matches_materialised_json_bytes() {
         source_record_id: &prepared.source_record_id,
         ecosystem: &job.ecosystem,
         package: &job.package,
-        normalised_ecosystem: &normalised_ecosystem,
-        normalised_package: &normalised_package,
         modified_at: &modified_at,
+        modified_day: &modified_day,
         published_at: &published_at,
         withdrawn: false,
         aliases: &aliases,
@@ -512,9 +466,30 @@ fn streaming_content_digest_matches_materialised_json_bytes() {
         },
     };
 
+    let mut document = prepared.document.clone();
+    document
+        .as_object_mut()
+        .unwrap()
+        .insert("affected".into(), Value::Array(job.affected.clone()));
+    let expected = CloneReferenceContent {
+        schema: "keldra.osv.source-record.v1",
+        source_id: "osv",
+        source_record_id: &prepared.source_record_id,
+        ecosystem: &job.ecosystem,
+        package: &job.package,
+        modified_at: &modified_at,
+        modified_day: &modified_day,
+        published_at: &published_at,
+        withdrawn: false,
+        aliases: &aliases,
+        summary: &summary,
+        details: &details,
+        state: "active",
+        document: &document,
+    };
     assert_eq!(
-        digest_json(&content).unwrap(),
-        digest_bytes(&serde_json::to_vec(&content).unwrap())
+        serde_json::to_value(content).unwrap(),
+        serde_json::to_value(expected).unwrap()
     );
 }
 
@@ -550,7 +525,6 @@ fn shard_encoding_is_content_addressed_zstd_6_ndjson() {
     let decoded = zstd::stream::decode_all(Cursor::new(&shard.encoded_payload)).unwrap();
 
     assert_eq!(digest_bytes(&decoded), shard.records_sha256);
-    assert_eq!(digest_bytes(&shard.encoded_payload), shard.encoded_sha256);
     assert_eq!(decoded.last(), Some(&b'\n'));
     assert_eq!(
         shard_path(&shard.records_sha256),
@@ -563,15 +537,9 @@ fn shard_encoding_is_content_addressed_zstd_6_ndjson() {
 }
 
 #[test]
-fn source_definition_has_exact_schema_and_content_addressed_identity() {
+fn source_definition_has_exact_schema_and_self_describing_identity() {
     let path = source_definition_path();
-    assert_eq!(
-        path,
-        format!(
-            "entities/source-definition/{}/current.json",
-            digest_bytes(b"source-definition\0osv")
-        )
-    );
+    assert_eq!(path, "entities/source-definition/osv/current.json");
     let definition = SourceDefinition {
         schema: "keldra.osv.source-definition.v1".into(),
         source_id: "osv".into(),
@@ -588,6 +556,29 @@ fn source_definition_has_exact_schema_and_content_addressed_identity() {
     assert_eq!(value["schema"], "keldra.osv.source-definition.v1");
     assert_eq!(value["authentication_profile"], "public-https");
     assert_eq!(value["source_bucket"], OSV_QUALIFICATION_BUCKET);
+}
+
+#[test]
+fn manifest_has_one_corpus_digest_fact() {
+    let value = serde_json::to_value(OsvSnapshotManifest {
+        schema: "keldra.osv.snapshot-manifest.v1".into(),
+        source_id: "osv".into(),
+        snapshot_id: "snapshot".into(),
+        snapshot_day: "2026-07-18".into(),
+        partition: "manifest".into(),
+        corpus_sha256: "a".repeat(64),
+        format: "keldra.osv.source-record.ndjson.v1".into(),
+        compression: "zstd-6".into(),
+        source_record_count: 0,
+        shard_count: 0,
+        partitions: BTreeMap::new(),
+        shards: Vec::new(),
+        state: "committed".into(),
+    })
+    .unwrap();
+    assert_eq!(value["corpus_sha256"], "a".repeat(64));
+    assert!(value.get("content_digest").is_none());
+    assert!(value.get("input_sha256").is_none());
 }
 
 #[test]

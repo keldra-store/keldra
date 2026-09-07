@@ -9,9 +9,10 @@ use keldra_storage::v1::accounting_service_client::AccountingServiceClient;
 use keldra_storage::v1::object_chunk::Value as ObjectChunkValue;
 use keldra_storage::v1::put_header::Operation as PutOperationValue;
 use keldra_storage::v1::{
-    CreateBucketRequest, DeleteRequest, DisableAccountingRequest, Durability,
-    EnableAccountingRequest, GetAccountingRequest, GetObjectRequest, ObjectAddress,
-    ObjectVersioning, PutHeader, PutOperation,
+    AccountingMeasurementState, CreateBucketRequest, DeleteRequest, DeleteVersionRequest,
+    DisableAccountingRequest, Durability, EnableAccountingRequest, GetAccountingRequest,
+    GetObjectRequest, LinkObjectRequest, MutationReceipt, ObjectAddress, ObjectVersioning,
+    PutHeader, PutOperation, UnlinkObjectRequest,
 };
 use keldra_storage::{
     BearerToken, RawClient, administration_client, connect_channel, exchange_client_credentials,
@@ -69,9 +70,16 @@ async fn main() -> TestResult<()> {
         .cloned()
         .map(|channel| object_client(channel, &token))
         .collect::<Result<Vec<_>, _>>()?;
+    let node_count = objects.len();
 
-    let bucket_definition = enable(&mut accounting[0], &bucket, "", "bucket").await?;
-    let prefix_definition = enable(&mut accounting[0], &bucket, "billable", "prefix").await?;
+    let bucket_definition = enable(&mut accounting[0], &bucket, "", "unversioned-bucket").await?;
+    let prefix_definition = enable(
+        &mut accounting[0],
+        &bucket,
+        "billable",
+        "unversioned-prefix",
+    )
+    .await?;
 
     // Definition objects are authoritative immediately; each node discovers
     // the disposable traffic-meter assignment asynchronously.
@@ -123,7 +131,6 @@ async fn main() -> TestResult<()> {
         expected_bytes,
     )
     .await?;
-
     for (index, address) in addresses.into_iter().enumerate() {
         let writer = (index + 2) % objects.len();
         objects[writer]
@@ -144,6 +151,7 @@ async fn main() -> TestResult<()> {
         expected_bytes,
     )
     .await?;
+    wait_for_retained_non_billable(&mut accounting, &bucket, "billable", expected_bytes).await?;
     wait_for(
         &mut accounting,
         &bucket,
@@ -155,14 +163,153 @@ async fn main() -> TestResult<()> {
     )
     .await?;
 
+    let alias_target = ObjectAddress {
+        tenant: tenant.clone(),
+        bucket: bucket.clone(),
+        path: "archive/alias-target.bin".into(),
+    };
+    let alias = ObjectAddress {
+        tenant: tenant.clone(),
+        bucket: bucket.clone(),
+        path: "billable/alias.bin".into(),
+    };
+    put_payload(
+        &mut objects[0],
+        alias_target.clone(),
+        b"0123456789",
+        "accounting-qualification-alias-put-10",
+    )
+    .await?;
+    link(
+        &mut objects[1 % node_count],
+        alias.clone(),
+        alias_target.clone(),
+        "accounting-qualification-alias-link",
+    )
+    .await?;
+    wait_for(
+        &mut accounting,
+        &bucket,
+        "billable",
+        1,
+        10,
+        expected_bytes,
+        expected_bytes,
+    )
+    .await?;
+    wait_for(
+        &mut accounting,
+        &bucket,
+        "",
+        2,
+        20,
+        expected_bytes + 10,
+        expected_bytes,
+    )
+    .await?;
+
+    put_payload(
+        &mut objects[2 % node_count],
+        alias_target.clone(),
+        b"01234567890123456789",
+        "accounting-qualification-alias-put-20",
+    )
+    .await?;
+    wait_for(
+        &mut accounting,
+        &bucket,
+        "billable",
+        1,
+        20,
+        expected_bytes,
+        expected_bytes,
+    )
+    .await?;
+    wait_for(
+        &mut accounting,
+        &bucket,
+        "",
+        2,
+        40,
+        expected_bytes + 30,
+        expected_bytes,
+    )
+    .await?;
+
+    unlink(
+        &mut objects[0],
+        alias,
+        "accounting-qualification-alias-unlink",
+    )
+    .await?;
+    wait_for(
+        &mut accounting,
+        &bucket,
+        "billable",
+        0,
+        0,
+        expected_bytes,
+        expected_bytes,
+    )
+    .await?;
+    wait_for(
+        &mut accounting,
+        &bucket,
+        "",
+        1,
+        20,
+        expected_bytes + 30,
+        expected_bytes,
+    )
+    .await?;
+
+    let delete_command_id = "accounting-qualification-alias-delete";
+    let deleted = objects[1 % node_count]
+        .delete(DeleteRequest {
+            address: Some(alias_target),
+            command_id: delete_command_id.into(),
+            durability: Durability::Local as i32,
+        })
+        .await?
+        .into_inner();
+    require_receipt(&deleted, delete_command_id, true)?;
+    wait_for(
+        &mut accounting,
+        &bucket,
+        "billable",
+        0,
+        0,
+        expected_bytes,
+        expected_bytes,
+    )
+    .await?;
+    wait_for(
+        &mut accounting,
+        &bucket,
+        "",
+        0,
+        0,
+        expected_bytes + 30,
+        expected_bytes,
+    )
+    .await?;
+
     disable(
         &mut accounting[0],
         &bucket,
         "billable",
         prefix_definition.version,
+        "unversioned-prefix",
     )
     .await?;
-    disable(&mut accounting[0], &bucket, "", bucket_definition.version).await?;
+    disable(
+        &mut accounting[0],
+        &bucket,
+        "",
+        bucket_definition.version,
+        "unversioned-bucket",
+    )
+    .await?;
     let error = accounting[0]
         .get_accounting(GetAccountingRequest {
             bucket: bucket.clone(),
@@ -177,10 +324,195 @@ async fn main() -> TestResult<()> {
         )));
     }
 
+    let versioned_bucket = format!("{bucket}-versioned");
+    administrator
+        .create_bucket(CreateBucketRequest {
+            bucket: versioned_bucket.clone(),
+            versioning: ObjectVersioning::Enabled as i32,
+        })
+        .await?;
+    let versioned_bucket_definition = enable(
+        &mut accounting[0],
+        &versioned_bucket,
+        "",
+        "versioned-bucket",
+    )
+    .await?;
+    let versioned_prefix_definition = enable(
+        &mut accounting[0],
+        &versioned_bucket,
+        "billable",
+        "versioned-prefix",
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for(&mut accounting, &versioned_bucket, "", 0, 0, 0, 0).await?;
+    wait_for(&mut accounting, &versioned_bucket, "billable", 0, 0, 0, 0).await?;
+
+    let retained_target = ObjectAddress {
+        tenant: tenant.clone(),
+        bucket: versioned_bucket.clone(),
+        path: "archive/retained-target.bin".into(),
+    };
+    let retained_alias = ObjectAddress {
+        tenant,
+        bucket: versioned_bucket.clone(),
+        path: "billable/retained-alias.bin".into(),
+    };
+    let first_version = put_payload(
+        &mut objects[0],
+        retained_target.clone(),
+        b"0123456789",
+        "accounting-qualification-retained-put-10",
+    )
+    .await?;
+    let second_version = put_payload(
+        &mut objects[1 % node_count],
+        retained_target.clone(),
+        b"01234567890123456789",
+        "accounting-qualification-retained-put-20",
+    )
+    .await?;
+    if second_version <= first_version {
+        return Err(invalid("versioned puts did not advance the object version"));
+    }
+    link(
+        &mut objects[2 % node_count],
+        retained_alias.clone(),
+        retained_target.clone(),
+        "accounting-qualification-retained-link",
+    )
+    .await?;
+    wait_for(&mut accounting, &versioned_bucket, "billable", 1, 30, 0, 0).await?;
+    wait_for(&mut accounting, &versioned_bucket, "", 2, 60, 30, 0).await?;
+
+    let deleted_non_current = objects[0]
+        .delete_version(DeleteVersionRequest {
+            address: Some(retained_alias.clone()),
+            version: first_version,
+            durability: Durability::Local as i32,
+        })
+        .await?
+        .into_inner();
+    if !deleted_non_current.deleted || deleted_non_current.replacement_tombstone_version.is_some() {
+        return Err(invalid(
+            "DeleteVersion through the alias did not remove only the retained version",
+        ));
+    }
+    wait_for(&mut accounting, &versioned_bucket, "billable", 1, 20, 0, 0).await?;
+    wait_for(&mut accounting, &versioned_bucket, "", 2, 40, 30, 0).await?;
+
+    unlink(
+        &mut objects[1 % node_count],
+        retained_alias,
+        "accounting-qualification-retained-unlink",
+    )
+    .await?;
+    wait_for(&mut accounting, &versioned_bucket, "billable", 0, 0, 0, 0).await?;
+    wait_for(&mut accounting, &versioned_bucket, "", 1, 20, 30, 0).await?;
+
+    let deleted_current = objects[2 % node_count]
+        .delete_version(DeleteVersionRequest {
+            address: Some(retained_target),
+            version: second_version,
+            durability: Durability::Local as i32,
+        })
+        .await?
+        .into_inner();
+    if !deleted_current.deleted || deleted_current.replacement_tombstone_version.is_none() {
+        return Err(invalid(
+            "DeleteVersion did not replace the current retained version with a tombstone",
+        ));
+    }
+    wait_for(&mut accounting, &versioned_bucket, "billable", 0, 0, 0, 0).await?;
+    wait_for(&mut accounting, &versioned_bucket, "", 0, 0, 30, 0).await?;
+
+    disable(
+        &mut accounting[0],
+        &versioned_bucket,
+        "billable",
+        versioned_prefix_definition.version,
+        "versioned-prefix",
+    )
+    .await?;
+    disable(
+        &mut accounting[0],
+        &versioned_bucket,
+        "",
+        versioned_bucket_definition.version,
+        "versioned-bucket",
+    )
+    .await?;
+
     println!(
-        "accounting qualification passed on {} node(s): {expected_bytes} payload bytes",
+        "accounting qualification passed on {} node(s): {expected_bytes} ordinary payload bytes plus alias and retained-lineage accounting",
         endpoints.len()
     );
+    Ok(())
+}
+
+async fn put_payload(
+    client: &mut RawClient,
+    address: ObjectAddress,
+    bytes: &[u8],
+    command_id: &str,
+) -> TestResult<u64> {
+    let receipt = put_chunks(
+        client,
+        PutHeader {
+            address: Some(address),
+            content_type: "application/octet-stream".into(),
+            command_id: command_id.into(),
+            durability: Durability::Local as i32,
+            operation: Some(PutOperationValue::Put(PutOperation {})),
+        },
+        [bytes.to_vec()],
+    )
+    .await?;
+    require_receipt(&receipt, command_id, false)?;
+    Ok(receipt.version)
+}
+
+async fn link(
+    client: &mut RawClient,
+    alias: ObjectAddress,
+    target: ObjectAddress,
+    command_id: &str,
+) -> TestResult<()> {
+    let receipt = client
+        .link_object(LinkObjectRequest {
+            link: Some(alias),
+            target: Some(target),
+            command_id: command_id.into(),
+            durability: Durability::Local as i32,
+        })
+        .await?
+        .into_inner();
+    require_receipt(&receipt, command_id, false)
+}
+
+async fn unlink(client: &mut RawClient, alias: ObjectAddress, command_id: &str) -> TestResult<()> {
+    let receipt = client
+        .unlink_object(UnlinkObjectRequest {
+            link: Some(alias),
+            command_id: command_id.into(),
+            durability: Durability::Local as i32,
+        })
+        .await?
+        .into_inner();
+    require_receipt(&receipt, command_id, true)
+}
+
+fn require_receipt(receipt: &MutationReceipt, command_id: &str, deleted: bool) -> TestResult<()> {
+    if receipt.command_id != command_id
+        || receipt.version == 0
+        || receipt.deleted != deleted
+        || receipt.replay_guarantee_expires_at.is_none()
+    {
+        return Err(invalid(format!(
+            "mutation returned an invalid receipt for {command_id}"
+        )));
+    }
     Ok(())
 }
 
@@ -220,20 +552,14 @@ async fn disable(
     bucket: &str,
     prefix: &str,
     expected_version: u64,
+    suffix: &str,
 ) -> TestResult<()> {
     let response = client
         .disable_accounting(DisableAccountingRequest {
             bucket: bucket.into(),
             path_prefix: prefix.into(),
             expected_version,
-            command_id: format!(
-                "accounting-qualification-disable-{}",
-                if prefix.is_empty() {
-                    "bucket"
-                } else {
-                    "prefix"
-                }
-            ),
+            command_id: format!("accounting-qualification-disable-{suffix}"),
         })
         .await?
         .into_inner();
@@ -284,14 +610,38 @@ async fn wait_for(
             {
                 Ok(response) => {
                     let snapshot = response.into_inner();
-                    let matches = snapshot.object_count == object_count
-                        && snapshot.logical_stored_bytes == logical_bytes
-                        && snapshot.accepted_inbound_bytes >= minimum_inbound
-                        && snapshot.served_outbound_bytes >= minimum_outbound
-                        && snapshot
-                            .freshness
+                    let logical = snapshot.logical.as_ref();
+                    let traffic = snapshot.traffic.as_ref();
+                    let matches = logical.is_some_and(|usage| {
+                        usage
+                            .visible_file_count
                             .as_ref()
-                            .is_some_and(|value| value.complete);
+                            .is_some_and(|measurement| {
+                                measurement.state == AccountingMeasurementState::Present as i32
+                                    && measurement.count == object_count
+                            })
+                            && usage
+                                .billable_logical_bytes
+                                .as_ref()
+                                .is_some_and(|measurement| {
+                                    measurement.state == AccountingMeasurementState::Present as i32
+                                        && measurement.bytes == logical_bytes
+                                })
+                            && usage
+                                .retained_non_billable_logical_bytes
+                                .as_ref()
+                                .is_some_and(|measurement| {
+                                    measurement.state == AccountingMeasurementState::Present as i32
+                                })
+                            && usage.freshness.as_ref().is_some_and(|value| value.complete)
+                    }) && traffic.is_some_and(|usage| {
+                        usage.accepted_inbound_bytes >= minimum_inbound
+                            && usage.served_outbound_bytes >= minimum_outbound
+                    }) && snapshot.tenant_physical_bytes.as_ref().is_some_and(
+                        |measurement| {
+                            measurement.state == AccountingMeasurementState::Unsupported as i32
+                        },
+                    );
                     if !matches {
                         last = format!("latest accounting snapshot: {snapshot:?}");
                         complete = false;
@@ -309,6 +659,63 @@ async fn wait_for(
         }
         if Instant::now() >= deadline {
             return Err(invalid(format!("accounting did not converge: {last}")));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_retained_non_billable(
+    clients: &mut [AccountingClient],
+    bucket: &str,
+    prefix: &str,
+    expected_bytes: u64,
+) -> TestResult<()> {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    let mut last = String::new();
+    loop {
+        let mut complete = true;
+        for client in clients.iter_mut() {
+            match client
+                .get_accounting(GetAccountingRequest {
+                    bucket: bucket.into(),
+                    path_prefix: prefix.into(),
+                })
+                .await
+            {
+                Ok(response) => {
+                    let snapshot = response.into_inner();
+                    let matches = snapshot.logical.as_ref().is_some_and(|usage| {
+                        usage
+                            .retained_non_billable_logical_bytes
+                            .as_ref()
+                            .is_some_and(|measurement| {
+                                measurement.state == AccountingMeasurementState::Present as i32
+                                    && measurement.bytes == expected_bytes
+                            })
+                            && usage
+                                .freshness
+                                .as_ref()
+                                .is_some_and(|freshness| freshness.complete)
+                    });
+                    if !matches {
+                        last = format!("latest retained accounting snapshot: {snapshot:?}");
+                        complete = false;
+                    }
+                }
+                Err(status) if retryable(&status) => {
+                    last = status.to_string();
+                    complete = false;
+                }
+                Err(status) => return Err(status.into()),
+            }
+        }
+        if complete {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(format!(
+                "retained non-billable accounting did not converge: {last}"
+            )));
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }

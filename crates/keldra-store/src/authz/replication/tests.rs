@@ -384,7 +384,7 @@ async fn replicas_reject_gaps_stale_mutations_siblings_and_tampering() {
 }
 
 #[test]
-fn released_unstamped_binding_json_decodes_as_a_committed_baseline() {
+fn stored_binding_requires_the_v1_envelope() {
     let binding = RealmBinding {
         scope: scope(),
         schema_ref: super::super::SchemaRef {
@@ -396,9 +396,23 @@ fn released_unstamped_binding_json_decodes_as_a_committed_baseline() {
         authz_revision: AuthzRevision(7),
         tuple_count: 0,
     };
-    let released = serde_json::to_vec(&binding).unwrap();
-    let decoded: StoredRealmBinding = serde_json::from_slice(&released).unwrap();
+    let bare = serde_json::to_vec(&binding).unwrap();
+    assert!(serde_json::from_slice::<StoredRealmBinding>(&bare).is_err());
+    let encoded = serde_json::to_vec(&StoredRealmBinding {
+        format: STORED_REALM_BINDING_FORMAT,
+        binding: binding.clone(),
+        mutation_stamp: None,
+        revision: AuthzRevision(7),
+    })
+    .unwrap();
+    let mut missing_stamp: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    missing_stamp
+        .as_object_mut()
+        .unwrap()
+        .remove("mutation_stamp");
+    assert!(serde_json::from_value::<StoredRealmBinding>(missing_stamp).is_err());
+    let decoded: StoredRealmBinding = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(decoded.binding, binding);
     assert_eq!(decoded.mutation_stamp, None);
-    assert_eq!(decoded.aggregate_revision, None);
+    assert_eq!(decoded.revision, AuthzRevision(7));
 }

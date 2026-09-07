@@ -1,6 +1,6 @@
 //! One fair hard ceiling for accounted index heap memory.
 //!
-//! The v6 pipeline holds its configured share for its lifetime. Queries use
+//! The v1 pipeline holds its configured share for its lifetime. Queries use
 //! the remaining capacity with FIFO admission. The process-wide ceiling is
 //! never exceeded.
 

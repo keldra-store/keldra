@@ -230,9 +230,18 @@ struct IdentityDocument {
     cluster_id: [u8; 16],
     node_id: u64,
     presented_peer_identity: PersistedPeerIdentity,
+    #[serde(deserialize_with = "deserialize_required_option")]
     overlap_peer_identity: Option<PersistedPeerIdentity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pending_join: Option<PendingJoinIdentity>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 impl From<&LocalNodeIdentity> for IdentityDocument {
@@ -865,7 +874,7 @@ mod tests {
         let malformed_cases = [
             b"not-json".as_slice(),
             br#"{"format_version":1,"unexpected":true}"#,
-            br#"{"format_version":2,"cluster_id":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"node_id":17,"presented_peer_identity":{"certificate_pem":"x","private_key_pem":"y"},"overlap_peer_identity":null}"#,
+            br#"{"format_version":0,"cluster_id":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"node_id":17,"presented_peer_identity":{"certificate_pem":"x","private_key_pem":"y"},"overlap_peer_identity":null}"#,
         ];
         for malformed in malformed_cases {
             let directory = tempfile::tempdir().unwrap();

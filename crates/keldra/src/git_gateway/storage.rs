@@ -10,9 +10,9 @@ use tokio_stream::StreamExt as _;
 
 use super::model::{self, GitCheckpoint, GitCurrent, GitPushBatch, RepositoryName};
 use super::{GitError, GitGatewayState, Target};
-use crate::v05::{GatewayIdentity, GatewayPutMode};
+use crate::object_service::{GatewayIdentity, GatewayPutMode};
 
-const NAME_CONTEXT: &str = "keldra.git/repository-name/v2";
+const NAME_CONTEXT: &str = "keldra.git/repository-name/v1";
 
 #[derive(Clone, Debug)]
 pub(super) struct RepositoryLocation {
@@ -102,7 +102,7 @@ impl RepositoryLocation {
         ObjectKey::new(
             self.tenant.clone(),
             self.bucket.clone(),
-            format!("_keldra/git/v2/repos/{}/{suffix}", self.repository_id),
+            format!("_keldra/git/v1/repos/{}/{suffix}", self.repository_id),
         )
         .map_err(|error| GitError::bad_request(error.to_string()))
     }
@@ -297,7 +297,7 @@ pub(super) fn name_key(target: &Target) -> Result<ObjectKey, GitError> {
     ObjectKey::new(
         target.tenant.clone(),
         target.bucket.clone(),
-        format!("_keldra/git/v2/names/{}", hasher.finalize().to_hex()),
+        format!("_keldra/git/v1/names/{}", hasher.finalize().to_hex()),
     )
     .map_err(|error| GitError::bad_request(error.to_string()))
 }

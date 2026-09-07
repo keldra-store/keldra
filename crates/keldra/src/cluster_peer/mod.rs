@@ -45,7 +45,6 @@ pub(crate) use accounting::{
 };
 pub(crate) use authz::LateBoundFreshAuthorization;
 pub(crate) use control::LateBoundDistributedControl;
-pub(crate) use index_artifacts::{IndexCurrentHead, IndexHeadScanPage, IndexHeadScanScope};
 pub(crate) use index_queries::{
     AuthorizedIndexQueryHandler, LocalIndexQueryExecutor, LocalIndexQueryRequest,
     RoutedIndexQueryHandlers, RoutedIndexQueryRequest,
@@ -57,7 +56,8 @@ pub(crate) use public_authz::{RoutedAuthzHandler, RoutedAuthzHandlers};
 pub(crate) use routing::{RoutedCall, RoutedPublicHandler, RoutedPublicHandlers};
 pub(crate) use transport::ClusterPeerTransport;
 
-pub(crate) const CLUSTER_PEER_SCHEMA_VERSION: u32 = 4;
+// Private peer messages use one exact schema and reject mismatched peers.
+pub(crate) const CLUSTER_PEER_SCHEMA_VERSION: u32 = 1;
 const MAX_CLUSTER_PEER_MESSAGE_BYTES: usize = 64 * 1024 * 1024 + 64 * 1024;
 const MAX_CLUSTER_OPERATION_TIME: Duration = Duration::from_secs(30);
 const MAX_CLUSTER_BULK_OPERATION_TIME: Duration = Duration::from_millis(u32::MAX as u64);

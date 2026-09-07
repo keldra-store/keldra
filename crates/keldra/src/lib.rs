@@ -36,6 +36,7 @@ mod mutation_admission;
 mod node_identity;
 mod object_distribution;
 mod object_path_access;
+mod object_service;
 pub mod observability;
 mod payload_distribution;
 mod payload_gc;
@@ -56,7 +57,6 @@ mod s3;
 mod serving_fence;
 mod startup_scan_evidence;
 mod storage_layout;
-mod v05;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -82,9 +82,9 @@ use mutation_admission::{AdmissionSurface, MutationAdmissionService};
 use startup_scan_evidence::StartupScanEvidence;
 
 pub use index_config::{IndexRuntimeConfig, IndexRuntimeConfigError};
+pub use object_service::ObjectServiceImpl;
 pub use plugin_gateway::PluginGatewayConfig;
 pub use storage_layout::{ExplicitAuthoritativePaths, StoragePaths};
-pub use v05::ObjectServiceImpl;
 
 const MAX_GRPC_MESSAGE_BYTES: usize = 72 * 1024 * 1024;
 const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -294,11 +294,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .await
         .context("apply existing cluster state before joining-node startup")?;
     }
-    let _capability_advertisement = cluster_capabilities::CapabilityAdvertisementTask::start(
-        decisions.clone(),
-        cluster_transport.clone(),
-        local_node,
-    );
     let cluster_id = cluster_startup::ensure_genesis_identity(&decisions).await?;
     tracing::info!(cluster.id = %hex::encode(cluster_id.0), "cluster identity is ready");
     cluster_startup::ensure_jwt_signing_key_fingerprint(
@@ -401,12 +396,18 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     name_resolution_binding
         .install(Arc::new(name_resolver.clone()))
         .map_err(|_| anyhow::anyhow!("logical name resolver was installed more than once"))?;
+    let bucket_governance = bucket_governance::BucketGovernance::new(
+        logical_records.clone(),
+        cluster_transport.clone(),
+        name_resolver.clone(),
+    );
     programs
         .install_distributed(
             object_reader.clone(),
             object_distribution.clone(),
             cluster_transport.clone(),
             name_resolver.clone(),
+            bucket_governance.clone(),
         )
         .await
         .context("initialize distributed atomic programs")?;
@@ -441,11 +442,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         local_node,
         decisions.clone(),
         zanzibar.clone(),
-        cluster_transport.clone(),
-        name_resolver.clone(),
-    );
-    let bucket_governance = bucket_governance::BucketGovernance::new(
-        logical_records,
         cluster_transport.clone(),
         name_resolver.clone(),
     );
@@ -610,7 +606,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .install(personaldb_service.routed_handler())
         .map_err(|_| anyhow::anyhow!("routed PersonalDB handler was installed more than once"))?;
     let request_rate_limits = RequestRateLimits::new(config.rate_limits);
-    let gateway_objects = v05::GatewayObjectAdapter::new(object_service.clone());
+    let gateway_objects = object_service::GatewayObjectAdapter::new(object_service.clone());
     let s3_state = s3::S3State {
         objects: gateway_objects.clone(),
         control: distributed_control.clone(),
@@ -628,7 +624,9 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         mutation_admission: mutation_admission.clone(),
         cache_root: config.storage.cache.join("gateway-cache/git"),
         repository_locks: Arc::new(git_gateway::cache::RepositoryLocks::default()),
+        repository_cache: Arc::new(git_gateway::cache::RepositoryCache::default()),
         basic_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        git_processes: Arc::new(tokio::sync::Semaphore::new(8)),
     };
     let plugin_state = plugin_gateway::PluginGatewayState::new(
         gateway_objects,
@@ -663,7 +661,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         decisions.clone(),
         config.storage.state.clone(),
     )
-    .with_distributed(distributed_control.clone());
+    .with_distributed(distributed_control.clone())
+    .with_cluster_peers(cluster_transport.clone());
     let credential_service = credential_service::CredentialServiceImpl::new(
         store.clone(),
         config.token_manager.clone(),

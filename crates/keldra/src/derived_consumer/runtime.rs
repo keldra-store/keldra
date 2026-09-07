@@ -501,9 +501,9 @@ async fn scan_raw_interval(
             let source_effects =
                 crate::index_runtime::events::source_change_effects(event_source, &change.change)
                     .map_err(event_status)?;
-            for bucket in change_buckets(kind, &change.change) {
+            visit_change_buckets(kind, &change.change, |bucket| {
                 if assignments.definitions(bucket.0, bucket.1).is_none() {
-                    continue;
+                    return;
                 }
                 let bucket_effects = effects.entry(bucket).or_default();
                 for effect in &source_effects {
@@ -534,7 +534,7 @@ async fn scan_raw_interval(
                                 .flatten(),
                         });
                 }
-            }
+            });
         }
         for ((tenant_id, bucket_id), effects) in effects {
             let definitions = assignments
@@ -666,32 +666,43 @@ fn demux_strategy(
     }
 }
 
-fn change_buckets(kind: DerivedConsumerKind, change: &LocalChange) -> Vec<(u64, u64)> {
+fn visit_change_buckets(
+    kind: DerivedConsumerKind,
+    change: &LocalChange,
+    mut visit: impl FnMut((u64, u64)),
+) {
     let included = match kind {
         DerivedConsumerKind::Index => crate::index_runtime::events::is_index_source_change(change),
         DerivedConsumerKind::Accounting => crate::accounting::is_accounting_source_change(change),
     };
     if !included {
-        return Vec::new();
+        return;
     }
     match change {
-        LocalChange::ObjectHead(change) => vec![(change.tenant_id, change.bucket_id)],
+        LocalChange::ObjectHead(change) => visit((change.tenant_id, change.bucket_id)),
         LocalChange::RetainedVersionDeleted(change) => {
-            vec![(change.tenant_id, change.bucket_id)]
+            visit((change.tenant_id, change.bucket_id));
         }
-        LocalChange::AtomicBatchPublished(change) => change
-            .affected_routes
-            .iter()
-            .map(|route| (route.tenant_id, route.bucket_id))
-            .collect(),
-        LocalChange::ContentLifecycleChanged(change) => change
-            .accounting_transition
-            .as_ref()
-            .map(|transition| vec![(transition.tenant_id, transition.bucket_id)])
-            .unwrap_or_default(),
-        LocalChange::AggregateChanged(_) => Vec::new(),
-        _ => Vec::new(),
+        LocalChange::AtomicBatchPublished(change) => {
+            for route in change.routes() {
+                visit((route.tenant_id, route.bucket_id));
+            }
+        }
+        LocalChange::ContentLifecycleChanged(change) => {
+            if let Some(transition) = change.accounting_transition.as_ref() {
+                visit((transition.tenant_id, transition.bucket_id));
+            }
+        }
+        LocalChange::AggregateChanged(_) => {}
+        _ => {}
     }
+}
+
+#[cfg(test)]
+fn change_buckets(kind: DerivedConsumerKind, change: &LocalChange) -> Vec<(u64, u64)> {
+    let mut buckets = Vec::new();
+    visit_change_buckets(kind, change, |bucket| buckets.push(bucket));
+    buckets
 }
 
 fn synchronize_assignment_changes(

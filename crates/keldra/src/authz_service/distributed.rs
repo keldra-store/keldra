@@ -5,7 +5,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use keldra_api::v1 as api;
 use keldra_api::v1::authz_service_server::AuthzService as PublicAuthzService;
-use keldra_authz::{Authorization, AuthorizationCheck};
+use keldra_authz::AuthorizationCheck;
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
     AuthzRevision, AuthzScope, BindSchemaRequest, CoordinatedAuthzRealmResult,
@@ -393,15 +393,8 @@ impl DistributedAuthzService {
         let snapshot = self
             .zanzibar
             .repository()
-            .realm_snapshot(&scope, consistency)
+            .validated_realm_snapshot(&scope, consistency)
             .map_err(authz_store_status)?;
-        Authorization::new(
-            scope.realm.clone(),
-            snapshot.schema,
-            snapshot.tuples.iter().cloned(),
-            self.zanzibar.repository().limits().evaluator,
-        )
-        .map_err(crate::authz_api::authz_status)?;
         let offset = match page_token {
             Some(token) if token.revision != snapshot.revision => {
                 return Err(Status::failed_precondition(
@@ -526,12 +519,6 @@ impl DistributedAuthzService {
                 .collect(),
             revision: revision.0,
         })
-    }
-
-    pub(crate) fn verify_routed_caller(&self, bearer: &str) -> Result<Caller, Status> {
-        self.tokens
-            .verify(bearer)
-            .map_err(|_| Status::unauthenticated("the bearer token is invalid or expired"))
     }
 
     async fn tenant_id(&self, caller: &Caller) -> Result<u64, Status> {

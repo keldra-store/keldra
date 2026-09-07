@@ -385,7 +385,7 @@ impl ProgramInvocation {
         let canonical_input = serde_json::to_vec(&input)
             .map_err(|error| format!("cannot encode program input: {error}"))?;
         let mut fingerprint = blake3::Hasher::new();
-        fingerprint.update(b"keldra.atomic-program.input.v2");
+        fingerprint.update(b"keldra.atomic-program.input.v1");
         fingerprint.update(&program_path_hash);
         fingerprint.update(&canonical_input);
         Ok(Self {
@@ -435,12 +435,22 @@ pub struct HeadPrecondition {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VersionedWrite {
-    pub path: ObjectPath,
-    pub expected: ObservedHead,
     /// `None` is a tombstone/delete.
     pub value: Option<StoredValue>,
     pub content_type: Option<String>,
+}
+
+/// One ordered atomic participant. Its observed head and optional mutation are
+/// inseparable, so contradictory parallel precondition/write lists cannot be
+/// encoded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AtomicParticipant {
+    pub path: ObjectPath,
+    pub expected: ObservedHead,
+    pub write: Option<VersionedWrite>,
 }
 
 /// Stored atomically with document heads. It is the durable replay contract.
@@ -455,9 +465,16 @@ pub struct CommandReceipt {
 
 /// A storage-neutral atomic apply request produced after deterministic evaluation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AtomicWriteBundle {
-    pub head_preconditions: Vec<HeadPrecondition>,
-    pub writes: Vec<VersionedWrite>,
+    pub participants: Vec<AtomicParticipant>,
     pub receipt: CommandReceipt,
-    pub outputs: BTreeMap<String, Value>,
+}
+
+impl AtomicWriteBundle {
+    pub fn writes(&self) -> impl Iterator<Item = (&AtomicParticipant, &VersionedWrite)> {
+        self.participants
+            .iter()
+            .filter_map(|participant| participant.write.as_ref().map(|write| (participant, write)))
+    }
 }

@@ -31,6 +31,7 @@ mod reservations;
 mod validation;
 
 use alias_resolution::{stored_alias_delete_binding, stored_alias_registry_transitions};
+use reservations::prepared_preconditions;
 use validation::{
     conservative_atomic_source_journal_changes, live_version_length, prepared_alias_publications,
     publishes_physical_write, validate_atomic_delivery_bound, validate_builtin_plan,
@@ -54,8 +55,7 @@ pub use reservations::{
     StoredProgramAliasRegistryTransition,
 };
 
-const PREPARED_BUNDLE_FORMAT: u16 = 5;
-const LEGACY_PREPARED_BUNDLE_FORMAT: u16 = 4;
+const PREPARED_BUNDLE_FORMAT: u16 = 1;
 const DURABILITY_EVIDENCE_FORMAT: u16 = 1;
 const APPLIED_PROGRAM_COMMIT_KEY: &[u8] = b"applied_program_commit";
 const ATOMIC_BATCH_PUBLISHED_KEY: &[u8] = b"atomic_batch_published";
@@ -84,14 +84,14 @@ impl std::fmt::Display for PreparedBundleHash {
 /// Ordinary content-addressed reference to the one prepared bundle blob.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PreparedBundleRef {
-    pub hash: [u8; 32],
+    pub hash: PreparedBundleHash,
     pub length: u64,
 }
 
 impl From<BlobRef> for PreparedBundleRef {
     fn from(reference: BlobRef) -> Self {
         Self {
-            hash: reference.hash,
+            hash: PreparedBundleHash(reference.hash),
             length: reference.length,
         }
     }
@@ -100,7 +100,7 @@ impl From<BlobRef> for PreparedBundleRef {
 impl From<PreparedBundleRef> for BlobRef {
     fn from(reference: PreparedBundleRef) -> Self {
         Self {
-            hash: reference.hash,
+            hash: reference.hash.0,
             length: reference.length,
         }
     }
@@ -133,8 +133,8 @@ pub struct ProgramDurabilityEvidence {
     pub format: u16,
     pub bundle: PreparedBundleRef,
     pub scope: ProgramDurabilityScope,
-    /// Reserved for a later replicated byte-plane acknowledgement. It is
-    /// empty for 0.5.0 LOCAL and is never stored in a bespoke side plane.
+    /// Provider-specific remote durability acknowledgement. Executor-local
+    /// evidence leaves it empty and no bespoke side plane is used.
     pub provider_receipt: Vec<u8>,
 }
 
@@ -243,7 +243,6 @@ impl ProgramExecutionLease {
 /// ordinary blob-plane objects; only their compact identities enter Raft.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedProgramBundle {
-    pub hash: PreparedBundleHash,
     pub source_bundle_hash: PreparedBundleHash,
     pub program_hash: ProgramHash,
     pub authority: ProgramBundleAuthority,
@@ -260,8 +259,8 @@ pub struct PublishedProgramVersion {
 }
 
 impl PreparedProgramBundle {
-    /// Returns evidence suitable for a cluster-safe `CommitBatch`. The
-    /// 0.5.0 executor-local byte plane always fails this check.
+    /// Returns evidence suitable for a cluster-safe prepared-batch commit.
+    /// Executor-local byte-plane evidence always fails this check.
     pub fn remote_durability_evidence_hash(
         &self,
     ) -> Result<ProgramDurabilityEvidenceHash, ProgramStoreError> {
@@ -276,51 +275,16 @@ impl PreparedProgramBundle {
 /// The only local finalization marker. It deliberately contains no program
 /// output, object path, or command receipt: the ordinary prepared bundle and
 /// Raft's bounded committed-invocation entry are authoritative for replay.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppliedProgramCommit {
     pub commit_cursor: u64,
     pub bundle_ref: PreparedBundleRef,
-    pub bundle_hash: PreparedBundleHash,
     pub program_hash: ProgramHash,
     pub authority: ProgramBundleAuthority,
     pub participant_manifest_hash: [u8; 32],
     pub durability_class: ProgramDurabilityClassHash,
     pub durability_evidence_hash: ProgramDurabilityEvidenceHash,
-}
-
-#[derive(Deserialize)]
-struct AppliedProgramCommitWire {
-    commit_cursor: u64,
-    bundle_ref: PreparedBundleRef,
-    bundle_hash: PreparedBundleHash,
-    program_hash: ProgramHash,
-    #[serde(default)]
-    authority: Option<ProgramBundleAuthority>,
-    #[serde(default)]
-    participant_manifest_hash: Option<[u8; 32]>,
-    durability_class: ProgramDurabilityClassHash,
-    durability_evidence_hash: ProgramDurabilityEvidenceHash,
-}
-
-impl<'de> Deserialize<'de> for AppliedProgramCommit {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = AppliedProgramCommitWire::deserialize(deserializer)?;
-        Ok(Self {
-            commit_cursor: wire.commit_cursor,
-            bundle_ref: wire.bundle_ref,
-            bundle_hash: wire.bundle_hash,
-            program_hash: wire.program_hash,
-            authority: wire
-                .authority
-                .unwrap_or(ProgramBundleAuthority::LegacyProgramOnly {
-                    program_path_hash: [0; 32],
-                    program_hash: wire.program_hash.0,
-                }),
-            participant_manifest_hash: wire.participant_manifest_hash.unwrap_or([0; 32]),
-            durability_class: wire.durability_class,
-            durability_evidence_hash: wire.durability_evidence_hash,
-        })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -337,7 +301,6 @@ pub struct ProgramCommit {
     pub commit_cursor: u64,
     pub begin_cursor: u64,
     pub bundle_ref: PreparedBundleRef,
-    pub bundle_hash: PreparedBundleHash,
     pub program_hash: ProgramHash,
     pub authority: ProgramBundleAuthority,
     pub participant_manifest_hash: [u8; 32],
@@ -398,28 +361,17 @@ pub enum ProgramStoreError {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredPreparedBundle {
     format: u16,
     source_bundle_hash: PreparedBundleHash,
     program_hash: ProgramHash,
     authority: ProgramBundleAuthority,
     participant_manifest: ProgramParticipantManifest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     builtin_plan: Option<BuiltInObjectTransactionPlan>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     alias_bindings: Vec<ProgramAliasBinding>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     alias_registry_transitions: Vec<StoredProgramAliasRegistryTransition>,
-    preconditions: Vec<HeadPrecondition>,
-    writes: Vec<PreparedVersionWrite>,
-    receipt: CommandReceipt,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct LegacyStoredPreparedBundleV4 {
-    format: u16,
-    source_bundle_hash: PreparedBundleHash,
-    program_hash: ProgramHash,
     preconditions: Vec<HeadPrecondition>,
     writes: Vec<PreparedVersionWrite>,
     receipt: CommandReceipt,
@@ -429,13 +381,21 @@ struct LegacyStoredPreparedBundleV4 {
 pub struct PreparedVersionWrite {
     path: ObjectPath,
     expected: ObservedHead,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     previous_version: Option<Version>,
     version: Version,
 }
 
 pub type PreparedProgramRecord = StoredPreparedBundle;
 pub type PreparedProgramWrite = PreparedVersionWrite;
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
 
 #[derive(Debug)]
 struct LoadedPreparedBundle {
@@ -628,30 +588,18 @@ impl Store {
 }
 
 fn validate_source_bundle(source: &AtomicWriteBundle) -> Result<(), ProgramStoreError> {
-    let mut preconditions = BTreeMap::new();
-    for precondition in &source.head_preconditions {
-        validate_observed_head(&precondition.expected)?;
-        if preconditions
-            .insert(precondition.path.clone(), precondition.expected.clone())
-            .is_some()
-        {
+    let mut previous = None;
+    for participant in &source.participants {
+        validate_observed_head(&participant.expected)?;
+        if previous.is_some_and(|path| path >= &participant.path) {
             return Err(ProgramStoreError::InvalidBundle(
-                "duplicate head precondition".into(),
+                "atomic participants are not strictly ordered".into(),
             ));
         }
-    }
-    let mut writes = BTreeSet::new();
-    for write in &source.writes {
-        if !writes.insert(write.path.clone()) {
-            return Err(ProgramStoreError::InvalidBundle(
-                "duplicate versioned write".into(),
-            ));
-        }
-        if preconditions.get(&write.path) != Some(&write.expected) {
-            return Err(ProgramStoreError::InvalidBundle(
-                "write does not match its exact head precondition".into(),
-            ));
-        }
+        previous = Some(&participant.path);
+        let Some(write) = participant.write.as_ref() else {
+            continue;
+        };
         match (&write.value, &write.content_type) {
             (Some(StoredValue::Json(_)), Some(content_type))
                 if is_json_content_type(content_type) => {}
@@ -663,36 +611,24 @@ fn validate_source_bundle(source: &AtomicWriteBundle) -> Result<(), ProgramStore
             }
         }
     }
-    if source.outputs != source.receipt.outputs {
-        return Err(ProgramStoreError::InvalidBundle(
-            "bundle outputs do not match command receipt".into(),
-        ));
-    }
     Ok(())
 }
 
 fn validate_prepared_record(record: &StoredPreparedBundle) -> Result<(), ProgramStoreError> {
-    let legacy = record.format == LEGACY_PREPARED_BUNDLE_FORMAT
-        && matches!(
-            record.authority,
-            ProgramBundleAuthority::LegacyProgramOnly { .. }
-        );
-    if record.format != PREPARED_BUNDLE_FORMAT && !legacy {
+    if record.format != PREPARED_BUNDLE_FORMAT {
         return Err(ProgramStoreError::InvalidBundle(
             "unsupported prepared record format".into(),
         ));
     }
     record
         .authority
-        .validate(legacy)
+        .validate()
         .map_err(|message| ProgramStoreError::InvalidBundle(message.into()))?;
     validate_builtin_record(record)?;
-    if !legacy {
-        record
-            .participant_manifest
-            .validate()
-            .map_err(ProgramStoreError::InvalidBundle)?;
-    }
+    record
+        .participant_manifest
+        .validate()
+        .map_err(ProgramStoreError::InvalidBundle)?;
     let manifest_heads = record
         .participant_manifest
         .objects
@@ -716,7 +652,7 @@ fn validate_prepared_record(record: &StoredPreparedBundle) -> Result<(), Program
             ));
         }
     }
-    if !legacy && manifest_heads != preconditions {
+    if manifest_heads != preconditions {
         return Err(ProgramStoreError::InvalidBundle(
             "prepared participant manifest does not bind every head precondition".into(),
         ));
@@ -729,7 +665,7 @@ fn validate_prepared_record(record: &StoredPreparedBundle) -> Result<(), Program
             .objects
             .iter()
             .find(|participant| participant.path == write.path);
-        if !legacy && participant.is_none() {
+        if participant.is_none() {
             return Err(ProgramStoreError::InvalidBundle(
                 "prepared write has no participant intent".into(),
             ));
@@ -786,12 +722,11 @@ fn validate_prepared_record(record: &StoredPreparedBundle) -> Result<(), Program
             ));
         }
     }
-    if !legacy
-        && record
-            .participant_manifest
-            .objects
-            .iter()
-            .any(|participant| participant.intent.put && !write_paths.contains(&participant.path))
+    if record
+        .participant_manifest
+        .objects
+        .iter()
+        .any(|participant| participant.intent.put && !write_paths.contains(&participant.path))
     {
         return Err(ProgramStoreError::InvalidBundle(
             "participant put intent has no exact prepared write".into(),
@@ -861,7 +796,7 @@ fn validate_durability_evidence(
     evidence: &ProgramDurabilityEvidence,
 ) -> Result<(), ProgramStoreError> {
     if evidence.format != DURABILITY_EVIDENCE_FORMAT
-        || evidence.bundle.hash == [0; 32]
+        || evidence.bundle.hash.0 == [0; 32]
         || evidence.bundle.length == 0
         || matches!(
             &evidence.scope,
@@ -878,13 +813,9 @@ fn verify_loaded_commit(
     commit: &ProgramCommit,
 ) -> Result<(), ProgramStoreError> {
     if loaded.bundle != commit.bundle_ref
-        || PreparedBundleHash(loaded.bundle.hash) != commit.bundle_hash
         || loaded.record.program_hash != commit.program_hash
         || loaded.record.authority != commit.authority
-        || loaded
-            .record
-            .participant_manifest_hash(commit.bundle_hash)?
-            != commit.participant_manifest_hash
+        || loaded.record.participant_manifest_hash()? != commit.participant_manifest_hash
         || loaded.evidence.hash()? != commit.durability_evidence_hash
     {
         return Err(ProgramStoreError::PreparedBundleMismatch);
@@ -898,7 +829,6 @@ fn verify_prepared_commit(
     commit: &ProgramCommit,
 ) -> Result<(), ProgramStoreError> {
     if prepared.bundle != commit.bundle_ref
-        || prepared.hash != commit.bundle_hash
         || prepared.program_hash != commit.program_hash
         || prepared.authority != commit.authority
         || prepared.participant_manifest_hash != commit.participant_manifest_hash
@@ -988,11 +918,7 @@ impl Store {
             loop {
                 let commit_guard = self.lock_commit("atomic_program").await;
                 let loaded = self
-                    .load_prepared_bundle(
-                        commit.bundle_ref,
-                        commit.bundle_hash,
-                        commit.durability_evidence_hash,
-                    )
+                    .load_prepared_bundle(commit.bundle_ref, commit.durability_evidence_hash)
                     .await?;
                 if source_hash != loaded.record.source_bundle_hash
                     || prepared.bundle != loaded.bundle
@@ -1037,11 +963,7 @@ impl Store {
             return self.committed_program_result(commit).await;
         }
         let loaded = self
-            .load_prepared_bundle(
-                commit.bundle_ref,
-                commit.bundle_hash,
-                commit.durability_evidence_hash,
-            )
+            .load_prepared_bundle(commit.bundle_ref, commit.durability_evidence_hash)
             .await?;
         verify_loaded_commit(&loaded, &commit)?;
         let paths = loaded
@@ -1056,11 +978,7 @@ impl Store {
             // Re-read and verify under the commit fence so GC cannot retire an
             // awaiting output or bundle between verification and publication.
             let loaded = self
-                .load_prepared_bundle(
-                    commit.bundle_ref,
-                    commit.bundle_hash,
-                    commit.durability_evidence_hash,
-                )
+                .load_prepared_bundle(commit.bundle_ref, commit.durability_evidence_hash)
                 .await?;
             let attempt = if let Some(existing) = self.applied_program_commit()?
                 && existing.commit_cursor == commit.commit_cursor
@@ -1088,11 +1006,7 @@ impl Store {
         commit: ProgramCommit,
     ) -> Result<CommittedProgramResult, ProgramStoreError> {
         let loaded = self
-            .load_prepared_bundle(
-                commit.bundle_ref,
-                commit.bundle_hash,
-                commit.durability_evidence_hash,
-            )
+            .load_prepared_bundle(commit.bundle_ref, commit.durability_evidence_hash)
             .await?;
         verify_loaded_commit(&loaded, &commit)?;
         Ok(committed_result(&loaded.record))
@@ -1119,26 +1033,11 @@ impl Store {
         existing: &AppliedProgramCommit,
         requested: &ProgramCommit,
     ) -> Result<(), ProgramStoreError> {
-        let legacy_authority_matches = matches!(
-            (existing.authority, requested.authority),
-            (
-                ProgramBundleAuthority::LegacyProgramOnly {
-                    program_path_hash: existing_path,
-                    program_hash: existing_hash,
-                },
-                ProgramBundleAuthority::LegacyProgramOnly {
-                    program_hash: requested_hash,
-                    ..
-                }
-            ) if existing_path == [0; 32] && existing_hash == requested_hash
-        ) && existing.participant_manifest_hash == [0; 32];
         if existing.commit_cursor == requested.commit_cursor
             && existing.bundle_ref == requested.bundle_ref
-            && existing.bundle_hash == requested.bundle_hash
             && existing.program_hash == requested.program_hash
-            && ((existing.authority == requested.authority
-                && existing.participant_manifest_hash == requested.participant_manifest_hash)
-                || legacy_authority_matches)
+            && existing.authority == requested.authority
+            && existing.participant_manifest_hash == requested.participant_manifest_hash
             && existing.durability_class == requested.durability_class
             && existing.durability_evidence_hash == requested.durability_evidence_hash
         {
@@ -1153,10 +1052,9 @@ impl Store {
     async fn load_prepared_bundle(
         &self,
         bundle: PreparedBundleRef,
-        hash: PreparedBundleHash,
         evidence_hash: ProgramDurabilityEvidenceHash,
     ) -> Result<LoadedPreparedBundle, ProgramStoreError> {
-        if bundle.hash != hash.0 || bundle.length == 0 {
+        if bundle.hash.0 == [0; 32] || bundle.length == 0 {
             return Err(ProgramStoreError::PreparedBundleMismatch);
         }
         let evidence = self.local_program_durability_evidence(bundle);
@@ -1170,7 +1068,9 @@ impl Store {
             .read_retained_blob_bytes(&bundle_reference)
             .await
             .map_err(|error| match error {
-                MutationError::BlobNotFound => ProgramStoreError::PreparedBundleNotFound(hash),
+                MutationError::BlobNotFound => {
+                    ProgramStoreError::PreparedBundleNotFound(bundle.hash)
+                }
                 other => program_mutation_error(other),
             })?;
         let record = serde_json::from_slice::<StoredPreparedBundle>(&bundle_bytes)
@@ -1217,11 +1117,7 @@ impl Store {
         verify_loaded_commit(loaded, commit)?;
 
         if commit.commit_cursor == 0
-            || (commit.begin_cursor == 0
-                && !matches!(
-                    record.authority,
-                    ProgramBundleAuthority::LegacyProgramOnly { .. }
-                ))
+            || commit.begin_cursor == 0
             || commit
                 .previous_commit_cursor
                 .is_some_and(|previous| previous >= commit.commit_cursor)
@@ -1252,37 +1148,32 @@ impl Store {
             return Err(ProgramStoreError::PreparedBundleMismatch);
         }
 
-        if !matches!(
-            record.authority,
-            ProgramBundleAuthority::LegacyProgramOnly { .. }
-        ) {
-            for participant in &record.participant_manifest.objects {
-                self.require_committed_program_reservation_locked(
-                    BucketIdentity {
-                        tenant_id: TenantId(participant.tenant_id),
-                        bucket_id: BucketId(participant.bucket_id),
-                    },
-                    &participant.path.path,
-                    commit.begin_cursor,
-                    commit.commit_cursor,
-                    mutation_context.serving_fence_term,
-                    mutation_context.active_placement_log_id,
-                )
-                .map_err(program_mutation_error)?;
-            }
-            for participant in &record.participant_manifest.governance {
-                self.require_committed_governance_reservation_locked(
-                    BucketIdentity {
-                        tenant_id: TenantId(participant.tenant_id),
-                        bucket_id: BucketId(participant.bucket_id),
-                    },
-                    commit.begin_cursor,
-                    commit.commit_cursor,
-                    mutation_context.serving_fence_term,
-                    mutation_context.active_placement_log_id,
-                )
-                .map_err(program_mutation_error)?;
-            }
+        for participant in &record.participant_manifest.objects {
+            self.require_committed_program_reservation_locked(
+                BucketIdentity {
+                    tenant_id: TenantId(participant.tenant_id),
+                    bucket_id: BucketId(participant.bucket_id),
+                },
+                &participant.path.path,
+                commit.begin_cursor,
+                commit.commit_cursor,
+                mutation_context.serving_fence_term,
+                mutation_context.active_placement_log_id,
+            )
+            .map_err(program_mutation_error)?;
+        }
+        for participant in &record.participant_manifest.governance {
+            self.require_committed_governance_reservation_locked(
+                BucketIdentity {
+                    tenant_id: TenantId(participant.tenant_id),
+                    bucket_id: BucketId(participant.bucket_id),
+                },
+                commit.begin_cursor,
+                commit.commit_cursor,
+                mutation_context.serving_fence_term,
+                mutation_context.active_placement_log_id,
+            )
+            .map_err(program_mutation_error)?;
         }
 
         let mut identities = BTreeMap::<(String, String), BucketIdentity>::new();
@@ -1378,10 +1269,9 @@ impl Store {
         let applied = AppliedProgramCommit {
             commit_cursor: commit.commit_cursor,
             bundle_ref: commit.bundle_ref,
-            bundle_hash: commit.bundle_hash,
             program_hash: record.program_hash,
             authority: record.authority,
-            participant_manifest_hash: record.participant_manifest_hash(commit.bundle_hash)?,
+            participant_manifest_hash: record.participant_manifest_hash()?,
             durability_class: commit.durability_class,
             durability_evidence_hash: commit.durability_evidence_hash,
         };
@@ -1450,9 +1340,15 @@ impl Store {
                     }
                 }
             }
+            let previous_live_length = old_version.and_then(live_version_length);
             let accounting_transition = AccountingHeadTransition::new(
-                old_version.and_then(live_version_length),
+                previous_live_length,
                 live_version_length(&write.version),
+                if retention == StoredVersionRetention::JournalPending {
+                    previous_live_length.unwrap_or(0)
+                } else {
+                    0
+                },
             );
             let encoded_version_key = version_key(identity, &key, write.version.id);
             let released_same_as_new = released_predecessor_blob
@@ -1525,7 +1421,7 @@ impl Store {
                         format: MUTATION_STAMP_FORMAT,
                         predecessor_version: old_version.map(|version| version.id),
                         program_commit_cursor: Some(commit.commit_cursor),
-                        mutation_fingerprint: commit.bundle_hash.0,
+                        mutation_fingerprint: commit.bundle_ref.hash.0,
                         active_placement_log_id: mutation_context.active_placement_log_id,
                         serving_fence_term: mutation_context.serving_fence_term,
                         source_id: journal_status.source_id,
@@ -1646,20 +1542,10 @@ impl Store {
             });
         }
         mutations.sort_unstable();
-        let mut affected_routes = mutations
-            .iter()
-            .map(|mutation| crate::AtomicBatchRoute {
-                tenant_id: mutation.tenant_id,
-                bucket_id: mutation.bucket_id,
-            })
-            .collect::<Vec<_>>();
-        affected_routes.sort_unstable();
-        affected_routes.dedup();
         if !mutations.is_empty() {
             changes.push(PendingLocalChange::AtomicBatchPublished {
                 cursor: commit.commit_cursor,
-                bundle_hash: commit.bundle_hash,
-                affected_routes,
+                bundle_hash: commit.bundle_ref.hash,
                 mutations,
             });
         }
@@ -1720,7 +1606,7 @@ impl Store {
     ) -> Result<PreparedProgramBundle, ProgramStoreError> {
         let source = lease.bundle();
         self.validate_program_policies(source)?;
-        self.prepare_program_bundle_source(lease.program_hash, source, None, &[])
+        self.prepare_program_bundle_source(lease.program_hash, source, None, &[], None)
             .await
     }
 
@@ -1731,7 +1617,7 @@ impl Store {
     ) -> Result<PreparedProgramBundle, ProgramStoreError> {
         let source = lease.bundle();
         self.validate_program_policies(source)?;
-        self.prepare_program_bundle_source(lease.program_hash, source, None, alias_bindings)
+        self.prepare_program_bundle_source(lease.program_hash, source, None, alias_bindings, None)
             .await
     }
 
@@ -1743,9 +1629,16 @@ impl Store {
         program_hash: ProgramHash,
         source: &AtomicWriteBundle,
         previous_versions: &BTreeMap<ObjectPath, Version>,
+        governance: &BTreeMap<(String, String), ProgramGovernanceParticipant>,
     ) -> Result<PreparedProgramBundle, ProgramStoreError> {
-        self.prepare_program_bundle_source(program_hash, source, Some(previous_versions), &[])
-            .await
+        self.prepare_program_bundle_source(
+            program_hash,
+            source,
+            Some(previous_versions),
+            &[],
+            Some(governance),
+        )
+        .await
     }
 
     pub async fn prepare_distributed_program_bundle_with_aliases(
@@ -1754,12 +1647,14 @@ impl Store {
         source: &AtomicWriteBundle,
         previous_versions: &BTreeMap<ObjectPath, Version>,
         alias_bindings: &[ProgramAliasBinding],
+        governance: &BTreeMap<(String, String), ProgramGovernanceParticipant>,
     ) -> Result<PreparedProgramBundle, ProgramStoreError> {
         self.prepare_program_bundle_source(
             program_hash,
             source,
             Some(previous_versions),
             alias_bindings,
+            Some(governance),
         )
         .await
     }
@@ -1770,6 +1665,7 @@ impl Store {
         source: &AtomicWriteBundle,
         previous_versions: Option<&BTreeMap<ObjectPath, Version>>,
         alias_bindings: &[ProgramAliasBinding],
+        authoritative_governance: Option<&BTreeMap<(String, String), ProgramGovernanceParticipant>>,
     ) -> Result<PreparedProgramBundle, ProgramStoreError> {
         validate_source_bundle(source)?;
         let alias_registry_transitions = stored_alias_registry_transitions(source, alias_bindings)?;
@@ -1788,10 +1684,11 @@ impl Store {
         ));
 
         let committed_at_unix_millis = now_unix_millis().map_err(program_mutation_error)?;
-        let mut writes = Vec::with_capacity(source.writes.len());
-        let mut allocated_versions = Vec::with_capacity(source.writes.len());
-        for write in &source.writes {
-            let alias_delete = stored_alias_delete_binding(write, alias_bindings);
+        let write_count = source.writes().count();
+        let mut writes = Vec::with_capacity(write_count);
+        let mut allocated_versions = Vec::with_capacity(write_count);
+        for (participant, write) in source.writes() {
+            let alias_delete = stored_alias_delete_binding(participant, alias_bindings);
             let (blob, deleted) = match &write.value {
                 Some(value) => {
                     let bytes = encode_stored_value(value)?;
@@ -1810,11 +1707,11 @@ impl Store {
             allocated_versions.push(version_id);
             let descriptor = PreparedVersionWrite {
                 path: alias_delete.map_or_else(
-                    || write.path.clone(),
+                    || participant.path.clone(),
                     |binding| binding.requested_path.clone(),
                 ),
                 expected: alias_delete.map_or_else(
-                    || write.expected.clone(),
+                    || participant.expected.clone(),
                     |binding| ObservedHead::Version {
                         version: binding
                             .descriptor_version
@@ -1828,7 +1725,8 @@ impl Store {
                 previous_version: alias_delete
                     .and_then(|binding| binding.descriptor_version.clone())
                     .or_else(|| {
-                        previous_versions.and_then(|versions| versions.get(&write.path).cloned())
+                        previous_versions
+                            .and_then(|versions| versions.get(&participant.path).cloned())
                     }),
                 version: Version {
                     id: version_id,
@@ -1854,6 +1752,7 @@ impl Store {
                 source,
                 alias_bindings,
                 &alias_registry_transitions,
+                authoritative_governance,
             )?,
             builtin_plan: None,
             alias_bindings: alias_bindings.to_vec(),
@@ -1869,8 +1768,6 @@ impl Store {
                 .await
                 .map_err(program_mutation_error)?,
         );
-        let hash = PreparedBundleHash(bundle_ref.hash);
-
         if let Some(allocated) = allocated_versions.into_iter().max() {
             let _commit_guard = self.lock_commit("atomic_program").await;
             let persisted = self.version_high_watermark()?.unwrap_or(VersionId(0));
@@ -1889,7 +1786,6 @@ impl Store {
         let durability_evidence_hash = durability.hash()?;
 
         Ok(PreparedProgramBundle {
-            hash,
             source_bundle_hash,
             program_hash,
             authority: record.authority,
@@ -1906,19 +1802,17 @@ impl Store {
     pub async fn prepared_program_bundle(
         &self,
         bundle: PreparedBundleRef,
-        hash: PreparedBundleHash,
         durability_evidence_hash: ProgramDurabilityEvidenceHash,
     ) -> Result<Option<PreparedProgramBundle>, ProgramStoreError> {
         match self
-            .load_prepared_bundle(bundle, hash, durability_evidence_hash)
+            .load_prepared_bundle(bundle, durability_evidence_hash)
             .await
         {
             Ok(loaded) => Ok(Some(PreparedProgramBundle {
-                hash,
                 source_bundle_hash: loaded.record.source_bundle_hash,
                 program_hash: loaded.record.program_hash,
                 authority: loaded.record.authority,
-                participant_manifest_hash: loaded.record.participant_manifest_hash(hash)?,
+                participant_manifest_hash: loaded.record.participant_manifest_hash()?,
                 bundle: loaded.bundle,
                 durability_evidence_hash,
                 durability: loaded.evidence,
@@ -1937,12 +1831,7 @@ impl Store {
             .read_retained_blob_bytes(&reference)
             .await
             .map_err(program_mutation_error)?;
-        PreparedProgramRecord::decode_distributed(
-            &bytes,
-            prepared.bundle,
-            prepared.hash,
-            prepared.program_hash,
-        )
+        PreparedProgramRecord::decode_distributed(&bytes, prepared.bundle, prepared.program_hash)
     }
 
     fn validate_program_policies(
@@ -1950,36 +1839,15 @@ impl Store {
         source: &AtomicWriteBundle,
     ) -> Result<(), ProgramStoreError> {
         if let Some(write) = source
-            .writes
-            .iter()
-            .find(|write| is_program_definition_path(&write.path.path))
+            .writes()
+            .find(|(participant, _)| is_program_definition_path(&participant.path.path))
         {
             return Err(ProgramStoreError::Immutable {
-                path: write.path.clone(),
+                path: write.0.path.clone(),
             });
         }
         Ok(())
     }
-}
-
-fn prepared_preconditions(
-    source: &AtomicWriteBundle,
-    alias_bindings: &[ProgramAliasBinding],
-) -> Vec<HeadPrecondition> {
-    let mut preconditions = source.head_preconditions.clone();
-    preconditions.extend(alias_bindings.iter().filter_map(|binding| {
-        binding
-            .descriptor_version
-            .as_ref()
-            .map(|version| HeadPrecondition {
-                path: binding.requested_path.clone(),
-                expected: ObservedHead::Version {
-                    version: version.id.0.to_string(),
-                },
-            })
-    }));
-    preconditions.sort_by(|left, right| left.path.cmp(&right.path));
-    preconditions
 }
 
 #[cfg(test)]

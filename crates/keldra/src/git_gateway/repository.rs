@@ -56,10 +56,24 @@ pub(super) async fn materialize(
     let directory = state.cache_root.join(storage.location().cache_key());
     let repository = directory.join(REPOSITORY_DIRECTORY);
     let lock = state.repository_locks.get(storage.location().cache_key());
+    if let Err(error) = state
+        .repository_cache
+        .reconcile(&state.cache_root, &state.repository_locks)
+        .await
+    {
+        drop(lock);
+        let _ = state
+            .repository_cache
+            .reconcile(&state.cache_root, &state.repository_locks)
+            .await;
+        return Err(GitError::from_status(tonic::Status::resource_exhausted(
+            format!("Git repository cache budget is unavailable: {error}"),
+        )));
+    }
 
     let guard = if writable {
         let guard = lock.write_owned().await;
-        ensure_current(storage, &directory, &repository).await?;
+        ensure_current(state, storage, &directory, &repository).await?;
         MaterializationGuard::Write { _guard: guard }
     } else {
         let mut read = lock.clone().read_owned().await;
@@ -67,12 +81,30 @@ pub(super) async fn materialize(
         if !marker_matches(&directory, storage.location().cache_key(), current.as_ref()).await? {
             drop(read);
             let write = lock.clone().write_owned().await;
-            ensure_current(storage, &directory, &repository).await?;
+            ensure_current(state, storage, &directory, &repository).await?;
             drop(write);
             read = lock.read_owned().await;
         }
         MaterializationGuard::Read { _guard: read }
     };
+
+    if let Err(error) = state
+        .repository_cache
+        .reconcile(&state.cache_root, &state.repository_locks)
+        .await
+    {
+        // The requested materialization itself exceeded the budget. Release
+        // its pin, then let the same serialized maintenance pass remove that
+        // disposable directory before rejecting the request.
+        drop(guard);
+        let _ = state
+            .repository_cache
+            .reconcile(&state.cache_root, &state.repository_locks)
+            .await;
+        return Err(GitError::from_status(tonic::Status::resource_exhausted(
+            format!("Git repository cache budget is unavailable: {error}"),
+        )));
+    }
 
     let current = storage.current().await?;
     if !marker_matches(&directory, storage.location().cache_key(), current.as_ref()).await? {
@@ -80,7 +112,7 @@ pub(super) async fn materialize(
             "Git repository advanced while its materialization was acquired",
         ));
     }
-    let before_refs = refs(&repository).await?;
+    let before_refs = refs(&repository, &state.git_processes).await?;
     let before_packs = pack_paths(&repository).await?;
     Ok(MaterializedRepository {
         repository,
@@ -94,14 +126,15 @@ pub(super) async fn materialize(
 
 #[tracing::instrument(
     name = "keldra.git.publish",
-    skip(storage, materialized),
+    skip(state, storage, materialized),
     fields(repository_id = %storage.location().repository_id)
 )]
 pub(super) async fn publish(
+    state: &GitGatewayState,
     storage: &GitStorage,
     materialized: &MaterializedRepository,
 ) -> Result<bool, GitError> {
-    let after_refs = refs(&materialized.repository).await?;
+    let after_refs = refs(&materialized.repository, &state.git_processes).await?;
     let commands = reference_commands(&materialized.before_refs, &after_refs);
     if commands.is_empty() {
         return Ok(false);
@@ -231,6 +264,7 @@ async fn compact_current(state: &GitGatewayState, storage: &GitStorage) -> Resul
         return Ok(());
     }
     let result = compact(
+        state,
         storage,
         &materialized,
         current.object_version,
@@ -246,6 +280,7 @@ async fn compact_current(state: &GitGatewayState, storage: &GitStorage) -> Resul
 }
 
 async fn ensure_current(
+    state: &GitGatewayState,
     storage: &GitStorage,
     directory: &Path,
     repository: &Path,
@@ -261,12 +296,12 @@ async fn ensure_current(
                 && marker.checkpoint_id.as_deref()
                     == Some(current.value.checkpoint_id.as_str()) =>
         {
-            catch_up(storage, repository, marker, current).await?
+            catch_up(state, storage, repository, marker, current).await?
         }
         _ => false,
     };
     if !caught_up {
-        rebuild(storage, directory, repository, current.as_ref()).await?;
+        rebuild(state, storage, directory, repository, current.as_ref()).await?;
     }
     let marker = match current {
         Some(current) => MaterializationMarker {
@@ -290,6 +325,7 @@ async fn ensure_current(
 }
 
 async fn catch_up(
+    state: &GitGatewayState,
     storage: &GitStorage,
     repository: &Path,
     marker: &MaterializationMarker,
@@ -317,17 +353,18 @@ async fn catch_up(
         return Ok(false);
     }
     for batch in reverse.into_iter().rev() {
-        apply_batch(storage, repository, &batch).await?;
+        apply_batch(state, storage, repository, &batch).await?;
     }
-    Ok(refs_hash(repository).await? == current.value.ref_state_hash)
+    Ok(refs_hash(repository, &state.git_processes).await? == current.value.ref_state_hash)
 }
 
 #[tracing::instrument(
     name = "keldra.git.rebuild_materialization",
-    skip(storage, directory, repository, current),
+    skip(state, storage, directory, repository, current),
     fields(repository_id = %storage.location().repository_id)
 )]
 async fn rebuild(
+    state: &GitGatewayState,
     storage: &GitStorage,
     directory: &Path,
     repository: &Path,
@@ -337,15 +374,15 @@ async fn rebuild(
     tokio::fs::create_dir_all(directory)
         .await
         .map_err(|error| GitError::internal(format!("create Git cache: {error}")))?;
-    init(repository).await?;
+    init(repository, &state.git_processes).await?;
     let Some(current) = current else {
         return Ok(());
     };
     let checkpoint = storage.checkpoint(&current.value.checkpoint_id).await?;
     for pack_id in &checkpoint.pack_ids {
-        install_pack(storage, repository, pack_id).await?;
+        install_pack(storage, repository, pack_id, &state.git_processes).await?;
     }
-    set_refs(repository, &checkpoint.refs).await?;
+    set_refs(repository, &checkpoint.refs, &state.git_processes).await?;
 
     let empty_marker = MaterializationMarker {
         format_version: model::FORMAT_VERSION,
@@ -355,12 +392,12 @@ async fn rebuild(
         checkpoint_id: Some(current.value.checkpoint_id.clone()),
         tail_batch_id: None,
     };
-    if !catch_up(storage, repository, &empty_marker, current).await? {
+    if !catch_up(state, storage, repository, &empty_marker, current).await? {
         return Err(GitError::internal(
             "Git checkpoint tail does not lead to current",
         ));
     }
-    if refs_hash(repository).await? != current.value.ref_state_hash {
+    if refs_hash(repository, &state.git_processes).await? != current.value.ref_state_hash {
         return Err(GitError::internal(
             "materialized Git refs do not match current",
         ));
@@ -369,17 +406,18 @@ async fn rebuild(
 }
 
 async fn apply_batch(
+    state: &GitGatewayState,
     storage: &GitStorage,
     repository: &Path,
     batch: &GitPushBatch,
 ) -> Result<(), GitError> {
     for push in &batch.pushes {
         for pack_id in &push.pack_ids {
-            install_pack(storage, repository, pack_id).await?;
+            install_pack(storage, repository, pack_id, &state.git_processes).await?;
         }
-        apply_commands(repository, &push.reference_commands).await?;
+        apply_commands(repository, &push.reference_commands, &state.git_processes).await?;
     }
-    if refs_hash(repository).await? != batch.resulting_ref_state_hash {
+    if refs_hash(repository, &state.git_processes).await? != batch.resulting_ref_state_hash {
         return Err(GitError::internal(
             "Git push batch produced an unexpected ref state",
         ));
@@ -388,6 +426,7 @@ async fn apply_batch(
 }
 
 async fn compact(
+    state: &GitGatewayState,
     storage: &GitStorage,
     materialized: &MaterializedRepository,
     expected_version: u64,
@@ -399,9 +438,10 @@ async fn compact(
             .arg(&materialized.repository)
             .args(["repack", "-ad"]),
         "compact Git packs",
+        &state.git_processes,
     )
     .await?;
-    let refs = refs(&materialized.repository).await?;
+    let refs = refs(&materialized.repository, &state.git_processes).await?;
     let mut pack_ids = Vec::new();
     for path in pack_paths(&materialized.repository).await? {
         pack_ids.push(storage.put_pack(&path).await?);
@@ -453,14 +493,16 @@ async fn compact(
     }
 }
 
-pub(super) async fn refs(repository: &Path) -> Result<BTreeMap<String, String>, GitError> {
-    let output = Command::new("git")
+pub(super) async fn refs(
+    repository: &Path,
+    processes: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<BTreeMap<String, String>, GitError> {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repository)
-        .args(["for-each-ref", "--format=%(refname)%00%(objectname)"])
-        .output()
-        .await
-        .map_err(|error| GitError::internal(format!("run git for-each-ref: {error}")))?;
+        .args(["for-each-ref", "--format=%(refname)%00%(objectname)"]);
+    let output = git_output(&mut command, "run git for-each-ref", processes).await?;
     if !output.status.success() {
         return Err(GitError::internal(format!(
             "git for-each-ref failed: {}",
@@ -504,19 +546,26 @@ fn reference_commands(
         .collect()
 }
 
-async fn refs_hash(repository: &Path) -> Result<String, GitError> {
+async fn refs_hash(
+    repository: &Path,
+    processes: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<String, GitError> {
     Ok(model::refs_hash(&model::references(
-        &refs(repository).await?,
+        &refs(repository, processes).await?,
     )))
 }
 
-async fn init(repository: &Path) -> Result<(), GitError> {
+async fn init(
+    repository: &Path,
+    processes: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<(), GitError> {
     git(
         Command::new("git")
             .arg("init")
             .arg("--bare")
             .arg(repository),
         "initialize Git repository",
+        processes,
     )
     .await?;
     git(
@@ -525,6 +574,7 @@ async fn init(repository: &Path) -> Result<(), GitError> {
             .arg(repository)
             .args(["config", "http.receivepack", "true"]),
         "enable authenticated Git receive-pack",
+        processes,
     )
     .await?;
     git(
@@ -533,6 +583,7 @@ async fn init(repository: &Path) -> Result<(), GitError> {
             .arg(repository)
             .args(["config", "receive.unpackLimit", "0"]),
         "retain received Git packs",
+        processes,
     )
     .await
 }
@@ -541,6 +592,7 @@ async fn install_pack(
     storage: &GitStorage,
     repository: &Path,
     pack_id: &str,
+    processes: &std::sync::Arc<tokio::sync::Semaphore>,
 ) -> Result<(), GitError> {
     let scratch = repository
         .parent()
@@ -549,14 +601,13 @@ async fn install_pack(
     storage.stream_pack(pack_id, &scratch).await?;
     let input = std::fs::File::open(&scratch)
         .map_err(|error| GitError::internal(format!("open downloaded Git pack: {error}")))?;
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repository)
         .args(["index-pack", "--stdin"])
-        .stdin(Stdio::from(input))
-        .output()
-        .await
-        .map_err(|error| GitError::internal(format!("install Git pack: {error}")))?;
+        .stdin(Stdio::from(input));
+    let output = git_output(&mut command, "install Git pack", processes).await?;
     let _ = tokio::fs::remove_file(&scratch).await;
     if output.status.success() {
         return Ok(());
@@ -567,7 +618,11 @@ async fn install_pack(
     )))
 }
 
-async fn set_refs(repository: &Path, refs: &[model::GitReference]) -> Result<(), GitError> {
+async fn set_refs(
+    repository: &Path,
+    refs: &[model::GitReference],
+    processes: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<(), GitError> {
     let commands = refs
         .iter()
         .map(|reference| GitReferenceCommand {
@@ -576,16 +631,21 @@ async fn set_refs(repository: &Path, refs: &[model::GitReference]) -> Result<(),
             new_object_id: Some(reference.object_id.clone()),
         })
         .collect::<Vec<_>>();
-    apply_commands(repository, &commands).await
+    apply_commands(repository, &commands, processes).await
 }
 
 async fn apply_commands(
     repository: &Path,
     commands: &[GitReferenceCommand],
+    processes: &std::sync::Arc<tokio::sync::Semaphore>,
 ) -> Result<(), GitError> {
     if commands.is_empty() {
         return Ok(());
     }
+    let _permit = processes
+        .acquire()
+        .await
+        .map_err(|_| GitError::internal("Git process admission is closed"))?;
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repository)
@@ -612,17 +672,21 @@ async fn apply_commands(
         }
     }
     input.push_str("prepare\ncommit\n");
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| GitError::internal("git update-ref stdin is unavailable"))?
-        .write_all(input.as_bytes())
-        .await
-        .map_err(|error| GitError::internal(format!("write git update-ref input: {error}")))?;
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| GitError::internal(format!("wait for git update-ref: {error}")))?;
+    let output = tokio::time::timeout(super::GIT_PROCESS_TIMEOUT, async move {
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| GitError::internal("git update-ref stdin is unavailable"))?
+            .write_all(input.as_bytes())
+            .await
+            .map_err(|error| GitError::internal(format!("write git update-ref input: {error}")))?;
+        child
+            .wait_with_output()
+            .await
+            .map_err(|error| GitError::internal(format!("wait for git update-ref: {error}")))
+    })
+    .await
+    .map_err(|_| GitError::internal("git update-ref exceeded its operation deadline"))??;
     if output.status.success() {
         return Ok(());
     }
@@ -721,11 +785,12 @@ async fn remove_disposable(path: &Path) -> Result<(), GitError> {
     }
 }
 
-async fn git(command: &mut Command, action: &str) -> Result<(), GitError> {
-    let output = command
-        .output()
-        .await
-        .map_err(|error| GitError::internal(format!("{action}: {error}")))?;
+async fn git(
+    command: &mut Command,
+    action: &str,
+    processes: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<(), GitError> {
+    let output = git_output(command, action, processes).await?;
     if output.status.success() {
         return Ok(());
     }
@@ -733,4 +798,20 @@ async fn git(command: &mut Command, action: &str) -> Result<(), GitError> {
         "{action}: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     )))
+}
+
+async fn git_output(
+    command: &mut Command,
+    action: &str,
+    processes: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<std::process::Output, GitError> {
+    let _permit = processes
+        .acquire()
+        .await
+        .map_err(|_| GitError::internal("Git process admission is closed"))?;
+    command.kill_on_drop(true);
+    tokio::time::timeout(super::GIT_PROCESS_TIMEOUT, command.output())
+        .await
+        .map_err(|_| GitError::internal(format!("{action} exceeded its operation deadline")))?
+        .map_err(|error| GitError::internal(format!("{action}: {error}")))
 }

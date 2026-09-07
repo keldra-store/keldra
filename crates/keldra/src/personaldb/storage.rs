@@ -12,7 +12,7 @@ use tonic::metadata::MetadataValue;
 use tonic::{Request, Status};
 
 use crate::object_path_access;
-use crate::v05::ObjectServiceImpl;
+use crate::object_service::ObjectServiceImpl;
 
 use super::model::GroupScope;
 

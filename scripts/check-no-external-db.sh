@@ -16,10 +16,17 @@ db_g='DATABASE''_URL'
 db_h='POST''GRES'
 pattern="${db_a}|${db_b}|${db_c}|${db_d}|${db_e}|${db_f}|${db_g}|${db_h}"
 
-if rg -n -i -uu "$pattern" . \
-  -g '!target/**' \
-  -g '!**/.git/**' \
-  -g '!docs/**'; then
-  echo "External relational metadata-store reference found; Keldra must be self-contained." >&2
+matches="$(
+  while IFS= read -r -d '' tracked_file; do
+    # Gitlinks are tracked entries but are not files in this worktree.
+    [[ -f "$tracked_file" ]] || continue
+    if rg --quiet --ignore-case -- "$pattern" "$tracked_file"; then
+      printf '%s\n' "$tracked_file"
+    fi
+  done < <(git ls-files -z -- . ':(exclude)docs/**')
+)"
+if [[ -n "$matches" ]]; then
+  echo "External relational metadata-store reference found in tracked source; Keldra must be self-contained." >&2
+  printf '%s\n' "$matches" >&2
   exit 1
 fi

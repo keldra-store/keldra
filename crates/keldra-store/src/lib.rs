@@ -9,7 +9,7 @@
 /// The storage kernel owns exact prefix recognition for its bounded
 /// bucket-scoped iterator. Definition-name validation remains a server
 /// concern.
-pub const INDEX_DEFINITION_PREFIX: &str = "_keldra/indices/v6/definitions/";
+pub const INDEX_DEFINITION_PREFIX: &str = "_keldra/indices/v1/definitions/";
 
 mod authz;
 mod blob;
@@ -34,21 +34,22 @@ mod watch;
 
 pub use authz::{
     AUTHZ_REALM_MUTATION_FORMAT, AUTHZ_REALM_MUTATION_STAMP_FORMAT, AUTHZ_REALM_SNAPSHOT_FORMAT,
-    AUTHZ_REALM_TRANSFER_MANIFEST_FORMAT, AtomicRealmBinding, AuthzBatchCheck, AuthzConsistency,
-    AuthzRealmAggregate, AuthzRealmChange, AuthzRealmCursor, AuthzRealmKeyPage, AuthzRealmMutation,
-    AuthzRealmMutationContext, AuthzRealmMutationStamp, AuthzRealmSchema,
-    AuthzRealmSnapshotApplied, AuthzRealmSnapshotError, AuthzRealmTransferManifest,
-    AuthzRepository, AuthzRevision, AuthzSchemaCatalogue, AuthzSchemaCatalogueApplied,
-    AuthzSchemaCatalogueCandidate, AuthzSchemaPublicationMutation, AuthzSchemaPublicationStamp,
-    AuthzSchemaRevision, AuthzScope, AuthzStoreError, AuthzStoreLimits, BindSchemaRequest,
-    BoundRealm, CoordinatedAuthzRealmMutation, CoordinatedAuthzRealmResult,
-    CoordinatedAuthzSchemaPublication, DEFAULT_AUTHZ_RECEIPT_MAX_BYTES,
-    DEFAULT_AUTHZ_RECEIPT_MAX_ENTRIES, DEFAULT_AUTHZ_RECEIPT_RETENTION_SECONDS,
-    MAX_AUTHZ_REALM_EXPORT_BYTES, MAX_AUTHZ_REALM_EXPORT_RECORDS, ProtectedRealmOwnership,
-    PublishSchemaRequest, PublishedSchema, RealmBinding, RealmSnapshot,
-    ReplicaAuthzRealmMutationApplied, ReplicaAuthzSchemaPublicationApplied,
-    SYSTEM_STORAGE_TENANT_ID, SchemaDigest, SchemaId, SchemaRef, StorageTenantId,
-    TupleBatchReceipt, TupleBatchRequest, TupleMutation, TupleMutationKind,
+    AUTHZ_REALM_STATE_FORMAT, AUTHZ_REALM_TRANSFER_MANIFEST_FORMAT, AtomicRealmBinding,
+    AuthzBatchCheck, AuthzConsistency, AuthzRealmAggregate, AuthzRealmChange, AuthzRealmCursor,
+    AuthzRealmKeyPage, AuthzRealmMutation, AuthzRealmMutationContext, AuthzRealmMutationStamp,
+    AuthzRealmSchema, AuthzRealmSnapshotApplied, AuthzRealmSnapshotError, AuthzRealmState,
+    AuthzRealmTransferManifest, AuthzRepository, AuthzRevision, AuthzSchemaCatalogue,
+    AuthzSchemaCatalogueApplied, AuthzSchemaCatalogueCandidate, AuthzSchemaPublicationMutation,
+    AuthzSchemaPublicationStamp, AuthzSchemaRevision, AuthzScope, AuthzStoreError,
+    AuthzStoreLimits, BindSchemaRequest, BoundRealm, CoordinatedAuthzRealmMutation,
+    CoordinatedAuthzRealmResult, CoordinatedAuthzSchemaPublication,
+    DEFAULT_AUTHZ_RECEIPT_MAX_BYTES, DEFAULT_AUTHZ_RECEIPT_MAX_ENTRIES,
+    DEFAULT_AUTHZ_RECEIPT_RETENTION_SECONDS, MAX_AUTHZ_REALM_EXPORT_BYTES,
+    MAX_AUTHZ_REALM_EXPORT_RECORDS, ProtectedRealmOwnership, PublishSchemaRequest, PublishedSchema,
+    RealmBinding, RealmSnapshot, ReplicaAuthzRealmMutationApplied,
+    ReplicaAuthzSchemaPublicationApplied, SYSTEM_STORAGE_TENANT_ID, SchemaDigest, SchemaId,
+    SchemaRef, StorageTenantId, TupleBatchReceipt, TupleBatchRequest, TupleMutation,
+    TupleMutationKind,
 };
 pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobUpload};
 pub use blob_gc::{BlobGcBudget, BlobGcCursor, BlobGcTick};
@@ -98,13 +99,12 @@ pub use logical_record::{
 pub use model::{
     BatchOperation, BatchOutcome, BucketPolicy, CloneRequest, CoordinatedObjectMutation,
     CoordinatedRetainedVersionDelete, DeleteRequest, DeleteRetainedVersionOutcome, Durability,
-    Head, LEGACY_OBJECT_MUTATION_FORMAT, MAX_BUCKET_POLICY_PREFIX_BYTES,
-    MAX_BUCKET_POLICY_PREFIXES, MAX_CONTENT_TYPE_BYTES, MAX_OBJECT_MUTATION_REFERENCE_DELTAS,
-    MUTATION_STAMP_FORMAT, MutationError, MutationReceipt, MutationStamp,
-    OBJECT_ALIAS_REGISTRY_FORMAT, OBJECT_ALIAS_REGISTRY_TRANSITION_FORMAT, OBJECT_MUTATION_FORMAT,
-    Object, ObjectAliasRegistry, ObjectAliasRegistryTransition, ObjectAliasSnapshot,
-    ObjectMutation, ObjectMutationContext, ObjectMutationGovernance, ObjectVersioning,
-    PlacementLogId, Precondition, PublishRequest, PutMode, PutRequest,
+    Head, MAX_BUCKET_POLICY_PREFIX_BYTES, MAX_BUCKET_POLICY_PREFIXES, MAX_CONTENT_TYPE_BYTES,
+    MAX_OBJECT_MUTATION_REFERENCE_DELTAS, MUTATION_STAMP_FORMAT, MutationError, MutationReceipt,
+    MutationStamp, OBJECT_ALIAS_REGISTRY_FORMAT, OBJECT_ALIAS_REGISTRY_TRANSITION_FORMAT,
+    OBJECT_MUTATION_FORMAT, Object, ObjectAliasRegistry, ObjectAliasRegistryTransition,
+    ObjectAliasSnapshot, ObjectMutation, ObjectMutationContext, ObjectMutationGovernance,
+    ObjectVersioning, PlacementLogId, Precondition, PublishRequest, PutMode, PutRequest,
     RETAINED_VERSION_DELETE_FORMAT, ReplicaObjectMutationApplied,
     ReplicaRetainedVersionDeleteApplied, RetainedVersionDeleteMutation, SMALL_BLOB_MAX_BYTES,
     Version, VersionId,
@@ -156,7 +156,8 @@ pub use store::{
     RetainedObjectCursor, RetainedObjectSnapshot, RetainedObjectSnapshotFrame,
     RetainedObjectSnapshotPage, RetainedObjectSnapshotScan, RetainedVersionCursor, ShardIdentity,
     ShardReader, ShardSealOutcome, ShardStoreError, SingleNodeGroupCommitConfig,
-    SingleNodeMutationBatch, SourceJournalSettlement, Store, StoreOptions,
+    SingleNodeMutationBatch, SourceJournalSettlement, SourceOwnedLogicalFileCounts, Store,
+    StoreOptions,
 };
 pub use watch::{
     AccountingHeadTransition, AggregateChanged, AggregateKind, AtomicBatchMutation,

@@ -209,16 +209,15 @@ impl Store {
         source_epoch: [u8; 32],
         change: &LocalChange,
     ) -> Result<(), crate::MutationError> {
-        let routes = routes_for_change(change);
         let cf = self.cf(CF_JOURNAL_ROUTES)?;
-        for route in routes {
+        try_visit_routes_for_change(change, |route| {
             batch.put_cf(
                 cf,
                 route_key(route, source_epoch, change.offset()).map_err(route_mutation_error)?,
                 [],
             );
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub(crate) fn stage_journal_route_removal(
@@ -228,13 +227,13 @@ impl Store {
         change: &LocalChange,
     ) -> Result<(), crate::MutationError> {
         let cf = self.cf(CF_JOURNAL_ROUTES)?;
-        for route in routes_for_change(change) {
+        try_visit_routes_for_change(change, |route| {
             batch.delete_cf(
                 cf,
                 route_key(route, source_epoch, change.offset()).map_err(route_mutation_error)?,
             );
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -256,9 +255,6 @@ fn project_change_for_route(
         });
     };
     batch
-        .affected_routes
-        .retain(|candidate| candidate.tenant_id == tenant_id && candidate.bucket_id == bucket_id);
-    batch
         .mutations
         .retain(|mutation| mutation.tenant_id == tenant_id && mutation.bucket_id == bucket_id);
     batch
@@ -269,52 +265,69 @@ fn project_change_for_route(
     Ok(LocalChange::AtomicBatchPublished(batch))
 }
 
-fn routes_for_change(change: &LocalChange) -> Vec<JournalRoute> {
+fn try_visit_routes_for_change<E>(
+    change: &LocalChange,
+    mut visit: impl FnMut(JournalRoute) -> Result<(), E>,
+) -> Result<(), E> {
     match change {
         LocalChange::ObjectHead(change) => {
-            let mut routes = vec![JournalRoute::Bucket {
+            visit(JournalRoute::Bucket {
                 tenant_id: change.tenant_id,
                 bucket_id: change.bucket_id,
-            }];
+            })?;
             if let Some(transition) = change.definition_transition.as_ref() {
-                routes.push(JournalRoute::Definition(transition.kind));
+                visit(JournalRoute::Definition(transition.kind))?;
             }
-            routes
         }
-        LocalChange::RetainedVersionDeleted(change) => vec![JournalRoute::Bucket {
-            tenant_id: change.tenant_id,
-            bucket_id: change.bucket_id,
-        }],
-        LocalChange::AtomicBatchPublished(change) => change
-            .affected_routes
-            .iter()
-            .map(|route| JournalRoute::Bucket {
-                tenant_id: route.tenant_id,
-                bucket_id: route.bucket_id,
-            })
-            .collect(),
-        LocalChange::ContentLifecycleChanged(change) => change
-            .accounting_transition
-            .as_ref()
-            .map(|transition| {
-                vec![JournalRoute::Bucket {
+        LocalChange::RetainedVersionDeleted(change) => {
+            visit(JournalRoute::Bucket {
+                tenant_id: change.tenant_id,
+                bucket_id: change.bucket_id,
+            })?;
+        }
+        LocalChange::AtomicBatchPublished(change) => {
+            for route in change.routes() {
+                visit(JournalRoute::Bucket {
+                    tenant_id: route.tenant_id,
+                    bucket_id: route.bucket_id,
+                })?;
+            }
+        }
+        LocalChange::ContentLifecycleChanged(change) => {
+            if let Some(transition) = change.accounting_transition.as_ref() {
+                visit(JournalRoute::Bucket {
                     tenant_id: transition.tenant_id,
                     bucket_id: transition.bucket_id,
-                }]
-            })
-            .unwrap_or_default(),
-        LocalChange::AggregateChanged(_) => Vec::new(),
+                })?;
+            }
+        }
+        LocalChange::AggregateChanged(_) => {}
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn routes_for_change(change: &LocalChange) -> Vec<JournalRoute> {
+    let mut routes = Vec::new();
+    try_visit_routes_for_change(change, |route| {
+        routes.push(route);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .expect("infallible route collection");
+    routes
 }
 
 pub(crate) fn journal_route_logical_bytes(change: &LocalChange) -> u64 {
-    routes_for_change(change)
-        .into_iter()
-        .map(|route| match route {
+    let mut bytes = 0_u64;
+    try_visit_routes_for_change(change, |route| {
+        bytes = bytes.saturating_add(match route {
             JournalRoute::Definition(_) => DEFINITION_ROUTE_KEY_BYTES as u64,
             JournalRoute::Bucket { .. } => BUCKET_ROUTE_KEY_BYTES as u64,
-        })
-        .sum()
+        });
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .expect("infallible route byte accounting");
+    bytes
 }
 
 fn route_matches(route: JournalRoute, change: &LocalChange) -> bool {
@@ -356,12 +369,8 @@ fn route_matches(route: JournalRoute, change: &LocalChange) -> bool {
             },
             LocalChange::AtomicBatchPublished(change),
         ) => change
-            .affected_routes
-            .binary_search(&crate::AtomicBatchRoute {
-                tenant_id,
-                bucket_id,
-            })
-            .is_ok(),
+            .routes()
+            .any(|route| route.tenant_id == tenant_id && route.bucket_id == bucket_id),
         _ => false,
     }
 }

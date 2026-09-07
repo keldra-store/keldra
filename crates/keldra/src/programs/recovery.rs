@@ -103,21 +103,6 @@ impl ProgramCoordinator {
         Ok(())
     }
 
-    pub(super) fn require_generalized_atomic_paths(&self) -> Result<(), Status> {
-        if self.generalized_atomic_paths_active()? {
-            Ok(())
-        } else {
-            Err(Status::failed_precondition(
-                "generalized atomic path reservations are not active for this cluster",
-            ))
-        }
-    }
-
-    pub(crate) fn generalized_atomic_paths_active(&self) -> Result<bool, Status> {
-        let state = self.decisions.state().map_err(decision_status)?;
-        Ok(crate::cluster_capabilities::generalized_atomic_paths_active(&state))
-    }
-
     pub(super) async fn reserve_local_participants(
         &self,
         reservations: &[ProgramReservation],
@@ -216,10 +201,9 @@ impl ProgramCoordinator {
                 .store
                 .prepared_program_bundle(
                     PreparedBundleRef {
-                        hash: request.bundle_ref.hash,
+                        hash: PreparedBundleHash(request.bundle_ref.hash),
                         length: request.bundle_ref.length,
                     },
-                    PreparedBundleHash(request.bundle_hash.0),
                     ProgramDurabilityEvidenceHash(request.durability_evidence_hash.0),
                 )
                 .await
@@ -239,7 +223,7 @@ impl ProgramCoordinator {
                 .reservations(
                     batch.begin_cursor,
                     request.invocation_id.0,
-                    prepared.hash,
+                    prepared.bundle.hash,
                     nomination.executor.0,
                     nomination.nomination_log_index,
                     mutation_context.active_placement_log_id,
@@ -311,10 +295,9 @@ impl ProgramCoordinator {
                 .store
                 .prepared_program_bundle(
                     PreparedBundleRef {
-                        hash: batch.bundle_ref.hash,
+                        hash: PreparedBundleHash(batch.bundle_ref.hash),
                         length: batch.bundle_ref.length,
                     },
-                    PreparedBundleHash(batch.bundle_hash.0),
                     ProgramDurabilityEvidenceHash(batch.durability_evidence_hash.0),
                 )
                 .await
@@ -329,7 +312,7 @@ impl ProgramCoordinator {
                 .reservations(
                     batch.begin_cursor,
                     invocation.invocation_id.0,
-                    prepared.hash,
+                    prepared.bundle.hash,
                     nomination.executor.0,
                     nomination.nomination_log_index,
                     mutation_context.active_placement_log_id,

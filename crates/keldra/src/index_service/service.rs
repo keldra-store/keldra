@@ -30,7 +30,7 @@ use crate::authorization::ObjectPermission;
 use crate::distributed_list::OriginalBearer;
 use crate::logical_name_resolution::LogicalNameResolver;
 use crate::object_path_access;
-use crate::v05::{ObjectServiceImpl, request_deadline, run_request_until};
+use crate::object_service::{ObjectServiceImpl, request_deadline, run_request_until};
 
 use super::boundary::{
     ExecuteIndexQuery, IndexAuthorizationEvidence, IndexDefinitionScan, IndexDefinitionScanPage,

@@ -1,22 +1,22 @@
+use std::collections::BTreeSet;
+
+use keldra_api::typed_json::validate_typed_json_specification;
 use keldra_api::v1::index_field::FieldType;
 use keldra_api::v1::index_specification::Specification;
 use keldra_api::v1::{
-    CreateIndexRequest, IndexDefinition, IndexField, IndexFieldCapability, IndexFieldCardinality,
-    IndexKind, IndexOrderDirection, IndexSpecification, TextAnalyzer, TypedJsonIndexSpec,
-    UpdateIndexRequest,
+    CreateIndexRequest, IndexDefinition, IndexKind, IndexSpecification, UpdateIndexRequest,
 };
 use keldra_atomic_program::MAX_OBJECT_PATH_BYTES;
 use keldra_index::typed_json::DateFormat;
 use keldra_store::INDEX_DEFINITION_PREFIX;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use tonic::Status;
 
 use crate::index_runtime::date::validate_format;
 use crate::index_runtime::typed_json_schema::compile_typed_json_schema;
 
-const STORED_DEFINITION_FORMAT: u16 = 4;
+const STORED_DEFINITION_FORMAT: u16 = 1;
 const MAX_INDEX_NAME_BYTES: usize = 128;
 const MAX_CONTENT_TYPE_BYTES: usize = 512;
 const MAX_COMMAND_ID_BYTES: usize = 256;
@@ -273,6 +273,20 @@ fn validate_specification(specification: &IndexSpecification) -> Result<(), Stat
     match specification.specification.as_ref() {
         Some(Specification::TypedJson(specification)) => {
             validate_typed_json_specification(specification)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            for field in &specification.fields {
+                if let Some(FieldType::Date(date)) = field.field_type.as_ref() {
+                    let format = if date.strftime_pattern.is_empty() {
+                        DateFormat::Iso8601
+                    } else {
+                        DateFormat::Strftime(date.strftime_pattern.clone())
+                    };
+                    validate_format(&format).map_err(|error| {
+                        Status::invalid_argument(format!("invalid Date format: {error}"))
+                    })?;
+                }
+            }
+            Ok(())
         }
         Some(
             Specification::Path(_)
@@ -296,173 +310,6 @@ fn kind_for(specification: &IndexSpecification) -> Result<IndexKind, Status> {
             "stored index definition uses a removed non-TypedJson index kind",
         )),
         None => Err(Status::data_loss("stored index specification is empty")),
-    }
-}
-
-fn validate_fields(fields: &[IndexField]) -> Result<(), Status> {
-    if fields.is_empty() {
-        return Err(Status::invalid_argument(
-            "typed JSON index needs at least one field",
-        ));
-    }
-    let mut names = BTreeSet::new();
-    for field in fields {
-        validate_field_parts(&field.name, &field.json_pointer)?;
-        if !names.insert(field.name.as_str()) {
-            return Err(Status::invalid_argument(
-                "typed JSON field names must be unique",
-            ));
-        }
-        validate_typed_json_field(field)?;
-    }
-    Ok(())
-}
-
-fn validate_typed_json_field(field: &IndexField) -> Result<(), Status> {
-    let cardinality = IndexFieldCardinality::try_from(field.cardinality)
-        .map_err(|_| Status::invalid_argument("typed JSON field cardinality is unknown"))?;
-    let field_type = field
-        .field_type
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("typed JSON field type is required"))?;
-    if let FieldType::Text(text) = field_type {
-        TextAnalyzer::try_from(text.analyzer)
-            .map_err(|_| Status::invalid_argument("typed JSON text analyzer is unknown"))?;
-    }
-    if let FieldType::Date(date) = field_type {
-        let format = if date.strftime_pattern.is_empty() {
-            DateFormat::Iso8601
-        } else {
-            DateFormat::Strftime(date.strftime_pattern.clone())
-        };
-        validate_format(&format)
-            .map_err(|error| Status::invalid_argument(format!("invalid Date format: {error}")))?;
-    }
-
-    if field.capabilities.is_empty() {
-        return Err(Status::invalid_argument(
-            "typed JSON field needs at least one capability",
-        ));
-    }
-    let mut capabilities = BTreeSet::new();
-    for encoded in &field.capabilities {
-        let capability = IndexFieldCapability::try_from(*encoded)
-            .map_err(|_| Status::invalid_argument("typed JSON field capability is unknown"))?;
-        if !capabilities.insert(capability) {
-            return Err(Status::invalid_argument(
-                "typed JSON field capabilities must be unique",
-            ));
-        }
-        if !capability_allowed(field_type, capability) {
-            return Err(Status::invalid_argument(format!(
-                "typed JSON field capability {capability:?} is invalid for its field type"
-            )));
-        }
-    }
-    if cardinality == IndexFieldCardinality::Multi
-        && capabilities.contains(&IndexFieldCapability::Order)
-    {
-        return Err(Status::invalid_argument(
-            "multi-valued typed JSON fields cannot declare ORDER",
-        ));
-    }
-    Ok(())
-}
-
-fn capability_allowed(field_type: &FieldType, capability: IndexFieldCapability) -> bool {
-    match field_type {
-        FieldType::Boolean(_) => matches!(
-            capability,
-            IndexFieldCapability::Exact | IndexFieldCapability::Facet
-        ),
-        FieldType::SignedInteger(_) | FieldType::UnsignedInteger(_) | FieldType::Float(_) => {
-            matches!(
-                capability,
-                IndexFieldCapability::Exact
-                    | IndexFieldCapability::Range
-                    | IndexFieldCapability::Order
-                    | IndexFieldCapability::Facet
-                    | IndexFieldCapability::Aggregate
-            )
-        }
-        FieldType::Keyword(_) => matches!(
-            capability,
-            IndexFieldCapability::Exact
-                | IndexFieldCapability::Prefix
-                | IndexFieldCapability::Range
-                | IndexFieldCapability::Order
-                | IndexFieldCapability::Facet
-        ),
-        FieldType::Text(_) => capability == IndexFieldCapability::FullText,
-        FieldType::Date(_) => matches!(
-            capability,
-            IndexFieldCapability::Exact
-                | IndexFieldCapability::Range
-                | IndexFieldCapability::Order
-                | IndexFieldCapability::Facet
-        ),
-    }
-}
-
-fn validate_typed_json_specification(specification: &TypedJsonIndexSpec) -> Result<(), Status> {
-    validate_fields(&specification.fields)?;
-
-    let fields = specification
-        .fields
-        .iter()
-        .map(|field| {
-            (
-                field.name.as_str(),
-                (field.cardinality, field.capabilities.as_slice()),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut ordered = BTreeSet::new();
-    for order in &specification.physical_order {
-        require_text(&order.field, "physical-order field")?;
-        if !ordered.insert(order.field.as_str()) {
-            return Err(Status::invalid_argument(
-                "physical-order field names must be unique",
-            ));
-        }
-        let Some((cardinality, capabilities)) = fields.get(order.field.as_str()) else {
-            return Err(Status::invalid_argument(
-                "physical order names a field outside the typed JSON definition",
-            ));
-        };
-        if IndexFieldCardinality::try_from(*cardinality)
-            .is_ok_and(|value| value == IndexFieldCardinality::Multi)
-        {
-            return Err(Status::invalid_argument(
-                "physical order requires single-valued typed JSON fields",
-            ));
-        }
-        if !capabilities
-            .iter()
-            .any(|value| *value == IndexFieldCapability::Order as i32)
-        {
-            return Err(Status::invalid_argument(
-                "physical order requires the typed JSON field to declare ORDER",
-            ));
-        }
-        IndexOrderDirection::try_from(order.direction)
-            .map_err(|_| Status::invalid_argument("physical order direction is unknown"))?;
-    }
-    Ok(())
-}
-
-fn validate_field_parts(name: &str, pointer: &str) -> Result<(), Status> {
-    require_text(name, "index field name")?;
-    validate_json_pointer(pointer)
-}
-
-fn validate_json_pointer(pointer: &str) -> Result<(), Status> {
-    if pointer.is_empty() || (pointer.starts_with('/') && !pointer.contains('\0')) {
-        Ok(())
-    } else {
-        Err(Status::invalid_argument(
-            "JSON pointer must be empty or begin with '/'",
-        ))
     }
 }
 
@@ -554,7 +401,8 @@ fn validate_explicit_rebuild(accepted_at_unix_millis: u64) -> Result<(), Status>
 #[cfg(test)]
 mod tests {
     use keldra_api::v1::{
-        DateIndexField, IndexOrder, KeywordIndexField, SignedIntegerIndexField, TensorIndexSpec,
+        DateIndexField, IndexField, IndexFieldCapability, IndexFieldCardinality, IndexOrder,
+        IndexOrderDirection, KeywordIndexField, SignedIntegerIndexField, TensorIndexSpec,
         TypedJsonIndexSpec, index_specification,
     };
 
@@ -600,7 +448,7 @@ mod tests {
         );
         assert_eq!(
             definition_path("by-json").unwrap(),
-            "_keldra/indices/v6/definitions/by-json"
+            "_keldra/indices/v1/definitions/by-json"
         );
         assert_eq!(
             derive_index_id(7, 9, "by-json", "create-index").unwrap(),
@@ -644,10 +492,10 @@ mod tests {
     }
 
     #[test]
-    fn format_three_definition_is_not_a_compatibility_input() {
+    fn non_v1_definition_is_not_a_compatibility_input() {
         let stored = StoredIndexDefinition::create("tenant".into(), request(), 44).unwrap();
         let mut encoded = serde_json::to_value(stored).unwrap();
-        encoded["format"] = serde_json::json!(3);
+        encoded["format"] = serde_json::json!(0);
         let error =
             StoredIndexDefinition::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
@@ -702,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "format-v6 admission no longer has the legacy statistics-size ceiling"]
+    #[ignore = "format-v1 admission no longer has the removed statistics-size ceiling"]
     fn definition_admission_rejects_a_schema_whose_statistics_cannot_fit() {
         let mut request = request();
         request.specification = Some(IndexSpecification {
@@ -794,27 +642,25 @@ mod tests {
             IndexFieldCapability::Order as i32,
             IndexFieldCapability::Facet as i32,
         ];
-        assert!(validate_typed_json_field(&specification.fields[0]).is_ok());
+        assert!(validate_typed_json_specification(specification).is_ok());
 
         specification.fields[0]
             .capabilities
             .push(IndexFieldCapability::Aggregate as i32);
-        assert_eq!(
-            validate_typed_json_field(&specification.fields[0])
-                .unwrap_err()
-                .code(),
-            tonic::Code::InvalidArgument
-        );
+        assert!(validate_typed_json_specification(specification).is_err());
 
         specification.fields[0].capabilities.pop();
         let Some(FieldType::Date(date)) = specification.fields[0].field_type.as_mut() else {
             unreachable!();
         };
         date.strftime_pattern = "%Y-%B-%d".into();
+        let invalid_date = IndexSpecification {
+            specification: Some(index_specification::Specification::TypedJson(
+                specification.clone(),
+            )),
+        };
         assert_eq!(
-            validate_typed_json_field(&specification.fields[0])
-                .unwrap_err()
-                .code(),
+            validate_specification(&invalid_date).unwrap_err().code(),
             tonic::Code::InvalidArgument
         );
     }
@@ -888,9 +734,9 @@ mod tests {
             assert!(definition_path(invalid).is_err(), "{invalid:?}");
         }
         for invalid_path in [
-            "_keldra/indices/v3/definitions/safe-name",
-            "_keldra/indices/v4/definitions/a/b",
-            "_keldra/indices/v4/definitions/..",
+            "_keldra/indices/v1/definition/safe-name",
+            "_keldra/indices/v1/definitions/a/b",
+            "_keldra/indices/v1/definitions/..",
         ] {
             assert_eq!(definition_name(invalid_path), None, "{invalid_path:?}");
         }

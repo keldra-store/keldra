@@ -10,7 +10,7 @@ impl Store {
             contract_version: plan.contract_version,
         };
         authority
-            .validate(false)
+            .validate()
             .map_err(|message| ProgramStoreError::InvalidBundle(message.into()))?;
         plan.participant_manifest
             .validate()
@@ -159,7 +159,6 @@ impl Store {
                 .await
                 .map_err(program_mutation_error)?,
         );
-        let hash = PreparedBundleHash(bundle.hash);
         if let Some(allocated) = allocated_versions.into_iter().max() {
             let _commit_guard = self.lock_commit("builtin_object_transaction").await;
             let persisted = self.version_high_watermark()?.unwrap_or(VersionId(0));
@@ -174,7 +173,6 @@ impl Store {
         let durability = self.local_program_durability_evidence(bundle);
         let durability_evidence_hash = durability.hash()?;
         Ok(PreparedProgramBundle {
-            hash,
             source_bundle_hash,
             program_hash: record.program_hash,
             authority,

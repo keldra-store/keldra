@@ -4,6 +4,7 @@ use crate::key::STORAGE_KEY_FORMAT_VERSION;
 use crate::watch::{REFERENCE_PROOF_KEY_BYTES, offset_from_key};
 use crate::{
     BatchOperation, DestinationReferenceArtifact, DestinationReferenceDelta, Durability,
+    OBJECT_ALIAS_REGISTRY_FORMAT, OBJECT_MUTATION_FORMAT, ObjectAliasRegistry, ObjectAliasSnapshot,
     ObjectMutationContext, PlacementLogId, PutMode, PutRequest, ReferenceDeltaBatch,
     ReplicaObjectMutationApplied, StoreOptions, VersionId,
 };
@@ -805,6 +806,83 @@ async fn prune_is_source_scoped_and_through_inclusive() {
             .read_reference_proof(other.source_id, other.offset())
             .unwrap(),
         Some(other)
+    );
+}
+
+#[tokio::test]
+async fn alias_primary_proof_is_retained_until_its_complete_derived_range_is_settled() {
+    let (_temporary, source, replica) = stores().await;
+    let first = source
+        .coordinate_object_mutation(
+            BatchOperation::Put(put("alias-prune", "alias-prune-first")),
+            context(),
+        )
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+    let mut replacement = put("alias-prune", "alias-prune-second");
+    replacement.mode = PutMode::Put;
+    let mut mutation = source
+        .coordinate_object_mutation(BatchOperation::Put(replacement), context())
+        .await
+        .unwrap()
+        .mutation
+        .unwrap();
+    mutation.format = OBJECT_MUTATION_FORMAT;
+    mutation.alias_snapshot = Some(ObjectAliasSnapshot {
+        registry: ObjectAliasRegistry {
+            format: OBJECT_ALIAS_REGISTRY_FORMAT,
+            revision: 1,
+            aliases: vec!["aliases/prune-a".into(), "aliases/prune-b".into()],
+            program_commit_cursor: Some(1),
+        },
+        canonical_version: first.version,
+    });
+    mutation.set_computed_fingerprint();
+    let proof = proof_for_mutation(&mutation).unwrap();
+    assert!(matches!(
+        &proof.change,
+        LocalChange::ObjectHead(change) if change.accounting_transition.is_none()
+    ));
+    replica
+        .install_quorum_reconciled_reference_proof(&proof)
+        .await
+        .unwrap();
+
+    let primary_floor = replica
+        .prune_reference_proofs(
+            proof.source_id,
+            proof.offset(),
+            MAX_REFERENCE_PROOF_PRUNE_RECORDS,
+            MAX_REFERENCE_PROOF_PRUNE_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(primary_floor.deleted_records, 0);
+    assert_eq!(
+        replica
+            .read_reference_proof(proof.source_id, proof.offset())
+            .unwrap(),
+        Some(proof.clone())
+    );
+
+    let complete_alias_floor = proof.offset() + 2;
+    let complete = replica
+        .prune_reference_proofs(
+            proof.source_id,
+            complete_alias_floor,
+            MAX_REFERENCE_PROOF_PRUNE_RECORDS,
+            MAX_REFERENCE_PROOF_PRUNE_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(complete.deleted_records, 1);
+    assert!(
+        replica
+            .read_reference_proof(proof.source_id, proof.offset())
+            .unwrap()
+            .is_none()
     );
 }
 

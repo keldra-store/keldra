@@ -472,6 +472,18 @@ impl Store {
                 "retained version descriptor is malformed".into(),
             ));
         }
+        if target.protected_link_descriptor {
+            return Err(MutationError::InvalidObjectMutation(
+                "ordinary retained-version deletion names a protected link descriptor".into(),
+            ));
+        }
+        let alias_paths = self
+            .alias_registry_locked(identity, key.path())?
+            .map(|registry| registry.aliases)
+            .unwrap_or_default();
+        if head.version == version_id && !alias_paths.is_empty() {
+            return Err(MutationError::ObjectHasInboundAliases);
+        }
 
         let now = now_unix_millis()?;
         let mut batch = WriteBatch::default();
@@ -552,23 +564,38 @@ impl Store {
                     // explicit no-op so accounting consumers do not mistake
                     // it for an old journal entry that lacks transition
                     // evidence and unnecessarily rebuild their baseline.
-                    accounting_transition: Some(AccountingHeadTransition::new(None, None)),
+                    accounting_transition: Some(AccountingHeadTransition::new(None, None, 0)),
                     definition_transition: None,
                 }),
             )
         };
-        let mut changes = vec![PendingLocalChange::RetainedVersionDeleted {
+        let mut changes = Vec::with_capacity(alias_paths.len().saturating_add(2));
+        changes.push(PendingLocalChange::RetainedVersionDeleted {
             identity,
             exact_path: key.path().to_owned(),
+            canonical_path: None,
             deleted_version: version_id,
             resulting_head_version,
             reference_deltas,
-            accounting_transition: Some(if resulting_head_version.is_some() {
-                AccountingHeadTransition::new(target.blob.as_ref().map(|blob| blob.length), None)
-            } else {
-                AccountingHeadTransition::new(None, None)
+            accounting_transition: alias_paths.is_empty().then(|| {
+                AccountingHeadTransition::new(
+                    resulting_head_version.and(target.blob.as_ref().map(|blob| blob.length)),
+                    None,
+                    target.blob.as_ref().map_or(0, |blob| blob.length),
+                )
             }),
-        }];
+        });
+        changes.extend(alias_paths.into_iter().map(|exact_path| {
+            PendingLocalChange::RetainedVersionDeleted {
+                identity,
+                exact_path,
+                canonical_path: Some(key.path().to_owned()),
+                deleted_version: version_id,
+                resulting_head_version,
+                reference_deltas: Vec::new(),
+                accounting_transition: None,
+            }
+        }));
         if let Some(head_change) = head_change {
             changes.push(head_change);
         }

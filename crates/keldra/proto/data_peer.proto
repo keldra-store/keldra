@@ -409,6 +409,25 @@ message ExistsResponse {
   bool exists = 2;
 }
 
+enum CompleteCopyState {
+  COMPLETE_COPY_STATE_UNSPECIFIED = 0;
+  COMPLETE_COPY_STATE_MISSING = 1;
+  COMPLETE_COPY_STATE_VALID = 2;
+  COMPLETE_COPY_STATE_CORRUPT = 3;
+}
+
+message CompleteSourceState {
+  uint32 schema_version = 1;
+  CompleteCopyState state = 2;
+}
+
+message CompleteSourceStateRequest {
+  PeerContext peer = 1;
+  BlobIdentity blob = 2;
+  uint64 placement_fence_term = 3;
+  uint64 placement_fence_index = 4;
+}
+
 message ContentFrame {
   uint32 schema_version = 1;
   uint64 offset = 2;
@@ -508,7 +527,7 @@ message AuthzRealmRequest {
 message AuthzRealmManifest {
   uint32 schema_version = 1;
   bool present = 2;
-  bytes manifest_json = 3;
+  bytes state_json = 3;
 }
 
 message AuthzSchemaCatalogueRequest {
@@ -631,6 +650,7 @@ service DataPeer {
   rpc PutSmallContent(stream SmallContentPutFrame) returns (ContentStored);
 
   rpc GetCompleteSource(ContentRequest) returns (stream ContentFrame);
+  rpc GetCompleteSourceState(CompleteSourceStateRequest) returns (CompleteSourceState);
   rpc PutCompleteSource(stream CompleteSourcePutFrame) returns (CompleteSourceStored);
 
   rpc ShardExists(ShardRequest) returns (ExistsResponse);

@@ -42,7 +42,7 @@ previously advertised kinds fail definition admission and create no state until
 implemented on this same partition publication protocol. None retains the old
 builder as a fallback.
 
-The canonical persistence is the format-v6 partition-root namespace and codec.
+The canonical persistence is the format-v1 partition-root namespace and codec.
 This is a clean break. No old manifest reader, builder scheduler, migration,
 converter, dual writer, compatibility shim, fallback builder, or mixed
 publication architecture is retained.
@@ -518,7 +518,7 @@ The implementation deletes rather than wraps:
 - per-definition/per-family active builders and source cursor loops;
 - global or family manifest/current publication on normal flush;
 - historical projected-state streams required only by the builder model;
-- format-v4 bridge assemblers operating as a second indexing pipeline;
+- bridge assemblers operating as a second indexing pipeline;
 - legacy manifest and component readers/writers superseded by partition roots;
 - converters, migrations, dual-write paths, compatibility modes and feature
   flags; and

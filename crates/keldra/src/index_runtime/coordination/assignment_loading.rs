@@ -154,7 +154,7 @@ pub(super) fn consumer_kind(kind: DefinitionKind) -> DefinitionConsumerKind {
 
 pub(super) fn delivery_consumer_kind(kind: DefinitionKind) -> DefinitionConsumerKind {
     match kind {
-        DefinitionKind::Index => DefinitionConsumerKind::V6IndexCatalog,
+        DefinitionKind::Index => DefinitionConsumerKind::V1IndexCatalog,
         DefinitionKind::Accounting => DefinitionConsumerKind::AccountingDelivery,
     }
 }

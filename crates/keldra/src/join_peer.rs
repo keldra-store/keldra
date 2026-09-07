@@ -37,7 +37,7 @@ pub(crate) mod wire {
     tonic::include_proto!("keldra.join_peer.v1");
 }
 
-const JOIN_PEER_SCHEMA_VERSION: u32 = 2;
+const JOIN_PEER_SCHEMA_VERSION: u32 = 1;
 const MAX_JOIN_PEER_MESSAGE_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy)]

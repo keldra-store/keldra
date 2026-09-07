@@ -11,12 +11,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use keldra_consensus::{
-    ApplyError, ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, ClusterId, Command,
-    CommittedPeerPinProvider, CommittedPeerPins, DecisionRaft, DecisionRaftError,
-    ErasureCodeProfile, JoinCapabilityHash, MAX_PEER_ADDRESS_BYTES, MembershipTransitionKind,
-    NodeDescriptor, NodeId, NodeState, PeerAddress, PeerNode, PeerRpcKind, PeerSpkiSha256,
-    PeerTlsAcceptor, PeerTlsConfig, PeerTlsConnector, PeerTlsError, PeerTlsIdentity,
-    ServingLeaseIssuer, TonicPeerTransport, TonicRaftPeerService,
+    ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, ClusterId, Command, CommittedPeerPinProvider,
+    CommittedPeerPins, DecisionRaft, ErasureCodeProfile, JoinCapabilityHash,
+    MAX_PEER_ADDRESS_BYTES, MembershipTransitionKind, NodeDescriptor, NodeId, NodeState,
+    PeerAddress, PeerNode, PeerRpcKind, PeerSpkiSha256, PeerTlsAcceptor, PeerTlsConfig,
+    PeerTlsConnector, PeerTlsError, PeerTlsIdentity, ServingLeaseIssuer, TonicPeerTransport,
+    TonicRaftPeerService,
 };
 use keldra_store::{ErasureProfile, Store};
 use tonic::codegen::tokio_stream::StreamExt;
@@ -182,15 +182,15 @@ pub(crate) async fn open(config: OpenPeerConfig<'_>) -> Result<(DecisionRaft, Pe
     let identity_exists = node_identity::identity_path(config.data_dir)
         .try_exists()
         .context("inspect local node identity path")?;
-    let decision_state_exists = legacy_decision_state_exists(config.data_dir)?;
-    if !identity_exists && decision_state_exists && config.join_bundle.is_some() {
-        bail!("a join bundle cannot be applied to an existing decision store");
-    }
-    let migrated_identity = if !identity_exists && decision_state_exists {
-        migrate_released_identity(&config).await?
-    } else {
-        None
-    };
+    let decision_state_exists = config
+        .data_dir
+        .join("decisions")
+        .try_exists()
+        .context("inspect local decision state")?;
+    anyhow::ensure!(
+        identity_exists || !decision_state_exists,
+        "decision state without a v1 node identity is unsupported"
+    );
 
     let mut created_genesis_identity = false;
     let identity = if identity_exists {
@@ -202,8 +202,6 @@ pub(crate) async fn open(config: OpenPeerConfig<'_>) -> Result<(DecisionRaft, Pe
             None => node_identity::load_for_node(config.data_dir, config.node_id)
                 .context("load local node identity")?,
         }
-    } else if let Some(identity) = migrated_identity {
-        identity
     } else if let Some(path) = config.join_bundle {
         if config.run_system_bootstrap {
             tracing::warn!("--run-system-bootstrap is ignored when --join-bundle is supplied");
@@ -830,26 +828,13 @@ async fn admit_genesis_descriptor(
         supported_protocol: PEER_PROTOCOL_CAPABILITY,
         supported_storage_format: STORAGE_FORMAT_CAPABILITY,
     };
-    let begin = match decisions
+    let begin = decisions
         .submit(Command::BeginAddNode {
             format_version: CLUSTER_CONTROL_COMMAND_VERSION,
-            descriptor: descriptor.clone(),
+            descriptor,
         })
         .await
-    {
-        Ok(begin) => begin,
-        Err(DecisionRaftError::Rejected(ApplyError::RaftMemberAddressMismatch { .. })) => {
-            migrate_legacy_peer_address(decisions, peer_address).await?;
-            decisions
-                .submit(Command::BeginAddNode {
-                    format_version: CLUSTER_CONTROL_COMMAND_VERSION,
-                    descriptor,
-                })
-                .await
-                .context("admit genesis node after legacy address migration")?
-        }
-        Err(error) => return Err(error).context("admit genesis node descriptor"),
-    };
+        .context("admit genesis node descriptor")?;
     let started_log_index = match begin.result {
         ApplyResult::MembershipTransitionBegun(transition)
             if transition.kind == MembershipTransitionKind::Add
@@ -1021,66 +1006,6 @@ fn genesis_transition_hash(node_id: NodeId, peer_pin: PeerSpkiSha256) -> JoinCap
     JoinCapabilityHash(*hasher.finalize().as_bytes())
 }
 
-fn legacy_decision_state_exists(data_dir: &Path) -> Result<bool> {
-    let path = data_dir.join("decisions");
-    path.try_exists()
-        .with_context(|| format!("inspect legacy decision state at {}", path.display()))
-}
-
-async fn migrate_legacy_peer_address(
-    decisions: &DecisionRaft,
-    peer_address: &PeerAddress,
-) -> Result<()> {
-    decisions
-        .migrate_released_single_node_address(peer_address.0.clone())
-        .await
-        .context("replace released one-node Raft peer address")
-}
-
-/// Open only the released one-node decision state long enough to bind its
-/// existing cluster identity to new private peer material and replace the
-/// synthetic `keldra-local://N` address. No public or peer listener is exposed
-/// during this bounded migration.
-async fn migrate_released_identity(
-    config: &OpenPeerConfig<'_>,
-) -> Result<Option<LocalNodeIdentity>> {
-    let decisions = DecisionRaft::open(
-        config.data_dir.join("decisions"),
-        config.node_id.0,
-        config.max_commit_entries,
-        config.max_commit_bytes,
-    )
-    .await
-    .context("open released one-node decision state for peer migration")?;
-    if !decisions.is_initialized().await? {
-        decisions.shutdown().await?;
-        return Ok(None);
-    }
-    decisions
-        .wait_for_leader(config.leader_timeout)
-        .await
-        .context("elect released one-node leader for peer migration")?;
-    let state = decisions.state()?;
-    anyhow::ensure!(
-        state.cluster_control().nodes().is_empty(),
-        "node identity is missing from an already admitted cluster node"
-    );
-    let cluster_id = state
-        .cluster_id()
-        .context("released decision state has no committed cluster identity")?;
-    let identity = node_identity::generate(cluster_id, config.node_id)
-        .context("generate peer identity for released one-node state")?;
-    node_identity::create(config.data_dir, &identity)
-        .context("persist migrated mode-0600 node identity")?;
-    migrate_legacy_peer_address(&decisions, &config.peer_address).await?;
-    decisions.shutdown().await?;
-    tracing::info!(
-        path = %node_identity::identity_path(config.data_dir).display(),
-        "migrated released one-node state to its mode-0600 cluster identity"
-    );
-    Ok(Some(identity))
-}
-
 struct RaftCommittedPeerPins {
     cluster_id: ClusterId,
     local_node_id: NodeId,
@@ -1121,7 +1046,7 @@ impl RaftCommittedPeerPins {
         }
     }
 
-    fn committed_state(&self) -> Option<keldra_consensus::StateMachine> {
+    fn committed_state(&self) -> Option<Arc<keldra_consensus::StateMachine>> {
         let decisions = self.decisions.read().ok()?.clone()?;
         decisions.state().ok()
     }
@@ -1371,7 +1296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn released_one_node_state_migrates_in_place_before_listening() {
+    async fn node_state_without_v1_identity_is_rejected_before_listening() {
         let directory = tempfile::tempdir().unwrap();
         let released = DecisionRaft::open(directory.path().join("decisions"), 1, 16, 64 * 1024)
             .await
@@ -1390,35 +1315,22 @@ mod tests {
         released.shutdown().await.unwrap();
         drop(released);
 
-        let advertised = PeerAddress("127.0.0.1:51052".into());
-        let (decisions, runtime) = open(OpenPeerConfig {
+        let result = open(OpenPeerConfig {
             data_dir: directory.path(),
             node_id: NodeId(1),
-            peer_address: advertised.clone(),
+            peer_address: PeerAddress("127.0.0.1:51052".into()),
             join_bundle: None,
             run_system_bootstrap: false,
             max_commit_entries: 16,
             max_commit_bytes: 64 * 1024,
             leader_timeout: Duration::from_secs(10),
         })
-        .await
-        .unwrap();
-
-        let identity = node_identity::load_for_node(directory.path(), NodeId(1)).unwrap();
-        assert_eq!(identity.cluster_id(), ClusterId([44; 16]));
-        let state = decisions.state().unwrap();
-        assert_eq!(state.cluster_id(), Some(ClusterId([44; 16])));
-        assert_eq!(
-            state.cluster_control().nodes()[&NodeId(1)].peer_address,
-            advertised
+        .await;
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.to_string().contains("without a v1 node identity"))
         );
-        assert_eq!(
-            state.cluster_control().nodes()[&NodeId(1)].state,
-            NodeState::Active
-        );
-
-        drop(runtime);
-        decisions.shutdown().await.unwrap();
     }
 
     #[tokio::test]

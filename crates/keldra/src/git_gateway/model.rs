@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::GitError;
 
-pub(super) const FORMAT_VERSION: u16 = 2;
-const REF_STATE_CONTEXT: &str = "keldra.git/ref-state/v2";
+pub(super) const FORMAT_VERSION: u16 = 1;
+const REF_STATE_CONTEXT: &str = "keldra.git/ref-state/v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -14,6 +14,7 @@ pub(super) struct GitCurrent {
     pub(super) repository_id: String,
     pub(super) generation: u64,
     pub(super) checkpoint_id: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(super) tail_batch_id: Option<String>,
     pub(super) tail_depth: u64,
     pub(super) ref_state_hash: String,
@@ -24,6 +25,7 @@ pub(super) struct GitCurrent {
 pub(super) struct GitPushBatch {
     pub(super) format_version: u16,
     pub(super) repository_id: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(super) parent_batch_id: Option<String>,
     pub(super) base_checkpoint_id: String,
     pub(super) first_generation: u64,
@@ -45,8 +47,18 @@ pub(super) struct GitPush {
 #[serde(deny_unknown_fields)]
 pub(super) struct GitReferenceCommand {
     pub(super) ref_name: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(super) expected_old_object_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(super) new_object_id: Option<String>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -51,7 +51,7 @@ reader, converter, migration, dual writer, query fallback, compatibility shim,
 mixed-generation path, or fallback builder. A deployment builds derived
 indices from authoritative ordinary objects and retained source journals.
 
-Format-v6 postings, points, live/head state, terms, doc values, vectors,
+Format-v1 postings, points, live/head state, terms, doc values, vectors,
 partition roots, and pack envelopes use explicit Keldra codecs matched to their
 native access patterns. An index never stores a second copy of an ordinary source field
 merely to return it in a hit; a client retrieves the authoritative object
@@ -59,10 +59,9 @@ through `GetObject` or `BatchGet`. The engine defines a root-vector-pinned scan
 contract so a future SQL gateway can push predicates, ordering, aggregation,
 and limits into the same authorized native planner rather than bypassing it.
 
-All physical producers and readers use only format v6. It replaces v4/v5 index
-persistence in full; the older namespaces, codecs, manifests, component streams,
-and currents are never read, migrated, converted, dual-written, or used as
-fallback. Fresh clusters rebuild v6 from source authority.
+All physical producers and readers use only format v1. No older index
+namespace, codec, manifest, component stream, or current pointer exists in the
+implementation. Fresh clusters build v1 projections from source authority.
 
 ## 2. Motivation
 
@@ -94,7 +93,7 @@ pressure, and run fanout as the primary cause.
 
 The cause is architectural:
 
-1. format v3 chooses one predicate as a driver;
+1. the superseded engine chooses one predicate as a driver;
 2. a broad equality such as `public = true` can become that driver;
 3. other predicates are evaluated after candidate retrieval instead of by
    intersecting independently advanceable postings;
@@ -130,7 +129,7 @@ query engine must be designed together.
 
 ## 3. Goals
 
-Format v6 must:
+Format v1 must:
 
 - make conjunctions use every useful predicate rather than one chosen driver;
 - make iterator advancement and block skipping the normal execution path;
@@ -333,7 +332,7 @@ publication, so a former owner cannot advance a partition root after handoff.
 An ACTIVE source produces its own immutable `SourceId { source_node,
 source_epoch }`. After source-node removal, rank ACTIVE nodes with the existing
 capacity-weighted `FutureIndex` HRW function over the domain-separated key
-`keldra/v6/source-producer/v1 || tenant_id || bucket_id || source_node ||
+`keldra/v1/source-producer/v1 || tenant_id || bucket_id || source_node ||
 source_epoch`; rank zero is the replacement producer. Definitions and families
 are excluded from that key, ensuring one locality-preserving source assignment
 and one deterministic handoff for all shared physical families.
@@ -774,7 +773,7 @@ the arbitrary top-K path.
 
 Each field has one declared logical type, so there is no cross-type tagged
 order. Numbers compare numerically, keywords use unsigned UTF-8 byte order, and
-locale collation is outside format v6. `NaN`, infinity, or an out-of-domain JSON
+locale collation is outside format v1. `NaN`, infinity, or an out-of-domain JSON
 number is a projection error. Missing and explicit JSON `null` remain distinct;
 missing sorts last ascending and first descending. The stable document identity
 is the final ascending tie-break in every physical or query order. Descending
@@ -789,7 +788,7 @@ definition for recurring sparse ordered queries.
 ### 8.5 Value-size contract
 
 The 512 KiB component ceiling is a block bound, not a scalar-size promise.
-Format v6 adopts Lucene's 32,766-byte maximum for one raw keyword term, one
+Format v1 adopts Lucene's 32,766-byte maximum for one raw keyword term, one
 sorted or sorted-set keyword doc value, and one analyzed token. This raises the
 current approximately 4 KiB raw term ceiling while deliberately lowering the
 accidental near-component-sized generic-column value ceiling. Numeric and Boolean
@@ -819,22 +818,22 @@ their explicit result structures; clients retrieve ordinary source data with
 No segment DocId, field ordinal, block address, or implementation structure is
 added to the public API.
 
-## 9. Format-v6 partition artifacts
+## 9. Format-v1 partition artifacts
 
 ### 9.1 Reserved namespace
 
-Format v6 uses only these canonical reserved object path shapes:
+Format v1 uses only these canonical reserved object path shapes:
 
 ```text
-_keldra/index-projections/v6/<family>/artifacts/packs/<hash>
-_keldra/index-projections/v6/<family>/artifacts/stream-pages/<hash>
-_keldra/index-projections/v6/<family>/artifacts/component-pages/<hash>
-_keldra/index-projections/v6/<family>/artifacts/query-run-packs/<hash>
-_keldra/index-projections/v6/<family>/artifacts/query-run-stream-pages/<hash>
-_keldra/index-projections/v6/<family>/artifacts/generations/<hash>
-_keldra/index-projections/v6/<family>/partitions/<source_node>/<source_epoch>/<producer_node>/<term>/<index>/current
-_keldra/index-projections/v6/<family>/partitions
-_keldra/index-projections/v6/<family>/catalogs/<catalog>/activation
+_keldra/index-projections/v1/<family>/artifacts/packs/<hash>
+_keldra/index-projections/v1/<family>/artifacts/stream-pages/<hash>
+_keldra/index-projections/v1/<family>/artifacts/component-pages/<hash>
+_keldra/index-projections/v1/<family>/artifacts/query-run-packs/<hash>
+_keldra/index-projections/v1/<family>/artifacts/query-run-stream-pages/<hash>
+_keldra/index-projections/v1/<family>/artifacts/generations/<hash>
+_keldra/index-projections/v1/<family>/partitions/<source_node>/<source_epoch>/<producer_node>/<term>/<index>/current
+_keldra/index-projections/v1/<family>/partitions
+_keldra/index-projections/v1/<family>/catalogs/<catalog>/activation
 ```
 
 Family hashes are complete canonical 256-bit lower-case hexadecimal identities.
@@ -864,10 +863,10 @@ partition root carries the only retention-authoritative source and atomic
 checkpoints. Segment artifacts are reachable only through a selected or
 retained root.
 
-A format-v6 process discovers only v6 catalog and projection state. The release
+A format-v1 process discovers only v1 catalog and projection state. The release
 starts from fresh volumes and definitions are recreated through the public API.
-It does not scan, interpret, convert, delete, or treat any v3/v4/v5 index object
-as a definition, artifact, root, or checkpoint.
+It does not scan, interpret, convert, delete, or recognize any other index
+format as a definition, artifact, root, or checkpoint.
 
 Every path segment exactly equal to `_keldra` is reserved. Source events for
 reserved objects continue to participate in ordinary durability, reference,
@@ -878,11 +877,11 @@ recursively indexing themselves.
 
 ### 9.2 Portable codec envelopes
 
-Format v6 uses distinct explicit codecs for delta segments, stream pages,
+Format v1 uses distinct explicit codecs for delta segments, stream pages,
 component directories, partition roots/currents, family directories, and
-catalog activation. Each codec starts with its own eight-byte v6 magic and
-version (`K6DELTA1`, `K6CSTR01`, `K6CDIR01`, `K6PGEN01`, `K6PCUR01`,
-`K6FDIR01`, or `K6CACT01`). Its checked body binds the applicable complete
+catalog activation. Each codec starts with its own eight-byte v1 magic and
+version (`K1DELTA1`, `K1CSTR01`, `K1CDIR01`, `K1PGEN01`, `K1PCUR01`,
+`K1FDIR01`, or `K1CACT01`). Its checked body binds the applicable complete
 partition/catalog/recipe identities, lengths, counts, source barrier, hashes,
 and byte accounting. Readers validate identity, bounds, checked arithmetic,
 structural ordering, and checksums before allocating or exposing state.
@@ -920,7 +919,7 @@ local cache files. A cache never changes authoritative bytes.
 
 ### 9.3 Fixed format bounds
 
-Format v6 retains these proven portable bounds:
+Format v1 retains these proven portable bounds:
 
 - one encoded logical component block, including its envelope, is at most
   512 KiB;
@@ -945,7 +944,7 @@ unvalidated value. These limits are format constants, not startup settings.
 
 ### 9.4 Schema fingerprint
 
-In format v6, fields are ordered and assigned dense physical IDs by
+In format v1, fields are ordered and assigned dense physical IDs by
 canonical field-recipe identity; public names and declaration order belong to
 the logical binding and are not physical fingerprint inputs. Path/content-type
 membership, source selectors, value semantics, capabilities, physical order,
@@ -954,7 +953,7 @@ fail-closed validation contract while allowing differently named
 logical definitions to read the same compatible physical segment.
 
 The schema fingerprint is BLAKE3 with domain separator
-`keldra.index.recipe.v6`. Its input is one explicit length-prefixed canonical
+`keldra.index.recipe.v1`. Its input is one explicit length-prefixed canonical
 binary encoding in this order:
 
 1. index kind, path prefix, and content-type scope;
@@ -1031,7 +1030,7 @@ double charged.
 
 Dropping a retained reference makes that root and its uniquely owned artifacts
 eligible for ordinary reference-counted deletion
-and GC. Maintenance is scoped to due v6 partition paths and uses bounded record,
+and GC. Maintenance is scoped to due v1 partition paths and uses bounded record,
 byte, and time budgets with a resumable local cursor; it never scans all object
 heads. Roots do not form an unbounded predecessor chain. A continuation for a
 root absent from the bounded current pointer fails with an explicit
@@ -1574,7 +1573,7 @@ restore a definition-owned builder.
 
 ## 16. Future native scan boundary
 
-Format v6 defines the internal contract a future SQL capability must consume.
+Format v1 defines the internal contract a future SQL capability must consume.
 The contract is a design boundary in `0.9.0`, not a user-visible SQL API or an
 executable adapter added by this release:
 
@@ -1660,7 +1659,7 @@ semantics.
 The future adapter translates SQL expressions to `ScanRequest`, consumes
 bounded `ScanBatch` values, and evaluates any inexact residual from requested
 doc values. Source-field projection is a separate ordinary-object fetch stage;
-format v6 does not turn an index into another copy of the source. If Keldra
+format v1 does not turn an index into another copy of the source. If Keldra
 performs a bounded residual exactly, it advertises the predicate as `Exact`.
 The adapter remains outside the store, consensus, program, gateway, and native
 index crates.
@@ -2017,12 +2016,11 @@ mandatory for it and its implementation must use the partition pipeline.
 
 The implementation deletes, rather than wraps:
 
-- every format-v3/v4 legacy publication reader and writer superseded by
-  partition roots;
+- every superseded publication reader and writer;
 - external, elected, representative, and per-definition builders;
 - builder due queues, leases, failover records, scheduler turns, and cursors;
-- format-v5 historical projected-state streams and the separately scheduled
-  native assembler bridge;
+- historical projected-state streams and the separately scheduled native
+  assembler bridge;
 - global/per-definition/per-family manifest CAS on normal flushes;
 - range-local ordinal persistence and cross-run latest-live probing;
 - single-driver Typed JSON query execution and broad ordered-query fallbacks;
@@ -2058,7 +2056,7 @@ only through new partition-owned implementations.
 
 Common DocIds, live masks, advanceable postings, points, typed doc values, and
 one planner remove duplicated query machinery while leaving Keldra free to tune
-its v6 codecs, layout, cache, compaction, and future ANN structures. The native
+its v1 codecs, layout, cache, compaction, and future ANN structures. The native
 scan boundary prevents a future SQL gateway from bypassing authorization,
 liveness, or topology. The clean break costs one rebuild from authoritative
 objects, adds no migration subsystem, and leaves source durability, Zanzibar,

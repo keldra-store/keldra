@@ -15,7 +15,7 @@ use tonic::{Request, Status};
 use super::authorization::GroupPermission;
 use crate::authentication::Caller;
 use crate::distributed_list::OriginalBearer;
-use crate::v05::{deadline_remaining, request_deadline};
+use crate::object_service::{deadline_remaining, request_deadline};
 
 use super::model::{
     GroupScope, digest, entry_certificate_path, entry_payload_path, projection_definition_path,

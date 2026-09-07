@@ -10,6 +10,7 @@ use keldra_consensus::{
 use keldra_store::{StoreOptions, SystemBootstrapRequest};
 
 use super::*;
+use crate::cluster_peer::CLUSTER_PEER_SCHEMA_VERSION;
 
 const SECRET: &str = "secret-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -87,7 +88,7 @@ fn prepare_request() -> api::PrepareNodeRequest {
 }
 
 #[tokio::test]
-async fn fresh_cluster_selects_current_capabilities_and_activation_is_fenced() {
+async fn fresh_cluster_reports_the_sole_v1_capability() {
     let (_directory, _store, service) = service().await;
     let status = service
         .get_cluster_capabilities(authenticated(
@@ -98,29 +99,201 @@ async fn fresh_cluster_selects_current_capabilities_and_activation_is_fenced() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(status.active_protocol_version, 2);
-    assert_eq!(status.active_storage_format, 2);
-    assert_eq!(status.target_protocol_version, 2);
-    assert_eq!(status.target_storage_format, 2);
-    assert!(status.ready_for_target_activation);
-    assert!(status.blocking_active_node_ids.is_empty());
+    assert_eq!(status.active_protocol_version, 1);
+    assert_eq!(status.active_storage_format, 1);
+    let physical = status.physical_storage.as_ref().unwrap();
+    assert_eq!(physical.active_node_count, 1);
+    assert_eq!(physical.reported_node_count, 1);
+    assert_eq!(physical.reported_storage_replica_count, 1);
+    assert_eq!(physical.nodes.len(), 1);
+    assert_eq!(physical.nodes[0].node_id, 1);
+    assert_eq!(
+        physical.wal_bytes.as_ref().unwrap().state,
+        api::AccountingMeasurementState::Present as i32
+    );
+    let logical = status.logical_file_counts.as_ref().unwrap();
+    assert_eq!(logical.active_source_node_count, 1);
+    assert_eq!(logical.reported_source_node_count, 1);
+    assert_eq!(
+        logical.visible_file_count.as_ref().unwrap().state,
+        api::AccountingMeasurementState::Present as i32
+    );
+    assert_eq!(logical.visible_file_count.as_ref().unwrap().count, 0);
+}
 
-    let activated = service
-        .activate_cluster_capabilities(authenticated(
-            StorageTenantId::system(),
-            "bootstrap-app",
-            api::ActivateClusterCapabilitiesRequest {
-                protocol_version: status.target_protocol_version,
-                storage_format: status.target_storage_format,
-                expected_placement_term: status.active_placement_term,
-                expected_placement_index: status.active_placement_index,
-            },
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(activated.active_protocol_version, 2);
-    assert_eq!(activated.active_storage_format, 2);
+#[test]
+fn physical_cluster_totals_fail_closed_when_one_node_is_unavailable() {
+    let active = [NodeId(1), NodeId(2)];
+    let observations = std::collections::BTreeMap::from([
+        (
+            NodeId(1),
+            Some(cluster_wire::NodeStorageObservationResponse {
+                schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+                node_id: 1,
+                refreshed_at_unix_millis: 1,
+                live_payload_blob_bytes: Some(10),
+                garbage_payload_blob_bytes: Some(2),
+                payload_sst_bytes: Some(3),
+                metadata_index_sst_bytes: Some(4),
+                wal_bytes: Some(5),
+                source_visible_file_count: Some(3),
+                tenant_visible_file_counts: vec![cluster_wire::TenantVisibleFileCount {
+                    tenant_id: 11,
+                    visible_file_count: 3,
+                }],
+            }),
+        ),
+        (NodeId(2), None),
+    ]);
+
+    let physical = physical_storage_from_observations(&active, &observations).unwrap();
+    assert_eq!(physical.active_node_count, 2);
+    assert_eq!(physical.reported_node_count, 1);
+    assert_eq!(physical.reported_storage_replica_count, 1);
+    assert_eq!(physical.nodes.len(), 2);
+    assert_eq!(
+        physical.live_payload_blob_bytes.unwrap().state,
+        api::AccountingMeasurementState::Unavailable as i32
+    );
+    assert_eq!(
+        physical.nodes[0]
+            .live_payload_blob_bytes
+            .as_ref()
+            .unwrap()
+            .bytes,
+        10
+    );
+    assert_eq!(
+        physical.nodes[1]
+            .live_payload_blob_bytes
+            .as_ref()
+            .unwrap()
+            .state,
+        api::AccountingMeasurementState::Unavailable as i32
+    );
+    let logical = logical_file_counts_from_observations(&active, &observations).unwrap();
+    assert_eq!(logical.active_source_node_count, 2);
+    assert_eq!(logical.reported_source_node_count, 1);
+    assert!(logical.tenants.is_empty());
+    assert_eq!(
+        logical.visible_file_count.unwrap().state,
+        api::AccountingMeasurementState::Unavailable as i32
+    );
+}
+
+#[test]
+fn physical_cluster_distinguishes_unsupported_property_from_unavailable_node() {
+    let active = [NodeId(1)];
+    let observations = std::collections::BTreeMap::from([(
+        NodeId(1),
+        Some(cluster_wire::NodeStorageObservationResponse {
+            schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+            node_id: 1,
+            refreshed_at_unix_millis: 1,
+            live_payload_blob_bytes: None,
+            garbage_payload_blob_bytes: Some(2),
+            payload_sst_bytes: Some(3),
+            metadata_index_sst_bytes: Some(4),
+            wal_bytes: Some(5),
+            source_visible_file_count: Some(3),
+            tenant_visible_file_counts: vec![cluster_wire::TenantVisibleFileCount {
+                tenant_id: 11,
+                visible_file_count: 3,
+            }],
+        }),
+    )]);
+
+    let physical = physical_storage_from_observations(&active, &observations).unwrap();
+    assert_eq!(physical.reported_node_count, 1);
+    assert_eq!(
+        physical.live_payload_blob_bytes.unwrap().state,
+        api::AccountingMeasurementState::Unsupported as i32
+    );
+    assert_eq!(
+        physical.nodes[0]
+            .live_payload_blob_bytes
+            .as_ref()
+            .unwrap()
+            .state,
+        api::AccountingMeasurementState::Unsupported as i32
+    );
+    assert_eq!(
+        physical.garbage_payload_blob_bytes.unwrap().state,
+        api::AccountingMeasurementState::Present as i32
+    );
+}
+
+#[test]
+fn physical_cluster_sums_every_reported_replica_store() {
+    let active = [NodeId(1), NodeId(2)];
+    let observation = |node_id, bytes| cluster_wire::NodeStorageObservationResponse {
+        schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+        node_id,
+        refreshed_at_unix_millis: node_id,
+        live_payload_blob_bytes: Some(bytes),
+        garbage_payload_blob_bytes: Some(bytes + 1),
+        payload_sst_bytes: Some(bytes + 2),
+        metadata_index_sst_bytes: Some(bytes + 3),
+        wal_bytes: Some(bytes + 4),
+        source_visible_file_count: Some(bytes),
+        tenant_visible_file_counts: vec![cluster_wire::TenantVisibleFileCount {
+            tenant_id: 11,
+            visible_file_count: bytes,
+        }],
+    };
+    let observations = std::collections::BTreeMap::from([
+        (NodeId(1), Some(observation(1, 10))),
+        (NodeId(2), Some(observation(2, 20))),
+    ]);
+
+    let physical = physical_storage_from_observations(&active, &observations).unwrap();
+    assert_eq!(physical.active_node_count, 2);
+    assert_eq!(physical.reported_node_count, 2);
+    assert_eq!(physical.reported_storage_replica_count, 2);
+    assert_eq!(physical.live_payload_blob_bytes.unwrap().bytes, 30);
+    assert_eq!(physical.garbage_payload_blob_bytes.unwrap().bytes, 32);
+    assert_eq!(physical.payload_sst_bytes.unwrap().bytes, 34);
+    assert_eq!(physical.metadata_index_sst_bytes.unwrap().bytes, 36);
+    assert_eq!(physical.wal_bytes.unwrap().bytes, 38);
+    let logical = logical_file_counts_from_observations(&active, &observations).unwrap();
+    assert_eq!(logical.reported_source_node_count, 2);
+    assert_eq!(logical.visible_file_count.unwrap().count, 30);
+    assert_eq!(logical.tenants.len(), 1);
+    assert_eq!(logical.tenants[0].tenant_id, 11);
+    assert_eq!(
+        logical.tenants[0]
+            .visible_file_count
+            .as_ref()
+            .unwrap()
+            .count,
+        30
+    );
+}
+
+#[test]
+fn logical_file_count_aggregation_rejects_inconsistent_source_totals() {
+    let active = [NodeId(1)];
+    let observations = std::collections::BTreeMap::from([(
+        NodeId(1),
+        Some(cluster_wire::NodeStorageObservationResponse {
+            schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+            node_id: 1,
+            refreshed_at_unix_millis: 1,
+            live_payload_blob_bytes: Some(0),
+            garbage_payload_blob_bytes: Some(0),
+            payload_sst_bytes: Some(0),
+            metadata_index_sst_bytes: Some(0),
+            wal_bytes: Some(0),
+            source_visible_file_count: Some(2),
+            tenant_visible_file_counts: vec![cluster_wire::TenantVisibleFileCount {
+                tenant_id: 11,
+                visible_file_count: 1,
+            }],
+        }),
+    )]);
+
+    let error = logical_file_counts_from_observations(&active, &observations).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DataLoss);
 }
 
 #[tokio::test]

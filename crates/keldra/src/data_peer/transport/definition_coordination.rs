@@ -162,7 +162,7 @@ pub(super) fn wire_consumer_kind(
         DefinitionConsumerKind::AccountingAssignments => {
             Ok(wire::PrivateDefinitionConsumerKind::AccountingAssignments)
         }
-        DefinitionConsumerKind::V6IndexCatalog
+        DefinitionConsumerKind::V1IndexCatalog
         | DefinitionConsumerKind::AccountingDelivery
         | DefinitionConsumerKind::IndexRetention
         | DefinitionConsumerKind::AccountingRetention => Err(Status::invalid_argument(

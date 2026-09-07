@@ -3,7 +3,7 @@ use base64::Engine as _;
 use keldra_api::v1::ExchangeClientCredentialsRequest;
 
 use super::{GitError, GitGatewayState};
-use crate::v05::GatewayIdentity;
+use crate::object_service::GatewayIdentity;
 
 pub(super) async fn authenticate(
     state: &GitGatewayState,

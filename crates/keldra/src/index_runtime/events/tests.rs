@@ -963,7 +963,13 @@ async fn reserved_index_artifacts_cannot_advance_or_rewake_their_index() {
         NodeId(1),
         (
             status(1, 1),
-            vec![change_at_path(1, 1, 1, 2, "_keldra/indices/v4/9/current")],
+            vec![change_at_path(
+                1,
+                1,
+                1,
+                2,
+                "_keldra/index-projections/v1/family/partitions",
+            )],
         ),
     );
     sources

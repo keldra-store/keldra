@@ -21,13 +21,17 @@ use tonic::{Request, Response, Status};
 
 use crate::authentication::Caller;
 use crate::authorization::{StorageTenantPermission, SystemAuthorizer};
-use crate::cluster_capabilities::{
-    GENERALIZED_ATOMIC_PEER_PROTOCOL_VERSION, GENERALIZED_ATOMIC_STORAGE_FORMAT_VERSION,
-    PEER_PROTOCOL_CAPABILITY, STORAGE_FORMAT_CAPABILITY, range_contains,
-};
+use crate::cluster_capabilities::{PEER_PROTOCOL_CAPABILITY, STORAGE_FORMAT_CAPABILITY};
+use crate::cluster_peer::{ClusterPeerTransport, wire as cluster_wire};
+use crate::cluster_placement::ClusterPlacement;
 use crate::distributed_control_plane::DistributedControlPlane;
 use crate::distributed_list::OriginalBearer;
 use crate::join_bundle::{self, JoinBundle, JoinBundleError, JoinSeed};
+use crate::object_distribution::object_placement_key;
+use crate::placement::PlacementKind;
+
+const MAX_CONCURRENT_PHYSICAL_STORAGE_REQUESTS: usize = 8;
+const STORAGE_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct AdministrationServiceImpl {
@@ -36,6 +40,7 @@ pub(crate) struct AdministrationServiceImpl {
     decisions: DecisionRaft,
     join_bundle_directory: PathBuf,
     distributed: Option<Arc<DistributedControlPlane>>,
+    cluster_peers: Option<ClusterPeerTransport>,
 }
 
 impl AdministrationServiceImpl {
@@ -50,12 +55,149 @@ impl AdministrationServiceImpl {
             decisions,
             join_bundle_directory,
             distributed: None,
+            cluster_peers: None,
         }
     }
 
     pub(crate) fn with_distributed(mut self, distributed: Arc<DistributedControlPlane>) -> Self {
         self.distributed = Some(distributed);
         self
+    }
+
+    pub(crate) fn with_cluster_peers(mut self, peers: ClusterPeerTransport) -> Self {
+        self.cluster_peers = Some(peers);
+        self
+    }
+}
+
+impl AdministrationServiceImpl {
+    async fn cluster_storage_observations(
+        &self,
+        state: &StateMachine,
+    ) -> Result<(api::ClusterPhysicalStorage, api::ClusterLogicalFileCounts), Status> {
+        let placement = ClusterPlacement::from_applied(state)
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let active_nodes = placement.active_node_ids();
+        let local_node = NodeId(self.decisions.node_id());
+        let mut observations = std::collections::BTreeMap::new();
+
+        let store = self.store.clone();
+        let local_placement = placement.clone();
+        let deadline = std::time::Instant::now() + STORAGE_OBSERVATION_TIMEOUT;
+        let (local_metrics, local_logical_counts, refreshed_at_unix_millis) = run(move || {
+            Ok((
+                store.metadata_runtime_metrics(),
+                store.source_owned_logical_file_counts(
+                    deadline,
+                    |tenant_id, bucket_id, exact_path| {
+                        local_placement
+                            .rank(
+                                PlacementKind::Object,
+                                &object_placement_key(tenant_id, bucket_id, exact_path),
+                            )
+                            .first()
+                            .copied()
+                            == Some(local_node)
+                    },
+                ),
+                unix_millis_now()?,
+            ))
+        })
+        .await?;
+        let (source_visible_file_count, tenant_visible_file_counts) = match local_logical_counts {
+            Ok(counts) => (
+                Some(counts.visible_file_count),
+                counts
+                    .tenant_visible_file_counts
+                    .into_iter()
+                    .map(
+                        |(tenant_id, visible_file_count)| cluster_wire::TenantVisibleFileCount {
+                            tenant_id,
+                            visible_file_count,
+                        },
+                    )
+                    .collect(),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "local source-owned logical file count observation is unavailable");
+                (None, Vec::new())
+            }
+        };
+        observations.insert(
+            local_node,
+            Some(cluster_wire::NodeStorageObservationResponse {
+                schema_version: crate::cluster_peer::CLUSTER_PEER_SCHEMA_VERSION,
+                node_id: local_node.0,
+                refreshed_at_unix_millis,
+                live_payload_blob_bytes: local_metrics.payload_live_blob_bytes,
+                garbage_payload_blob_bytes: local_metrics.payload_garbage_blob_bytes,
+                payload_sst_bytes: local_metrics.payload_sst_bytes,
+                metadata_index_sst_bytes: local_metrics.non_payload_metadata_index_sst_bytes,
+                wal_bytes: local_metrics.total_wal_bytes,
+                source_visible_file_count,
+                tenant_visible_file_counts,
+            }),
+        );
+
+        let mut remote_requests = Vec::new();
+        if let Some(peers) = self.cluster_peers.as_ref() {
+            for node in active_nodes
+                .iter()
+                .copied()
+                .filter(|node| *node != local_node)
+            {
+                let Some(address) = placement.address(node).map(|address| address.0.clone()) else {
+                    observations.insert(node, None);
+                    continue;
+                };
+                remote_requests.push((node, address, peers.clone(), placement.fence()));
+            }
+        } else {
+            observations.extend(
+                active_nodes
+                    .iter()
+                    .copied()
+                    .filter(|node| *node != local_node)
+                    .map(|node| (node, None)),
+            );
+        }
+        let mut pending = remote_requests.into_iter();
+        let mut requests = tokio::task::JoinSet::new();
+        loop {
+            while requests.len() < MAX_CONCURRENT_PHYSICAL_STORAGE_REQUESTS {
+                let Some((node, address, peers, fence)) = pending.next() else {
+                    break;
+                };
+                requests.spawn(async move {
+                    (
+                        node,
+                        peers.node_storage_observation(node, &address, fence).await,
+                    )
+                });
+            }
+            let Some(joined) = requests.join_next().await else {
+                break;
+            };
+            match joined {
+                Ok((node, Ok(observation))) => {
+                    observations.insert(node, Some(observation));
+                }
+                Ok((node, Err(error))) => {
+                    tracing::warn!(storage.node_id = node.0, %error, "node physical storage observation is unavailable");
+                    observations.insert(node, None);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "node physical storage observation task failed");
+                }
+            }
+        }
+        for node in &active_nodes {
+            observations.entry(*node).or_insert(None);
+        }
+        Ok((
+            physical_storage_from_observations(&active_nodes, &observations)?,
+            logical_file_counts_from_observations(&active_nodes, &observations)?,
+        ))
     }
 }
 
@@ -68,71 +210,11 @@ impl AdministrationService for AdministrationServiceImpl {
         let caller = caller(&request)?;
         self.authorize_capability_management(&caller).await?;
         let state = self.decisions.state().map_err(decision_status)?;
-        Ok(Response::new(cluster_capabilities(&state)?))
-    }
-
-    async fn activate_cluster_capabilities(
-        &self,
-        request: Request<api::ActivateClusterCapabilitiesRequest>,
-    ) -> Result<Response<api::ClusterCapabilities>, Status> {
-        let caller = caller(&request)?;
-        self.authorize_capability_management(&caller).await?;
-        let request = request.into_inner();
-        let protocol_version = u16::try_from(request.protocol_version)
-            .map_err(|_| Status::invalid_argument("protocol version exceeds u16"))?;
-        let storage_format = u16::try_from(request.storage_format)
-            .map_err(|_| Status::invalid_argument("storage format exceeds u16"))?;
-        if !range_contains(PEER_PROTOCOL_CAPABILITY, protocol_version)
-            || !range_contains(STORAGE_FORMAT_CAPABILITY, storage_format)
-        {
-            return Err(Status::invalid_argument(
-                "requested capability is not supported by this server",
-            ));
-        }
-        if request.expected_placement_term == 0 || request.expected_placement_index == 0 {
-            return Err(Status::invalid_argument(
-                "expected placement term and index must be non-zero",
-            ));
-        }
-        self.decisions
-            .confirm_leadership()
-            .await
-            .map_err(decision_status)?;
-        let state = self.decisions.state().map_err(decision_status)?;
-        let expected_active_placement_log_id = state
-            .cluster_control()
-            .active_placement_log_id()
-            .ok_or_else(|| Status::failed_precondition("active placement is unavailable"))?;
-        if expected_active_placement_log_id.leader_id.term != request.expected_placement_term
-            || expected_active_placement_log_id.index != request.expected_placement_index
-        {
-            return Err(Status::failed_precondition(
-                "active placement differs from the requested capability fence",
-            ));
-        }
-        let committed = self
-            .decisions
-            .submit(Command::ActivateClusterCapabilities {
-                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
-                protocol_version,
-                storage_format,
-                expected_active_placement_log_id,
-            })
-            .await
-            .map_err(decision_status)?;
-        if !matches!(
-            committed.result,
-            ApplyResult::ClusterCapabilitiesActivated {
-                protocol_version: committed_protocol,
-                storage_format: committed_storage,
-            } if committed_protocol == protocol_version && committed_storage == storage_format
-        ) {
-            return Err(Status::internal(
-                "capability activation returned an unexpected result",
-            ));
-        }
-        let state = self.decisions.state().map_err(decision_status)?;
-        Ok(Response::new(cluster_capabilities(&state)?))
+        let mut response = cluster_capabilities(&state)?;
+        let (physical, logical) = self.cluster_storage_observations(&state).await?;
+        response.physical_storage = Some(physical);
+        response.logical_file_counts = Some(logical);
+        Ok(Response::new(response))
     }
 
     async fn prepare_node(
@@ -670,36 +752,278 @@ fn cluster_capabilities(state: &StateMachine) -> Result<api::ClusterCapabilities
         .cluster_control()
         .active_placement_log_id()
         .ok_or_else(|| Status::failed_precondition("active placement is unavailable"))?;
-    let blocking_active_node_ids = state
-        .cluster_control()
-        .nodes()
-        .values()
-        .filter(|descriptor| {
-            descriptor.state == NodeState::Active
-                && (!range_contains(
-                    descriptor.supported_protocol,
-                    GENERALIZED_ATOMIC_PEER_PROTOCOL_VERSION,
-                ) || !range_contains(
-                    descriptor.supported_storage_format,
-                    GENERALIZED_ATOMIC_STORAGE_FORMAT_VERSION,
-                ))
-        })
-        .map(|descriptor| descriptor.node_id.0)
-        .collect::<Vec<_>>();
-    let activation_quiescent = state.cluster_control().transition().is_none()
-        && state.preparing_batch().is_none()
-        && state.unfinalized_commit_len() == 0;
     Ok(api::ClusterCapabilities {
         active_protocol_version: u32::from(state.cluster_control().active_protocol_version()),
         active_storage_format: u32::from(state.cluster_control().active_storage_format()),
-        target_protocol_version: u32::from(GENERALIZED_ATOMIC_PEER_PROTOCOL_VERSION),
-        target_storage_format: u32::from(GENERALIZED_ATOMIC_STORAGE_FORMAT_VERSION),
         active_placement_term: placement.leader_id.term,
         active_placement_index: placement.index,
-        ready_for_target_activation: blocking_active_node_ids.is_empty() && activation_quiescent,
-        blocking_active_node_ids,
-        activation_quiescent,
+        physical_storage: None,
+        logical_file_counts: None,
     })
+}
+
+fn physical_storage_from_observations(
+    active_nodes: &[NodeId],
+    observations: &std::collections::BTreeMap<
+        NodeId,
+        Option<cluster_wire::NodeStorageObservationResponse>,
+    >,
+) -> Result<api::ClusterPhysicalStorage, Status> {
+    let reported_node_count = active_nodes
+        .iter()
+        .filter(|node| observations.get(node).is_some_and(Option::is_some))
+        .count();
+    let nodes = active_nodes
+        .iter()
+        .map(|node| {
+            let observation = observations.get(node).and_then(Option::as_ref);
+            Ok(api::NodePhysicalStorage {
+                node_id: node.0,
+                refreshed_at: observation
+                    .map(|value| millis_timestamp(value.refreshed_at_unix_millis))
+                    .transpose()?,
+                live_payload_blob_bytes: Some(observed_bytes(observation, |value| {
+                    value.live_payload_blob_bytes
+                })),
+                garbage_payload_blob_bytes: Some(observed_bytes(observation, |value| {
+                    value.garbage_payload_blob_bytes
+                })),
+                payload_sst_bytes: Some(observed_bytes(observation, |value| {
+                    value.payload_sst_bytes
+                })),
+                metadata_index_sst_bytes: Some(observed_bytes(observation, |value| {
+                    value.metadata_index_sst_bytes
+                })),
+                wal_bytes: Some(observed_bytes(observation, |value| value.wal_bytes)),
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    Ok(api::ClusterPhysicalStorage {
+        live_payload_blob_bytes: Some(aggregate_bytes(active_nodes, observations, |value| {
+            value.live_payload_blob_bytes
+        })?),
+        garbage_payload_blob_bytes: Some(aggregate_bytes(active_nodes, observations, |value| {
+            value.garbage_payload_blob_bytes
+        })?),
+        payload_sst_bytes: Some(aggregate_bytes(active_nodes, observations, |value| {
+            value.payload_sst_bytes
+        })?),
+        metadata_index_sst_bytes: Some(aggregate_bytes(active_nodes, observations, |value| {
+            value.metadata_index_sst_bytes
+        })?),
+        wal_bytes: Some(aggregate_bytes(active_nodes, observations, |value| {
+            value.wal_bytes
+        })?),
+        active_node_count: active_nodes
+            .len()
+            .try_into()
+            .map_err(|_| Status::resource_exhausted("active node count exceeds u32"))?,
+        reported_node_count: reported_node_count
+            .try_into()
+            .map_err(|_| Status::resource_exhausted("reported node count exceeds u32"))?,
+        reported_storage_replica_count: reported_node_count
+            .try_into()
+            .map_err(|_| Status::resource_exhausted("replica coverage exceeds u32"))?,
+        nodes,
+    })
+}
+
+fn logical_file_counts_from_observations(
+    active_nodes: &[NodeId],
+    observations: &std::collections::BTreeMap<
+        NodeId,
+        Option<cluster_wire::NodeStorageObservationResponse>,
+    >,
+) -> Result<api::ClusterLogicalFileCounts, Status> {
+    let mut reported_source_node_count = 0_usize;
+    let mut cluster_visible_file_count = 0_u64;
+    let mut tenants = std::collections::BTreeMap::<u64, u64>::new();
+    let mut complete = true;
+    let mut sources = Vec::with_capacity(active_nodes.len());
+
+    for node in active_nodes {
+        let observation = observations.get(node).and_then(Option::as_ref);
+        let source_count = observation.and_then(|value| value.source_visible_file_count);
+        if let (Some(observation), Some(source_count)) = (observation, source_count) {
+            validate_logical_file_count_observation(observation, source_count)?;
+            reported_source_node_count += 1;
+            cluster_visible_file_count = cluster_visible_file_count
+                .checked_add(source_count)
+                .ok_or_else(|| Status::resource_exhausted("cluster logical file count overflow"))?;
+            for tenant in &observation.tenant_visible_file_counts {
+                let count = tenants.entry(tenant.tenant_id).or_default();
+                *count = count
+                    .checked_add(tenant.visible_file_count)
+                    .ok_or_else(|| {
+                        Status::resource_exhausted("tenant logical file count overflow")
+                    })?;
+            }
+        } else {
+            complete = false;
+        }
+        sources.push(api::NodeLogicalFileCountSource {
+            node_id: node.0,
+            refreshed_at: observation
+                .map(|value| millis_timestamp(value.refreshed_at_unix_millis))
+                .transpose()?,
+            visible_file_count: Some(measured_count(
+                if source_count.is_some() {
+                    api::AccountingMeasurementState::Present
+                } else {
+                    api::AccountingMeasurementState::Unavailable
+                },
+                source_count.unwrap_or(0),
+            )),
+        });
+    }
+
+    Ok(api::ClusterLogicalFileCounts {
+        visible_file_count: Some(measured_count(
+            if complete {
+                api::AccountingMeasurementState::Present
+            } else {
+                api::AccountingMeasurementState::Unavailable
+            },
+            if complete {
+                cluster_visible_file_count
+            } else {
+                0
+            },
+        )),
+        tenants: if complete {
+            tenants
+                .into_iter()
+                .map(
+                    |(tenant_id, visible_file_count)| api::TenantLogicalFileCount {
+                        tenant_id,
+                        visible_file_count: Some(measured_count(
+                            api::AccountingMeasurementState::Present,
+                            visible_file_count,
+                        )),
+                    },
+                )
+                .collect()
+        } else {
+            Vec::new()
+        },
+        active_source_node_count: active_nodes
+            .len()
+            .try_into()
+            .map_err(|_| Status::resource_exhausted("active source node count exceeds u32"))?,
+        reported_source_node_count: reported_source_node_count
+            .try_into()
+            .map_err(|_| Status::resource_exhausted("reported source node count exceeds u32"))?,
+        sources,
+    })
+}
+
+fn validate_logical_file_count_observation(
+    observation: &cluster_wire::NodeStorageObservationResponse,
+    expected_total: u64,
+) -> Result<(), Status> {
+    let mut previous_tenant = None;
+    let mut observed_total = 0_u64;
+    for tenant in &observation.tenant_visible_file_counts {
+        if tenant.tenant_id == 0
+            || previous_tenant.is_some_and(|previous| previous >= tenant.tenant_id)
+        {
+            return Err(Status::data_loss(
+                "logical file count observation has unordered or zero tenant identity",
+            ));
+        }
+        previous_tenant = Some(tenant.tenant_id);
+        observed_total = observed_total
+            .checked_add(tenant.visible_file_count)
+            .ok_or_else(|| Status::data_loss("logical file count observation overflow"))?;
+    }
+    if observed_total != expected_total {
+        return Err(Status::data_loss(
+            "logical file count observation total disagrees with tenant counts",
+        ));
+    }
+    Ok(())
+}
+
+fn aggregate_bytes(
+    active_nodes: &[NodeId],
+    observations: &std::collections::BTreeMap<
+        NodeId,
+        Option<cluster_wire::NodeStorageObservationResponse>,
+    >,
+    select: impl Fn(&cluster_wire::NodeStorageObservationResponse) -> Option<u64>,
+) -> Result<api::AccountingByteMeasurement, Status> {
+    let mut total = 0_u64;
+    let mut unsupported = false;
+    for node in active_nodes {
+        let Some(observation) = observations.get(node).and_then(Option::as_ref) else {
+            return Ok(measured_bytes(
+                api::AccountingMeasurementState::Unavailable,
+                0,
+            ));
+        };
+        let Some(value) = select(observation) else {
+            unsupported = true;
+            continue;
+        };
+        total = total
+            .checked_add(value)
+            .ok_or_else(|| Status::resource_exhausted("cluster physical byte total overflow"))?;
+    }
+    Ok(if unsupported {
+        measured_bytes(api::AccountingMeasurementState::Unsupported, 0)
+    } else {
+        measured_bytes(api::AccountingMeasurementState::Present, total)
+    })
+}
+
+fn observed_bytes(
+    observation: Option<&cluster_wire::NodeStorageObservationResponse>,
+    select: impl FnOnce(&cluster_wire::NodeStorageObservationResponse) -> Option<u64>,
+) -> api::AccountingByteMeasurement {
+    match observation {
+        None => measured_bytes(api::AccountingMeasurementState::Unavailable, 0),
+        Some(observation) => match select(observation) {
+            Some(bytes) => measured_bytes(api::AccountingMeasurementState::Present, bytes),
+            None => measured_bytes(api::AccountingMeasurementState::Unsupported, 0),
+        },
+    }
+}
+
+fn measured_bytes(
+    state: api::AccountingMeasurementState,
+    bytes: u64,
+) -> api::AccountingByteMeasurement {
+    api::AccountingByteMeasurement {
+        state: state.into(),
+        bytes,
+    }
+}
+
+fn measured_count(
+    state: api::AccountingMeasurementState,
+    count: u64,
+) -> api::AccountingCountMeasurement {
+    api::AccountingCountMeasurement {
+        state: state.into(),
+        count,
+    }
+}
+
+fn unix_millis_now() -> Result<u64, Status> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Status::internal("system clock predates Unix epoch"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| Status::internal("system clock exceeds physical metric range"))
+}
+
+fn millis_timestamp(value: u64) -> Result<prost_types::Timestamp, Status> {
+    let duration = std::time::Duration::from_millis(value);
+    std::time::UNIX_EPOCH
+        .checked_add(duration)
+        .map(Into::into)
+        .ok_or_else(|| Status::data_loss("physical metric timestamp exceeds system time"))
 }
 
 impl AdministrationServiceImpl {

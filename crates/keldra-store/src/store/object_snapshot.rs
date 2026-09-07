@@ -86,12 +86,20 @@ pub struct ObjectPathSnapshot {
     pub versions: Vec<Version>,
     pub journal_pending_versions: Vec<VersionId>,
     pub journal_released_versions: Vec<VersionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub definition_locator: Option<DefinitionLocator>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub alias_registry: Option<ObjectAliasRegistry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub alias_registry_transition: Option<ObjectAliasRegistryTransition>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,8 +540,7 @@ impl Store {
                 continue;
             }
             let Some(mutation) = stored.object_mutation.clone() else {
-                // Released 0.5.0 receipts did not carry enough typed identity
-                // to transfer safely. Their local retry window remains local.
+                // Source-local receipts carry no peer-transfer identity.
                 continue;
             };
             validate_stored_receipt(&stored, &mutation, &key)?;

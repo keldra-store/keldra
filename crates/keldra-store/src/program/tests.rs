@@ -9,6 +9,7 @@ use tempfile::TempDir;
 
 use super::distributed::PROGRAM_PATH_STAGE_FORMAT;
 use super::*;
+use crate::key::{BucketId, BucketIdentity, TenantId};
 use crate::{
     BucketPolicy, DeleteRetainedVersionOutcome, DestinationReferenceArtifact,
     DestinationReferenceDelta, Durability, LocalChange, LogicalRecordCandidate,
@@ -16,6 +17,9 @@ use crate::{
     ObjectMutationGovernance, ObjectVersioning, PlacementLogId, PutMode, PutRequest,
     ReferenceDeltaBatch, StoreOptions, WatchRetention,
 };
+
+mod descriptor_mime;
+mod renomination;
 
 fn counter_path() -> ObjectPath {
     ObjectPath::new("tenant", "bucket", "managed/counter").unwrap()
@@ -104,45 +108,6 @@ async fn configured_store() -> (TempDir, Store, VerifiedProgramDefinition) {
     (temporary, store, verified_definition())
 }
 
-#[tokio::test]
-async fn descriptor_mime_without_target_sidecar_provenance_remains_an_ordinary_object() {
-    let (_temporary, store, _) = configured_store().await;
-    let requested = ObjectPath::new("tenant", "bucket", "historical/descriptor-shaped").unwrap();
-    let descriptor = crate::ObjectLinkDescriptor::new("historical/target").unwrap();
-    let receipt = store
-        .put(PutRequest {
-            key: object_key(&requested).unwrap(),
-            bytes: descriptor.encode(),
-            content_type: Some(crate::OBJECT_LINK_CONTENT_TYPE.into()),
-            mode: PutMode::Put,
-            command_id: Some("historical-descriptor-mime".into()),
-            durability: Durability::Local,
-        })
-        .await
-        .unwrap();
-
-    let bindings = store
-        .resolve_program_alias_bindings(&[ExpandedProgramPath {
-            path: requested.clone(),
-            intent: keldra_atomic_program::ProgramPathIntent {
-                get: true,
-                put: false,
-                delete: false,
-            },
-        }])
-        .await
-        .unwrap();
-
-    assert_eq!(bindings.len(), 1);
-    assert_eq!(bindings[0].requested_path, requested);
-    assert_eq!(bindings[0].canonical_path, requested);
-    assert!(bindings[0].descriptor_version.is_none());
-    assert_eq!(
-        bindings[0].canonical_version.as_ref().map(|v| v.id),
-        Some(receipt.version)
-    );
-}
-
 async fn configure_policy(store: &Store) {
     store
         .set_bucket_policy(
@@ -193,6 +158,29 @@ fn install_versioned_governance(store: &Store) {
     }
 }
 
+fn authoritative_governance(
+    store: &Store,
+    versioning: ObjectVersioning,
+) -> BTreeMap<(String, String), ProgramGovernanceParticipant> {
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    [(
+        ("tenant".to_owned(), "bucket".to_owned()),
+        ProgramGovernanceParticipant {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            tenant_id,
+            bucket_id,
+            policy: BucketPolicy {
+                program_only_prefixes: vec!["managed".into()],
+                ..Default::default()
+            },
+            versioning,
+        },
+    )]
+    .into_iter()
+    .collect()
+}
+
 fn reserved_program_path_attempt(
     command_id: &str,
     expected_head: ExpectedHead,
@@ -233,7 +221,6 @@ fn commit(
         commit_cursor,
         begin_cursor: commit_cursor,
         bundle_ref: prepared.bundle,
-        bundle_hash: prepared.hash,
         program_hash: prepared.program_hash,
         authority: prepared.authority,
         participant_manifest_hash: prepared.participant_manifest_hash,
@@ -253,7 +240,7 @@ async fn commit_prepared_reservations(
         .reservations(
             commit.begin_cursor,
             [0x51; 32],
-            prepared.hash,
+            prepared.bundle.hash,
             1,
             context.serving_fence_term,
             context.active_placement_log_id,
@@ -270,6 +257,51 @@ async fn commit_prepared_reservations(
             .unwrap();
     }
     reservations
+}
+
+async fn commit_stage_reservation(
+    store: &Store,
+    stage: &ProgramPathStage,
+    commit_cursor: u64,
+    context: ObjectMutationContext,
+) {
+    let condition = stage.previous_version.clone().map_or_else(
+        || ProgramPathCondition::Head(stage.expected.clone()),
+        |expected| ProgramPathCondition::HeadVersion { expected },
+    );
+    let reservation = ProgramReservation::Object(ProgramPathReservation {
+        format: PROGRAM_PATH_RESERVATION_FORMAT,
+        begin_cursor: stage.begin_cursor,
+        invocation_id: [0x71; 32],
+        bundle_hash: stage.bundle_hash.0,
+        participant_manifest_hash: stage.participant_manifest_hash,
+        authority: stage.authority,
+        executor_node_id: 1,
+        nomination_log_index: context.serving_fence_term,
+        placement: context.active_placement_log_id,
+        participant: ProgramObjectParticipant {
+            tenant_id: stage.tenant_id,
+            bucket_id: stage.bucket_id,
+            path: stage.path.clone(),
+            condition,
+            alias_registry: None,
+            intent: ProgramParticipantIntent {
+                read: true,
+                put: !stage.version.deleted,
+                delete: stage.version.deleted,
+            },
+        },
+        governance: stage.governance.clone(),
+        state: ProgramReservationState::Prepared,
+    });
+    store
+        .reserve_program_participant(&reservation)
+        .await
+        .unwrap();
+    store
+        .commit_program_participant(&reservation, commit_cursor)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -306,7 +338,6 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         commit_cursor: 1,
         begin_cursor: 1,
         bundle_ref: prepared.bundle,
-        bundle_hash: prepared.hash,
         program_hash: prepared.program_hash,
         authority: prepared.authority,
         participant_manifest_hash: prepared.participant_manifest_hash,
@@ -340,7 +371,6 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         Some(AppliedProgramCommit {
             commit_cursor: 1,
             bundle_ref: prepared.bundle,
-            bundle_hash: prepared.hash,
             program_hash: prepared.program_hash,
             authority: prepared.authority,
             participant_manifest_hash: prepared.participant_manifest_hash,
@@ -363,7 +393,6 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         marker_fields,
         BTreeSet::from([
             "authority",
-            "bundle_hash",
             "bundle_ref",
             "commit_cursor",
             "durability_class",
@@ -447,7 +476,6 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
                 commit_cursor: 1,
                 begin_cursor: 1,
                 bundle_ref: prepared.bundle,
-                bundle_hash: prepared.hash,
                 program_hash: prepared.program_hash,
                 authority: prepared.authority,
                 participant_manifest_hash: prepared.participant_manifest_hash,
@@ -903,11 +931,7 @@ async fn ordinary_prepared_blobs_survive_reopen_for_recovery() {
         .unwrap();
     assert_eq!(
         reopened
-            .prepared_program_bundle(
-                prepared.bundle,
-                prepared.hash,
-                prepared.durability_evidence_hash,
-            )
+            .prepared_program_bundle(prepared.bundle, prepared.durability_evidence_hash,)
             .await
             .unwrap(),
         Some(prepared.clone())
@@ -943,7 +967,7 @@ async fn recovery_rejects_committed_bundle_reference_and_durability_class_mismat
 
     let mut wrong_reference = commit(&prepared, None, 1);
     wrong_reference.bundle_ref = PreparedBundleRef {
-        hash: [0x41; 32],
+        hash: PreparedBundleHash([0x41; 32]),
         length: prepared.bundle.length,
     };
     assert_eq!(
@@ -1029,7 +1053,7 @@ async fn finalization_is_idempotent_and_rejects_cursor_corruption() {
 
     let mut corrupt = commit(&prepared, None, 10);
     corrupt.bundle_ref = PreparedBundleRef {
-        hash: [8; 32],
+        hash: PreparedBundleHash([8; 32]),
         length: prepared.bundle.length,
     };
     assert_eq!(
@@ -1144,7 +1168,15 @@ async fn mutable_read_only_program_dependency_is_evaluated_at_its_exact_version(
         .await
         .unwrap();
     assert_eq!(
-        lease.bundle().head_preconditions,
+        lease
+            .bundle()
+            .participants
+            .iter()
+            .map(|participant| HeadPrecondition {
+                path: participant.path.clone(),
+                expected: participant.expected.clone(),
+            })
+            .collect::<Vec<_>>(),
         vec![
             HeadPrecondition {
                 path: counter_path(),
@@ -1158,24 +1190,21 @@ async fn mutable_read_only_program_dependency_is_evaluated_at_its_exact_version(
             },
         ]
     );
-    assert_eq!(lease.bundle().writes.len(), 1);
-    assert_eq!(lease.bundle().writes[0].path, counter_path());
+    let writes = lease.bundle().writes().collect::<Vec<_>>();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0.path, counter_path());
+    assert_eq!(writes[0].0.expected, ObservedHead::NeverExisted);
     assert_eq!(
-        lease.bundle().writes[0].expected,
-        ObservedHead::NeverExisted
-    );
-    assert_eq!(
-        lease.bundle().writes[0].value,
+        writes[0].1.value,
         Some(StoredValue::Json(json!({"value": 1})))
     );
     assert!(
         lease
             .bundle()
-            .writes
-            .iter()
-            .all(|write| write.path != config_path)
+            .writes()
+            .all(|(participant, _)| participant.path != config_path)
     );
-    assert_eq!(lease.bundle().outputs.get("value"), Some(&json!(1)));
+    assert_eq!(lease.bundle().receipt.outputs.get("value"), Some(&json!(1)));
     assert_eq!(
         store.head(&object_key(&counter_path()).unwrap()).unwrap(),
         None
@@ -1255,7 +1284,15 @@ async fn immutable_read_only_program_dependency_is_evaluated_at_its_exact_versio
         .await
         .unwrap();
     assert_eq!(
-        lease.bundle().head_preconditions,
+        lease
+            .bundle()
+            .participants
+            .iter()
+            .map(|participant| HeadPrecondition {
+                path: participant.path.clone(),
+                expected: participant.expected.clone(),
+            })
+            .collect::<Vec<_>>(),
         vec![
             HeadPrecondition {
                 path: counter_path(),
@@ -1269,24 +1306,21 @@ async fn immutable_read_only_program_dependency_is_evaluated_at_its_exact_versio
             },
         ]
     );
-    assert_eq!(lease.bundle().writes.len(), 1);
-    assert_eq!(lease.bundle().writes[0].path, counter_path());
+    let writes = lease.bundle().writes().collect::<Vec<_>>();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0.path, counter_path());
+    assert_eq!(writes[0].0.expected, ObservedHead::NeverExisted);
     assert_eq!(
-        lease.bundle().writes[0].expected,
-        ObservedHead::NeverExisted
-    );
-    assert_eq!(
-        lease.bundle().writes[0].value,
+        writes[0].1.value,
         Some(StoredValue::Json(json!({"value": 1})))
     );
     assert!(
         lease
             .bundle()
-            .writes
-            .iter()
-            .all(|write| write.path != config_path)
+            .writes()
+            .all(|(participant, _)| participant.path != config_path)
     );
-    assert_eq!(lease.bundle().outputs.get("value"), Some(&json!(1)));
+    assert_eq!(lease.bundle().receipt.outputs.get("value"), Some(&json!(1)));
     assert_eq!(
         store.head(&object_key(&counter_path()).unwrap()).unwrap(),
         None
@@ -1326,25 +1360,27 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
         .await
         .unwrap();
     let mut prepared = store
-        .prepare_distributed_program_bundle(program.hash, lease.bundle(), &BTreeMap::new())
+        .prepare_distributed_program_bundle(
+            program.hash,
+            lease.bundle(),
+            &BTreeMap::new(),
+            &authoritative_governance(&store, ObjectVersioning::Unversioned),
+        )
         .await
         .unwrap();
     prepared.attest_remote_durability("replicated").unwrap();
     let record = store.prepared_program_record(&prepared).await.unwrap();
-    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
-    let stage = path_stage_from_prepared(
-        &prepared,
-        record.writes().first().unwrap(),
-        40,
-        tenant_id,
-        bucket_id,
-    )
-    .unwrap();
+    let stage =
+        path_stage_from_prepared(&prepared, &record, record.writes().first().unwrap(), 40).unwrap();
+    assert_eq!(
+        stage.governance,
+        record.participant_manifest().governance[0]
+    );
     let reservations = record
         .reservations(
             40,
             [1; 32],
-            prepared.hash,
+            prepared.bundle.hash,
             1,
             3,
             PlacementLogId { term: 3, index: 7 },
@@ -1361,6 +1397,19 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
             .unwrap();
     }
 
+    let mut tampered_governance = stage.clone();
+    tampered_governance.governance.policy = BucketPolicy::default();
+    assert!(
+        store
+            .coordinate_program_path_finalization(tampered_governance, 42, mutation_context(),)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.head(&object_key(&counter_path()).unwrap()).unwrap(),
+        None
+    );
+
     let persisted = store.persist_program_path_stage(&stage).await.unwrap();
     assert_eq!(persisted, stage.blob_ref().unwrap());
     assert_eq!(
@@ -1372,9 +1421,9 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
         .coordinate_program_path_finalization(
             stage.clone(),
             42,
-            crate::ObjectMutationContext {
-                active_placement_log_id: crate::PlacementLogId { term: 3, index: 7 },
+            ObjectMutationContext {
                 serving_fence_term: 2,
+                ..mutation_context()
             },
         )
         .await;
@@ -1385,18 +1434,15 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
     );
 
     let finalized = store
-        .coordinate_program_path_finalization(
-            stage.clone(),
-            42,
-            crate::ObjectMutationContext {
-                active_placement_log_id: crate::PlacementLogId { term: 3, index: 7 },
-                serving_fence_term: 3,
-            },
-        )
+        .coordinate_program_path_finalization(stage.clone(), 42, mutation_context())
         .await
         .unwrap();
     assert_eq!(finalized.mutation.commit_cursor, 42);
     assert_eq!(finalized.mutation.stamp.program_commit_cursor, Some(42));
+    assert_eq!(
+        finalized.mutation.accounting_transition,
+        AccountingHeadTransition::new(None, stage.version.blob.as_ref().map(|blob| blob.length), 0,)
+    );
     let head = store
         .head(&object_key(&counter_path()).unwrap())
         .unwrap()
@@ -1416,7 +1462,7 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
     );
 
     let replay = store
-        .apply_program_path_finalization_replica(&finalized.mutation)
+        .apply_program_path_finalization_replica(&finalized.mutation, mutation_context())
         .await
         .unwrap();
     assert!(replay.replayed);
@@ -1425,7 +1471,6 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
     let publication = SealedAtomicBatchPublication::from_prepared(
         42,
         prepared.bundle,
-        prepared.hash,
         &record,
         &[stage.clone()],
         &[finalized.mutation.clone()],
@@ -1446,17 +1491,10 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
         panic!("last source event is not the complete atomic batch");
     };
     assert_eq!(published.cursor, 42);
-    assert_eq!(published.bundle_hash, prepared.hash);
+    assert_eq!(published.bundle_hash, prepared.bundle.hash);
     assert_eq!(published.mutations.len(), 1);
-    let truncated = SealedAtomicBatchPublication::from_prepared(
-        43,
-        prepared.bundle,
-        prepared.hash,
-        &record,
-        &[],
-        &[],
-        &[],
-    );
+    let truncated =
+        SealedAtomicBatchPublication::from_prepared(43, prepared.bundle, &record, &[], &[], &[]);
     assert_eq!(truncated, Err(ProgramStoreError::PreparedBundleMismatch));
 }
 
@@ -1474,6 +1512,14 @@ fn distributed_path_stage_program_hash_shape_follows_authority() {
         participant_manifest_hash: [0x22; 32],
         tenant_id: 1,
         bucket_id: 1,
+        governance: ProgramGovernanceParticipant {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            tenant_id: 1,
+            bucket_id: 1,
+            policy: BucketPolicy::default(),
+            versioning: ObjectVersioning::Unversioned,
+        },
         path: counter_path(),
         expected: ObservedHead::NeverExisted,
         previous_version: None,
@@ -1494,16 +1540,10 @@ fn distributed_path_stage_program_hash_shape_follows_authority() {
     stage.program_hash = ProgramHash([0x44; 32]);
     assert!(stage.validate().is_err());
 
-    for authority in [
-        ProgramBundleAuthority::StoredProgram {
-            program_path_hash: [0x55; 32],
-            program_hash: [0x44; 32],
-        },
-        ProgramBundleAuthority::LegacyProgramOnly {
-            program_path_hash: [0x55; 32],
-            program_hash: [0x44; 32],
-        },
-    ] {
+    for authority in [ProgramBundleAuthority::StoredProgram {
+        program_path_hash: [0x55; 32],
+        program_hash: [0x44; 32],
+    }] {
         stage.authority = authority;
         assert!(stage.validate().is_ok());
         stage.program_hash = ProgramHash([0; 32]);
@@ -1531,31 +1571,41 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         committed_at_unix_millis: now_unix_millis().unwrap(),
         protected_link_descriptor: false,
     };
+    let context = ObjectMutationContext {
+        active_placement_log_id: PlacementLogId { term: 3, index: 7 },
+        serving_fence_term: 3,
+    };
+    let first_stage = ProgramPathStage {
+        format: PROGRAM_PATH_STAGE_FORMAT,
+        begin_cursor: 40,
+        bundle_hash: PreparedBundleHash([0x11; 32]),
+        program_hash: ProgramHash([0x22; 32]),
+        authority: ProgramBundleAuthority::StoredProgram {
+            program_path_hash: [0x33; 32],
+            program_hash: [0x22; 32],
+        },
+        participant_manifest_hash: [0x44; 32],
+        tenant_id,
+        bucket_id,
+        governance: ProgramGovernanceParticipant {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            tenant_id,
+            bucket_id,
+            policy: BucketPolicy {
+                program_only_prefixes: vec!["managed".into()],
+                ..Default::default()
+            },
+            versioning: ObjectVersioning::Enabled,
+        },
+        path: counter_path(),
+        expected: ObservedHead::NeverExisted,
+        previous_version: None,
+        version: first_version.clone(),
+    };
+    commit_stage_reservation(&store, &first_stage, 41, context).await;
     let first = store
-        .coordinate_program_path_finalization(
-            ProgramPathStage {
-                format: PROGRAM_PATH_STAGE_FORMAT,
-                begin_cursor: 40,
-                bundle_hash: PreparedBundleHash([0x11; 32]),
-                program_hash: ProgramHash([0x22; 32]),
-                authority: ProgramBundleAuthority::LegacyProgramOnly {
-                    program_path_hash: [0x33; 32],
-                    program_hash: [0x22; 32],
-                },
-                participant_manifest_hash: [0x44; 32],
-                tenant_id,
-                bucket_id,
-                path: counter_path(),
-                expected: ObservedHead::NeverExisted,
-                previous_version: None,
-                version: first_version.clone(),
-            },
-            41,
-            ObjectMutationContext {
-                active_placement_log_id: PlacementLogId { term: 3, index: 7 },
-                serving_fence_term: 3,
-            },
-        )
+        .coordinate_program_path_finalization(first_stage, 41, context)
         .await
         .unwrap();
     assert_eq!(
@@ -1564,6 +1614,10 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
             blob: payload.clone(),
             change: 1,
         }]
+    );
+    assert_eq!(
+        first.mutation.accounting_transition,
+        AccountingHeadTransition::new(None, Some(payload.length), 0)
     );
     let source = first.mutation.stamp.source_id;
     let before_first = store.reference_delta_cursor(source).unwrap();
@@ -1588,33 +1642,39 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         committed_at_unix_millis: now_unix_millis().unwrap(),
         protected_link_descriptor: false,
     };
+    let second_stage = ProgramPathStage {
+        format: PROGRAM_PATH_STAGE_FORMAT,
+        begin_cursor: 41,
+        bundle_hash: PreparedBundleHash([0x33; 32]),
+        program_hash: ProgramHash([0x22; 32]),
+        authority: ProgramBundleAuthority::StoredProgram {
+            program_path_hash: [0x33; 32],
+            program_hash: [0x22; 32],
+        },
+        participant_manifest_hash: [0x44; 32],
+        tenant_id,
+        bucket_id,
+        governance: ProgramGovernanceParticipant {
+            tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            tenant_id,
+            bucket_id,
+            policy: BucketPolicy {
+                program_only_prefixes: vec!["managed".into()],
+                ..Default::default()
+            },
+            versioning: ObjectVersioning::Enabled,
+        },
+        path: counter_path(),
+        expected: ObservedHead::Version {
+            version: first_version.id.0.to_string(),
+        },
+        previous_version: Some(first_version.clone()),
+        version: second_version.clone(),
+    };
+    commit_stage_reservation(&store, &second_stage, 42, context).await;
     let second = store
-        .coordinate_program_path_finalization(
-            ProgramPathStage {
-                format: PROGRAM_PATH_STAGE_FORMAT,
-                begin_cursor: 41,
-                bundle_hash: PreparedBundleHash([0x33; 32]),
-                program_hash: ProgramHash([0x22; 32]),
-                authority: ProgramBundleAuthority::LegacyProgramOnly {
-                    program_path_hash: [0x33; 32],
-                    program_hash: [0x22; 32],
-                },
-                participant_manifest_hash: [0x44; 32],
-                tenant_id,
-                bucket_id,
-                path: counter_path(),
-                expected: ObservedHead::Version {
-                    version: first_version.id.0.to_string(),
-                },
-                previous_version: Some(first_version.clone()),
-                version: second_version.clone(),
-            },
-            42,
-            ObjectMutationContext {
-                active_placement_log_id: PlacementLogId { term: 3, index: 7 },
-                serving_fence_term: 3,
-            },
-        )
+        .coordinate_program_path_finalization(second_stage, 42, context)
         .await
         .unwrap();
     assert_eq!(
@@ -1624,6 +1684,17 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
             change: 1,
         }]
     );
+    assert_eq!(
+        second.mutation.accounting_transition,
+        AccountingHeadTransition::new(Some(payload.length), Some(payload.length), 0)
+    );
+    let mut tampered = second.mutation.clone();
+    tampered.accounting_transition.logical_bytes_removed = payload.length;
+    assert_ne!(
+        tampered.computed_fingerprint().unwrap(),
+        tampered.stamp.mutation_fingerprint
+    );
+    assert!(tampered.validate().is_err());
     store
         .apply_reference_deltas(ReferenceDeltaBatch {
             source,
@@ -1645,34 +1716,17 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         2
     );
 
-    let (_replica_temporary, replica, _program) = configured_store().await;
-    let policy = LogicalRecordValue::BucketPolicy {
-        tenant_id,
-        bucket_id,
-        policy: BucketPolicy {
-            program_only_prefixes: vec!["managed".into()],
-            ..Default::default()
-        },
-    };
-    let policy_mutation = replica
-        .construct_logical_record_mutation(
-            policy,
-            LogicalRecordMutationContext {
-                record_version: replica.allocate_logical_record_version().unwrap(),
-                active_placement_log_id: PlacementLogId { term: 3, index: 7 },
-                serving_fence_term: 3,
-            },
-        )
+    let replica_temporary = tempfile::tempdir().unwrap();
+    let replica = Store::open(StoreOptions::new(replica_temporary.path(), 2))
+        .await
         .unwrap();
+    commit_stage_reservation(&replica, &first.mutation.stage, 71, context).await;
     replica
-        .commit_logical_record_mutation(&policy_mutation)
-        .unwrap();
-    replica
-        .apply_program_path_finalization_replica(&first.mutation)
+        .apply_program_path_finalization_replica(&first.mutation, mutation_context())
         .await
         .unwrap();
     replica
-        .apply_program_path_finalization_replica(&second.mutation)
+        .apply_program_path_finalization_replica(&second.mutation, mutation_context())
         .await
         .unwrap();
 
@@ -1735,4 +1789,181 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         store.read_blob_bytes(&payload).await.unwrap(),
         br#"{"value":1}"#
     );
+}
+
+#[tokio::test]
+async fn unversioned_program_finalization_replays_after_released_predecessor_is_deleted() {
+    let (_temporary, store, _program) = configured_store().await;
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let governance = ProgramGovernanceParticipant {
+        tenant: "tenant".into(),
+        bucket: "bucket".into(),
+        tenant_id,
+        bucket_id,
+        policy: BucketPolicy {
+            program_only_prefixes: vec!["managed".into()],
+            ..Default::default()
+        },
+        versioning: ObjectVersioning::Unversioned,
+    };
+    let first_blob = store.stage_blob(b"first program payload").await.unwrap();
+    let second_blob = store.stage_blob(b"second program payload").await.unwrap();
+    let first_version = Version {
+        id: store.clock.next().unwrap(),
+        blob: Some(first_blob.clone()),
+        content_type: Some("application/octet-stream".into()),
+        deleted: false,
+        committed_at_unix_millis: now_unix_millis().unwrap(),
+        protected_link_descriptor: false,
+    };
+    let first_stage = ProgramPathStage {
+        format: PROGRAM_PATH_STAGE_FORMAT,
+        begin_cursor: 70,
+        bundle_hash: PreparedBundleHash([0x51; 32]),
+        program_hash: ProgramHash([0x52; 32]),
+        authority: ProgramBundleAuthority::StoredProgram {
+            program_path_hash: [0x53; 32],
+            program_hash: [0x52; 32],
+        },
+        participant_manifest_hash: [0x54; 32],
+        tenant_id,
+        bucket_id,
+        governance: governance.clone(),
+        path: counter_path(),
+        expected: ObservedHead::NeverExisted,
+        previous_version: None,
+        version: first_version.clone(),
+    };
+    let context = ObjectMutationContext {
+        active_placement_log_id: PlacementLogId { term: 3, index: 7 },
+        serving_fence_term: 3,
+    };
+    commit_stage_reservation(&store, &first_stage, 71, context).await;
+    let first = store
+        .coordinate_program_path_finalization(first_stage, 71, context)
+        .await
+        .unwrap();
+    let replica_temporary = tempfile::tempdir().unwrap();
+    let replica = Store::open(StoreOptions::new(replica_temporary.path(), 2))
+        .await
+        .unwrap();
+    assert!(
+        !replica
+            .apply_program_path_finalization_replica(&first.mutation, context)
+            .await
+            .unwrap()
+            .replayed
+    );
+
+    let first_position = first.mutation.stamp.source_journal_position;
+    store
+        .advance_source_journal_reference_safe_through(first_position)
+        .await
+        .unwrap();
+    store
+        .advance_source_journal_settled_through(first_position)
+        .await
+        .unwrap();
+    while store.local_watch_status().unwrap().retention_floor < first_position {
+        assert!(store.prune_source_journal_for_test().await.unwrap());
+    }
+    assert_eq!(
+        store
+            .version_metadata(&object_key(&counter_path()).unwrap(), first_version.id)
+            .unwrap(),
+        Some(first_version.clone()),
+        "pruning the current source event releases but does not delete its descriptor"
+    );
+
+    let second_version = Version {
+        id: store.clock.next().unwrap(),
+        blob: Some(second_blob.clone()),
+        content_type: Some("application/octet-stream".into()),
+        deleted: false,
+        committed_at_unix_millis: now_unix_millis().unwrap(),
+        protected_link_descriptor: false,
+    };
+    let second_stage = ProgramPathStage {
+        format: PROGRAM_PATH_STAGE_FORMAT,
+        begin_cursor: 72,
+        bundle_hash: PreparedBundleHash([0x61; 32]),
+        program_hash: ProgramHash([0x62; 32]),
+        authority: ProgramBundleAuthority::StoredProgram {
+            program_path_hash: [0x63; 32],
+            program_hash: [0x62; 32],
+        },
+        participant_manifest_hash: [0x64; 32],
+        tenant_id,
+        bucket_id,
+        governance,
+        path: counter_path(),
+        expected: ObservedHead::Version {
+            version: first_version.id.0.to_string(),
+        },
+        previous_version: Some(first_version.clone()),
+        version: second_version,
+    };
+    commit_stage_reservation(&store, &second_stage, 73, context).await;
+    let second = store
+        .coordinate_program_path_finalization(second_stage.clone(), 73, context)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.mutation.reference_deltas,
+        [
+            ReferenceDelta {
+                blob: second_blob,
+                change: 1,
+            },
+            ReferenceDelta {
+                blob: first_blob,
+                change: -1,
+            },
+        ]
+    );
+    assert_eq!(
+        store
+            .version_metadata(&object_key(&counter_path()).unwrap(), first_version.id)
+            .unwrap(),
+        None,
+        "first application deletes the journal-released predecessor"
+    );
+
+    let coordinator_replay = store
+        .coordinate_program_path_finalization(second_stage, 73, context)
+        .await
+        .unwrap();
+    assert!(coordinator_replay.replayed);
+    assert_eq!(coordinator_replay.mutation, second.mutation);
+
+    commit_stage_reservation(&replica, &second.mutation.stage, 73, context).await;
+    let replica_first_apply = replica
+        .apply_program_path_finalization_replica(&second.mutation, context)
+        .await
+        .unwrap();
+    assert!(!replica_first_apply.replayed);
+    assert_eq!(
+        replica_first_apply.version,
+        second.mutation.stage.version.id
+    );
+    assert_eq!(
+        replica
+            .version_metadata_by_identity(
+                BucketIdentity {
+                    tenant_id: TenantId(tenant_id),
+                    bucket_id: BucketId(bucket_id),
+                },
+                &object_key(&counter_path()).unwrap(),
+                first_version.id,
+            )
+            .unwrap(),
+        Some(first_version),
+        "the replica keeps its pending descriptor for proof cleanup"
+    );
+    let replica_replay = replica
+        .apply_program_path_finalization_replica(&second.mutation, context)
+        .await
+        .unwrap();
+    assert!(replica_replay.replayed);
+    assert_eq!(replica_replay.version, second.mutation.stage.version.id);
 }

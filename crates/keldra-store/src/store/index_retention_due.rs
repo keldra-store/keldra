@@ -6,9 +6,7 @@ use crate::{DeletedDefinitionCleanup, IndexCommitRetentionDue, IndexRetentionDue
 
 const DUE_DOMAIN: u8 = b'D';
 const IDENTITY_DOMAIN: u8 = b'd';
-// KELDRA-0016 deliberately rejects the previous candidate-generation due
-// record. Retention work now names an exact committed manifest revision.
-const VALUE_FORMAT: u8 = 2;
+const VALUE_FORMAT: u8 = 1;
 const COMMIT_KIND: u8 = 1;
 const DELETED_DEFINITION_KIND: u8 = 2;
 const DUE_KEY_BYTES: usize = 1 + 1 + 1 + 8 + 8 + 8 + 8;

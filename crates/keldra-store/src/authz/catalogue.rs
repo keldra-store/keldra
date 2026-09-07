@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use keldra_authz::Schema;
-use rocksdb::{Direction, IteratorMode, WriteBatch};
+use rocksdb::{Direction, IteratorMode, Snapshot, WriteBatch};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -25,13 +25,15 @@ pub const AUTHZ_SCHEMA_PUBLICATION_STAMP_FORMAT: u16 = 1;
 const CATALOGUE_HASH_DOMAIN: &[u8] = b"keldra.authz-schema-catalogue.v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthzSchemaRevision {
     pub schema_ref: SchemaRef,
     pub schema: Schema,
     pub published_at_revision: AuthzRevision,
-    /// Exact coordinator mutation for 0.5.1+ publications. Released 0.5.0
-    /// revision values decode with this absent and remain baseline state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Exact coordinator mutation when this publication used replication.
+    /// The field is required in the v1 envelope; a direct local publication
+    /// represents its absence explicitly as `null`.
+    #[serde(deserialize_with = "super::deserialize_required_option")]
     pub publication_mutation: Option<AuthzSchemaPublicationMutation>,
 }
 
@@ -60,6 +62,7 @@ impl From<&AuthzSchemaRevision> for StoredSchema {
 /// the shared tenant Zanzibar revision, so it also advances when a realm in
 /// this replica group changes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthzSchemaCatalogue {
     pub format: u16,
     pub storage_tenant: StorageTenantId,
@@ -161,6 +164,7 @@ pub struct AuthzSchemaCatalogueCandidate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthzSchemaPublicationStamp {
     pub format: u16,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
     pub predecessor_revision: Option<AuthzRevision>,
     pub mutation_fingerprint: [u8; 32],
     pub active_placement_log_id: crate::PlacementLogId,
@@ -488,15 +492,39 @@ impl AuthzRepository {
         Ok(revision)
     }
 
+    /// Reads the shared tenant revision and every retained schema revision from
+    /// one RocksDB sequence so the returned catalogue represents a real state.
     pub fn export_authz_schema_catalogue(
         &self,
         tenant: &StorageTenantId,
     ) -> Result<Option<AuthzSchemaCatalogue>, AuthzStoreError> {
         tenant.validate()?;
-        let authz_revision = self.tenant_revision(tenant)?;
+        let snapshot = self.db.snapshot();
+        self.export_authz_schema_catalogue_from_snapshot(&snapshot, tenant)
+    }
+
+    fn export_authz_schema_catalogue_from_snapshot(
+        &self,
+        snapshot: &Snapshot<'_>,
+        tenant: &StorageTenantId,
+    ) -> Result<Option<AuthzSchemaCatalogue>, AuthzStoreError> {
+        let authz_revision = match snapshot
+            .get_cf(self.cf(CF_AUTHZ_TENANTS)?, tenant_revision_key(tenant))
+            .map_err(storage_error)?
+            .map(|encoded| decode_json::<AuthzRevision>(&encoded))
+            .transpose()?
+        {
+            None => AuthzRevision::ZERO,
+            Some(AuthzRevision(0)) => {
+                return Err(AuthzStoreError::Storage(
+                    "persisted authorization revision must be nonzero".into(),
+                ));
+            }
+            Some(revision) => revision,
+        };
         let mut schemas = Vec::<AuthzSchemaRevision>::new();
         let prefix = schema_tenant_prefix(b'S', tenant);
-        for item in self.db.iterator_cf(
+        for item in snapshot.iterator_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,
             IteratorMode::From(&prefix, Direction::Forward),
         ) {

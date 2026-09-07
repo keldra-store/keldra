@@ -798,7 +798,7 @@ fn require_authorization_evidence(
 mod tests {
     use keldra_api::v1::{
         IndexAggregateOperation, IndexAggregateRequest, IndexAggregateResult, IndexFacetBucket,
-        IndexFacetRequest, IndexFacetResult, IndexSpecification, PathIndexQuery, PathIndexSpec,
+        IndexFacetRequest, IndexFacetResult, IndexSpecification, PathIndexQuery,
         TypedJsonIndexQuery, index_query, index_specification,
     };
 

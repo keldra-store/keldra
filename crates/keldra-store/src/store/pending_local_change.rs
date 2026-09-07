@@ -45,20 +45,32 @@ impl PendingLocalChange {
             Self::RetainedVersionDeleted {
                 identity,
                 exact_path,
+                canonical_path,
                 deleted_version,
                 resulting_head_version,
                 reference_deltas,
                 accounting_transition,
-            } => LocalChange::retained_version_deleted(
-                offset,
-                identity.tenant_id.0,
-                identity.bucket_id.0,
-                exact_path.clone(),
-                *deleted_version,
-                *resulting_head_version,
-                reference_deltas.clone(),
-                *accounting_transition,
-            ),
+            } => match canonical_path {
+                Some(canonical_path) => LocalChange::alias_retained_version_deleted(
+                    offset,
+                    identity.tenant_id.0,
+                    identity.bucket_id.0,
+                    exact_path.clone(),
+                    canonical_path.clone(),
+                    *deleted_version,
+                    *resulting_head_version,
+                ),
+                None => LocalChange::retained_version_deleted(
+                    offset,
+                    identity.tenant_id.0,
+                    identity.bucket_id.0,
+                    exact_path.clone(),
+                    *deleted_version,
+                    *resulting_head_version,
+                    reference_deltas.clone(),
+                    *accounting_transition,
+                ),
+            },
             Self::AggregateChanged {
                 aggregate_kind,
                 aggregate_key,
@@ -84,13 +96,11 @@ impl PendingLocalChange {
             Self::AtomicBatchPublished {
                 cursor,
                 bundle_hash,
-                affected_routes,
                 mutations,
             } => LocalChange::atomic_batch_published(
                 offset,
                 *cursor,
                 *bundle_hash,
-                affected_routes.clone(),
                 mutations.clone(),
             ),
         }

@@ -332,29 +332,21 @@ where
             outputs: outputs.clone(),
         };
 
-        let head_preconditions = working
-            .iter()
-            .map(|document| HeadPrecondition {
-                path: document.path.clone(),
-                expected: document.observed.clone(),
-            })
-            .collect();
-        let writes = working
+        let participants = working
             .into_iter()
-            .filter(|document| document.dirty)
-            .map(|document| VersionedWrite {
+            .map(|document| AtomicParticipant {
                 path: document.path,
                 expected: document.observed,
-                value: document.current,
-                content_type: document.current_content_type,
+                write: document.dirty.then_some(VersionedWrite {
+                    value: document.current,
+                    content_type: document.current_content_type,
+                }),
             })
             .collect();
 
         Ok(Box::new(AtomicWriteBundle {
-            head_preconditions,
-            writes,
+            participants,
             receipt,
-            outputs,
         }))
     }
 }

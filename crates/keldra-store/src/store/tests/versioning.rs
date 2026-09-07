@@ -103,6 +103,45 @@ async fn enabled_versioning_retains_descriptors_and_payload_references() {
             .ref_count,
         2
     );
+    store
+        .delete(DeleteRequest {
+            key: key("a"),
+            precondition: Precondition::Version(second.version),
+            command_id: Some("delete".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .blob_reference_state(&reference)
+            .unwrap()
+            .unwrap()
+            .ref_count,
+        2
+    );
+    let heads = store
+        .scan_local_changes(0, 10)
+        .unwrap()
+        .into_iter()
+        .filter_map(|change| match change {
+            LocalChange::ObjectHead(change) => Some(change),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(heads.len(), 3);
+    assert_eq!(
+        heads[0].accounting_transition,
+        Some(AccountingHeadTransition::new(None, Some(4), 0))
+    );
+    assert_eq!(
+        heads[1].accounting_transition,
+        Some(AccountingHeadTransition::new(Some(4), Some(4), 0))
+    );
+    assert_eq!(
+        heads[2].accounting_transition,
+        Some(AccountingHeadTransition::new(Some(4), None, 0))
+    );
 }
 
 #[tokio::test]
@@ -328,6 +367,46 @@ async fn unversioned_reference_ownership_remains_pinned_until_checkpoint() {
             .unwrap()
             .deleted
     );
+
+    let heads = store
+        .scan_local_changes(0, 20)
+        .unwrap()
+        .into_iter()
+        .filter_map(|change| match change {
+            LocalChange::ObjectHead(change) => Some(change),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(heads.len(), 4);
+    assert_eq!(
+        heads[0].accounting_transition,
+        Some(AccountingHeadTransition::new(None, Some(4), 0))
+    );
+    assert_eq!(
+        heads[1].accounting_transition,
+        Some(AccountingHeadTransition::new(Some(4), Some(4), 4))
+    );
+    assert_eq!(
+        heads[1].reference_deltas,
+        [ReferenceDelta {
+            blob: blob_reference_for_bytes(b"same"),
+            change: 1,
+        }]
+    );
+    assert!(
+        heads[1]
+            .reference_deltas
+            .iter()
+            .all(|delta| delta.change >= 0)
+    );
+    assert_eq!(
+        heads[2].accounting_transition,
+        Some(AccountingHeadTransition::new(Some(4), Some(5), 4))
+    );
+    assert_eq!(
+        heads[3].accounting_transition,
+        Some(AccountingHeadTransition::new(Some(5), None, 5))
+    );
 }
 
 #[tokio::test]
@@ -420,6 +499,10 @@ async fn retained_version_deletion_never_reveals_an_older_value() {
     assert_eq!(retained_deletions[0].deleted_version, first.version);
     assert_eq!(retained_deletions[0].resulting_head_version, None);
     assert_eq!(
+        retained_deletions[0].accounting_transition,
+        Some(AccountingHeadTransition::new(None, None, 5))
+    );
+    assert_eq!(
         retained_deletions[0].reference_deltas,
         [ReferenceDelta {
             blob: blob_reference_for_bytes(b"first"),
@@ -430,6 +513,10 @@ async fn retained_version_deletion_never_reveals_an_older_value() {
     assert_eq!(
         retained_deletions[1].resulting_head_version,
         Some(tombstone)
+    );
+    assert_eq!(
+        retained_deletions[1].accounting_transition,
+        Some(AccountingHeadTransition::new(Some(5), None, 5))
     );
     assert_eq!(
         retained_deletions[1].reference_deltas,

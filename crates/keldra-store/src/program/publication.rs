@@ -15,7 +15,6 @@ struct AtomicBatchPublicationMarker {
 pub struct SealedAtomicBatchPublication {
     cursor: u64,
     bundle_hash: PreparedBundleHash,
-    affected_routes: Vec<crate::AtomicBatchRoute>,
     mutations: Vec<crate::AtomicBatchMutation>,
     aliases: Vec<PreparedAliasPublication>,
 }
@@ -24,7 +23,6 @@ impl SealedAtomicBatchPublication {
     pub fn from_prepared(
         cursor: u64,
         bundle_ref: PreparedBundleRef,
-        bundle_hash: PreparedBundleHash,
         record: &PreparedProgramRecord,
         stages: &[ProgramPathStage],
         finalized: &[ProgramPathMutation],
@@ -32,10 +30,10 @@ impl SealedAtomicBatchPublication {
     ) -> Result<Self, ProgramStoreError> {
         validate_prepared_record(record)?;
         let encoded = serde_json::to_vec(record).map_err(program_storage_error)?;
+        let bundle_hash = bundle_ref.hash;
         if cursor == 0
             || bundle_ref.length != encoded.len() as u64
-            || bundle_ref.hash != bundle_hash.0
-            || *blake3::hash(&encoded).as_bytes() != bundle_ref.hash
+            || *blake3::hash(&encoded).as_bytes() != bundle_ref.hash.0
             || stages.len() != record.writes.len()
             || finalized.len() != stages.len()
         {
@@ -47,8 +45,7 @@ impl SealedAtomicBatchPublication {
             if stage.bundle_hash != bundle_hash
                 || stage.program_hash != record.program_hash
                 || stage.authority != record.authority
-                || stage.participant_manifest_hash
-                    != record.participant_manifest_hash(bundle_hash)?
+                || stage.participant_manifest_hash != record.participant_manifest_hash()?
                 || stage.path != write.path
                 || stage.expected != write.expected
                 || stage.previous_version != write.previous_version
@@ -71,18 +68,11 @@ impl SealedAtomicBatchPublication {
             .filter(|mutation| publishes_physical_write(record, &mutation.stage.path))
             .cloned()
             .collect::<Vec<_>>();
-        let (mut affected_routes, mutations) = atomic_batch_descriptors(&published_physical);
+        let mutations = atomic_batch_descriptors(&published_physical);
         let aliases = prepared_alias_publications(record)?;
-        affected_routes.extend(aliases.iter().map(|alias| crate::AtomicBatchRoute {
-            tenant_id: alias.identity.tenant_id.0,
-            bucket_id: alias.identity.bucket_id.0,
-        }));
-        affected_routes.sort_unstable();
-        affected_routes.dedup();
         let publication = Self {
             cursor,
             bundle_hash,
-            affected_routes,
             mutations,
             aliases,
         };
@@ -113,7 +103,6 @@ impl SealedAtomicBatchPublication {
             u64::MAX,
             self.cursor,
             self.bundle_hash,
-            self.affected_routes.clone(),
             mutations,
         );
         let crate::LocalChange::AtomicBatchPublished(batch) = &event else {
@@ -159,7 +148,7 @@ fn validate_alias_registry_finalizations(
             || stage.bundle_hash != bundle_hash
             || stage.program_hash != record.program_hash
             || stage.authority != record.authority
-            || stage.participant_manifest_hash != record.participant_manifest_hash(bundle_hash)?
+            || stage.participant_manifest_hash != record.participant_manifest_hash()?
             || stage.tenant_id != target.tenant_id
             || stage.bucket_id != target.bucket_id
             || stage.target != target.path
@@ -241,7 +230,6 @@ impl Store {
             changes.push(PendingLocalChange::AtomicBatchPublished {
                 cursor,
                 bundle_hash,
-                affected_routes: publication.affected_routes.clone(),
                 mutations,
             });
             let mut batch = WriteBatch::default();
@@ -271,21 +259,7 @@ impl Store {
     }
 }
 
-fn atomic_batch_descriptors(
-    finalized: &[ProgramPathMutation],
-) -> (
-    Vec<crate::AtomicBatchRoute>,
-    Vec<crate::AtomicBatchMutation>,
-) {
-    let mut affected_routes = finalized
-        .iter()
-        .map(|mutation| crate::AtomicBatchRoute {
-            tenant_id: mutation.stage.tenant_id,
-            bucket_id: mutation.stage.bucket_id,
-        })
-        .collect::<Vec<_>>();
-    affected_routes.sort_unstable();
-    affected_routes.dedup();
+fn atomic_batch_descriptors(finalized: &[ProgramPathMutation]) -> Vec<crate::AtomicBatchMutation> {
     let mut mutations = finalized
         .iter()
         .map(|mutation| crate::AtomicBatchMutation {
@@ -300,5 +274,5 @@ fn atomic_batch_descriptors(
         })
         .collect::<Vec<_>>();
     mutations.sort_unstable();
-    (affected_routes, mutations)
+    mutations
 }

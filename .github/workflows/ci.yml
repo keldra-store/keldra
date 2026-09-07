@@ -22,13 +22,17 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
 
+      - name: Use runner-local Cargo target
+        run: printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/keldra-cargo-target" >> "$GITHUB_ENV"
+
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: 1.96.0
           components: rustfmt
 
       - name: Install system build dependencies
@@ -44,16 +48,16 @@ jobs:
             ripgrep
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v09-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v09-
+            ${{ runner.os }}-cargo-v1-
 
       - name: Run static release gates
         run: ./scripts/release-gates.sh static
@@ -70,12 +74,17 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
 
+      - name: Use runner-local Cargo target
+        run: printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/keldra-cargo-target" >> "$GITHUB_ENV"
+
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.96.0
 
       - name: Install system build dependencies
         run: |
@@ -89,15 +98,15 @@ jobs:
             protobuf-compiler
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v09-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v09-
+            ${{ runner.os }}-cargo-v1-
 
       - name: Run workspace tests
         run: ./scripts/release-gates.sh rust
@@ -122,17 +131,17 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build image
         run: ./scripts/build-image.sh
 
-      - name: Smoke image through the 0.9 gRPC API
+      - name: Smoke image through the v1 gRPC API
         run: ./scripts/release-gates.sh image
 
       - name: Remove local image

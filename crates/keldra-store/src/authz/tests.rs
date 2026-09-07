@@ -277,13 +277,31 @@ async fn tuple_batches_are_atomic_replayable_and_principal_scoped() {
         .unwrap();
     assert_eq!(result.revision, AuthzRevision(4));
     assert_eq!(result.allowed, vec![true]);
-    assert_eq!(
-        repository
-            .realm_snapshot(&realm, AuthzConsistency::Exact(AuthzRevision(4)))
-            .unwrap()
-            .revision,
-        AuthzRevision(4)
-    );
+    assert_eq!(repository.compiled_cache.lock().unwrap().entries.len(), 1);
+    let cached = repository
+        .batch_check(
+            &realm,
+            AuthzConsistency::Exact(AuthzRevision(4)),
+            &[AuthorizationCheck::new(
+                principal("alice"),
+                resource("one"),
+                "view",
+            )],
+        )
+        .unwrap();
+    assert_eq!(cached.allowed, vec![true]);
+    {
+        let cache = repository.compiled_cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].key.realm_revision, AuthzRevision(4));
+    }
+    let snapshot = repository
+        .validated_realm_snapshot(&realm, AuthzConsistency::Exact(AuthzRevision(4)))
+        .unwrap();
+    assert_eq!(snapshot.revision, AuthzRevision(4));
+    assert_eq!(snapshot.realm_revision, AuthzRevision(4));
+    assert_eq!(snapshot.binding.authz_revision, AuthzRevision(2));
+    assert_eq!(repository.compiled_cache.lock().unwrap().entries.len(), 1);
     assert!(matches!(
         repository.realm_snapshot(&realm, AuthzConsistency::Exact(AuthzRevision(3))),
         Err(AuthzStoreError::RevisionExpired { .. })
@@ -363,6 +381,95 @@ async fn retained_tuple_replay_restores_the_original_revision_for_same_mutation(
         repository.restore_retained_tuple_replay_precondition(reconstructed),
         Err(AuthzStoreError::OperationMismatch)
     ));
+}
+
+#[tokio::test]
+async fn compiled_authorization_cache_misses_after_a_tuple_mutation() {
+    let (_directory, store) = store().await;
+    let repository = store.authz();
+    let realm = scope("acme", "cache-revision");
+    let published = publish(
+        &repository,
+        tenant("acme"),
+        "documents",
+        document_schema(false),
+        AuthzRevision::ZERO,
+    );
+    bind(
+        &repository,
+        realm.clone(),
+        published.schema_ref,
+        AuthzRevision(1),
+    );
+    let check = AuthorizationCheck::new(principal("alice"), resource("one"), "view");
+    assert!(
+        !repository
+            .check(&realm, AuthzConsistency::Latest, &check)
+            .unwrap()
+            .0
+    );
+    assert_eq!(
+        repository.compiled_cache.lock().unwrap().entries[0]
+            .key
+            .realm_revision,
+        AuthzRevision(2)
+    );
+
+    repository
+        .mutate_tuples(TupleBatchRequest {
+            scope: realm.clone(),
+            principal: principal("writer"),
+            expected_revision: Some(AuthzRevision(2)),
+            expected_binding_generation: 1,
+            operation_id: None,
+            mutations: vec![TupleMutation {
+                kind: TupleMutationKind::Add,
+                tuple: viewer_tuple("one", "alice"),
+            }],
+        })
+        .unwrap();
+    assert!(
+        repository
+            .check(&realm, AuthzConsistency::Latest, &check)
+            .unwrap()
+            .0
+    );
+    let cache = repository.compiled_cache.lock().unwrap();
+    assert_eq!(cache.entries.len(), 1);
+    assert_eq!(cache.entries[0].key.realm_revision, AuthzRevision(3));
+    assert_eq!(cache.byte_weight, cache.entries[0].byte_weight);
+    assert!(cache.byte_weight > 0);
+}
+
+#[tokio::test]
+async fn compiled_authorization_cache_rejects_an_entry_over_its_byte_budget() {
+    let (_directory, store) = store().await;
+    let repository = store.authz();
+    let realm = scope("acme", "cache-byte-budget");
+    let published = publish(
+        &repository,
+        tenant("acme"),
+        "documents",
+        document_schema(false),
+        AuthzRevision::ZERO,
+    );
+    bind(
+        &repository,
+        realm.clone(),
+        published.schema_ref,
+        AuthzRevision(1),
+    );
+    repository.compiled_cache.lock().unwrap().max_byte_weight = 1;
+    repository
+        .check(
+            &realm,
+            AuthzConsistency::Latest,
+            &AuthorizationCheck::new(principal("alice"), resource("one"), "view"),
+        )
+        .unwrap();
+    let cache = repository.compiled_cache.lock().unwrap();
+    assert!(cache.entries.is_empty());
+    assert_eq!(cache.byte_weight, 0);
 }
 
 #[tokio::test]

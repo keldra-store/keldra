@@ -478,9 +478,9 @@ impl ClusterPeerService {
         let fence = admitted.placement.fence();
         let placement = admitted.placement;
         let local_node = self.local_node;
-        let include_prefix = path_prefix.clone();
         let include = move |record: &RetainedObjectSnapshot| {
-            crate::accounting::includes_path(&include_prefix, &record.exact_path)
+            (record.user_retained || record.version.id == record.current_head.version)
+                && !record.version.protected_link_descriptor
                 && object_coordinator(
                     &placement,
                     record.tenant_id,
@@ -488,16 +488,20 @@ impl ClusterPeerService {
                     &record.exact_path,
                 ) == Some(local_node)
         };
+        let logical_prefix = path_prefix.clone();
+        let includes_name =
+            move |path: &str| crate::accounting::includes_path(&logical_prefix, path);
         let inactivity_timeout = admitted.timeout;
         let mut scan = tokio::time::timeout(
             inactivity_timeout,
-            self.store.start_retained_object_snapshot_scan(
+            self.store.start_logical_retained_object_snapshot_scan(
                 tenant_id,
                 bucket_id,
                 &path_prefix,
                 RETAINED_SOURCE_FRAME_MAX_RECORDS,
                 max_frame_bytes,
                 include,
+                includes_name,
             ),
         )
         .await

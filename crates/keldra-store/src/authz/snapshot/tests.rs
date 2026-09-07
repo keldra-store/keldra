@@ -216,6 +216,41 @@ async fn complete_realms_page_install_replay_and_survive_restart() {
             .unwrap(),
         Some(realm(&aggregates, "documents").clone())
     );
+    let documents = realm(&aggregates, "documents");
+    let mut obsolete_shape = serde_json::to_value(documents).unwrap();
+    obsolete_shape.as_object_mut().unwrap().insert(
+        "aggregate_revision".into(),
+        serde_json::json!(documents.revision),
+    );
+    assert!(serde_json::from_value::<AuthzRealmAggregate>(obsolete_shape).is_err());
+    let mut missing_stamp = serde_json::to_value(documents).unwrap();
+    missing_stamp
+        .as_object_mut()
+        .unwrap()
+        .remove("mutation_stamp");
+    assert!(serde_json::from_value::<AuthzRealmAggregate>(missing_stamp).is_err());
+    let state = source_repository
+        .authz_realm_state(&documents.scope)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.revision, documents.revision);
+    assert_eq!(state.schema_ref, documents.binding.schema_ref);
+    assert_eq!(state.binding_generation, documents.binding.generation);
+    assert_eq!(state.tuple_count, documents.binding.tuple_count);
+    let rocks_snapshot = source_repository.db.snapshot();
+    let without_expired_receipts = source_repository
+        .read_realm_aggregate(&rocks_snapshot, &documents.scope, u64::MAX)
+        .unwrap()
+        .unwrap();
+    assert!(without_expired_receipts.receipts.is_empty());
+    assert_eq!(
+        source_repository
+            .authz_realm_state(&documents.scope)
+            .unwrap()
+            .unwrap(),
+        state,
+        "receipt expiry must not perturb authoritative realm identity"
+    );
 
     let target_path = temporary.path().join("target");
     let target = Store::open(StoreOptions::new(&target_path, 2))
@@ -229,6 +264,13 @@ async fn complete_realms_page_install_replay_and_survive_restart() {
             .unwrap()
             .unwrap();
         assert_eq!(manifest.encoded_bytes, bytes.len() as u64);
+        assert_eq!(
+            manifest.state(),
+            source_repository
+                .authz_realm_state(&aggregate.scope)
+                .unwrap()
+                .unwrap()
+        );
         let applied = target_repository
             .install_quorum_reconciled_authz_realm_stream(&manifest, std::io::Cursor::new(bytes))
             .unwrap();
@@ -573,7 +615,7 @@ async fn export_validates_cursor_limits_and_key_page_size() {
 }
 
 #[tokio::test]
-async fn released_untyped_receipts_do_not_become_a_transfer_side_plane() {
+async fn local_retry_receipts_do_not_become_realm_authority() {
     let temporary = tempfile::tempdir().unwrap();
     let source = Store::open(StoreOptions::new(temporary.path().join("source"), 1))
         .await
@@ -589,7 +631,7 @@ async fn released_untyped_receipts_do_not_become_a_transfer_side_plane() {
         .unwrap();
     repository
         .bind_schema(BindSchemaRequest {
-            scope: scope("legacy"),
+            scope: scope("local"),
             schema_ref: published.schema_ref,
             expected_generation: Some(0),
             expected_revision: Some(AuthzRevision(1)),
@@ -597,14 +639,14 @@ async fn released_untyped_receipts_do_not_become_a_transfer_side_plane() {
         .unwrap();
     repository
         .mutate_tuples(tuple_request(
-            "legacy",
-            "legacy-receipt",
+            "local",
+            "local-receipt",
             2,
             &[("one", "alice")],
         ))
         .unwrap();
     let aggregate = repository
-        .export_authz_realm(&scope("legacy"))
+        .export_authz_realm(&scope("local"))
         .unwrap()
         .unwrap();
     assert!(aggregate.mutation_stamp.is_none());
@@ -620,7 +662,7 @@ async fn released_untyped_receipts_do_not_become_a_transfer_side_plane() {
     assert_eq!(
         target
             .authz()
-            .realm_snapshot(&scope("legacy"), AuthzConsistency::Latest)
+            .realm_snapshot(&scope("local"), AuthzConsistency::Latest)
             .unwrap()
             .tuples,
         vec![tuple("one", "alice")]

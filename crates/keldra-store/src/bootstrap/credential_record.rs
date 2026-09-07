@@ -12,13 +12,19 @@ pub(crate) struct StoredApplicationCredential {
     pub(crate) storage_tenant: StorageTenantId,
     pub(crate) active: bool,
     pub(crate) verifier: StoredCredentialVerifier,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) sigv4_secret: Option<CredentialSecretEnvelope>,
 }
 
-/// KDF identity and costs are durable data so a later release can add an
-/// explicit migration branch without guessing which verifier produced a
-/// credential record.
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// KDF identity and costs are durable, self-describing verification data.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "algorithm", rename_all = "snake_case")]
 pub(crate) enum StoredCredentialVerifier {

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-pub const QUALIFICATION_SCHEMA: &str = "keldra.perf.osv_import.v3";
+pub const QUALIFICATION_SCHEMA: &str = "keldra.perf.osv_import.v1";
 pub const TARGET_SECONDS: f64 = 150.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
@@ -122,7 +122,7 @@ impl Default for SchemaShapeReport {
             snapshot_manifest_schema: "keldra.osv.snapshot-manifest.v1",
             source: "osv",
             bucket: "keldra-osv-qualification",
-            source_definition_path: "entities/source-definition/{sha256(source-definition\\0osv)}/current.json",
+            source_definition_path: "entities/source-definition/osv/current.json",
             shard_path: "shards/v1/{records_sha256[0..2]}/{records_sha256}.ndjson.zst",
             manifest_path: "snapshots/{snapshot_id}/manifest.json",
             shard_format: "keldra.osv.source-record.ndjson.v1",

@@ -18,14 +18,13 @@ use super::{
     AuthzRealmSchema, AuthzRepository, AuthzRevision, AuthzScope, AuthzStoreError, RealmBinding,
     STORED_TUPLE_RECEIPT_FORMAT, StorageTenantId, StoredSchema, StoredTuple, StoredTupleReceipt,
     binding_key, current_unix_millis, decode_json, encode_json, receipt_key, receipt_record_bytes,
-    schema_digest_key, schema_revision_key, storage_error, tenant_revision_key, tuple_key,
-    tuple_prefix, validate_binding, validate_stored_schema, validate_stored_tuple_receipt_shape,
+    schema_digest_key, schema_revision_key, storage_error, tuple_key, tuple_prefix,
+    validate_binding, validate_stored_schema, validate_stored_tuple_receipt_shape,
 };
-use crate::store::{
-    CF_AUTHZ_BINDINGS, CF_AUTHZ_RECEIPTS, CF_AUTHZ_SCHEMAS, CF_AUTHZ_TENANTS, CF_AUTHZ_TUPLES,
-};
+use crate::store::{CF_AUTHZ_BINDINGS, CF_AUTHZ_RECEIPTS, CF_AUTHZ_SCHEMAS, CF_AUTHZ_TUPLES};
 
 pub const AUTHZ_REALM_SNAPSHOT_FORMAT: u16 = 1;
+pub const AUTHZ_REALM_STATE_FORMAT: u16 = 1;
 pub const AUTHZ_REALM_TRANSFER_MANIFEST_FORMAT: u16 = 1;
 pub const MAX_AUTHZ_REALM_EXPORT_RECORDS: u32 = 1_000;
 pub const MAX_AUTHZ_REALM_EXPORT_BYTES: u64 = 64 * 1024 * 1024;
@@ -80,17 +79,17 @@ impl fmt::Debug for AuthzRealmCursor {
     }
 }
 
-/// One complete logical Zanzibar realm replica. Receipt mutations are the
-/// live, typed retry guarantees for this realm; released untyped 0.5.0
-/// receipts remain source-local until their bounded lifetime ends.
+/// One complete logical Zanzibar realm replica. Receipt mutations are bounded
+/// retry guarantees and do not participate in realm candidate identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthzRealmAggregate {
     pub format: u16,
     pub scope: AuthzScope,
     pub revision: AuthzRevision,
     pub binding: RealmBinding,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
     pub mutation_stamp: Option<AuthzRealmMutationStamp>,
-    pub aggregate_revision: Option<AuthzRevision>,
     pub schema: AuthzRealmSchema,
     pub tuples: Vec<Tuple>,
     pub receipts: Vec<AuthzRealmMutation>,
@@ -204,14 +203,53 @@ pub struct AuthzRealmKeyPage {
 /// Streamed bytes have no authority until the whole manifest is verified and
 /// the decoded aggregate is atomically installed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthzRealmTransferManifest {
     pub format: u16,
     pub scope: AuthzScope,
     pub revision: AuthzRevision,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
     pub predecessor_revision: Option<AuthzRevision>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
     pub mutation_fingerprint: Option<[u8; 32]>,
+    pub schema_ref: super::SchemaRef,
+    pub binding_generation: u64,
+    pub tuple_count: usize,
     pub encoded_bytes: u64,
     pub content_hash: [u8; 32],
+}
+
+/// O(1) quorum identity derived from the binding envelope written atomically
+/// with every realm mutation. Transfer length and hash deliberately remain
+/// separate: they are computed only when bytes cross the peer boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthzRealmState {
+    pub format: u16,
+    pub scope: AuthzScope,
+    pub revision: AuthzRevision,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    pub predecessor_revision: Option<AuthzRevision>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    pub mutation_fingerprint: Option<[u8; 32]>,
+    pub schema_ref: super::SchemaRef,
+    pub binding_generation: u64,
+    pub tuple_count: usize,
+}
+
+impl AuthzRealmTransferManifest {
+    pub fn state(&self) -> AuthzRealmState {
+        AuthzRealmState {
+            format: AUTHZ_REALM_STATE_FORMAT,
+            scope: self.scope.clone(),
+            revision: self.revision,
+            predecessor_revision: self.predecessor_revision,
+            mutation_fingerprint: self.mutation_fingerprint,
+            schema_ref: self.schema_ref.clone(),
+            binding_generation: self.binding_generation,
+            tuple_count: self.tuple_count,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +280,34 @@ pub enum AuthzRealmSnapshotError {
 }
 
 impl AuthzRepository {
+    pub fn authz_realm_state(
+        &self,
+        scope: &AuthzScope,
+    ) -> Result<Option<AuthzRealmState>, AuthzRealmSnapshotError> {
+        scope.validate().map_err(invalid_aggregate)?;
+        let Some(stored) =
+            self.read_json::<StoredRealmBinding>(CF_AUTHZ_BINDINGS, &binding_key(scope))?
+        else {
+            return Ok(None);
+        };
+        super::validate_stored_realm_binding(&stored, scope).map_err(invalid_aggregate)?;
+        let revision = stored.revision;
+        Ok(Some(AuthzRealmState {
+            format: AUTHZ_REALM_STATE_FORMAT,
+            scope: scope.clone(),
+            revision,
+            predecessor_revision: stored
+                .mutation_stamp
+                .and_then(|stamp| stamp.predecessor_revision),
+            mutation_fingerprint: stored
+                .mutation_stamp
+                .map(|stamp| stamp.mutation_fingerprint),
+            schema_ref: stored.binding.schema_ref,
+            binding_generation: stored.binding.generation,
+            tuple_count: stored.binding.tuple_count,
+        }))
+    }
+
     /// Reads one complete realm candidate for a quorum read. Reconciliation
     /// policy deliberately remains outside the storage kernel.
     pub fn export_authz_realm(
@@ -331,6 +397,9 @@ impl AuthzRepository {
             mutation_fingerprint: aggregate
                 .mutation_stamp
                 .map(|stamp| stamp.mutation_fingerprint),
+            schema_ref: aggregate.binding.schema_ref,
+            binding_generation: aggregate.binding.generation,
+            tuple_count: aggregate.binding.tuple_count,
             encoded_bytes,
             content_hash,
         }))
@@ -452,28 +521,8 @@ impl AuthzRepository {
         else {
             return Ok(None);
         };
-        validate_binding(&stored_binding.binding, scope).map_err(invalid_aggregate)?;
-        let revision = match (
-            stored_binding.aggregate_revision,
-            stored_binding.mutation_stamp,
-        ) {
-            (Some(revision), Some(_)) if revision != AuthzRevision::ZERO => revision,
-            (None, None) => snapshot_json::<AuthzRevision>(
-                snapshot,
-                self.cf(CF_AUTHZ_TENANTS)?,
-                &tenant_revision_key(&scope.storage_tenant),
-            )?
-            .ok_or_else(|| {
-                AuthzRealmSnapshotError::Store(AuthzStoreError::Storage(
-                    "authorization realm has no tenant revision".into(),
-                ))
-            })?,
-            _ => {
-                return Err(invalid_aggregate(
-                    "authorization realm lineage is inconsistent",
-                ));
-            }
-        };
+        super::validate_stored_realm_binding(&stored_binding, scope).map_err(invalid_aggregate)?;
+        let revision = stored_binding.revision;
         let stored_schema = snapshot_json::<StoredSchema>(
             snapshot,
             self.cf(CF_AUTHZ_SCHEMAS)?,
@@ -538,7 +587,6 @@ impl AuthzRepository {
             revision,
             binding: stored_binding.binding,
             mutation_stamp: stored_binding.mutation_stamp,
-            aggregate_revision: stored_binding.aggregate_revision,
             schema: AuthzRealmSchema {
                 schema_ref: stored_schema.schema_ref,
                 schema: stored_schema.schema,
@@ -690,9 +738,10 @@ impl AuthzRepository {
             self.cf(CF_AUTHZ_BINDINGS)?,
             binding_key(scope),
             encode_json(&StoredRealmBinding {
+                format: super::replication::STORED_REALM_BINDING_FORMAT,
                 binding: aggregate.binding.clone(),
                 mutation_stamp: aggregate.mutation_stamp,
-                aggregate_revision: aggregate.aggregate_revision,
+                revision: aggregate.revision,
             })?,
         );
         for tuple in &aggregate.tuples {
@@ -717,14 +766,13 @@ impl AuthzRepository {
 }
 
 fn validate_lineage(aggregate: &AuthzRealmAggregate) -> Result<(), AuthzRealmSnapshotError> {
-    match (aggregate.mutation_stamp, aggregate.aggregate_revision) {
-        (None, None) => Ok(()),
-        (Some(stamp), Some(revision))
+    match aggregate.mutation_stamp {
+        None => Ok(()),
+        Some(stamp)
             if stamp.format == AUTHZ_REALM_MUTATION_STAMP_FORMAT
-                && revision == aggregate.revision
-                && revision != AuthzRevision::ZERO
+                && stamp.mutation_fingerprint != [0; 32]
                 && stamp.predecessor_revision.is_none_or(|predecessor| {
-                    predecessor != AuthzRevision::ZERO && predecessor < revision
+                    predecessor != AuthzRevision::ZERO && predecessor < aggregate.revision
                 })
                 && stamp.serving_fence_term != 0
                 && stamp.source_id.node_id != 0
@@ -831,6 +879,9 @@ fn canonical_manifest(
         mutation_fingerprint: aggregate
             .mutation_stamp
             .map(|stamp| stamp.mutation_fingerprint),
+        schema_ref: aggregate.binding.schema_ref.clone(),
+        binding_generation: aggregate.binding.generation,
+        tuple_count: aggregate.binding.tuple_count,
         encoded_bytes,
         content_hash,
     })
@@ -841,6 +892,7 @@ fn validate_transfer_manifest(
 ) -> Result<(), AuthzRealmSnapshotError> {
     if manifest.format != AUTHZ_REALM_TRANSFER_MANIFEST_FORMAT
         || manifest.revision == AuthzRevision::ZERO
+        || manifest.binding_generation == 0
         || manifest.encoded_bytes == 0
     {
         return Err(transfer_integrity(
@@ -860,7 +912,8 @@ fn validate_transfer_manifest(
             ));
         }
     }
-    manifest.scope.validate().map_err(transfer_integrity)
+    manifest.scope.validate().map_err(transfer_integrity)?;
+    manifest.schema_ref.validate().map_err(transfer_integrity)
 }
 
 fn copy_exact_transfer<R: Read, W: Write>(

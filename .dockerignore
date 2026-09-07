@@ -13,4 +13,6 @@ keldra-data/
 docs/decisions/*.local.md
 clients/python/
 clients/typescript/
+**/__pycache__/
+**/*.py[cod]
 tmp/

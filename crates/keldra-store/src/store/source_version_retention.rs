@@ -4,7 +4,7 @@ use super::mutation_helpers::exact_version_key;
 use super::*;
 use crate::{ReferenceProof, ReferenceProofMutation};
 
-const STORED_VERSION_FORMAT: u16 = 3;
+const STORED_VERSION_FORMAT: u16 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

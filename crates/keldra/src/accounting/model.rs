@@ -1,8 +1,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use keldra_api::v1::{
-    AccountingDefinition as ApiDefinition, AccountingFreshness as ApiFreshness,
-    AccountingSnapshot as ApiSnapshot, AccountingSourceCheckpoint as ApiSourceCheckpoint,
+    AccountingByteMeasurement as ApiByteMeasurement,
+    AccountingCountMeasurement as ApiCountMeasurement, AccountingDefinition as ApiDefinition,
+    AccountingFreshness as ApiFreshness, AccountingLogicalUsage as ApiLogicalUsage,
+    AccountingMeasurementState, AccountingSnapshot as ApiSnapshot,
+    AccountingSourceCheckpoint as ApiSourceCheckpoint, AccountingTrafficUsage as ApiTrafficUsage,
 };
 use keldra_store::{LocalChange, ObjectKey, PlacementLogId, SourceId, VersionId};
 use prost_types::Timestamp;
@@ -12,8 +15,8 @@ use tonic::Status;
 use crate::index_runtime::events::IndexBarrier;
 
 const DEFINITION_FORMAT: u16 = 1;
-const ROLLUP_FORMAT: u16 = 2;
-const OUTBOUND_SOURCE_FORMAT: u16 = 2;
+const ROLLUP_FORMAT: u16 = 1;
+const OUTBOUND_SOURCE_FORMAT: u16 = 1;
 const MAX_TRAFFIC_FLUSH_ID_BYTES: usize = 256;
 const DEFINITION_PREFIX: &str = "_keldra/accounting/definitions/";
 const ACCOUNTING_ROOT: &str = "_keldra/accounting/";
@@ -91,17 +94,26 @@ pub(crate) struct StoredAccountingRollup {
     format: u16,
     pub(crate) accounting_id: u64,
     pub(crate) definition_version: u64,
-    pub(crate) logical_stored_bytes: u64,
-    pub(crate) object_count: u64,
+    pub(crate) billable_logical_bytes: u64,
+    pub(crate) retained_non_billable_logical_bytes: u64,
+    pub(crate) visible_file_count: u64,
     pub(crate) accepted_inbound_bytes: u64,
     pub(crate) served_outbound_bytes: u64,
     pub(crate) refreshed_at_unix_millis: u64,
     pub(crate) complete: bool,
     pub(crate) placement_fence: PlacementLogId,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) atomic_finalized_through: Option<u64>,
     pub(crate) sources: Vec<StoredSourceCheckpoint>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) traffic_sources: Vec<StoredTrafficCheckpoint>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 impl StoredAccountingRollup {
@@ -109,8 +121,9 @@ impl StoredAccountingRollup {
     pub(crate) fn new(
         accounting_id: u64,
         definition_version: u64,
-        logical_stored_bytes: u64,
-        object_count: u64,
+        billable_logical_bytes: u64,
+        retained_non_billable_logical_bytes: u64,
+        visible_file_count: u64,
         accepted_inbound_bytes: u64,
         served_outbound_bytes: u64,
         complete: bool,
@@ -126,8 +139,9 @@ impl StoredAccountingRollup {
             format: ROLLUP_FORMAT,
             accounting_id,
             definition_version,
-            logical_stored_bytes,
-            object_count,
+            billable_logical_bytes,
+            retained_non_billable_logical_bytes,
+            visible_file_count,
             accepted_inbound_bytes,
             served_outbound_bytes,
             refreshed_at_unix_millis: unix_millis(SystemTime::now())?,
@@ -239,24 +253,49 @@ impl StoredAccountingRollup {
         let refreshed_at = millis_timestamp(self.refreshed_at_unix_millis)?;
         Ok(ApiSnapshot {
             definition: Some(definition.to_api(definition_version)?),
-            logical_stored_bytes: self.logical_stored_bytes,
-            object_count: self.object_count,
-            accepted_inbound_bytes: self.accepted_inbound_bytes,
-            served_outbound_bytes: self.served_outbound_bytes,
-            freshness: Some(ApiFreshness {
-                refreshed_at: Some(refreshed_at),
-                sources: self
-                    .sources
-                    .iter()
-                    .map(|source| ApiSourceCheckpoint {
-                        node_id: source.node_id,
-                        source_epoch: source.source.source_epoch.to_vec(),
-                        through_offset: source.through_offset,
-                    })
-                    .collect(),
-                complete: self.complete,
+            logical: Some(ApiLogicalUsage {
+                billable_logical_bytes: Some(present_bytes(self.billable_logical_bytes)),
+                retained_non_billable_logical_bytes: Some(present_bytes(
+                    self.retained_non_billable_logical_bytes,
+                )),
+                visible_file_count: Some(present_count(self.visible_file_count)),
+                freshness: Some(ApiFreshness {
+                    refreshed_at: Some(refreshed_at),
+                    sources: self
+                        .sources
+                        .iter()
+                        .map(|source| ApiSourceCheckpoint {
+                            node_id: source.node_id,
+                            source_epoch: source.source.source_epoch.to_vec(),
+                            through_offset: source.through_offset,
+                        })
+                        .collect(),
+                    complete: self.complete,
+                }),
+            }),
+            traffic: Some(ApiTrafficUsage {
+                accepted_inbound_bytes: self.accepted_inbound_bytes,
+                served_outbound_bytes: self.served_outbound_bytes,
+            }),
+            tenant_physical_bytes: Some(ApiByteMeasurement {
+                state: AccountingMeasurementState::Unsupported.into(),
+                bytes: 0,
             }),
         })
+    }
+}
+
+fn present_bytes(bytes: u64) -> ApiByteMeasurement {
+    ApiByteMeasurement {
+        state: AccountingMeasurementState::Present.into(),
+        bytes,
+    }
+}
+
+fn present_count(count: u64) -> ApiCountMeasurement {
+    ApiCountMeasurement {
+        state: AccountingMeasurementState::Present.into(),
+        count,
     }
 }
 
@@ -378,10 +417,6 @@ pub(crate) fn outbound_source_path(accounting_id: u64, node_id: u64) -> Result<S
     })
 }
 
-pub(crate) fn definition_id_from_path(path: &str) -> Option<u64> {
-    canonical_id(path.strip_prefix(DEFINITION_PREFIX)?)
-}
-
 pub(crate) fn is_artifact_path(path: &str, expected_id: u64) -> bool {
     definition_path(expected_id).ok().as_deref() == Some(path)
         || current_path(expected_id).ok().as_deref() == Some(path)
@@ -404,17 +439,19 @@ pub(crate) fn is_accounting_path(path: &str) -> bool {
     path == "_keldra/accounting" || path.starts_with("_keldra/accounting/")
 }
 
-/// Select object changes which can alter an accounting rollup. Ordinary source
-/// objects and per-node traffic sources are inputs; definitions and published
-/// rollups are not, so publishing a rollup cannot recursively wake itself.
+/// Select logical object and delayed reference-retirement changes which can
+/// alter an accounting rollup. Rollup publication remains excluded so an
+/// accounting worker cannot recursively wake itself.
 pub(crate) fn is_accounting_source_change(change: &LocalChange) -> bool {
     let path = match change {
         LocalChange::ObjectHead(change) => &change.exact_path,
         LocalChange::RetainedVersionDeleted(change) => &change.exact_path,
-        LocalChange::ContentLifecycleChanged(change) => match &change.accounting_transition {
-            Some(transition) => &transition.exact_path,
-            None => return false,
-        },
+        LocalChange::ContentLifecycleChanged(change) => {
+            let Some(transition) = change.accounting_transition.as_ref() else {
+                return false;
+            };
+            &transition.exact_path
+        }
         _ => return false,
     };
     !is_accounting_path(path) || is_outbound_source_path(path)
@@ -538,5 +575,39 @@ mod tests {
         );
         assert!(StoredTrafficSource::new(7, 3, 2, 10, 20, String::new()).is_err());
         assert!(StoredTrafficSource::new(7, 3, 2, 10, 20, "bad\0id".into()).is_err());
+    }
+
+    #[test]
+    fn rollup_v1_requires_the_separated_logical_categories() {
+        let separated = serde_json::json!({
+            "format": 1,
+            "accounting_id": 7,
+            "definition_version": 2,
+            "billable_logical_bytes": 11,
+            "retained_non_billable_logical_bytes": 3,
+            "visible_file_count": 2,
+            "accepted_inbound_bytes": 13,
+            "served_outbound_bytes": 5,
+            "refreshed_at_unix_millis": 1,
+            "complete": true,
+            "placement_fence": {"term": 1, "index": 1},
+            "atomic_finalized_through": null,
+            "sources": [],
+            "traffic_sources": [],
+        });
+        let rollup = StoredAccountingRollup::decode(&serde_json::to_vec(&separated).unwrap())
+            .expect("separated v1 rollup must decode");
+        assert_eq!(rollup.billable_logical_bytes, 11);
+        assert_eq!(rollup.retained_non_billable_logical_bytes, 3);
+        assert_eq!(rollup.visible_file_count, 2);
+
+        let mut obsolete = separated;
+        let object = obsolete.as_object_mut().unwrap();
+        object.remove("billable_logical_bytes");
+        object.remove("retained_non_billable_logical_bytes");
+        object.remove("visible_file_count");
+        object.insert("logical_stored_bytes".into(), 14.into());
+        object.insert("object_count".into(), 2.into());
+        assert!(StoredAccountingRollup::decode(&serde_json::to_vec(&obsolete).unwrap()).is_err());
     }
 }

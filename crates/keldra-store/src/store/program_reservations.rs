@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
     PlacementLogId, ProgramAliasRegistryCondition, ProgramGovernanceReservation,
-    ProgramPathCondition, ProgramPathReservation, ProgramReservation, ProgramReservationState,
+    ProgramPathCondition, ProgramPathReservation, ProgramPathStage, ProgramReservation,
+    ProgramReservationState,
 };
 use keldra_atomic_program::ObservedHead;
 
@@ -94,11 +95,6 @@ impl Store {
             &reservation.participant.path.path,
         )
         .map_err(|error| MutationError::InvalidObjectMutation(error.to_string()))?;
-        if self.resolve_bucket_identity(key.tenant(), key.bucket())? != identity {
-            return Err(MutationError::InvalidObjectMutation(
-                "atomic participant stable bucket identity does not match its path".into(),
-            ));
-        }
         let _path_guard = self
             .ordinary_locks
             .acquire(&[reservation.participant.path.clone()])
@@ -120,9 +116,6 @@ impl Store {
             }
             return Ok(());
         }
-        let policy = self
-            .bucket_policy_by_key(&identity.encode())?
-            .unwrap_or_default();
         if matches!(
             reservation.authority,
             crate::ProgramBundleAuthority::StoredProgram { .. }
@@ -132,7 +125,7 @@ impl Store {
                 "stored atomic program cannot address a reserved internal path".into(),
             ));
         }
-        if policy.is_immutable(key.path())
+        if reservation.governance.policy.is_immutable(key.path())
             && (reservation.participant.intent.delete
                 || (reservation.participant.intent.put
                     && !matches!(
@@ -179,15 +172,6 @@ impl Store {
         )
         .map_err(MutationError::InvalidPolicy)?;
         let identity = governance_identity(reservation);
-        if self.resolve_bucket_identity(
-            &reservation.participant.tenant,
-            &reservation.participant.bucket,
-        )? != identity
-        {
-            return Err(MutationError::InvalidPolicy(
-                "atomic governance stable bucket identity does not match its name".into(),
-            ));
-        }
         let _policy_guard = self.policy_gate.read().await;
         let _path_guard = self.ordinary_locks.acquire(&[path]).await;
         let _commit_guard = self.lock_commit("atomic_governance_reservation").await;
@@ -401,6 +385,60 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn require_committed_program_path_stage_reservation_locked(
+        &self,
+        stage: &ProgramPathStage,
+        commit_cursor: u64,
+        nomination_log_index: u64,
+        placement: PlacementLogId,
+    ) -> Result<(), MutationError> {
+        let identity = BucketIdentity {
+            tenant_id: TenantId(stage.tenant_id),
+            bucket_id: BucketId(stage.bucket_id),
+        };
+        let key = object_reservation_key(identity, &stage.path.path);
+        let reservation = self
+            .read_json::<ProgramPathReservation>(CF_METADATA, &key)?
+            .ok_or(MutationError::AtomicReservationConflict {
+                begin_cursor: stage.begin_cursor,
+            })?;
+        let condition_matches = reservation.participant.condition.observed_head().as_ref()
+            == Some(&stage.expected)
+            && reservation
+                .participant
+                .condition
+                .head_version()
+                .is_none_or(|expected| stage.previous_version.as_ref() == Some(expected));
+        let write_intent_matches = if stage.version.deleted {
+            reservation.participant.intent.delete
+        } else {
+            reservation.participant.intent.put
+        };
+        if reservation.begin_cursor != stage.begin_cursor
+            || reservation.bundle_hash != stage.bundle_hash.0
+            || reservation.participant_manifest_hash != stage.participant_manifest_hash
+            || reservation.authority != stage.authority
+            || reservation.nomination_log_index != nomination_log_index
+            || reservation.placement != placement
+            || reservation.participant.tenant_id != stage.tenant_id
+            || reservation.participant.bucket_id != stage.bucket_id
+            || reservation.participant.path != stage.path
+            || !condition_matches
+            || !write_intent_matches
+            || reservation.governance != stage.governance
+            || !matches!(
+                reservation.state,
+                ProgramReservationState::Committed { commit_cursor: stored }
+                    if stored == commit_cursor
+            )
+        {
+            return Err(MutationError::AtomicReservationConflict {
+                begin_cursor: reservation.begin_cursor,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn require_unreserved_governance_locked(
         &self,
         identity: BucketIdentity,
@@ -556,6 +594,10 @@ fn validate_path_reservation(reservation: &ProgramPathReservation) -> Result<(),
         || reservation.placement.index == 0
         || reservation.participant.tenant_id == 0
         || reservation.participant.bucket_id == 0
+        || reservation.governance.tenant != reservation.participant.path.tenant
+        || reservation.governance.bucket != reservation.participant.path.bucket
+        || reservation.governance.tenant_id != reservation.participant.tenant_id
+        || reservation.governance.bucket_id != reservation.participant.bucket_id
     {
         return Err(MutationError::InvalidObjectMutation(
             "atomic path reservation is malformed".into(),
@@ -563,8 +605,9 @@ fn validate_path_reservation(reservation: &ProgramPathReservation) -> Result<(),
     }
     reservation
         .authority
-        .validate(false)
-        .map_err(|message| MutationError::InvalidObjectMutation(message.into()))
+        .validate()
+        .map_err(|message| MutationError::InvalidObjectMutation(message.into()))?;
+    reservation.governance.policy.validate()
 }
 
 fn validate_governance_reservation(
@@ -579,6 +622,10 @@ fn validate_governance_reservation(
         || reservation.nomination_log_index == 0
         || reservation.placement.term == 0
         || reservation.placement.index == 0
+        || reservation.participant.tenant.is_empty()
+        || reservation.participant.bucket.is_empty()
+        || reservation.participant.tenant_id == 0
+        || reservation.participant.bucket_id == 0
     {
         return Err(MutationError::InvalidObjectMutation(
             "atomic governance reservation is malformed".into(),
@@ -586,8 +633,9 @@ fn validate_governance_reservation(
     }
     reservation
         .authority
-        .validate(false)
-        .map_err(|message| MutationError::InvalidObjectMutation(message.into()))
+        .validate()
+        .map_err(|message| MutationError::InvalidObjectMutation(message.into()))?;
+    reservation.participant.policy.validate()
 }
 
 fn require_refreshable_path_reservation(
@@ -600,6 +648,7 @@ fn require_refreshable_path_reservation(
         || existing.participant_manifest_hash != requested.participant_manifest_hash
         || existing.authority != requested.authority
         || existing.participant != requested.participant
+        || existing.governance != requested.governance
         || existing.placement != requested.placement
         || !matches!(requested.state, ProgramReservationState::Prepared)
     {
@@ -685,6 +734,7 @@ fn require_exact_path_reservation_fence(
         || existing.nomination_log_index != expected.nomination_log_index
         || existing.placement != expected.placement
         || existing.participant != expected.participant
+        || existing.governance != expected.governance
     {
         return Err(MutationError::AtomicReservationConflict {
             begin_cursor: existing.begin_cursor,

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${script_root}/qualification-disk-ledger.sh"
+
 # Destructive experiment state is deliberately confined to this one removable
 # directory on the qualification host.
 experiment_root="${HOME}/keldra_experiments"
-kit_root="${experiment_root}/kit"
+kit_root="${KELDRA_CATALOG_KIT_ROOT:-${experiment_root}/kit}"
 results_root="${experiment_root}/results"
 work_root="${experiment_root}/work"
 definitions="${KELDRA_CATALOG_DEFINITIONS:-250000}"
@@ -12,6 +15,8 @@ concurrency="${KELDRA_CATALOG_CONCURRENCY:-64}"
 port="${KELDRA_CATALOG_PORT:-50051}"
 indexing_cores="${KELDRA_CATALOG_INDEXING_CORES:-4}"
 pipeline_memory_bytes="${KELDRA_CATALOG_PIPELINE_MEMORY_BYTES:-1073741824}"
+disk_budget_bytes="${KELDRA_CATALOG_DISK_BUDGET_BYTES:-53687091200}"
+keep_work="${KELDRA_CATALOG_KEEP_WORK:-0}"
 # Per-request INFO emits several lines per definition and would both distort a
 # rotational-disk catalogue run and create multi-gigabyte evidence logs.
 server_rust_log="${KELDRA_CATALOG_RUST_LOG:-warn}"
@@ -43,7 +48,7 @@ done
 mkdir -p "${results_root}" "${work_root}"
 chmod 0700 "${experiment_root}" "${results_root}" "${work_root}"
 exec 9>"${experiment_root}/run.lock"
-flock -n 9 || { echo "another Keldra experiment is running" >&2; exit 2; }
+flock 9
 ulimit -n 65536
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$(hostname -s)-catalog-${server_source_commit:0:12}"
@@ -53,6 +58,8 @@ mkdir -p "${run_dir}" "${cell_work}/state" "${cell_work}/metadata" \
   "${cell_work}/wal" "${cell_work}/payload" "${cell_work}/scratch" \
   "${cell_work}/cache" "${cell_work}/tmp"
 chmod -R 0700 "${run_dir}" "${cell_work}"
+qualification_disk_ledger_init "${run_id}" "${cell_work}" "${disk_budget_bytes}" "${run_dir}/disk-ledger.jsonl"
+qualification_disk_ledger_add_root "${run_dir}"
 ln -sfn "${run_id}" "${results_root}/latest"
 dd if=/dev/urandom of="${cell_work}/token-signing-key" bs=64 count=1 status=none
 chmod 0600 "${cell_work}/token-signing-key"
@@ -103,6 +110,18 @@ on_exit() {
   trap - EXIT INT TERM
   stop_server
   printf '%s\n' "${status}" >"${run_dir}/runner-exit-status"
+  if [[ "${keep_work}" == 0 && -d "${cell_work}" ]]; then
+    canonical_work="$(readlink -f "${cell_work}")"
+    canonical_root="$(readlink -f "${work_root}")"
+    case "${canonical_work}" in
+      "${canonical_root}"/*)
+        qualification_disk_ledger_event cleanup catalog-work "${canonical_work}"
+        rm -rf -- "${canonical_work}"
+        ;;
+      *) echo "refusing to clean catalog work outside ${canonical_root}" >&2; status=1 ;;
+    esac
+  fi
+  qualification_disk_ledger_finish "exit-${status}"
   exit "${status}"
 }
 trap on_exit EXIT INT TERM
@@ -171,6 +190,7 @@ run_catalog_phase() {
 } >"${run_dir}/host-info.txt"
 
 start_server initial true
+qualification_disk_ledger_check
 for _ in $(seq 1 180); do [[ -s "${credential_file}" ]] && break; sleep 1; done
 [[ -s "${credential_file}" ]] || { echo "bootstrap credentials were not produced" >&2; exit 1; }
 KELDRA_NEW_CLIENT_SECRET="${client_secret}" "${kit_root}/bin/keldra" \
@@ -186,6 +206,7 @@ run_catalog_phase create "${run_dir}/create-report.json" \
   "${run_dir}/create.stdout.log" "${run_dir}/create.stderr.log"
 ps -o pid,%cpu,rss,nlwp,etime -p "${server_pid}" >"${run_dir}/before-restart-process.txt"
 stop_server
+qualification_disk_ledger_check
 
 start_server restarted false
 run_catalog_phase verify "${run_dir}/verify-report.json" \
@@ -199,7 +220,10 @@ jq -n --slurpfile create "${run_dir}/create-report.json" \
   '{schema:"keldra.catalog-scale-run.v1",server_source_commit:$server,catalog_harness_commit:$harness,create:$create[0],verify:$verify[0]}' \
   >"${run_dir}/report.json"
 printf '0\n' >"${run_dir}/overall-status"
-tar -C "${results_root}" -czf "${results_root}/${run_id}.results.tar.gz" "${run_id}"
-sha256sum "${results_root}/${run_id}.results.tar.gz" >"${results_root}/${run_id}.results.tar.gz.sha256"
+archive_path="${results_root}/${run_id}.results.tar.gz"
+tar -C "${results_root}" -czf "${archive_path}" "${run_id}"
+qualification_disk_ledger_add_root "${archive_path}"
+qualification_disk_ledger_check
+sha256sum "${archive_path}" >"${archive_path}.sha256"
 echo "results=${run_dir}"
-echo "archive=${results_root}/${run_id}.results.tar.gz"
+echo "archive=${archive_path}"

@@ -38,9 +38,11 @@ use tonic::{
 
 mod config;
 mod exclusive_tasks;
+mod shard_compression;
 
 use config::*;
 use exclusive_tasks::{ExclusiveTasks, connect_object_clients};
+use shard_compression::ShardCompressor;
 
 const OSV_QUALIFICATION_BUCKET: &str = "keldra-osv-qualification";
 const DEFAULT_SOURCE_URL: &str = "https://osv-vulnerabilities.storage.googleapis.com/all.zip";
@@ -215,12 +217,8 @@ struct OsvSourceRecord {
     schema: String,
     source_id: String,
     source_record_id: String,
-    record_identity_hash: String,
-    content_sha256: String,
     ecosystem: String,
     package: String,
-    normalised_ecosystem: String,
-    normalised_package: String,
     modified_at: Option<String>,
     modified_day: String,
     published_at: Option<String>,
@@ -266,9 +264,8 @@ struct OsvSourceRecordContent<'a> {
     source_record_id: &'a str,
     ecosystem: &'a str,
     package: &'a str,
-    normalised_ecosystem: &'a str,
-    normalised_package: &'a str,
     modified_at: &'a Option<String>,
+    modified_day: &'a str,
     published_at: &'a Option<String>,
     withdrawn: bool,
     aliases: &'a [String],
@@ -281,7 +278,7 @@ struct OsvSourceRecordContent<'a> {
 #[derive(Debug, PartialEq, Eq)]
 struct PreparedRecord {
     encoded: Vec<u8>,
-    normalised_ecosystem: String,
+    ecosystem: String,
     modified_day: String,
 }
 
@@ -389,7 +386,6 @@ struct PreparedShard {
     partition: String,
     shard_index: u64,
     records_sha256: String,
-    encoded_sha256: String,
     source_record_count: u64,
     uncompressed_bytes: u64,
     encoded_payload: Vec<u8>,
@@ -405,7 +401,7 @@ struct OsvShardRef {
     object_key: String,
     version_id: String,
     records_sha256: String,
-    encoded_sha256: String,
+    content_blake3: String,
     source_record_count: u64,
     uncompressed_bytes: u64,
     encoded_bytes: u64,
@@ -421,8 +417,7 @@ struct OsvSnapshotManifest {
     snapshot_id: String,
     snapshot_day: String,
     partition: String,
-    content_digest: String,
-    input_sha256: String,
+    corpus_sha256: String,
     format: String,
     compression: String,
     source_record_count: u64,
@@ -444,7 +439,6 @@ struct PreparedShardDescriptor {
     partition: String,
     shard_index: u64,
     records_sha256: String,
-    encoded_sha256: String,
     source_record_count: u64,
     uncompressed_bytes: u64,
     ecosystems: Vec<String>,
@@ -458,6 +452,15 @@ struct PreparedObject {
     payload: Vec<u8>,
     content_type: &'static str,
     command_id: String,
+    kind: PreparedObjectKind,
+}
+
+#[derive(Debug)]
+struct PendingObjectReceipt {
+    path: String,
+    content_length: u64,
+    content_type: &'static str,
+    content_blake3: [u8; 32],
     kind: PreparedObjectKind,
 }
 
@@ -535,7 +538,7 @@ impl ShardBuilder {
         self.payload.extend_from_slice(&prepared.encoded);
         self.payload.push(b'\n');
         self.source_record_count += 1;
-        self.ecosystems.insert(prepared.normalised_ecosystem);
+        self.ecosystems.insert(prepared.ecosystem);
         update_min(&mut self.modified_day_min, &prepared.modified_day);
         update_max(&mut self.modified_day_max, &prepared.modified_day);
     }
@@ -543,12 +546,10 @@ impl ShardBuilder {
     fn finish(self) -> Result<PreparedShard> {
         let records_sha256 = digest_bytes(&self.payload);
         let encoded_payload = zstd::stream::encode_all(Cursor::new(&self.payload), 6)?;
-        let encoded_sha256 = digest_bytes(&encoded_payload);
         Ok(PreparedShard {
             partition: self.partition,
             shard_index: self.shard_index,
             records_sha256,
-            encoded_sha256,
             source_record_count: self.source_record_count,
             uncompressed_bytes: self.payload.len() as u64,
             encoded_payload,
@@ -556,90 +557,6 @@ impl ShardBuilder {
             modified_day_min: self.modified_day_min.unwrap_or_else(|| "unknown".into()),
             modified_day_max: self.modified_day_max.unwrap_or_else(|| "unknown".into()),
         })
-    }
-}
-
-struct ShardCompressor {
-    worker_count: usize,
-    output: mpsc::Sender<PreparedShard>,
-    pending: Vec<thread::JoinHandle<Result<PreparedShard>>>,
-    next_job_index: u64,
-}
-
-impl ShardCompressor {
-    fn start(worker_count: usize, output: mpsc::Sender<PreparedShard>) -> Result<Self> {
-        ensure!(
-            worker_count > 0,
-            "shard compression requires at least one worker"
-        );
-        Ok(Self {
-            worker_count,
-            output,
-            pending: Vec::with_capacity(worker_count),
-            next_job_index: 0,
-        })
-    }
-
-    fn submit(&mut self, builder: ShardBuilder) -> Result<()> {
-        let job_index = self.next_job_index;
-        self.next_job_index += 1;
-        let worker = match thread::Builder::new()
-            .name(format!("osv-shard-compressor-{job_index}"))
-            .spawn(move || builder.finish().context("compress OSV shard"))
-        {
-            Ok(worker) => worker,
-            Err(error) => {
-                // Existing jobs precede this one, so join the entire wave and
-                // return their first input-order error before the spawn error.
-                self.join_wave()?;
-                return Err(error).context("start OSV shard compression worker");
-            }
-        };
-        self.pending.push(worker);
-        if self.pending.len() == self.worker_count {
-            self.flush_wave()?;
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<()> {
-        self.flush_wave()
-    }
-
-    fn flush_wave(&mut self) -> Result<()> {
-        let shards = self.join_wave()?;
-        for shard in shards {
-            self.output.blocking_send(shard).map_err(|_| {
-                anyhow::anyhow!("OSV shard consumer stopped before parsing completed")
-            })?;
-        }
-        Ok(())
-    }
-
-    fn join_wave(&mut self) -> Result<Vec<PreparedShard>> {
-        let workers = std::mem::take(&mut self.pending);
-        let mut shards = Vec::with_capacity(workers.len());
-        let mut first_error = None;
-        for worker in workers {
-            match worker.join() {
-                Ok(Ok(shard)) => shards.push(shard),
-                Ok(Err(error)) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
-                Err(_) => {
-                    if first_error.is_none() {
-                        first_error =
-                            Some(anyhow::anyhow!("OSV shard compression worker panicked"));
-                    }
-                }
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(shards),
-        }
     }
 }
 
@@ -705,10 +622,8 @@ async fn main() -> Result<()> {
     });
 
     let manifest = snapshot_manifest(&config, parsing.normalised_source_records, data.shards);
-    // Derive the manifest mutation identity from the typed struct, while the
-    // immutable JSON storage helper serializes through serde_json::Value.
-    let manifest_sha256 = digest_bytes(&serde_json::to_vec(&manifest)?);
     let manifest_payload = immutable_json_payload(&manifest)?;
+    let manifest_sha256 = digest_bytes(&manifest_payload);
     let manifest_result = send_batch(
         client.clone(),
         config.auth.clone(),
@@ -1056,27 +971,42 @@ async fn send_batch(
         total.checked_add(object.payload.len() as u64)
     });
     let payload_bytes = payload_bytes.context("BulkWrite payload byte count overflowed")?;
-    let expected_commands = objects
-        .iter()
-        .map(|object| object.command_id.clone())
-        .collect::<Vec<_>>();
-    let operations = objects
-        .iter()
-        .map(|object| BulkOperation {
+    let mut expected_commands = Vec::with_capacity(objects.len());
+    let mut pending_receipts = Vec::with_capacity(objects.len());
+    let mut operations = Vec::with_capacity(objects.len());
+    for object in objects {
+        let PreparedObject {
+            path,
+            payload,
+            content_type,
+            command_id,
+            kind,
+        } = object;
+        let content_length = payload.len() as u64;
+        let content_blake3 = *blake3::hash(&payload).as_bytes();
+        operations.push(BulkOperation {
             operation: Some(bulk_operation::Operation::PutImmutable(BulkPutRequest {
-                address: Some(address(&tenant, &bucket, &object.path)),
-                bytes: object.payload.clone(),
-                content_type: object.content_type.into(),
-                command_id: object.command_id.clone(),
+                address: Some(address(&tenant, &bucket, &path)),
+                bytes: payload,
+                content_type: content_type.into(),
+                command_id: command_id.clone(),
                 durability,
             })),
-        })
-        .collect();
+        });
+        expected_commands.push(command_id.clone());
+        pending_receipts.push(PendingObjectReceipt {
+            path,
+            content_length,
+            content_type,
+            content_blake3,
+            kind,
+        });
+    }
     let request_message = BulkWriteRequest { operations };
+    let encoded_len = request_message.encoded_len();
     ensure!(
-        request_message.encoded_len() <= SERVER_MAX_BULK_ENCODED_BYTES,
-        "BulkWrite protobuf encoding is {} bytes, exceeding the server limit {SERVER_MAX_BULK_ENCODED_BYTES}; lower --batch-size or --maximum-batch-payload-bytes",
-        request_message.encoded_len()
+        encoded_len <= SERVER_MAX_BULK_ENCODED_BYTES,
+        "BulkWrite protobuf encoding is {encoded_len} bytes, exceeding the server limit {SERVER_MAX_BULK_ENCODED_BYTES}; lower --batch-size or --maximum-batch-payload-bytes"
     );
     let started = Instant::now();
     let response = client
@@ -1086,13 +1016,12 @@ async fn send_batch(
         .into_inner();
     let latency = started.elapsed();
     let receipts = ordered_receipts(response.outcomes, &expected_commands)?;
-    let objects = objects
+    let objects = pending_receipts
         .into_iter()
         .zip(receipts)
         .map(|(object, receipt)| {
             ensure!(receipt.version > 0, "BulkWrite receipt omitted its version");
-            let content_blake3 = *blake3::hash(&object.payload).as_bytes();
-            let encoded_bytes = object.payload.len() as u64;
+            let encoded_bytes = object.content_length;
             let kind = match object.kind {
                 PreparedObjectKind::SourceDefinition => StoredObjectKind::SourceDefinition,
                 PreparedObjectKind::Manifest => StoredObjectKind::Manifest,
@@ -1102,7 +1031,7 @@ async fn send_batch(
                     object_key: object.path.clone(),
                     version_id: receipt.version.to_string(),
                     records_sha256: shard.records_sha256,
-                    encoded_sha256: shard.encoded_sha256,
+                    content_blake3: hex::encode(object.content_blake3),
                     source_record_count: shard.source_record_count,
                     uncompressed_bytes: shard.uncompressed_bytes,
                     encoded_bytes,
@@ -1117,7 +1046,7 @@ async fn send_batch(
                     version: receipt.version,
                     content_length: encoded_bytes,
                     content_type: object.content_type,
-                    content_blake3,
+                    content_blake3: object.content_blake3,
                 },
                 kind,
                 replayed: receipt.replayed,
@@ -1198,9 +1127,8 @@ fn source_definition_object(config: &RuntimeConfig) -> Result<PreparedObject> {
         redistribution_policy: "record-level-upstream-rights".into(),
         enabled: true,
     };
-    // Keep mutation identity and immutable payload serialization as distinct boundaries.
-    let content_sha256 = digest_bytes(&serde_json::to_vec(&definition)?);
     let payload = immutable_json_payload(&definition)?;
+    let content_sha256 = digest_bytes(&payload);
     Ok(PreparedObject {
         path: source_definition_path(),
         payload,
@@ -1211,10 +1139,6 @@ fn source_definition_object(config: &RuntimeConfig) -> Result<PreparedObject> {
 }
 
 fn shard_object(config: &RuntimeConfig, shard: PreparedShard) -> Result<PreparedObject> {
-    ensure!(
-        digest_bytes(&shard.encoded_payload) == shard.encoded_sha256,
-        "encoded shard digest changed before persistence"
-    );
     let path = shard_path(&shard.records_sha256);
     Ok(PreparedObject {
         path,
@@ -1225,7 +1149,6 @@ fn shard_object(config: &RuntimeConfig, shard: PreparedShard) -> Result<Prepared
             partition: shard.partition,
             shard_index: shard.shard_index,
             records_sha256: shard.records_sha256,
-            encoded_sha256: shard.encoded_sha256,
             source_record_count: shard.source_record_count,
             uncompressed_bytes: shard.uncompressed_bytes,
             ecosystems: shard.ecosystems,
@@ -1250,8 +1173,7 @@ fn snapshot_manifest(
         snapshot_id: config.snapshot_id.clone(),
         snapshot_day: config.snapshot_day.clone(),
         partition: "manifest".into(),
-        content_digest: config.corpus_sha256.clone(),
-        input_sha256: config.corpus_sha256.clone(),
+        corpus_sha256: config.corpus_sha256.clone(),
         format: "keldra.osv.source-record.ndjson.v1".into(),
         compression: "zstd-6".into(),
         source_record_count,
@@ -1453,8 +1375,6 @@ where
         }
         Ok(timings)
     })();
-    // A failed consumer must wake any worker blocked on its capacity-one
-    // result channel before we join it.
     drop(receivers);
     let joining = join_archive_workers(workers);
     match (consuming, joining) {
@@ -1559,7 +1479,7 @@ fn push_record_into_shards(
     builders: &mut BTreeMap<String, ShardBuilder>,
     next_indices: &mut BTreeMap<String, u64>,
 ) -> Result<()> {
-    let partition = storage_partition(&prepared.normalised_ecosystem).to_string();
+    let partition = storage_partition(&prepared.ecosystem).to_string();
     if builders
         .get(&partition)
         .is_some_and(|builder| builder.would_exceed(prepared.encoded.len() + 1, target_bytes))
@@ -1628,10 +1548,10 @@ fn prepare_record_jobs(mut document: Value) -> Result<PreparedRecordJobs> {
     })
 }
 
-fn package_identity(affected: &Value) -> Option<(String, String)> {
+fn package_identity(affected: &Value) -> Option<(&str, &str)> {
     let package = affected.get("package")?.as_object()?;
-    let ecosystem = package.get("ecosystem")?.as_str()?.trim().to_string();
-    let name = package.get("name")?.as_str()?.trim().to_string();
+    let ecosystem = package.get("ecosystem")?.as_str()?.trim();
+    let name = package.get("name")?.as_str()?.trim();
     if ecosystem.is_empty() || name.is_empty() {
         return None;
     }
@@ -1645,7 +1565,7 @@ fn canonical_package_identity(affected: &Value) -> Option<(String, String)> {
         "cargo" | "crates.io" => "crates.io".to_string(),
         _ => lower_ecosystem,
     };
-    let canonical_package = normalize_package_name(&ecosystem, &package);
+    let canonical_package = normalize_package_name(ecosystem, package);
     Some((canonical_ecosystem, canonical_package))
 }
 
@@ -1682,15 +1602,6 @@ fn prepare_record(
         "OSV base document still contains affected"
     );
     let scoped_document = ScopedDocument { base, affected };
-    let normalised_ecosystem = ecosystem.trim().to_ascii_lowercase();
-    let normalised_package = normalize_package_name(ecosystem, package);
-    let record_identity_hash = digest_bytes(
-        format!(
-            "osv\0{}\0{normalised_ecosystem}\0{normalised_package}",
-            source_record_id
-        )
-        .as_bytes(),
-    );
     let modified_at = string_field(document, "modified");
     let modified_day = timestamp_day(modified_at.as_deref());
     let published_at = string_field(document, "published");
@@ -1701,15 +1612,14 @@ fn prepare_record(
     let summary = string_field(document, "summary");
     let details = string_field(document, "details");
     let state = if withdrawn { "withdrawn" } else { "active" };
-    let content = serde_json::to_vec(&OsvSourceRecordContent {
+    let encoded = serde_json::to_vec(&OsvSourceRecordContent {
         schema: "keldra.osv.source-record.v1",
         source_id: "osv",
         source_record_id,
         ecosystem,
         package,
-        normalised_ecosystem: &normalised_ecosystem,
-        normalised_package: &normalised_package,
         modified_at: &modified_at,
+        modified_day: &modified_day,
         published_at: &published_at,
         withdrawn,
         aliases: &aliases,
@@ -1718,69 +1628,17 @@ fn prepare_record(
         state,
         document: scoped_document,
     })?;
-    let content_sha256 = digest_bytes(&content);
-    let encoded = encode_final_record(
-        &content,
-        &record_identity_hash,
-        &content_sha256,
-        &modified_day,
-    )?;
     Ok(PreparedRecord {
         encoded,
-        normalised_ecosystem,
+        ecosystem: ecosystem.clone(),
         modified_day,
     })
 }
-
-fn encode_final_record(
-    content: &[u8],
-    record_identity_hash: &str,
-    content_sha256: &str,
-    modified_day: &str,
-) -> Result<Vec<u8>> {
-    const ECOSYSTEM_FIELD: &[u8] = b",\"ecosystem\":";
-    const PUBLISHED_AT_FIELD: &[u8] = b",\"published_at\":";
-
-    let identity_offset = find_bytes(content, ECOSYSTEM_FIELD)
-        .context("encoded OSV content has no ecosystem field boundary")?;
-    let modified_day_offset = identity_offset
-        + find_bytes(&content[identity_offset..], PUBLISHED_AT_FIELD)
-            .context("encoded OSV content has no published_at field boundary")?;
-    let mut encoded = Vec::with_capacity(content.len() + 256);
-    encoded.extend_from_slice(&content[..identity_offset]);
-    write_json_field(
-        &mut encoded,
-        b",\"record_identity_hash\":",
-        record_identity_hash,
-    )?;
-    write_json_field(&mut encoded, b",\"content_sha256\":", content_sha256)?;
-    encoded.extend_from_slice(&content[identity_offset..modified_day_offset]);
-    write_json_field(&mut encoded, b",\"modified_day\":", modified_day)?;
-    encoded.extend_from_slice(&content[modified_day_offset..]);
-    Ok(encoded)
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn write_json_field<T: Serialize + ?Sized>(
-    encoded: &mut Vec<u8>,
-    prefix: &[u8],
-    value: &T,
-) -> Result<()> {
-    encoded.extend_from_slice(prefix);
-    serde_json::to_writer(encoded, value)?;
-    Ok(())
-}
-
-fn storage_partition(normalised_ecosystem: &str) -> &str {
+fn storage_partition(ecosystem: &str) -> &str {
     CLIENT_PARTITIONS
         .iter()
         .copied()
-        .find(|candidate| *candidate == normalised_ecosystem)
+        .find(|candidate| *candidate == ecosystem)
         .unwrap_or("other")
 }
 
@@ -1927,10 +1785,7 @@ fn address(tenant: &str, bucket: &str, path: &str) -> ObjectAddress {
 }
 
 fn source_definition_path() -> String {
-    format!(
-        "entities/source-definition/{}/current.json",
-        digest_bytes(b"source-definition\0osv")
-    )
+    "entities/source-definition/osv/current.json".into()
 }
 
 fn shard_path(records_sha256: &str) -> String {
@@ -1946,22 +1801,15 @@ fn manifest_path(snapshot_id: &str) -> String {
 }
 
 fn command_id(corpus_sha256: &str, phase: &str, identity: &str) -> String {
-    format!("osv-qualification-v2:{corpus_sha256}:{phase}:{identity}")
+    format!("osv-qualification-v1:{corpus_sha256}:{phase}:{identity}")
 }
 
 fn digest_bytes(value: &[u8]) -> String {
     hex::encode(Sha256::digest(value))
 }
 
-#[cfg(test)]
-fn digest_json(value: &impl Serialize) -> Result<String> {
-    let mut digest = Sha256::new();
-    serde_json::to_writer(&mut digest, value)?;
-    Ok(hex::encode(digest.finalize()))
-}
-
 fn immutable_json_payload<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec(&serde_json::to_value(value)?)?)
+    Ok(serde_json::to_vec(value)?)
 }
 
 fn emit_report(report: &QualificationReport<'_>, output: Option<&Path>) -> Result<()> {

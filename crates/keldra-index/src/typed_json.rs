@@ -2,7 +2,7 @@
 //!
 //! These types describe the public Typed JSON contract. They intentionally do
 //! not describe a segment layout, a cursor encoding, or an execution engine.
-//! The v6 projection pipeline consumes their canonical recipe fingerprints;
+//! The v1 projection pipeline consumes their canonical recipe fingerprints;
 //! query materializers may consume the predicate, facet, aggregate, and order
 //! shapes without inheriting a durable index format.
 
@@ -12,8 +12,8 @@ use std::collections::BTreeSet;
 use crate::IndexError;
 
 const TYPED_JSON_SCHEMA_DOMAIN: &[u8] = b"keldra.index.typed-json-schema/v1";
-const MEMBERSHIP_RECIPE_DOMAIN: &[u8] = b"keldra.index.membership-recipe/v2";
-const FIELD_RECIPE_DOMAIN: &[u8] = b"keldra.index.field-recipe/v2";
+const MEMBERSHIP_RECIPE_DOMAIN: &[u8] = b"keldra.index.membership-recipe/v1";
+const FIELD_RECIPE_DOMAIN: &[u8] = b"keldra.index.field-recipe/v1";
 const MAX_SELECTOR_BYTES: usize = 16 * 1024;
 const MAX_TERM_BYTES: usize = 32_766;
 
@@ -517,10 +517,10 @@ pub fn decode_scalar_sort_key(bytes: &[u8]) -> Result<(ScalarValue, usize), Inde
             } else {
                 !sortable
             };
-            let value = ScalarValue::number(f64::from_bits(bits))?;
-            if encode_scalar_sort_key(&value)? != bytes[..9] {
+            if f64::from_bits(bits) == 0.0 && bits != 0 {
                 return Err(IndexError::InvalidFormat("Typed JSON scalar number"));
             }
+            let value = ScalarValue::number(f64::from_bits(bits))?;
             Ok((value, 9))
         }
         4 => {
@@ -785,7 +785,7 @@ const FIELD_STATE_FORMAT: u8 = 1;
 
 /// Exact selected values for one Typed JSON field at one document key.
 ///
-/// It is the canonical value carried by a v6 field-recipe component. It has
+/// It is the canonical value carried by a v1 field-recipe component. It has
 /// no segment, object-path, or definition identity: the recipe component is
 /// already bound to one validated [`FieldSchema`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -835,13 +835,7 @@ pub fn encode_typed_json_field_state(
     field: &FieldSchema,
     state: &TypedJsonFieldState,
 ) -> Result<Vec<u8>, IndexError> {
-    let mut normalized = state.clone();
-    canonicalize_field_state(field, &mut normalized)?;
-    if &normalized != state {
-        return Err(IndexError::InvalidDefinition(
-            "Typed JSON field state is not canonical".into(),
-        ));
-    }
+    validate_canonical_field_state(field, state)?;
     let mut out = Vec::with_capacity(16);
     out.extend_from_slice(FIELD_STATE_MAGIC);
     out.push(FIELD_STATE_FORMAT);
@@ -885,32 +879,22 @@ pub fn decode_typed_json_field_state(
         null,
         values,
     };
-    let canonical = encode_typed_json_field_state(field, &state)?;
-    if canonical != bytes {
-        return Err(IndexError::InvalidFormat(
-            "Typed JSON field state is not canonical",
-        ));
-    }
+    validate_canonical_field_state(field, &state)
+        .map_err(|_| IndexError::InvalidFormat("Typed JSON field state is not canonical"))?;
     Ok(state)
 }
 
 /// Verify one leaf predicate against a candidate selected by a query run.
 ///
 /// This is intentionally a single-candidate verifier, not a document scan:
-/// v6 query runs first seek a term, point, or positional posting structure and
+/// v1 query runs first seek a term, point, or positional posting structure and
 /// call this only to discard stale L0 candidates after a newer field update.
 pub fn matches_typed_json_leaf(
     field: &FieldSchema,
     state: &TypedJsonFieldState,
     predicate: &Predicate,
 ) -> Result<bool, IndexError> {
-    let mut normalized = state.clone();
-    canonicalize_field_state(field, &mut normalized)?;
-    if normalized != *state {
-        return Err(IndexError::InvalidDefinition(
-            "Typed JSON candidate field state is not canonical".into(),
-        ));
-    }
+    validate_canonical_field_state(field, state)?;
     match predicate {
         Predicate::Equal {
             field_id, value, ..
@@ -1041,6 +1025,45 @@ fn canonicalize_field_state(
     Ok(())
 }
 
+pub(crate) fn validate_canonical_field_state(
+    field: &FieldSchema,
+    state: &TypedJsonFieldState,
+) -> Result<(), IndexError> {
+    field.validate()?;
+    if !state.present {
+        if state.null || !state.values.is_empty() || !field.allow_missing {
+            return Err(IndexError::InvalidDefinition(
+                "missing field state is invalid".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if state.null && !field.allow_null {
+        return Err(IndexError::InvalidDefinition(
+            "field state contains a disallowed null".into(),
+        ));
+    }
+    if field.cardinality == Cardinality::Single
+        && state.values.len().saturating_add(usize::from(state.null)) > 1
+    {
+        return Err(IndexError::InvalidDefinition(
+            "single-valued field state has multiple values".into(),
+        ));
+    }
+    for value in &state.values {
+        value_matches_field(field, value)?;
+    }
+    if field.field_type == FieldType::Keyword
+        && field.cardinality == Cardinality::Multi
+        && state.values.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(IndexError::InvalidDefinition(
+            "Typed JSON field state is not canonical".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn require_leaf_capability(
     field: &FieldSchema,
     field_id: FieldId,
@@ -1080,7 +1103,7 @@ fn value_matches_field(field: &FieldSchema, value: &ScalarValue) -> Result<(), I
     Ok(())
 }
 
-/// Canonical analyzer used by Typed JSON text recipes and v6 text postings.
+/// Canonical analyzer used by Typed JSON text recipes and v1 text postings.
 pub fn analyze_typed_json_text(value: &str) -> Vec<String> {
     value
         .split(|character: char| !character.is_alphanumeric())

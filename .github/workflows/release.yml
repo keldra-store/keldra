@@ -1,16 +1,23 @@
 name: Keldra Release
 
 on:
-  push:
-    tags: ['[0-9]*.[0-9]*.[0-9]*']
   workflow_dispatch:
     inputs:
       tag:
         description: Release tag to publish
         required: true
         type: string
+      rust_builder_image:
+        description: Digest-pinned rust:1.96-trixie builder image reference
+        required: true
+        type: string
+      runtime_image:
+        description: Digest-pinned debian:trixie-slim runtime image reference
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -27,7 +34,7 @@ jobs:
       commit: ${{ steps.release.outputs.commit }}
     steps:
       - name: Checkout workflow revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           submodules: recursive
@@ -36,6 +43,8 @@ jobs:
         id: release
         env:
           REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+          RUST_BUILDER_IMAGE: ${{ inputs.rust_builder_image }}
+          RUNTIME_IMAGE: ${{ inputs.runtime_image }}
         run: |
           set -euo pipefail
           tag="$REQUESTED_TAG"
@@ -53,8 +62,12 @@ jobs:
             echo "release tag $tag does not match workspace version ${workspace_version}" >&2
             exit 1
           fi
-          if [[ "$GITHUB_EVENT_NAME" == "push" && "$commit" != "$GITHUB_SHA" ]]; then
-            echo "tag commit does not match the push event commit" >&2
+          if [[ ! "$RUST_BUILDER_IMAGE" =~ ^rust:1\.96-trixie@sha256:[0-9a-f]{64}$ ]]; then
+            echo "rust_builder_image must pin rust:1.96-trixie by SHA-256 digest" >&2
+            exit 1
+          fi
+          if [[ ! "$RUNTIME_IMAGE" =~ ^debian:trixie-slim@sha256:[0-9a-f]{64}$ ]]; then
+            echo "runtime_image must pin debian:trixie-slim by SHA-256 digest" >&2
             exit 1
           fi
           printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >>"$GITHUB_OUTPUT"
@@ -71,14 +84,18 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - name: Checkout release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.release-context.outputs.commit }}
           submodules: recursive
 
+      - name: Use runner-local Cargo target
+        run: printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/keldra-cargo-target" >> "$GITHUB_ENV"
+
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: 1.96.0
           components: rustfmt
 
       - name: Install system build dependencies
@@ -94,16 +111,16 @@ jobs:
             ripgrep
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-release-cargo-v09-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-release-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-release-cargo-v09-
+            ${{ runner.os }}-release-cargo-v1-
 
       - name: Run static gates
         run: ./scripts/release-gates.sh static
@@ -113,15 +130,16 @@ jobs:
 
   build-image:
     name: Build release image (${{ matrix.platform }})
-    needs: release-context
+    needs: [release-context, validate]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
       contents: read
-      packages: write
     env:
       KELDRA_IMAGE: keldra:release-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
       KELDRA_DOCKER_PLATFORM: ${{ matrix.platform }}
+      KELDRA_RUST_BUILDER_IMAGE: ${{ inputs.rust_builder_image }}
+      KELDRA_RUNTIME_IMAGE: ${{ inputs.runtime_image }}
     strategy:
       fail-fast: false
       matrix:
@@ -134,89 +152,361 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - name: Checkout release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.release-context.outputs.commit }}
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install image archive tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y file jq skopeo
 
-      - name: Build and push release image by digest
+      - name: Build local release OCI archive
         id: build
         env:
+          OCI_ARCHIVE: ${{ runner.temp }}/keldra-image-${{ matrix.arch }}.oci.tar
           DIGEST_FILE: ${{ runner.temp }}/keldra-image-digest-${{ matrix.arch }}.txt
           SOURCE_COMMIT: ${{ needs.release-context.outputs.commit }}
         run: |
           set -euo pipefail
-          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
-          metadata_file="${RUNNER_TEMP}/keldra-image-metadata-${{ matrix.arch }}.json"
-
           docker buildx build \
             --platform "$KELDRA_DOCKER_PLATFORM" \
             --build-arg "KELDRA_SOURCE_REVISION=${SOURCE_COMMIT}" \
-            --provenance=false \
-            --sbom=false \
-            --output "type=image,name=${repository},push=true,push-by-digest=true,name-canonical=true" \
-            --metadata-file "$metadata_file" \
+            --build-arg "KELDRA_RUST_BUILDER_IMAGE=${KELDRA_RUST_BUILDER_IMAGE}" \
+            --build-arg "KELDRA_RUNTIME_IMAGE=${KELDRA_RUNTIME_IMAGE}" \
+            --provenance=true \
+            --sbom=true \
+            --output "type=oci,dest=${OCI_ARCHIVE}" \
             --file crates/keldra/Dockerfile \
             .
 
-          digest="$(
-            python3 -c '
-          import json, sys
-          with open(sys.argv[1], encoding="utf-8") as metadata:
-              print(json.load(metadata).get("containerimage.digest", ""))
-          ' "$metadata_file"
-          )"
+          digest="$(skopeo inspect --format '{{.Digest}}' "oci-archive:${OCI_ARCHIVE}")"
           if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "native ${KELDRA_DOCKER_PLATFORM} build did not report a valid digest" >&2
+            echo "native ${KELDRA_DOCKER_PLATFORM} archive did not report a valid digest" >&2
+            exit 1
+          fi
+          archive_digest="sha256:$(
+            skopeo inspect --raw "oci-archive:${OCI_ARCHIVE}" |
+              sha256sum | awk '{print $1}'
+          )"
+          if [[ "$archive_digest" != "$digest" ]]; then
+            echo "OCI archive manifest ${archive_digest} does not match build digest ${digest}" >&2
+            exit 1
+          fi
+          image_manifest_digest="$(
+            skopeo inspect --raw "oci-archive:${OCI_ARCHIVE}" |
+              jq --exit-status --raw-output --arg platform "$KELDRA_DOCKER_PLATFORM" '
+                [
+                  .manifests[]
+                  | select((.platform.os + "/" + .platform.architecture) == $platform)
+                  | .digest
+                ]
+                | if length == 1 then .[0] else error("expected one runnable platform manifest") end
+              '
+          )"
+          attestation_references="$(
+            skopeo inspect --raw "oci-archive:${OCI_ARCHIVE}" |
+              jq --exit-status --raw-output '
+                [
+                  .manifests[]
+                  | select(
+                      (.platform.os == "unknown")
+                      and (.platform.architecture == "unknown")
+                      and (.annotations["vnd.docker.reference.type"] == "attestation-manifest")
+                    )
+                  | .annotations["vnd.docker.reference.digest"]
+                ]
+                | if length > 0 then unique[] else error("attestation manifest is missing") end
+              '
+          )"
+          if [[ "$attestation_references" != "$image_manifest_digest" ]]; then
+            echo "OCI attestations do not exclusively reference ${image_manifest_digest}" >&2
+            exit 1
+          fi
+          inspection="$(skopeo inspect "oci-archive:${OCI_ARCHIVE}")"
+          revision="$(jq -r '.Labels["org.opencontainers.image.revision"] // ""' <<<"$inspection")"
+          platform="$(jq -r '.Os + "/" + .Architecture' <<<"$inspection")"
+          if [[ "$revision" != "$SOURCE_COMMIT" || "$platform" != "$KELDRA_DOCKER_PLATFORM" ]]; then
+            echo "OCI archive identity ${revision} ${platform} does not match ${SOURCE_COMMIT} ${KELDRA_DOCKER_PLATFORM}" >&2
             exit 1
           fi
           printf '%s\n' "$digest" >"$DIGEST_FILE"
-          printf 'repository=%s\ndigest=%s\n' "$repository" "$digest" >>"$GITHUB_OUTPUT"
+          printf 'digest=%s\nrunnable_manifest_digest=%s\n' \
+            "$digest" "$image_manifest_digest" >>"$GITHUB_OUTPUT"
 
-      - name: Pull exact release image digest
+      - name: Load exact local release image
         env:
-          IMAGE_REPOSITORY: ${{ steps.build.outputs.repository }}
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          OCI_ARCHIVE: ${{ runner.temp }}/keldra-image-${{ matrix.arch }}.oci.tar
         run: |
           set -euo pipefail
-          docker pull --platform "$KELDRA_DOCKER_PLATFORM" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
-          docker tag "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" "$KELDRA_IMAGE"
+          skopeo copy \
+            "oci-archive:${OCI_ARCHIVE}" \
+            "docker-daemon:${KELDRA_IMAGE}"
+          platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$KELDRA_IMAGE")"
+          if [[ "$platform" != "$KELDRA_DOCKER_PLATFORM" ]]; then
+            echo "local candidate platform ${platform} does not match ${KELDRA_DOCKER_PLATFORM}" >&2
+            exit 1
+          fi
 
       - name: Smoke release image through gRPC
         run: ./scripts/release-gates.sh image
 
-      - name: Upload tested release image digest
-        uses: actions/upload-artifact@v4
+      - name: Record embedded release binaries
+        env:
+          OCI_ARCHIVE: ${{ runner.temp }}/keldra-image-${{ matrix.arch }}.oci.tar
+          IMAGE_RECORD: ${{ runner.temp }}/keldra-release-image-${{ matrix.arch }}.json
+          SOURCE_COMMIT: ${{ needs.release-context.outputs.commit }}
+          RELEASE_VERSION: ${{ needs.release-context.outputs.tag }}
+          OCI_INDEX_DIGEST: ${{ steps.build.outputs.digest }}
+          RUNNABLE_MANIFEST_DIGEST: ${{ steps.build.outputs.runnable_manifest_digest }}
+        run: |
+          set -euo pipefail
+          extract="${RUNNER_TEMP}/keldra-embedded-${{ matrix.arch }}"
+          mkdir -p "$extract"
+          container="$(docker create --platform "$KELDRA_DOCKER_PLATFORM" "$KELDRA_IMAGE")"
+          trap 'docker rm "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/usr/local/bin/keldra-server" "$extract/keldra-server"
+          docker cp "$container:/usr/local/bin/keldra" "$extract/keldra"
+          case "${{ matrix.arch }}" in
+            amd64) file "$extract/keldra-server" "$extract/keldra" | grep -Fq 'x86-64' ;;
+            arm64) file "$extract/keldra-server" "$extract/keldra" | grep -Fq 'ARM aarch64' ;;
+          esac
+          ./scripts/release-record.py image \
+            --version "$RELEASE_VERSION" \
+            --commit "$SOURCE_COMMIT" \
+            --platform "$KELDRA_DOCKER_PLATFORM" \
+            --oci-archive "$OCI_ARCHIVE" \
+            --oci-index-digest "$OCI_INDEX_DIGEST" \
+            --runnable-manifest-digest "$RUNNABLE_MANIFEST_DIGEST" \
+            --builder-image "$KELDRA_RUST_BUILDER_IMAGE" \
+            --runtime-image "$KELDRA_RUNTIME_IMAGE" \
+            --server-binary "$extract/keldra-server" \
+            --cli-binary "$extract/keldra" \
+            --output "$IMAGE_RECORD"
+
+      - name: Upload tested local release image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: keldra-release-digest-${{ matrix.arch }}
-          path: ${{ runner.temp }}/keldra-image-digest-${{ matrix.arch }}.txt
+          name: keldra-release-image-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/keldra-image-${{ matrix.arch }}.oci.tar
+            ${{ runner.temp }}/keldra-image-digest-${{ matrix.arch }}.txt
+            ${{ runner.temp }}/keldra-release-image-${{ matrix.arch }}.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+      - name: Upload compact image record for release assembly
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: keldra-image-record-${{ matrix.arch }}
+          path: ${{ runner.temp }}/keldra-release-image-${{ matrix.arch }}.json
           if-no-files-found: error
           retention-days: 2
 
       - name: Remove local image
         if: always()
-        env:
-          IMAGE_REPOSITORY: ${{ steps.build.outputs.repository }}
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           docker image rm "$KELDRA_IMAGE" || true
-          if [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            docker image rm "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" || true
+
+  qualify-three-node:
+    name: Qualify exact amd64 candidate across three nodes
+    needs: [release-context, build-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '2'
+      KELDRA_DOCKER_PLATFORM: linux/amd64
+      KELDRA_QUALIFICATION_MODE: release
+      KELDRA_QUALIFICATION_KEEP: '0'
+      KELDRA_QUALIFICATION_VERSION: ${{ needs.release-context.outputs.tag }}
+      KELDRA_QUALIFICATION_DISK_BUDGET_BYTES: '21474836480'
+      KELDRA_QUALIFICATION_DISK_LEDGER: ${{ runner.temp }}/keldra-three-node-disk-ledger.jsonl
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-context.outputs.commit }}
+          submodules: recursive
+
+      - name: Download exact amd64 candidate archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: keldra-release-image-amd64
+          path: ${{ runner.temp }}/keldra-image-amd64
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Install qualification dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            jq \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler \
+            skopeo
+          docker compose version
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-release-three-node-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-three-node-cargo-
+
+      - name: Load and qualify the exact unpublished candidate
+        env:
+          OCI_ARCHIVE: ${{ runner.temp }}/keldra-image-amd64/keldra-image-amd64.oci.tar
+          DIGEST_FILE: ${{ runner.temp }}/keldra-image-amd64/keldra-image-digest-amd64.txt
+        run: |
+          set -euo pipefail
+          digest="$(tr -d '[:space:]' <"$DIGEST_FILE")"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "amd64 release candidate did not contain a valid digest" >&2
+            exit 1
           fi
+          archive_digest="sha256:$(
+            skopeo inspect --raw "oci-archive:${OCI_ARCHIVE}" |
+              sha256sum | awk '{print $1}'
+          )"
+          if [[ "$archive_digest" != "$digest" ]]; then
+            echo "amd64 OCI archive manifest ${archive_digest} does not match ${digest}" >&2
+            exit 1
+          fi
+          export KELDRA_IMAGE="keldra:qualification-amd64-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          skopeo copy \
+            "oci-archive:${OCI_ARCHIVE}" \
+            "docker-daemon:${KELDRA_IMAGE}"
+          ./scripts/qualify-three-node.sh
+
+      - name: Upload qualification disk ledger
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: keldra-three-node-disk-ledger
+          path: ${{ runner.temp }}/keldra-three-node-disk-ledger.jsonl
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Record exact three-node result
+        env:
+          IMAGE_RECORD: ${{ runner.temp }}/keldra-image-amd64/keldra-release-image-amd64.json
+          OUTPUT: ${{ runner.temp }}/keldra-three-node-result.json
+          RELEASE_VERSION: ${{ needs.release-context.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg version "$RELEASE_VERSION" \
+            --arg source_commit "$SOURCE_COMMIT" \
+            --arg oci_index_digest "$(jq -r '.oci_index_digest' "$IMAGE_RECORD")" \
+            --arg runnable_manifest_digest "$(jq -r '.runnable_manifest_digest' "$IMAGE_RECORD")" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{schema:"keldra.qualification-result.v1",gate_id:"three-node-release",result:"pass",version:$version,source_commit:$source_commit,platform:"linux/amd64",oci_index_digest:$oci_index_digest,runnable_manifest_digest:$runnable_manifest_digest,run_id:$run_id,run_attempt:$run_attempt}' \
+            >"$OUTPUT"
+
+      - name: Upload three-node result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: keldra-three-node-result
+          path: ${{ runner.temp }}/keldra-three-node-result.json
+          if-no-files-found: error
+          retention-days: 2
+
+  release-record:
+    name: Assemble immutable release record
+    needs: [release-context, build-image, qualify-three-node]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Use runner-local Cargo target
+        run: printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/keldra-cargo-target" >> "$GITHUB_ENV"
+
+      - name: Download compact image records
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: keldra-image-record-*
+          path: ${{ runner.temp }}/release-evidence
+
+      - name: Download exact three-node result
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: keldra-three-node-result
+          path: ${{ runner.temp }}/release-evidence/keldra-three-node-result
+
+      - name: Setup Rust for exact package archives
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Package exact crates without registry mutation
+        env:
+          RELEASE_VERSION: ${{ needs.release-context.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cargo package --locked --no-verify --package keldra-api
+          cargo package --locked --no-verify --package keldra
+          target="$(cargo metadata --quiet --locked --no-deps --format-version 1 | jq -er '.target_directory')"
+          install -d "${RUNNER_TEMP}/release-packages"
+          install -m 0644 "${target}/package/keldra-api-${RELEASE_VERSION}.crate" \
+            "${RUNNER_TEMP}/release-packages/keldra-api-${RELEASE_VERSION}.crate"
+          install -m 0644 "${target}/package/keldra-${RELEASE_VERSION}.crate" \
+            "${RUNNER_TEMP}/release-packages/keldra-${RELEASE_VERSION}.crate"
+
+      - name: Assemble and verify release record
+        env:
+          RELEASE_VERSION: ${{ needs.release-context.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.release-context.outputs.commit }}
+          RELEASE_RECORD: ${{ runner.temp }}/keldra-release-record-${{ needs.release-context.outputs.tag }}.json
+        run: |
+          set -euo pipefail
+          ./scripts/release-record.py assemble \
+            --version "$RELEASE_VERSION" --commit "$SOURCE_COMMIT" \
+            --image "${RUNNER_TEMP}/release-evidence/keldra-image-record-amd64/keldra-release-image-amd64.json" \
+            --image "${RUNNER_TEMP}/release-evidence/keldra-image-record-arm64/keldra-release-image-arm64.json" \
+            --three-node "${RUNNER_TEMP}/release-evidence/keldra-three-node-result/keldra-three-node-result.json" \
+            --package-crate "keldra-api=${RUNNER_TEMP}/release-packages/keldra-api-${RELEASE_VERSION}.crate" \
+            --package-crate "keldra=${RUNNER_TEMP}/release-packages/keldra-${RELEASE_VERSION}.crate" \
+            --output "$RELEASE_RECORD"
+          ./scripts/release-record.py verify \
+            --record "$RELEASE_RECORD" --version "$RELEASE_VERSION" --commit "$SOURCE_COMMIT"
+
+      - name: Upload immutable release record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: keldra-release-record
+          path: ${{ runner.temp }}/keldra-release-record-${{ needs.release-context.outputs.tag }}.json
+          if-no-files-found: error
+          retention-days: 30
 
   publish:
     name: Publish Keldra image and release
-    needs: [release-context, validate, build-image]
+    needs: [release-context, validate, build-image, qualify-three-node, release-record]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -224,28 +514,58 @@ jobs:
       packages: write
     steps:
       - name: Checkout release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.release-context.outputs.commit }}
           submodules: recursive
 
-      - name: Download tested release image digests
-        uses: actions/download-artifact@v4
+      - name: Download tested release image archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: keldra-release-digest-*
-          path: ${{ runner.temp }}/keldra-image-digests
+          pattern: keldra-release-image-*
+          path: ${{ runner.temp }}/keldra-image-archives
+
+      - name: Download immutable release record
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: keldra-release-record
+          path: ${{ runner.temp }}/release-record
+
+      - name: Setup Rust for package publication
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.96.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Install image publication tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y file jq protobuf-compiler skopeo
+
+      - name: Reverify downloaded archives and embedded binaries
+        env:
+          RELEASE_RECORD: ${{ runner.temp }}/release-record/keldra-release-record-${{ needs.release-context.outputs.tag }}.json
+          RELEASE_VERSION: ${{ needs.release-context.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            ./scripts/verify-release-image-artifact.sh \
+              "$RELEASE_RECORD" \
+              "${RUNNER_TEMP}/keldra-image-archives/keldra-release-image-${arch}/keldra-image-${arch}.oci.tar" \
+              "$RELEASE_VERSION" "$EXPECTED_COMMIT" "linux/${arch}"
+          done
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify release tag is still pinned
+      - name: Verify release tag immediately before publication
         env:
           RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
           EXPECTED_COMMIT: ${{ needs.release-context.outputs.commit }}
@@ -258,22 +578,96 @@ jobs:
             exit 1
           fi
 
-      - name: Publish multi-architecture image
+      - name: Publish API crate then Rust client from release record
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_RECORD: ${{ runner.temp }}/release-record/keldra-release-record-${{ needs.release-context.outputs.tag }}.json
+          RELEASE_VERSION: ${{ needs.release-context.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: ./scripts/publish-release-crates.sh "$RELEASE_RECORD" "$RELEASE_VERSION" "$EXPECTED_COMMIT"
+
+      - name: Publish exact archives and multi-architecture image
         id: image
         env:
           RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.release-context.outputs.commit }}
         run: |
           set -euo pipefail
           repository="ghcr.io/${GITHUB_REPOSITORY,,}"
           final_image="${repository}:${RELEASE_TAG}"
           amd64_digest="$(tr -d '[:space:]' < \
-            "${RUNNER_TEMP}/keldra-image-digests/keldra-release-digest-amd64/keldra-image-digest-amd64.txt")"
+            "${RUNNER_TEMP}/keldra-image-archives/keldra-release-image-amd64/keldra-image-digest-amd64.txt")"
           arm64_digest="$(tr -d '[:space:]' < \
-            "${RUNNER_TEMP}/keldra-image-digests/keldra-release-digest-arm64/keldra-image-digest-arm64.txt")"
+            "${RUNNER_TEMP}/keldra-image-archives/keldra-release-image-arm64/keldra-image-digest-arm64.txt")"
 
           for digest in "$amd64_digest" "$arm64_digest"; do
             if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
               echo "tested release artifact did not contain a valid digest" >&2
+              exit 1
+            fi
+          done
+
+          for arch in amd64 arm64; do
+            archive="${RUNNER_TEMP}/keldra-image-archives/keldra-release-image-${arch}/keldra-image-${arch}.oci.tar"
+            case "$arch" in
+              amd64) expected_digest="$amd64_digest" ;;
+              arm64) expected_digest="$arm64_digest" ;;
+            esac
+            archive_digest="sha256:$(
+              skopeo inspect --raw "oci-archive:${archive}" |
+                sha256sum | awk '{print $1}'
+            )"
+            if [[ "$archive_digest" != "$expected_digest" ]]; then
+              echo "${arch} archive manifest ${archive_digest} does not match ${expected_digest}" >&2
+              exit 1
+            fi
+            inspection="$(skopeo inspect --override-os linux --override-arch "$arch" "oci-archive:${archive}")"
+            revision="$(jq -r '.Labels["org.opencontainers.image.revision"] // ""' <<<"$inspection")"
+            platform="$(jq -r '.Os + "/" + .Architecture' <<<"$inspection")"
+            if [[ "$revision" != "$EXPECTED_COMMIT" || "$platform" != "linux/${arch}" ]]; then
+              echo "${arch} archive identity ${revision} ${platform} does not match ${EXPECTED_COMMIT} linux/${arch}" >&2
+              exit 1
+            fi
+            image_digest="$(
+              skopeo inspect --raw "oci-archive:${archive}" |
+                jq --exit-status --raw-output --arg platform "linux/${arch}" '
+                  [
+                    .manifests[]
+                    | select((.platform.os + "/" + .platform.architecture) == $platform)
+                    | .digest
+                  ]
+                  | if length == 1 then .[0] else error("expected one runnable platform manifest") end
+                '
+            )"
+            attestation_references="$(
+              skopeo inspect --raw "oci-archive:${archive}" |
+                jq --exit-status --raw-output '
+                  [
+                    .manifests[]
+                    | select(
+                        (.platform.os == "unknown")
+                        and (.platform.architecture == "unknown")
+                        and (.annotations["vnd.docker.reference.type"] == "attestation-manifest")
+                      )
+                    | .annotations["vnd.docker.reference.digest"]
+                  ]
+                  | if length > 0 then unique[] else error("attestation manifest is missing") end
+                '
+            )"
+            if [[ "$attestation_references" != "$image_digest" ]]; then
+              echo "${arch} attestations do not exclusively reference ${image_digest}" >&2
+              exit 1
+            fi
+            printf -v "${arch}_image_digest" '%s' "$image_digest"
+            skopeo copy --all --preserve-digests \
+              "oci-archive:${archive}" \
+              "docker://${repository}@${expected_digest}"
+            remote_digest="sha256:$(
+              skopeo inspect --raw "docker://${repository}@${expected_digest}" |
+                sha256sum | awk '{print $1}'
+            )"
+            if [[ "$remote_digest" != "$expected_digest" ]]; then
+              echo "published ${arch} manifest ${remote_digest} does not match ${expected_digest}" >&2
               exit 1
             fi
           done
@@ -284,7 +678,7 @@ jobs:
             "${repository}@${arm64_digest}"
 
           raw_manifest="$(docker buildx imagetools inspect --raw "$final_image")"
-          AMD64_DIGEST="$amd64_digest" ARM64_DIGEST="$arm64_digest" python3 -c '
+          AMD64_DIGEST="$amd64_image_digest" ARM64_DIGEST="$arm64_image_digest" python3 -c '
           import json, os, sys
           manifest = json.load(sys.stdin)
           published = {
@@ -293,6 +687,7 @@ jobs:
                   item.get("platform", {}).get("architecture"),
               ): item.get("digest")
               for item in manifest.get("manifests", [])
+              if item.get("platform", {}).get("os") != "unknown"
           }
           expected = {
               "linux/amd64": os.environ["AMD64_DIGEST"],
@@ -300,6 +695,15 @@ jobs:
           }
           if published != expected:
               raise SystemExit(f"published platform digests {published!r} != {expected!r}")
+          attested = {
+              item.get("annotations", {}).get("vnd.docker.reference.digest")
+              for item in manifest.get("manifests", [])
+              if item.get("platform", {}).get("os") == "unknown"
+              and item.get("platform", {}).get("architecture") == "unknown"
+              and item.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"
+          }
+          if attested != set(expected.values()):
+              raise SystemExit(f"published attestation references {attested!r} != {set(expected.values())!r}")
           ' <<<"$raw_manifest"
           inspection="$(docker buildx imagetools inspect "$final_image")"
           digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")"
@@ -309,56 +713,28 @@ jobs:
           fi
           printf 'image=%s\ndigest=%s\n' "$final_image" "$digest" >>"$GITHUB_OUTPUT"
 
-      - name: Verify release tag before GitHub publication
+      - name: Derive release channel and notes from candidate record
+        id: release_metadata
         env:
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          RELEASE_RECORD: ${{ runner.temp }}/release-record/keldra-release-record-${{ needs.release-context.outputs.tag }}.json
+          RELEASE_VERSION: ${{ needs.release-context.outputs.tag }}
           EXPECTED_COMMIT: ${{ needs.release-context.outputs.commit }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          MANIFEST_DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           set -euo pipefail
-          git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-          actual_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          if [[ "$actual_commit" != "$EXPECTED_COMMIT" ]]; then
-            echo "release tag moved during publication: ${actual_commit} != ${EXPECTED_COMMIT}" >&2
-            exit 1
-          fi
+          prerelease="$(./scripts/release-record.py verify --record "$RELEASE_RECORD" --version "$RELEASE_VERSION" --commit "$EXPECTED_COMMIT" --print-field release.prerelease)"
+          make_latest="$(./scripts/release-record.py verify --record "$RELEASE_RECORD" --version "$RELEASE_VERSION" --commit "$EXPECTED_COMMIT" --print-field release.make_latest)"
+          ./scripts/render-release-notes.sh "$RELEASE_VERSION" "$RELEASE_RECORD" "$IMAGE" "$MANIFEST_DIGEST" >"${RUNNER_TEMP}/release-notes.md"
+          printf 'prerelease=%s\nmake_latest=%s\n' "$prerelease" "$make_latest" >>"$GITHUB_OUTPUT"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.release-context.outputs.tag }}
           target_commitish: ${{ needs.release-context.outputs.commit }}
           generate_release_notes: true
-          make_latest: true
-          body: |
-            Keldra ${{ needs.release-context.outputs.tag }} introduces the v6 memory-first Typed JSON
-            index architecture. Logical definitions with equivalent normalized
-            recipes share physical extraction, immutable segment artifacts, and
-            publication work instead of multiplying steady-state indexing cost
-            by catalog size.
-
-            Partition-owned hot ingress, bounded CPU and memory admission,
-            journal-backed recovery, and atomic published root vectors keep
-            ingestion and queries on one explicit consistency boundary. Exact,
-            prefix, range, order, facet, aggregate, and full-text queries execute
-            against one published cut, while immutable artifacts remain ordinary
-            Keldra objects and local materialization remains disposable.
-
-            This release also adds runtime-configurable single-node group-commit
-            bounds and reduces storage and publication amplification through
-            grouped current resolution, batched derived-artifact staging,
-            consolidated source-journal settlement, and reused decoded v6
-            component segments.
-
-            This release is a clean storage-format and index-architecture break
-            and changes cluster and data-peer protocols. Start 0.17 on fresh
-            authoritative and derived-index volumes; in-place upgrades from any
-            earlier Keldra release and mixed 0.16/0.17 operation are unsupported.
-            Move application data through the public API as new writes rather
-            than opening an earlier volume with 0.17.
-
-            It includes the multi-platform Keldra server image, CLI, Rust client,
-            generated API crate, and public qualification clients.
-
-            - Image: `${{ steps.image.outputs.image }}`
-            - Manifest digest: `${{ steps.image.outputs.digest }}`
-            - Source commit: `${{ needs.release-context.outputs.commit }}`
+          prerelease: ${{ steps.release_metadata.outputs.prerelease }}
+          make_latest: ${{ steps.release_metadata.outputs.make_latest }}
+          body_path: ${{ runner.temp }}/release-notes.md
+          files: ${{ runner.temp }}/release-record/keldra-release-record-${{ needs.release-context.outputs.tag }}.json

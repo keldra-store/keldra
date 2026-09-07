@@ -16,10 +16,10 @@ use keldra_store::{
     ShardIdentity, ShardSealOutcome, Store,
 };
 use thiserror::Error;
-use tonic::{Code, Status};
+use tonic::Status;
 
 use crate::cluster_placement::ClusterPlacement;
-use crate::data_peer::{DATA_PEER_FRAME_BYTES, DATA_PEER_SCHEMA_VERSION, DataPeerTransport};
+use crate::data_peer::DataPeerTransport;
 use crate::payload_placement::{
     NodePayloadEvidence, PayloadPlacement, PayloadReadinessError, select_payload_placement,
 };
@@ -139,6 +139,7 @@ pub(crate) trait PayloadArtifactPeers: Send + Sync {
         &self,
         target: NodeId,
         address: &str,
+        fence: keldra_store::PlacementLogId,
         reference: &BlobRef,
     ) -> Result<bool, Status>;
 
@@ -196,39 +197,12 @@ impl PayloadArtifactPeers for DataPeerTransport {
         &self,
         target: NodeId,
         address: &str,
+        fence: keldra_store::PlacementLogId,
         reference: &BlobRef,
     ) -> Result<bool, Status> {
-        let mut stream = match self.get_complete_source(target, address, reference).await {
-            Ok(stream) => stream,
-            Err(status) if status.code() == Code::NotFound => return Ok(false),
-            Err(status) => return Err(status),
-        };
-        let mut offset = 0_u64;
-        let mut hasher = blake3::Hasher::new();
-        while let Some(frame) = stream.message().await? {
-            let next = offset
-                .checked_add(frame.content.len() as u64)
-                .ok_or_else(|| Status::data_loss("complete-copy response offset overflowed"))?;
-            if frame.schema_version != DATA_PEER_SCHEMA_VERSION
-                || frame.offset != offset
-                || frame.content.len() > DATA_PEER_FRAME_BYTES
-                || next > reference.length
-            {
-                return Err(Status::data_loss(
-                    "complete-copy response is not a bounded contiguous stream",
-                ));
-            }
-            hasher.update(&frame.content);
-            offset = next;
-            if frame.end {
-                return Ok(
-                    offset == reference.length && hasher.finalize().as_bytes() == &reference.hash
-                );
-            }
-        }
-        Err(Status::data_loss(
-            "complete-copy response ended without a final frame",
-        ))
+        self.complete_source_state(target, address, fence, reference)
+            .await
+            .map(|state| state == PayloadArtifactState::Valid)
     }
 
     async fn put_shard(
@@ -527,7 +501,12 @@ impl PayloadDistribution {
             );
         }
         self.peers
-            .complete_exists(owner, peer_address(placement, owner)?, reference)
+            .complete_exists(
+                owner,
+                peer_address(placement, owner)?,
+                placement.fence(),
+                reference,
+            )
             .await
             .map_err(|status| peer_error(owner, status))
     }
@@ -902,6 +881,7 @@ mod tests {
             &self,
             target: NodeId,
             _address: &str,
+            _fence: keldra_store::PlacementLogId,
             reference: &BlobRef,
         ) -> Result<bool, Status> {
             self.available(target)?

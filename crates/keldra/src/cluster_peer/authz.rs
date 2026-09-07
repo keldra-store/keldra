@@ -14,12 +14,15 @@ use super::{
     CLUSTER_PEER_SCHEMA_VERSION, ClusterPeerService, MAX_CLUSTER_OPERATION_TIME, decode_json,
     encode_json, wire,
 };
-use crate::authz_distribution::{AuthzRealmReplicaCandidate, ZanzibarDistribution};
+use crate::authz_distribution::{
+    AuthzRealmReplicaCandidate, AuthzTransferSpool, ZanzibarDistribution,
+};
 use crate::logical_name_resolution::LogicalNameResolution;
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
 use crate::placement::PlacementKind;
 
 const REALM_FRAME_BYTES: usize = 64 * 1024;
+const NAME_RESOLUTION_CONCURRENCY: usize = 16;
 
 pub(super) type RealmAggregateStream =
     Pin<Box<dyn tokio_stream::Stream<Item = Result<wire::RealmAggregateFrame, Status>> + Send>>;
@@ -217,9 +220,9 @@ impl ClusterPeerService {
         Ok(Response::new(wire::RealmCandidate {
             schema_version: CLUSTER_PEER_SCHEMA_VERSION,
             present: candidate.is_some(),
-            manifest_json: candidate
+            state_json: candidate
                 .as_ref()
-                .map(|candidate| encode_json(&candidate.manifest))
+                .map(|candidate| encode_json(&candidate.state))
                 .transpose()?
                 .unwrap_or_default(),
         }))
@@ -241,11 +244,18 @@ impl ClusterPeerService {
         )?;
         let repository = self.store.authz();
         let manifest_scope = scope.clone();
-        let manifest = super::storage::bounded_blocking(admitted.timeout, move || {
-            repository
-                .export_authz_realm_stream(&manifest_scope, io::sink())
+        let (mut spool, manifest) = super::storage::bounded_blocking(admitted.timeout, move || {
+            let mut spool = AuthzTransferSpool::new().map_err(|error| {
+                Status::resource_exhausted(format!("authorization spool failed: {error}"))
+            })?;
+            let manifest = repository
+                .export_authz_realm_stream(&manifest_scope, &mut spool)
                 .map_err(snapshot_status)?
-                .ok_or_else(|| Status::not_found("authorization realm is absent"))
+                .ok_or_else(|| Status::not_found("authorization realm is absent"))?;
+            spool.rewind().map_err(|error| {
+                Status::internal(format!("authorization spool rewind failed: {error}"))
+            })?;
+            Ok::<_, Status>((spool, manifest))
         })
         .await?;
         AuthzRealmReplicaCandidate::from_manifest(manifest.clone())?.validate_for(&scope)?;
@@ -261,18 +271,16 @@ impl ClusterPeerService {
             }))
             .await
             .map_err(|_| Status::cancelled("authorization realm stream closed"))?;
-        let repository = self.store.authz();
         tokio::task::spawn_blocking(move || {
             let mut writer = RealmFrameWriter::new(sender);
-            match repository.export_authz_realm_stream(&scope, &mut writer) {
-                Ok(Some(observed)) if observed == manifest => writer.finish(),
-                Ok(Some(_)) => writer.fail(Status::unavailable(
-                    "authorization realm changed during aggregate export",
+            match io::copy(&mut spool, &mut writer) {
+                Ok(copied) if copied == manifest.encoded_bytes => writer.finish(),
+                Ok(_) => writer.fail(Status::data_loss(
+                    "authorization spool length disagrees with its manifest",
                 )),
-                Ok(None) => writer.fail(Status::not_found(
-                    "authorization realm disappeared during aggregate export",
-                )),
-                Err(error) => writer.fail(snapshot_status(error)),
+                Err(error) => writer.fail(Status::internal(format!(
+                    "authorization spool read failed: {error}"
+                ))),
             }
         });
         Ok(Response::new(Box::pin(
@@ -454,7 +462,7 @@ impl ClusterPeerService {
         verify_stable_bucket_bindings(
             &self.name_resolution,
             stable_tenant_id,
-            raw.stable_buckets.clone(),
+            &raw.stable_buckets,
             deadline,
         )
         .await?;
@@ -477,9 +485,11 @@ impl ClusterPeerService {
 async fn verify_stable_bucket_bindings(
     names: &crate::logical_name_resolution::LateBoundLogicalNameResolution,
     _stable_tenant_id: u64,
-    bindings: Vec<wire::StableBucketBinding>,
+    bindings: &[wire::StableBucketBinding],
     deadline: tokio::time::Instant,
 ) -> Result<(), Status> {
+    let mut unique = std::collections::BTreeMap::<String, u64>::new();
+    let mut tenant: Option<(String, u64)> = None;
     for binding in bindings {
         if binding.expected_tenant_id == 0
             || binding.expected_bucket_id == 0
@@ -490,20 +500,67 @@ async fn verify_stable_bucket_bindings(
                 "stable bucket authorization binding is invalid",
             ));
         }
-        let tenant = keldra_store::StorageTenantId::parse(&binding.storage_tenant)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let (tenant_id, bucket_id) = tokio::time::timeout_at(deadline, async {
-            let tenant_id = names.resolve_tenant_id(&tenant).await?;
-            let bucket_id = names
-                .resolve_bucket_id(binding.expected_tenant_id, &binding.bucket)
-                .await?;
-            Ok::<_, Status>((tenant_id, bucket_id))
-        })
+        match &tenant {
+            None => tenant = Some((binding.storage_tenant.clone(), binding.expected_tenant_id)),
+            Some((storage_tenant, tenant_id))
+                if storage_tenant == &binding.storage_tenant
+                    && *tenant_id == binding.expected_tenant_id => {}
+            Some(_) => {
+                return Err(Status::invalid_argument(
+                    "stable bucket authorization bindings span tenants",
+                ));
+            }
+        }
+        if let Some(previous) = unique.insert(binding.bucket.clone(), binding.expected_bucket_id)
+            && previous != binding.expected_bucket_id
+        {
+            return Err(Status::invalid_argument(
+                "stable bucket authorization bindings disagree",
+            ));
+        }
+    }
+    let Some((storage_tenant, expected_tenant_id)) = tenant else {
+        return Ok(());
+    };
+    let tenant = keldra_store::StorageTenantId::parse(storage_tenant)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let observed_tenant = tokio::time::timeout_at(deadline, names.resolve_tenant_id(&tenant))
         .await
         .map_err(|_| Status::deadline_exceeded("authorization deadline exceeded"))??;
-        if tenant_id != Some(binding.expected_tenant_id)
-            || bucket_id != Some(binding.expected_bucket_id)
-        {
+    if observed_tenant != Some(expected_tenant_id) {
+        return Err(Status::unavailable(
+            "tenant identity changed while authorizing the request",
+        ));
+    }
+
+    let mut pending = unique.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut observed_buckets = std::collections::BTreeMap::new();
+    loop {
+        while tasks.len() < NAME_RESOLUTION_CONCURRENCY {
+            let Some((bucket, expected_bucket_id)) = pending.next() else {
+                break;
+            };
+            let names = names.clone();
+            tasks.spawn(async move {
+                let observed = tokio::time::timeout_at(
+                    deadline,
+                    names.resolve_bucket_id(expected_tenant_id, &bucket),
+                )
+                .await
+                .map_err(|_| Status::deadline_exceeded("authorization deadline exceeded"))??;
+                Ok::<_, Status>((bucket, expected_bucket_id, observed))
+            });
+        }
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
+        let (bucket, expected_bucket_id, observed) = joined
+            .map_err(|error| Status::internal(format!("name-resolution task failed: {error}")))??;
+        observed_buckets.insert(bucket, (expected_bucket_id, observed));
+    }
+    for (_bucket, (expected_bucket_id, observed)) in observed_buckets {
+        if observed != Some(expected_bucket_id) {
             return Err(Status::unavailable(
                 "bucket identity changed while authorizing the request",
             ));
@@ -611,11 +668,11 @@ fn read_candidate(
     repository: &keldra_store::AuthzRepository,
     scope: &AuthzScope,
 ) -> Result<Option<AuthzRealmReplicaCandidate>, Status> {
-    let manifest = repository
-        .export_authz_realm_stream(scope, io::sink())
+    let state = repository
+        .authz_realm_state(scope)
         .map_err(snapshot_status)?;
-    manifest
-        .map(AuthzRealmReplicaCandidate::from_manifest)
+    state
+        .map(AuthzRealmReplicaCandidate::from_state)
         .transpose()
 }
 
