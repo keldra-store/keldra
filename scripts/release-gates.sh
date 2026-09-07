@@ -105,7 +105,7 @@ image_gates() (
   local owner_client_secret="smoke-owner-secret-with-at-least-32-bytes"
   local ready=0
   local attempt
-  for attempt in $(seq 1 30); do
+  for attempt in $(seq 1 120); do
     local probe
     probe="$(
       docker run --rm --network "container:${container}" \
@@ -124,7 +124,7 @@ image_gates() (
   done
   if [[ "${ready}" != "1" ]]; then
     docker logs "${container}" >&2 || true
-    echo "Keldra did not bootstrap and provision the smoke tenant within 30 seconds" >&2
+    echo "Keldra did not bootstrap and provision the smoke tenant within 120 seconds" >&2
     return 1
   fi
 

@@ -498,10 +498,7 @@ mod tests {
         assert_eq!(response.aggregate_results[0].contributing_count, 4);
 
         let set = descriptors();
-        assert_eq!(
-            field_number(&set, "IndexPredicateExpression", "predicate"),
-            5
-        );
+        assert_eq!(field_number(&set, "TypedJsonIndexQuery", "predicate"), 5);
         assert_eq!(
             field_number(&set, "MetadataFilterIndexQuery", "predicate"),
             2
