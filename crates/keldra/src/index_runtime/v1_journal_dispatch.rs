@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use keldra_index::v1::IndexingMemoryPermit;
+use keldra_index::v1::{IndexingMemoryPermit, MemoryAdmission};
 use keldra_store::{LocalChange, ObjectHeadChange, PlacementLogId, SourceId};
 use tonic::Status;
 
@@ -42,23 +42,29 @@ pub(crate) struct V1OrderedSourceDispatcher {
     assigned_sources: BTreeSet<SourceId>,
     ordinary: BTreeMap<SourceId, BTreeMap<u64, ObjectHeadChange>>,
     maximum_control_entries: usize,
-    _control_memory: IndexingMemoryPermit,
+    control_memory: IndexingMemoryPermit,
 }
 
 impl V1OrderedSourceDispatcher {
+    const CONTROL_ENTRY_BYTES: usize = 512;
+    const EMPTY_CONTROL_BYTES: usize = 1;
+
     pub(crate) fn new(
         assignment_fence: PlacementLogId,
         assigned_sources: BTreeSet<SourceId>,
-        control_memory: IndexingMemoryPermit,
+        mut control_memory: IndexingMemoryPermit,
         control_memory_bytes: usize,
     ) -> Self {
+        control_memory
+            .shrink_to(Self::EMPTY_CONTROL_BYTES)
+            .expect("v1 dispatcher control permit admits its empty state");
         Self {
             atomic: AtomicFinalizationDispatcher::default(),
             assignment_fence,
             assigned_sources,
             ordinary: BTreeMap::new(),
-            maximum_control_entries: (control_memory_bytes / 512).max(1),
-            _control_memory: control_memory,
+            maximum_control_entries: (control_memory_bytes / Self::CONTROL_ENTRY_BYTES).max(1),
+            control_memory,
         }
     }
 
@@ -101,16 +107,30 @@ impl V1OrderedSourceDispatcher {
         );
         let atomic_addition = self.atomic.maximum_added_entries(change)?;
         let retained = self
-            .atomic
-            .retained_entries()
-            .checked_add(self.ordinary.values().map(BTreeMap::len).sum())
-            .and_then(|entries| entries.checked_add(ordinary_addition))
+            .retained_control_entries()?
+            .checked_add(ordinary_addition)
             .and_then(|entries| entries.checked_add(atomic_addition))
             .ok_or_else(|| Status::resource_exhausted("v1 control backlog size overflow"))?;
         if retained > self.maximum_control_entries {
             return Err(Status::resource_exhausted(
                 "v1 ordered control backlog exhausted its pipeline credit",
             ));
+        }
+        let admitted_bytes = retained
+            .checked_mul(Self::CONTROL_ENTRY_BYTES)
+            .ok_or_else(|| Status::resource_exhausted("v1 control backlog byte size overflow"))?
+            .max(Self::EMPTY_CONTROL_BYTES);
+        match self.control_memory.grow_to(admitted_bytes) {
+            Ok(()) => {}
+            Err(MemoryAdmission::ReplayRequired {
+                needed_bytes,
+                available_bytes,
+            }) => {
+                return Err(Status::resource_exhausted(format!(
+                    "v1 ordered control backlog needs {needed_bytes} additional bytes but only {available_bytes} are available"
+                )));
+            }
+            Err(MemoryAdmission::Admitted) => unreachable!(),
         }
         let mut delivered = Vec::new();
         let released = self.atomic.observe_all(event_source, change)?;
@@ -151,6 +171,15 @@ impl V1OrderedSourceDispatcher {
                 delivered.extend(self.take_runnable_ordinary(source));
             }
         }
+        let retained_bytes = self
+            .retained_control_entries()
+            .expect("admitted v1 control mutation retains a bounded entry count")
+            .checked_mul(Self::CONTROL_ENTRY_BYTES)
+            .expect("admitted v1 control entry count has a bounded byte size")
+            .max(Self::EMPTY_CONTROL_BYTES);
+        self.control_memory
+            .shrink_to(retained_bytes)
+            .expect("the admitted v1 control bound covers exact retained entries");
         Ok(delivered)
     }
 
@@ -166,6 +195,15 @@ impl V1OrderedSourceDispatcher {
 
     fn is_assigned(&self, source: SourceId) -> bool {
         self.assigned_sources.contains(&source)
+    }
+
+    fn retained_control_entries(&self) -> Result<usize, Status> {
+        self.ordinary
+            .values()
+            .try_fold(self.atomic.retained_entries(), |entries, queued| {
+                entries.checked_add(queued.len())
+            })
+            .ok_or_else(|| Status::resource_exhausted("v1 control backlog size overflow"))
     }
 
     fn take_runnable_ordinary(&mut self, source: SourceId) -> Vec<V1SourceDispatch> {
@@ -262,7 +300,12 @@ mod tests {
         sources: impl IntoIterator<Item = SourceId>,
     ) -> V1OrderedSourceDispatcher {
         let bytes = 1024 * 1024;
-        let credits = IndexingMemoryCredits::new(
+        let credits = credits(bytes);
+        assignment_on(&credits, bytes, fence_index, sources)
+    }
+
+    fn credits(bytes: usize) -> IndexingMemoryCredits {
+        IndexingMemoryCredits::new(
             bytes,
             IndexingMemoryLimits {
                 hot_payload_bytes: bytes,
@@ -274,7 +317,15 @@ mod tests {
                 ordering_catalog_bytes: bytes,
             },
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn assignment_on(
+        credits: &IndexingMemoryCredits,
+        control_memory_bytes: usize,
+        fence_index: u64,
+        sources: impl IntoIterator<Item = SourceId>,
+    ) -> V1OrderedSourceDispatcher {
         V1OrderedSourceDispatcher::new(
             PlacementLogId {
                 term: 1,
@@ -282,10 +333,68 @@ mod tests {
             },
             sources.into_iter().collect(),
             credits
-                .acquire(IndexingMemoryStage::ReplayInput, bytes)
+                .acquire(IndexingMemoryStage::ReplayInput, 1)
                 .unwrap(),
-            bytes,
+            control_memory_bytes,
         )
+    }
+
+    #[test]
+    fn idle_dispatchers_retain_only_the_empty_control_admission() {
+        let memory = credits(16 * 1024);
+        let dispatchers = (0..8)
+            .map(|index| assignment_on(&memory, 1024, index, [source(index as u16 + 1)]))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::ReplayInput),
+            dispatchers.len()
+        );
+    }
+
+    #[test]
+    fn observation_grows_then_shrinks_control_admission_to_retained_entries() {
+        let memory = credits(4096);
+        let local = source(7);
+        let executor = source(9);
+        let mut dispatcher = assignment_on(&memory, 4096, 2, [local]);
+        assert_eq!(memory.stage_used_bytes(IndexingMemoryStage::ReplayInput), 1);
+
+        assert!(dispatcher.observe(local, &held(4, 12)).unwrap().is_empty());
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::ReplayInput),
+            512
+        );
+
+        let delivered = dispatcher
+            .observe(executor, &published(12, vec![(local, 4)]))
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        // Publication admission conservatively covers five entries (2,560
+        // bytes), then drops to the two replay identities actually retained.
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::ReplayInput),
+            1024
+        );
+    }
+
+    #[test]
+    fn refused_control_growth_does_not_observe_the_change() {
+        let memory = credits(512);
+        let local = source(7);
+        let mut dispatcher = assignment_on(&memory, 512, 2, [local]);
+        let blocker = memory
+            .acquire(IndexingMemoryStage::HotPayload, 511)
+            .unwrap();
+
+        let error = dispatcher.observe(local, &held(4, 12)).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(dispatcher.checkpoint_limit(local, 5), 5);
+        assert_eq!(memory.stage_used_bytes(IndexingMemoryStage::ReplayInput), 1);
+
+        drop(blocker);
+        assert!(dispatcher.observe(local, &held(4, 12)).unwrap().is_empty());
+        assert_eq!(dispatcher.checkpoint_limit(local, 5), 4);
     }
 
     #[test]

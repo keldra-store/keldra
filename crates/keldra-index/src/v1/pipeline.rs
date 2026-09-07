@@ -86,7 +86,7 @@ impl IndexingMemoryPermit {
 
     /// Grow an existing reservation without releasing its current admission.
     /// Failure leaves the permit and the shared accounting unchanged.
-    pub(crate) fn grow_to(&mut self, bytes: usize) -> Result<(), MemoryAdmission> {
+    pub fn grow_to(&mut self, bytes: usize) -> Result<(), MemoryAdmission> {
         if bytes <= self.bytes {
             return Ok(());
         }
@@ -568,6 +568,8 @@ pub struct PartitionProjectionAccumulator {
 }
 
 impl PartitionProjectionAccumulator {
+    const EMPTY_BUFFER_ADMISSION_BYTES: usize = 1;
+
     pub fn new(
         source_scope: [u8; 32],
         partition: ProjectionPartitionIdentity,
@@ -584,10 +586,10 @@ impl PartitionProjectionAccumulator {
         let buffer_permit = credits
             .acquire(
                 IndexingMemoryStage::ProjectionAccumulator,
-                buffer_limit_bytes,
+                Self::EMPTY_BUFFER_ADMISSION_BYTES,
             )
             .map_err(|_| IndexError::ResourceLimit {
-                needed: buffer_limit_bytes,
+                needed: Self::EMPTY_BUFFER_ADMISSION_BYTES,
                 limit: credits.total_limit_bytes(),
             })?;
         Ok(Self {
@@ -656,24 +658,73 @@ impl PartitionProjectionAccumulator {
             )
         });
         match applied {
-            Ok(()) => match self.buffer.merge_overlay(overlay) {
-                Ok(()) => {
-                    self.next_offset = next_offset;
-                    Ok(ProjectionBatchAdmission::Applied {
-                        source_rows,
-                        coalesced_rows,
-                        next_offset,
-                    })
+            Ok(()) => {
+                // The overlay and accumulated buffer account the same component
+                // again when a key is replaced. Their saturated sum is therefore
+                // a conservative pre-merge bound; cap it at the unchanged logical
+                // buffer limit, then shrink to the exact merged residency below.
+                let admitted_merge_bytes = self
+                    .buffer
+                    .used_bytes()
+                    .saturating_add(overlay.used_bytes())
+                    .min(self.buffer_limit_bytes)
+                    .max(Self::EMPTY_BUFFER_ADMISSION_BYTES);
+                match self._buffer_permit.grow_to(admitted_merge_bytes) {
+                    Ok(()) => {}
+                    Err(MemoryAdmission::ReplayRequired {
+                        needed_bytes,
+                        available_bytes,
+                    }) => {
+                        return Ok(ProjectionBatchAdmission::ReplayRequired {
+                            from_offset: self.next_offset,
+                            needed_bytes,
+                            available_bytes,
+                        });
+                    }
+                    Err(MemoryAdmission::Admitted) => unreachable!(),
                 }
-                Err(IndexError::ResourceLimit { needed, limit }) => {
-                    Ok(ProjectionBatchAdmission::ReplayRequired {
-                        from_offset: self.next_offset,
-                        needed_bytes: needed,
-                        available_bytes: limit.saturating_sub(self.buffer.used_bytes()),
-                    })
+                match self.buffer.merge_overlay(overlay) {
+                    Ok(()) => {
+                        self._buffer_permit
+                            .shrink_to(
+                                self.buffer
+                                    .used_bytes()
+                                    .max(Self::EMPTY_BUFFER_ADMISSION_BYTES),
+                            )
+                            .expect("the admitted projection buffer covers its resident bytes");
+                        self.next_offset = next_offset;
+                        Ok(ProjectionBatchAdmission::Applied {
+                            source_rows,
+                            coalesced_rows,
+                            next_offset,
+                        })
+                    }
+                    Err(IndexError::ResourceLimit { needed, limit }) => {
+                        self._buffer_permit
+                            .shrink_to(
+                                self.buffer
+                                    .used_bytes()
+                                    .max(Self::EMPTY_BUFFER_ADMISSION_BYTES),
+                            )
+                            .expect("a refused merge leaves the projection buffer unchanged");
+                        Ok(ProjectionBatchAdmission::ReplayRequired {
+                            from_offset: self.next_offset,
+                            needed_bytes: needed,
+                            available_bytes: limit.saturating_sub(self.buffer.used_bytes()),
+                        })
+                    }
+                    Err(error) => {
+                        self._buffer_permit
+                            .shrink_to(
+                                self.buffer
+                                    .used_bytes()
+                                    .max(Self::EMPTY_BUFFER_ADMISSION_BYTES),
+                            )
+                            .expect("a failed merge leaves the projection buffer unchanged");
+                        Err(error)
+                    }
                 }
-                Err(error) => Err(error),
-            },
+            }
             Err(IndexError::ResourceLimit { needed, limit }) => {
                 Ok(ProjectionBatchAdmission::ReplayRequired {
                     from_offset: self.next_offset,
@@ -699,6 +750,8 @@ impl PartitionProjectionAccumulator {
             ProjectionMutationBuffer::new(self.buffer_limit_bytes)?,
         )
         .seal()?;
+        self._buffer_permit
+            .shrink_to(Self::EMPTY_BUFFER_ADMISSION_BYTES)?;
         Ok(ChargedSealedPartitionProjection {
             projection: SealedPartitionProjection {
                 checkpoint: PartitionProjectionCheckpoint {
@@ -716,7 +769,7 @@ impl PartitionProjectionAccumulator {
 mod tests {
     use super::*;
     use crate::v1::{
-        CanonicalRecipeState, ComponentIdentity, DocumentHead, RecipeIdentity,
+        CanonicalRecipeState, ComponentIdentity, DocumentHead, QueryBlockCredits, RecipeIdentity,
         decode_component_delta_segment, decode_document_head,
     };
 
@@ -832,9 +885,109 @@ mod tests {
         ));
         assert_eq!(accumulator.next_offset(), 7);
         assert_eq!(accumulator.buffered_bytes(), 0);
-        assert_eq!(memory.used_bytes(), 1024);
+        assert_eq!(memory.used_bytes(), 1);
         drop(accumulator);
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn empty_accumulators_retain_only_minimum_admission_and_leave_query_headroom() {
+        let memory = credits(4096);
+        let accumulators = (0..8)
+            .map(|offset| {
+                PartitionProjectionAccumulator::new(
+                    [9; 32],
+                    partition(),
+                    offset,
+                    1024,
+                    memory.clone(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::ProjectionAccumulator),
+            accumulators.len()
+        );
+
+        let permit = memory
+            .acquire(IndexingMemoryStage::OrderingCatalog, 1)
+            .unwrap();
+        let mut query = QueryBlockCredits::from_growable_pipeline_permit(permit, 1024).unwrap();
+        query.reserve(64).unwrap();
+
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::OrderingCatalog),
+            64
+        );
+    }
+
+    #[test]
+    fn accumulator_retains_actual_buffer_bytes_and_resets_after_seal() {
+        let memory = credits(256 * 1024);
+        let mut accumulator =
+            PartitionProjectionAccumulator::new([9; 32], partition(), 0, 64 * 1024, memory.clone())
+                .unwrap();
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::ProjectionAccumulator),
+            1
+        );
+
+        let batch =
+            PreparedProjectionBatch::new([9; 32], 0, 1, vec![row(0, "objects/a", 1, b"value")])
+                .unwrap();
+        accumulator
+            .apply_batch(charged(&memory, batch), BTreeMap::new())
+            .unwrap();
+        assert!(accumulator.buffered_bytes() > 1);
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::ProjectionAccumulator),
+            accumulator.buffered_bytes()
+        );
+
+        let sealed = accumulator.seal_and_reset().unwrap();
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::ProjectionAccumulator),
+            1
+        );
+        drop(sealed);
+    }
+
+    #[test]
+    fn accumulator_growth_refusal_leaves_buffer_and_checkpoint_unchanged() {
+        let total = 256 * 1024;
+        let memory = IndexingMemoryCredits::new(
+            total,
+            IndexingMemoryLimits {
+                hot_payload_bytes: total,
+                worker_scratch_bytes: total,
+                prepared_rows_bytes: total,
+                replay_input_bytes: total,
+                projection_accumulator_bytes: 1,
+                seal_scratch_bytes: total,
+                ordering_catalog_bytes: total,
+            },
+        )
+        .unwrap();
+        let mut accumulator =
+            PartitionProjectionAccumulator::new([9; 32], partition(), 7, 64 * 1024, memory.clone())
+                .unwrap();
+        let batch =
+            PreparedProjectionBatch::new([9; 32], 7, 8, vec![row(7, "objects/a", 1, b"value")])
+                .unwrap();
+
+        assert!(matches!(
+            accumulator
+                .apply_batch(charged(&memory, batch), BTreeMap::new())
+                .unwrap(),
+            ProjectionBatchAdmission::ReplayRequired { from_offset: 7, .. }
+        ));
+        assert_eq!(accumulator.next_offset(), 7);
+        assert_eq!(accumulator.buffered_bytes(), 0);
+        assert_eq!(
+            memory.stage_used_bytes(IndexingMemoryStage::ProjectionAccumulator),
+            1
+        );
     }
 
     #[test]
@@ -1138,9 +1291,9 @@ mod tests {
         let accumulator_charge = memory.used_bytes();
         let sealed = accumulator.seal_and_reset().unwrap();
         assert_eq!(sealed.projection.checkpoint.next_offset, 1);
-        assert!(memory.used_bytes() > accumulator_charge);
+        assert_eq!(memory.used_bytes(), accumulator_charge + 1);
         drop(sealed);
-        assert_eq!(memory.used_bytes(), accumulator_charge);
+        assert_eq!(memory.used_bytes(), 1);
 
         let empty = PreparedProjectionBatch::new([9; 32], 1, 5, Vec::new()).unwrap();
         accumulator

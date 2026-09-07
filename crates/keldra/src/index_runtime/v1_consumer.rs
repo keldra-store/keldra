@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_index::v1::{
     IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryPermit, IndexingMemoryStage,
-    PartitionProjectionAccumulator, PreparedProjectionBatchReservation, PreparedProjectionRow,
-    PreparedQueryMutationBatch, ProjectionBatchAdmission, ProjectionPackCredits,
-    ProjectionPartitionIdentity, QueryBlockCredits,
+    MemoryAdmission, PartitionProjectionAccumulator, PreparedProjectionBatchReservation,
+    PreparedProjectionRow, PreparedQueryMutationBatch, ProjectionBatchAdmission,
+    ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits,
 };
 use keldra_store::{ObjectHeadChange, ObjectHeadChangeKind, ObjectKey, SourceId, VersionId};
 use tonic::Status;
@@ -32,6 +32,7 @@ use super::v1_publication::{
 
 const RETRY: Duration = Duration::from_millis(250);
 const SAFETY_RECONCILE: Duration = Duration::from_secs(30);
+const JOURNAL_PAGE_RESIDENT_MULTIPLIER: usize = 4;
 
 pub(crate) struct V1IndexProducerTask {
     task: tokio::task::JoinHandle<()>,
@@ -77,7 +78,7 @@ struct Writer {
     pending_operations: u64,
     pending_next: u64,
     pending_mutation_capacity: usize,
-    _pending_mutation_permit: IndexingMemoryPermit,
+    pending_mutation_permit: IndexingMemoryPermit,
 }
 
 #[derive(Clone, Debug)]
@@ -328,7 +329,7 @@ async fn open_writer(
     }
     let control_bytes = limits.bytes.saturating_div(16).max(512);
     let control = credits
-        .acquire(IndexingMemoryStage::ReplayInput, control_bytes)
+        .acquire(IndexingMemoryStage::ReplayInput, 1)
         .map_err(|_| Status::resource_exhausted("v1 control memory unavailable"))?;
     let dispatcher = V1OrderedSourceDispatcher::new(
         target.fence,
@@ -359,7 +360,7 @@ async fn open_writer(
     );
     let pending_mutation_capacity = limits.flush_bytes.max(1);
     let pending_mutation_permit = credits
-        .acquire(IndexingMemoryStage::ReplayInput, pending_mutation_capacity)
+        .acquire(IndexingMemoryStage::ReplayInput, 1)
         .map_err(|_| Status::resource_exhausted("v1 mutation-window memory unavailable"))?;
     Ok(Writer {
         recipe,
@@ -384,7 +385,7 @@ async fn open_writer(
         pending_operations: 0,
         pending_next: accumulator_start,
         pending_mutation_capacity,
-        _pending_mutation_permit: pending_mutation_permit,
+        pending_mutation_permit,
     })
 }
 
@@ -538,41 +539,53 @@ async fn advance(
         .unwrap_or(u64::MAX)
         .min(MAX_INDEX_EVENT_PAGE_BYTES)
         .max(1);
-    if let Some(page) = journal
-        .next_page(
-            writer.recipe.family.tenant_id,
-            writer.recipe.family.bucket_id,
-            &writer.scanned,
-            target,
-            max_page,
-        )
-        .await
-        .map_err(event_status)?
+    let page_memory_bytes = usize::try_from(max_page)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(JOURNAL_PAGE_RESIDENT_MULTIPLIER)
+        .max(1);
+    // Charge the encoded page, decoded changes, dispatcher output, and
+    // mutation clones before reading any of them. This permit is transient;
+    // only the coalesced mutation window remains charged after this advance.
     {
-        let mut dispatches = Vec::new();
-        for change in &page.changes {
-            let event_source = page.through.sources[&change.node].source;
-            dispatches.extend(writer.dispatcher.observe(event_source, &change.change)?);
-        }
-        writer.scanned = page.through;
-        let node = NodeId(u64::from(writer.source.node_id));
-        let proposed = writer.scanned.sources[&node].next_offset;
-        let safe_next = writer.dispatcher.checkpoint_limit(writer.source, proposed);
-        if safe_next > writer.pending_next {
-            let (page_atomic, mutations) = prepare_page(writer, dispatches, safe_next)?;
-            if !writer.pending_mutations.is_empty()
-                && mutation_window_needed(
-                    &writer.pending_mutations,
-                    writer.pending_mutation_bytes,
-                    &mutations,
-                )? > writer.pending_mutation_capacity
-            {
-                flush(writer, reader, extractor, publisher, credits, limits).await?;
+        let _page_memory = credits
+            .acquire(IndexingMemoryStage::ReplayInput, page_memory_bytes)
+            .map_err(|_| Status::resource_exhausted("v1 journal-page memory unavailable"))?;
+        if let Some(page) = journal
+            .next_page(
+                writer.recipe.family.tenant_id,
+                writer.recipe.family.bucket_id,
+                &writer.scanned,
+                target,
+                max_page,
+            )
+            .await
+            .map_err(event_status)?
+        {
+            let mut dispatches = Vec::new();
+            for change in &page.changes {
+                let event_source = page.through.sources[&change.node].source;
+                dispatches.extend(writer.dispatcher.observe(event_source, &change.change)?);
             }
-            writer.through_atomic = writer.through_atomic.max(page_atomic);
-            queue_mutations(writer, mutations, safe_next)?;
-            if should_flush(writer, limits) {
-                flush(writer, reader, extractor, publisher, credits, limits).await?;
+            writer.scanned = page.through;
+            let node = NodeId(u64::from(writer.source.node_id));
+            let proposed = writer.scanned.sources[&node].next_offset;
+            let safe_next = writer.dispatcher.checkpoint_limit(writer.source, proposed);
+            if safe_next > writer.pending_next {
+                let (page_atomic, mutations) = prepare_page(writer, dispatches, safe_next)?;
+                if !writer.pending_mutations.is_empty()
+                    && mutation_window_needed(
+                        &writer.pending_mutations,
+                        writer.pending_mutation_bytes,
+                        &mutations,
+                    )? > writer.pending_mutation_capacity
+                {
+                    flush(writer, reader, extractor, publisher, credits, limits).await?;
+                }
+                writer.through_atomic = writer.through_atomic.max(page_atomic);
+                queue_mutations(writer, mutations, safe_next)?;
+                if should_flush(writer, limits) {
+                    flush(writer, reader, extractor, publisher, credits, limits).await?;
+                }
             }
         }
     }
@@ -611,15 +624,42 @@ fn queue_mutations(
     safe_next: u64,
 ) -> Result<(), Status> {
     let arms_age = !mutations.is_empty();
-    queue_mutation_window(
+    let needed = mutation_window_needed(
+        &writer.pending_mutations,
+        writer.pending_mutation_bytes,
+        &mutations,
+    )?;
+    if needed > writer.pending_mutation_capacity {
+        return Err(Status::resource_exhausted(format!(
+            "v1 mutation window requires {needed} bytes but admits {}",
+            writer.pending_mutation_capacity
+        )));
+    }
+    match writer.pending_mutation_permit.grow_to(needed.max(1)) {
+        Ok(()) => {}
+        Err(MemoryAdmission::ReplayRequired {
+            needed_bytes,
+            available_bytes,
+        }) => {
+            return Err(Status::resource_exhausted(format!(
+                "v1 mutation window needs {needed_bytes} additional bytes but only {available_bytes} are available"
+            )));
+        }
+        Err(MemoryAdmission::Admitted) => unreachable!(),
+    }
+    apply_mutation_window(
         &mut writer.pending_mutations,
         &mut writer.pending_mutation_bytes,
         &mut writer.pending_operations,
         &mut writer.pending_next,
-        writer.pending_mutation_capacity,
+        needed,
         mutations,
         safe_next,
     )?;
+    writer
+        .pending_mutation_permit
+        .shrink_to(needed.max(1))
+        .map_err(index_status)?;
     if arms_age {
         writer.since.get_or_insert_with(Instant::now);
     }
@@ -643,6 +683,27 @@ fn queue_mutation_window(
             capacity
         )));
     }
+    apply_mutation_window(
+        latest,
+        resident_bytes,
+        observed_operations,
+        next_offset,
+        needed,
+        mutations,
+        safe_next,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_mutation_window(
+    latest: &mut BTreeMap<String, Mutation>,
+    resident_bytes: &mut usize,
+    observed_operations: &mut u64,
+    next_offset: &mut u64,
+    needed: usize,
+    mutations: Vec<Mutation>,
+    safe_next: u64,
+) -> Result<(), Status> {
     let operations = u64::try_from(mutations.len())
         .map_err(|_| Status::resource_exhausted("v1 mutation-window operations overflow"))?;
     for mutation in mutations {
@@ -977,9 +1038,7 @@ async fn flush(
         .await?;
     }
     if !has_publication_work(writer.current.is_some(), writer.pending_prepared_rows) {
-        writer.pending_mutations.clear();
-        writer.pending_mutation_bytes = 0;
-        writer.pending_operations = 0;
+        clear_pending_mutations(writer)?;
         writer.since = None;
         return Ok(());
     }
@@ -1156,10 +1215,18 @@ async fn flush(
     writer.pending_prepared_rows = 0;
     writer.pending_prepared_bytes = 0;
     writer.pending_projected_rows = 0;
+    clear_pending_mutations(writer)?;
+    Ok(())
+}
+
+fn clear_pending_mutations(writer: &mut Writer) -> Result<(), Status> {
     writer.pending_mutations.clear();
     writer.pending_mutation_bytes = 0;
     writer.pending_operations = 0;
-    Ok(())
+    writer
+        .pending_mutation_permit
+        .shrink_to(1)
+        .map_err(index_status)
 }
 
 fn dispatch_mutations(dispatch: V1SourceDispatch) -> Result<(u64, Vec<Mutation>), Status> {
