@@ -147,6 +147,7 @@ fn validate_transport_endpoint(
     }
     let loopback = uri
         .host()
+        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
         .and_then(|host| host.parse::<std::net::IpAddr>().ok())
         .is_some_and(|address| address.is_loopback());
     if uri.scheme_str() == Some("http") && loopback {
