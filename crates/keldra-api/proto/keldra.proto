@@ -1252,9 +1252,9 @@ message ProvisionTenantResponse {
 }
 
 // Application IDs and client IDs are cluster-wide authentication identities;
-// each is globally unique. An application has exactly one client credential
-// in Keldra 0.9. Supplying the same canonical application, client ID and secret is
-// an idempotent replay.
+// each is globally unique. An application has exactly one client credential.
+// Supplying the same canonical application, client ID and secret is an
+// idempotent replay.
 message CreateApplicationRequest {
   string app_id = 1;
   string client_id = 2;
@@ -1507,7 +1507,7 @@ message TupleToUsersetRule {
   string target_relation = 2;
 }
 
-// A 0.5 schema contains at most 256 namespaces, 256 members per namespace,
+// A schema contains at most 256 namespaces, 256 members per namespace,
 // and 256 selectors or rules per member. Publication canonicalizes the body:
 // replaying identical content returns the same SchemaRef, while changed
 // content creates the next immutable revision for the schema ID.
@@ -1575,7 +1575,7 @@ message TupleMutation {
 }
 
 // The non-empty batch is one all-or-nothing set mutation in one realm. Add
-// and remove are idempotent. The 0.5 hard limit is 1000 mutations and the
+// and remove are idempotent. The hard limit is 1000 mutations and the
 // operation ID is limited to 128 UTF-8 bytes. Reusing an operation ID with a
 // different canonical input is rejected.
 message MutateTuplesRequest {
@@ -1614,7 +1614,7 @@ message TupleFilter {
 
 message AuthzConsistency {
   // Latest evaluates the current authoritative revision. AtLeast evaluates
-  // current state only when it has reached the requested revision. Keldra 0.9
+  // current state only when it has reached the requested revision. Keldra
   // retains only current authorization state: Exact(current) succeeds and an
   // older exact revision fails with AUTHZ_REVISION_EXPIRED.
   oneof requirement {
@@ -1635,7 +1635,7 @@ message ExactRevision {
 }
 
 // An absent consistency value means latest. page_size zero selects the server
-// default of 100; the 0.5 hard maximum is 1000. page_token is opaque and
+// default of 100; the hard maximum is 1000. page_token is opaque and
 // limited to 128 KiB. A returned token pins its continuation to the same
 // filters and revision; a no-longer-current revision fails rather than moving.
 message ReadTuplesRequest {

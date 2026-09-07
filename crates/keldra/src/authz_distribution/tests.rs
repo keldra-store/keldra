@@ -798,18 +798,20 @@ async fn coordinator_gate_allows_reads_and_excludes_writes() {
         }),
         coordinator_lanes: coordinator_lanes(),
     };
-    let first_reader = core.coordinator_lane(2718).read().await;
+    let realm = scope();
+    let first_reader = core.realm_lane(2718, &realm).read().await;
     let second_reader = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        core.coordinator_lane(2718).read(),
+        core.realm_lane(2718, &realm).read(),
     )
     .await
     .expect("independent coordinator readers must overlap");
 
     let contender = core.clone();
+    let contender_realm = realm.clone();
     let (writer_entered_tx, mut writer_entered_rx) = tokio::sync::mpsc::channel(1);
     let writer = tokio::spawn(async move {
-        let _writer = contender.coordinator_lane(2718).write().await;
+        let _writer = contender.realm_lane(2718, &contender_realm).write().await;
         writer_entered_tx.send(()).await.unwrap();
     });
     assert!(
@@ -843,11 +845,13 @@ async fn coordinator_gate_writer_excludes_reads() {
         }),
         coordinator_lanes: coordinator_lanes(),
     };
-    let writer = core.coordinator_lane(2719).write().await;
+    let realm = scope();
+    let writer = core.realm_lane(2719, &realm).write().await;
     let contender = core.clone();
+    let contender_realm = realm.clone();
     let (reader_entered_tx, mut reader_entered_rx) = tokio::sync::mpsc::channel(1);
     let reader = tokio::spawn(async move {
-        let _reader = contender.coordinator_lane(2719).read().await;
+        let _reader = contender.realm_lane(2719, &contender_realm).read().await;
         reader_entered_tx.send(()).await.unwrap();
     });
     assert!(
@@ -881,21 +885,73 @@ async fn coordinator_lanes_do_not_couple_unrelated_tenants() {
         coordinator_lanes: coordinator_lanes(),
     };
     let first_tenant = 1_u64;
+    assert!(std::ptr::eq(
+        core.tenant_lane(first_tenant),
+        core.tenant_lane(first_tenant)
+    ));
     let other_tenant = (2_u64..)
-        .find(|tenant| {
-            !std::ptr::eq(
-                core.coordinator_lane(first_tenant),
-                core.coordinator_lane(*tenant),
-            )
-        })
+        .take(AUTHZ_COORDINATOR_LANES * 2)
+        .find(|tenant| !std::ptr::eq(core.tenant_lane(first_tenant), core.tenant_lane(*tenant)))
         .unwrap();
-    let _writer = core.coordinator_lane(first_tenant).write().await;
+    let _writer = core.tenant_lane(first_tenant).write().await;
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        core.coordinator_lane(other_tenant).read(),
+        core.tenant_lane(other_tenant).read(),
     )
     .await
     .expect("unrelated tenant lanes must make progress");
+}
+
+#[tokio::test]
+async fn realm_lanes_are_deterministic_and_include_scope() {
+    let (_root, stores) = stores().await;
+    let replicas = replica_set(2722);
+    let coordinator = replicas.group.coordinator();
+    let core = AuthzDistributionCore {
+        local_node: coordinator,
+        repository: stores[&coordinator].authz(),
+        peers: Arc::new(StoreTransport {
+            stores,
+            ..Default::default()
+        }),
+        coordinator_lanes: coordinator_lanes(),
+    };
+    let first = scope();
+    assert!(std::ptr::eq(
+        core.realm_lane(2722, &first),
+        core.realm_lane(2722, &first)
+    ));
+
+    let other = (0_u64..)
+        .take(AUTHZ_COORDINATOR_LANES * 2)
+        .map(|suffix| {
+            AuthzScope::new(tenant(), RealmId::parse(format!("other-{suffix}")).unwrap()).unwrap()
+        })
+        .find(|candidate| {
+            !std::ptr::eq(
+                core.realm_lane(2722, &first),
+                core.realm_lane(2722, candidate),
+            )
+        })
+        .expect("scope hashing must use more than one fixed lane");
+    assert!(!std::ptr::eq(
+        core.realm_lane(2722, &first),
+        core.realm_lane(2722, &other)
+    ));
+
+    let other_tenant = (2723_u64..)
+        .take(AUTHZ_COORDINATOR_LANES * 2)
+        .find(|tenant| {
+            !std::ptr::eq(
+                core.realm_lane(2722, &first),
+                core.realm_lane(*tenant, &first),
+            )
+        })
+        .expect("realm lane hashing must include the stable tenant");
+    assert!(!std::ptr::eq(
+        core.realm_lane(2722, &first),
+        core.realm_lane(other_tenant, &first)
+    ));
 }
 
 #[tokio::test]
@@ -961,7 +1017,7 @@ async fn concurrent_fresh_reads_install_the_same_quorum_winner() {
         let barrier = barrier.clone();
         tasks.spawn(async move {
             barrier.wait().await;
-            let _serial = core.coordinator_lane(2720).read().await;
+            let _serial = core.realm_lane(2720, &realm).read().await;
             core.fresh_check(
                 &replicas,
                 realm,

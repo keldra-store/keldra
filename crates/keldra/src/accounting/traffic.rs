@@ -56,8 +56,7 @@ impl AccountingTraffic {
         // deliberately process-local. Give each process incarnation its own
         // batch epoch so sequence numbers restarted at one cannot replay an
         // earlier process's acknowledged traffic command IDs.
-        let mut hasher =
-            blake3::Hasher::new_derive_key("keldra 0.7 accounting traffic batch epoch");
+        let mut hasher = blake3::Hasher::new_derive_key("keldra v1 accounting traffic batch epoch");
         hasher.update(&source.source_epoch);
         hasher.update(uuid::Uuid::new_v4().as_bytes());
         let source = SourceId {
