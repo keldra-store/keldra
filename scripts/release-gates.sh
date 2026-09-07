@@ -71,7 +71,7 @@ image_gates() (
   cleanup_image_gate() {
     docker rm --force "${container}" >/dev/null 2>&1 || true
     docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
-      rm -rf /smoke/data /smoke/signing-key /smoke/payload /smoke/replacement \
+      rm -rf /smoke/data /smoke/signing-key /smoke/owner-client-secret /smoke/payload /smoke/replacement \
       >/dev/null 2>&1 || true
     rm -rf "${scratch}"
   }
@@ -103,6 +103,10 @@ image_gates() (
 
   local owner_client_id="smoke-owner-client"
   local owner_client_secret="smoke-owner-secret-with-at-least-32-bytes"
+  printf '%s' "${owner_client_secret}" >"${scratch}/owner-client-secret"
+  chmod 0600 "${scratch}/owner-client-secret"
+  docker run --rm --user 0 --volume "${scratch}:/smoke" "${image}" \
+    chown 10001:10001 /smoke/owner-client-secret
   local ready=0
   local attempt
   for attempt in $(seq 1 120); do
@@ -110,7 +114,8 @@ image_gates() (
     probe="$(
       docker run --rm --network "container:${container}" \
         --volume "${scratch}/data:/var/lib/keldra:ro" \
-        --env KELDRA_NEW_CLIENT_SECRET="${owner_client_secret}" \
+        --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+        --env KELDRA_NEW_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
         "${image}" \
         keldra --endpoint http://127.0.0.1:50051 \
         --credentials-file /var/lib/keldra/system-bootstrap-credential.json \

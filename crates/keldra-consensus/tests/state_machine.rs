@@ -79,15 +79,17 @@ fn commit(
     batch: BeginBatch,
 ) -> Result<CommitResult, ApplyError> {
     let result = state.apply(log_id(log_index), &Command::BeginBatch(batch))?;
-    if let ApplyResult::BatchBegun(BeginResult::AlreadyCommitted(result)) = result {
-        return Ok(result);
-    }
+    let begin_cursor = match result {
+        ApplyResult::BatchBegun(BeginResult::AlreadyCommitted(result)) => return Ok(result),
+        ApplyResult::BatchBegun(BeginResult::Prepared { batch, .. }) => batch.begin_cursor,
+        _ => unreachable!(),
+    };
     let result = state.apply(
         log_id(log_index),
         &Command::CommitPreparedBatch(CommitPreparedBatch {
             executor: batch.executor,
             nomination_log_index: batch.nomination_log_index,
-            begin_cursor: log_index,
+            begin_cursor,
             invocation_id: batch.invocation_id,
             participant_manifest_hash: batch.participant_manifest_hash,
         }),
