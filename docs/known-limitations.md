@@ -29,7 +29,17 @@ v1 metrics in [observability](observability.md).
 | Catalog scale | Logical definitions are compact catalog rows. Equivalent definitions share a physical recipe, extraction, and immutable segment work. Distinct physical recipes still require distinct projection and segment output, so P rather than logical definition count D is the steady-state indexing multiplier. |
 | Query materialization | Queries execute against an exact published root vector for one atomic cut. A cold query node may need to fetch and materialize immutable blocks before execution, increasing first-query latency without weakening cut consistency or the authoritative object/version check. |
 | Backpressure | Source journals remain bounded durable recovery authority. If indexing cannot advance its durable checkpoint before retained evidence reaches the configured journal capacity, ingress can be backpressured rather than silently dropping index work. |
-| Qualification | Throughput and catch-up claims require `scripts/qualify-index-v1-ssd-scale.sh` on the attested SSD kit. The ordinary single-node and three-node wrappers intentionally contain no index phase. Sustained qualification covers D1/D64/D1K/D10K/D250K, P1/P4/P16/P64, worker/memory scaling, and 1 KiB plus 96 KiB objects. |
+| Qualification | The three-node release wrapper verifies the Worka-shaped functional contract: an atomic task mutation followed by an all-source ULID/Boolean conjunction through every node at a view covering that atomic cursor. Throughput and catch-up claims still require `scripts/qualify-index-v1-ssd-scale.sh` on the attested SSD kit. Sustained qualification covers D1/D64/D1K/D10K/D250K, P1/P4/P16/P64, worker/memory scaling, and 1 KiB plus 96 KiB objects. |
+
+### Pre-atomic routed pagination
+
+Before the cluster has committed any atomic program, an index view can carry
+atomic cursor zero. Owner-local single-page queries work in that state, but a
+routed peer query rejects the otherwise valid placement-bound view and a page
+continuation treats cursor zero as invalid. This does not affect views after the
+first atomic commit, including the Worka release workflow. Until cursor-zero
+pagination is supported, perform the first atomic commit before relying on
+routed or paginated index queries.
 
 ## Usage accounting
 
