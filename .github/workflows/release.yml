@@ -327,7 +327,6 @@ jobs:
       KELDRA_QUALIFICATION_KEEP: '0'
       KELDRA_QUALIFICATION_VERSION: ${{ needs.release-context.outputs.tag }}
       KELDRA_QUALIFICATION_DISK_BUDGET_BYTES: '21474836480'
-      KELDRA_QUALIFICATION_DISK_LEDGER: ${{ runner.temp }}/keldra-three-node-disk-ledger.jsonl
     steps:
       - name: Checkout release commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -378,6 +377,7 @@ jobs:
         env:
           OCI_ARCHIVE: ${{ runner.temp }}/keldra-image-amd64/keldra-image-amd64.oci.tar
           DIGEST_FILE: ${{ runner.temp }}/keldra-image-amd64/keldra-image-digest-amd64.txt
+          KELDRA_QUALIFICATION_DISK_LEDGER: ${{ runner.temp }}/keldra-three-node-disk-ledger.jsonl
         run: |
           set -euo pipefail
           digest="$(tr -d '[:space:]' <"$DIGEST_FILE")"
