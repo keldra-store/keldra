@@ -325,42 +325,22 @@ struct AuthzDistributionCore {
     local_node: NodeId,
     repository: AuthzRepository,
     peers: Arc<dyn AuthzReplicaTransport>,
-    /// Fixed lanes retain the required tenant-wide schema ordering and
-    /// per-realm ordering without a growing lock registry.
+    /// Fixed tenant lanes retain same-tenant revision and replication ordering
+    /// without a growing lock registry or process-wide head-of-line blocking
+    /// between tenants. Realm mutations cannot use independent lanes while the
+    /// durable authorization revision remains tenant-wide.
     coordinator_lanes: Arc<[tokio::sync::RwLock<()>; AUTHZ_COORDINATOR_LANES]>,
 }
 
 impl AuthzDistributionCore {
-    fn tenant_lane(&self, stable_tenant_id: u64) -> &tokio::sync::RwLock<()> {
-        &self.coordinator_lanes[lane_index(stable_tenant_id)]
+    fn coordinator_lane(&self, stable_tenant_id: u64) -> &tokio::sync::RwLock<()> {
+        let mut hash = stable_tenant_id;
+        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^= hash >> 31;
+        &self.coordinator_lanes[(hash as usize) % AUTHZ_COORDINATOR_LANES]
     }
 
-    fn realm_lane(&self, stable_tenant_id: u64, scope: &AuthzScope) -> &tokio::sync::RwLock<()> {
-        let mut hash = stable_tenant_id ^ 0x517c_c1b7_2722_0a95;
-        hash = hash_lane_component(hash, scope.storage_tenant.as_str().as_bytes());
-        hash = hash_lane_component(hash, scope.realm.as_str().as_bytes());
-        &self.coordinator_lanes[lane_index(hash)]
-    }
-}
-
-fn hash_lane_component(mut hash: u64, bytes: &[u8]) -> u64 {
-    hash ^= bytes.len() as u64;
-    hash = hash.wrapping_mul(0x100_0000_01b3);
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    hash
-}
-
-fn lane_index(mut hash: u64) -> usize {
-    hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    hash ^= hash >> 31;
-    (hash as usize) % AUTHZ_COORDINATOR_LANES
-}
-
-impl AuthzDistributionCore {
     async fn replicate_schema_publication(
         &self,
         replicas: &TenantReplicaSet,
@@ -740,11 +720,7 @@ impl ZanzibarDistribution {
         request: BindSchemaRequest,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         loop {
-            let serial = self
-                .core
-                .realm_lane(stable_tenant_id, &request.scope)
-                .write()
-                .await;
+            let serial = self.core.coordinator_lane(stable_tenant_id).write().await;
             let permit = self.mutation_admission.enter()?;
             let mut replicas = self.require_coordinator(stable_tenant_id)?;
             let serving = self.serving.mutation_context()?;
@@ -787,7 +763,7 @@ impl ZanzibarDistribution {
         request: PublishSchemaRequest,
     ) -> Result<CoordinatedAuthzSchemaPublication, Status> {
         loop {
-            let serial = self.core.tenant_lane(stable_tenant_id).write().await;
+            let serial = self.core.coordinator_lane(stable_tenant_id).write().await;
             let permit = self.mutation_admission.enter()?;
             let replicas = self.require_coordinator(stable_tenant_id)?;
             let serving = self.serving.mutation_context()?;
@@ -822,7 +798,7 @@ impl ZanzibarDistribution {
         stable_tenant_id: u64,
         scope: &AuthzScope,
     ) -> Result<(), Status> {
-        let _serial = self.core.realm_lane(stable_tenant_id, scope).write().await;
+        let _serial = self.core.coordinator_lane(stable_tenant_id).write().await;
         let replicas = self.require_coordinator(stable_tenant_id)?;
         self.serving.mutation_context()?;
         if self.core.reconcile(&replicas, scope).await?.is_none() {
@@ -869,11 +845,7 @@ impl ZanzibarDistribution {
         restore_retained_precondition: bool,
     ) -> Result<CoordinatedAuthzRealmMutation, Status> {
         loop {
-            let serial = self
-                .core
-                .realm_lane(stable_tenant_id, &request.scope)
-                .write()
-                .await;
+            let serial = self.core.coordinator_lane(stable_tenant_id).write().await;
             let permit = self.mutation_admission.enter()?;
             let mut replicas = self.require_coordinator(stable_tenant_id)?;
             let serving = self.serving.mutation_context()?;
@@ -936,7 +908,7 @@ impl ZanzibarDistribution {
         consistency: AuthzConsistency,
         check: AuthorizationCheck,
     ) -> Result<(bool, AuthzRevision, u64), Status> {
-        let _serial = self.core.realm_lane(stable_tenant_id, &scope).read().await;
+        let _serial = self.core.coordinator_lane(stable_tenant_id).read().await;
         let (replicas, placement_fence) = self.require_read_replica(stable_tenant_id)?;
         let checked_scope = scope.clone();
         let (allowed, revision) = self
@@ -960,7 +932,7 @@ impl ZanzibarDistribution {
         consistency: AuthzConsistency,
         checks: Vec<AuthorizationCheck>,
     ) -> Result<(Vec<bool>, AuthzRevision, u64), Status> {
-        let _serial = self.core.realm_lane(stable_tenant_id, &scope).read().await;
+        let _serial = self.core.coordinator_lane(stable_tenant_id).read().await;
         let (replicas, placement_fence) = self.require_read_replica(stable_tenant_id)?;
         let checked_scope = scope.clone();
         let (allowed, revision) = self

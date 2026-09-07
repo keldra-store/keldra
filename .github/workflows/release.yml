@@ -522,6 +522,9 @@ jobs:
           ref: ${{ needs.release-context.outputs.commit }}
           submodules: recursive
 
+      - name: Use runner-local Cargo target
+        run: printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/keldra-cargo-target" >> "$GITHUB_ENV"
+
       - name: Download tested release image archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

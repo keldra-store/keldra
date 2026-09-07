@@ -148,8 +148,76 @@ if [[ -n "${host_target_overrides}" ]]; then
   echo "host release tooling must use the machine's stable Cargo target directory" >&2
   exit 1
 fi
-if [[ "$(grep -RhF -- "${runner_target_setup}" .github/workflows | wc -l)" != "7" ]]; then
-  echo "every GitHub job that invokes host Cargo must select its runner-local target" >&2
+workflow_target_errors="$(
+  python3 - "${runner_target_setup}" <<'PY'
+import pathlib
+import re
+import sys
+
+target_setup = sys.argv[1]
+job_header = re.compile(r"^  ([A-Za-z0-9_-]+):(?:\s*#.*)?$")
+cargo_command = re.compile(
+    r"(?<![A-Za-z0-9_-])cargo\s+"
+    r"(?:bench|build|check|clippy|doc|fmt|install|metadata|package|publish|run|test)\b"
+)
+cargo_wrapper = re.compile(
+    r"(?:\./)?scripts/(?:"
+    r"publish-release-crates\.sh|"
+    r"qualify-(?:single|three)-node\.sh|"
+    r"release-gates\.sh\s+(?:all|rust|server|static)"
+    r")\b"
+)
+errors = []
+workflow_root = pathlib.Path(".github/workflows")
+paths = sorted([*workflow_root.glob("*.yml"), *workflow_root.glob("*.yaml")])
+
+for path in paths:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    in_jobs = False
+    jobs = []
+    current = None
+    for line_number, line in enumerate(lines, 1):
+        if line == "jobs:":
+            in_jobs = True
+            continue
+        if not in_jobs:
+            continue
+        match = job_header.match(line)
+        if match:
+            if current is not None:
+                jobs.append(current)
+            current = [match.group(1), line_number, []]
+        elif current is not None:
+            current[2].append((line_number, line))
+    if current is not None:
+        jobs.append(current)
+
+    for job_name, job_line, body in jobs:
+        text = "\n".join(line for _, line in body)
+        invokes_host_cargo = bool(cargo_command.search(text) or cargo_wrapper.search(text))
+        setup_lines = [
+            line_number
+            for line_number, line in body
+            if target_setup in line
+        ]
+        location = f"{path}:{job_line}: job {job_name}"
+        if invokes_host_cargo and len(setup_lines) != 1:
+            errors.append(
+                f"{location} invokes host Cargo but has {len(setup_lines)} "
+                "runner-local CARGO_TARGET_DIR setups"
+            )
+        elif not invokes_host_cargo and setup_lines:
+            errors.append(
+                f"{location} configures runner-local CARGO_TARGET_DIR but no host Cargo "
+                "invocation was found"
+            )
+
+print("\n".join(errors))
+PY
+)"
+if [[ -n "${workflow_target_errors}" ]]; then
+  printf '%s\n' "${workflow_target_errors}" >&2
+  echo "every GitHub job that invokes host Cargo must select exactly one runner-local target" >&2
   exit 1
 fi
 

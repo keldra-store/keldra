@@ -204,7 +204,7 @@ async fn main() -> TestResult<()> {
     disable_atomic_accounting(&mut accounting[0], &bucket, accounting_definition.version).await?;
 
     println!(
-        "atomic-program qualification passed on {} node(s): authenticated multi-object commit, Worka-shaped ULID plus schedulable Boolean conjunction on a source-complete index generation, {accounting_bytes} atomic logical bytes, and deterministic replay verified",
+        "atomic-program qualification passed on {} node(s): authenticated multi-object commit, Worka-shaped ULID plus schedulable Boolean conjunction on an all-source index generation covering the atomic commit cursor, {accounting_bytes} atomic logical bytes, and deterministic replay verified",
         endpoints.len(),
     );
     Ok(())
@@ -270,7 +270,7 @@ async fn verify_task_index_eventually(
             match client.query_index(request.clone()).await {
                 Ok(response) => {
                     let response = response.into_inner();
-                    let source_complete = response.freshness.as_ref().is_some_and(|freshness| {
+                    let all_sources = response.freshness.as_ref().is_some_and(|freshness| {
                         let source_ids = freshness
                             .sources
                             .iter()
@@ -278,8 +278,7 @@ async fn verify_task_index_eventually(
                             .collect::<std::collections::BTreeSet<_>>();
                         freshness.index_id == index_id
                             && freshness.definition_version == definition_version
-                            && freshness.commit_revision != 0
-                            && freshness.published_at.is_some()
+                            && freshness.commit_revision >= atomic_through
                             && freshness.initial_build_complete
                             && !freshness.rebuilding
                             && freshness.authorization_revision != 0
@@ -297,10 +296,10 @@ async fn verify_task_index_eventually(
                             object_version: task_version,
                             score: None,
                         }];
-                    if !source_complete || !positive_hit || !response.next_page_token.is_empty() {
+                    if !all_sources || !positive_hit || !response.next_page_token.is_empty() {
                         complete = false;
                         last = format!(
-                            "source_complete={source_complete} hits={} next_page_token_bytes={}",
+                            "all_sources={all_sources} hits={} next_page_token_bytes={}",
                             response.hits.len(),
                             response.next_page_token.len()
                         );
@@ -320,7 +319,7 @@ async fn verify_task_index_eventually(
         }
         if Instant::now() >= deadline {
             return Err(invalid(format!(
-                "Worka-shaped atomic task did not become a positive source-complete index hit through every endpoint: {last}"
+                "Worka-shaped atomic task did not become a positive all-source index hit covering its atomic commit cursor through every endpoint: {last}"
             )));
         }
         sleep(REPLICA_POLL_INTERVAL).await;

@@ -41,6 +41,9 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Use runner-local Cargo target
+        run: printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/keldra-cargo-target" >> "$GITHUB_ENV"
+
       - name: Install verification tools
         run: |
           sudo apt-get update

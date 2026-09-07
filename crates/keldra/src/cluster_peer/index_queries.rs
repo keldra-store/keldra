@@ -591,9 +591,7 @@ fn validate_result(
                 || result.freshness.placement_term != 0
                 || result.freshness.placement_index != 0))
         || (result.freshness.commit_revision != 0
-            && (result.freshness.published_at.is_none()
-                || result.freshness.placement_term == 0
-                || result.freshness.placement_index == 0))
+            && (result.freshness.placement_term == 0 || result.freshness.placement_index == 0))
         || result.next_position.as_ref().is_some_and(Vec::is_empty)
         || (result.next_position.is_some() && result.freshness.commit_revision == 0)
     {
@@ -839,7 +837,9 @@ mod tests {
     fn published_freshness() -> keldra_api::v1::IndexFreshness {
         keldra_api::v1::IndexFreshness {
             commit_revision: 1,
-            published_at: Some(Default::default()),
+            // The v1 immutable root carries a commit cursor but does not
+            // manufacture wall-clock publication evidence.
+            published_at: None,
             authorization_revision: 19,
             placement_term: 1,
             placement_index: 1,

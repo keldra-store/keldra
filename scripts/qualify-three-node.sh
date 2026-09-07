@@ -560,7 +560,7 @@ run_atomic_program_qualification() {
   KELDRA_ATOMIC_QUALIFICATION_CLIENT_ID=qatomic-client \
   KELDRA_ATOMIC_QUALIFICATION_CLIENT_SECRET="${atomic_secret}" \
     "${qualification_binaries[atomic_program_qualification]}"
-  echo "[keldra-qualification] distributed atomic program, replay, and source-complete Worka task index conjunction passed"
+  echo "[keldra-qualification] distributed atomic program, replay, and all-source Worka task index conjunction covering the atomic commit cursor passed"
 }
 
 assert_zero_accounting_traffic_drops() {
