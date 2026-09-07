@@ -148,7 +148,7 @@ if [[ -n "${host_target_overrides}" ]]; then
   echo "host release tooling must use the machine's stable Cargo target directory" >&2
   exit 1
 fi
-if [[ "$(grep -RhF -- "${runner_target_setup}" .github/workflows | wc -l)" != "5" ]]; then
+if [[ "$(grep -RhF -- "${runner_target_setup}" .github/workflows | wc -l)" != "7" ]]; then
   echo "every GitHub job that invokes host Cargo must select its runner-local target" >&2
   exit 1
 fi

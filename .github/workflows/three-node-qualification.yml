@@ -55,6 +55,9 @@ jobs:
           ref: ${{ inputs.release_tag }}
           submodules: recursive
 
+      - name: Use runner-local Cargo target
+        run: printf 'CARGO_TARGET_DIR=%s\n' "$RUNNER_TEMP/keldra-cargo-target" >> "$GITHUB_ENV"
+
       - name: Verify immutable release identity
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
