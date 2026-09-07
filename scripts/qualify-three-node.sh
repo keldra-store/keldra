@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 # Three-node release qualification for cluster formation, peer authentication,
 # replicated/erasure payload durability, object semantics, accounting,
-# PersonalDB, S3, and Git. Indexing is qualified separately by
-# scripts/qualify-index-v1-ssd-scale.sh on the attested SSD kit.
+# PersonalDB, S3, Git, and the Worka-shaped functional index contract. Index
+# performance is qualified separately on the attested SSD kit.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/qualification-log-evidence.sh"
 source "${repo_root}/scripts/qualification-three-node-phases.sh"
@@ -560,7 +560,7 @@ run_atomic_program_qualification() {
   KELDRA_ATOMIC_QUALIFICATION_CLIENT_ID=qatomic-client \
   KELDRA_ATOMIC_QUALIFICATION_CLIENT_SECRET="${atomic_secret}" \
     "${qualification_binaries[atomic_program_qualification]}"
-  echo "[keldra-qualification] distributed atomic multi-object program and replay passed"
+  echo "[keldra-qualification] distributed atomic program, replay, and source-complete Worka task index conjunction passed"
 }
 
 assert_zero_accounting_traffic_drops() {
@@ -823,7 +823,7 @@ for node in keldra-1 keldra-2 keldra-3; do
   public_endpoints+=("$(public_endpoint_for "${node}")")
 done
 
-echo "[keldra-qualification] indexing is qualified separately by scripts/qualify-index-v1-ssd-scale.sh"
+echo "[keldra-qualification] index performance is qualified separately by scripts/qualify-index-v1-ssd-scale.sh"
 
 accounting_secret=qualification-accounting-secret-000000000000000000000
 provision_tenant qaccounting qaccounting-client "${accounting_secret}"
@@ -1038,7 +1038,7 @@ assert_zero_accounting_traffic_drops
 qualification_disk_ledger_check
 
 if [[ "${qualification_mode}" == "release" ]]; then
-  echo "[keldra-qualification] PASS non-index release phases image=${image_id} platform=${KELDRA_DOCKER_PLATFORM}"
+  echo "[keldra-qualification] PASS release phases image=${image_id} platform=${KELDRA_DOCKER_PLATFORM}"
 else
-  echo "[keldra-qualification] SMOKE PASS non-index phases image=${image_id} platform=${KELDRA_DOCKER_PLATFORM}"
+  echo "[keldra-qualification] SMOKE PASS phases image=${image_id} platform=${KELDRA_DOCKER_PLATFORM}"
 fi

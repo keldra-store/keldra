@@ -7,18 +7,21 @@ use std::io;
 use std::time::Duration;
 
 use keldra_storage::v1::accounting_service_client::AccountingServiceClient;
+use keldra_storage::v1::index_query::Query as IndexQueryValue;
 use keldra_storage::v1::object_chunk::Value as ObjectChunkValue;
 use keldra_storage::v1::object_head::State as ObjectHeadState;
 use keldra_storage::v1::put_header::Operation as PutOperationValue;
 use keldra_storage::v1::{
     AccountingMeasurementState, BucketPolicy, CreateBucketRequest, DisableAccountingRequest,
     Durability, EnableAccountingRequest, GetAccountingRequest, GetObjectRequest, HeadObjectRequest,
-    InvokeProgramRequest, ObjectAddress, ObjectVersioning, PutHeader, PutImmutableOperation,
-    SetBucketPolicyRequest,
+    IndexFreshnessRequirement, IndexQuery, InvokeProgramRequest, ObjectAddress, ObjectVersioning,
+    PutHeader, PutImmutableOperation, QueryIndexRequest, SetBucketPolicyRequest,
+    TypedJsonIndexQuery,
 };
 use keldra_storage::{
-    BearerToken, RawClient, administration_client, connect_channel, exchange_client_credentials,
-    object_client, put_chunks,
+    BearerToken, BooleanField, KeywordField, PredicateExpression, RawClient, RawIndexClient,
+    TypedJsonIndexBuilder, administration_client, connect_channel, exchange_client_credentials,
+    index_client, object_client, put_chunks,
 };
 use serde_json::Value;
 use tokio::time::{Instant, sleep};
@@ -30,11 +33,13 @@ type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 type AccountingClient = AccountingServiceClient<InterceptedService<Channel, BearerToken>>;
 
 const PROGRAM_PATH: &str = "_keldra/programs/atomic-program-qualification@1";
-const PRIMARY_PATH: &str = "atomic/primary.json";
+const TASK_ID: &str = "01J00000000000000000000000";
+const TASK_PATH: &str = "atomic/tasks/01J00000000000000000000000.json";
+const TASK_INDEX: &str = "worka-task-lookup";
 const SECONDARY_PATH: &str = "atomic/secondary.json";
 const REPLICA_WAIT_LIMIT: Duration = Duration::from_secs(90);
 const REPLICA_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const PROGRAM: &[u8] = br#"{"schema_version":1,"documents":[{"name":"primary","path":{"tenant":"{tenant}","bucket":"{bucket}","path":"atomic/primary.json"},"cardinality":"one","access":"read_write","allow_initial_json":true},{"name":"secondary","path":{"tenant":"{tenant}","bucket":"{bucket}","path":"atomic/secondary.json"},"cardinality":"one","access":"read_write","allow_initial_json":true}],"assertions":[],"operations":[{"kind":"set_value","target":{"document":{"slot":"primary","index":0},"pointer":"/status"},"value":{"kind":"literal","value":"primary-committed"}},{"kind":"set_value","target":{"document":{"slot":"secondary","index":0},"pointer":"/status"},"value":{"kind":"literal","value":"secondary-committed"}}],"returns":[{"name":"primary_status","value":{"value":{"document":{"slot":"primary","index":0},"pointer":"/status"},"view":"current"}},{"name":"secondary_status","value":{"value":{"document":{"slot":"secondary","index":0},"pointer":"/status"},"view":"current"}}],"caps":{"max_paths":2,"max_writes":2,"max_operations":4,"max_input_bytes":4096,"max_document_bytes":4096}}"#;
+const PROGRAM: &[u8] = br#"{"schema_version":1,"documents":[{"name":"primary","path":{"tenant":"{tenant}","bucket":"{bucket}","path":"atomic/tasks/01J00000000000000000000000.json"},"cardinality":"one","access":"read_write","allow_initial_json":true},{"name":"secondary","path":{"tenant":"{tenant}","bucket":"{bucket}","path":"atomic/secondary.json"},"cardinality":"one","access":"read_write","allow_initial_json":true}],"assertions":[],"operations":[{"kind":"set_value","target":{"document":{"slot":"primary","index":0},"pointer":"/schedulable"},"value":{"kind":"literal","value":true}},{"kind":"set_value","target":{"document":{"slot":"secondary","index":0},"pointer":"/status"},"value":{"kind":"literal","value":"secondary-committed"}}],"returns":[{"name":"task_id","value":{"value":{"document":{"slot":"primary","index":0},"pointer":"/id"},"view":"current"}},{"name":"task_schedulable","value":{"value":{"document":{"slot":"primary","index":0},"pointer":"/schedulable"},"view":"current"}},{"name":"secondary_status","value":{"value":{"document":{"slot":"secondary","index":0},"pointer":"/status"},"view":"current"}}],"caps":{"max_paths":2,"max_writes":2,"max_operations":4,"max_input_bytes":4096,"max_document_bytes":4096}}"#;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> TestResult<()> {
@@ -71,6 +76,13 @@ async fn main() -> TestResult<()> {
             versioning: ObjectVersioning::Unversioned as i32,
         })
         .await?;
+
+    let mut indexes = channels
+        .iter()
+        .cloned()
+        .map(|channel| index_client(channel, &token))
+        .collect::<Result<Vec<_>, _>>()?;
+    let task_index = create_task_index(&mut indexes[0], &bucket).await?;
 
     let mut objects = object_client(channels[0].clone(), &token)?;
     let program = String::from_utf8(PROGRAM.to_vec())?
@@ -129,6 +141,10 @@ async fn main() -> TestResult<()> {
             "first atomic invocation unexpectedly reported replay",
         ));
     }
+    if first.commit_log_index == 0 {
+        return Err(invalid("first atomic invocation omitted its commit cursor"));
+    }
+    let atomic_through = first.commit_log_index;
     let first_output = first.output_json.clone();
     assert_output(&first_output)?;
     let first_receipts = receipt_versions(first.path_receipts)?;
@@ -137,6 +153,18 @@ async fn main() -> TestResult<()> {
             "atomic visibility observation did not match committed path receipts",
         ));
     }
+    verify_task_index_eventually(
+        &mut indexes,
+        &tenant,
+        &bucket,
+        task_index.index_id,
+        task_index.version,
+        atomic_through,
+        *first_receipts
+            .get(TASK_PATH)
+            .ok_or_else(|| invalid("atomic task receipt was absent"))?,
+    )
+    .await?;
 
     let replay = objects
         .invoke_program(invocation(
@@ -176,10 +204,134 @@ async fn main() -> TestResult<()> {
     disable_atomic_accounting(&mut accounting[0], &bucket, accounting_definition.version).await?;
 
     println!(
-        "atomic-program qualification passed on {} node(s): authenticated multi-object commit, {accounting_bytes} atomic logical bytes, and deterministic replay verified",
+        "atomic-program qualification passed on {} node(s): authenticated multi-object commit, Worka-shaped ULID plus schedulable Boolean conjunction on a source-complete index generation, {accounting_bytes} atomic logical bytes, and deterministic replay verified",
         endpoints.len(),
     );
     Ok(())
+}
+
+async fn create_task_index(
+    client: &mut RawIndexClient,
+    bucket: &str,
+) -> TestResult<keldra_storage::v1::IndexDefinition> {
+    let request = TypedJsonIndexBuilder::new(bucket, TASK_INDEX)
+        .path_prefix("atomic/tasks/")
+        .content_type("application/json")
+        .field(KeywordField::single("id", "/id").exact())
+        .field(BooleanField::single("schedulable", "/schedulable").exact())
+        .finish("atomic-program-qualification-task-index")?;
+    let definition = client.create_index(request).await?.into_inner();
+    if definition.index_id == 0 || definition.version == 0 {
+        return Err(invalid(
+            "Worka-shaped task index returned an invalid identity",
+        ));
+    }
+    Ok(definition)
+}
+
+async fn verify_task_index_eventually(
+    clients: &mut [RawIndexClient],
+    tenant: &str,
+    bucket: &str,
+    index_id: u64,
+    definition_version: u64,
+    atomic_through: u64,
+    task_version: u64,
+) -> TestResult<()> {
+    let predicate = PredicateExpression::all([
+        PredicateExpression::equal("id", TASK_ID)?,
+        PredicateExpression::equal("schedulable", true)?,
+    ])?;
+    let request = QueryIndexRequest {
+        bucket: bucket.into(),
+        index_name: TASK_INDEX.into(),
+        query: Some(IndexQuery {
+            query: Some(IndexQueryValue::TypedJson(TypedJsonIndexQuery {
+                predicate: Some(predicate.into_proto()),
+                order: Vec::new(),
+                facets: Vec::new(),
+                aggregates: Vec::new(),
+            })),
+        }),
+        limit: 1,
+        page_token: Vec::new(),
+        tenant: String::new(),
+        required_freshness: Some(IndexFreshnessRequirement {
+            sources: Vec::new(),
+            atomic_through: Some(atomic_through),
+        }),
+    };
+    let deadline = Instant::now() + REPLICA_WAIT_LIMIT;
+    let expected_sources = clients.len();
+    let mut last = String::new();
+    loop {
+        let mut complete = true;
+        for client in clients.iter_mut() {
+            match client.query_index(request.clone()).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let source_complete = response.freshness.as_ref().is_some_and(|freshness| {
+                        let source_ids = freshness
+                            .sources
+                            .iter()
+                            .map(|source| source.node_id)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        freshness.index_id == index_id
+                            && freshness.definition_version == definition_version
+                            && freshness.commit_revision != 0
+                            && freshness.published_at.is_some()
+                            && freshness.initial_build_complete
+                            && !freshness.rebuilding
+                            && freshness.authorization_revision != 0
+                            && freshness.placement_term != 0
+                            && freshness.placement_index != 0
+                            && freshness.sources.len() == expected_sources
+                            && source_ids.len() == expected_sources
+                            && freshness.sources.iter().all(|source| {
+                                source.node_id != 0 && source.source_epoch.len() == 32
+                            })
+                    });
+                    let positive_hit = response.hits.as_slice()
+                        == [keldra_storage::v1::IndexQueryHit {
+                            address: Some(address(tenant, bucket, TASK_PATH)),
+                            object_version: task_version,
+                            score: None,
+                        }];
+                    if !source_complete || !positive_hit || !response.next_page_token.is_empty() {
+                        complete = false;
+                        last = format!(
+                            "source_complete={source_complete} hits={} next_page_token_bytes={}",
+                            response.hits.len(),
+                            response.next_page_token.len()
+                        );
+                        break;
+                    }
+                }
+                Err(status) if retryable_index(&status) => {
+                    complete = false;
+                    last = status.to_string();
+                    break;
+                }
+                Err(status) => return Err(status.into()),
+            }
+        }
+        if complete {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(format!(
+                "Worka-shaped atomic task did not become a positive source-complete index hit through every endpoint: {last}"
+            )));
+        }
+        sleep(REPLICA_POLL_INTERVAL).await;
+    }
+}
+
+fn retryable_index(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::NotFound
+    )
 }
 
 fn accounting_client(
@@ -377,7 +529,8 @@ async fn observe_atomic_accounting(
 
 fn expected_committed_payload_bytes() -> TestResult<u64> {
     let primary = serde_json::to_vec(&serde_json::json!({
-        "status": "primary-committed",
+        "id": TASK_ID,
+        "schedulable": true,
     }))?;
     let secondary = serde_json::to_vec(&serde_json::json!({
         "status": "secondary-committed",
@@ -427,7 +580,7 @@ async fn program_hash(objects: &mut RawClient, tenant: &str, bucket: &str) -> Te
 
 fn invocation_input(tenant: &str, bucket: &str) -> Vec<u8> {
     format!(
-        r#"{{"bindings":{{"primary":[{{"path":{{"tenant":"{tenant}","bucket":"{bucket}","path":"{PRIMARY_PATH}"}},"template_values":{{}},"expected_head":{{"kind":"absent"}},"initial_json":{{"status":"uncommitted"}}}}],"secondary":[{{"path":{{"tenant":"{tenant}","bucket":"{bucket}","path":"{SECONDARY_PATH}"}},"template_values":{{}},"expected_head":{{"kind":"absent"}},"initial_json":{{"status":"uncommitted"}}}}]}}}}"#
+        r#"{{"bindings":{{"primary":[{{"path":{{"tenant":"{tenant}","bucket":"{bucket}","path":"{TASK_PATH}"}},"template_values":{{}},"expected_head":{{"kind":"absent"}},"initial_json":{{"id":"{TASK_ID}","schedulable":false}}}}],"secondary":[{{"path":{{"tenant":"{tenant}","bucket":"{bucket}","path":"{SECONDARY_PATH}"}},"template_values":{{}},"expected_head":{{"kind":"absent"}},"initial_json":{{"status":"uncommitted"}}}}]}}}}"#
     )
     .into_bytes()
 }
@@ -435,7 +588,8 @@ fn invocation_input(tenant: &str, bucket: &str) -> Vec<u8> {
 fn assert_output(output: &[u8]) -> TestResult<()> {
     let actual: Value = serde_json::from_slice(output)?;
     let expected = serde_json::json!({
-        "primary_status": "primary-committed",
+        "task_id": TASK_ID,
+        "task_schedulable": true,
         "secondary_status": "secondary-committed",
     });
     if actual != expected {
@@ -460,7 +614,7 @@ fn receipt_versions(
         })
         .collect::<TestResult<BTreeMap<_, _>>>()?;
     if versions.len() != 2
-        || !versions.contains_key(PRIMARY_PATH)
+        || !versions.contains_key(TASK_PATH)
         || !versions.contains_key(SECONDARY_PATH)
     {
         return Err(invalid(
@@ -517,7 +671,7 @@ async fn observe_pair(
 ) -> TestResult<PairObservation> {
     let primary = objects
         .head_object(HeadObjectRequest {
-            address: Some(address(tenant, bucket, PRIMARY_PATH)),
+            address: Some(address(tenant, bucket, TASK_PATH)),
         })
         .await?
         .into_inner()
@@ -537,7 +691,7 @@ async fn observe_pair(
             if primary.version != 0 && secondary.version != 0 =>
         {
             Ok(PairObservation::BothPresent(BTreeMap::from([
-                (PRIMARY_PATH.into(), primary.version),
+                (TASK_PATH.into(), primary.version),
                 (SECONDARY_PATH.into(), secondary.version),
             ])))
         }
@@ -570,12 +724,15 @@ async fn verify_committed_pair(
         }
         let bytes = read_all(objects, address(tenant, bucket, path)).await?;
         let value: Value = serde_json::from_slice(&bytes)?;
-        let expected = if path == PRIMARY_PATH {
-            "primary-committed"
+        let valid = if path == TASK_PATH {
+            value.get("id").and_then(Value::as_str) == Some(TASK_ID)
+                && value.get("schedulable").and_then(Value::as_bool) == Some(true)
+        } else if path == SECONDARY_PATH {
+            value.get("status").and_then(Value::as_str) == Some("secondary-committed")
         } else {
-            "secondary-committed"
+            false
         };
-        if value.get("status").and_then(Value::as_str) != Some(expected) {
+        if !valid {
             return Err(invalid(format!(
                 "atomic path {path} has unexpected JSON state"
             )));
