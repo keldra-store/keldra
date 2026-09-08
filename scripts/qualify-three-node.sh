@@ -387,12 +387,12 @@ run_cli() {
   shift 3
   client_secret_file="$(install_client_secret "${client_id}" "${client_secret}")"
   docker run --rm \
-    --network "${network}" \
+    --network host \
     --volume "${KELDRA_QUALIFICATION_DIR}:/qualification" \
     --env "KELDRA_CLIENT_ID=${client_id}" \
     --env "KELDRA_CLIENT_SECRET_FILE=${client_secret_file}" \
     "${image_id}" \
-    keldra --endpoint "http://${node}:50051" "$@"
+    keldra --endpoint "$(public_endpoint_for "${node}")" "$@"
 }
 run_bootstrap_cli() {
   local node="$1"
@@ -402,11 +402,11 @@ run_bootstrap_cli() {
     secret_environment=(--env "KELDRA_NEW_CLIENT_SECRET_FILE=${KELDRA_NEW_CLIENT_SECRET_FILE}")
   fi
   docker run --rm \
-    --network "${network}" \
+    --network host \
     --volume "${KELDRA_QUALIFICATION_DIR}:/qualification" \
     "${secret_environment[@]}" \
     "${image_id}" \
-    keldra --endpoint "http://${node}:50051" \
+    keldra --endpoint "$(public_endpoint_for "${node}")" \
       --credentials-file /qualification/node-1/system-bootstrap-credential.json "$@"
 }
 wait_for_bootstrap() {
