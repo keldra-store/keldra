@@ -571,11 +571,12 @@ impl AuthzRepository {
             schema: canonical,
             published_at_revision: authz_revision,
         };
+        let revision = catalogue::AuthzSchemaRevision::from(stored.clone());
 
         batch.put_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,
             schema_revision_key(&request.storage_tenant, &schema_ref),
-            encode_json(&stored)?,
+            encode_json(&revision)?,
         );
         batch.put_cf(
             self.cf(CF_AUTHZ_SCHEMAS)?,

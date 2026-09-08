@@ -169,11 +169,14 @@ async fn v1_schema_revision_requires_explicit_publication_lineage() {
         )
         .unwrap()
         .unwrap();
+    let persisted: serde_json::Value = serde_json::from_slice(&raw).unwrap();
     assert!(
-        !String::from_utf8(raw)
+        persisted
+            .as_object()
             .unwrap()
-            .contains("publication_mutation")
+            .contains_key("publication_mutation")
     );
+    assert_eq!(persisted["publication_mutation"], serde_json::Value::Null);
 
     let catalogue = source
         .export_authz_schema_catalogue(&tenant())

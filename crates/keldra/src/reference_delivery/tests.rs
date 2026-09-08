@@ -1523,7 +1523,16 @@ async fn program_proof_waits_for_nominated_executor_completion() {
     assert!(blocked.contains("unresolved"));
     assert!(peers.applies.lock().expect("test apply lock").is_empty());
 
-    stores.stores[&NodeId(2)]
+    let replica = &stores.stores[&NodeId(2)];
+    replica
+        .reserve_program_participant(&reservation)
+        .await
+        .unwrap();
+    replica
+        .commit_program_participant(&reservation, 42)
+        .await
+        .unwrap();
+    replica
         .apply_program_path_finalization_replica(
             &finalized.mutation,
             ObjectMutationContext {
@@ -1604,9 +1613,10 @@ async fn one_of_one_exact_proof_is_committed() {
 async fn one_node_proofless_object_event_is_rejected() {
     let stores = TestStores::open(&[1]).await;
     let source = stores.stores[&NodeId(1)].clone();
+    let path = node_one_coordinator_path("proofless");
     source
         .put(PutRequest {
-            key: ObjectKey::new("tenant", "bucket", "proofless").unwrap(),
+            key: ObjectKey::new("tenant", "bucket", &path).unwrap(),
             bytes: b"proofless reference".to_vec(),
             content_type: None,
             mode: PutMode::PutIfAbsent,
@@ -1623,7 +1633,7 @@ async fn one_node_proofless_object_event_is_rejected() {
         .find(|change| {
             matches!(
                 change,
-                LocalChange::ObjectHead(change) if change.exact_path == "proofless"
+                LocalChange::ObjectHead(change) if change.exact_path == path
             )
         })
         .unwrap();

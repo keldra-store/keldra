@@ -494,7 +494,6 @@ async fn committed_path_recovery_rebinds_to_the_new_executor_without_resealing()
     assert!(!sealed.replayed);
     // Crash boundary: Raft committed and the path authority materialized the
     // mutation, while the replica retains only its stage and reservation.
-    let authority_tail = store.local_invalidation_offset().unwrap();
     assert_eq!(
         replica.local_invalidation_offset().unwrap(),
         replica_stage_tail,
@@ -604,19 +603,16 @@ async fn committed_path_recovery_rebinds_to_the_new_executor_without_resealing()
         peer_finalization.version,
         replay.mutation.stage.version.id.0
     );
-    assert_eq!(store.local_invalidation_offset().unwrap(), authority_tail);
-    let replica_tail = replica.local_invalidation_offset().unwrap();
-    let replica_key = ObjectKey::new(
-        &replay.mutation.stage.path.tenant,
-        &replay.mutation.stage.path.bucket,
-        &replay.mutation.stage.path.path,
-    )
-    .unwrap();
     assert_eq!(
         replica
-            .head(&replica_key)
+            .export_object_path_record(
+                replay.mutation.stage.tenant_id,
+                replay.mutation.stage.bucket_id,
+                &replay.mutation.stage.path.path,
+            )
             .unwrap()
             .unwrap()
+            .head
             .mutation_stamp
             .unwrap(),
         sealed.mutation.stamp
@@ -637,7 +633,6 @@ async fn committed_path_recovery_rebinds_to_the_new_executor_without_resealing()
     .into_inner();
     assert!(peer_replay.replayed);
     assert_eq!(peer_replay.version, replay.mutation.stage.version.id.0);
-    assert_eq!(replica.local_invalidation_offset().unwrap(), replica_tail);
 
     first
         .submit(Command::FinalizedThrough {

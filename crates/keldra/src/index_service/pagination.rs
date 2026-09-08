@@ -239,7 +239,13 @@ mod tests {
         let expected = binding();
         let mut claims = IndexPageTokenClaims::new(&caller, expected, &cursor());
         claims.format = 0;
-        let token = manager.seal_index_page_token(&claims).unwrap();
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(KEY),
+        )
+        .unwrap()
+        .into_bytes();
 
         assert!(manager.decode(&caller, &token, expected).is_err());
     }

@@ -156,7 +156,8 @@ image_gates() (
   run_step "image authenticated bucket provisioning" docker run --rm \
     --network "container:${container}" \
     --env KELDRA_CLIENT_ID="${owner_client_id}" \
-    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+    --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
     "${image}" \
     keldra --endpoint http://127.0.0.1:50051 create-bucket objects
 
@@ -171,7 +172,8 @@ image_gates() (
     --network "container:${container}" \
     --volume "${scratch}:/smoke:ro" \
     --env KELDRA_CLIENT_ID="${owner_client_id}" \
-    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+    --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
     "${image}" \
     keldra --endpoint http://127.0.0.1:50051 \
     put smoke objects hello /smoke/payload \
@@ -181,7 +183,8 @@ image_gates() (
   value="$(
     docker run --rm --network "container:${container}" \
       --env KELDRA_CLIENT_ID="${owner_client_id}" \
-      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+      --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
       "${image}" \
       keldra --endpoint http://127.0.0.1:50051 \
       get smoke objects hello
@@ -195,7 +198,8 @@ image_gates() (
   source_head="$(
     docker run --rm --network "container:${container}" \
       --env KELDRA_CLIENT_ID="${owner_client_id}" \
-      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+      --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
       "${image}" \
       keldra --endpoint http://127.0.0.1:50051 \
       head smoke objects hello
@@ -209,7 +213,8 @@ image_gates() (
   run_step "image zero-copy clone" docker run --rm \
     --network "container:${container}" \
     --env KELDRA_CLIENT_ID="${owner_client_id}" \
-    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+    --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
     "${image}" \
     keldra --endpoint http://127.0.0.1:50051 \
     clone-object smoke objects hello "${source_version}" cloned \
@@ -218,7 +223,8 @@ image_gates() (
   run_step "image protected link" docker run --rm \
     --network "container:${container}" \
     --env KELDRA_CLIENT_ID="${owner_client_id}" \
-    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+    --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
     "${image}" \
     keldra --endpoint http://127.0.0.1:50051 \
     link-object smoke objects linked hello \
@@ -229,7 +235,8 @@ image_gates() (
   delete_output="$(
     docker run --rm --network "container:${container}" \
       --env KELDRA_CLIENT_ID="${owner_client_id}" \
-      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+      --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
       "${image}" \
       keldra --endpoint http://127.0.0.1:50051 \
       delete smoke objects hello --command-id image-smoke-blocked-delete 2>&1
@@ -245,7 +252,8 @@ image_gates() (
     --network "container:${container}" \
     --volume "${scratch}:/smoke:ro" \
     --env KELDRA_CLIENT_ID="${owner_client_id}" \
-    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+    --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
     "${image}" \
     keldra --endpoint http://127.0.0.1:50051 \
     put smoke objects linked /smoke/replacement \
@@ -255,19 +263,22 @@ image_gates() (
   canonical_value="$(
     docker run --rm --network "container:${container}" \
       --env KELDRA_CLIENT_ID="${owner_client_id}" \
-      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+      --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
       "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects hello
   )"
   linked_value="$(
     docker run --rm --network "container:${container}" \
       --env KELDRA_CLIENT_ID="${owner_client_id}" \
-      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+      --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
       "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects linked
   )"
   clone_value="$(
     docker run --rm --network "container:${container}" \
       --env KELDRA_CLIENT_ID="${owner_client_id}" \
-      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+      --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
       "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects cloned
   )"
   if [[ "${canonical_value}" != 'keldra-v1-linked-update' \
@@ -280,7 +291,8 @@ image_gates() (
   run_step "image protected unlink" docker run --rm \
     --network "container:${container}" \
     --env KELDRA_CLIENT_ID="${owner_client_id}" \
-    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+    --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
     "${image}" \
     keldra --endpoint http://127.0.0.1:50051 \
     unlink-object smoke objects linked \
@@ -291,7 +303,8 @@ image_gates() (
   unlinked_output="$(
     docker run --rm --network "container:${container}" \
       --env KELDRA_CLIENT_ID="${owner_client_id}" \
-      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+      --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
       "${image}" \
       keldra --endpoint http://127.0.0.1:50051 get smoke objects linked 2>&1
   )"
@@ -305,7 +318,8 @@ image_gates() (
   run_step "image target delete after unlink" docker run --rm \
     --network "container:${container}" \
     --env KELDRA_CLIENT_ID="${owner_client_id}" \
-    --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+    --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+    --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
     "${image}" \
     keldra --endpoint http://127.0.0.1:50051 \
     delete smoke objects hello --command-id image-smoke-delete-after-unlink
@@ -313,7 +327,8 @@ image_gates() (
   clone_value="$(
     docker run --rm --network "container:${container}" \
       --env KELDRA_CLIENT_ID="${owner_client_id}" \
-      --env KELDRA_CLIENT_SECRET="${owner_client_secret}" \
+      --volume "${scratch}/owner-client-secret:/run/secrets/keldra-owner-client-secret:ro" \
+      --env KELDRA_CLIENT_SECRET_FILE=/run/secrets/keldra-owner-client-secret \
       "${image}" keldra --endpoint http://127.0.0.1:50051 get smoke objects cloned
   )"
   if [[ "${clone_value}" != 'keldra-v1-smoke' ]]; then

@@ -264,7 +264,7 @@ async fn commit_stage_reservation(
     stage: &ProgramPathStage,
     commit_cursor: u64,
     context: ObjectMutationContext,
-) {
+) -> ProgramReservation {
     let condition = stage.previous_version.clone().map_or_else(
         || ProgramPathCondition::Head(stage.expected.clone()),
         |expected| ProgramPathCondition::HeadVersion { expected },
@@ -302,6 +302,7 @@ async fn commit_stage_reservation(
         .commit_program_participant(&reservation, commit_cursor)
         .await
         .unwrap();
+    reservation
 }
 
 #[tokio::test]
@@ -975,7 +976,7 @@ async fn recovery_rejects_committed_bundle_reference_and_durability_class_mismat
             .recover_program_bundle(wrong_reference, mutation_context())
             .await
             .unwrap_err(),
-        ProgramStoreError::PreparedBundleMismatch
+        ProgramStoreError::DurabilityEvidenceMismatch
     );
 
     let mut wrong_class = commit(&prepared, None, 1);
@@ -1179,14 +1180,14 @@ async fn mutable_read_only_program_dependency_is_evaluated_at_its_exact_version(
             .collect::<Vec<_>>(),
         vec![
             HeadPrecondition {
-                path: counter_path(),
-                expected: ObservedHead::NeverExisted,
-            },
-            HeadPrecondition {
                 path: config_path.clone(),
                 expected: ObservedHead::Version {
                     version: config.version.0.to_string(),
                 },
+            },
+            HeadPrecondition {
+                path: counter_path(),
+                expected: ObservedHead::NeverExisted,
             },
         ]
     );
@@ -1295,14 +1296,14 @@ async fn immutable_read_only_program_dependency_is_evaluated_at_its_exact_versio
             .collect::<Vec<_>>(),
         vec![
             HeadPrecondition {
-                path: counter_path(),
-                expected: ObservedHead::NeverExisted,
-            },
-            HeadPrecondition {
                 path: config_path.clone(),
                 expected: ObservedHead::Version {
                     version: config.version.0.to_string(),
                 },
+            },
+            HeadPrecondition {
+                path: counter_path(),
+                expected: ObservedHead::NeverExisted,
             },
         ]
     );
@@ -1603,9 +1604,13 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         previous_version: None,
         version: first_version.clone(),
     };
-    commit_stage_reservation(&store, &first_stage, 41, context).await;
+    let first_reservation = commit_stage_reservation(&store, &first_stage, 41, context).await;
     let first = store
         .coordinate_program_path_finalization(first_stage, 41, context)
+        .await
+        .unwrap();
+    store
+        .release_program_participant(&first_reservation, Some(41))
         .await
         .unwrap();
     assert_eq!(
@@ -1672,9 +1677,13 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
         previous_version: Some(first_version.clone()),
         version: second_version.clone(),
     };
-    commit_stage_reservation(&store, &second_stage, 42, context).await;
+    let second_reservation = commit_stage_reservation(&store, &second_stage, 42, context).await;
     let second = store
         .coordinate_program_path_finalization(second_stage, 42, context)
+        .await
+        .unwrap();
+    store
+        .release_program_participant(&second_reservation, Some(42))
         .await
         .unwrap();
     assert_eq!(
@@ -1720,13 +1729,24 @@ async fn distributed_versioned_program_counts_each_same_blob_retained_version() 
     let replica = Store::open(StoreOptions::new(replica_temporary.path(), 2))
         .await
         .unwrap();
-    commit_stage_reservation(&replica, &first.mutation.stage, 71, context).await;
+    let first_replica_reservation =
+        commit_stage_reservation(&replica, &first.mutation.stage, 41, context).await;
     replica
         .apply_program_path_finalization_replica(&first.mutation, mutation_context())
         .await
         .unwrap();
     replica
+        .release_program_participant(&first_replica_reservation, Some(41))
+        .await
+        .unwrap();
+    let second_replica_reservation =
+        commit_stage_reservation(&replica, &second.mutation.stage, 42, context).await;
+    replica
         .apply_program_path_finalization_replica(&second.mutation, mutation_context())
+        .await
+        .unwrap();
+    replica
+        .release_program_participant(&second_replica_reservation, Some(42))
         .await
         .unwrap();
 
@@ -1838,15 +1858,21 @@ async fn unversioned_program_finalization_replays_after_released_predecessor_is_
         active_placement_log_id: PlacementLogId { term: 3, index: 7 },
         serving_fence_term: 3,
     };
-    commit_stage_reservation(&store, &first_stage, 71, context).await;
+    let first_reservation = commit_stage_reservation(&store, &first_stage, 71, context).await;
     let first = store
         .coordinate_program_path_finalization(first_stage, 71, context)
+        .await
+        .unwrap();
+    store
+        .release_program_participant(&first_reservation, Some(71))
         .await
         .unwrap();
     let replica_temporary = tempfile::tempdir().unwrap();
     let replica = Store::open(StoreOptions::new(replica_temporary.path(), 2))
         .await
         .unwrap();
+    let first_replica_reservation =
+        commit_stage_reservation(&replica, &first.mutation.stage, 71, context).await;
     assert!(
         !replica
             .apply_program_path_finalization_replica(&first.mutation, context)
@@ -1854,6 +1880,10 @@ async fn unversioned_program_finalization_replays_after_released_predecessor_is_
             .unwrap()
             .replayed
     );
+    replica
+        .release_program_participant(&first_replica_reservation, Some(71))
+        .await
+        .unwrap();
 
     let first_position = first.mutation.stamp.source_journal_position;
     store

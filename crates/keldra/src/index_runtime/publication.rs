@@ -1554,26 +1554,32 @@ mod tests {
         let partition =
             keldra_index::v1::ProjectionPartitionIdentity::new(family, 3, [4; 32], 5, 6, 8)
                 .unwrap();
-        let routing = keldra_index::v1::projection_routing_id(partition);
+        let immutable_routing = keldra_index::v1::projection_artifact_routing_id(
+            family,
+            keldra_index::v1::ProjectionArtifactKind::Pack,
+            [3; 32],
+        )
+        .unwrap();
         let mut immutable = artifact_publish(
             keldra_index::v1::projection_pack_path(partition, [3; 32]),
             None,
         );
-        immutable.index_id = routing;
+        immutable.index_id = immutable_routing;
         assert_eq!(
             immutable.validate().unwrap(),
             ArtifactPathKind::ProjectionImmutable
         );
 
-        immutable.index_id = routing.wrapping_add(1).max(1);
+        immutable.index_id = immutable_routing.wrapping_add(1).max(1);
         assert!(immutable.validate().is_err());
-        immutable.index_id = routing;
+        immutable.index_id = immutable_routing;
         immutable.blob.hash = [4; 32];
         assert!(immutable.validate().is_err());
 
+        let partition_routing = keldra_index::v1::projection_routing_id(partition);
         let mut current =
             artifact_publish(keldra_index::v1::projection_current_path(partition), None);
-        current.index_id = routing;
+        current.index_id = partition_routing;
         assert_eq!(
             current.validate().unwrap(),
             ArtifactPathKind::ProjectionCurrent

@@ -194,7 +194,11 @@ impl V1ProjectionPublisher {
                 &mut query_pages,
             )
             .await?;
-            let query_fan_in = maximum_runs.min(QUERY_RUN_PAGE_FANOUT).max(2);
+            let block_limits = QueryBlockLimits::default_for_memory();
+            let query_fan_in = maximum_runs
+                .min(QUERY_RUN_PAGE_FANOUT)
+                .min(block_limits.maximum_loaded_blocks)
+                .max(2);
             let limits = QueryRunCompactionLimits {
                 level_trigger: query_fan_in.min(8),
                 maximum_input_runs: query_fan_in,
@@ -218,7 +222,7 @@ impl V1ProjectionPublisher {
                 &plan,
                 partition,
                 loaded.generation.physical_catalog_generation,
-                QueryBlockLimits::default_for_memory(),
+                block_limits,
                 query_credits,
                 |hash| {
                     blocking_artifact(
@@ -516,7 +520,7 @@ mod tests {
             },
             QueryRunCompactionLimits {
                 level_trigger: 8,
-                maximum_input_runs: 64,
+                maximum_input_runs: QueryBlockLimits::default_for_memory().maximum_loaded_blocks,
             },
         )
         .unwrap()

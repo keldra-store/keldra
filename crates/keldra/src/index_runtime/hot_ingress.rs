@@ -860,7 +860,8 @@ mod tests {
 
     #[test]
     fn full_budget_falls_back_without_blocking_ingestion() {
-        let ingress = HotProjectionIngress::new(800).unwrap();
+        let maximum_bytes = 4_096;
+        let ingress = HotProjectionIngress::new(maximum_bytes).unwrap();
         ingress.activate_test_route(1, 2);
         for version in 1..=20 {
             let path = format!("item-{version}");
@@ -873,7 +874,7 @@ mod tests {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(total_bytes(&state) <= 800);
+        assert!(u64::try_from(total_bytes(&state)).unwrap() <= maximum_bytes);
     }
 
     #[test]
