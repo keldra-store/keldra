@@ -726,7 +726,7 @@ impl AuthzRepository {
             batch.put_cf(
                 self.cf(CF_AUTHZ_SCHEMAS)?,
                 schema_key,
-                encode_json(&stored_schema)?,
+                encode_json(&super::AuthzSchemaRevision::from(stored_schema.clone()))?,
             );
         }
         batch.put_cf(

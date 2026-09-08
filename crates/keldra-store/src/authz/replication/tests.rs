@@ -129,6 +129,12 @@ async fn complete_realm_mutations_apply_to_a_second_store_and_replay_exactly() {
             .unwrap(),
         Some(canonical_schema(schema(), AuthorizationLimits::default()).unwrap())
     );
+    let replica_catalogue = replica_repository
+        .export_authz_schema_catalogue(&tenant())
+        .unwrap()
+        .unwrap();
+    assert_eq!(replica_catalogue.schemas.len(), 1);
+    assert_eq!(replica_catalogue.schemas[0].publication_mutation, None);
 
     let request = tuple_request("grant-alice", 2, "one", "alice");
     let coordinated_tuple = coordinator_repository

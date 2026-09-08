@@ -278,6 +278,12 @@ async fn complete_realms_page_install_replay_and_survive_restart() {
         assert_eq!(applied.retained_receipts, 1);
     }
     assert_eq!(target.local_watch_status().unwrap().tail, 0);
+    let target_catalogue = target_repository
+        .export_authz_schema_catalogue(&tenant())
+        .unwrap()
+        .unwrap();
+    assert_eq!(target_catalogue.schemas.len(), 1);
+    assert_eq!(target_catalogue.schemas[0].publication_mutation, None);
     assert_eq!(export_all(&target_repository, 1), aggregates);
     for aggregate in &aggregates {
         assert!(
