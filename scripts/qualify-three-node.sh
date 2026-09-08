@@ -346,6 +346,8 @@ for directory in node-1 node-2 node-3 artifacts; do
   mkdir "${KELDRA_QUALIFICATION_DIR}/${directory}"
   chmod 0777 "${KELDRA_QUALIFICATION_DIR}/${directory}"
 done
+mkdir "${KELDRA_QUALIFICATION_DIR}/secrets"
+chmod 0711 "${KELDRA_QUALIFICATION_DIR}/secrets"
 chmod 0755 "${KELDRA_QUALIFICATION_DIR}"
 head -c 64 /dev/urandom >"${KELDRA_QUALIFICATION_DIR}/token-signing-key"
 chmod 0600 "${KELDRA_QUALIFICATION_DIR}/token-signing-key"
@@ -356,16 +358,39 @@ compose config --quiet
 compose up --detach keldra-1
 require_service_image keldra-1 "${image_id}" candidate
 network="${KELDRA_QUALIFICATION_PROJECT}_default"
+install_client_secret() {
+  local client_id="$1"
+  local client_secret="$2"
+  local secret_file
+  if [[ ! "${client_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "qualification client ID cannot name a secret file: ${client_id}" >&2
+    return 2
+  fi
+  secret_file="/qualification/secrets/${client_id}"
+  if [[ -e "${KELDRA_QUALIFICATION_DIR}/secrets/${client_id}" ]]; then
+    printf '%s\n' "${secret_file}"
+    return 0
+  fi
+  printf '%s' "${client_secret}" \
+    | docker run --rm --interactive --user 0 \
+        --volume "${KELDRA_QUALIFICATION_DIR}:/qualification" \
+        "${image_id}" sh -c \
+          'umask 077; cat >"$1"; chown 10001:10001 "$1"; chmod 0400 "$1"' \
+          sh "${secret_file}"
+  printf '%s\n' "${secret_file}"
+}
 run_cli() {
   local node="$1"
   local client_id="$2"
   local client_secret="$3"
+  local client_secret_file
   shift 3
+  client_secret_file="$(install_client_secret "${client_id}" "${client_secret}")"
   docker run --rm \
     --network "${network}" \
     --volume "${KELDRA_QUALIFICATION_DIR}:/qualification" \
     --env "KELDRA_CLIENT_ID=${client_id}" \
-    --env "KELDRA_CLIENT_SECRET=${client_secret}" \
+    --env "KELDRA_CLIENT_SECRET_FILE=${client_secret_file}" \
     "${image_id}" \
     keldra --endpoint "http://${node}:50051" "$@"
 }
@@ -373,8 +398,8 @@ run_bootstrap_cli() {
   local node="$1"
   shift
   local -a secret_environment=()
-  if [[ -n "${KELDRA_NEW_CLIENT_SECRET:-}" ]]; then
-    secret_environment=(--env KELDRA_NEW_CLIENT_SECRET)
+  if [[ -n "${KELDRA_NEW_CLIENT_SECRET_FILE:-}" ]]; then
+    secret_environment=(--env "KELDRA_NEW_CLIENT_SECRET_FILE=${KELDRA_NEW_CLIENT_SECRET_FILE}")
   fi
   docker run --rm \
     --network "${network}" \
@@ -464,11 +489,13 @@ provision_tenant() {
   local client_secret="$3"
   local node
   local output=""
+  local client_secret_file
+  client_secret_file="$(install_client_secret "${client_id}" "${client_secret}")"
   for node in keldra-1 keldra-2 keldra-3; do
     if ! compose ps --status running --services | grep -Fxq "${node}"; then
       continue
     fi
-    if output="$(KELDRA_NEW_CLIENT_SECRET="${client_secret}" \
+    if output="$(KELDRA_NEW_CLIENT_SECRET_FILE="${client_secret_file}" \
       run_bootstrap_cli "${node}" provision-tenant \
         "${tenant}" "${tenant}-owner" "${client_id}" 2>&1)"
     then
