@@ -313,6 +313,7 @@ enum QuantumSchedule {
     Now,
     Idle,
     Retry(Status),
+    Rebaseline(super::snapshot::AccountingAdvanceError),
     WaitForBaseline,
 }
 
@@ -363,10 +364,22 @@ async fn run_identity_quantum(
     if held_before && !held_after {
         scheduler.wake_baseline_waiter();
     }
+    apply_quantum_schedule(identity, schedule, scheduler);
+}
+
+fn apply_quantum_schedule(
+    identity: AccountingIdentity,
+    schedule: QuantumSchedule,
+    scheduler: &mut AccountingScheduler,
+) {
     match schedule {
         QuantumSchedule::Now => scheduler.schedule_now(identity),
         QuantumSchedule::Idle => scheduler.remove_worker(identity),
         QuantumSchedule::WaitForBaseline => scheduler.wait_for_baseline(identity),
+        QuantumSchedule::Rebaseline(error) => {
+            tracing::warn!(accounting.id = identity.2, %error, "accounting work quantum requires a scoped baseline");
+            scheduler.schedule_now(identity);
+        }
         QuantumSchedule::Retry(error) => {
             tracing::warn!(accounting.id = identity.2, %error, "accounting work quantum will retry");
             scheduler.retry(identity);
@@ -538,7 +551,7 @@ async fn run_quantum(
                     if let Err(error) = apply_page(definition, &mut snapshot, &page) {
                         return (
                             WorkerPhase::AwaitBaseline,
-                            QuantumSchedule::Retry(Status::unavailable(error.to_string())),
+                            QuantumSchedule::Rebaseline(error),
                         );
                     }
                     through = page.through;
@@ -1110,5 +1123,34 @@ mod tests {
         assert!(scheduler.baseline_owner.is_none());
         assert!(scheduler.apply_change(AccountingCatalogChange::Upsert(later)));
         assert!(scheduler.workers.contains_key(&later_identity));
+    }
+
+    #[test]
+    fn rebaseline_schedule_retains_the_worker_and_queues_its_next_quantum() {
+        let definition = definition();
+        let identity = (
+            definition.tenant_id,
+            definition.bucket_id,
+            definition.stored.accounting_id,
+        );
+        let mut scheduler = AccountingScheduler::default();
+        assert!(scheduler.apply_change(AccountingCatalogChange::Upsert(definition)));
+        assert_eq!(scheduler.pop_ready(), Some(identity));
+        scheduler.workers.get_mut(&identity).unwrap().phase = WorkerPhase::AwaitBaseline;
+
+        apply_quantum_schedule(
+            identity,
+            QuantumSchedule::Rebaseline(
+                super::super::snapshot::AccountingAdvanceError::TransitionEvidenceUnavailable,
+            ),
+            &mut scheduler,
+        );
+
+        assert!(scheduler.workers.contains_key(&identity));
+        assert!(matches!(
+            scheduler.workers[&identity].phase,
+            WorkerPhase::AwaitBaseline
+        ));
+        assert_eq!(scheduler.pop_ready(), Some(identity));
     }
 }
