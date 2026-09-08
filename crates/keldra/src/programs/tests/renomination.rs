@@ -285,6 +285,30 @@ async fn peer_commit(
     .unwrap();
 }
 
+async fn peer_release(
+    service: &ClusterPeerService,
+    source: NodeId,
+    nomination_log_index: u64,
+    placement: PlacementLogId,
+    commit_cursor: u64,
+    reservation: &ProgramReservation,
+) {
+    ClusterPeer::release_program_participant(
+        service,
+        authenticated(
+            wire::ProgramReleaseParticipantRequest {
+                peer: Some(peer_context(source, placement)),
+                executor_nomination_log_index: nomination_log_index,
+                reservation_json: serde_json::to_vec(reservation).unwrap(),
+                finalized_commit_cursor: commit_cursor,
+            },
+            source,
+        ),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_path_recovery_rebinds_to_the_new_executor_without_resealing() {
     let first_store_root = tempfile::tempdir().unwrap();
@@ -449,6 +473,22 @@ async fn committed_path_recovery_rebinds_to_the_new_executor_without_resealing()
     )
     .await;
 
+    let expected_commit_cursor = batch.begin_cursor.checked_add(1).unwrap();
+    let early_peer_commit = peer_commit(
+        &service,
+        NodeId(1),
+        old_nomination.nomination_log_index,
+        placement_fence,
+        expected_commit_cursor,
+        &old_reservation,
+    );
+    tokio::pin!(early_peer_commit);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut early_peer_commit)
+            .await
+            .is_err(),
+        "reservation commit must wait for its local Raft decision"
+    );
     let committed = first
         .submit(Command::CommitPreparedBatch(CommitPreparedBatch {
             executor: old_nomination.executor,
@@ -461,27 +501,14 @@ async fn committed_path_recovery_rebinds_to_the_new_executor_without_resealing()
         .unwrap();
     let committed = expect_batch_committed(committed.result).unwrap();
     let commit_cursor = committed.invocation.committed_batch.commit_cursor;
-    wait_until(|| {
-        second
-            .state()
-            .unwrap()
-            .committed_invocation(commit_cursor)
-            .is_some()
-    })
-    .await;
+    assert_eq!(commit_cursor, expected_commit_cursor);
     store
         .commit_program_participant(&old_reservation, commit_cursor)
         .await
         .unwrap();
-    peer_commit(
-        &service,
-        NodeId(1),
-        old_nomination.nomination_log_index,
-        placement_fence,
-        commit_cursor,
-        &old_reservation,
-    )
-    .await;
+    tokio::time::timeout(Duration::from_secs(5), &mut early_peer_commit)
+        .await
+        .expect("reservation commit did not resume after local Raft apply");
 
     let old_context = ObjectMutationContext {
         active_placement_log_id: placement_fence,
@@ -634,6 +661,21 @@ async fn committed_path_recovery_rebinds_to_the_new_executor_without_resealing()
     assert!(peer_replay.replayed);
     assert_eq!(peer_replay.version, replay.mutation.stage.version.id.0);
 
+    let early_peer_release = peer_release(
+        &service,
+        NodeId(2),
+        replacement.nomination_log_index,
+        placement_fence,
+        commit_cursor,
+        &rebound,
+    );
+    tokio::pin!(early_peer_release);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut early_peer_release)
+            .await
+            .is_err(),
+        "reservation release must wait for local FinalizedThrough apply"
+    );
     first
         .submit(Command::FinalizedThrough {
             executor: replacement.executor,
@@ -642,25 +684,13 @@ async fn committed_path_recovery_rebinds_to_the_new_executor_without_resealing()
         })
         .await
         .unwrap();
-    wait_until(|| second.state().unwrap().finalized_through() == Some(commit_cursor)).await;
     store
         .release_program_participant(&rebound, Some(commit_cursor))
         .await
         .unwrap();
-    ClusterPeer::release_program_participant(
-        &service,
-        authenticated(
-            wire::ProgramReleaseParticipantRequest {
-                peer: Some(peer_context(NodeId(2), placement_fence)),
-                executor_nomination_log_index: replacement.nomination_log_index,
-                reservation_json: serde_json::to_vec(&rebound).unwrap(),
-                finalized_commit_cursor: commit_cursor,
-            },
-            NodeId(2),
-        ),
-    )
-    .await
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), &mut early_peer_release)
+        .await
+        .expect("reservation release did not resume after local FinalizedThrough apply");
     assert!(store.program_reservations().unwrap().is_empty());
     assert!(replica.program_reservations().unwrap().is_empty());
 

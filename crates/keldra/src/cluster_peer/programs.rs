@@ -58,16 +58,16 @@ impl ClusterPeerService {
         )?;
         let reservation: ProgramReservation = decode_json(&request.get_ref().reservation_json)?;
         let commit_cursor = request.get_ref().commit_cursor;
-        self.require_reservation_authority(
-            &admitted.placement,
-            nomination,
-            &reservation,
-            ReservationOperation::Commit { commit_cursor },
-        )?;
+        self.require_reservation_fence(&admitted.placement, nomination, &reservation)?;
         let group = reservation_group(&admitted.placement, &reservation)?;
         require_program_replica(&group, self.local_node)?;
+        let deadline = Instant::now()
+            .checked_add(admitted.timeout)
+            .ok_or_else(|| Status::invalid_argument("program deadline overflowed"))?;
+        self.wait_for_reservation_commit(commit_cursor, &reservation, deadline)
+            .await?;
         let store = self.store.clone();
-        tokio::time::timeout(admitted.timeout, async move {
+        tokio::time::timeout(remaining(deadline)?, async move {
             store
                 .commit_program_participant(&reservation, commit_cursor)
                 .await
@@ -99,16 +99,27 @@ impl ClusterPeerService {
         } else {
             ReservationOperation::ReleaseAborted
         };
-        self.require_reservation_authority(
-            &admitted.placement,
-            nomination,
-            &reservation,
-            operation,
-        )?;
+        self.require_reservation_fence(&admitted.placement, nomination, &reservation)?;
         let group = reservation_group(&admitted.placement, &reservation)?;
         require_program_replica(&group, self.local_node)?;
+        let deadline = Instant::now()
+            .checked_add(admitted.timeout)
+            .ok_or_else(|| Status::invalid_argument("program deadline overflowed"))?;
+        match operation {
+            ReservationOperation::ReleaseFinalized { commit_cursor } => {
+                self.wait_for_reservation_finalization(commit_cursor, &reservation, deadline)
+                    .await?;
+            }
+            ReservationOperation::ReleaseAborted => self.require_reservation_authority(
+                &admitted.placement,
+                nomination,
+                &reservation,
+                operation,
+            )?,
+            ReservationOperation::Reserve => unreachable!("release operation was already selected"),
+        }
         let store = self.store.clone();
-        tokio::time::timeout(admitted.timeout, async move {
+        tokio::time::timeout(remaining(deadline)?, async move {
             store
                 .release_program_participant(&reservation, finalized_commit_cursor)
                 .await
@@ -403,16 +414,7 @@ impl ClusterPeerService {
         reservation: &ProgramReservation,
         operation: ReservationOperation,
     ) -> Result<(), Status> {
-        let identity = reservation_identity(reservation);
-        if identity.executor_node_id != nomination.executor.0
-            || identity.nomination_log_index != nomination.nomination_log_index
-            || identity.placement != placement.fence()
-            || !matches!(identity.state, ProgramReservationState::Prepared)
-        {
-            return Err(Status::unavailable(
-                "atomic reservation does not carry the current executor and placement fence",
-            ));
-        }
+        let identity = self.require_reservation_fence(placement, nomination, reservation)?;
         let state = self
             .decisions
             .state()
@@ -431,20 +433,6 @@ impl ClusterPeerService {
                     ));
                 }
             }
-            ReservationOperation::Commit { commit_cursor } => {
-                let invocation = state.committed_invocation(commit_cursor).ok_or_else(|| {
-                    Status::failed_precondition(
-                        "atomic reservation commit has no matching Raft decision",
-                    )
-                })?;
-                if state.finalized_through().unwrap_or(0) >= commit_cursor
-                    || !reservation_matches_committed(identity, invocation)
-                {
-                    return Err(Status::failed_precondition(
-                        "atomic reservation commit does not match an unfinalized Raft decision",
-                    ));
-                }
-            }
             ReservationOperation::ReleaseAborted => {
                 if state
                     .preparing_batch()
@@ -458,22 +446,30 @@ impl ClusterPeerService {
                     ));
                 }
             }
-            ReservationOperation::ReleaseFinalized { commit_cursor } => {
-                if state.finalized_through().unwrap_or(0) < commit_cursor {
-                    return Err(Status::failed_precondition(
-                        "atomic reservation cannot be released before its exact commit is finalized",
-                    ));
-                }
-                if let Some(invocation) = state.committed_invocation(commit_cursor)
-                    && !reservation_matches_committed(identity, invocation)
-                {
-                    return Err(Status::failed_precondition(
-                        "atomic reservation release does not match its retained Raft decision",
-                    ));
-                }
+            ReservationOperation::ReleaseFinalized { .. } => {
+                unreachable!("finalized release authority is checked asynchronously")
             }
         }
         Ok(())
+    }
+
+    fn require_reservation_fence(
+        &self,
+        placement: &ClusterPlacement,
+        nomination: ExecutorNomination,
+        reservation: &ProgramReservation,
+    ) -> Result<ReservationIdentity, Status> {
+        let identity = reservation_identity(reservation);
+        if identity.executor_node_id != nomination.executor.0
+            || identity.nomination_log_index != nomination.nomination_log_index
+            || identity.placement != placement.fence()
+            || !matches!(identity.state, ProgramReservationState::Prepared)
+        {
+            return Err(Status::unavailable(
+                "atomic reservation does not carry the current executor and placement fence",
+            ));
+        }
+        Ok(identity)
     }
 
     pub(super) fn require_program_fence(
@@ -513,6 +509,79 @@ impl ClusterPeerService {
             deadline,
         )
         .await
+    }
+
+    async fn wait_for_reservation_commit(
+        &self,
+        commit_cursor: u64,
+        reservation: &ProgramReservation,
+        deadline: Instant,
+    ) -> Result<(), Status> {
+        if commit_cursor == 0 {
+            return Err(Status::invalid_argument(
+                "program commit cursor must be non-zero",
+            ));
+        }
+        let identity = reservation_identity(reservation);
+        loop {
+            {
+                let state = self.decisions.state().map_err(|_| {
+                    Status::unavailable("atomic reservation authority is unavailable")
+                })?;
+                if let Some(invocation) = state.committed_invocation(commit_cursor) {
+                    if state.finalized_through().unwrap_or(0) >= commit_cursor
+                        || !reservation_matches_committed(identity, invocation)
+                    {
+                        return Err(Status::failed_precondition(
+                            "atomic reservation commit does not match an unfinalized Raft decision",
+                        ));
+                    }
+                    return Ok(());
+                }
+                if state
+                    .last_commit_cursor()
+                    .is_some_and(|last| last >= commit_cursor)
+                    || state.finalized_through().unwrap_or(0) >= commit_cursor
+                {
+                    return Err(Status::failed_precondition(
+                        "atomic reservation commit has no matching Raft decision",
+                    ));
+                }
+            }
+            tokio::time::sleep(remaining(deadline)?.min(Duration::from_millis(5))).await;
+        }
+    }
+
+    async fn wait_for_reservation_finalization(
+        &self,
+        commit_cursor: u64,
+        reservation: &ProgramReservation,
+        deadline: Instant,
+    ) -> Result<(), Status> {
+        if commit_cursor == 0 {
+            return Err(Status::invalid_argument(
+                "program commit cursor must be non-zero",
+            ));
+        }
+        let identity = reservation_identity(reservation);
+        loop {
+            {
+                let state = self.decisions.state().map_err(|_| {
+                    Status::unavailable("atomic reservation authority is unavailable")
+                })?;
+                if let Some(invocation) = state.committed_invocation(commit_cursor)
+                    && !reservation_matches_committed(identity, invocation)
+                {
+                    return Err(Status::failed_precondition(
+                        "atomic reservation release does not match its retained Raft decision",
+                    ));
+                }
+                if state.finalized_through().unwrap_or(0) >= commit_cursor {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(remaining(deadline)?.min(Duration::from_millis(5))).await;
+        }
     }
 
     async fn wait_for_alias_registry_commit(
@@ -587,7 +656,6 @@ impl ClusterPeerService {
 #[derive(Clone, Copy)]
 enum ReservationOperation {
     Reserve,
-    Commit { commit_cursor: u64 },
     ReleaseAborted,
     ReleaseFinalized { commit_cursor: u64 },
 }
