@@ -401,13 +401,15 @@ run_bootstrap_cli() {
   if [[ -n "${KELDRA_NEW_CLIENT_SECRET_FILE:-}" ]]; then
     secret_environment=(--env "KELDRA_NEW_CLIENT_SECRET_FILE=${KELDRA_NEW_CLIENT_SECRET_FILE}")
   fi
-  docker run --rm \
+  compose exec -T keldra-1 \
+    cat /var/lib/keldra/system-bootstrap-credential.json \
+  | docker run --rm --interactive \
     --network host \
     --volume "${KELDRA_QUALIFICATION_DIR}:/qualification" \
     "${secret_environment[@]}" \
     "${image_id}" \
     keldra --endpoint "$(public_endpoint_for "${node}")" \
-      --credentials-file /qualification/node-1/system-bootstrap-credential.json "$@"
+      --credentials-file - "$@"
 }
 wait_for_bootstrap() {
   local attempt
@@ -416,8 +418,6 @@ wait_for_bootstrap() {
       test -f /var/lib/keldra/system-bootstrap-credential.json \
       >/dev/null 2>&1
     then
-      compose exec -T keldra-1 \
-        chmod 0600 /var/lib/keldra/system-bootstrap-credential.json
       return 0
     fi
     sleep 1
