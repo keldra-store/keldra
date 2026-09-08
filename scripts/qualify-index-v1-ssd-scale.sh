@@ -220,6 +220,9 @@ cleanup() {
   trap - EXIT INT TERM
   stop_server
   if [[ -n "${active_cell}" ]]; then printf '%s\n' "${status}" >"${active_cell}/runner-exit-status"; fi
+  if [[ -n "${active_work}" ]]; then
+    rm -f -- "${active_work}/owner-client-secret" "${active_work}/system-bootstrap-credential.json"
+  fi
   if [[ "${keep_work}" == 0 && -n "${active_work}" && -d "${active_work}" ]]; then
     if ! remove_cell_work "${active_work}"; then
       echo "failed to remove guarded active work directory ${active_work}" >&2
@@ -380,7 +383,7 @@ summarize_cell() {
 
 run_capability_preflight() {
   local port="$1" workers="$2" memory_per_worker="$3"
-  local cell="public-query-capabilities" credential_file token_key tenant bucket client_id client_secret report driver_status
+  local cell="public-query-capabilities" credential_file token_key tenant bucket client_id client_secret client_secret_file report driver_status
   active_cell="${run_dir}/${cell}"
   active_work="${work_root}/${run_id}/${cell}"
   mkdir -p "${active_cell}" "${active_work}"/{state,metadata,wal,payload,scratch,cache,tmp}
@@ -393,16 +396,19 @@ run_capability_preflight() {
   bucket="capabilities"
   client_id="v1-capability-client"
   client_secret="$(dd if=/dev/urandom bs=32 count=1 status=none | base64 | tr -d '\n')"
+  client_secret_file="${active_work}/owner-client-secret"
+  printf '%s' "${client_secret}" >"${client_secret_file}"
+  chmod 0600 "${client_secret_file}"
   printf 'running\n' >"${active_cell}/status.txt"
   start_server "${port}" "${active_work}" "${active_cell}" "${credential_file}" \
     "$((workers * memory_per_worker))" "${workers}"
   for _ in $(seq 1 180); do [[ -s "${credential_file}" ]] && break; sleep 1; done
   [[ -s "${credential_file}" ]] || { echo "capability bootstrap credentials were not produced" >&2; return 1; }
-  KELDRA_NEW_CLIENT_SECRET="${client_secret}" "${kit_root}/bin/keldra" \
+  KELDRA_NEW_CLIENT_SECRET_FILE="${client_secret_file}" "${kit_root}/bin/keldra" \
     --endpoint "http://127.0.0.1:${port}" --credentials-file "${credential_file}" \
     provision-tenant "${tenant}" v1-capability-owner "${client_id}" \
     >"${active_cell}/provision.stdout.log" 2>"${active_cell}/provision.stderr.log"
-  rm -f -- "${credential_file}"
+  rm -f -- "${credential_file}" "${client_secret_file}"
   report="${active_cell}/report.json"
   set +e
   KELDRA_INDEX_CONTENTION_CAPABILITY_ONLY=1 \
@@ -491,13 +497,17 @@ for definitions in "${definitions_values[@]}"; do
           dd if=/dev/urandom of="${token_key}" bs=64 count=1 status=none; chmod 0600 "${token_key}"
           tenant="v1-${source_commit:0:8}-${run_id:0:8}-${port}"; bucket="objects"; client_id="v1-index-client"
           client_secret="$(dd if=/dev/urandom bs=32 count=1 status=none | base64 | tr -d '\n')"
+          client_secret_file="${active_work}/owner-client-secret"
+          printf '%s' "${client_secret}" >"${client_secret_file}"
+          chmod 0600 "${client_secret_file}"
           printf 'running %s\n' "${cell}" >"${active_cell}/status.txt"
           start_server "${port}" "${active_work}" "${active_cell}" "${credential_file}" "${pipeline_memory_bytes}" "${workers}"
           for _ in $(seq 1 180); do [[ -s "${credential_file}" ]] && break; sleep 1; done
-          if [[ ! -s "${credential_file}" ]]; then echo "bootstrap credentials were not produced" >&2; stop_server; fatal_cells=$((fatal_cells + 1)); printf 'failure\n' >"${active_cell}/status.txt"; continue; fi
-          KELDRA_NEW_CLIENT_SECRET="${client_secret}" "${kit_root}/bin/keldra" --endpoint "http://127.0.0.1:${port}" --credentials-file "${credential_file}" provision-tenant "${tenant}" v1-owner "${client_id}" >"${active_cell}/provision.stdout.log" 2>"${active_cell}/provision.stderr.log"
+          if [[ ! -s "${credential_file}" ]]; then rm -f -- "${client_secret_file}" "${credential_file}"; echo "bootstrap credentials were not produced" >&2; stop_server; fatal_cells=$((fatal_cells + 1)); printf 'failure\n' >"${active_cell}/status.txt"; continue; fi
+          KELDRA_NEW_CLIENT_SECRET_FILE="${client_secret_file}" "${kit_root}/bin/keldra" --endpoint "http://127.0.0.1:${port}" --credentials-file "${credential_file}" provision-tenant "${tenant}" v1-owner "${client_id}" >"${active_cell}/provision.stdout.log" 2>"${active_cell}/provision.stderr.log"
           rm -f -- "${credential_file}"
-          KELDRA_CLIENT_ID="${client_id}" KELDRA_CLIENT_SECRET="${client_secret}" "${kit_root}/bin/keldra" --endpoint "http://127.0.0.1:${port}" create-bucket "${bucket}" >"${active_cell}/bucket.stdout.log" 2>"${active_cell}/bucket.stderr.log"
+          KELDRA_CLIENT_ID="${client_id}" KELDRA_CLIENT_SECRET_FILE="${client_secret_file}" "${kit_root}/bin/keldra" --endpoint "http://127.0.0.1:${port}" create-bucket "${bucket}" >"${active_cell}/bucket.stdout.log" 2>"${active_cell}/bucket.stderr.log"
+          rm -f -- "${client_secret_file}"
           report="${active_cell}/report.json"; progress="${active_cell}/driver-progress.jsonl"
           set +e
           KELDRA_INDEX_CONTENTION_ENDPOINTS="http://127.0.0.1:${port}" KELDRA_INDEX_CONTENTION_TENANT="${tenant}" KELDRA_INDEX_CONTENTION_BUCKET="${bucket}" KELDRA_INDEX_CONTENTION_CLIENT_ID="${client_id}" KELDRA_INDEX_CONTENTION_CLIENT_SECRET="${client_secret}" KELDRA_INDEX_CONTENTION_SERVER_SOURCE_COMMIT="${source_commit}" KELDRA_INDEX_CONTENTION_IMAGE="qualification-kit:${source_commit}" KELDRA_INDEX_CONTENTION_TOPOLOGY=single-node KELDRA_INDEX_CONTENTION_DURABILITY=LOCAL KELDRA_INDEX_CONTENTION_DEFINITION_COUNT="${definitions}" KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT="${recipes}" KELDRA_INDEX_CONTENTION_BASELINE_SECONDS="${baseline_seconds}" KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS="${concurrent_seconds}" KELDRA_INDEX_CONTENTION_POST_SECONDS="${post_seconds}" KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND="${offered_rate}" KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES="${object_bytes}" KELDRA_INDEX_CONTENTION_MUTATION_WORKERS="${mutation_workers}" KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=32 KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH="$((mutation_workers * 8))" KELDRA_INDEX_CONTENTION_QUERY_RATE="${query_rate}" KELDRA_INDEX_CONTENTION_QUERY_MAX_IN_FLIGHT="${query_max_in_flight}" KELDRA_INDEX_CONTENTION_REQUEST_TIMEOUT_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_DRAIN_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=2000 KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_OUTPUT="${report}" KELDRA_INDEX_CONTENTION_PROGRESS_JSONL="${progress}" "${kit_root}/bin/index-contention-qualification" >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log"
