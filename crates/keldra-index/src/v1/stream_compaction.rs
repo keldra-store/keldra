@@ -100,12 +100,12 @@ pub(super) fn select_component_compaction(
     if source.len() != limits.l0_trigger {
         return Err(IndexError::Integrity);
     }
-    let minimum_key = source
+    let source_minimum_key = source
         .iter()
         .map(|run| run.minimum_key)
         .min()
         .ok_or(IndexError::Integrity)?;
-    let maximum_key = source
+    let source_maximum_key = source
         .iter()
         .map(|run| run.maximum_key)
         .max()
@@ -116,7 +116,7 @@ pub(super) fn select_component_compaction(
         previous.root_hash,
         None,
         target_level,
-        Some((minimum_key, maximum_key)),
+        Some((source_minimum_key, source_maximum_key)),
         limits
             .maximum_input_runs
             .checked_add(1)
@@ -127,6 +127,16 @@ pub(super) fn select_component_compaction(
         return Ok(None);
     }
     inputs.sort_unstable_by_key(|run| run.sequence);
+    let minimum_key = inputs
+        .iter()
+        .map(|run| run.minimum_key)
+        .min()
+        .ok_or(IndexError::Integrity)?;
+    let maximum_key = inputs
+        .iter()
+        .map(|run| run.maximum_key)
+        .max()
+        .ok_or(IndexError::Integrity)?;
     let selected = inputs
         .iter()
         .map(|run| run.sequence)

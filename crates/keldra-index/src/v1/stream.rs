@@ -1573,6 +1573,10 @@ impl<'a> Decoder<'a> {
 mod lookup_tests;
 
 #[cfg(test)]
+#[path = "stream_compaction_tests.rs"]
+mod compaction_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::v1::pack::test_pack_credits;
