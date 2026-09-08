@@ -416,6 +416,8 @@ wait_for_bootstrap() {
       test -f /var/lib/keldra/system-bootstrap-credential.json \
       >/dev/null 2>&1
     then
+      compose exec -T keldra-1 \
+        chmod 0600 /var/lib/keldra/system-bootstrap-credential.json
       return 0
     fi
     sleep 1
