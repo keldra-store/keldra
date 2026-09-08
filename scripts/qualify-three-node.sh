@@ -375,7 +375,7 @@ install_client_secret() {
     | docker run --rm --interactive --user 0 \
         --volume "${KELDRA_QUALIFICATION_DIR}:/qualification" \
         "${image_id}" sh -c \
-          'umask 077; cat >"$1"; chown 10001:10001 "$1"; chmod 0400 "$1"' \
+          'umask 077; cat >"$1"; chown 10001:10001 "$1"; chmod 0600 "$1"' \
           sh "${secret_file}"
   printf '%s\n' "${secret_file}"
 }
