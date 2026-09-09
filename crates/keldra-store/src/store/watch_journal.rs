@@ -294,13 +294,30 @@ impl Store {
         Ok(Some(through))
     }
 
-    /// Reconstructs the volatile reference-safe cut after a one-node mutation.
-    /// Its durable visibility cut was already staged in the same RocksDB batch
-    /// as the journal entry; this helper performs no second durable write.
+    /// Reconstructs the volatile reference-safe cut after a one-node mutation
+    /// whose reference effects were applied in its durable RocksDB batch. This
+    /// helper performs no second durable write.
     pub(crate) fn settle_inline_source_changes(&self) -> Result<(), MutationError> {
         let status = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
+        self.settle_inline_source_changes_from_status(status)
+    }
+
+    pub(super) fn settle_inline_source_changes_from_status(
+        &self,
+        status: WatchJournalStatus,
+    ) -> Result<(), MutationError> {
+        let local_source = SourceId {
+            node_id: self.node_id,
+            source_epoch: self.watch_source_epoch,
+        };
+        if status.source_id != local_source {
+            return Err(MutationError::Storage(format!(
+                "source journal identity {:?} does not match local source {local_source:?}",
+                status.source_id,
+            )));
+        }
         let reference_safe = self
             .source_journal_reference_safe_through
             .load(std::sync::atomic::Ordering::Acquire);

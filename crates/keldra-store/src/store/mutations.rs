@@ -19,6 +19,13 @@ use crate::{DefinitionMutationIntent, DefinitionOperation, DefinitionTransition}
 const MAX_EXPIRED_RECEIPTS_PRUNED_PER_PASS: usize = 1_024;
 const MAX_EXPIRED_RECEIPT_BYTES_PRUNED_PER_PASS: u64 = 4 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StagedLocalChanges {
+    pub(super) previous_tail: u64,
+    pub(super) status: WatchJournalStatus,
+    pub(super) visibility_settlement_staged: bool,
+}
+
 impl Store {
     /// One-node WriteBatch request with coordinator-reconciled bucket options.
     pub async fn mutate_with_governance(
@@ -959,23 +966,19 @@ impl Store {
             SourceJournalAdmission::Bounded,
         )
     }
-    pub(super) fn stage_local_changes_with_admission(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stage_local_changes_from_status(
         &self,
         batch: &mut WriteBatch,
         changes: &[PendingLocalChange],
         reference_effects: LocalReferenceEffects,
         admission: SourceJournalAdmission,
-    ) -> Result<(), MutationError> {
-        if admission.suppresses_physical_replica_changes(changes, reference_effects)?
-            || changes.is_empty()
-        {
-            return Ok(());
-        }
+        mut status: WatchJournalStatus,
+        cursor: u64,
+        stage_visibility_settlement: bool,
+    ) -> Result<StagedLocalChanges, MutationError> {
         let journal = self.cf(CF_LOCAL_INVALIDATIONS)?;
         let metadata = self.cf(CF_METADATA)?;
-        let mut status = self
-            .local_watch_status()
-            .map_err(|error| MutationError::Storage(error.to_string()))?;
         let retained_entries_before = status.retained_entries;
         let retained_bytes_before = status.retained_bytes;
         if admission == SourceJournalAdmission::Bounded
@@ -985,13 +988,6 @@ impl Store {
             return Err(MutationError::SourceJournalCapacity);
         }
         let old_tail = status.tail;
-        let cursor = self
-            .reference_delta_cursor(status.source_id)
-            .map_err(|error| {
-                MutationError::Storage(format!(
-                    "cannot read local reference cursor before source-journal append: {error}"
-                ))
-            })?;
         if cursor > old_tail {
             return Err(MutationError::Storage(format!(
                 "local reference cursor {cursor} is ahead of source-journal tail {old_tail}"
@@ -1083,9 +1079,10 @@ impl Store {
             LOCAL_INVALIDATION_OFFSET_KEY,
             status.tail.to_be_bytes(),
         );
-        if reference_effects != LocalReferenceEffects::Deferred
-            && status.settled_through == old_tail
-        {
+        let visibility_settlement_staged =
+            stage_visibility_settlement && status.settled_through == old_tail;
+        if visibility_settlement_staged {
+            status.settled_through = status.tail;
             batch.put_cf(
                 metadata,
                 LOCAL_INVALIDATION_SETTLED_KEY,
@@ -1110,10 +1107,19 @@ impl Store {
         if let Some(source) = local_reference_cursor {
             self.stage_reference_delta_cursor(batch, source, status.tail)?;
         }
-        Ok(())
+        Ok(StagedLocalChanges {
+            previous_tail: old_tail,
+            status,
+            visibility_settlement_staged,
+        })
     }
     pub(crate) fn notify_local_invalidations(&self) {
         self.observe_source_journal_progress_debt();
+        self.watch_notify.send_replace(());
+    }
+
+    pub(super) fn notify_local_invalidations_from_status(&self, status: WatchJournalStatus) {
+        self.observe_source_journal_progress_debt_from_status(status);
         self.watch_notify.send_replace(());
     }
 

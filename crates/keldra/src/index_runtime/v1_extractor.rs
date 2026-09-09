@@ -58,15 +58,18 @@ impl V1ProjectionExtractor {
         bucket_id: u64,
         source: IndexSourceMutation,
         recipes: &[PhysicalCatalogRecipe],
+        physical_catalog_identity: [u8; 32],
     ) -> Result<SelectedV1Source, Status> {
-        let Some(object) = (match &source {
-            IndexSourceMutation::Upsert(object) => Some(object.clone()),
-            IndexSourceMutation::Remove(_) => None,
-        }) else {
-            return Ok(SelectedV1Source {
-                source,
-                selected: None,
-            });
+        let object = match &source {
+            IndexSourceMutation::Upsert(object) => object.clone(),
+            IndexSourceMutation::Remove(identity) => {
+                self.hot
+                    .discard_through(tenant_id, bucket_id, &identity.path, identity.version);
+                return Ok(SelectedV1Source {
+                    source,
+                    selected: None,
+                });
+            }
         };
         let pointers = if recipes.len() == 1 {
             recipes[0].selectors.clone()
@@ -81,15 +84,19 @@ impl V1ProjectionExtractor {
             )
         };
         if pointers.is_empty() {
+            self.discard_hot_through(tenant_id, bucket_id, &object.path, object.version);
             return Ok(SelectedV1Source {
                 source,
                 selected: None,
             });
         }
-        if let Some(selected) =
-            self.hot
-                .take_exact_selected(tenant_id, bucket_id, &object.path, object.version)
-        {
+        if let Some(selected) = self.hot.take_exact_selected_for_generation(
+            tenant_id,
+            bucket_id,
+            &object.path,
+            object.version,
+            physical_catalog_identity,
+        ) {
             super::v1_telemetry::V1PipelineTelemetry::add(
                 &super::v1_telemetry::global().hot_prepared_hits,
                 1,
@@ -138,6 +145,17 @@ impl V1ProjectionExtractor {
             wait.as_nanos().min(u128::from(u64::MAX)) as u64,
         );
         Ok(SelectedV1Source { source, selected })
+    }
+
+    pub(crate) fn discard_hot_through(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        path: &str,
+        version: u64,
+    ) {
+        self.hot
+            .discard_through(tenant_id, bucket_id, path, version);
     }
 
     pub(crate) fn prepare(

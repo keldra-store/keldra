@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
+use tokio::time::Instant;
 
 use super::Store;
 use crate::{
@@ -12,7 +13,7 @@ use crate::{
     ObjectMutationContext, ObjectMutationGovernance,
 };
 
-const DEFAULT_MAX_GROUP_REQUESTS: usize = 5;
+const DEFAULT_MAX_GROUP_REQUESTS: usize = 16;
 const DEFAULT_MAX_GROUP_OPERATIONS: usize = 5_000;
 const DEFAULT_MAX_GROUP_INLINE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_QUEUED_REQUESTS: usize = 64;
@@ -170,6 +171,7 @@ pub(super) type SingleNodeOutcomes = Result<SingleNodeMutationBatch, MutationErr
 pub(super) struct SingleNodeCommitRequest {
     pub(super) operations: SingleNodeOperations,
     pub(super) context: ObjectMutationContext,
+    enqueued_at: Instant,
     response: oneshot::Sender<SingleNodeOutcomes>,
     _queue_permits: QueuePermits,
 }
@@ -222,10 +224,27 @@ struct QueueState {
     worker_running: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GroupPlan {
+    request_count: usize,
+    stop_reason: &'static str,
+}
+
+enum QueueAction {
+    Empty,
+    Group {
+        requests: Vec<SingleNodeCommitRequest>,
+        queued_requests: usize,
+        stop_reason: &'static str,
+    },
+    WaitUntil(Instant),
+}
+
 #[derive(Clone)]
 pub(super) struct SingleNodeGroupCommit {
     config: SingleNodeGroupCommitConfig,
     state: Arc<Mutex<QueueState>>,
+    queue_changed: Arc<Notify>,
     queue_slots: Arc<Semaphore>,
     operation_slots: Arc<Semaphore>,
     inline_byte_slots: Arc<Semaphore>,
@@ -243,6 +262,7 @@ impl SingleNodeGroupCommit {
             inline_byte_slots: Arc::new(Semaphore::new(config.max_queued_inline_bytes)),
             config,
             state: Arc::new(Mutex::new(QueueState::default())),
+            queue_changed: Arc::new(Notify::new()),
             #[cfg(test)]
             settlement_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -264,12 +284,16 @@ impl SingleNodeGroupCommit {
 
     #[cfg(test)]
     async fn wait_until_idle(&self) {
-        loop {
-            if !self.state.lock().await.worker_running {
-                return;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !self.state.lock().await.worker_running {
+                    return;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("single-node group worker must become idle");
     }
 
     #[cfg(test)]
@@ -287,6 +311,91 @@ impl SingleNodeGroupCommit {
     #[cfg(not(test))]
     pub(super) fn take_injected_settlement_failure(&self) -> bool {
         false
+    }
+
+    fn plan_group(&self, requests: &VecDeque<SingleNodeCommitRequest>) -> Option<GroupPlan> {
+        let first = requests.front()?;
+        let mut request_count = 1;
+        let mut operations = first.operation_count();
+        let mut inline_bytes = first.inline_bytes();
+        let context = first.context;
+        let Some(mut governance) = first.consistent_governance() else {
+            return Some(GroupPlan {
+                request_count,
+                stop_reason: "inconsistent_governance",
+            });
+        };
+        let stop_reason = loop {
+            if request_count >= self.config.max_group_requests {
+                break "max_requests";
+            }
+            if operations >= self.config.max_group_operations {
+                break "operations";
+            }
+            if inline_bytes >= self.config.max_group_inline_bytes {
+                break "inline_bytes";
+            }
+            let Some(candidate) = requests.get(request_count) else {
+                break "queue_empty";
+            };
+            let Some(candidate_governance) = candidate.consistent_governance() else {
+                break "inconsistent_governance";
+            };
+            let candidate_operations = candidate.operation_count();
+            let candidate_bytes = candidate.inline_bytes();
+            let compatible_governance = candidate_governance.iter().all(|(identity, value)| {
+                governance
+                    .get(identity)
+                    .is_none_or(|existing| existing == value)
+            });
+            if candidate.context != context {
+                break "context";
+            }
+            if !compatible_governance {
+                break "governance";
+            }
+            if operations.saturating_add(candidate_operations) > self.config.max_group_operations {
+                break "operations";
+            }
+            if inline_bytes.saturating_add(candidate_bytes) > self.config.max_group_inline_bytes {
+                break "inline_bytes";
+            }
+            operations = operations.saturating_add(candidate_operations);
+            inline_bytes = inline_bytes.saturating_add(candidate_bytes);
+            for (identity, value) in candidate_governance {
+                governance.entry(identity).or_insert(value);
+            }
+            request_count += 1;
+        };
+        Some(GroupPlan {
+            request_count,
+            stop_reason,
+        })
+    }
+
+    fn next_queue_action(&self, state: &mut QueueState, now: Instant) -> QueueAction {
+        let Some(plan) = self.plan_group(&state.requests) else {
+            state.worker_running = false;
+            return QueueAction::Empty;
+        };
+        if plan.stop_reason == "queue_empty" {
+            let deadline = state.requests[0]
+                .enqueued_at
+                .checked_add(self.config.max_group_dwell)
+                .unwrap_or(now);
+            if now < deadline {
+                return QueueAction::WaitUntil(deadline);
+            }
+        }
+        let requests = state
+            .requests
+            .drain(..plan.request_count)
+            .collect::<Vec<_>>();
+        QueueAction::Group {
+            requests,
+            queued_requests: state.requests.len(),
+            stop_reason: plan.stop_reason,
+        }
     }
 
     pub(super) async fn submit(
@@ -337,6 +446,7 @@ impl SingleNodeGroupCommit {
             state.requests.push_back(SingleNodeCommitRequest {
                 operations,
                 context,
+                enqueued_at: Instant::now(),
                 response,
                 _queue_permits: QueuePermits {
                     _request: request_permit,
@@ -354,6 +464,8 @@ impl SingleNodeGroupCommit {
         if start_worker {
             let queue = self.clone();
             tokio::spawn(async move { queue.run(store).await });
+        } else {
+            self.queue_changed.notify_one();
         }
         received.await.unwrap_or_else(|_| {
             Err(MutationError::Storage(
@@ -364,74 +476,29 @@ impl SingleNodeGroupCommit {
 
     async fn run(self, store: Store) {
         loop {
-            let dwell_started = std::time::Instant::now();
-            tokio::time::sleep(self.config.max_group_dwell).await;
-            let dwell_duration = dwell_started.elapsed();
-            let (requests, queued_requests, stop_reason) = {
-                let mut state = self.state.lock().await;
-                let Some(first) = state.requests.pop_front() else {
-                    state.worker_running = false;
-                    return;
+            let dwell_started = Instant::now();
+            let (requests, queued_requests, stop_reason) = loop {
+                let notified = self.queue_changed.notified();
+                let action = {
+                    let mut state = self.state.lock().await;
+                    self.next_queue_action(&mut state, Instant::now())
                 };
-                let mut group = vec![first];
-                let mut operations = group[0].operation_count();
-                let mut inline_bytes = group[0].inline_bytes();
-                let context = group[0].context;
-                let mut governance = group[0].consistent_governance();
-                let mut stop_reason = "max_requests";
-                while group.len() < self.config.max_group_requests {
-                    let Some(candidate) = state.requests.front() else {
-                        stop_reason = "queue_empty";
-                        break;
-                    };
-                    let (Some(group_governance), Some(candidate_governance)) =
-                        (governance.as_ref(), candidate.consistent_governance())
-                    else {
-                        stop_reason = "inconsistent_governance";
-                        break;
-                    };
-                    let candidate_operations = candidate.operation_count();
-                    let candidate_bytes = candidate.inline_bytes();
-                    let compatible_governance =
-                        candidate_governance.iter().all(|(identity, value)| {
-                            group_governance
-                                .get(&identity)
-                                .is_none_or(|existing| existing == value)
-                        });
-                    if candidate.context != context {
-                        stop_reason = "context";
-                        break;
+                match action {
+                    QueueAction::Empty => return,
+                    QueueAction::Group {
+                        requests,
+                        queued_requests,
+                        stop_reason,
+                    } => break (requests, queued_requests, stop_reason),
+                    QueueAction::WaitUntil(deadline) => {
+                        tokio::select! {
+                            () = notified => {}
+                            () = tokio::time::sleep_until(deadline) => {}
+                        }
                     }
-                    if !compatible_governance {
-                        stop_reason = "governance";
-                        break;
-                    }
-                    if operations.saturating_add(candidate_operations)
-                        > self.config.max_group_operations
-                    {
-                        stop_reason = "operations";
-                        break;
-                    }
-                    if inline_bytes.saturating_add(candidate_bytes)
-                        > self.config.max_group_inline_bytes
-                    {
-                        stop_reason = "inline_bytes";
-                        break;
-                    }
-                    let candidate = state.requests.pop_front().expect("front exists");
-                    operations = operations.saturating_add(candidate_operations);
-                    inline_bytes = inline_bytes.saturating_add(candidate_bytes);
-                    for (identity, value) in candidate_governance {
-                        governance
-                            .as_mut()
-                            .expect("compatible group governance exists")
-                            .entry(identity)
-                            .or_insert(value);
-                    }
-                    group.push(candidate);
                 }
-                (group, state.requests.len(), stop_reason)
             };
+            let dwell_duration = dwell_started.elapsed();
 
             let request_count = requests.len();
             let operation_counts = requests
@@ -583,6 +650,15 @@ mod tests {
         }
     }
 
+    fn governance_stub() -> ObjectMutationGovernance {
+        ObjectMutationGovernance {
+            tenant_id: 1,
+            bucket_id: 1,
+            versioning: Default::default(),
+            policy: Default::default(),
+        }
+    }
+
     fn request(
         path: &str,
         command: &str,
@@ -612,8 +688,47 @@ mod tests {
             .len()
     }
 
+    fn queued_request(
+        queue: &SingleNodeGroupCommit,
+        operations: SingleNodeOperations,
+        context: ObjectMutationContext,
+        enqueued_at: Instant,
+    ) -> SingleNodeCommitRequest {
+        let operation_count = u32::try_from(operations.len()).unwrap();
+        let inline_bytes = operations
+            .iter()
+            .map(|(operation, _, _)| match operation {
+                BatchOperation::Put(request) => request.bytes.len(),
+                BatchOperation::Publish(_)
+                | BatchOperation::Clone(_)
+                | BatchOperation::Delete(_) => 0,
+            })
+            .sum::<usize>();
+        let (response, received) = oneshot::channel();
+        drop(received);
+        SingleNodeCommitRequest {
+            operations,
+            context,
+            enqueued_at,
+            response,
+            _queue_permits: QueuePermits {
+                _request: queue.queue_slots.clone().try_acquire_owned().unwrap(),
+                _operations: queue
+                    .operation_slots
+                    .clone()
+                    .try_acquire_many_owned(operation_count)
+                    .unwrap(),
+                _inline_bytes: queue
+                    .inline_byte_slots
+                    .clone()
+                    .try_acquire_many_owned(u32::try_from(inline_bytes).unwrap())
+                    .unwrap(),
+            },
+        }
+    }
+
     #[tokio::test]
-    async fn five_requests_share_one_commit_and_one_group_settlement_attempt() {
+    async fn five_requests_share_one_commit_with_primary_settlement() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
@@ -650,7 +765,7 @@ mod tests {
         assert_eq!(physical_commits_since(&store, before), 1);
         assert_eq!(
             store.single_node_group_commit.settlement_attempts() - settlements_before,
-            1
+            0
         );
         let status = store.local_watch_status().unwrap();
         assert_eq!(status.settled_through, status.tail);
@@ -726,13 +841,189 @@ mod tests {
         assert_eq!(physical_commits_since(&store, before), 1);
         assert_eq!(
             store.single_node_group_commit.settlement_attempts() - settlements_before,
-            1
+            0
         );
         let status = store.local_watch_status().unwrap();
         assert_eq!(
             store.reference_delta_cursor(status.source_id).unwrap(),
             status.tail
         );
+    }
+
+    #[tokio::test]
+    async fn full_compatible_group_skips_its_dwell_deadline() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = SingleNodeGroupCommitConfig::new(
+            2,
+            DEFAULT_MAX_GROUP_OPERATIONS,
+            DEFAULT_MAX_GROUP_INLINE_BYTES,
+            DEFAULT_MAX_QUEUED_REQUESTS,
+            DEFAULT_MAX_QUEUED_OPERATIONS,
+            DEFAULT_MAX_QUEUED_INLINE_BYTES,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
+        )
+        .await
+        .unwrap();
+        let governance = governance(&store);
+        let before = store.db.latest_sequence_number();
+
+        let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                store.coordinate_single_node_mutation_batch(
+                    request("objects/full-a", "full-a", governance.clone()),
+                    context(1),
+                ),
+                store.coordinate_single_node_mutation_batch(
+                    request("objects/full-b", "full-b", governance),
+                    context(1),
+                ),
+            )
+        })
+        .await
+        .expect("a full compatible group must not wait for its dwell deadline");
+
+        assert!(matches!(first.as_deref(), Ok([Ok(_)])));
+        assert!(matches!(second.as_deref(), Ok([Ok(_)])));
+        assert_eq!(physical_commits_since(&store, before), 1);
+    }
+
+    #[test]
+    fn underfilled_group_waits_until_the_first_request_deadline() {
+        let queue = SingleNodeGroupCommit::new(SingleNodeGroupCommitConfig::default());
+        let enqueued_at = Instant::now();
+        let deadline = enqueued_at + queue.config.max_group_dwell;
+        let mut state = QueueState::default();
+        state.requests.push_back(queued_request(
+            &queue,
+            request("objects/underfilled", "underfilled", governance_stub()),
+            context(1),
+            enqueued_at,
+        ));
+
+        for now in [enqueued_at, deadline - Duration::from_nanos(1)] {
+            assert_eq!(
+                match queue.next_queue_action(&mut state, now) {
+                    QueueAction::WaitUntil(planned) => planned,
+                    _ => panic!("an underfilled group must wait for another compatible request"),
+                },
+                deadline,
+            );
+        }
+        assert!(matches!(
+            queue.next_queue_action(&mut state, deadline),
+            QueueAction::Group { requests, .. } if requests.len() == 1
+        ));
+    }
+
+    #[test]
+    fn group_planning_keeps_operation_and_inline_byte_bounds() {
+        fn assert_limit(config: SingleNodeGroupCommitConfig, commands: [&str; 2], reason: &str) {
+            let queue = SingleNodeGroupCommit::new(config);
+            let enqueued_at = Instant::now();
+            let mut state = QueueState::default();
+            for (index, command) in commands.into_iter().enumerate() {
+                state.requests.push_back(queued_request(
+                    &queue,
+                    request(
+                        &format!("objects/bounded-{index}"),
+                        command,
+                        governance_stub(),
+                    ),
+                    context(1),
+                    enqueued_at,
+                ));
+            }
+            match queue.next_queue_action(&mut state, enqueued_at) {
+                QueueAction::Group {
+                    requests,
+                    stop_reason,
+                    ..
+                } => {
+                    assert_eq!(requests.len(), 1);
+                    assert_eq!(stop_reason, reason);
+                }
+                _ => panic!("a bounded compatible prefix must proceed immediately"),
+            }
+            assert_eq!(state.requests.len(), 1);
+        }
+
+        assert_limit(
+            SingleNodeGroupCommitConfig::new(
+                16,
+                1,
+                DEFAULT_MAX_GROUP_INLINE_BYTES,
+                DEFAULT_MAX_QUEUED_REQUESTS,
+                DEFAULT_MAX_QUEUED_OPERATIONS,
+                DEFAULT_MAX_QUEUED_INLINE_BYTES,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+            ["operation-a", "operation-b"],
+            "operations",
+        );
+        assert_limit(
+            SingleNodeGroupCommitConfig::new(
+                16,
+                DEFAULT_MAX_GROUP_OPERATIONS,
+                3,
+                DEFAULT_MAX_QUEUED_REQUESTS,
+                DEFAULT_MAX_QUEUED_OPERATIONS,
+                DEFAULT_MAX_QUEUED_INLINE_BYTES,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+            ["aa", "bb"],
+            "inline_bytes",
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_requests_are_rejected_before_queueing_or_writing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = SingleNodeGroupCommitConfig::new(
+            16,
+            1,
+            3,
+            DEFAULT_MAX_QUEUED_REQUESTS,
+            DEFAULT_MAX_QUEUED_OPERATIONS,
+            DEFAULT_MAX_QUEUED_INLINE_BYTES,
+            DEFAULT_MAX_GROUP_DWELL,
+        )
+        .unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
+        )
+        .await
+        .unwrap();
+        let governance = governance(&store);
+        let before = store.db.latest_sequence_number();
+        let mut too_many = request("objects/too-many-a", "a", governance.clone());
+        too_many.extend(request("objects/too-many-b", "b", governance.clone()));
+
+        for result in [
+            store
+                .coordinate_single_node_mutation_batch(too_many, context(1))
+                .await,
+            store
+                .coordinate_single_node_mutation_batch(
+                    request("objects/too-large", "four", governance),
+                    context(1),
+                )
+                .await,
+        ] {
+            assert!(matches!(
+                result,
+                Err(MutationError::InvalidObjectMutation(_))
+            ));
+        }
+        assert_eq!(store.db.latest_sequence_number(), before);
+        let state = store.single_node_group_commit.state.lock().await;
+        assert!(state.requests.is_empty());
+        assert!(!state.worker_running);
     }
 
     #[test]
@@ -837,10 +1128,10 @@ mod tests {
             matches!(second.as_deref(), Ok([Ok(_)])),
             "second={second:?}"
         );
-        assert_eq!(physical_commits_since(&store, before_sequence), 2);
+        assert_eq!(physical_commits_since(&store, before_sequence), 1);
         assert_eq!(
             store.single_node_group_commit.settlement_attempts() - settlements_before,
-            1
+            0
         );
         for (path, expected) in [
             ("objects/first-after-gap", b"first-after-gap".as_slice()),
@@ -885,7 +1176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settlement_failure_preserves_receipt_and_requires_quorum_fallback() {
+    async fn settlement_gap_and_failure_preserve_the_post_commit_fallback() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
@@ -906,7 +1197,31 @@ mod tests {
         let before = store.local_watch_status().unwrap();
         assert!(before.settled_through < before.tail);
 
+        let gap_operation = request(
+            "objects/settlement-gap",
+            "settlement-gap",
+            governance.clone(),
+        );
+        let settlements_before = store.single_node_group_commit.settlement_attempts();
+        let gap_committed = store
+            .coordinate_single_node_mutation_batch_with_settlement(gap_operation, context(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            gap_committed.source_journal_settlement,
+            SourceJournalSettlement::CompletedByCoordinator
+        );
+        assert!(!gap_committed.outcomes[0].as_ref().unwrap().receipt.replayed);
+        assert_eq!(
+            store.single_node_group_commit.settlement_attempts() - settlements_before,
+            1
+        );
+        let after_gap = store.local_watch_status().unwrap();
+        assert!(after_gap.tail > before.tail);
+        assert_eq!(after_gap.settled_through, before.settled_through);
+
         let operation = request("objects/settlement-retry", "settlement-retry", governance);
+        let settlements_before = store.single_node_group_commit.settlement_attempts();
         store.single_node_group_commit.fail_next_settlement();
         let committed = store
             .coordinate_single_node_mutation_batch_with_settlement(operation.clone(), context(1))
@@ -918,8 +1233,12 @@ mod tests {
         );
         let receipt = committed.outcomes[0].as_ref().unwrap();
         assert!(!receipt.receipt.replayed);
+        assert_eq!(
+            store.single_node_group_commit.settlement_attempts() - settlements_before,
+            1
+        );
         let committed_tail = store.local_watch_status().unwrap().tail;
-        assert!(committed_tail > before.tail);
+        assert!(committed_tail > after_gap.tail);
 
         let replay = store
             .coordinate_single_node_mutation_batch_with_settlement(operation, context(1))
@@ -986,7 +1305,7 @@ mod tests {
         );
         assert_eq!(
             store.single_node_group_commit.settlement_attempts() - settlements_before,
-            1
+            0
         );
         let status = store.local_watch_status().unwrap();
         assert_eq!(status.settled_through, status.tail);
@@ -1057,33 +1376,12 @@ mod tests {
         let queue = store.single_node_group_commit.clone();
         let settlements_before = queue.settlement_attempts();
         let operations = request("objects/detached", "detached", governance(&store));
-        let request_permit = queue.queue_slots.clone().acquire_owned().await.unwrap();
-        let operation_permit = queue
-            .operation_slots
-            .clone()
-            .acquire_many_owned(1)
-            .await
-            .unwrap();
-        let inline_byte_permit = queue
-            .inline_byte_slots
-            .clone()
-            .acquire_many_owned("detached".len() as u32)
-            .await
-            .unwrap();
-        let (response, received) = oneshot::channel();
-        drop(received);
+        let enqueued_at = Instant::now();
         {
             let mut state = queue.state.lock().await;
-            state.requests.push_back(SingleNodeCommitRequest {
-                operations,
-                context: context(1),
-                response,
-                _queue_permits: QueuePermits {
-                    _request: request_permit,
-                    _operations: operation_permit,
-                    _inline_bytes: inline_byte_permit,
-                },
-            });
+            state
+                .requests
+                .push_back(queued_request(&queue, operations, context(1), enqueued_at));
             state.worker_running = true;
         }
 
@@ -1096,7 +1394,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(queue.settlement_attempts() - settlements_before, 1);
+        assert_eq!(queue.settlement_attempts() - settlements_before, 0);
         let status = store.local_watch_status().unwrap();
         assert_eq!(status.settled_through, status.tail);
     }

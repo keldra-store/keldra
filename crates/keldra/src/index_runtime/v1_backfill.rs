@@ -105,6 +105,7 @@ impl V1PartitionBaseline {
     pub(crate) async fn next_selected(
         &mut self,
         extractor: &V1ProjectionExtractor,
+        physical_catalog_identity: [u8; 32],
         credits: &IndexingMemoryCredits,
         maximum_selected_bytes: usize,
     ) -> Result<Option<V1BaselineSelected>, Status> {
@@ -156,6 +157,7 @@ impl V1PartitionBaseline {
                         self.recipe.family.bucket_id,
                         source,
                         &recipes,
+                        physical_catalog_identity,
                     )
                     .await?;
                 let resident_bytes = selected_resident_bytes(&selected)?;
@@ -207,6 +209,7 @@ impl V1PartitionBaseline {
     pub(crate) async fn next_selected_batch(
         &mut self,
         extractor: &V1ProjectionExtractor,
+        physical_catalog_identity: [u8; 32],
         credits: &IndexingMemoryCredits,
         maximum_selected_bytes: usize,
         max_items: usize,
@@ -219,7 +222,12 @@ impl V1PartitionBaseline {
         let mut selected = Vec::with_capacity(max_items.min(4_096));
         while selected.len() < max_items {
             match self
-                .next_selected(extractor, credits, maximum_selected_bytes)
+                .next_selected(
+                    extractor,
+                    physical_catalog_identity,
+                    credits,
+                    maximum_selected_bytes,
+                )
                 .await
             {
                 Ok(Some(item)) => selected.push(item),

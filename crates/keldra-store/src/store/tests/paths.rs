@@ -13,7 +13,7 @@ fn store_options_default_to_the_existing_root_layout() {
     assert_eq!(options.payload_directory, root.join("blobs"));
     assert_eq!(options.max_total_wal_bytes, 50 * 1024 * 1024 * 1024);
     assert_eq!(options.pending_upload_max_bytes, 16 * 1024 * 1024 * 1024);
-    assert_eq!(options.single_node_group_commit.max_group_requests(), 5);
+    assert_eq!(options.single_node_group_commit.max_group_requests(), 16);
     assert_eq!(
         options.single_node_group_commit.max_group_operations(),
         5_000

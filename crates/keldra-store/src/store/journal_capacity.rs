@@ -43,10 +43,51 @@ impl SourceJournalAdmission {
 }
 
 impl Store {
+    pub(super) fn stage_local_changes_with_admission(
+        &self,
+        batch: &mut WriteBatch,
+        changes: &[PendingLocalChange],
+        reference_effects: LocalReferenceEffects,
+        admission: SourceJournalAdmission,
+    ) -> Result<(), MutationError> {
+        if admission.suppresses_physical_replica_changes(changes, reference_effects)?
+            || changes.is_empty()
+        {
+            return Ok(());
+        }
+        let status = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let cursor = self
+            .reference_delta_cursor(status.source_id)
+            .map_err(|error| {
+                MutationError::Storage(format!(
+                    "cannot read local reference cursor before source-journal append: {error}"
+                ))
+            })?;
+        self.stage_local_changes_from_status(
+            batch,
+            changes,
+            reference_effects,
+            admission,
+            status,
+            cursor,
+            reference_effects != LocalReferenceEffects::Deferred,
+        )?;
+        Ok(())
+    }
+
     pub(super) fn observe_source_journal_progress_debt(&self) {
         let Ok(status) = self.local_watch_status() else {
             return;
         };
+        self.observe_source_journal_progress_debt_from_status(status);
+    }
+
+    pub(super) fn observe_source_journal_progress_debt_from_status(
+        &self,
+        status: WatchJournalStatus,
+    ) {
         self.source_journal_progress_debt_peak_entries.fetch_max(
             status
                 .retained_entries

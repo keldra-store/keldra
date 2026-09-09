@@ -282,7 +282,16 @@ async fn reconcile(
                 return Err(Status::unavailable("v1 physical catalog changed"));
             }
             advance(
-                writer, &target, journal, scanner, reader, extractor, publisher, credits, limits,
+                writer,
+                &target,
+                catalog_snapshot.identity,
+                journal,
+                scanner,
+                reader,
+                extractor,
+                publisher,
+                credits,
+                limits,
             )
             .await?;
         }
@@ -417,6 +426,7 @@ fn empty_query_credits(
 
 async fn backfill(
     writer: &mut Writer,
+    physical_catalog_identity: [u8; 32],
     scanner: &super::scanner::ClusterIndexScanner,
     reader: &ClusterObjectReader,
     extractor: &V1ProjectionExtractor,
@@ -448,7 +458,13 @@ async fn backfill(
         .max(1);
     let selected_bytes = limits.flush_bytes.saturating_div(limits.parallelism).max(1);
     let batch = baseline
-        .next_selected_batch(extractor, credits, selected_bytes, batch_items)
+        .next_selected_batch(
+            extractor,
+            physical_catalog_identity,
+            credits,
+            selected_bytes,
+            batch_items,
+        )
         .await?;
     if !batch.is_empty() {
         let mut rows = Vec::with_capacity(batch.len());
@@ -506,13 +522,23 @@ async fn backfill(
         .ok_or_else(|| Status::data_loss("v1 baseline source cursor is absent"))?
         .next_offset = captured_next;
     writer.pending_next = captured_next;
-    flush(writer, reader, extractor, publisher, credits, limits).await
+    flush(
+        writer,
+        physical_catalog_identity,
+        reader,
+        extractor,
+        publisher,
+        credits,
+        limits,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn advance(
     writer: &mut Writer,
     target: &IndexBarrier,
+    physical_catalog_identity: [u8; 32],
     journal: &IndexEventJournal,
     scanner: &super::scanner::ClusterIndexScanner,
     reader: &ClusterObjectReader,
@@ -527,7 +553,14 @@ async fn advance(
     // same source versions twice in one unpublished query run.
     if writer.current.is_none() {
         backfill(
-            writer, scanner, reader, extractor, publisher, credits, limits,
+            writer,
+            physical_catalog_identity,
+            scanner,
+            reader,
+            extractor,
+            publisher,
+            credits,
+            limits,
         )
         .await?;
         return Ok(());
@@ -579,12 +612,30 @@ async fn advance(
                         &mutations,
                     )? > writer.pending_mutation_capacity
                 {
-                    flush(writer, reader, extractor, publisher, credits, limits).await?;
+                    flush(
+                        writer,
+                        physical_catalog_identity,
+                        reader,
+                        extractor,
+                        publisher,
+                        credits,
+                        limits,
+                    )
+                    .await?;
                 }
                 writer.through_atomic = writer.through_atomic.max(page_atomic);
                 queue_mutations(writer, mutations, safe_next)?;
                 if should_flush(writer, limits) {
-                    flush(writer, reader, extractor, publisher, credits, limits).await?;
+                    flush(
+                        writer,
+                        physical_catalog_identity,
+                        reader,
+                        extractor,
+                        publisher,
+                        credits,
+                        limits,
+                    )
+                    .await?;
                 }
             }
         }
@@ -593,7 +644,16 @@ async fn advance(
         .since
         .is_some_and(|since| since.elapsed() >= limits.flush_age)
     {
-        flush(writer, reader, extractor, publisher, credits, limits).await?;
+        flush(
+            writer,
+            physical_catalog_identity,
+            reader,
+            extractor,
+            publisher,
+            credits,
+            limits,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -749,6 +809,7 @@ fn mutation_window_bytes(mutation: &Mutation) -> usize {
 #[allow(clippy::too_many_arguments)]
 async fn prepare_lane(
     writer: &mut Writer,
+    physical_catalog_identity: [u8; 32],
     mutations: Vec<Mutation>,
     safe_next: u64,
     reader: &ClusterObjectReader,
@@ -778,7 +839,15 @@ async fn prepare_lane(
                         Status::resource_exhausted("v1 replay input memory unavailable")
                     })?;
                 select_mutation(
-                    reader, extractor, publisher, recipe, current, scope, mutation, input,
+                    reader,
+                    extractor,
+                    publisher,
+                    recipe,
+                    current,
+                    physical_catalog_identity,
+                    scope,
+                    mutation,
+                    input,
                 )
                 .await
             });
@@ -823,6 +892,7 @@ async fn select_mutation(
     publisher: V1ProjectionPublisher,
     recipe: PhysicalCatalogRecipe,
     current: Option<LoadedV1ProjectionGeneration>,
+    physical_catalog_identity: [u8; 32],
     scope: [u8; 32],
     mutation: Mutation,
     mut input: keldra_index::v1::IndexingMemoryPermit,
@@ -851,10 +921,25 @@ async fn select_mutation(
         content_type,
     );
     if matched.is_empty() {
+        // A delete or content-type transition can stop matching this recipe
+        // before extraction. Retire any exact-or-older hot state so a cached
+        // projection cannot outlive the journal mutation that made it obsolete.
+        extractor.discard_hot_through(
+            mutation.tenant_id,
+            mutation.bucket_id,
+            &mutation.path,
+            mutation.version,
+        );
         return Ok(None);
     }
     let selected = extractor
-        .select(mutation.tenant_id, mutation.bucket_id, source, &matched)
+        .select(
+            mutation.tenant_id,
+            mutation.bucket_id,
+            source,
+            &matched,
+            physical_catalog_identity,
+        )
         .await?;
     let previous = match current {
         Some(current) => {
@@ -1018,6 +1103,7 @@ fn has_publication_work(has_current: bool, prepared_source_rows: u64) -> bool {
 
 async fn flush(
     writer: &mut Writer,
+    physical_catalog_identity: [u8; 32],
     reader: &ClusterObjectReader,
     extractor: &V1ProjectionExtractor,
     publisher: &V1ProjectionPublisher,
@@ -1033,7 +1119,15 @@ async fn flush(
             .collect::<Vec<_>>();
         mutations.sort_by_key(|mutation| (mutation.offset, mutation.ordinal));
         prepare_lane(
-            writer, mutations, next, reader, extractor, publisher, credits, limits,
+            writer,
+            physical_catalog_identity,
+            mutations,
+            next,
+            reader,
+            extractor,
+            publisher,
+            credits,
+            limits,
         )
         .await?;
     }

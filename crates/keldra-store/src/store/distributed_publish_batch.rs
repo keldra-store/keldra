@@ -4,6 +4,7 @@ use super::evaluation_telemetry::EvaluationSubphaseMetrics;
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::DistributedEvaluationContext;
+use super::mutations::StagedLocalChanges;
 use super::single_node_group_commit::{SingleNodeOperations, SingleNodeOutcomes};
 use super::*;
 use crate::model::{CoordinatedObjectMutation, ObjectMutationContext, ObjectMutationGovernance};
@@ -18,7 +19,30 @@ struct PreparedDistributedMutation {
 struct CoordinatedBatchEvaluation {
     outcomes: Vec<Result<CoordinatedObjectMutation, MutationError>>,
     receipt_capacity_at: Option<usize>,
+    primary_source_settlement: Option<PrimarySourceSettlement>,
     metrics: CoordinatorBatchMetrics,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PrimarySourceSettlement {
+    source: SourceId,
+    previous_tail: u64,
+    through: u64,
+}
+
+impl PrimarySourceSettlement {
+    fn covers(self, settlement: &SingleNodeGroupSettlement) -> bool {
+        let Some(first) = self.previous_tail.checked_add(1) else {
+            return false;
+        };
+        self.source == settlement.source
+            && self.through >= first
+            && settlement
+                .positions
+                .iter()
+                .copied()
+                .eq(first..=self.through)
+    }
 }
 
 #[derive(Debug)]
@@ -118,6 +142,29 @@ enum CoordinatorBatchPayloadPreparation {
 }
 
 impl Store {
+    fn stage_single_node_local_changes(
+        &self,
+        batch: &mut WriteBatch,
+        changes: &[PendingLocalChange],
+        reference_effects: LocalReferenceEffects,
+        status: WatchJournalStatus,
+        reference_cursor: u64,
+    ) -> Result<Option<StagedLocalChanges>, MutationError> {
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        self.stage_local_changes_from_status(
+            batch,
+            changes,
+            reference_effects,
+            SourceJournalAdmission::Bounded,
+            status,
+            reference_cursor,
+            true,
+        )
+        .map(Some)
+    }
+
     /// Evaluate independently receipted operations for one metadata replica
     /// group in request order and commit their successful coordinator state
     /// with one physical RocksDB batch.
@@ -211,30 +258,37 @@ impl Store {
         let settle_started = std::time::Instant::now();
         let source_journal_settlement = match single_node_group_settlement(&evaluated.outcomes) {
             Ok(Some(settlement)) => {
-                #[cfg(test)]
-                self.single_node_group_commit.record_settlement_attempt();
-                if self
-                    .single_node_group_commit
-                    .take_injected_settlement_failure()
+                if evaluated
+                    .primary_source_settlement
+                    .is_some_and(|primary| primary.covers(&settlement))
                 {
-                    SourceJournalSettlement::RequiredAfterQuorum
+                    SourceJournalSettlement::CompletedByCoordinator
                 } else {
-                    match self
-                        .settle_source_journal_positions_if_contiguous(
-                            settlement.source,
-                            &settlement.positions,
-                        )
-                        .await
+                    #[cfg(test)]
+                    self.single_node_group_commit.record_settlement_attempt();
+                    if self
+                        .single_node_group_commit
+                        .take_injected_settlement_failure()
                     {
-                        Ok(_) => SourceJournalSettlement::CompletedByCoordinator,
-                        Err(error) => {
-                            tracing::warn!(
-                                source = ?settlement.source,
-                                count = settlement.positions.len(),
-                                %error,
-                                "single-node group committed but source settlement requires quorum fallback"
-                            );
-                            SourceJournalSettlement::RequiredAfterQuorum
+                        SourceJournalSettlement::RequiredAfterQuorum
+                    } else {
+                        match self
+                            .settle_source_journal_positions_if_contiguous(
+                                settlement.source,
+                                &settlement.positions,
+                            )
+                            .await
+                        {
+                            Ok(_) => SourceJournalSettlement::CompletedByCoordinator,
+                            Err(error) => {
+                                tracing::warn!(
+                                    source = ?settlement.source,
+                                    count = settlement.positions.len(),
+                                    %error,
+                                    "single-node group committed but source settlement requires quorum fallback"
+                                );
+                                SourceJournalSettlement::RequiredAfterQuorum
+                            }
                         }
                     }
                 }
@@ -302,6 +356,7 @@ impl Store {
             return Ok(CoordinatedBatchEvaluation {
                 outcomes: Vec::new(),
                 receipt_capacity_at: None,
+                primary_source_settlement: None,
                 metrics: CoordinatorBatchMetrics::default(),
             });
         }
@@ -406,8 +461,10 @@ impl Store {
         let source = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
-        let reference_effects = match payload_preparation {
-            CoordinatorBatchPayloadPreparation::Distributed => LocalReferenceEffects::Deferred,
+        let (reference_effects, reference_cursor) = match payload_preparation {
+            CoordinatorBatchPayloadPreparation::Distributed => {
+                (LocalReferenceEffects::Deferred, None)
+            }
             CoordinatorBatchPayloadPreparation::SingleNode => {
                 let cursor = self.reference_delta_cursor(source.source_id).map_err(|error| {
                     MutationError::Storage(format!(
@@ -420,7 +477,7 @@ impl Store {
                         source.tail
                     )));
                 }
-                if cursor == source.tail {
+                let effects = if cursor == source.tail {
                     LocalReferenceEffects::AppliedInline
                 } else {
                     // A derived or distributed publication may have appended
@@ -429,7 +486,8 @@ impl Store {
                     // group's effects out of order; append them to the same
                     // authoritative journal for contiguous delivery instead.
                     LocalReferenceEffects::Deferred
-                }
+                };
+                (effects, Some(cursor))
             }
         };
         let mut next_source_position = source.tail.checked_add(1).ok_or_else(|| {
@@ -581,7 +639,20 @@ impl Store {
         if receipt_status != initial_receipt_status {
             self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
         }
-        self.stage_local_changes(&mut batch, &pending_changes, reference_effects)?;
+        let staged_local_changes = match payload_preparation {
+            CoordinatorBatchPayloadPreparation::SingleNode => self
+                .stage_single_node_local_changes(
+                    &mut batch,
+                    &pending_changes,
+                    reference_effects,
+                    source,
+                    reference_cursor.expect("single-node reference cursor was read"),
+                )?,
+            CoordinatorBatchPayloadPreparation::Distributed => {
+                self.stage_local_changes(&mut batch, &pending_changes, reference_effects)?;
+                None
+            }
+        };
         if let Some(high_watermark) = high_watermark {
             batch.put_cf(
                 self.cf(CF_METADATA)?,
@@ -606,9 +677,20 @@ impl Store {
         }
         if !pending_changes.is_empty() {
             if reference_effects == LocalReferenceEffects::AppliedInline {
-                self.settle_inline_source_changes()?;
+                if let Some(staged) = staged_local_changes {
+                    self.settle_inline_source_changes_from_status(staged.status)?;
+                } else {
+                    self.settle_inline_source_changes()?;
+                }
+            } else if staged_local_changes.is_some_and(|staged| staged.visibility_settlement_staged)
+            {
+                self.mutation_capacity_notify.notify_waiters();
             }
-            self.notify_local_invalidations();
+            if let Some(staged) = staged_local_changes {
+                self.notify_local_invalidations_from_status(staged.status);
+            } else {
+                self.notify_local_invalidations();
+            }
         }
         let settle_duration = settle_started.elapsed();
         let mut outcomes = Vec::with_capacity(total);
@@ -626,9 +708,23 @@ impl Store {
             });
         }
         let commit_hold_duration = commit_hold_started.elapsed();
+        let primary_source_settlement = staged_local_changes.and_then(
+            |StagedLocalChanges {
+                 previous_tail,
+                 status,
+                 visibility_settlement_staged,
+             }| {
+                visibility_settlement_staged.then_some(PrimarySourceSettlement {
+                    source: status.source_id,
+                    previous_tail,
+                    through: status.settled_through,
+                })
+            },
+        );
         let outcome = CoordinatedBatchEvaluation {
             outcomes,
             receipt_capacity_at,
+            primary_source_settlement,
             metrics: CoordinatorBatchMetrics {
                 prepare: prepare_duration,
                 policy_wait: policy_wait_duration,
@@ -958,6 +1054,39 @@ mod tests {
             command_id: Some(command.into()),
             durability,
         }
+    }
+
+    #[test]
+    fn primary_settlement_proof_requires_the_exact_contiguous_group_range() {
+        let source = SourceId {
+            node_id: 7,
+            source_epoch: [3; 32],
+        };
+        let primary = PrimarySourceSettlement {
+            source,
+            previous_tail: 40,
+            through: 43,
+        };
+
+        assert!(primary.covers(&SingleNodeGroupSettlement {
+            source,
+            positions: vec![41, 42, 43],
+        }));
+        assert!(!primary.covers(&SingleNodeGroupSettlement {
+            source,
+            positions: vec![42, 43],
+        }));
+        assert!(!primary.covers(&SingleNodeGroupSettlement {
+            source,
+            positions: vec![41, 43],
+        }));
+        assert!(!primary.covers(&SingleNodeGroupSettlement {
+            source: SourceId {
+                node_id: 8,
+                source_epoch: [3; 32],
+            },
+            positions: vec![41, 42, 43],
+        }));
     }
 
     #[tokio::test]
