@@ -46,7 +46,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.17.0
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.17.1
 export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
@@ -163,7 +163,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add keldra@0.17.0
+cargo add keldra@0.17.1
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -251,7 +251,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add keldra@0.17.0 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.17.1 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -741,7 +741,7 @@ and performs a rolling restart. Index qualification is a separate SSD-kit
 phase:
 
 ```sh
-KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.17.0 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.17.1 \
   ./scripts/qualify-three-node.sh
 ```
 

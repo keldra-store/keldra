@@ -10,14 +10,14 @@
 
 ## Workspace
 
-All workspace packages currently share version `0.17.0`:
+All workspace packages currently share version `0.17.1`:
 
 - server, CLI, and Rust client: `keldra-server`, `keldra-cli`, and `keldra`;
 - core crates: `keldra-api`, `keldra-authz`, `keldra-atomic-program`,
   `keldra-consensus`, `keldra-index`, and `keldra-store`;
 - qualification tooling: `keldra-osv-qualification`.
 
-Keldra 0.17.0 runs as one flat cluster of capacity-weighted nodes with native
+Keldra 0.17.1 runs as one flat cluster of capacity-weighted nodes with native
 on-disk state, cluster-managed mTLS between peers, cluster-wide derived
 streaming indices, and no external metadata database, external PKI, or second
 storage system. It includes PersonalDB, accounting, S3 and Git gateways, and
@@ -91,15 +91,15 @@ Never start an earlier Keldra binary against storage initialized or touched by
 0.17.
 
 The release tag must be the exact, unprefixed workspace version. After the
-validated commit is pushed, maintainers publish `0.17.0` with:
+validated commit is pushed, maintainers publish `0.17.1` with:
 
 ```sh
 validated_commit="$(git rev-parse HEAD)"
-git tag 0.17.0 "$validated_commit"
-git push origin refs/tags/0.17.0
+git tag 0.17.1 "$validated_commit"
+git push origin refs/tags/0.17.1
 ```
 
-Run the `Keldra Release` workflow manually with tag `0.17.0` and digest-pinned
+Run the `Keldra Release` workflow manually with tag `0.17.1` and digest-pinned
 `rust:1.96-trixie` and `debian:trixie-slim` image references. The workflow
 reruns the static and Rust gates, builds both image architectures, qualifies the
 exact amd64 candidate across three nodes, and creates an immutable release

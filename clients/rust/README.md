@@ -8,7 +8,7 @@ clients.
 ## Install
 
 ```sh
-cargo add keldra@0.17.0
+cargo add keldra@0.17.1
 cargo add tokio --features macros,rt-multi-thread
 ```
 

@@ -9,7 +9,7 @@ or rotation of that one root affects all three authorities together. Keldra has
 no online rotation flow for this root: replacing it would require coordinated
 JWT rollover, durable credential re-encryption, and PersonalDB trust migration.
 This coupled lifecycle is an explicitly accepted pre-1.0 limitation; the
-authorities are not split in 0.17.0.
+authorities are not split in 0.17.1.
 
 ## Current v1 index boundary
 

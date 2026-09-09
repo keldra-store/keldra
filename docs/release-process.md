@@ -44,4 +44,4 @@ legacy migration, mixed-version cluster, or predecessor format guarantees.
 `Keldra v1 Index Acceptance` remains a standalone performance-qualification
 workflow for the later Performance tranche. It builds a candidate-bound kit and
 runs the sustained and Catalog-250K matrices on attested SSD and rotational
-hosts, but its evidence is not a prerequisite for publishing 0.17.0.
+hosts, but its evidence is not a prerequisite for publishing 0.17.1.
