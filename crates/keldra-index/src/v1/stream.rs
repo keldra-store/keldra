@@ -495,7 +495,9 @@ pub fn component_stream_child_hashes(
     })
 }
 
-pub fn resolve_component_record(
+/// Resolves a record from immutable artifacts already verified by their load
+/// boundary and keyed by their content identities.
+pub fn resolve_component_record_from_verified_artifacts(
     directory: &ComponentStreamDirectory,
     artifacts: &BTreeMap<[u8; 32], Vec<u8>>,
     stable_key: StableDocumentKey,
@@ -507,7 +509,12 @@ pub fn resolve_component_record(
         let pack = artifacts
             .get(&descriptor.pack_hash)
             .ok_or(IndexError::Integrity)?;
-        match lookup_component_record_in_pack(directory.component, descriptor, pack, stable_key)? {
+        match lookup_component_record_in_verified_pack(
+            directory.component,
+            descriptor,
+            pack,
+            stable_key,
+        )? {
             ComponentRecordLookup::Missing => {}
             ComponentRecordLookup::Tombstone => return Ok(None),
             ComponentRecordLookup::Value(value) => return Ok(Some(value)),
@@ -527,7 +534,12 @@ pub fn resolve_component_record(
         let pack = artifacts
             .get(&descriptor.pack_hash)
             .ok_or(IndexError::Integrity)?;
-        match lookup_component_record_in_pack(directory.component, descriptor, pack, stable_key)? {
+        match lookup_component_record_in_verified_pack(
+            directory.component,
+            descriptor,
+            pack,
+            stable_key,
+        )? {
             ComponentRecordLookup::Missing => {}
             ComponentRecordLookup::Tombstone => return Ok(None),
             ComponentRecordLookup::Value(value) => return Ok(Some(value)),
@@ -536,15 +548,18 @@ pub fn resolve_component_record(
     Ok(None)
 }
 
-pub fn lookup_component_record_in_pack(
+/// Looks up one record in immutable pack bytes already verified by the
+/// artifact-loading boundary.
+///
+/// Offset, component, record-count, and encoded-record structure remain
+/// validated here. The complete pack is deliberately not rehashed for every
+/// record lookup.
+pub fn lookup_component_record_in_verified_pack(
     component: ComponentIdentity,
     descriptor: &ComponentSegmentDescriptor,
     pack: &[u8],
     stable_key: StableDocumentKey,
 ) -> Result<ComponentRecordLookup, IndexError> {
-    if *crate::profiled_blake3_hash!(pack).as_bytes() != descriptor.pack_hash {
-        return Err(IndexError::Integrity);
-    }
     let start = usize::try_from(descriptor.pack_offset).map_err(|_| IndexError::OffsetOverflow)?;
     let length =
         usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::OffsetOverflow)?;
@@ -1650,21 +1665,23 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(
-            resolve_component_record(&two, &artifacts, key(1)).unwrap(),
+            resolve_component_record_from_verified_artifacts(&two, &artifacts, key(1)).unwrap(),
             Some(b"new".to_vec())
         );
         assert_eq!(
-            resolve_component_record(&two, &artifacts, key(2)).unwrap(),
+            resolve_component_record_from_verified_artifacts(&two, &artifacts, key(2)).unwrap(),
             None
         );
         let newest = decode_component_stream(&two).unwrap().pop().unwrap();
         let newest_pack = artifacts.get(&newest.pack_hash).unwrap();
         assert_eq!(
-            lookup_component_record_in_pack(component, &newest, newest_pack, key(2)).unwrap(),
+            lookup_component_record_in_verified_pack(component, &newest, newest_pack, key(2))
+                .unwrap(),
             ComponentRecordLookup::Tombstone
         );
         assert_eq!(
-            lookup_component_record_in_pack(component, &newest, newest_pack, key(3)).unwrap(),
+            lookup_component_record_in_verified_pack(component, &newest, newest_pack, key(3))
+                .unwrap(),
             ComponentRecordLookup::Missing
         );
     }
@@ -1751,8 +1768,14 @@ mod tests {
         let compacted_artifacts = [(delta.pack_hash, bytes)].into_iter().collect();
         for stable_key in [key(1), key(2), key(3), key(4)] {
             assert_eq!(
-                resolve_component_record(&two, &artifacts, stable_key).unwrap(),
-                resolve_component_record(&compacted, &compacted_artifacts, stable_key).unwrap()
+                resolve_component_record_from_verified_artifacts(&two, &artifacts, stable_key)
+                    .unwrap(),
+                resolve_component_record_from_verified_artifacts(
+                    &compacted,
+                    &compacted_artifacts,
+                    stable_key,
+                )
+                .unwrap()
             );
         }
     }
@@ -1953,14 +1976,13 @@ mod tests {
     }
 
     #[test]
-    fn artifact_identity_is_verified_before_reading() {
+    fn artifact_identity_selects_a_preverified_pack() {
         let component = ComponentIdentity::DocumentHead;
-        let (segment, mut corrupted) = packed(sealed(component, &[(1, Some(b"state"))]));
+        let (segment, _) = packed(sealed(component, &[(1, Some(b"state"))]));
         let directory = append_component_delta(None, &segment, 0, 1, 1).unwrap();
-        corrupted[0] ^= 1;
-        let artifacts = [(segment.pack_hash, corrupted)].into_iter().collect();
+        let artifacts = BTreeMap::new();
         assert!(matches!(
-            resolve_component_record(&directory, &artifacts, key(1)),
+            resolve_component_record_from_verified_artifacts(&directory, &artifacts, key(1)),
             Err(IndexError::Integrity)
         ));
     }

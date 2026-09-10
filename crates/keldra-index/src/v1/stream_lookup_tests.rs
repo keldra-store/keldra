@@ -34,15 +34,15 @@ fn lookup_distinguishes_value_tombstone_and_missing() {
     let (descriptor, pack) = packed(component, &[(1, Some(b"value")), (2, None)]);
 
     assert_eq!(
-        lookup_component_record_in_pack(component, &descriptor, &pack, key(1)).unwrap(),
+        lookup_component_record_in_verified_pack(component, &descriptor, &pack, key(1)).unwrap(),
         ComponentRecordLookup::Value(b"value".to_vec())
     );
     assert_eq!(
-        lookup_component_record_in_pack(component, &descriptor, &pack, key(2)).unwrap(),
+        lookup_component_record_in_verified_pack(component, &descriptor, &pack, key(2)).unwrap(),
         ComponentRecordLookup::Tombstone
     );
     assert_eq!(
-        lookup_component_record_in_pack(component, &descriptor, &pack, key(3)).unwrap(),
+        lookup_component_record_in_verified_pack(component, &descriptor, &pack, key(3)).unwrap(),
         ComponentRecordLookup::Missing
     );
 }
@@ -52,7 +52,7 @@ fn lookup_rejects_a_wrong_component_and_record_count() {
     let component = ComponentIdentity::DocumentHead;
     let (descriptor, pack) = packed(component, &[(1, Some(b"value"))]);
     assert!(matches!(
-        lookup_component_record_in_pack(
+        lookup_component_record_in_verified_pack(
             ComponentIdentity::SourceRecords,
             &descriptor,
             &pack,
@@ -64,7 +64,7 @@ fn lookup_rejects_a_wrong_component_and_record_count() {
     let mut wrong_count = descriptor;
     wrong_count.records += 1;
     assert!(matches!(
-        lookup_component_record_in_pack(component, &wrong_count, &pack, key(1)),
+        lookup_component_record_in_verified_pack(component, &wrong_count, &pack, key(1)),
         Err(IndexError::Integrity)
     ));
 }
@@ -72,7 +72,7 @@ fn lookup_rejects_a_wrong_component_and_record_count() {
 #[test]
 fn lookup_stops_after_an_early_match() {
     let component = ComponentIdentity::DocumentHead;
-    let (mut descriptor, mut pack) =
+    let (descriptor, mut pack) =
         packed(component, &[(1, Some(b"first")), (2, Some(b"second"))]);
     let second_key = pack
         .windows(32)
@@ -80,11 +80,8 @@ fn lookup_stops_after_an_early_match() {
         .expect("the second record key must be encoded");
     pack[second_key..second_key + 32].copy_from_slice(&[1_u8; 32]);
 
-    let artifact_hash = *crate::profiled_blake3_hash!(&pack).as_bytes();
-    descriptor.pack_hash = artifact_hash;
-
     assert_eq!(
-        lookup_component_record_in_pack(component, &descriptor, &pack, key(1)).unwrap(),
+        lookup_component_record_in_verified_pack(component, &descriptor, &pack, key(1)).unwrap(),
         ComponentRecordLookup::Value(b"first".to_vec())
     );
 }

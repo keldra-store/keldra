@@ -33,7 +33,7 @@ mod values;
 use values::{
     aggregate_candidates, count_predicate_nodes, facet_candidates, leaf_field, order_candidates,
     page_summary, predicate_requires_universe, requested_value_recipes, resident_scalar_bytes,
-    resource, validate_leaf_capability, verify_hash,
+    resource, validate_leaf_capability,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +142,11 @@ pub struct QueryLoadEvidence {
     pub bytes: usize,
 }
 
+/// Loads immutable artifacts by their content identity.
+///
+/// Implementations must verify bytes when they cross an untrusted boundary.
+/// Callers may then decode the returned trusted-local bytes without hashing the
+/// complete artifact again on every query.
 pub trait QueryArtifactLoader: Send {
     fn load_query_artifact(
         &mut self,
@@ -301,7 +306,7 @@ async fn load_exact_pre_admitted<L: QueryArtifactLoader>(
             return Err(error);
         }
     };
-    if bytes.len() != encoded_bytes || verify_hash(hash, &bytes).is_err() {
+    if bytes.len() != encoded_bytes {
         credits.release(encoded_bytes)?;
         return Err(IndexError::Integrity);
     }

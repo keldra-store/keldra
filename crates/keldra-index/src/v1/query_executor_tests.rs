@@ -92,6 +92,32 @@ fn artifact_memory_refusal_happens_before_payload_loader() {
 }
 
 #[test]
+fn preverified_artifact_loader_is_not_rehashed() {
+    let hash = [9; 32];
+    let bytes = vec![1; 32];
+    let mut loader = Loader {
+        artifacts: [(hash, bytes.clone())].into(),
+        payload_loads: 0,
+    };
+    let mut credits = credits(bytes.len());
+    let mut budget = budget();
+
+    assert_eq!(
+        ready(load_exact_pre_admitted(
+            &mut loader,
+            QueryArtifactKind::Block,
+            hash,
+            bytes.len(),
+            &mut credits,
+            &mut budget,
+        ))
+        .unwrap(),
+        bytes
+    );
+    assert_eq!(loader.payload_loads, 1);
+}
+
+#[test]
 fn logical_heap_limit_does_not_report_query_credit_exhaustion() {
     let mut limits = QueryExecutionLimits::default_for_memory();
     limits.maximum_heap_bytes = 8;

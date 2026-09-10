@@ -16,7 +16,7 @@ use keldra_index::v1::{
     decode_projection_family_directory, decode_projection_generation,
     decode_projection_generation_header, decode_query_run_page, decode_source_records,
     encode_projection_catalog_activation, encode_projection_family_directory,
-    lookup_component_record_in_pack, prepare_atomic_projection_generation,
+    lookup_component_record_in_verified_pack, prepare_atomic_projection_generation,
     projection_artifact_routing_id, projection_catalog_activation_path,
     projection_catalog_routing_id, projection_component_page_path, projection_current_path,
     projection_family_directory_path, projection_generation_path, projection_pack_path,
@@ -826,8 +826,13 @@ impl V1ProjectionPublisher {
                         )
                         .await?
                         .ok_or_else(|| Status::data_loss("v1 projection pack is absent"))?;
-                    match lookup_component_record_in_pack(component, &descriptor, &bytes, key)
-                        .map_err(index_status)?
+                    match lookup_component_record_in_verified_pack(
+                        component,
+                        &descriptor,
+                        &bytes,
+                        key,
+                    )
+                    .map_err(index_status)?
                     {
                         ComponentRecordLookup::Missing => {}
                         ComponentRecordLookup::Tombstone => return Ok(None),
