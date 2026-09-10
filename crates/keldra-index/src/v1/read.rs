@@ -16,7 +16,7 @@ pub fn decode_component_records_in_pack(
     descriptor: &ComponentSegmentDescriptor,
     pack: &[u8],
 ) -> Result<Vec<ComponentDeltaRecord>, IndexError> {
-    if *blake3::hash(pack).as_bytes() != descriptor.pack_hash {
+    if *crate::profiled_blake3_hash!(pack).as_bytes() != descriptor.pack_hash {
         return Err(IndexError::Integrity);
     }
     let start = usize::try_from(descriptor.pack_offset).map_err(|_| IndexError::OffsetOverflow)?;

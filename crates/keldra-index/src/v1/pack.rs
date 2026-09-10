@@ -144,7 +144,7 @@ fn seal_pack(
             "projection delta pack is empty or unbounded".into(),
         ));
     }
-    let hash = *blake3::hash(&bytes).as_bytes();
+    let hash = *crate::profiled_blake3_hash!(&bytes).as_bytes();
     let deltas = staged
         .into_iter()
         .map(|(delta, offset)| PackedComponentDelta {
@@ -215,7 +215,10 @@ mod tests {
             .packs;
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0].deltas.len(), 64);
-        assert_eq!(packs[0].hash, *blake3::hash(&packs[0].bytes).as_bytes());
+        assert_eq!(
+            packs[0].hash,
+            *crate::profiled_blake3_hash!(&packs[0].bytes).as_bytes()
+        );
         for delta in &packs[0].deltas {
             let start = delta.offset as usize;
             let end = start + delta.encoded_bytes as usize;

@@ -80,7 +80,7 @@ fn lookup_stops_after_an_early_match() {
         .expect("the second record key must be encoded");
     pack[second_key..second_key + 32].copy_from_slice(&[1_u8; 32]);
 
-    let artifact_hash = *blake3::hash(&pack).as_bytes();
+    let artifact_hash = *crate::profiled_blake3_hash!(&pack).as_bytes();
     descriptor.pack_hash = artifact_hash;
 
     assert_eq!(

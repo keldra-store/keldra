@@ -132,6 +132,16 @@ impl V1PipelineTelemetry {
             keldra_index_v1_lag_oldest_age_milliseconds = Self::load(&self.lag_oldest_age_millis),
             "keldra_index_v1_summary"
         );
+        for snapshot in keldra_index::hash_profile_snapshots() {
+            tracing::info!(
+                target: "keldra::hash_profile",
+                hash_site = snapshot.site,
+                hash_calls_total = snapshot.calls,
+                hash_bytes_total = snapshot.bytes,
+                hash_nanoseconds_total = snapshot.nanoseconds,
+                "keldra_hash_profile"
+            );
+        }
     }
 
     pub(crate) fn record_catalog_checkpoint(&self, rows: u64, bytes: u64) {

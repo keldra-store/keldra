@@ -554,7 +554,7 @@ impl V1ProjectionPublisher {
             self.artifacts.publish_immutable_many(publications).await?,
         )?;
         let current_blob = self.stage(&plan.current_bytes).await?;
-        if current_blob.hash != *blake3::hash(&plan.current_bytes).as_bytes()
+        if current_blob.hash != *keldra_index::profiled_blake3_hash!(&plan.current_bytes).as_bytes()
             || current_blob.length != plan.current_bytes.len() as u64
         {
             return Err(Status::data_loss(
@@ -1322,7 +1322,9 @@ fn plan_atomic_publication(
                 .checked_add(delta.encoded_bytes)
                 .ok_or_else(|| Status::resource_exhausted("v1 sealed delta bytes overflow"))
         })?;
-    if prepared.generation.hash != *blake3::hash(&prepared.generation.bytes).as_bytes() {
+    if prepared.generation.hash
+        != *keldra_index::profiled_blake3_hash!(&prepared.generation.bytes).as_bytes()
+    {
         return Err(Status::data_loss(
             "prepared v1 generation has the wrong content hash",
         ));
@@ -1390,7 +1392,8 @@ fn plan_atomic_publication(
         &mut validation_credits,
     )
     .map_err(index_status)?;
-    if prepared.query_run.hash != *blake3::hash(&prepared.query_run.bytes).as_bytes()
+    if prepared.query_run.hash
+        != *keldra_index::profiled_blake3_hash!(&prepared.query_run.bytes).as_bytes()
         || query_run.partition != partition
         || query_run.physical_catalog_generation != generation.physical_catalog_generation
         || previous
@@ -1534,7 +1537,7 @@ fn newest_prepared_query_run(
         let page = pages.get(&hash).ok_or_else(|| {
             Status::data_loss("prepared v1 query stream omits its new right spine")
         })?;
-        if page.hash != *blake3::hash(&page.bytes).as_bytes() {
+        if page.hash != *keldra_index::profiled_blake3_hash!(&page.bytes).as_bytes() {
             return Err(Status::data_loss(
                 "prepared v1 query stream page has the wrong content hash",
             ));
@@ -1563,7 +1566,7 @@ fn insert_artifact(
     hash: [u8; 32],
     bytes: Vec<u8>,
 ) -> Result<(), Status> {
-    if hash != *blake3::hash(&bytes).as_bytes() {
+    if hash != *keldra_index::profiled_blake3_hash!(&bytes).as_bytes() {
         return Err(Status::data_loss(
             "prepared v1 projection artifact has the wrong content hash",
         ));
@@ -1872,7 +1875,7 @@ mod tests {
         );
 
         let blob = BlobRef {
-            hash: *blake3::hash(&first.current_bytes).as_bytes(),
+            hash: *keldra_index::profiled_blake3_hash!(&first.current_bytes).as_bytes(),
             length: first.current_bytes.len() as u64,
         };
         let first_request = request(

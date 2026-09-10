@@ -69,7 +69,7 @@ fn candidate(partition: ProjectionPartitionIdentity, covered: u64) -> QueryAdmis
 #[test]
 fn artifact_memory_refusal_happens_before_payload_loader() {
     let bytes = vec![1; 1024];
-    let hash = *blake3::hash(&bytes).as_bytes();
+    let hash = *crate::profiled_blake3_hash!(&bytes).as_bytes();
     let mut loader = Loader {
         artifacts: [(hash, bytes)].into(),
         payload_loads: 0,

@@ -838,7 +838,7 @@ pub fn encode_query_block(
         recipe,
         minimum_key: records.first().expect("nonempty").key.clone(),
         maximum_key: records.last().expect("nonempty").key.clone(),
-        hash: *blake3::hash(&bytes).as_bytes(),
+        hash: *crate::profiled_blake3_hash!(&bytes).as_bytes(),
         encoded_bytes: bytes.len() as u64,
         records: u32::try_from(records.len()).map_err(|_| IndexError::OffsetOverflow)?,
     };
@@ -852,7 +852,7 @@ impl<'a> QueryBlockCursor<'a> {
         limits: QueryBlockLimits,
         credits: &mut QueryBlockCredits,
     ) -> Result<Self, IndexError> {
-        if *blake3::hash(bytes).as_bytes() != descriptor.hash {
+        if *crate::profiled_blake3_hash!(bytes).as_bytes() != descriptor.hash {
             return Err(IndexError::Integrity);
         }
         Self::from_verified_content(descriptor, bytes, limits, credits)
@@ -1118,7 +1118,7 @@ pub fn encode_projection_query_run(
         return Err(IndexError::Integrity);
     }
     Ok(EncodedProjectionQueryRun {
-        hash: *blake3::hash(&bytes).as_bytes(),
+        hash: *crate::profiled_blake3_hash!(&bytes).as_bytes(),
         bytes,
     })
 }

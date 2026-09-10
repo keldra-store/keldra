@@ -127,7 +127,7 @@ pub fn encode_projection_generation(
     put_u64(&mut out, component_directory.root_count);
     put_optional_hash(&mut out, generation.previous_generation_hash);
     Ok(EncodedProjectionGeneration {
-        hash: *blake3::hash(&out).as_bytes(),
+        hash: *crate::profiled_blake3_hash!(&out).as_bytes(),
         bytes: out,
         component_directory,
     })
@@ -218,7 +218,7 @@ pub fn decode_current_projection_generation_header(
     current: ProjectionCurrent,
     bytes: &[u8],
 ) -> Result<ProjectionGenerationHeader, IndexError> {
-    if *blake3::hash(bytes).as_bytes() != current.generation_hash {
+    if *crate::profiled_blake3_hash!(bytes).as_bytes() != current.generation_hash {
         return Err(IndexError::Integrity);
     }
     let header = decode_projection_generation_header(bytes)?;
@@ -251,7 +251,7 @@ pub fn resolve_component_root(
 }
 
 pub fn empty_component_directory_hash() -> [u8; 32] {
-    *blake3::hash(EMPTY_COMPONENT_DIRECTORY_DOMAIN).as_bytes()
+    *crate::profiled_blake3_hash!(EMPTY_COMPONENT_DIRECTORY_DOMAIN).as_bytes()
 }
 
 /// Child page hashes named by one verified component-directory page.
@@ -269,7 +269,7 @@ fn resolve_component_subtree(
     load_page: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
 ) -> Result<Option<ComponentRoot>, IndexError> {
     let bytes = load_page(hash)?;
-    if hash != *blake3::hash(&bytes).as_bytes() {
+    if hash != *crate::profiled_blake3_hash!(&bytes).as_bytes() {
         return Err(IndexError::Integrity);
     }
     match decode_directory_page(&bytes)? {
@@ -460,7 +460,7 @@ pub fn decode_component_directory(
     let mut pages = BTreeMap::new();
     for page in &directory.pages {
         if page.hash == [0; 32]
-            || page.hash != *blake3::hash(&page.bytes).as_bytes()
+            || page.hash != *crate::profiled_blake3_hash!(&page.bytes).as_bytes()
             || pages.insert(page.hash, page.bytes.as_slice()).is_some()
         {
             return Err(IndexError::Integrity);
@@ -535,7 +535,7 @@ fn encode_directory_page(
         }
     }
     Ok(EncodedComponentDirectoryPage {
-        hash: *blake3::hash(&out).as_bytes(),
+        hash: *crate::profiled_blake3_hash!(&out).as_bytes(),
         bytes: out,
     })
 }
@@ -875,7 +875,7 @@ mod tests {
                 let recipe = RecipeIdentity::new(identity).unwrap();
                 ComponentRoot::new(
                     ComponentIdentity::Field(recipe),
-                    *blake3::hash(&identity).as_bytes(),
+                    *crate::profiled_blake3_hash!(&identity).as_bytes(),
                     1,
                     64,
                     48,
@@ -1003,7 +1003,7 @@ mod tests {
             identity[..4].copy_from_slice(&ordinal.to_be_bytes());
             ComponentRoot::new(
                 ComponentIdentity::Field(RecipeIdentity::new(identity).unwrap()),
-                *blake3::hash(&identity).as_bytes(),
+                *crate::profiled_blake3_hash!(&identity).as_bytes(),
                 1,
                 64,
                 48,

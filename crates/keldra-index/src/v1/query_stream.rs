@@ -549,7 +549,7 @@ fn load_page_with_summary(
     load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
 ) -> Result<(QueryRunPage, QueryRunChild), IndexError> {
     let bytes = load(hash)?;
-    if *blake3::hash(&bytes).as_bytes() != hash {
+    if *crate::profiled_blake3_hash!(&bytes).as_bytes() != hash {
         return Err(IndexError::Integrity);
     }
     let page = decode_query_run_page(&bytes)?;
@@ -674,7 +674,7 @@ fn encode_page(page: QueryRunPage) -> Result<EncodedQueryRunPage, IndexError> {
             }
         }
     }
-    let hash = *blake3::hash(&bytes).as_bytes();
+    let hash = *crate::profiled_blake3_hash!(&bytes).as_bytes();
     let summary = summarize_page(&page, hash, bytes.len())?;
     Ok(EncodedQueryRunPage {
         hash,

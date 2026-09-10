@@ -173,7 +173,7 @@ fn validate_projection_query_run_fixed(
 ) -> Result<(), IndexError> {
     if bytes.len() > limits.maximum_run_descriptor_bytes
         || bytes.len() < 174
-        || *blake3::hash(bytes).as_bytes() != hash
+        || *crate::profiled_blake3_hash!(bytes).as_bytes() != hash
     {
         return Err(IndexError::Integrity);
     }

@@ -19,7 +19,7 @@ where
     fn page(&mut self, hash: [u8; 32], expected: Option<&Child>) -> Result<Page, IndexError> {
         if !self.pages.contains_key(&hash) {
             let bytes = (self.load)(hash)?;
-            if *blake3::hash(&bytes).as_bytes() != hash {
+            if *crate::profiled_blake3_hash!(&bytes).as_bytes() != hash {
                 return Err(IndexError::Integrity);
             }
             let page = decode_page(self.component, &bytes)?;

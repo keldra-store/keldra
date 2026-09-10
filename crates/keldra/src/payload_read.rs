@@ -681,7 +681,7 @@ fn classify_small_fetch(
     Ok(match fetched {
         Ok(())
             if bytes.len() as u64 == reference.length
-                && blake3::hash(bytes).as_bytes() == &reference.hash =>
+                && keldra_index::profiled_blake3_hash!(bytes).as_bytes() == &reference.hash =>
         {
             OwnerState::Healthy
         }
@@ -1134,7 +1134,7 @@ mod tests {
 
     fn reference(bytes: &[u8]) -> BlobRef {
         BlobRef {
-            hash: *blake3::hash(bytes).as_bytes(),
+            hash: *keldra_index::profiled_blake3_hash!(bytes).as_bytes(),
             length: bytes.len() as u64,
         }
     }

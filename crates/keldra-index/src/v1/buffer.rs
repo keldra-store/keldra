@@ -559,7 +559,7 @@ pub(super) fn seal_component(
             None => bytes.push(0),
         }
     }
-    let artifact_hash = *blake3::hash(&bytes).as_bytes();
+    let artifact_hash = *crate::profiled_blake3_hash!(&bytes).as_bytes();
     let encoded_bytes = bytes.len() as u64;
     Ok(SealedComponentDelta {
         component,

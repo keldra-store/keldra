@@ -204,7 +204,7 @@ impl ComponentStreamReverseCursor {
         let expected = self.awaiting_page.take().ok_or_else(|| {
             IndexError::InvalidDefinition("component cursor did not request a page".into())
         })?;
-        if hash != expected.hash || hash != *blake3::hash(bytes).as_bytes() {
+        if hash != expected.hash || hash != *crate::profiled_blake3_hash!(bytes).as_bytes() {
             return Err(IndexError::Integrity);
         }
         match decode_page(self.component, bytes)? {
@@ -456,7 +456,7 @@ pub fn decode_component_stream(
     let mut pages = BTreeMap::new();
     for page in &directory.pages {
         if page.hash == [0; 32]
-            || page.hash != *blake3::hash(&page.bytes).as_bytes()
+            || page.hash != *crate::profiled_blake3_hash!(&page.bytes).as_bytes()
             || pages.insert(page.hash, page.bytes.as_slice()).is_some()
         {
             return Err(IndexError::Integrity);
@@ -542,7 +542,7 @@ pub fn lookup_component_record_in_pack(
     pack: &[u8],
     stable_key: StableDocumentKey,
 ) -> Result<ComponentRecordLookup, IndexError> {
-    if *blake3::hash(pack).as_bytes() != descriptor.pack_hash {
+    if *crate::profiled_blake3_hash!(pack).as_bytes() != descriptor.pack_hash {
         return Err(IndexError::Integrity);
     }
     let start = usize::try_from(descriptor.pack_offset).map_err(|_| IndexError::OffsetOverflow)?;
@@ -666,7 +666,7 @@ pub fn compact_component_runs(
                 limit: limits.maximum_loaded_pack_bytes,
             });
         }
-        if *blake3::hash(&pack).as_bytes() != run.pack_hash {
+        if *crate::profiled_blake3_hash!(&pack).as_bytes() != run.pack_hash {
             return Err(IndexError::Integrity);
         }
         packs.insert(run.pack_hash, pack);
@@ -922,7 +922,7 @@ fn splice_subtree(
     matched: &mut usize,
 ) -> Result<Vec<Child>, IndexError> {
     let bytes = load_page(hash)?;
-    if *blake3::hash(&bytes).as_bytes() != hash {
+    if *crate::profiled_blake3_hash!(&bytes).as_bytes() != hash {
         return Err(IndexError::Integrity);
     }
     match decode_page(component, &bytes)? {
@@ -1033,7 +1033,7 @@ fn append_subtree(
     new_pages: &mut Vec<EncodedComponentStreamPage>,
 ) -> Result<Vec<Child>, IndexError> {
     let bytes = load_page(hash)?;
-    if hash != *blake3::hash(&bytes).as_bytes() {
+    if hash != *crate::profiled_blake3_hash!(&bytes).as_bytes() {
         return Err(IndexError::Integrity);
     }
     match decode_page(component, &bytes)? {
@@ -1316,7 +1316,7 @@ fn encode_page(
         }
     }
     Ok(EncodedComponentStreamPage {
-        hash: *blake3::hash(&bytes).as_bytes(),
+        hash: *crate::profiled_blake3_hash!(&bytes).as_bytes(),
         bytes,
     })
 }
@@ -1614,7 +1614,7 @@ mod tests {
             source_start_offset: sequence - 1,
             next_offset: sequence,
             through_atomic_position: sequence,
-            pack_hash: *blake3::hash(&sequence.to_le_bytes()).as_bytes(),
+            pack_hash: *crate::profiled_blake3_hash!(&sequence.to_le_bytes()).as_bytes(),
             pack_offset: 0,
             encoded_bytes: 100,
             logical_bytes: 80,

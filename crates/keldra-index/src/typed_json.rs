@@ -311,7 +311,7 @@ impl TypedJsonSchema {
         let mut membership = CanonicalBytes::new(MEMBERSHIP_RECIPE_DOMAIN);
         membership.string(&self.path_prefix)?;
         membership.optional_string(self.content_type_scope.as_deref())?;
-        let membership = *blake3::hash(&membership.finish()).as_bytes();
+        let membership = *crate::profiled_blake3_hash!(&membership.finish()).as_bytes();
         let fields = self
             .fields
             .iter()
@@ -334,7 +334,7 @@ impl TypedJsonSchema {
             out.u32(order.field_id.get());
             out.u8(order.direction as u8);
         }
-        Ok(*blake3::hash(&out.finish()).as_bytes())
+        Ok(*crate::profiled_blake3_hash!(&out.finish()).as_bytes())
     }
 }
 
@@ -730,7 +730,7 @@ fn field_recipe(field: &FieldSchema, membership: [u8; 32]) -> Result<[u8; 32], I
     let mut out = CanonicalBytes::new(FIELD_RECIPE_DOMAIN);
     out.raw(&membership);
     encode_field_contract(&mut out, field)?;
-    Ok(*blake3::hash(&out.finish()).as_bytes())
+    Ok(*crate::profiled_blake3_hash!(&out.finish()).as_bytes())
 }
 
 fn encode_field_contract(out: &mut CanonicalBytes, field: &FieldSchema) -> Result<(), IndexError> {

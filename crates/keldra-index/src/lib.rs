@@ -7,6 +7,8 @@
 
 pub mod compaction;
 mod error;
+#[doc(hidden)]
+pub mod hash_profile;
 mod io;
 pub mod typed_json;
 pub mod v1;
@@ -17,3 +19,6 @@ pub use compaction::{
 pub use error::IndexError;
 pub use io::IndexFileRead;
 pub use v1::INDEX_FORMAT_VERSION;
+
+#[doc(hidden)]
+pub use hash_profile::snapshots as hash_profile_snapshots;

@@ -455,7 +455,7 @@ pub(super) fn scalar_number(value: &ScalarValue) -> Result<f64, IndexError> {
 }
 
 pub(super) fn verify_hash(expected: [u8; 32], bytes: &[u8]) -> Result<(), IndexError> {
-    if expected == [0; 32] || *blake3::hash(bytes).as_bytes() != expected {
+    if expected == [0; 32] || *crate::profiled_blake3_hash!(bytes).as_bytes() != expected {
         Err(IndexError::Integrity)
     } else {
         Ok(())
