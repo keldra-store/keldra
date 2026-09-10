@@ -40,12 +40,14 @@ use super::v1_query_compile::compile_v1_query;
 const _: [(); MAX_OBJECT_PATH_BYTES] = [(); keldra_index::v1::MAX_QUERY_DOCUMENT_PATH_BYTES];
 
 const CONTROL_OBJECT_MAX_BYTES: usize = 256 * 1024;
-// D1 visibility queries have been measured retaining up to 4 MiB plus 980
-// bytes once authorized candidates and decoded run state overlap. Keep the
-// mandatory grant at the next power-of-two bound so fair-share contention
-// cannot admit a query that is guaranteed to fail after doing artifact work.
-const MIN_QUERY_MEMORY_BYTES: u64 = 8 * 1024 * 1024;
-const PREFERRED_QUERY_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+// The sustained D1 qualification retains slightly more than 8 MiB once
+// authorized candidates and decoded run state overlap. Keep the initial lease
+// at the next power-of-two bound: the default 512 MiB query share still admits
+// all 32 public-query lanes without forcing every query through a failed pass.
+const MIN_QUERY_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_QUERY_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+// This is a logical-work limit, not a conversion of the memory lease.
+const MAX_QUERY_CANDIDATES: usize = 1_000_000;
 
 impl QueryMemoryPermit for IndexQueryMemoryPermit {
     fn admitted_bytes(&self) -> usize {
@@ -120,17 +122,7 @@ impl V1LocalIndexQueryExecutor {
             "v1 query pinned its common-cut root vector"
         );
 
-        tracing::debug!("v1 query begins working-memory admission");
-        let memory = self
-            .memory
-            .acquire_up_to(MIN_QUERY_MEMORY_BYTES, PREFERRED_QUERY_MEMORY_BYTES)
-            .await
-            .map_err(|error| Status::resource_exhausted(error.to_string()))?;
-        tracing::debug!("v1 query acquired working-memory admission");
-        let admitted = usize::try_from(memory.charged_bytes()).unwrap_or(usize::MAX);
-        let mut credits =
-            QueryBlockCredits::from_query_permit(Box::new(memory)).map_err(index_status)?;
-        let limits = execution_limits(admitted, pinned.roots.len(), request.limit)?;
+        let limits = execution_limits(pinned.roots.len(), request.limit)?;
         let query = TypedJsonQueryRequest {
             logical,
             fields: schema
@@ -167,25 +159,71 @@ impl V1LocalIndexQueryExecutor {
             // skips an order position hidden by an earlier truncation.
             result_limit: limits.maximum_results,
         };
-        let mut loader = RuntimeArtifactLoader::new(self.projections.clone());
-        let mut admission = RuntimeCandidateAdmission {
-            visibility: request.candidate_visibility.clone(),
-            storage_tenant: request.storage_tenant.clone(),
-            bucket: request.definition.bucket.clone(),
-            authorization_revision: request.authorization_revision,
+        let maximum_memory = self.memory.maximum_bounded_lease(MAX_QUERY_MEMORY_BYTES);
+        let mut requested_memory = MIN_QUERY_MEMORY_BYTES.min(maximum_memory);
+        let mut retries = 0usize;
+        let (result, _credits) = loop {
+            tracing::debug!(
+                query.memory_bytes = requested_memory,
+                query.memory_retry = retries,
+                "v1 query begins working-memory admission"
+            );
+            let memory = self
+                .memory
+                .acquire_bounded(requested_memory, MAX_QUERY_MEMORY_BYTES)
+                .await
+                .map_err(|error| Status::resource_exhausted(error.to_string()))?;
+            tracing::debug!(
+                query.memory_bytes = requested_memory,
+                "v1 query acquired working-memory admission"
+            );
+            let mut credits =
+                QueryBlockCredits::from_query_permit(Box::new(memory)).map_err(index_status)?;
+            let mut loader = RuntimeArtifactLoader::new(self.projections.clone());
+            let mut admission = RuntimeCandidateAdmission {
+                visibility: request.candidate_visibility.clone(),
+                storage_tenant: request.storage_tenant.clone(),
+                bucket: request.definition.bucket.clone(),
+                authorization_revision: request.authorization_revision,
+            };
+            let attempt = execute_typed_json_query(
+                &mut loader,
+                &mut admission,
+                pinned.cut,
+                &pinned.roots,
+                &query,
+                limits,
+                QueryBlockLimits::default_for_memory(),
+                &mut credits,
+            )
+            .await;
+            let required_memory = credits.required_query_lease_bytes();
+
+            match attempt {
+                Ok(result) => break (result, credits),
+                Err(error)
+                    if matches!(&error, IndexError::ResourceLimit { .. })
+                        && required_memory.is_some() =>
+                {
+                    drop(credits);
+                    requested_memory = next_query_memory_lease(
+                        requested_memory,
+                        required_memory.expect("credit exhaustion recorded required bytes"),
+                        maximum_memory,
+                    )?;
+                    retries += 1;
+                    tracing::debug!(
+                        query.memory_bytes = requested_memory,
+                        query.memory_retry = retries,
+                        "v1 query will retry with a larger exact memory lease"
+                    );
+                }
+                Err(error) => {
+                    drop(credits);
+                    return Err(index_status(error));
+                }
+            }
         };
-        let result = execute_typed_json_query(
-            &mut loader,
-            &mut admission,
-            pinned.cut,
-            &pinned.roots,
-            &query,
-            limits,
-            QueryBlockLimits::default_for_memory(),
-            &mut credits,
-        )
-        .await
-        .map_err(index_status)?;
         tracing::debug!("v1 query completed artifact execution and candidate admission");
 
         self.verify_pin(&request, &recipe, &activation, &pinned)
@@ -702,27 +740,42 @@ fn require_request(request: &LocalIndexQueryRequest) -> Result<(), Status> {
     Ok(())
 }
 
-fn execution_limits(
-    admitted: usize,
-    partitions: usize,
-    requested: usize,
-) -> Result<QueryExecutionLimits, Status> {
-    let maximum_candidates = admitted
-        .checked_div(256)
-        .unwrap_or(0)
-        .max(requested)
-        .min(1_000_000);
-    if maximum_candidates < requested {
+fn next_query_memory_lease(current: u64, required: usize, maximum: u64) -> Result<u64, Status> {
+    let required = u64::try_from(required).map_err(|_| {
+        Status::resource_exhausted("v1 query memory requirement exceeds this platform")
+    })?;
+    if required > maximum {
         return Err(Status::resource_exhausted(
-            "v1 query memory cannot retain the requested result page",
+            "v1 query requires more than the bounded per-query memory maximum",
         ));
     }
+    let geometric = current
+        .checked_mul(2)
+        .unwrap_or(maximum)
+        .min(maximum);
+    let next = geometric.max(required);
+    if next <= current {
+        return Err(Status::internal(
+            "v1 query memory retry did not increase its exact lease",
+        ));
+    }
+    Ok(next)
+}
+
+fn execution_limits(partitions: usize, requested: usize) -> Result<QueryExecutionLimits, Status> {
+    if requested > MAX_QUERY_CANDIDATES {
+        return Err(Status::resource_exhausted(
+            "v1 query result page exceeds the bounded candidate limit",
+        ));
+    }
+    let maximum_memory = usize::try_from(MAX_QUERY_MEMORY_BYTES)
+        .map_err(|_| Status::resource_exhausted("v1 query memory maximum exceeds this platform"))?;
     Ok(QueryExecutionLimits {
         maximum_partitions: partitions.max(1),
-        maximum_loaded_bytes: admitted,
-        maximum_heap_bytes: admitted,
-        maximum_candidates,
-        maximum_results: maximum_candidates,
+        maximum_loaded_bytes: maximum_memory,
+        maximum_heap_bytes: maximum_memory,
+        maximum_candidates: MAX_QUERY_CANDIDATES,
+        maximum_results: MAX_QUERY_CANDIDATES,
         ..QueryExecutionLimits::default_for_memory()
     })
 }
@@ -936,14 +989,88 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn measured_query_floor_covers_qualification_concurrency() {
+    fn minimum_query_leases_retain_qualification_concurrency() {
         const QUALIFICATION_QUERY_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
         const QUALIFICATION_MAX_IN_FLIGHT: u64 = 32;
 
-        assert_eq!(MIN_QUERY_MEMORY_BYTES, 8 * 1024 * 1024);
+        assert_eq!(MIN_QUERY_MEMORY_BYTES, 16 * 1024 * 1024);
         assert!(
             MIN_QUERY_MEMORY_BYTES * QUALIFICATION_MAX_IN_FLIGHT
                 <= QUALIFICATION_QUERY_MEMORY_BYTES
+        );
+    }
+
+    #[test]
+    fn execution_limits_are_fixed_independently_of_adaptive_leases() {
+        let limits = execution_limits(3, 100).unwrap();
+
+        assert_eq!(limits.maximum_candidates, MAX_QUERY_CANDIDATES);
+        assert_eq!(limits.maximum_results, MAX_QUERY_CANDIDATES);
+        assert_eq!(limits.maximum_loaded_bytes, MAX_QUERY_MEMORY_BYTES as usize);
+        assert_eq!(limits.maximum_heap_bytes, MAX_QUERY_MEMORY_BYTES as usize);
+    }
+
+    #[test]
+    fn requested_page_cannot_expand_bounded_logical_work() {
+        assert!(execution_limits(1, MAX_QUERY_CANDIDATES).is_ok());
+        assert!(execution_limits(1, MAX_QUERY_CANDIDATES + 1).is_err());
+    }
+
+    #[test]
+    fn adaptive_query_lease_grows_geometrically_or_to_required_bytes() {
+        assert_eq!(
+            next_query_memory_lease(
+                16 * 1024 * 1024,
+                16 * 1024 * 1024 + 1,
+                MAX_QUERY_MEMORY_BYTES,
+            )
+            .unwrap(),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            next_query_memory_lease(
+                16 * 1024 * 1024,
+                40 * 1024 * 1024,
+                MAX_QUERY_MEMORY_BYTES,
+            )
+            .unwrap(),
+            40 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn adaptive_query_growth_is_bounded_by_retry_count_and_memory_maximum() {
+        let mut lease = MIN_QUERY_MEMORY_BYTES;
+        for _ in 0..4 {
+            lease = next_query_memory_lease(
+                lease,
+                (lease + 1) as usize,
+                MAX_QUERY_MEMORY_BYTES,
+            )
+            .unwrap();
+        }
+        assert_eq!(lease, MAX_QUERY_MEMORY_BYTES);
+        assert_eq!(
+            next_query_memory_lease(
+                lease,
+                (MAX_QUERY_MEMORY_BYTES + 1) as usize,
+                MAX_QUERY_MEMORY_BYTES,
+            )
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn adaptive_query_lease_respects_a_smaller_configured_ceiling() {
+        let maximum = 8 * 1024 * 1024;
+        assert_eq!(MIN_QUERY_MEMORY_BYTES.min(maximum), maximum);
+        assert_eq!(
+            next_query_memory_lease(maximum, maximum as usize + 1, maximum)
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
         );
     }
 

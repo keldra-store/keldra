@@ -222,6 +222,15 @@ impl IndexWorkingMemory {
     pub(crate) fn available(&self) -> u64 {
         self.inner.hard_limit.saturating_sub(self.used())
     }
+
+    #[cfg(test)]
+    pub(crate) fn waiting(&self, account: WorkingMemoryAccount) -> usize {
+        lock_state(&self.inner)
+            .waiters
+            .iter()
+            .filter(|waiter| waiter.account == account)
+            .count()
+    }
 }
 
 fn lock_state(inner: &WorkingMemoryInner) -> std::sync::MutexGuard<'_, WorkingMemoryState> {

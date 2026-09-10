@@ -17,10 +17,14 @@ mode="${KELDRA_V1_SCALE_MODE:-smoke}"
 keep_work="${KELDRA_V1_SCALE_KEEP_WORK:-0}"
 disk_budget_bytes="${KELDRA_V1_SCALE_DISK_BUDGET_BYTES:-214748364800}"
 base_port="${KELDRA_V1_SCALE_PORT:-51051}"
-server_rust_log="${KELDRA_V1_SCALE_RUST_LOG:-warn,keldra::index_runtime::v1_summary=info,keldra::single_node_group_commit_config=info}"
+server_rust_log="${KELDRA_V1_SCALE_RUST_LOG:-warn,keldra::index_runtime::v1_summary=info,keldra::single_node_group_commit_config=info,keldra_store::single_node_group_commit_phases=info}"
 query_rate="${KELDRA_V1_SCALE_QUERY_RATE:-20}"
 query_max_in_flight="${KELDRA_V1_SCALE_QUERY_MAX_IN_FLIGHT:-32}"
-mutation_workers_override="${KELDRA_V1_SCALE_MUTATION_WORKERS:-}"
+query_memory_bytes="${KELDRA_V1_SCALE_QUERY_MEMORY_BYTES:-536870912}"
+# Load generation is deliberately independent of the server indexing-core
+# axis. Coupling these made low-core cells client-concurrency tests and could
+# not show whether additional server CPU or memory increased throughput.
+mutation_workers="${KELDRA_V1_SCALE_MUTATION_WORKERS:-64}"
 lag_slope_limit="${KELDRA_V1_SCALE_MAX_LAG_SLOPE_RECORDS_PER_SECOND:-1}"
 source_journal_entries="${KELDRA_V1_SCALE_SOURCE_JOURNAL_MAX_ENTRIES:-10000000}"
 catalog_only_at_or_above="${KELDRA_V1_SCALE_CATALOG_ONLY_AT_OR_ABOVE_DEFINITIONS:-250000}"
@@ -120,12 +124,14 @@ parse_integer_matrix worker-matrix 256 "${worker_matrix}"
 parse_integer_matrix memory-per-worker-matrix 68719476736 "${memory_per_worker_matrix}"
 parse_integer_matrix object-size-matrix 67108864 "${object_size_matrix}"
 parse_rate_ladder
-if [[ -n "${mutation_workers_override}" ]]; then
-  positive_integer "${mutation_workers_override}" && ((mutation_workers_override <= 256)) || {
-    echo "KELDRA_V1_SCALE_MUTATION_WORKERS must be a positive integer no greater than 256" >&2
-    exit 2
-  }
-fi
+positive_integer "${query_memory_bytes}" && ((query_memory_bytes <= 68719476736)) || {
+  echo "KELDRA_V1_SCALE_QUERY_MEMORY_BYTES must be a positive integer no greater than 64 GiB" >&2
+  exit 2
+}
+positive_integer "${mutation_workers}" && ((mutation_workers <= 256)) || {
+  echo "KELDRA_V1_SCALE_MUTATION_WORKERS must be a positive integer no greater than 256" >&2
+  exit 2
+}
 for value in "${base_port}" "${query_rate}" "${query_max_in_flight}" "${source_journal_entries}" \
   "${baseline_seconds}" "${concurrent_seconds}" "${post_seconds}" "${catalog_only_at_or_above}"
 do
@@ -183,12 +189,13 @@ summary_rows="${run_dir}/cells.jsonl"
   echo "definition_matrix=${definition_matrix}"
   echo "physical_recipe_matrix=${recipe_matrix}"
   echo "indexing_worker_matrix=${worker_matrix}"
-  echo "mutation_workers_override=${mutation_workers_override:-cell-indexing-workers}"
+  echo "mutation_workers=${mutation_workers}"
   echo "memory_per_worker_matrix=${memory_per_worker_matrix}"
   echo "offered_rate_ladder=${rate_ladder}"
   echo "mutation_object_size_matrix=${object_size_matrix}"
   echo "query_rate=${query_rate}"
   echo "query_max_in_flight=${query_max_in_flight}"
+  echo "query_memory_bytes=${query_memory_bytes}"
   echo "max_lag_slope_records_per_second=${lag_slope_limit}"
   echo "group_max_requests=${group_max_requests:-server-default}"
   echo "group_max_operations=${group_max_operations:-server-default}"
@@ -265,8 +272,11 @@ start_server() {
   KELDRA_SYSTEM_BOOTSTRAP_CREDENTIAL_OUTPUT="${credential_file}" \
   KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_PER_MINUTE=10000000 KELDRA_RATE_LIMIT_CREDENTIAL_GLOBAL_BURST=1000000 \
   KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_PER_MINUTE=10000000 KELDRA_RATE_LIMIT_CREDENTIAL_CLIENT_BURST=1000000 \
+  KELDRA_RATE_LIMIT_GLOBAL_PER_SECOND=1000000 KELDRA_RATE_LIMIT_GLOBAL_BURST=1000000 \
+  KELDRA_RATE_LIMIT_AUTHENTICATED_PER_SECOND=1000000 KELDRA_RATE_LIMIT_AUTHENTICATED_BURST=1000000 \
   KELDRA_INDEX_DISK_CACHE_BYTES=1073741824 \
   KELDRA_INDEX_PIPELINE_MEMORY_BYTES="${pipeline_memory_bytes}" \
+  KELDRA_INDEX_QUERY_MEMORY_BYTES="${query_memory_bytes}" \
   KELDRA_INDEXING_CORES="${workers}" KELDRA_SOURCE_JOURNAL_MAX_ENTRIES="${source_journal_entries}" \
     "${kit_root}/bin/keldra-server" >"${cell_root}/server.log" 2>&1 &
   server_pid=$!
@@ -372,11 +382,11 @@ summarize_cell() {
   ' 2>/dev/null || printf '{"classification":"failure","result":"unparseable-report"}')"
   jq -cn --arg cell "${cell}" --arg report_path "${report}" --arg progress_path "${progress}" --arg telemetry_path "${telemetry_samples}" \
     --argjson definitions "${definitions}" --argjson recipes "${recipes}" --argjson workers "${workers}" \
-    --argjson memory_per_worker "${memory_per_worker}" --argjson offered_rate "${offered_rate}" --argjson object_bytes "${object_bytes}" \
+    --argjson memory_per_worker "${memory_per_worker}" --argjson query_memory_bytes "${query_memory_bytes}" --argjson mutation_workers "${mutation_workers}" --argjson offered_rate "${offered_rate}" --argjson object_bytes "${object_bytes}" \
     --argjson store_bytes "${store_bytes}" --argjson resources "${resources}" --argjson lag "${lag}" --argjson throughput "${throughput}" \
     --argjson quality "${quality}" --slurpfile report "${report}" '
       ($report[0] // {}) as $r | ($workers * $memory_per_worker) as $pipeline_memory_bytes | ($pipeline_memory_bytes / 268435456) as $memory_256_mib_units | ($r.mutations // {}) as $m
-      | {cell:$cell,logical_definitions:$definitions,qualified_definitions:($r.qualified_definition_count // 0),physical_recipes:$recipes,definition_creation_seconds:($r.definition_creation_seconds // null),definition_creation_per_second:(if ($r.definition_creation_seconds // 0) > 0 then ($definitions / $r.definition_creation_seconds) else null end),qualified_definition_activation_seconds:($r.qualified_definition_activation_seconds // null),indexing_cores:$workers,memory_per_core_bytes:$memory_per_worker,pipeline_memory_bytes:$pipeline_memory_bytes,mutation_record_minimum_bytes:$object_bytes,offered_operations_per_second:$offered_rate,offered_operations:($m.offered_operations // 0),accepted_operations:($m.accepted_operations // 0),accepted_operations_per_second:($m.accepted_operations_per_second // 0),accepted_source_bytes:($m.accepted_bytes // 0),accepted_source_bytes_per_second:($m.accepted_bytes_per_second // 0),runtime_throughput:$throughput,indexed_source_rows_per_second:($throughput.checkpointed_source_rows_per_second // null),indexed_source_rows_per_second_per_core:(($throughput.checkpointed_source_rows_per_second // 0) / $workers),indexed_source_rows_per_second_per_256_mib:(($throughput.checkpointed_source_rows_per_second // 0) / $memory_256_mib_units),accepted_operations_per_second_per_core:(($m.accepted_operations_per_second // 0) / $workers),accepted_operations_per_second_per_256_mib:(($m.accepted_operations_per_second // 0) / $memory_256_mib_units),indexed_end_to_end_operations_per_second:(if (($m.elapsed_seconds // 0) + ($r.drain_seconds // 0)) > 0 then (($m.accepted_operations // 0) / (($m.elapsed_seconds // 0) + ($r.drain_seconds // 0))) else 0 end),drain_seconds:($r.drain_seconds // null),concurrent_query_schedule_to_response:($r.concurrent.schedule_to_response // null),concurrent_query_dispatch_to_response:($r.concurrent.dispatch_to_response // null),publication_visibility_lag:($m.publication_visibility_lag // null),lag:$lag,resources:$resources,durable_store_bytes:$store_bytes,report_path:$report_path,progress_path:$progress_path,telemetry_path:$telemetry_path,quality:$quality,raw_report:$r}
+      | {cell:$cell,logical_definitions:$definitions,qualified_definitions:($r.qualified_definition_count // 0),physical_recipes:$recipes,definition_creation_seconds:($r.definition_creation_seconds // null),definition_creation_per_second:(if ($r.definition_creation_seconds // 0) > 0 then ($definitions / $r.definition_creation_seconds) else null end),qualified_definition_activation_seconds:($r.qualified_definition_activation_seconds // null),indexing_cores:$workers,memory_per_core_bytes:$memory_per_worker,pipeline_memory_bytes:$pipeline_memory_bytes,query_memory_bytes:$query_memory_bytes,mutation_workers:$mutation_workers,mutation_record_minimum_bytes:$object_bytes,offered_operations_per_second:$offered_rate,offered_operations:($m.offered_operations // 0),accepted_operations:($m.accepted_operations // 0),accepted_operations_per_second:($m.accepted_operations_per_second // 0),accepted_source_bytes:($m.accepted_bytes // 0),accepted_source_bytes_per_second:($m.accepted_bytes_per_second // 0),runtime_throughput:$throughput,indexed_source_rows_per_second:($throughput.checkpointed_source_rows_per_second // null),indexed_source_rows_per_second_per_core:(($throughput.checkpointed_source_rows_per_second // 0) / $workers),indexed_source_rows_per_second_per_256_mib:(($throughput.checkpointed_source_rows_per_second // 0) / $memory_256_mib_units),accepted_operations_per_second_per_core:(($m.accepted_operations_per_second // 0) / $workers),accepted_operations_per_second_per_256_mib:(($m.accepted_operations_per_second // 0) / $memory_256_mib_units),indexed_end_to_end_operations_per_second:(if (($m.elapsed_seconds // 0) + ($r.drain_seconds // 0)) > 0 then (($m.accepted_operations // 0) / (($m.elapsed_seconds // 0) + ($r.drain_seconds // 0))) else 0 end),drain_seconds:($r.drain_seconds // null),concurrent_query_schedule_to_response:($r.concurrent.schedule_to_response // null),concurrent_query_dispatch_to_response:($r.concurrent.dispatch_to_response // null),publication_visibility_lag:($m.publication_visibility_lag // null),lag:$lag,resources:$resources,durable_store_bytes:$store_bytes,report_path:$report_path,progress_path:$progress_path,telemetry_path:$telemetry_path,quality:$quality,raw_report:$r}
     ' >>"${summary_rows}"
   jq -r '.classification' <<<"${quality}"
 }
@@ -464,7 +474,6 @@ for definitions in "${definitions_values[@]}"; do
       for memory_per_worker in "${memory_values[@]}"; do
         if ! { ((recipes == 1 && workers == maximum_workers && memory_per_worker == maximum_memory_per_worker)) || ((definitions == physical_axis_definitions && workers == maximum_workers && memory_per_worker == maximum_memory_per_worker)) || ((definitions == resource_axis_definitions && recipes == 1)); }; then continue; fi
         pipeline_memory_bytes=$((workers * memory_per_worker))
-        mutation_workers="${mutation_workers_override:-${workers}}"
         for object_bytes in "${object_sizes[@]}"; do
           # The pathological object is a D1/P1 cell. It measures the known
           # large-object ingestion shape without multiplying catalog or recipe
@@ -486,10 +495,7 @@ for definitions in "${definitions_values[@]}"; do
             continue
           fi
           ((reached_limit == 0)) || break
-          cell="d${definitions}-p${recipes}-w${workers}-m${memory_per_worker}-b${object_bytes}-r${offered_rate//./_}"
-          if [[ -n "${mutation_workers_override}" ]]; then
-            cell="${cell}-cw${mutation_workers}"
-          fi
+          cell="d${definitions}-p${recipes}-w${workers}-m${memory_per_worker}-b${object_bytes}-r${offered_rate//./_}-cw${mutation_workers}"
           active_cell="${run_dir}/${cell}"; active_work="${work_root}/${run_id}/${cell}"
           qualification_disk_ledger_check
           mkdir -p "${active_cell}" "${active_work}"/{state,metadata,wal,payload,scratch,cache,tmp}; chmod -R 0700 "${active_cell}" "${active_work}"
@@ -535,7 +541,7 @@ done
   echo "scale shard ${shard_index}/${shard_count} selected no configurations" >&2
   exit 2
 }
-jq -s --arg run_id "${run_id}" --arg mode "${mode}" --arg source_commit "${source_commit}" --arg harness_commit "${harness_commit}" --argjson shard_index "${shard_index}" --argjson shard_count "${shard_count}" --argjson selected_configurations "${selected_configurations}" --argjson total_configurations "${configuration_index}" --argjson fatal_cells "${fatal_cells}" --slurpfile capability "${run_dir}/public-query-capabilities/report.json" '{schema:"keldra.index-v1-ssd-scale.v1",run_id:$run_id,mode:$mode,server_source_commit:$source_commit,harness_commit:$harness_commit,shard_index:$shard_index,shard_count:$shard_count,selected_configurations:$selected_configurations,total_configurations:$total_configurations,public_query_capabilities:$capability[0],fatal_cells:$fatal_cells,cells:.}' "${summary_rows}" >"${run_dir}/report.json"
+jq -s --arg run_id "${run_id}" --arg mode "${mode}" --arg source_commit "${source_commit}" --arg harness_commit "${harness_commit}" --argjson query_memory_bytes "${query_memory_bytes}" --argjson mutation_workers "${mutation_workers}" --argjson shard_index "${shard_index}" --argjson shard_count "${shard_count}" --argjson selected_configurations "${selected_configurations}" --argjson total_configurations "${configuration_index}" --argjson fatal_cells "${fatal_cells}" --slurpfile capability "${run_dir}/public-query-capabilities/report.json" '{schema:"keldra.index-v1-ssd-scale.v1",run_id:$run_id,mode:$mode,server_source_commit:$source_commit,harness_commit:$harness_commit,query_memory_bytes:$query_memory_bytes,mutation_workers:$mutation_workers,shard_index:$shard_index,shard_count:$shard_count,selected_configurations:$selected_configurations,total_configurations:$total_configurations,public_query_capabilities:$capability[0],fatal_cells:$fatal_cells,cells:.}' "${summary_rows}" >"${run_dir}/report.json"
 qualification_disk_ledger_check
 archive_path="${results_root}/${run_id}.results.tar.gz"
 tar -C "${results_root}" -czf "${archive_path}" "${run_id}"

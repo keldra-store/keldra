@@ -1060,7 +1060,6 @@ async fn produce_fixed_rate_jobs(
     let started = Instant::now();
     let deadline = started + duration;
     let batch_rate = operation_rate / (mutation_batch_size + 1) as f64;
-    let schedule_interval = Duration::from_secs_f64(1.0 / batch_rate);
     let mut report = MutationProducerReport::default();
     let mut schedule_ordinal = 1_u64;
     loop {
@@ -1069,12 +1068,17 @@ async fn produce_fixed_rate_jobs(
             break;
         }
         tokio::time::sleep_until(scheduled).await;
-        report.offered_batches = report.offered_batches.saturating_add(1);
-        // A delayed producer records missed open-loop schedules instead of
-        // manufacturing a catch-up burst that changes the offered workload.
-        if Instant::now() >= scheduled + schedule_interval {
-            report.dropped_batches = report.dropped_batches.saturating_add(1);
-        } else {
+        // Tokio timers commonly coalesce sub-millisecond deadlines. Account
+        // for every schedule which is due now instead of treating timer
+        // granularity as server backpressure; the bounded channel remains the
+        // authority which drops work the driver cannot actually offer.
+        let now = Instant::now();
+        loop {
+            let scheduled = started + Duration::from_secs_f64(schedule_ordinal as f64 / batch_rate);
+            if scheduled >= deadline || scheduled > now {
+                break;
+            }
+            report.offered_batches = report.offered_batches.saturating_add(1);
             match job_tx.try_send(MutationJob {
                 sequence: schedule_ordinal - 1,
             }) {
@@ -1086,10 +1090,10 @@ async fn produce_fixed_rate_jobs(
                     bail!("mutation worker queue closed during fixed-rate production")
                 }
             }
+            schedule_ordinal = schedule_ordinal
+                .checked_add(1)
+                .context("mutation schedule overflow")?;
         }
-        schedule_ordinal = schedule_ordinal
-            .checked_add(1)
-            .context("mutation schedule overflow")?;
     }
     Ok(report)
 }

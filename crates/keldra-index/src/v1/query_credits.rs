@@ -8,6 +8,7 @@ pub struct QueryBlockCredits {
     admitted: usize,
     remaining: usize,
     loaded_blocks: usize,
+    required_query_lease_bytes: Option<usize>,
     _permit: QueryCreditPermit,
 }
 
@@ -33,6 +34,10 @@ impl std::fmt::Debug for QueryBlockCredits {
             .field("admitted", &self.admitted)
             .field("remaining", &self.remaining)
             .field("loaded_blocks", &self.loaded_blocks)
+            .field(
+                "required_query_lease_bytes",
+                &self.required_query_lease_bytes,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -44,6 +49,7 @@ impl QueryBlockCredits {
             admitted,
             remaining: admitted,
             loaded_blocks: 0,
+            required_query_lease_bytes: None,
             _permit: QueryCreditPermit::Pipeline {
                 permit,
                 maximum: admitted,
@@ -70,6 +76,7 @@ impl QueryBlockCredits {
             admitted,
             remaining: admitted,
             loaded_blocks: 0,
+            required_query_lease_bytes: None,
             _permit: QueryCreditPermit::Pipeline {
                 permit,
                 maximum,
@@ -89,6 +96,7 @@ impl QueryBlockCredits {
             admitted: remaining,
             remaining,
             loaded_blocks: 0,
+            required_query_lease_bytes: None,
             _permit: QueryCreditPermit::Query { _permit: permit },
         })
     }
@@ -97,9 +105,22 @@ impl QueryBlockCredits {
         self.remaining
     }
 
+    /// Total query lease needed by the reservation which exhausted these
+    /// credits. Logical execution limits do not populate this retry signal.
+    #[doc(hidden)]
+    pub const fn required_query_lease_bytes(&self) -> Option<usize> {
+        self.required_query_lease_bytes
+    }
+
     pub fn reserve(&mut self, bytes: usize) -> Result<(), IndexError> {
         if bytes > self.remaining {
             let additional = bytes - self.remaining;
+            let required = self
+                .admitted
+                .checked_sub(self.remaining)
+                .ok_or(IndexError::Integrity)?
+                .checked_add(bytes)
+                .ok_or(IndexError::OffsetOverflow)?;
             match &mut self._permit {
                 QueryCreditPermit::Pipeline {
                     permit,
@@ -131,7 +152,17 @@ impl QueryBlockCredits {
                         .checked_add(additional)
                         .ok_or(IndexError::OffsetOverflow)?;
                 }
-                _ => {
+                QueryCreditPermit::Query { .. } => {
+                    self.required_query_lease_bytes = Some(
+                        self.required_query_lease_bytes
+                            .map_or(required, |recorded| recorded.max(required)),
+                    );
+                    return Err(IndexError::ResourceLimit {
+                        needed: required,
+                        limit: self.admitted,
+                    });
+                }
+                QueryCreditPermit::Pipeline { .. } => {
                     return Err(IndexError::ResourceLimit {
                         needed: bytes,
                         limit: self.remaining,
@@ -192,6 +223,14 @@ mod tests {
     use super::*;
     use crate::v1::{IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage};
 
+    struct QueryPermit(usize);
+
+    impl QueryMemoryPermit for QueryPermit {
+        fn admitted_bytes(&self) -> usize {
+            self.0
+        }
+    }
+
     fn memory(bytes: usize) -> IndexingMemoryCredits {
         IndexingMemoryCredits::new(
             bytes,
@@ -244,5 +283,33 @@ mod tests {
         ));
         assert_eq!(memory.used_bytes(), 65);
         assert_eq!(credits.remaining(), 1);
+    }
+
+    #[test]
+    fn query_credit_exhaustion_records_the_total_required_lease() {
+        let mut credits = QueryBlockCredits::from_query_permit(Box::new(QueryPermit(16))).unwrap();
+        credits.reserve(10).unwrap();
+
+        assert_eq!(
+            credits.reserve(8),
+            Err(IndexError::ResourceLimit {
+                needed: 18,
+                limit: 16,
+            })
+        );
+        assert_eq!(credits.required_query_lease_bytes(), Some(18));
+        assert_eq!(credits.remaining(), 6);
+    }
+
+    #[test]
+    fn loaded_block_limit_does_not_report_query_credit_exhaustion() {
+        let mut credits = QueryBlockCredits::from_query_permit(Box::new(QueryPermit(16))).unwrap();
+
+        assert!(matches!(
+            credits.reserve_loaded_block(1, 0),
+            Err(IndexError::ResourceLimit { .. })
+        ));
+        assert_eq!(credits.required_query_lease_bytes(), None);
+        assert_eq!(credits.remaining(), 16);
     }
 }

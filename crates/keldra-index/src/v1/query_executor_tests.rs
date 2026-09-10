@@ -88,6 +88,26 @@ fn artifact_memory_refusal_happens_before_payload_loader() {
         Err(IndexError::ResourceLimit { .. })
     ));
     assert_eq!(loader.payload_loads, 0);
+    assert_eq!(credits.required_query_lease_bytes(), Some(1024));
+}
+
+#[test]
+fn logical_heap_limit_does_not_report_query_credit_exhaustion() {
+    let mut limits = QueryExecutionLimits::default_for_memory();
+    limits.maximum_heap_bytes = 8;
+    let mut budget = Budget {
+        limits,
+        evidence: QueryLoadEvidence::default(),
+        heap_bytes: 0,
+    };
+    let mut credits = credits(1024);
+
+    assert!(matches!(
+        budget.reserve_heap(&mut credits, 9),
+        Err(IndexError::ResourceLimit { .. })
+    ));
+    assert_eq!(credits.required_query_lease_bytes(), None);
+    assert_eq!(credits.remaining(), 1024);
 }
 
 #[test]
