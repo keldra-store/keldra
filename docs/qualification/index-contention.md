@@ -85,6 +85,38 @@ cd ~/keldra_experiments/kit
 KELDRA_V1_SCALE_MODE=sustained ./qualify-index-v1-ssd-scale.sh
 ```
 
+To retain symbolized CPU evidence for one exact matrix cell, opt in with the
+cell name emitted by the runner (for example,
+`d64-p1-w4-m1073741824-b1024-r5000-cw64`):
+
+```bash
+KELDRA_V1_SCALE_MODE=sustained \
+KELDRA_V1_SCALE_PROFILE=1 \
+KELDRA_V1_SCALE_PROFILE_CELL=d64-p1-w4-m1073741824-b1024-r5000-cw64 \
+  ./qualify-index-v1-ssd-scale.sh
+```
+
+The selected cell retains separate `perf-ingest-concurrent.data` and
+`perf-drain.data` recordings, flat demangled reports, and DWARF caller graphs.
+The two raw recordings are captured back-to-back; report rendering is deferred
+until the workload driver, server, and resource samplers stop so it cannot
+contend with a measured phase or extend whole-run resource sampling.
+Before starting the workload, the runner proves access to the CPU cycles event.
+If the host policy rejects the invoking user but permits passwordless
+`sudo perf`, only recording is elevated and ownership of the raw data is
+returned before user-level checksumming and report rendering. If neither route
+works, or either requested recording fails, qualification fails rather than
+silently publishing an empty profile.
+The harness publishes progress once per second and samples its timestamp
+separately from its phase value. Metadata therefore retains adjacent progress
+samples as observation context, not as exact transition timestamps or strict
+bounds. A driver exit before the next phase is explicitly marked as a partial
+capture. The runner also emits allocator-leaf CPU stacks. Those samples show
+CPU time observed inside `malloc`, `realloc`, and `free`; they are not an
+allocation count or byte census. A status file records when no portable heap
+profiler is available, and no allocation totals should be inferred in that
+case.
+
 Each target-data-rate cell starts with fresh durable state and walks the ascending
 open-loop rate ladder (smoke: 100, 1,000; sustained: 1,000, 5,000, 10,000,
 20,000, 40,000 data operations/s by default). It stops an axis at the first

@@ -36,6 +36,14 @@ group_max_queued_inline_bytes="${KELDRA_V1_SCALE_GROUP_MAX_QUEUED_INLINE_BYTES:-
 group_dwell_microseconds="${KELDRA_V1_SCALE_GROUP_DWELL_MICROSECONDS:-}"
 shard_index="${KELDRA_V1_SCALE_SHARD_INDEX:-0}"
 shard_count="${KELDRA_V1_SCALE_SHARD_COUNT:-1}"
+# Profiling is opt-in and restricted to one exact matrix cell so raw DWARF
+# evidence cannot unexpectedly multiply the run's disk footprint. The harness
+# progress stream supplies sampled concurrent-ingest, drain, and post phase
+# observations used to delimit the recordings.
+profile="${KELDRA_V1_SCALE_PROFILE:-0}"
+profile_cell="${KELDRA_V1_SCALE_PROFILE_CELL:-}"
+profile_frequency="${KELDRA_V1_SCALE_PROFILE_FREQUENCY:-99}"
+perf_prefix=()
 
 case "${mode}" in
   smoke)
@@ -68,10 +76,33 @@ case "${experiment_root}" in
   *) echo "experiment root escaped HOME/keldra_experiments" >&2; exit 2 ;;
 esac
 case "${keep_work}" in 0|1) ;; *) echo "KELDRA_V1_SCALE_KEEP_WORK must be 0 or 1" >&2; exit 2 ;; esac
+case "${profile}" in 0|1) ;; *) echo "KELDRA_V1_SCALE_PROFILE must be 0 or 1" >&2; exit 2 ;; esac
+if [[ "${profile}" == 1 ]]; then
+  [[ -n "${profile_cell}" ]] || {
+    echo "KELDRA_V1_SCALE_PROFILE_CELL must name one exact cell when profiling is enabled" >&2
+    exit 2
+  }
+  [[ "${profile_frequency}" =~ ^[1-9][0-9]*$ ]] && ((profile_frequency <= 999)) || {
+    echo "KELDRA_V1_SCALE_PROFILE_FREQUENCY must be between 1 and 999" >&2
+    exit 2
+  }
+fi
 
 for command in awk base64 dd flock jq lscpu lsblk ps readlink sha256sum ss tar vmstat; do
   command -v "${command}" >/dev/null 2>&1 || { echo "${command} is required" >&2; exit 2; }
 done
+if [[ "${profile}" == 1 ]]; then
+  command -v perf >/dev/null 2>&1 || { echo "perf is required when profiling is enabled" >&2; exit 2; }
+  if perf stat --event cycles -- true >/dev/null 2>&1; then
+    perf_prefix=()
+  elif command -v sudo >/dev/null 2>&1 \
+    && sudo -n perf stat --event cycles -- true >/dev/null 2>&1; then
+    perf_prefix=(sudo -n)
+  else
+    echo "perf cycles are unavailable both directly and through passwordless sudo" >&2
+    exit 2
+  fi
+fi
 for binary in keldra-server keldra index-contention-qualification; do
   [[ -x "${kit_root}/bin/${binary}" ]] || { echo "missing ${kit_root}/bin/${binary}" >&2; exit 2; }
 done
@@ -201,14 +232,45 @@ summary_rows="${run_dir}/cells.jsonl"
   echo "group_max_queued_operations=${group_max_queued_operations:-server-default}"
   echo "group_max_queued_inline_bytes=${group_max_queued_inline_bytes:-server-default}"
   echo "group_dwell_microseconds=${group_dwell_microseconds:-server-default}"
+  echo "profile=${profile}"
+  echo "profile_cell=${profile_cell:-none}"
+  echo "profile_frequency=${profile_frequency}"
   sha256sum "${kit_root}/bin/keldra-server" "${kit_root}/bin/keldra" \
     "${kit_root}/bin/index-contention-qualification"
   uname -srvmo; lscpu; free -h; df -hT "${experiment_root}"
   lsblk -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,ROTA,MODEL
 } >"${run_dir}/host-info.txt"
 
-server_pid=""; sampler_pid=""; vmstat_pid=""; active_work=""; active_cell=""
+server_pid=""; sampler_pid=""; vmstat_pid=""; profiler_pid=""; profiler_data=""
+driver_pid=""; active_work=""; active_cell=""
+stop_profiler() {
+  local signal_child="${1:-1}" status=0
+  [[ -n "${profiler_pid}" ]] || return 0
+  if [[ "${signal_child}" == 1 ]]; then
+    kill -INT "${profiler_pid}" 2>/dev/null || true
+  fi
+  wait "${profiler_pid}" || status=$?
+  profiler_pid=""
+  if ((${#perf_prefix[@]} > 0)) && [[ -n "${profiler_data}" && -e "${profiler_data}" ]]; then
+    sudo -n chown -- "$(id -u):$(id -g)" "${profiler_data}" || status=1
+  fi
+  profiler_data=""
+  return "${status}"
+}
+stop_driver() {
+  local signal_child="${1:-1}"
+  [[ -n "${driver_pid}" ]] || return 0
+  if [[ "${signal_child}" == 1 ]]; then
+    kill -TERM "${driver_pid}" 2>/dev/null || true
+    for _ in $(seq 1 30); do kill -0 "${driver_pid}" 2>/dev/null || break; sleep 1; done
+    kill -KILL "${driver_pid}" 2>/dev/null || true
+  fi
+  wait "${driver_pid}" 2>/dev/null || true
+  driver_pid=""
+}
 stop_server() {
+  stop_profiler || true
+  stop_driver || true
   if [[ -n "${sampler_pid}" ]]; then kill -TERM "${sampler_pid}" 2>/dev/null || true; wait "${sampler_pid}" 2>/dev/null || true; fi
   if [[ -n "${vmstat_pid}" ]]; then kill -TERM "${vmstat_pid}" 2>/dev/null || true; wait "${vmstat_pid}" 2>/dev/null || true; fi
   if [[ -n "${server_pid}" ]]; then
@@ -217,7 +279,7 @@ stop_server() {
     kill -KILL "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
   fi
-  server_pid=""; sampler_pid=""; vmstat_pid=""
+  server_pid=""; sampler_pid=""; vmstat_pid=""; profiler_pid=""; profiler_data=""; driver_pid=""
 }
 cleanup() {
   local status=$?
@@ -328,6 +390,143 @@ extract_v1_telemetry() {
       )
     | del(.timestamp_utc)
   ' >"${output}"
+}
+
+latest_progress_phase() {
+  local progress="$1"
+  [[ -s "${progress}" ]] || return 1
+  tail -n 1 "${progress}" | jq -er '.phase'
+}
+
+profile_phase() {
+  local phase="$1" next_phase="$2" progress="$3" driver_pid="$4" output_root="$5"
+  local evidence_phase="${phase}" observed_record observed_phase previous_record profiler_ms
+  local stop_record perf_status capture_status
+  [[ "${phase}" == "concurrent" ]] && evidence_phase="ingest-concurrent"
+  local data="${output_root}/perf-${evidence_phase}.data"
+  local metadata="${output_root}/perf-${evidence_phase}-metadata.txt"
+
+  while kill -0 "${driver_pid}" 2>/dev/null; do
+    observed_phase="$(latest_progress_phase "${progress}" 2>/dev/null || true)"
+    [[ "${observed_phase}" == "${phase}" ]] && break
+    # A later phase means the requested phase was never sampled.
+    if [[ "${observed_phase}" == "${next_phase}" || "${observed_phase}" == "post" || "${observed_phase}" == "complete" ]]; then
+      printf 'status=phase-not-observed\nrequested_phase=%s\nfirst_later_phase=%s\n' \
+        "${phase}" "${observed_phase}" >"${metadata}"
+      return 1
+    fi
+    sleep 0.1
+  done
+  if [[ "$(latest_progress_phase "${progress}" 2>/dev/null || true)" != "${phase}" ]]; then
+    printf 'status=driver-ended-before-phase\nrequested_phase=%s\n' "${phase}" >"${metadata}"
+    return 1
+  fi
+
+  # The progress writer samples once per second and captures its timestamp
+  # separately from its phase mutex. Preserve the adjacent samples as timing
+  # context, but do not claim that they strictly bound the transition.
+  observed_record="$(jq -c --arg phase "${phase}" 'select(.phase == $phase)' "${progress}" | head -n 1)"
+  previous_record="$(jq -cs --arg phase "${phase}" 'map(select(.phase != $phase)) | last // empty' "${progress}")"
+  profiler_ms="$(date +%s%3N)"
+  {
+    echo "schema=keldra.perf-phase-profile.v1"
+    echo "record_started=true"
+    echo "evidence_phase=${evidence_phase}"
+    echo "harness_phase=${phase}"
+    echo "end_phase=${next_phase}"
+    echo "event=cycles"
+    echo "frequency_hz=${profile_frequency}"
+    echo "call_graph=dwarf,8192"
+    echo "phase_timing=sampled-observation-not-exact-boundary"
+    echo "first_phase_record=${observed_record}"
+    echo "previous_phase_record=${previous_record:-none}"
+    echo "profiler_started_unix_milliseconds=${profiler_ms}"
+    echo "server_pid=${server_pid}"
+  } >"${metadata}"
+
+  "${perf_prefix[@]}" perf record --event cycles --freq "${profile_frequency}" --call-graph dwarf,8192 \
+    --pid "${server_pid}" --output "${data}" \
+    >"${output_root}/perf-${evidence_phase}-record.stdout" \
+    2>"${output_root}/perf-${evidence_phase}-record.stderr" &
+  profiler_pid=$!
+  profiler_data="${data}"
+  while kill -0 "${driver_pid}" 2>/dev/null; do
+    if ! kill -0 "${profiler_pid}" 2>/dev/null; then
+      if stop_profiler 0; then perf_status=0; else perf_status=$?; fi
+      printf 'perf_record_exit=%s\nstatus=record-ended-before-phase\n' "${perf_status}" >>"${metadata}"
+      return 1
+    fi
+    observed_phase="$(latest_progress_phase "${progress}" 2>/dev/null || true)"
+    [[ "${observed_phase}" == "${phase}" || -z "${observed_phase}" ]] || break
+    sleep 0.1
+  done
+  profiler_ms="$(date +%s%3N)"
+  if [[ -n "${observed_phase:-}" && "${observed_phase}" != "${phase}" ]]; then
+    stop_record="$(jq -c --arg phase "${observed_phase}" 'select(.phase == $phase)' "${progress}" 2>/dev/null | head -n 1)"
+  else
+    stop_record=""
+  fi
+  observed_record="$(jq -c --arg phase "${phase}" 'select(.phase == $phase)' "${progress}" 2>/dev/null | tail -n 1)"
+  if [[ "${observed_phase:-}" == "${next_phase}" ]]; then
+    capture_status="recorded"
+  elif [[ -n "${stop_record}" ]]; then
+    capture_status="recorded-after-next-phase-was-not-observed"
+  else
+    capture_status="partial-driver-ended"
+  fi
+  printf 'profiler_stop_observed_phase=%s\nlast_profiled_phase_record=%s\nfirst_later_phase_record=%s\nprofiler_stopped_unix_milliseconds=%s\n' \
+    "${observed_phase:-driver-ended}" "${observed_record:-none}" "${stop_record:-none}" \
+    "${profiler_ms}" >>"${metadata}"
+  if stop_profiler; then perf_status=0; else perf_status=$?; fi
+  printf 'perf_record_exit=%s\n' "${perf_status}" >>"${metadata}"
+  if ((perf_status != 0)) || [[ ! -s "${data}" ]]; then
+    printf 'status=record-failed\n' >>"${metadata}"
+    return 1
+  fi
+  printf 'status=%s\n' "${capture_status}" >>"${metadata}"
+}
+
+render_perf_reports() {
+  local evidence_phase="$1" output_root="$2"
+  local data="${output_root}/perf-${evidence_phase}.data"
+  local metadata="${output_root}/perf-${evidence_phase}-metadata.txt"
+  local report_status=0 allocator
+  [[ -s "${data}" ]] || return 1
+  printf 'perf_version=%s\n' "$(perf version)" >>"${metadata}"
+  sha256sum "${kit_root}/bin/keldra-server" "${data}" >>"${metadata}"
+  report_status=0
+  perf report --input "${data}" --stdio --header --demangle --no-children \
+    --sort comm,dso,symbol \
+    >"${output_root}/perf-${evidence_phase}-flat-demangled.txt" \
+    2>"${output_root}/perf-${evidence_phase}-flat.stderr" || report_status=$?
+  perf report --input "${data}" --stdio --header --demangle --children \
+    --call-graph graph,0.1,caller,function --sort symbol \
+    >"${output_root}/perf-${evidence_phase}-dwarf-callgraph-demangled.txt" \
+    2>"${output_root}/perf-${evidence_phase}-dwarf-callgraph.stderr" || report_status=$?
+
+  # These are sampled CPU-cycle stacks whose selected leaf contains an
+  # allocator name. They are not allocation counts or allocated-byte totals.
+  # A true allocation census requires an external heap profiler; do not infer
+  # one from ordinary perf samples.
+  for allocator in malloc realloc free; do
+    perf report --input "${data}" --stdio --header --demangle --children \
+      --call-graph graph,0.1,caller,function --sort symbol \
+      --symbol-filter "${allocator}" \
+      >"${output_root}/perf-${evidence_phase}-allocation-cpu-stacks-${allocator}.txt" \
+      2>"${output_root}/perf-${evidence_phase}-allocation-cpu-stacks-${allocator}.stderr" \
+      || report_status=$?
+  done
+  printf 'perf_report_exit=%s\n' "${report_status}" >>"${metadata}"
+  if command -v heaptrack >/dev/null 2>&1 && command -v heaptrack_print >/dev/null 2>&1; then
+    printf '%s\n' \
+      'heaptrack is available, but attach-time instrumentation is deliberately not mixed into the qualification workload; run it as a separate diagnostic workload.' \
+      >"${output_root}/perf-${evidence_phase}-allocation-profiler-status.txt"
+  else
+    printf '%s\n' \
+      'No portable allocation-count/byte profiler is available. The allocation-cpu-stacks reports contain sampled cycle stacks only.' \
+      >"${output_root}/perf-${evidence_phase}-allocation-profiler-status.txt"
+  fi
+  return "${report_status}"
 }
 
 remove_cell_work() {
@@ -482,7 +681,7 @@ maximum_workers=0; maximum_memory_per_worker=0
 for workers in "${worker_values[@]}"; do ((workers > maximum_workers)) && maximum_workers="${workers}"; done
 for bytes in "${memory_values[@]}"; do ((bytes > maximum_memory_per_worker)) && maximum_memory_per_worker="${bytes}"; done
 
-port="${base_port}"; fatal_cells=0; configuration_index=0; selected_configurations=0
+port="${base_port}"; fatal_cells=0; configuration_index=0; selected_configurations=0; profiled_cell=0
 run_capability_preflight "${port}" "${maximum_workers}" "${maximum_memory_per_worker}"
 port=$((port + 2))
 for definitions in "${definitions_values[@]}"; do
@@ -533,12 +732,75 @@ for definitions in "${definitions_values[@]}"; do
           KELDRA_CLIENT_ID="${client_id}" KELDRA_CLIENT_SECRET_FILE="${client_secret_file}" "${kit_root}/bin/keldra" --endpoint "http://127.0.0.1:${port}" create-bucket "${bucket}" >"${active_cell}/bucket.stdout.log" 2>"${active_cell}/bucket.stderr.log"
           rm -f -- "${client_secret_file}"
           report="${active_cell}/report.json"; progress="${active_cell}/driver-progress.jsonl"
+          driver_env=(
+            "KELDRA_INDEX_CONTENTION_ENDPOINTS=http://127.0.0.1:${port}"
+            "KELDRA_INDEX_CONTENTION_TENANT=${tenant}"
+            "KELDRA_INDEX_CONTENTION_BUCKET=${bucket}"
+            "KELDRA_INDEX_CONTENTION_CLIENT_ID=${client_id}"
+            "KELDRA_INDEX_CONTENTION_CLIENT_SECRET=${client_secret}"
+            "KELDRA_INDEX_CONTENTION_SERVER_SOURCE_COMMIT=${source_commit}"
+            "KELDRA_INDEX_CONTENTION_IMAGE=qualification-kit:${source_commit}"
+            "KELDRA_INDEX_CONTENTION_TOPOLOGY=single-node"
+            "KELDRA_INDEX_CONTENTION_DURABILITY=LOCAL"
+            "KELDRA_INDEX_CONTENTION_DEFINITION_COUNT=${definitions}"
+            "KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT=${recipes}"
+            "KELDRA_INDEX_CONTENTION_BASELINE_SECONDS=${baseline_seconds}"
+            "KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS=${concurrent_seconds}"
+            "KELDRA_INDEX_CONTENTION_POST_SECONDS=${post_seconds}"
+            "KELDRA_INDEX_CONTENTION_TARGET_DATA_OPERATIONS_PER_SECOND=${target_data_rate}"
+            "KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES=${object_bytes}"
+            "KELDRA_INDEX_CONTENTION_MUTATION_WORKERS=${mutation_workers}"
+            "KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=32"
+            "KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=$((mutation_workers * 8))"
+            "KELDRA_INDEX_CONTENTION_QUERY_RATE=${query_rate}"
+            "KELDRA_INDEX_CONTENTION_QUERY_MAX_IN_FLIGHT=${query_max_in_flight}"
+            "KELDRA_INDEX_CONTENTION_REQUEST_TIMEOUT_MILLISECONDS=30000"
+            "KELDRA_INDEX_CONTENTION_DRAIN_TIMEOUT_SECONDS=600"
+            "KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS=600"
+            "KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=2000"
+            "KELDRA_INDEX_CONTENTION_MAX_SUCCESSFUL_RECEIPT_TO_QUERY_VISIBILITY_P99_MILLISECONDS=30000"
+            "KELDRA_INDEX_CONTENTION_OUTPUT=${report}"
+            "KELDRA_INDEX_CONTENTION_PROGRESS_JSONL=${progress}"
+          )
           set +e
-          KELDRA_INDEX_CONTENTION_ENDPOINTS="http://127.0.0.1:${port}" KELDRA_INDEX_CONTENTION_TENANT="${tenant}" KELDRA_INDEX_CONTENTION_BUCKET="${bucket}" KELDRA_INDEX_CONTENTION_CLIENT_ID="${client_id}" KELDRA_INDEX_CONTENTION_CLIENT_SECRET="${client_secret}" KELDRA_INDEX_CONTENTION_SERVER_SOURCE_COMMIT="${source_commit}" KELDRA_INDEX_CONTENTION_IMAGE="qualification-kit:${source_commit}" KELDRA_INDEX_CONTENTION_TOPOLOGY=single-node KELDRA_INDEX_CONTENTION_DURABILITY=LOCAL KELDRA_INDEX_CONTENTION_DEFINITION_COUNT="${definitions}" KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT="${recipes}" KELDRA_INDEX_CONTENTION_BASELINE_SECONDS="${baseline_seconds}" KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS="${concurrent_seconds}" KELDRA_INDEX_CONTENTION_POST_SECONDS="${post_seconds}" KELDRA_INDEX_CONTENTION_TARGET_DATA_OPERATIONS_PER_SECOND="${target_data_rate}" KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES="${object_bytes}" KELDRA_INDEX_CONTENTION_MUTATION_WORKERS="${mutation_workers}" KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=32 KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH="$((mutation_workers * 8))" KELDRA_INDEX_CONTENTION_QUERY_RATE="${query_rate}" KELDRA_INDEX_CONTENTION_QUERY_MAX_IN_FLIGHT="${query_max_in_flight}" KELDRA_INDEX_CONTENTION_REQUEST_TIMEOUT_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_DRAIN_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=2000 KELDRA_INDEX_CONTENTION_MAX_SUCCESSFUL_RECEIPT_TO_QUERY_VISIBILITY_P99_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_OUTPUT="${report}" KELDRA_INDEX_CONTENTION_PROGRESS_JSONL="${progress}" "${kit_root}/bin/index-contention-qualification" >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log"
-          driver_status=$?
+          if [[ "${profile}" == 1 && "${cell}" == "${profile_cell}" ]]; then
+            profiled_cell=1
+            env "${driver_env[@]}" "${kit_root}/bin/index-contention-qualification" \
+              >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log" &
+            driver_pid=$!
+            profile_status=0
+            profile_phase concurrent drain "${progress}" "${driver_pid}" "${active_cell}" || profile_status=$?
+            if ((profile_status == 0)); then
+              profile_phase drain post "${progress}" "${driver_pid}" "${active_cell}" || profile_status=$?
+            fi
+            if ((profile_status != 0)); then
+              if kill -0 "${driver_pid}" 2>/dev/null; then
+                stop_driver 1
+              else
+                stop_driver 0
+              fi
+              driver_status="${profile_status}"
+            else
+              wait "${driver_pid}"
+              driver_status=$?
+              driver_pid=""
+            fi
+          else
+            env "${driver_env[@]}" "${kit_root}/bin/index-contention-qualification" \
+              >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log"
+            driver_status=$?
+          fi
           set -e
           store_bytes="$(du -sb "${active_work}/metadata" "${active_work}/payload" "${active_work}/wal" 2>/dev/null | awk '{total += $1} END {print total + 0}')"
           stop_server
+          if [[ "${profile}" == 1 && "${cell}" == "${profile_cell}" ]]; then
+            # Symbolization starts only after the driver, server, and resource
+            # samplers stop, so it cannot alter measured or whole-run evidence.
+            profile_report_status=0
+            render_perf_reports ingest-concurrent "${active_cell}" || profile_report_status=$?
+            render_perf_reports drain "${active_cell}" || profile_report_status=$?
+            if ((profile_report_status != 0)); then driver_status="${profile_report_status}"; fi
+          fi
           telemetry_samples="${active_cell}/v1-summary.jsonl"
           extract_v1_telemetry "${active_cell}/server.log" "${telemetry_samples}"
           [[ -s "${report}" ]] || printf '{"result":"missing-report"}\n' >"${report}"
@@ -559,6 +821,10 @@ done
   echo "scale shard ${shard_index}/${shard_count} selected no configurations" >&2
   exit 2
 }
+if [[ "${profile}" == 1 && "${profiled_cell}" == 0 ]]; then
+  echo "requested profiling cell was not selected by this matrix shard: ${profile_cell}" >&2
+  exit 2
+fi
 jq -s --arg run_id "${run_id}" --arg mode "${mode}" --arg source_commit "${source_commit}" --arg harness_commit "${harness_commit}" --argjson query_memory_bytes "${query_memory_bytes}" --argjson mutation_workers "${mutation_workers}" --argjson shard_index "${shard_index}" --argjson shard_count "${shard_count}" --argjson selected_configurations "${selected_configurations}" --argjson total_configurations "${configuration_index}" --argjson fatal_cells "${fatal_cells}" --slurpfile capability "${run_dir}/public-query-capabilities/report.json" '{schema:"keldra.index-v1-ssd-scale.v2",run_id:$run_id,mode:$mode,server_source_commit:$source_commit,harness_commit:$harness_commit,query_memory_bytes:$query_memory_bytes,mutation_workers:$mutation_workers,shard_index:$shard_index,shard_count:$shard_count,selected_configurations:$selected_configurations,total_configurations:$total_configurations,public_query_capabilities:$capability[0],fatal_cells:$fatal_cells,cells:.}' "${summary_rows}" >"${run_dir}/report.json"
 qualification_disk_ledger_check
 archive_path="${results_root}/${run_id}.results.tar.gz"
