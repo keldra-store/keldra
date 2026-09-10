@@ -1821,7 +1821,7 @@ impl Store {
             distributed.is_some_and(|distributed| distributed.materialize_inline_payload);
         evaluation_subphases.record_since(EvaluationSubphase::DurableEncoding, timing);
         evaluation_subphases.count_inline_payload_receipt_stage();
-        let (inline_payload_value, reservation) =
+        let (inline_payload_key, reservation) =
             evaluation_subphases.measure(EvaluationSubphase::InlinePayloadReceiptStage, || {
                 self.prepare_coordinated_inline_payload(
                     operation,
@@ -1879,13 +1879,18 @@ impl Store {
                     pending_receipts,
                 )
             })?;
-        if let Some((key, bytes)) = inline_payload_value {
-            let reference = match operation {
-                PreparedOperation::Put { payload, .. } => payload.reference(),
+        if let Some(key) = inline_payload_key {
+            let (reference, bytes) = match operation {
+                PreparedOperation::Put { payload, .. } => (
+                    payload.reference(),
+                    payload
+                        .inline_bytes()
+                        .expect("only an inline put materializes inline payload bytes"),
+                ),
                 _ => unreachable!("only a put materializes inline payload bytes"),
             };
             evaluation_subphases.measure(EvaluationSubphase::InlinePayloadReceiptStage, || {
-                self.stage_inline_complete_artifact(batch, reference, &bytes)
+                self.stage_inline_complete_artifact(batch, reference, bytes)
             })?;
             timing = evaluation_subphases.start();
             pending_inline_payloads.insert(key);

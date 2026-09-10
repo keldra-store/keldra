@@ -60,13 +60,13 @@ impl V1ProjectionExtractor {
         recipes: &[PhysicalCatalogRecipe],
         physical_catalog_identity: [u8; 32],
     ) -> Result<SelectedV1Source, Status> {
-        let object = match &source {
-            IndexSourceMutation::Upsert(object) => object.clone(),
+        let object = match source {
+            IndexSourceMutation::Upsert(object) => object,
             IndexSourceMutation::Remove(identity) => {
                 self.hot
                     .discard_through(tenant_id, bucket_id, &identity.path, identity.version);
                 return Ok(SelectedV1Source {
-                    source,
+                    source: IndexSourceMutation::Remove(identity),
                     selected: None,
                 });
             }
@@ -86,7 +86,7 @@ impl V1ProjectionExtractor {
         if pointers.is_empty() {
             self.discard_hot_through(tenant_id, bucket_id, &object.path, object.version);
             return Ok(SelectedV1Source {
-                source,
+                source: IndexSourceMutation::Upsert(object),
                 selected: None,
             });
         }
@@ -106,7 +106,7 @@ impl V1ProjectionExtractor {
                 selected.resident_bytes().map_err(index_status)? as u64,
             );
             return Ok(SelectedV1Source {
-                source,
+                source: IndexSourceMutation::Upsert(object),
                 selected: Some(selected),
             });
         }
@@ -144,7 +144,10 @@ impl V1ProjectionExtractor {
             &telemetry.stage_queue_wait_nanos,
             wait.as_nanos().min(u128::from(u64::MAX)) as u64,
         );
-        Ok(SelectedV1Source { source, selected })
+        Ok(SelectedV1Source {
+            source: IndexSourceMutation::Upsert(object),
+            selected,
+        })
     }
 
     pub(crate) fn discard_hot_through(
@@ -162,7 +165,7 @@ impl V1ProjectionExtractor {
         source_scope: [u8; 32],
         selected: &SelectedV1Source,
         recipe: &PhysicalCatalogRecipe,
-        previous: Vec<ProjectedDocumentState>,
+        previous: &[ProjectedDocumentState],
         credits: &mut QueryBlockCredits,
     ) -> Result<PreparedTypedJsonDocument, Status> {
         let (path, version, result, live) = match &selected.source {

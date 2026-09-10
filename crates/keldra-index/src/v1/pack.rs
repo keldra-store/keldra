@@ -64,6 +64,14 @@ pub struct ChargedProjectionDeltaPacks {
     pub(crate) credits: ProjectionPackCredits,
 }
 
+impl ChargedProjectionDeltaPacks {
+    /// Split the prepared packs from the admission that must remain live while
+    /// their encoded bytes are retained by a downstream publisher.
+    pub fn into_parts(self) -> (Vec<SealedProjectionDeltaPack>, ProjectionPackCredits) {
+        (self.packs, self.credits)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedComponentDelta {
     pub component: ComponentIdentity,
@@ -95,26 +103,48 @@ pub fn pack_component_deltas(
             credits,
         });
     }
-    let packed_bytes = deltas.iter().try_fold(0usize, |total, delta| {
+    let mut packed_bytes = 0_usize;
+    let mut pack_count = 0_usize;
+    let mut current_pack_bytes = 0_usize;
+    for delta in &deltas {
         validate_delta(delta)?;
-        total
-            .checked_add(delta.bytes.len())
-            .ok_or(IndexError::OffsetOverflow)
-    })?;
-    // Refuse before allocating/copying the first destination byte. The caller
-    // still owns its sealed-output admission at this point, so this second
-    // permit proves the transient coexistence also fits the hard node budget.
-    credits.reserve(packed_bytes)?;
-    let mut packs = Vec::new();
-    let mut bytes = Vec::new();
-    let mut staged = Vec::new();
-    for delta in deltas {
         if delta.bytes.len() > INDEX_ARTIFACT_PACK_BYTES {
             return Err(IndexError::ResourceLimit {
                 needed: delta.bytes.len(),
                 limit: INDEX_ARTIFACT_PACK_BYTES,
             });
         }
+        packed_bytes = packed_bytes
+            .checked_add(delta.bytes.len())
+            .ok_or(IndexError::OffsetOverflow)?;
+        if current_pack_bytes != 0
+            && current_pack_bytes
+                .checked_add(delta.bytes.len())
+                .is_none_or(|needed| needed > INDEX_ARTIFACT_PACK_BYTES)
+        {
+            pack_count = pack_count
+                .checked_add(1)
+                .ok_or(IndexError::OffsetOverflow)?;
+            current_pack_bytes = 0;
+        }
+        current_pack_bytes = current_pack_bytes
+            .checked_add(delta.bytes.len())
+            .ok_or(IndexError::OffsetOverflow)?;
+    }
+    if current_pack_bytes != 0 {
+        pack_count = pack_count
+            .checked_add(1)
+            .ok_or(IndexError::OffsetOverflow)?;
+    }
+    // Refuse before allocating/copying the first destination byte. The caller
+    // still owns its sealed-output admission at this point, so this second
+    // permit proves the transient coexistence also fits the hard node budget.
+    credits.reserve(packed_bytes)?;
+    let mut remaining_bytes = packed_bytes;
+    let mut packs = Vec::with_capacity(pack_count);
+    let mut bytes = Vec::with_capacity(packed_bytes.min(INDEX_ARTIFACT_PACK_BYTES));
+    let mut staged = Vec::new();
+    for delta in deltas {
         if !bytes.is_empty()
             && bytes
                 .len()
@@ -122,11 +152,14 @@ pub fn pack_component_deltas(
                 .is_none_or(|needed| needed > INDEX_ARTIFACT_PACK_BYTES)
         {
             packs.push(seal_pack(bytes, staged)?);
-            bytes = Vec::new();
+            bytes = Vec::with_capacity(remaining_bytes.min(INDEX_ARTIFACT_PACK_BYTES));
             staged = Vec::new();
         }
         let offset = bytes.len() as u64;
         bytes.extend_from_slice(&delta.bytes);
+        remaining_bytes = remaining_bytes
+            .checked_sub(delta.bytes.len())
+            .ok_or(IndexError::OffsetOverflow)?;
         staged.push((delta, offset));
     }
     if !bytes.is_empty() {
@@ -185,7 +218,10 @@ mod tests {
 
     use super::*;
     use crate::v1::buffer::seal_component;
-    use crate::v1::{RecipeIdentity, StableDocumentKey};
+    use crate::v1::{
+        IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage, RecipeIdentity,
+        StableDocumentKey,
+    };
 
     fn delta(component: ComponentIdentity, byte: u8, bytes: usize) -> SealedComponentDelta {
         seal_component(
@@ -196,6 +232,46 @@ mod tests {
             )]),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn split_packs_retain_their_memory_admission() {
+        let bytes = 4 * 1024;
+        let memory = IndexingMemoryCredits::new(
+            bytes,
+            IndexingMemoryLimits {
+                hot_payload_bytes: bytes,
+                worker_scratch_bytes: bytes,
+                prepared_rows_bytes: bytes,
+                replay_input_bytes: bytes,
+                projection_accumulator_bytes: bytes,
+                seal_scratch_bytes: bytes,
+                ordering_catalog_bytes: bytes,
+            },
+        )
+        .unwrap();
+        let credits = ProjectionPackCredits::from_pipeline_permit(
+            memory
+                .acquire(IndexingMemoryStage::SealScratch, bytes)
+                .unwrap(),
+        );
+        let charged = pack_component_deltas(
+            vec![delta(
+                ComponentIdentity::Field(RecipeIdentity::new([1; 32]).unwrap()),
+                1,
+                8,
+            )],
+            credits,
+        )
+        .unwrap();
+
+        let (packs, credits) = charged.into_parts();
+        assert_eq!(packs.len(), 1);
+        assert!(memory.acquire(IndexingMemoryStage::SealScratch, 1).is_err());
+        drop(packs);
+        assert!(memory.acquire(IndexingMemoryStage::SealScratch, 1).is_err());
+        drop(credits);
+        assert!(memory.acquire(IndexingMemoryStage::SealScratch, 1).is_ok());
     }
 
     #[test]

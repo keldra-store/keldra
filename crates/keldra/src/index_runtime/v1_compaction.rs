@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use bytes::Bytes;
 use keldra_index::v1::{
     COMPONENT_STREAM_DIRECTORY_FANOUT, ChargedProjectionDeltaPacks, ChargedQueryRunCompaction,
     ComponentCompactionLimits, ComponentCompactionPlan, ComponentStreamRoot,
@@ -32,8 +33,8 @@ pub(crate) struct V1CompactionPublication {
 
 pub(crate) struct V1CompactionBase {
     pub(crate) predecessor: ProjectionGeneration,
-    component_overlay: BTreeMap<[u8; 32], Vec<u8>>,
-    query_overlay: BTreeMap<[u8; 32], Vec<u8>>,
+    component_overlay: BTreeMap<[u8; 32], Bytes>,
+    query_overlay: BTreeMap<[u8; 32], Bytes>,
 }
 
 pub(crate) struct V1CompactionArtifacts {
@@ -48,11 +49,11 @@ impl V1CompactionPublication {
 }
 
 impl V1CompactionBase {
-    pub(crate) fn component_page(&self, hash: &[u8; 32]) -> Option<&Vec<u8>> {
+    pub(crate) fn component_page(&self, hash: &[u8; 32]) -> Option<&Bytes> {
         self.component_overlay.get(hash)
     }
 
-    pub(crate) fn query_page(&self, hash: &[u8; 32]) -> Option<&Vec<u8>> {
+    pub(crate) fn query_page(&self, hash: &[u8; 32]) -> Option<&Bytes> {
         self.query_overlay.get(hash)
     }
 }
@@ -175,7 +176,7 @@ impl V1ProjectionPublisher {
                 predecessor.roots[index] = replacement;
             }
             for page in &pages {
-                component_pages.insert(page.hash, page.bytes.clone());
+                component_pages.insert(page.hash, Bytes::from(page.bytes.clone()));
             }
             Some(V1ComponentCompaction { packs, pages })
         };
@@ -258,7 +259,7 @@ impl V1ProjectionPublisher {
             .map_err(index_status)?;
             predecessor.query_stream_root = compacted.splice().root;
             for page in &compacted.splice().pages {
-                query_pages.insert(page.hash, page.bytes.clone());
+                query_pages.insert(page.hash, Bytes::from(page.bytes.clone()));
             }
             Some((compacted, query_pages))
         } else {
@@ -291,7 +292,7 @@ async fn load_component_pages(
     root: ComponentStreamRoot,
     maximum_bytes: usize,
     resident: &mut usize,
-    pages: &mut BTreeMap<[u8; 32], Vec<u8>>,
+    pages: &mut BTreeMap<[u8; 32], Bytes>,
 ) -> Result<(), Status> {
     let mut pending = VecDeque::from([root.root_hash]);
     while let Some(hash) = pending.pop_front() {
@@ -317,7 +318,7 @@ async fn load_component_pages(
             })?;
         pending
             .extend(component_stream_child_hashes(root.component, &bytes).map_err(index_status)?);
-        pages.insert(hash, bytes);
+        pages.insert(hash, Bytes::from(bytes));
     }
     Ok(())
 }
@@ -332,7 +333,7 @@ async fn load_query_pages(
     partition: keldra_index::v1::ProjectionPartitionIdentity,
     root: [u8; 32],
     maximum_bytes: usize,
-    pages: &mut BTreeMap<[u8; 32], Vec<u8>>,
+    pages: &mut BTreeMap<[u8; 32], Bytes>,
 ) -> Result<(), Status> {
     let mut pending = VecDeque::from([root]);
     let mut resident = 0usize;
@@ -363,7 +364,7 @@ async fn load_query_pages(
         {
             pending.extend(children.into_iter().map(|child| child.hash));
         }
-        pages.insert(hash, bytes);
+        pages.insert(hash, Bytes::from(bytes));
     }
     Ok(())
 }
@@ -537,7 +538,7 @@ mod tests {
                     .cloned()
                     .ok_or(keldra_index::IndexError::Integrity)
             },
-            |_| Err(keldra_index::IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(keldra_index::IndexError::Integrity),
             |hash| {
                 pages
                     .get(&hash)

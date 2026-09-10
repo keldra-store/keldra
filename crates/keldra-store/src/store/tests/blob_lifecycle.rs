@@ -49,6 +49,26 @@ fn blob_reference_state_is_exactly_twenty_five_bytes() {
     ));
 }
 
+#[tokio::test]
+async fn blob_reference_pinned_read_rejects_malformed_value() {
+    let (_temporary, store) = store().await;
+    let blob = store.stage_blob(b"lifecycle-pinned-read").await.unwrap();
+    store
+        .db
+        .put_cf(
+            store.cf(CF_BLOB_REFERENCES).unwrap(),
+            blob_reference_key(&blob),
+            [0_u8; 24],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.blob_reference_state(&blob),
+        Err(MutationError::Storage(message))
+            if message.contains("metadata value is malformed")
+    ));
+}
+
 #[test]
 fn blob_gc_due_keys_sort_by_update_time_before_artifact_identity() {
     let earlier_state = BlobReferenceState {
@@ -230,6 +250,13 @@ async fn concurrent_seal_refresh_prevents_a_selected_blob_from_being_collected()
 #[tokio::test]
 async fn small_blob_boundary_and_streamed_seal_use_only_rocksdb() {
     let (_temporary, store) = store().await;
+    let empty = store.stage_blob(&[]).await.unwrap();
+    assert_eq!(empty.length, 0);
+    assert_eq!(
+        store.read_blob_bytes(&empty).await.unwrap(),
+        Vec::<u8>::new()
+    );
+
     let boundary_bytes = vec![7_u8; SMALL_BLOB_MAX_BYTES];
     let boundary = store.stage_blob(&boundary_bytes).await.unwrap();
     assert_eq!(boundary.length, SMALL_BLOB_MAX_BYTES as u64);
@@ -272,6 +299,28 @@ async fn small_blob_boundary_and_streamed_seal_use_only_rocksdb() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn derived_progress_inline_batch_persists_borrowed_payloads() {
+    let (_temporary, store) = store().await;
+    let blobs = vec![
+        b"first borrowed inline payload".to_vec(),
+        b"second borrowed inline payload".to_vec(),
+    ];
+
+    let references = store
+        .stage_derived_progress_inline_blob_batch(&blobs)
+        .await
+        .unwrap();
+
+    assert_eq!(references.len(), blobs.len());
+    for (reference, expected) in references.iter().zip(&blobs) {
+        assert_eq!(
+            store.read_blob_bytes(reference).await.unwrap().as_slice(),
+            expected.as_slice()
+        );
+    }
 }
 
 #[tokio::test]
@@ -344,6 +393,14 @@ async fn retirement_reaches_zero_but_gc_waits_for_the_inactivity_ttl() {
         0
     );
     assert!(store.read_complete_manifest(&blob).unwrap().is_some());
+    assert!(matches!(
+        store.open_blob(&blob).await,
+        Err(MutationError::BlobNotFound)
+    ));
+    assert_eq!(
+        store.read_retained_blob_bytes(&blob).await.unwrap(),
+        b"retired payload"
+    );
     assert_eq!(
         store
             .collect_blob_garbage_at(retired.updated_at + store.awaiting_publish_ttl_millis,)

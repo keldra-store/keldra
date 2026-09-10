@@ -51,12 +51,25 @@ impl ChargedQueryRunCompaction {
     ) {
         (self.artifacts, self.reference, self.splice)
     }
+
+    /// Split the prepared compaction from the admission that must remain live
+    /// while its encoded artifacts are retained by a downstream publisher.
+    pub fn into_parts_with_credits(
+        self,
+    ) -> (
+        ProjectionQueryRunArtifacts,
+        QueryRunReference,
+        PreparedQueryRunSplice,
+        QueryBlockCredits,
+    ) {
+        (self.artifacts, self.reference, self.splice, self._credits)
+    }
 }
 
 /// Merge one selected same-level window and return both immutable run
 /// artifacts and the exact path-copy replacement for the pinned stream root.
 #[allow(clippy::too_many_arguments)]
-pub fn compact_encoded_query_runs(
+pub fn compact_encoded_query_runs<PageBytes>(
     previous: ProjectionQueryStreamRoot,
     plan: &QueryRunCompactionPlan,
     partition: ProjectionPartitionIdentity,
@@ -65,8 +78,11 @@ pub fn compact_encoded_query_runs(
     mut credits: QueryBlockCredits,
     mut load_run: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
     mut load_block: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-    mut load_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-) -> Result<ChargedQueryRunCompaction, IndexError> {
+    mut load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+) -> Result<ChargedQueryRunCompaction, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     let limits = limits.validate()?;
     partition.validate()?;
     if physical_catalog_generation == [0; 32] {
@@ -908,11 +924,11 @@ mod tests {
 
     use super::*;
     use crate::v1::{
-        ChargedProjectionQueryRunArtifacts, IndexingMemoryCredits, IndexingMemoryLimits,
-        IndexingMemoryStage, PreparedQueryFieldDelta, PreparedQueryMembershipDelta,
-        PreparedQueryMutationBatch, PreparedQueryRecipeDelta, PreparedQueryTermDelta,
-        QueryDocValue, QueryDocumentGate, QueryPoint, QueryRunCompactionLimits, StableDocumentKey,
-        append_query_run_path_copy, prepare_projection_query_run, select_query_run_compaction,
+        IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage, PreparedQueryFieldDelta,
+        PreparedQueryMembershipDelta, PreparedQueryMutationBatch, PreparedQueryRecipeDelta,
+        PreparedQueryTermDelta, QueryDocValue, QueryDocumentGate, QueryPoint,
+        QueryRunCompactionLimits, StableDocumentKey, append_query_run_path_copy,
+        prepare_projection_query_run, select_query_run_compaction,
     };
 
     fn partition() -> ProjectionPartitionIdentity {

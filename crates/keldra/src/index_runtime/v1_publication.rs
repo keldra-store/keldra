@@ -5,14 +5,15 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
 
+use bytes::Bytes;
 use keldra_index::v1::{
-    CanonicalRecipeState, ComponentIdentity, ComponentRecordLookup, ComponentRoot,
-    ComponentStreamReverseCursor, ComponentStreamReverseStep, ComponentStreamRoot,
-    PreparedAtomicProjectionGeneration, PreparedQueryMutationBatch, ProjectedDocumentState,
-    ProjectionCatalogActivation, ProjectionCurrent, ProjectionFamilyPartitionDirectory,
-    ProjectionGeneration, ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits,
-    QueryBlockLimits, QueryRunPage, StableDocumentKey, component_stream_child_hashes,
-    decode_document_head, decode_projection_catalog_activation, decode_projection_current,
+    CanonicalRecipeState, ComponentIdentity, ComponentRecordLookup, ComponentStreamReverseCursor,
+    ComponentStreamReverseStep, ComponentStreamRoot, PreparedAtomicProjectionGeneration,
+    PreparedQueryMutationBatch, ProjectedDocumentState, ProjectionCatalogActivation,
+    ProjectionCurrent, ProjectionFamilyPartitionDirectory, ProjectionGeneration,
+    ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits, QueryBlockLimits,
+    QueryRunPage, StableDocumentKey, component_stream_child_hashes, decode_document_head,
+    decode_projection_catalog_activation, decode_projection_current,
     decode_projection_family_directory, decode_projection_generation,
     decode_projection_generation_header, decode_query_run_page, decode_source_records,
     encode_projection_catalog_activation, encode_projection_family_directory,
@@ -253,7 +254,7 @@ impl V1ProjectionPublisher {
                             MAX_STREAM_PAGE_BYTES,
                         )
                         .await?
-                        .map(|(bytes, _)| bytes)
+                        .map(|(bytes, _)| Bytes::from(bytes))
                         .ok_or_else(|| Status::data_loss("v1 component stream page is absent"))?
                     };
                     preloaded_bytes = preloaded_bytes
@@ -296,7 +297,7 @@ impl V1ProjectionPublisher {
                             MAX_STREAM_PAGE_BYTES,
                         )
                         .await?
-                        .map(|(bytes, _)| bytes)
+                        .map(|(bytes, _)| Bytes::from(bytes))
                         .ok_or_else(|| Status::data_loss("v1 query stream page is absent"))?
                     };
                     let page = decode_query_run_page(&bytes).map_err(index_status)?;
@@ -632,54 +633,63 @@ impl V1ProjectionPublisher {
         compaction: V1CompactionArtifacts,
     ) -> Result<(), Status> {
         let mut artifacts = BTreeMap::new();
-        if let Some(component) = &compaction.component {
-            for pack in &component.packs.packs {
+        let V1CompactionArtifacts { component, query } = compaction;
+        let component_credits = if let Some(component) = component {
+            let (packs, credits) = component.packs.into_parts();
+            for pack in packs {
                 insert_artifact(
                     &mut artifacts,
                     projection_pack_path(partition, pack.hash),
                     keldra_index::v1::ProjectionArtifactKind::Pack,
                     pack.hash,
-                    pack.bytes.clone(),
+                    pack.bytes,
                 )?;
             }
-            for page in &component.pages {
+            for page in component.pages {
                 insert_artifact(
                     &mut artifacts,
                     projection_stream_page_path(partition, page.hash),
                     keldra_index::v1::ProjectionArtifactKind::StreamPage,
                     page.hash,
-                    page.bytes.clone(),
+                    page.bytes,
                 )?;
             }
-        }
-        if let Some(query) = &compaction.query {
-            for block in &query.artifacts().blocks {
+            Some(credits)
+        } else {
+            None
+        };
+        let query_credits = if let Some(query) = query {
+            let (query_artifacts, _reference, splice, credits) = query.into_parts_with_credits();
+            for block in query_artifacts.blocks {
                 insert_artifact(
                     &mut artifacts,
                     projection_query_run_pack_path(partition, block.descriptor.hash),
                     keldra_index::v1::ProjectionArtifactKind::QueryRunPack,
                     block.descriptor.hash,
-                    block.bytes.clone(),
+                    block.bytes,
                 )?;
             }
-            let run = &query.artifacts().run;
+            let run = query_artifacts.run;
             insert_artifact(
                 &mut artifacts,
                 projection_query_run_pack_path(partition, run.hash),
                 keldra_index::v1::ProjectionArtifactKind::QueryRunPack,
                 run.hash,
-                run.bytes.clone(),
+                run.bytes,
             )?;
-            for page in &query.splice().pages {
+            for page in splice.pages {
                 insert_artifact(
                     &mut artifacts,
                     projection_query_run_stream_page_path(partition, page.hash),
                     keldra_index::v1::ProjectionArtifactKind::QueryRunStreamPage,
                     page.hash,
-                    page.bytes.clone(),
+                    page.bytes,
                 )?;
             }
-        }
+            Some(credits)
+        } else {
+            None
+        };
         let mut publications = Vec::with_capacity(artifacts.len());
         for artifact in self
             .stage_immutable_artifacts(artifacts.into_values().collect())
@@ -702,8 +712,8 @@ impl V1ProjectionPublisher {
         require_all_immutable_publications(
             self.artifacts.publish_immutable_many(publications).await?,
         )?;
-        // Retain byte credits until every cloned payload leaves this future.
-        drop(compaction);
+        // Retain byte credits until every moved payload leaves this future.
+        drop((component_credits, query_credits));
         Ok(())
     }
 
@@ -1158,9 +1168,14 @@ impl V1ProjectionPublisher {
             projection.path = path,
             "v1 artifact read begins stable head selection"
         );
-        let Some(version) = self.reader.head_stable(&key, tenant_id, bucket_id).await? else {
+        let Some(snapshot) = self
+            .reader
+            .current_head_snapshot_stable(&key, tenant_id, bucket_id)
+            .await?
+        else {
             return Ok(None);
         };
+        let version = snapshot.version;
         tracing::debug!(
             projection.path = path,
             "v1 artifact read selected its stable head"
@@ -1196,23 +1211,17 @@ impl V1ProjectionPublisher {
         let read_limit = u64::try_from(maximum_bytes)
             .unwrap_or(u64::MAX)
             .saturating_add(1);
-        let mut bytes = Vec::with_capacity(blob.length as usize);
-        match self.store.open_blob(blob).await {
-            Ok(mut payload) => {
+        let expected_length = usize::try_from(blob.length).map_err(|_| {
+            Status::data_loss("v1 projection artifact violates its exact byte bound")
+        })?;
+        let bytes = match self.store.read_blob_bytes(blob).await {
+            Ok(bytes) => {
                 tracing::debug!("v1 artifact read opened its local integrated blob");
-                let mut chunk = [0_u8; 8 * 1024];
-                while bytes.len() < blob.length as usize {
-                    let read = payload.read(&mut chunk).await.map_err(|error| {
-                        Status::internal(format!("read local v1 projection artifact: {error}"))
-                    })?;
-                    if read == 0 {
-                        break;
-                    }
-                    bytes.extend_from_slice(&chunk[..read]);
-                }
+                bytes
             }
             Err(MutationError::BlobNotFound) => {
                 tracing::debug!("v1 artifact read falls back to distributed reconstruction");
+                let mut bytes = Vec::with_capacity(expected_length);
                 let mut payload = self.reader.open_blob_payload(blob).await?;
                 payload
                     .by_ref()
@@ -1223,9 +1232,10 @@ impl V1ProjectionPublisher {
                             "read distributed v1 projection artifact: {error}"
                         ))
                     })?;
+                bytes
             }
             Err(error) => return Err(Status::unavailable(error.to_string())),
-        }
+        };
         if bytes.len() > maximum_bytes || bytes.len() as u64 != blob.length {
             return Err(Status::data_loss(
                 "v1 projection artifact violates its exact byte bound",
@@ -1716,8 +1726,8 @@ mod tests {
             QueryBlockLimits::default_for_memory(),
             query_credits(),
             pack_credits(),
-            |_| Err(keldra_index::IndexError::Integrity),
-            |_| Err(keldra_index::IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(keldra_index::IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(keldra_index::IndexError::Integrity),
         )
         .unwrap()
     }

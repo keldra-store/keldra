@@ -314,14 +314,17 @@ pub fn build_component_stream(
     })
 }
 
-pub fn append_component_stream(
+pub fn append_component_stream<PageBytes>(
     previous: Option<ComponentStreamRoot>,
-    mut load_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    mut load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     delta: &PackedComponentDelta,
     source_start_offset: u64,
     next_offset: u64,
     through_atomic_position: u64,
-) -> Result<ComponentStreamAppend, IndexError> {
+) -> Result<ComponentStreamAppend, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     let next_sequence = match previous {
         Some(root) => {
             validate_root(root)?;
@@ -638,11 +641,14 @@ impl ComponentCompactionPlan {
         self.inputs.len()
     }
 }
-pub fn select_component_compaction(
+pub fn select_component_compaction<PageBytes>(
     previous: ComponentStreamRoot,
-    load_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     limits: ComponentCompactionLimits,
-) -> Result<Option<ComponentCompactionPlan>, IndexError> {
+) -> Result<Option<ComponentCompactionPlan>, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     compaction_selection::select_component_compaction(previous, load_page, limits)
 }
 
@@ -778,12 +784,15 @@ pub fn compact_component_runs(
     }
     Ok(output)
 }
-pub fn splice_compacted_component_runs(
+pub fn splice_compacted_component_runs<PageBytes>(
     previous: ComponentStreamRoot,
     plan: &ComponentCompactionPlan,
     output: &[PackedComponentDelta],
-    mut load_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-) -> Result<ComponentStreamAppend, IndexError> {
+    mut load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+) -> Result<ComponentStreamAppend, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     validate_root(previous)?;
     validate_compaction_plan(plan)?;
     if previous.root_hash != plan.stream_root_hash || previous.component != plan.component {
@@ -927,20 +936,24 @@ fn validate_compaction_plan(plan: &ComponentCompactionPlan) -> Result<(), IndexE
     }
     Ok(())
 }
-fn splice_subtree(
+fn splice_subtree<PageBytes>(
     component: ComponentIdentity,
     hash: [u8; 32],
     selected: &BTreeMap<u64, &ComponentSegmentDescriptor>,
     replacements: &BTreeMap<u64, ComponentSegmentDescriptor>,
-    load_page: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    load_page: &mut impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     new_pages: &mut Vec<EncodedComponentStreamPage>,
     matched: &mut usize,
-) -> Result<Vec<Child>, IndexError> {
+) -> Result<Vec<Child>, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     let bytes = load_page(hash)?;
-    if *crate::profiled_blake3_hash!(&bytes).as_bytes() != hash {
+    let bytes = bytes.as_ref();
+    if *crate::profiled_blake3_hash!(bytes).as_bytes() != hash {
         return Err(IndexError::Integrity);
     }
-    match decode_page(component, &bytes)? {
+    match decode_page(component, bytes)? {
         Page::Leaf(segments) => {
             let mut next = Vec::with_capacity(segments.len());
             for segment in segments {
@@ -1040,18 +1053,22 @@ fn validate_root(root: ComponentStreamRoot) -> Result<(), IndexError> {
     Ok(())
 }
 
-fn append_subtree(
+fn append_subtree<PageBytes>(
     component: ComponentIdentity,
     hash: [u8; 32],
     descriptor: &ComponentSegmentDescriptor,
-    load_page: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    load_page: &mut impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     new_pages: &mut Vec<EncodedComponentStreamPage>,
-) -> Result<Vec<Child>, IndexError> {
+) -> Result<Vec<Child>, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     let bytes = load_page(hash)?;
-    if hash != *crate::profiled_blake3_hash!(&bytes).as_bytes() {
+    let bytes = bytes.as_ref();
+    if hash != *crate::profiled_blake3_hash!(bytes).as_bytes() {
         return Err(IndexError::Integrity);
     }
-    match decode_page(component, &bytes)? {
+    match decode_page(component, bytes)? {
         Page::Leaf(mut segments) => {
             if segments
                 .last()
@@ -1816,7 +1833,7 @@ mod tests {
                 directory.root(),
                 &plan,
                 &[delta.clone(), delta.clone(), delta.clone()],
-                |_| Err(IndexError::Integrity)
+                |_| Err::<Vec<u8>, _>(IndexError::Integrity)
             ),
             Err(IndexError::ResourceLimit { .. })
         ));
@@ -1824,7 +1841,7 @@ mod tests {
         wrong_root.root_hash = [42; 32];
         assert_eq!(
             splice_compacted_component_runs(wrong_root, &plan, &[delta], |_| {
-                Err(IndexError::Integrity)
+                Err::<Vec<u8>, _>(IndexError::Integrity)
             }),
             Err(IndexError::Integrity)
         );

@@ -118,13 +118,16 @@ pub struct PreparedQueryRunSplice {
     pub pages: Vec<EncodedQueryRunPage>,
 }
 
-pub fn append_query_run_path_copy(
+pub fn append_query_run_path_copy<PageBytes>(
     previous: Option<ProjectionQueryStreamRoot>,
     partition: ProjectionPartitionIdentity,
     catalog: [u8; 32],
     reference: QueryRunReference,
-    mut load: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-) -> Result<PreparedQueryRunAppend, IndexError> {
+    mut load: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+) -> Result<PreparedQueryRunAppend, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     partition.validate()?;
     validate_reference(reference)?;
     if reference.level != 0 {
@@ -237,11 +240,14 @@ pub fn find_query_run_by_hash(
 /// Select one bounded, contiguous same-level window. The walk is newest-first
 /// and stops once a complete window is found, retaining at most
 /// `maximum_input_runs` references regardless of stream lifetime.
-pub fn select_query_run_compaction(
+pub fn select_query_run_compaction<PageBytes>(
     previous: ProjectionQueryStreamRoot,
-    mut load: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    mut load: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     limits: QueryRunCompactionLimits,
-) -> Result<Option<QueryRunCompactionPlan>, IndexError> {
+) -> Result<Option<QueryRunCompactionPlan>, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     let limits = limits.validate()?;
     previous.validate_at(previous.next_offset, previous.through_atomic_position)?;
     if previous.run_count == 0 {
@@ -303,12 +309,15 @@ pub fn select_query_run_compaction(
 /// Replace a selected whole-run window with the already merged immutable run.
 /// The output occupies the newest selected sequence, so future level-zero
 /// appends retain their monotonic sequence without renumbering history.
-pub fn splice_compacted_query_runs(
+pub fn splice_compacted_query_runs<PageBytes>(
     previous: ProjectionQueryStreamRoot,
     plan: &QueryRunCompactionPlan,
     output: QueryRunReference,
-    mut load: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-) -> Result<PreparedQueryRunSplice, IndexError> {
+    mut load: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+) -> Result<PreparedQueryRunSplice, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     previous.validate_at(previous.next_offset, previous.through_atomic_position)?;
     let limits = QueryRunCompactionLimits {
         level_trigger: 2,
@@ -384,12 +393,15 @@ pub fn splice_compacted_query_runs(
     Ok(PreparedQueryRunSplice { root, pages })
 }
 
-fn visit_page_newest_until(
+fn visit_page_newest_until<PageBytes>(
     hash: [u8; 32],
     expected: Option<QueryRunChild>,
-    load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    load: &mut impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     visit: &mut impl FnMut(QueryRunReference) -> bool,
-) -> Result<bool, IndexError> {
+) -> Result<bool, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     let (page, actual) = load_page_with_summary(hash, load)?;
     if expected.is_some_and(|expected| expected != actual) {
         return Err(IndexError::Integrity);
@@ -477,15 +489,18 @@ fn validate_compaction_plan(
     Ok(())
 }
 
-fn splice_subtree(
+fn splice_subtree<PageBytes>(
     hash: [u8; 32],
     expected: Option<QueryRunChild>,
     selected: &BTreeMap<u64, QueryRunReference>,
     output: QueryRunReference,
-    load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    load: &mut impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     pages: &mut Vec<EncodedQueryRunPage>,
     matched: &mut usize,
-) -> Result<Option<EncodedQueryRunPage>, IndexError> {
+) -> Result<Option<EncodedQueryRunPage>, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     let (page, actual) = load_page_with_summary(hash, load)?;
     if expected.is_some_and(|expected| expected != actual) {
         return Err(IndexError::Integrity);
@@ -544,15 +559,19 @@ fn splice_subtree(
     Ok(Some(encoded))
 }
 
-fn load_page_with_summary(
+fn load_page_with_summary<PageBytes>(
     hash: [u8; 32],
-    load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-) -> Result<(QueryRunPage, QueryRunChild), IndexError> {
+    load: &mut impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+) -> Result<(QueryRunPage, QueryRunChild), IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     let bytes = load(hash)?;
-    if *crate::profiled_blake3_hash!(&bytes).as_bytes() != hash {
+    let bytes = bytes.as_ref();
+    if *crate::profiled_blake3_hash!(bytes).as_bytes() != hash {
         return Err(IndexError::Integrity);
     }
-    let page = decode_query_run_page(&bytes)?;
+    let page = decode_query_run_page(bytes)?;
     let summary = summarize_page(&page, hash, bytes.len())?;
     Ok((page, summary))
 }
@@ -574,13 +593,16 @@ fn root_child(root: ProjectionQueryStreamRoot) -> Result<QueryRunChild, IndexErr
     })
 }
 
-fn append_page(
+fn append_page<PageBytes>(
     hash: [u8; 32],
     expected: Option<QueryRunChild>,
     reference: QueryRunReference,
-    load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    load: &mut impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     pages: &mut Vec<EncodedQueryRunPage>,
-) -> Result<(EncodedQueryRunPage, Option<EncodedQueryRunPage>), IndexError> {
+) -> Result<(EncodedQueryRunPage, Option<EncodedQueryRunPage>), IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     let (page, actual) = load_page_with_summary(hash, load)?;
     if expected.is_some_and(|expected| expected != actual) {
         return Err(IndexError::Integrity);
@@ -912,7 +934,7 @@ mod tests {
         };
         let prepared =
             append_query_run_path_copy(Some(empty), partition(), [6; 32], reference, |_| {
-                panic!("an empty root has no page to load")
+                Err::<Vec<u8>, _>(IndexError::Integrity)
             })
             .unwrap();
         assert_eq!(prepared.root.run_count, 1);
@@ -920,7 +942,7 @@ mod tests {
         assert!(
             select_query_run_compaction(
                 empty,
-                |_| panic!("an empty root has no page to load"),
+                |_| -> Result<Vec<u8>, IndexError> { panic!("an empty root has no page to load") },
                 QueryRunCompactionLimits {
                     level_trigger: 2,
                     maximum_input_runs: 4,

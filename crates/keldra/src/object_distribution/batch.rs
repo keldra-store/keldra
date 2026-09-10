@@ -320,19 +320,27 @@ impl ObjectDistribution {
                 let prepared_payloads = self
                     .prepare_mutation_group_payloads(&placement, &pending, single_node)
                     .await;
-                let reconcilable = pending
-                    .iter()
-                    .zip(&prepared_payloads)
-                    .filter(|(_, evidence)| evidence.is_ok())
-                    .map(|(item, _)| item.clone())
-                    .collect::<Vec<_>>();
-                let context = if reconcilable.is_empty() {
-                    None
+                let context = if single_node {
+                    if prepared_payloads.iter().any(Result::is_ok) {
+                        Some(self.reconcile_mutation_group(&placement, &[]).await?)
+                    } else {
+                        None
+                    }
                 } else {
-                    Some(
-                        self.reconcile_mutation_group(&placement, &reconcilable)
-                            .await?,
-                    )
+                    let reconcilable = pending
+                        .iter()
+                        .zip(&prepared_payloads)
+                        .filter(|(_, evidence)| evidence.is_ok())
+                        .map(|(item, _)| item.clone())
+                        .collect::<Vec<_>>();
+                    if reconcilable.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            self.reconcile_mutation_group(&placement, &reconcilable)
+                                .await?,
+                        )
+                    }
                 };
                 Ok((placement, group, prepared_payloads, context))
             })
@@ -535,7 +543,12 @@ impl ObjectDistribution {
         single_node: bool,
     ) -> Vec<Result<Option<PreparedPayloadEvidence>, Status>> {
         let mut tasks = tokio::task::JoinSet::new();
+        let mut evidence = BTreeMap::new();
         for item in prepared {
+            if single_node && matches!(&item.item.operation, BatchOperation::Put(_)) {
+                evidence.insert(item.item.index, Ok(None));
+                continue;
+            }
             let distribution = self.clone();
             let placement = placement.clone();
             let index = item.item.index;
@@ -579,7 +592,6 @@ impl ObjectDistribution {
                 (index, evidence)
             });
         }
-        let mut evidence = BTreeMap::new();
         while let Some(joined) = tasks.join_next().await {
             match joined {
                 Ok((index, value)) => {

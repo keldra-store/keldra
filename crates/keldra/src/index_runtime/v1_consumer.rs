@@ -484,7 +484,7 @@ async fn backfill(
                 source_scope(writer.source),
                 &item.selected,
                 &writer.recipe,
-                Vec::new(),
+                &[],
                 &mut writer.query_credits,
             )?;
             merge_query(&mut writer.query, prepared.query)?;
@@ -869,7 +869,7 @@ async fn prepare_lane(
             scope,
             &value.selected,
             &writer.recipe,
-            value.previous.clone(),
+            &value.previous,
             &mut writer.query_credits,
         )?;
         merge_query(&mut writer.query, prepared.query)?;

@@ -101,7 +101,7 @@ impl PreparedProjectionGeneration {
 /// installs `generation`. Failure before that install leaves only ordinary
 /// content-addressed orphans. Existing stream pages are loaded by hash only
 /// for the rightmost path of each changed component.
-pub fn prepare_projection_generation(
+pub fn prepare_projection_generation<StreamPageBytes>(
     partition: ProjectionPartitionIdentity,
     physical_catalog_generation: [u8; 32],
     previous: Option<(&ProjectionGeneration, [u8; 32])>,
@@ -111,8 +111,11 @@ pub fn prepare_projection_generation(
     inherited_partitions: Vec<ProjectionGenerationReference>,
     deltas: Vec<SealedComponentDelta>,
     pack_credits: ProjectionPackCredits,
-    load_stream_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-) -> Result<PreparedProjectionGeneration, IndexError> {
+    load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
+) -> Result<PreparedProjectionGeneration, IndexError>
+where
+    StreamPageBytes: AsRef<[u8]>,
+{
     let components = prepare_projection_components(
         partition,
         physical_catalog_generation,
@@ -130,7 +133,7 @@ pub fn prepare_projection_generation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_projection_components(
+fn prepare_projection_components<StreamPageBytes>(
     partition: ProjectionPartitionIdentity,
     physical_catalog_generation: [u8; 32],
     previous: Option<(&ProjectionGeneration, [u8; 32])>,
@@ -141,8 +144,11 @@ fn prepare_projection_components(
     inherited_partitions: Vec<ProjectionGenerationReference>,
     deltas: Vec<SealedComponentDelta>,
     pack_credits: ProjectionPackCredits,
-    mut load_stream_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-) -> Result<PreparedProjectionComponents, IndexError> {
+    mut load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
+) -> Result<PreparedProjectionComponents, IndexError>
+where
+    StreamPageBytes: AsRef<[u8]>,
+{
     validate_publication_cut(
         partition,
         physical_catalog_generation,
@@ -323,7 +329,7 @@ fn validate_publication_cut(
 /// source/atomic cut. The returned generation is the only visibility point and
 /// references the newly appended query-run stream root.
 #[allow(clippy::too_many_arguments)]
-pub fn prepare_atomic_projection_generation(
+pub fn prepare_atomic_projection_generation<StreamPageBytes, QueryPageBytes>(
     partition: ProjectionPartitionIdentity,
     physical_catalog_generation: [u8; 32],
     previous: Option<(&ProjectionGeneration, [u8; 32])>,
@@ -336,9 +342,13 @@ pub fn prepare_atomic_projection_generation(
     query_limits: QueryBlockLimits,
     query_credits: QueryBlockCredits,
     pack_credits: ProjectionPackCredits,
-    load_stream_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-    load_query_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-) -> Result<PreparedAtomicProjectionGeneration, IndexError> {
+    load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
+    load_query_page: impl FnMut([u8; 32]) -> Result<QueryPageBytes, IndexError>,
+) -> Result<PreparedAtomicProjectionGeneration, IndexError>
+where
+    StreamPageBytes: AsRef<[u8]>,
+    QueryPageBytes: AsRef<[u8]>,
+{
     prepare_atomic_projection_generation_inner(
         partition,
         physical_catalog_generation,
@@ -359,7 +369,7 @@ pub fn prepare_atomic_projection_generation(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn prepare_atomic_projection_catalog_transition(
+pub fn prepare_atomic_projection_catalog_transition<StreamPageBytes, QueryPageBytes>(
     partition: ProjectionPartitionIdentity,
     physical_catalog_generation: [u8; 32],
     previous: (&ProjectionGeneration, [u8; 32]),
@@ -372,9 +382,13 @@ pub fn prepare_atomic_projection_catalog_transition(
     query_limits: QueryBlockLimits,
     query_credits: QueryBlockCredits,
     pack_credits: ProjectionPackCredits,
-    load_stream_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-    load_query_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-) -> Result<PreparedAtomicProjectionGeneration, IndexError> {
+    load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
+    load_query_page: impl FnMut([u8; 32]) -> Result<QueryPageBytes, IndexError>,
+) -> Result<PreparedAtomicProjectionGeneration, IndexError>
+where
+    StreamPageBytes: AsRef<[u8]>,
+    QueryPageBytes: AsRef<[u8]>,
+{
     prepare_atomic_projection_generation_inner(
         partition,
         physical_catalog_generation,
@@ -395,7 +409,7 @@ pub fn prepare_atomic_projection_catalog_transition(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_atomic_projection_generation_inner(
+fn prepare_atomic_projection_generation_inner<StreamPageBytes, QueryPageBytes>(
     partition: ProjectionPartitionIdentity,
     physical_catalog_generation: [u8; 32],
     previous: Option<(&ProjectionGeneration, [u8; 32])>,
@@ -409,9 +423,13 @@ fn prepare_atomic_projection_generation_inner(
     query_limits: QueryBlockLimits,
     query_credits: QueryBlockCredits,
     pack_credits: ProjectionPackCredits,
-    mut load_stream_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-    mut load_query_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-) -> Result<PreparedAtomicProjectionGeneration, IndexError> {
+    mut load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
+    mut load_query_page: impl FnMut([u8; 32]) -> Result<QueryPageBytes, IndexError>,
+) -> Result<PreparedAtomicProjectionGeneration, IndexError>
+where
+    StreamPageBytes: AsRef<[u8]>,
+    QueryPageBytes: AsRef<[u8]>,
+{
     validate_publication_cut(
         partition,
         physical_catalog_generation,
@@ -670,7 +688,7 @@ mod tests {
                 sealed(ComponentIdentity::SourceRecords, 1),
             ],
             pack_credits(1024 * 1024),
-            |_| Err(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         )
         .unwrap();
 
@@ -708,7 +726,7 @@ mod tests {
                 sealed(ComponentIdentity::SourceRecords, 1),
             ],
             pack_credits(1024 * 1024),
-            |_| Err(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         )
         .unwrap();
         let previous = decode_projection_generation(
@@ -770,7 +788,7 @@ mod tests {
                 Vec::new(),
                 vec![delta.clone(), delta],
                 pack_credits(1024 * 1024),
-                |_| Err(IndexError::Integrity),
+                |_| Err::<Vec<u8>, _>(IndexError::Integrity),
             )
             .is_err()
         );
@@ -788,7 +806,7 @@ mod tests {
                 sealed(ComponentIdentity::SourceRecords, 1),
             ],
             pack_credits(1024 * 1024),
-            |_| Err(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         )
         .unwrap();
         let previous = decode_projection_generation(
@@ -807,7 +825,7 @@ mod tests {
                 Vec::new(),
                 vec![sealed(ComponentIdentity::DocumentHead, 2)],
                 pack_credits(1024 * 1024),
-                |_| Err(IndexError::Integrity),
+                |_| Err::<Vec<u8>, _>(IndexError::Integrity),
             )
             .is_err()
         );
@@ -825,7 +843,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             pack_credits(1),
-            |_| Err(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         )
         .unwrap();
         assert!(prepared.packs.is_empty());
@@ -855,7 +873,7 @@ mod tests {
                 sealed(ComponentIdentity::SourceRecords, 1),
             ],
             pack_credits(1024 * 1024),
-            |_| Err(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         )
         .unwrap();
         let components = prepared.packs[0]
@@ -891,7 +909,7 @@ mod tests {
             Vec::new(),
             vec![sealed(ComponentIdentity::DocumentHead, 1)],
             pack_credits(1024 * 1024),
-            |_| Err(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         )
         .unwrap();
         assert_eq!(
@@ -917,7 +935,7 @@ mod tests {
             vec![predecessor],
             vec![sealed(ComponentIdentity::DocumentHead, 2)],
             pack_credits(1024 * 1024),
-            |_| Err(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         )
         .unwrap();
         assert_eq!(
@@ -936,7 +954,7 @@ mod tests {
                 vec![predecessor],
                 vec![sealed(ComponentIdentity::DocumentHead, 3)],
                 pack_credits(1024 * 1024),
-                |_| Err(IndexError::Integrity),
+                |_| Err::<Vec<u8>, _>(IndexError::Integrity),
             )
             .is_err()
         );
@@ -958,8 +976,8 @@ mod tests {
             QueryBlockLimits::default_for_memory(),
             query_credits(1024 * 1024),
             pack_credits(1024 * 1024),
-            |_| Err(IndexError::Integrity),
-            |_| Err(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         )
         .unwrap();
         assert!(first.query_blocks.is_empty());
@@ -1020,8 +1038,8 @@ mod tests {
                 QueryBlockLimits::default_for_memory(),
                 query_credits(1024 * 1024),
                 pack_credits(1024 * 1024),
-                |_| Err(IndexError::Integrity),
-                |_| Err(IndexError::Integrity),
+                |_| Err::<Vec<u8>, _>(IndexError::Integrity),
+                |_| Err::<Vec<u8>, _>(IndexError::Integrity),
             )
             .is_err()
         );
@@ -1047,8 +1065,8 @@ mod tests {
             QueryBlockLimits::default_for_memory(),
             query_credits(1024 * 1024),
             pack_credits(1024 * 1024),
-            |_| Err(IndexError::Integrity),
-            |_| Err(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         )
         .unwrap();
         let previous = decode_projection_generation(

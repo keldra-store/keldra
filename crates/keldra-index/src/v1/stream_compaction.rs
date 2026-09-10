@@ -12,17 +12,23 @@ struct PageCache<F> {
     pages: BTreeMap<[u8; 32], (Page, u64)>,
 }
 
-impl<F> PageCache<F>
-where
-    F: FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-{
-    fn page(&mut self, hash: [u8; 32], expected: Option<&Child>) -> Result<Page, IndexError> {
+impl<F> PageCache<F> {
+    fn page<PageBytes>(
+        &mut self,
+        hash: [u8; 32],
+        expected: Option<&Child>,
+    ) -> Result<Page, IndexError>
+    where
+        F: FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+        PageBytes: AsRef<[u8]>,
+    {
         if !self.pages.contains_key(&hash) {
             let bytes = (self.load)(hash)?;
-            if *crate::profiled_blake3_hash!(&bytes).as_bytes() != hash {
+            let bytes = bytes.as_ref();
+            if *crate::profiled_blake3_hash!(bytes).as_bytes() != hash {
                 return Err(IndexError::Integrity);
             }
-            let page = decode_page(self.component, &bytes)?;
+            let page = decode_page(self.component, bytes)?;
             match &page {
                 Page::Leaf(segments) => validate_segments(segments)?,
                 Page::Branch(_) => {}
@@ -54,11 +60,14 @@ fn summarize(page: &Page, hash: [u8; 32], encoded_bytes: u64) -> Result<Child, I
     }
 }
 
-pub(super) fn select_component_compaction(
+pub(super) fn select_component_compaction<PageBytes>(
     previous: ComponentStreamRoot,
-    load_page: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     limits: ComponentCompactionLimits,
-) -> Result<Option<ComponentCompactionPlan>, IndexError> {
+) -> Result<Option<ComponentCompactionPlan>, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
     let limits = limits.validate()?;
     validate_root(previous)?;
     let mut pages = PageCache {
@@ -178,7 +187,7 @@ pub(super) fn select_component_compaction(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_level<F>(
+fn collect_level<F, PageBytes>(
     pages: &mut PageCache<F>,
     hash: [u8; 32],
     expected: Option<&Child>,
@@ -188,7 +197,8 @@ fn collect_level<F>(
     output: &mut Vec<ComponentSegmentDescriptor>,
 ) -> Result<(), IndexError>
 where
-    F: FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    F: FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+    PageBytes: AsRef<[u8]>,
 {
     if output.len() >= maximum {
         return Ok(());
@@ -235,7 +245,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn has_older_overlap<F>(
+fn has_older_overlap<F, PageBytes>(
     pages: &mut PageCache<F>,
     hash: [u8; 32],
     expected: Option<&Child>,
@@ -245,7 +255,8 @@ fn has_older_overlap<F>(
     selected: &BTreeSet<u64>,
 ) -> Result<bool, IndexError>
 where
-    F: FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    F: FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+    PageBytes: AsRef<[u8]>,
 {
     match pages.page(hash, expected)? {
         Page::Leaf(segments) => Ok(segments.into_iter().any(|segment| {

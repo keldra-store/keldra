@@ -51,11 +51,11 @@ pub struct PreparedTypedJsonDocument {
 /// source-record locator and component roots.
 pub fn prepare_typed_json_document(
     input: TypedJsonDocumentInput,
-    previous: Vec<ProjectedDocumentState>,
+    previous: &[ProjectedDocumentState],
     credits: &mut QueryBlockCredits,
 ) -> Result<PreparedTypedJsonDocument, IndexError> {
-    validate_input(&input, &previous)?;
-    credits.reserve(preparation_bound(&input, &previous)?)?;
+    validate_input(&input, previous)?;
+    credits.reserve(preparation_bound(&input, previous)?)?;
 
     let previous_state = previous.first();
     let previous_fields = previous_state
@@ -141,7 +141,7 @@ pub fn prepare_typed_json_document(
         vec![CanonicalRecipeState::new(input.membership_recipe, vec![1])?],
         canonical_fields,
     )?];
-    inherit_projection_preserving_versions(&mut current, &previous)?;
+    inherit_projection_preserving_versions(&mut current, previous)?;
     let stable_key = current[0].head.stable_key;
     let material_source_version = current[0].head.material_source_version;
     let material_changed = previous_state.is_none()
@@ -406,7 +406,7 @@ mod tests {
         let mut memory = credits();
         let prepared = prepare_typed_json_document(
             input(1, Some(vec!["alpha", "beta"]), true),
-            Vec::new(),
+            &[],
             &mut memory,
         )
         .unwrap();
@@ -445,14 +445,14 @@ mod tests {
         let mut first_memory = credits();
         let first = prepare_typed_json_document(
             input(1, Some(vec!["alpha", "beta"]), true),
-            Vec::new(),
+            &[],
             &mut first_memory,
         )
         .unwrap();
         let mut second_memory = credits();
         let second = prepare_typed_json_document(
             input(2, Some(vec!["beta"]), true),
-            first.current,
+            &first.current,
             &mut second_memory,
         )
         .unwrap();
@@ -484,7 +484,7 @@ mod tests {
         let mut first_memory = credits();
         let first = prepare_typed_json_document(
             input(1, Some(vec!["stable"]), true),
-            Vec::new(),
+            &[],
             &mut first_memory,
         )
         .unwrap();
@@ -492,7 +492,7 @@ mod tests {
         let mut second_memory = credits();
         let second = prepare_typed_json_document(
             input(2, Some(vec!["stable"]), true),
-            first.current,
+            &first.current,
             &mut second_memory,
         )
         .unwrap();
@@ -516,7 +516,7 @@ mod tests {
         let mut durable_memory = credits();
         let durable = prepare_typed_json_document(
             input(1, Some(vec!["alpha"]), true),
-            Vec::new(),
+            &[],
             &mut durable_memory,
         )
         .unwrap();
@@ -530,7 +530,7 @@ mod tests {
         let mut intermediate_memory = credits();
         let intermediate = prepare_typed_json_document(
             input(2, Some(vec!["beta"]), true),
-            durable_state.clone(),
+            &durable_state,
             &mut intermediate_memory,
         )
         .unwrap();
@@ -539,7 +539,7 @@ mod tests {
         let mut final_memory = credits();
         let final_document = prepare_typed_json_document(
             input(3, Some(vec!["alpha"]), true),
-            durable_state,
+            &durable_state,
             &mut final_memory,
         )
         .unwrap();
@@ -556,14 +556,14 @@ mod tests {
         let mut first_memory = credits();
         let first = prepare_typed_json_document(
             input(1, Some(vec!["alpha", "beta"]), true),
-            Vec::new(),
+            &[],
             &mut first_memory,
         )
         .unwrap();
         let stable_key = first.current[0].head.stable_key;
         let mut delete_memory = credits();
         let deleted =
-            prepare_typed_json_document(input(2, None, false), first.current, &mut delete_memory)
+            prepare_typed_json_document(input(2, None, false), &first.current, &mut delete_memory)
                 .unwrap();
         assert!(deleted.current.is_empty());
         let gate = &deleted.query.membership.as_ref().unwrap().gates[0];
@@ -584,7 +584,7 @@ mod tests {
         assert!(matches!(
             prepare_typed_json_document(
                 input(1, Some(vec!["alpha", "beta"]), true),
-                Vec::new(),
+                &[],
                 &mut memory
             ),
             Err(IndexError::ResourceLimit { .. })

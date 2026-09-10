@@ -236,20 +236,6 @@ impl ClusterObjectReader {
         Ok((selected, cursor))
     }
 
-    pub(crate) async fn head_stable(
-        &self,
-        key: &ObjectKey,
-        tenant_id: u64,
-        bucket_id: u64,
-    ) -> Result<Option<Version>, Status> {
-        let (placement, snapshot) = self
-            .stable_snapshot_with_ids(key, tenant_id, bucket_id)
-            .await?;
-        let selected = select_descriptor(snapshot.as_ref(), key, Selection::Current)?;
-        self.metadata.require_current_fence(placement.fence())?;
-        Ok(selected)
-    }
-
     /// Returns the reconciled stable-ID metadata snapshot under one placement
     /// fence without fetching payload bytes. Derived-view builders use its
     /// mutation stamp to prove a reread does not pass their captured journal

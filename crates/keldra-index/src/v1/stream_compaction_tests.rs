@@ -58,8 +58,15 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         &[(1, Some(b"wide-left")), (250, Some(b"wide-right"))],
     ));
     packs.insert(wide_first.pack_hash, wide_first_pack);
-    let first = append_component_stream(None, |_| Err(IndexError::Integrity), &wide_first, 0, 1, 1)
-        .unwrap();
+    let first = append_component_stream(
+        None,
+        |_| Err::<Vec<u8>, _>(IndexError::Integrity),
+        &wide_first,
+        0,
+        1,
+        1,
+    )
+    .unwrap();
     pages.extend(
         first
             .new_pages
@@ -265,7 +272,9 @@ fn expanded_target_range_keeps_tombstones_when_older_history_overlaps_its_flank(
             &plan,
             limits,
             TombstoneCompactionPolicy::DropWhenOldestHistoryCovered,
-            |_| panic!("unsafe tombstone drop must fail before packs are loaded"),
+            |_| -> Result<Vec<u8>, IndexError> {
+                panic!("unsafe tombstone drop must fail before packs are loaded")
+            },
         ),
         Err(IndexError::InvalidDefinition(_))
     ));

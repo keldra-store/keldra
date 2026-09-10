@@ -382,12 +382,12 @@ impl Store {
         let identity = complete_identity(reference);
         let Some(encoded) = self
             .db
-            .get_cf(self.cf(CF_PAYLOAD_MANIFESTS)?, manifest_key(&identity))
+            .get_pinned_cf(self.cf(CF_PAYLOAD_MANIFESTS)?, manifest_key(&identity))
             .map_err(storage_error)?
         else {
             return Ok(None);
         };
-        let manifest = ArtifactManifest::decode(&encoded)?;
+        let manifest = ArtifactManifest::decode(encoded.as_ref())?;
         if manifest.kind != ArtifactKind::Complete
             || manifest.encoded_length != reference.length
             || manifest.integrity != reference.hash
@@ -398,6 +398,77 @@ impl Store {
             ));
         }
         Ok(Some(manifest))
+    }
+
+    pub(super) fn read_complete_artifact_owned(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<Vec<u8>, MutationError> {
+        if manifest.kind != ArtifactKind::Complete {
+            return Err(artifact_storage(
+                "owned complete payload read received a non-complete manifest",
+            ));
+        }
+        let length = usize::try_from(manifest.encoded_length)
+            .map_err(|_| artifact_storage("payload artifact length does not fit in memory"))?;
+        let cf = self.cf(CF_PAYLOAD_ARTIFACTS)?;
+        let mut read_options = rocksdb::ReadOptions::default();
+        read_options.set_verify_checksums(false);
+
+        match manifest.layout {
+            ArtifactLayout::Inline => {
+                let bytes = self
+                    .db
+                    .get_cf_opt(
+                        cf,
+                        tagged_identity(COMPLETE_INLINE_TAG, &manifest.storage_id),
+                        &read_options,
+                    )
+                    .map_err(storage_error)?
+                    .ok_or_else(|| artifact_storage("payload artifact value is missing"))?;
+                if bytes.len() != length {
+                    return Err(artifact_storage(
+                        "payload artifact value has the wrong encoded length",
+                    ));
+                }
+                Ok(bytes)
+            }
+            ArtifactLayout::Chunked { chunk_count } => {
+                let mut bytes = Vec::with_capacity(length);
+                let mut offset = 0_usize;
+                for ordinal in 0..chunk_count {
+                    let remaining = length.checked_sub(offset).ok_or_else(|| {
+                        artifact_storage("payload artifact chunk layout exceeds its length")
+                    })?;
+                    let expected = remaining.min(PAYLOAD_ARTIFACT_CHUNK_BYTES);
+                    let chunk = self
+                        .db
+                        .get_pinned_cf_opt(
+                            cf,
+                            chunk_key(COMPLETE_CHUNK_TAG, &manifest.storage_id, ordinal),
+                            &read_options,
+                        )
+                        .map_err(storage_error)?
+                        .ok_or_else(|| artifact_storage("payload artifact chunk is missing"))?;
+                    if chunk.len() != expected {
+                        return Err(artifact_storage(
+                            "payload artifact chunk has the wrong encoded length",
+                        ));
+                    }
+                    let end = offset.checked_add(expected).ok_or_else(|| {
+                        artifact_storage("payload artifact chunk offset overflow")
+                    })?;
+                    bytes.extend_from_slice(chunk.as_ref());
+                    offset = end;
+                }
+                if offset != length {
+                    return Err(artifact_storage(
+                        "payload artifact chunk layout is shorter than its length",
+                    ));
+                }
+                Ok(bytes)
+            }
+        }
     }
 
     pub(super) fn read_shard_manifest(
@@ -832,8 +903,7 @@ impl RocksArtifactReader {
                         io::ErrorKind::UnexpectedEof,
                         "payload artifact chunk is missing",
                     )
-                })?
-                .to_vec();
+                })?;
             let chunk_start = u64::from(ordinal)
                 .checked_mul(PAYLOAD_ARTIFACT_CHUNK_BYTES as u64)
                 .ok_or_else(|| {
@@ -900,6 +970,27 @@ impl Read for RocksArtifactReader {
 mod tests {
     use super::super::journal_capacity::SourceJournalAdmission;
     use super::*;
+
+    #[tokio::test]
+    async fn complete_manifest_pinned_read_rejects_malformed_value() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let reference = store.stage_blob(b"manifest-pinned-read").await.unwrap();
+        let identity = complete_identity(&reference);
+        store
+            .db
+            .put_cf(
+                store.cf(CF_PAYLOAD_MANIFESTS).unwrap(),
+                manifest_key(&identity),
+                [0_u8; MANIFEST_BYTES - 1],
+            )
+            .unwrap();
+
+        let error = store.read_complete_manifest(&reference).unwrap_err();
+        assert!(error.to_string().contains("manifest is malformed"));
+    }
 
     #[tokio::test]
     async fn complete_value_above_eight_mib_is_chunked_verified_and_collectable() {
@@ -1045,6 +1136,26 @@ mod tests {
         store
             .db
             .put_cf(store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(), key, malformed)
+            .unwrap();
+
+        let error = store.read_blob_bytes(&reference).await.unwrap_err();
+        assert!(error.to_string().contains("wrong encoded length"));
+    }
+
+    #[tokio::test]
+    async fn inline_value_with_wrong_length_is_rejected_by_owned_read() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let reference = store.stage_blob(b"inline-owned-read").await.unwrap();
+        store
+            .db
+            .put_cf(
+                store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(),
+                complete_inline_key(&reference),
+                b"short",
+            )
             .unwrap();
 
         let error = store.read_blob_bytes(&reference).await.unwrap_err();

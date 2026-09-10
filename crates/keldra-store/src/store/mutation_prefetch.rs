@@ -390,12 +390,7 @@ fn multi_get_raw(
             )));
         }
         for (key, value) in keys.iter().zip(fetched) {
-            values.insert(
-                (*key).clone(),
-                value
-                    .map(|encoded| encoded.map(|bytes| bytes.to_vec()))
-                    .map_err(storage_error),
-            );
+            values.insert((*key).clone(), value.map_err(storage_error));
         }
     }
     Ok(values)

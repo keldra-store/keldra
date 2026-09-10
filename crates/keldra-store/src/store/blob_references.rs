@@ -110,10 +110,10 @@ impl Store {
         let mut changes = Vec::with_capacity(blobs.len());
 
         for (bytes, reference) in blobs.iter().zip(references) {
-            if let Some((artifact_key, artifact_bytes)) =
+            if let Some(artifact_key) =
                 self.prepare_inline_payload_value(reference, bytes, &pending_inline_payloads)?
             {
-                self.stage_inline_complete_artifact(&mut batch, reference, &artifact_bytes)?;
+                self.stage_inline_complete_artifact(&mut batch, reference, bytes)?;
                 pending_inline_payloads.insert(artifact_key);
             }
             let state = self
@@ -388,42 +388,18 @@ impl Store {
         }
     }
 
-    pub(crate) async fn read_blob_bytes(
-        &self,
-        reference: &BlobRef,
-    ) -> Result<Vec<u8>, MutationError> {
-        let mut reader = self.open_blob(reference).await?;
-        let capacity = usize::try_from(reference.length)
-            .map_err(|_| MutationError::Storage("blob length does not fit in memory".into()))?;
-        let mut bytes = Vec::with_capacity(capacity);
-        let mut buffer = vec![0_u8; PAYLOAD_ARTIFACT_CHUNK_BYTES.min(64 * 1024)];
-        loop {
-            let read = reader.read(&mut buffer).await.map_err(storage_error)?;
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-        }
-        Ok(bytes)
+    /// Reads one live blob into a single owned allocation.
+    pub async fn read_blob_bytes(&self, reference: &BlobRef) -> Result<Vec<u8>, MutationError> {
+        let manifest = self.live_blob_manifest(reference)?;
+        self.read_complete_artifact_owned(&manifest)
     }
 
     pub(crate) async fn read_retained_blob_bytes(
         &self,
         reference: &BlobRef,
     ) -> Result<Vec<u8>, MutationError> {
-        let mut reader = self.open_retained_blob(reference).await?;
-        let capacity = usize::try_from(reference.length)
-            .map_err(|_| MutationError::Storage("blob length does not fit in memory".into()))?;
-        let mut bytes = Vec::with_capacity(capacity);
-        let mut buffer = vec![0_u8; PAYLOAD_ARTIFACT_CHUNK_BYTES.min(64 * 1024)];
-        loop {
-            let read = reader.read(&mut buffer).await.map_err(storage_error)?;
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-        }
-        Ok(bytes)
+        let manifest = self.retained_blob_manifest(reference)?;
+        self.read_complete_artifact_owned(&manifest)
     }
 
     pub(super) async fn contains_blob(&self, reference: &BlobRef) -> Result<bool, MutationError> {
@@ -896,7 +872,7 @@ impl Store {
     ) -> Result<(), MutationError> {
         validate_complete_artifact(reference, bytes)?;
         let pending = BTreeSet::new();
-        let value = self.prepare_inline_payload_value(reference, bytes, &pending)?;
+        let artifact_key = self.prepare_inline_payload_value(reference, bytes, &pending)?;
         let state = self
             .prepare_sealed_blob_reservation(reference, now_unix_millis)?
             .ok_or_else(|| {
@@ -904,8 +880,8 @@ impl Store {
             })?;
         let key = blob_reference_key(reference);
         let mut batch = WriteBatch::default();
-        if let Some((_artifact_key, artifact_bytes)) = value {
-            self.stage_inline_complete_artifact(&mut batch, reference, &artifact_bytes)?;
+        if artifact_key.is_some() {
+            self.stage_inline_complete_artifact(&mut batch, reference, bytes)?;
         }
         let mut references = PendingBlobReferences::new();
         self.stage_blob_reference_update(&mut batch, &mut references, key.clone(), state)?;
@@ -996,13 +972,7 @@ impl Store {
         pending_blob_references: &PendingBlobReferences,
         read_cache: &MutationReadCache,
         now_unix_millis: u64,
-    ) -> Result<
-        (
-            Option<(Vec<u8>, Vec<u8>)>,
-            Option<(Vec<u8>, BlobReferenceState)>,
-        ),
-        MutationError,
-    > {
+    ) -> Result<(Option<Vec<u8>>, Option<(Vec<u8>, BlobReferenceState)>), MutationError> {
         if !materialize {
             return Ok((None, None));
         }
@@ -1036,7 +1006,7 @@ impl Store {
         reference: &BlobRef,
         bytes: &[u8],
         pending: &BTreeSet<Vec<u8>>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, MutationError> {
+    ) -> Result<Option<Vec<u8>>, MutationError> {
         validate_complete_artifact(reference, bytes)?;
         self.prepare_hashed_inline_payload_value(reference, bytes, pending)
     }
@@ -1049,7 +1019,7 @@ impl Store {
         reference: &BlobRef,
         bytes: &[u8],
         pending: &BTreeSet<Vec<u8>>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, MutationError> {
+    ) -> Result<Option<Vec<u8>>, MutationError> {
         self.prepare_hashed_inline_payload_value_cached(reference, bytes, pending, None)
     }
 
@@ -1059,7 +1029,7 @@ impl Store {
         bytes: &[u8],
         pending: &BTreeSet<Vec<u8>>,
         prefetched: Option<Result<Option<Vec<u8>>, MutationError>>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, MutationError> {
+    ) -> Result<Option<Vec<u8>>, MutationError> {
         let key = complete_artifact_key(reference);
         if pending.contains(&key) {
             return Ok(None);
@@ -1069,8 +1039,7 @@ impl Store {
             None => self
                 .db
                 .get_cf(self.cf(CF_PAYLOAD_ARTIFACTS)?, &key)
-                .map_err(storage_error)?
-                .map(|encoded| encoded.to_vec()),
+                .map_err(storage_error)?,
         };
         match existing {
             Some(existing) => {
@@ -1093,7 +1062,7 @@ impl Store {
                 }
                 Ok(None)
             }
-            None => Ok(Some((key, bytes.to_vec()))),
+            None => Ok(Some(key)),
         }
     }
 
@@ -1235,36 +1204,57 @@ impl Store {
         key: &[u8],
     ) -> Result<Option<BlobReferenceState>, MutationError> {
         self.db
-            .get_cf(self.cf(CF_BLOB_REFERENCES)?, key)
+            .get_pinned_cf(self.cf(CF_BLOB_REFERENCES)?, key)
             .map_err(storage_error)?
-            .map(|encoded| decode_blob_reference_state(&encoded))
+            .map(|encoded| decode_blob_reference_state(encoded.as_ref()))
             .transpose()
     }
 
     pub async fn open_blob(&self, reference: &BlobRef) -> Result<BlobReader, MutationError> {
-        let state = self
-            .blob_reference_state(reference)?
-            .filter(|state| state.ref_count != 0)
-            .ok_or(MutationError::BlobNotFound)?;
-        validate_blob_reference_state(state)?;
-        self.open_retained_blob(reference).await
+        let manifest = self.live_blob_manifest(reference)?;
+        Ok(BlobReader::from_rocksdb(
+            reference,
+            RocksArtifactReader::new(self.db.clone(), manifest),
+        ))
     }
 
     pub(crate) async fn open_retained_blob(
         &self,
         reference: &BlobRef,
     ) -> Result<BlobReader, MutationError> {
-        let state = self
-            .blob_reference_state(reference)?
-            .ok_or(MutationError::BlobNotFound)?;
-        validate_blob_reference_state(state)?;
-        let manifest = self
-            .read_complete_manifest(reference)?
-            .ok_or(MutationError::BlobNotFound)?;
+        let manifest = self.retained_blob_manifest(reference)?;
         Ok(BlobReader::from_rocksdb(
             reference,
             RocksArtifactReader::new(self.db.clone(), manifest),
         ))
+    }
+
+    fn live_blob_manifest(&self, reference: &BlobRef) -> Result<ArtifactManifest, MutationError> {
+        let state = self
+            .blob_reference_state(reference)?
+            .filter(|state| state.ref_count != 0)
+            .ok_or(MutationError::BlobNotFound)?;
+        self.blob_manifest_for_validated_state(reference, state)
+    }
+
+    fn retained_blob_manifest(
+        &self,
+        reference: &BlobRef,
+    ) -> Result<ArtifactManifest, MutationError> {
+        let state = self
+            .blob_reference_state(reference)?
+            .ok_or(MutationError::BlobNotFound)?;
+        self.blob_manifest_for_validated_state(reference, state)
+    }
+
+    fn blob_manifest_for_validated_state(
+        &self,
+        reference: &BlobRef,
+        state: BlobReferenceState,
+    ) -> Result<ArtifactManifest, MutationError> {
+        validate_blob_reference_state(state)?;
+        self.read_complete_manifest(reference)?
+            .ok_or(MutationError::BlobNotFound)
     }
 }
 
