@@ -155,7 +155,7 @@ async fn fixed_rate_records_every_schedule_and_queue_drop() {
     .await
     .unwrap();
     assert_eq!(report.scheduled_batches, 7);
-    assert_eq!(report.scheduler_deadline_missed_batches, 0);
+    assert_eq!(report.undispatched_at_measurement_deadline_batches, 0);
     assert_eq!(report.client_queue_enqueued_batches, 2);
     assert_eq!(report.client_queue_dropped_batches, 5);
     assert_eq!(job_rx.recv().await.unwrap().sequence, 0);
@@ -171,7 +171,7 @@ async fn fixed_rate_does_not_dispatch_schedules_after_deadline() {
         .await
         .unwrap();
     assert_eq!(report.scheduled_batches, 7);
-    assert_eq!(report.scheduler_deadline_missed_batches, 7);
+    assert_eq!(report.undispatched_at_measurement_deadline_batches, 7);
     assert_eq!(report.client_queue_enqueued_batches, 0);
     assert!(job_rx.try_recv().is_err());
 }

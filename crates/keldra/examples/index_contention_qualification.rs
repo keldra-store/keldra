@@ -132,11 +132,11 @@ struct MutationReport {
     total_until_all_terminal_seconds: f64,
     response_drain_seconds: f64,
     scheduled_batches: u64,
-    scheduler_deadline_missed_batches: u64,
+    undispatched_at_measurement_deadline_batches: u64,
     client_queue_enqueued_batches: u64,
     client_queue_dropped_batches: u64,
     scheduled_data_operations: u64,
-    scheduler_deadline_missed_data_operations: u64,
+    undispatched_at_measurement_deadline_data_operations: u64,
     client_queue_enqueued_data_operations: u64,
     fully_successful_batches: u64,
     structurally_valid_batches_with_operation_failures: u64,
@@ -294,7 +294,7 @@ struct MutationResult {
 #[derive(Default)]
 struct MutationProducerReport {
     scheduled_batches: u64,
-    scheduler_deadline_missed_batches: u64,
+    undispatched_at_measurement_deadline_batches: u64,
     client_queue_enqueued_batches: u64,
     client_queue_dropped_batches: u64,
 }
@@ -547,7 +547,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         && mutation_report.sampled_client_queue_empty_count == 0;
     let mutation_load_shape_valid = if config.target_data_operations_per_second.is_some() {
         mutation_report.client_queue_dropped_batches == 0
-            && mutation_report.scheduler_deadline_missed_batches == 0
+            && mutation_report.undispatched_at_measurement_deadline_batches == 0
             && mutation_report.scheduled_batches == mutation_report.client_queue_enqueued_batches
     } else {
         sustained_nonempty_mutation_queue
@@ -1129,14 +1129,15 @@ async fn run_mutations(
     let mutation_elapsed = mutation_started.elapsed();
     let producer_report = producer.await.context("mutation producer panicked")??;
     report.scheduled_batches = producer_report.scheduled_batches;
-    report.scheduler_deadline_missed_batches = producer_report.scheduler_deadline_missed_batches;
+    report.undispatched_at_measurement_deadline_batches =
+        producer_report.undispatched_at_measurement_deadline_batches;
     report.client_queue_enqueued_batches = producer_report.client_queue_enqueued_batches;
     report.client_queue_dropped_batches = producer_report.client_queue_dropped_batches;
     report.scheduled_data_operations = producer_report
         .scheduled_batches
         .saturating_mul(config.mutation_batch_size as u64);
-    report.scheduler_deadline_missed_data_operations = producer_report
-        .scheduler_deadline_missed_batches
+    report.undispatched_at_measurement_deadline_data_operations = producer_report
+        .undispatched_at_measurement_deadline_batches
         .saturating_mul(config.mutation_batch_size as u64);
     report.client_queue_enqueued_data_operations = producer_report
         .client_queue_enqueued_batches
@@ -1217,7 +1218,7 @@ async fn produce_mutation_jobs(
 ) -> Result<MutationProducerReport> {
     let mut report = MutationProducerReport {
         scheduled_batches: prefilled_batches,
-        scheduler_deadline_missed_batches: 0,
+        undispatched_at_measurement_deadline_batches: 0,
         client_queue_enqueued_batches: prefilled_batches,
         client_queue_dropped_batches: 0,
     };
@@ -1277,8 +1278,9 @@ async fn produce_fixed_rate_jobs(
             while started + Duration::from_secs_f64(schedule_ordinal as f64 / batch_rate) < deadline
             {
                 report.scheduled_batches = report.scheduled_batches.saturating_add(1);
-                report.scheduler_deadline_missed_batches =
-                    report.scheduler_deadline_missed_batches.saturating_add(1);
+                report.undispatched_at_measurement_deadline_batches = report
+                    .undispatched_at_measurement_deadline_batches
+                    .saturating_add(1);
                 schedule_ordinal = schedule_ordinal
                     .checked_add(1)
                     .context("mutation schedule overflow")?;

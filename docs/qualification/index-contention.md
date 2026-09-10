@@ -104,7 +104,7 @@ those extra capability recipes cannot contaminate the measured physical-work
 axis. Failure aborts the run and its report is embedded in the final evidence.
 
 Each v2 summary reports the target and actual scheduled data-operation rates,
-mutation-scheduler deadline misses, client-queue admission and drop counts, and disjoint fully successful,
+intended mutation arrivals left undispatched at the measurement deadline, client-queue admission and drop counts, and disjoint fully successful,
 structurally valid with operation failures, and indeterminate batch outcomes.
 Per-operation outcomes reconcile as successful, failed, or indeterminate;
 successful receipts are split between the measurement window and response
