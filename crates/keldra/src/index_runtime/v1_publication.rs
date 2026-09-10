@@ -95,7 +95,7 @@ struct AtomicPublicationPlan {
     current: ProjectionCurrent,
     generation: ProjectionGeneration,
     sealed_bytes: u64,
-    source_rows: u64,
+    source_positions: u64,
 }
 
 impl V1ProjectionPublisher {
@@ -515,8 +515,8 @@ impl V1ProjectionPublisher {
         partition: ProjectionPartitionIdentity,
         predecessor: V1PublicationPredecessor<'_>,
         prepared: PreparedAtomicProjectionGeneration,
-        published_source_rows: u64,
-        published_source_bytes: u64,
+        checkpointed_source_positions: u64,
+        checkpointed_source_payload_bytes: u64,
     ) -> Result<LoadedV1ProjectionGeneration, Status> {
         let (previous, expected_current_version) = match predecessor {
             V1PublicationPredecessor::Initial => (None, None),
@@ -526,9 +526,9 @@ impl V1ProjectionPublisher {
             V1PublicationPredecessor::CatalogRebuild(version) => (None, Some(version)),
         };
         let plan = plan_atomic_publication(partition, previous, prepared)?;
-        if published_source_rows != plan.source_rows {
+        if checkpointed_source_positions != plan.source_positions {
             return Err(Status::data_loss(
-                "v1 publication telemetry rows do not match the prepared source cut",
+                "v1 publication telemetry positions do not match the prepared source cut",
             ));
         }
         let sealed_bytes = plan.sealed_bytes;
@@ -605,28 +605,12 @@ impl V1ProjectionPublisher {
             sealed_bytes,
         );
         super::v1_telemetry::V1PipelineTelemetry::add(
-            &super::v1_telemetry::global().published_source_rows,
-            published_source_rows,
+            &super::v1_telemetry::global().checkpointed_source_positions,
+            checkpointed_source_positions,
         );
         super::v1_telemetry::V1PipelineTelemetry::add(
-            &super::v1_telemetry::global().published_source_bytes,
-            published_source_bytes,
-        );
-        super::v1_telemetry::V1PipelineTelemetry::add(
-            &super::v1_telemetry::global().source_rows,
-            published_source_rows,
-        );
-        super::v1_telemetry::V1PipelineTelemetry::add(
-            &super::v1_telemetry::global().source_bytes,
-            published_source_bytes,
-        );
-        super::v1_telemetry::V1PipelineTelemetry::add(
-            &super::v1_telemetry::global().checkpointed_source_rows,
-            published_source_rows,
-        );
-        super::v1_telemetry::V1PipelineTelemetry::add(
-            &super::v1_telemetry::global().checkpointed_source_bytes,
-            published_source_bytes,
+            &super::v1_telemetry::global().checkpointed_source_payload_bytes,
+            checkpointed_source_payload_bytes,
         );
         Ok(LoadedV1ProjectionGeneration {
             current: plan.current,
@@ -1500,7 +1484,7 @@ fn plan_atomic_publication(
         current,
         generation,
         sealed_bytes,
-        source_rows: query_run
+        source_positions: query_run
             .next_offset
             .checked_sub(query_run.source_start_offset)
             .ok_or_else(|| Status::data_loss("v1 query run source cut moves backwards"))?,

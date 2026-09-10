@@ -16,7 +16,7 @@ index_pipeline_memory_bytes="${KELDRA_INDEX_CONTENTION_PIPELINE_MEMORY_BYTES:-10
 indexing_cores="${KELDRA_INDEX_CONTENTION_INDEXING_CORES:-4}"
 source_journal_entries="${KELDRA_INDEX_CONTENTION_SOURCE_JOURNAL_MAX_ENTRIES:-1000000}"
 max_concurrent_query_p99_ms="${KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS:-2000}"
-max_publication_visibility_p99_ms="${KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS:-30000}"
+max_successful_receipt_to_query_visibility_p99_ms="${KELDRA_INDEX_CONTENTION_MAX_SUCCESSFUL_RECEIPT_TO_QUERY_VISIBILITY_P99_MILLISECONDS:-30000}"
 request_timeout_ms="${KELDRA_INDEX_CONTENTION_REQUEST_TIMEOUT_MILLISECONDS:-30000}"
 drain_timeout_seconds="${KELDRA_INDEX_CONTENTION_DRAIN_TIMEOUT_SECONDS:-600}"
 visibility_poll_ms="${KELDRA_INDEX_CONTENTION_VISIBILITY_POLL_MILLISECONDS:-100}"
@@ -27,7 +27,7 @@ mutation_workload="${KELDRA_INDEX_CONTENTION_MUTATION_WORKLOAD:-material-change}
 mutation_batch_size="${KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE:-32}"
 mutation_record_bytes="${KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES:-0}"
 mutation_queue_depth="${KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH:-32}"
-mutation_rate_operations_per_second="${KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND:-disabled}"
+target_data_operations_per_second="${KELDRA_INDEX_CONTENTION_TARGET_DATA_OPERATIONS_PER_SECOND:-disabled}"
 physical_recipe_count="${KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT:-1}"
 work_root="${KELDRA_INDEX_CONTENTION_WORK_ROOT:-${HOME}/keldra_experiments/work/index-contention}"
 qualification_backend="${KELDRA_INDEX_CONTENTION_BACKEND:-docker}"
@@ -99,11 +99,11 @@ then
   echo "concurrent-query p99 gate must be positive milliseconds or disabled" >&2
   exit 2
 fi
-if [[ "${max_publication_visibility_p99_ms}" != disabled ]] \
-  && { [[ ! "${max_publication_visibility_p99_ms}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
-    || ! awk -v value="${max_publication_visibility_p99_ms}" 'BEGIN {exit !(value > 0)}'; }
+if [[ "${max_successful_receipt_to_query_visibility_p99_ms}" != disabled ]] \
+  && { [[ ! "${max_successful_receipt_to_query_visibility_p99_ms}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || ! awk -v value="${max_successful_receipt_to_query_visibility_p99_ms}" 'BEGIN {exit !(value > 0)}'; }
 then
-  echo "publication-visibility p99 gate must be positive milliseconds or disabled" >&2
+  echo "successful-receipt-to-query-visibility p99 gate must be positive milliseconds or disabled" >&2
   exit 2
 fi
 for timeout_value in "${request_timeout_ms}" "${drain_timeout_seconds}" \
@@ -128,12 +128,12 @@ if ((mutation_queue_depth < mutation_workers)); then
   echo "KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH must cover every mutation worker" >&2
   exit 2
 fi
-if [[ "${mutation_rate_operations_per_second}" != disabled ]] \
-  && { [[ ! "${mutation_rate_operations_per_second}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
-    || ! awk -v value="${mutation_rate_operations_per_second}" \
+if [[ "${target_data_operations_per_second}" != disabled ]] \
+  && { [[ ! "${target_data_operations_per_second}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || ! awk -v value="${target_data_operations_per_second}" \
       'BEGIN {exit !(value > 0 && value <= 1000000)}'; }
 then
-  echo "mutation rate must be in 0..=1000000 operations/s or disabled" >&2
+  echo "target data-operation rate must be in 0..=1000000 operations/s or disabled" >&2
   exit 2
 fi
 IFS=, read -r -a definition_matrix <<<"${matrix}"
@@ -376,7 +376,7 @@ jq -n \
   --argjson driver_memory_bytes "${remote_driver_memory_bytes}" \
   --arg server_rust_log "${server_rust_log}" \
   --arg max_concurrent_query_p99_ms "${max_concurrent_query_p99_ms}" \
-  --arg max_publication_visibility_p99_ms "${max_publication_visibility_p99_ms}" \
+  --arg max_successful_receipt_to_query_visibility_p99_ms "${max_successful_receipt_to_query_visibility_p99_ms}" \
   --argjson request_timeout_ms "${request_timeout_ms}" \
   --argjson drain_timeout_seconds "${drain_timeout_seconds}" \
   --argjson visibility_poll_ms "${visibility_poll_ms}" \
@@ -387,7 +387,7 @@ jq -n \
   --argjson mutation_batch_size "${mutation_batch_size}" \
   --argjson mutation_record_bytes "${mutation_record_bytes}" \
   --argjson mutation_queue_depth "${mutation_queue_depth}" \
-  --arg mutation_rate_operations_per_second "${mutation_rate_operations_per_second}" \
+  --arg target_data_operations_per_second "${target_data_operations_per_second}" \
   --argjson physical_recipe_count "${physical_recipe_count}" \
   --argjson index_disk_cache_bytes "${index_disk_cache_bytes}" \
   --argjson index_pipeline_memory_bytes "${index_pipeline_memory_bytes}" \
@@ -400,7 +400,7 @@ jq -n \
   --argjson docker_cpus "${docker_cpus}" --argjson docker_memory_bytes "${docker_memory_bytes}" \
   --argjson filesystem_kib "${filesystem_kib}" \
   --argjson filesystem_available_kib "${filesystem_available_kib}" \
-  '{schema_version:1,run_id:$run_id,harness_source_commit:$source_commit,images:$images,execution:{server_backend:$server_backend,driver_backend:$driver_backend,driver_host:$driver_host,driver_repo_root:$driver_repo_root,server_advertise_host:$server_advertise_host},workload:{mode:$mode,topology:$topology,durability:$durability,comparison_order:$comparison_order,index_definition_count_matrix:($matrix|split(",")|map(tonumber)),physical_recipe_count:$physical_recipe_count,baseline_seconds:$baseline_seconds,concurrent_seconds:$concurrent_seconds,post_seconds:$post_seconds,mutation_workers:$mutation_workers,mutation_workload:$mutation_workload,mutation_batch_size:$mutation_batch_size,mutation_record_bytes:$mutation_record_bytes,mutation_queue_depth:$mutation_queue_depth,mutation_rate_operations_per_second:(if $mutation_rate_operations_per_second == "disabled" then null else ($mutation_rate_operations_per_second|tonumber) end),request_timeout_milliseconds:$request_timeout_ms,drain_timeout_seconds:$drain_timeout_seconds,visibility_poll_milliseconds:$visibility_poll_ms,visibility_observation_timeout_seconds:$visibility_observation_timeout_seconds,visibility_sample_every_batches:$visibility_sample_every_batches,max_concurrent_query_p99_milliseconds:(if $max_concurrent_query_p99_ms == "disabled" then null else ($max_concurrent_query_p99_ms|tonumber) end),max_publication_visibility_p99_milliseconds:(if $max_publication_visibility_p99_ms == "disabled" then null else ($max_publication_visibility_p99_ms|tonumber) end)},server:{rust_log:$server_rust_log,index_disk_cache_bytes:$index_disk_cache_bytes,index_pipeline_memory_bytes:$index_pipeline_memory_bytes,indexing_cores:$indexing_cores,source_journal_max_entries:$source_journal_entries},hardware:{uname:$uname,host_logical_cpus:$host_logical_cpus,host_memory_bytes:$host_memory_bytes,docker_logical_cpus:$docker_cpus,docker_memory_bytes:$docker_memory_bytes,driver_uname:$driver_uname,driver_logical_cpus:$driver_logical_cpus,driver_memory_bytes:$driver_memory_bytes,evidence_filesystem_kib:$filesystem_kib,evidence_filesystem_available_kib:$filesystem_available_kib}}' \
+  '{schema_version:2,run_id:$run_id,harness_source_commit:$source_commit,images:$images,execution:{server_backend:$server_backend,driver_backend:$driver_backend,driver_host:$driver_host,driver_repo_root:$driver_repo_root,server_advertise_host:$server_advertise_host},workload:{mode:$mode,topology:$topology,durability:$durability,comparison_order:$comparison_order,index_definition_count_matrix:($matrix|split(",")|map(tonumber)),physical_recipe_count:$physical_recipe_count,baseline_seconds:$baseline_seconds,concurrent_seconds:$concurrent_seconds,post_seconds:$post_seconds,mutation_workers:$mutation_workers,mutation_workload:$mutation_workload,mutation_batch_size:$mutation_batch_size,mutation_record_bytes:$mutation_record_bytes,mutation_queue_depth:$mutation_queue_depth,target_data_operations_per_second:(if $target_data_operations_per_second == "disabled" then null else ($target_data_operations_per_second|tonumber) end),request_timeout_milliseconds:$request_timeout_ms,drain_timeout_seconds:$drain_timeout_seconds,visibility_poll_milliseconds:$visibility_poll_ms,visibility_observation_timeout_seconds:$visibility_observation_timeout_seconds,visibility_sample_every_batches:$visibility_sample_every_batches,max_concurrent_query_p99_milliseconds:(if $max_concurrent_query_p99_ms == "disabled" then null else ($max_concurrent_query_p99_ms|tonumber) end),max_successful_receipt_to_query_visibility_p99_milliseconds:(if $max_successful_receipt_to_query_visibility_p99_ms == "disabled" then null else ($max_successful_receipt_to_query_visibility_p99_ms|tonumber) end)},server:{rust_log:$server_rust_log,index_disk_cache_bytes:$index_disk_cache_bytes,index_pipeline_memory_bytes:$index_pipeline_memory_bytes,indexing_cores:$indexing_cores,source_journal_max_entries:$source_journal_entries},hardware:{uname:$uname,host_logical_cpus:$host_logical_cpus,host_memory_bytes:$host_memory_bytes,docker_logical_cpus:$docker_cpus,docker_memory_bytes:$docker_memory_bytes,driver_uname:$driver_uname,driver_logical_cpus:$driver_logical_cpus,driver_memory_bytes:$driver_memory_bytes,evidence_filesystem_kib:$filesystem_kib,evidence_filesystem_available_kib:$filesystem_available_kib}}' \
   >"${run_dir}/run.json"
 
 if [[ "${driver_backend}" == ssh-macos ]]; then
@@ -532,10 +532,10 @@ run_qualification_driver() {
     KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE="${mutation_batch_size}" \
     KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES="${mutation_record_bytes}" \
     KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH="${mutation_queue_depth}" \
-    KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND="${mutation_rate_operations_per_second}" \
+    KELDRA_INDEX_CONTENTION_TARGET_DATA_OPERATIONS_PER_SECOND="${target_data_operations_per_second}" \
     KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT="${physical_recipe_count}" \
     KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS="${max_concurrent_query_p99_ms}" \
-    KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS="${max_publication_visibility_p99_ms}" \
+    KELDRA_INDEX_CONTENTION_MAX_SUCCESSFUL_RECEIPT_TO_QUERY_VISIBILITY_P99_MILLISECONDS="${max_successful_receipt_to_query_visibility_p99_ms}" \
     KELDRA_INDEX_CONTENTION_OUTPUT="${output_path}" \
     KELDRA_INDEX_CONTENTION_PROGRESS_JSONL="${progress_path}" \
       "${driver}"
@@ -568,10 +568,10 @@ run_qualification_driver() {
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=%q\n' "${mutation_batch_size}"
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES=%q\n' "${mutation_record_bytes}"
     printf 'export KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=%q\n' "${mutation_queue_depth}"
-    printf 'export KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=%q\n' "${mutation_rate_operations_per_second}"
+    printf 'export KELDRA_INDEX_CONTENTION_TARGET_DATA_OPERATIONS_PER_SECOND=%q\n' "${target_data_operations_per_second}"
     printf 'export KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT=%q\n' "${physical_recipe_count}"
     printf 'export KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=%q\n' "${max_concurrent_query_p99_ms}"
-    printf 'export KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS=%q\n' "${max_publication_visibility_p99_ms}"
+    printf 'export KELDRA_INDEX_CONTENTION_MAX_SUCCESSFUL_RECEIPT_TO_QUERY_VISIBILITY_P99_MILLISECONDS=%q\n' "${max_successful_receipt_to_query_visibility_p99_ms}"
     printf 'export KELDRA_INDEX_CONTENTION_OUTPUT=%q\n' "${remote_run_dir}/${cell}/report.json"
     printf 'export KELDRA_INDEX_CONTENTION_PROGRESS_JSONL=%q\n' "${remote_run_dir}/${cell}/driver-progress.jsonl"
     printf 'driver=%q\n' "${remote_driver}"
@@ -778,7 +778,7 @@ for definitions in "${definition_matrix[@]}"; do
   if [[ ! -s "${cell_dir}/report.json" ]] \
     || ! jq -e "${report_gate}" "${cell_dir}/report.json" >/dev/null \
     || ! jq -e --argjson expected "${physical_recipe_count}" \
-      '.physical_recipe_count == $expected' "${cell_dir}/report.json" >/dev/null \
+      '.schema == "keldra.index-contention-qualification.v2" and .physical_recipe_count == $expected' "${cell_dir}/report.json" >/dev/null \
     || [[ ! -s "${cell_dir}/container-resources.jsonl" ]] \
     || ! jq -e . "${cell_dir}/container-resources.jsonl" >/dev/null; then
     emit_event cell_failed "${cell}" "${definitions}" "driver_exit=${driver_status}"
@@ -811,20 +811,26 @@ if [[ -n "${baseline_image}" ]]; then
            p99_ms:($after.p99_ms-$before.p99_ms),
            max_ms:($after.max_ms-$before.max_ms)}
         else null end;
-      (latency($before[0];["concurrent","schedule_to_response"])) as $before_query |
-      (latency($after[0];["concurrent","schedule_to_response"])) as $after_query |
-      (latency($before[0];["concurrent","dispatch_to_response"])) as $before_service |
-      (latency($after[0];["concurrent","dispatch_to_response"])) as $after_service |
-      (latency($before[0];["mutations","publication_visibility_lag"])) as $before_visible |
-      (latency($after[0];["mutations","publication_visibility_lag"])) as $after_visible |
+      (latency($before[0];["concurrent","successful_schedule_to_response_latency"])) as $before_query |
+      (latency($after[0];["concurrent","successful_schedule_to_response_latency"])) as $after_query |
+      (latency($before[0];["concurrent","successful_dispatch_to_response_latency"])) as $before_service |
+      (latency($after[0];["concurrent","successful_dispatch_to_response_latency"])) as $after_service |
+      (latency($before[0];["mutations","successful_receipt_to_query_visibility_latency"])) as $before_visible |
+      (latency($after[0];["mutations","successful_receipt_to_query_visibility_latency"])) as $after_visible |
+      (latency($before[0];["mutations","successful_receipt_to_probe_start_delay"])) as $before_probe_wait |
+      (latency($after[0];["mutations","successful_receipt_to_probe_start_delay"])) as $after_probe_wait |
+      (latency($before[0];["mutations","probe_start_to_query_visibility_latency"])) as $before_active_probe |
+      (latency($after[0];["mutations","probe_start_to_query_visibility_latency"])) as $after_active_probe |
       {index_definition_count:$definition_count,
-       outcomes:{baseline:{result:$before[0].result,responsiveness:$before[0].responsiveness,concurrent:{offered:$before[0].concurrent.offered_schedules,completed:$before[0].concurrent.completed,dropped:$before[0].concurrent.dropped_schedules,request_errors:$before[0].concurrent.request_errors,timeouts:$before[0].concurrent.timeouts}},candidate:{result:$after[0].result,responsiveness:$after[0].responsiveness,concurrent:{offered:$after[0].concurrent.offered_schedules,completed:$after[0].concurrent.completed,dropped:$after[0].concurrent.dropped_schedules,request_errors:$after[0].concurrent.request_errors,timeouts:$after[0].concurrent.timeouts}}},
+       outcomes:{baseline:{result:$before[0].result,responsiveness:$before[0].responsiveness,mutations:{fully_successful_batches:$before[0].mutations.fully_successful_batches,structurally_valid_batches_with_operation_failures:$before[0].mutations.structurally_valid_batches_with_operation_failures,indeterminate_batches:$before[0].mutations.indeterminate_batches,successful_data_operations:$before[0].mutations.successful_data_operations,failed_data_operations:$before[0].mutations.failed_data_operations,indeterminate_data_operations:$before[0].mutations.indeterminate_data_operations,successful_probe_operations:$before[0].mutations.successful_probe_operations,failed_probe_operations:$before[0].mutations.failed_probe_operations,indeterminate_probe_operations:$before[0].mutations.indeterminate_probe_operations},concurrent:{scheduled:$before[0].concurrent.scheduled_queries,successful:$before[0].concurrent.successful_queries,scheduler_deadline_misses:$before[0].concurrent.scheduler_deadline_misses,client_concurrency_rejections:$before[0].concurrent.client_concurrency_rejections,request_errors:$before[0].concurrent.request_errors,timeouts:$before[0].concurrent.timeouts}},candidate:{result:$after[0].result,responsiveness:$after[0].responsiveness,mutations:{fully_successful_batches:$after[0].mutations.fully_successful_batches,structurally_valid_batches_with_operation_failures:$after[0].mutations.structurally_valid_batches_with_operation_failures,indeterminate_batches:$after[0].mutations.indeterminate_batches,successful_data_operations:$after[0].mutations.successful_data_operations,failed_data_operations:$after[0].mutations.failed_data_operations,indeterminate_data_operations:$after[0].mutations.indeterminate_data_operations,successful_probe_operations:$after[0].mutations.successful_probe_operations,failed_probe_operations:$after[0].mutations.failed_probe_operations,indeterminate_probe_operations:$after[0].mutations.indeterminate_probe_operations},concurrent:{scheduled:$after[0].concurrent.scheduled_queries,successful:$after[0].concurrent.successful_queries,scheduler_deadline_misses:$after[0].concurrent.scheduler_deadline_misses,client_concurrency_rejections:$after[0].concurrent.client_concurrency_rejections,request_errors:$after[0].concurrent.request_errors,timeouts:$after[0].concurrent.timeouts}}},
        query_concurrent:{baseline:$before_query,candidate:$after_query,delta_candidate_minus_baseline:(delta($after_query;$before_query))},
        query_service_concurrent:{baseline:$before_service,candidate:$after_service,delta_candidate_minus_baseline:(delta($after_service;$before_service))},
-       publication_visibility_lag:{definition:"mutation acceptance to first ordinary-query observation of exact version",baseline:$before_visible,candidate:$after_visible,delta_candidate_minus_baseline:(delta($after_visible;$before_visible))}}
+       successful_receipt_to_probe_start_delay:{definition:"local observer queue wait after mutation successful receipt",baseline:$before_probe_wait,candidate:$after_probe_wait,delta_candidate_minus_baseline:(delta($after_probe_wait;$before_probe_wait))},
+       probe_start_to_query_visibility_latency:{definition:"active polling from observer start to first ordinary-query observation of exact version",baseline:$before_active_probe,candidate:$after_active_probe,delta_candidate_minus_baseline:(delta($after_active_probe;$before_active_probe))},
+       successful_receipt_to_query_visibility_latency:{definition:"end-to-end mutation successful receipt to first ordinary-query observation of exact version, including separately reported observer queue wait",baseline:$before_visible,candidate:$after_visible,delta_candidate_minus_baseline:(delta($after_visible;$before_visible))}}
     ' >>"${comparison_rows}"
   done
-  jq -s '{schema:"keldra.index-contention-comparison.v1",cells:.}' \
+  jq -s '{schema:"keldra.index-contention-comparison.v2",cells:.}' \
     "${comparison_rows}" >"${run_dir}/comparison.json"
   rm -f -- "${comparison_rows}"
 fi

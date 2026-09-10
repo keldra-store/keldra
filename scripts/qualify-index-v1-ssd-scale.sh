@@ -25,7 +25,6 @@ query_memory_bytes="${KELDRA_V1_SCALE_QUERY_MEMORY_BYTES:-536870912}"
 # axis. Coupling these made low-core cells client-concurrency tests and could
 # not show whether additional server CPU or memory increased throughput.
 mutation_workers="${KELDRA_V1_SCALE_MUTATION_WORKERS:-64}"
-lag_slope_limit="${KELDRA_V1_SCALE_MAX_LAG_SLOPE_RECORDS_PER_SECOND:-1}"
 source_journal_entries="${KELDRA_V1_SCALE_SOURCE_JOURNAL_MAX_ENTRIES:-10000000}"
 catalog_only_at_or_above="${KELDRA_V1_SCALE_CATALOG_ONLY_AT_OR_ABOVE_DEFINITIONS:-250000}"
 group_max_requests="${KELDRA_V1_SCALE_GROUP_MAX_REQUESTS:-}"
@@ -137,7 +136,6 @@ for value in "${base_port}" "${query_rate}" "${query_max_in_flight}" "${source_j
 do
   positive_integer "${value}" || { echo "server, query, journal, and duration settings must be positive integers" >&2; exit 2; }
 done
-positive_number "${lag_slope_limit}" || { echo "lag-slope limit must be positive" >&2; exit 2; }
 [[ "${shard_index}" =~ ^[0-9]+$ && "${shard_count}" =~ ^[1-9][0-9]*$ ]] \
   && ((shard_index < shard_count)) || {
   echo "scale shard index must be within the positive shard count" >&2
@@ -191,12 +189,11 @@ summary_rows="${run_dir}/cells.jsonl"
   echo "indexing_worker_matrix=${worker_matrix}"
   echo "mutation_workers=${mutation_workers}"
   echo "memory_per_worker_matrix=${memory_per_worker_matrix}"
-  echo "offered_rate_ladder=${rate_ladder}"
+  echo "target_data_operations_rate_ladder=${rate_ladder}"
   echo "mutation_object_size_matrix=${object_size_matrix}"
   echo "query_rate=${query_rate}"
   echo "query_max_in_flight=${query_max_in_flight}"
   echo "query_memory_bytes=${query_memory_bytes}"
-  echo "max_lag_slope_records_per_second=${lag_slope_limit}"
   echo "group_max_requests=${group_max_requests:-server-default}"
   echo "group_max_operations=${group_max_operations:-server-default}"
   echo "group_max_inline_bytes=${group_max_inline_bytes:-server-default}"
@@ -244,19 +241,35 @@ trap 'exit 130' INT TERM
 
 sample_process() {
   local pid="$1" output="$2"
-  printf 'timestamp_utc\tepoch_seconds\tcpu_percent\trss_kib\tthreads\tread_bytes\twrite_bytes\tcancelled_write_bytes\tmem_available_kib\n' >"${output}"
+  local clock_ticks previous_cpu_ticks previous_time_ns previous_write_bytes
+  clock_ticks="$(getconf CLK_TCK)"
+  previous_cpu_ticks="$(awk '{print $14 + $15}' "/proc/${pid}/stat")"
+  previous_time_ns="$(date +%s%N)"
+  previous_write_bytes="$(awk '/^write_bytes:/ {print $2}' "/proc/${pid}/io" 2>/dev/null || printf 0)"
+  printf 'timestamp_utc\tinterval_end_epoch_milliseconds\tinterval_cpu_percent\trss_kib\tthreads\tread_bytes\twrite_bytes\tcancelled_write_bytes\tmem_available_kib\tinterval_seconds\tinterval_kernel_write_bytes\n' >"${output}"
   while kill -0 "${pid}" 2>/dev/null; do
-    local now epoch cpu rss threads read_bytes write_bytes cancelled available
-    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; epoch="$(date +%s)"
-    read -r cpu rss threads < <(ps -p "${pid}" -o %cpu=,rss=,nlwp= 2>/dev/null || printf '0 0 0')
+    local now epoch_ms current_cpu_ticks current_time_ns interval_ns interval_seconds cpu rss threads read_bytes write_bytes interval_write_bytes cancelled available
+    sleep 1
+    kill -0 "${pid}" 2>/dev/null || break
+    now="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"; epoch_ms="$(date +%s%3N)"
+    current_cpu_ticks="$(awk '{print $14 + $15}' "/proc/${pid}/stat")"
+    current_time_ns="$(date +%s%N)"
+    interval_ns="$((current_time_ns - previous_time_ns))"
+    interval_seconds="$(awk -v nanoseconds="${interval_ns}" 'BEGIN {print nanoseconds / 1000000000}')"
+    cpu="$(awk -v ticks="$((current_cpu_ticks - previous_cpu_ticks))" -v nanoseconds="${interval_ns}" -v hz="${clock_ticks}" 'BEGIN {if (nanoseconds > 0 && hz > 0) print ticks * 100000000000 / (nanoseconds * hz); else print 0}')"
+    previous_cpu_ticks="${current_cpu_ticks}"
+    previous_time_ns="${current_time_ns}"
+    read -r rss threads < <(ps -p "${pid}" -o rss=,nlwp= 2>/dev/null || printf '0 0')
     read_bytes="$(awk '/^read_bytes:/ {print $2}' "/proc/${pid}/io" 2>/dev/null || printf 0)"
     write_bytes="$(awk '/^write_bytes:/ {print $2}' "/proc/${pid}/io" 2>/dev/null || printf 0)"
+    interval_write_bytes="$((write_bytes >= previous_write_bytes ? write_bytes - previous_write_bytes : 0))"
+    previous_write_bytes="${write_bytes}"
     cancelled="$(awk '/^cancelled_write_bytes:/ {print $2}' "/proc/${pid}/io" 2>/dev/null || printf 0)"
     available="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${now}" "${epoch}" "${cpu}" "${rss}" "${threads}" "${read_bytes}" \
-      "${write_bytes}" "${cancelled}" "${available}" >>"${output}"
-    sleep 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${now}" "${epoch_ms}" "${cpu}" "${rss}" "${threads}" "${read_bytes}" \
+      "${write_bytes}" "${cancelled}" "${available}" "${interval_seconds}" \
+      "${interval_write_bytes}" >>"${output}"
   done
 }
 
@@ -297,7 +310,7 @@ extract_v1_telemetry() {
     /keldra_index_v1_summary/ {
       elapsed = metric($0, "keldra_index_v1_summary_elapsed_milliseconds")
       if (elapsed == "null") next
-      printf "{\"timestamp_utc\":\"%s\",\"summary_elapsed_milliseconds\":%s,\"source_rows_total\":%s,\"source_bytes_total\":%s,\"hot_raw_hits_total\":%s,\"hot_prepared_hits_total\":%s,\"hot_misses_total\":%s,\"hot_evictions_total\":%s,\"selected_bytes_total\":%s,\"prepared_bytes_total\":%s,\"projected_bytes_total\":%s,\"sealed_bytes_total\":%s,\"published_source_rows_total\":%s,\"published_source_bytes_total\":%s,\"checkpointed_source_rows_total\":%s,\"checkpointed_source_bytes_total\":%s,\"catalog_source_rows_total\":%s,\"catalog_source_bytes_total\":%s,\"catalog_checkpointed_source_rows_total\":%s,\"catalog_checkpointed_source_bytes_total\":%s}\n", $1, elapsed, metric($0, "keldra_index_v1_source_rows_total"), metric($0, "keldra_index_v1_source_bytes_total"), metric($0, "keldra_index_v1_hot_raw_hits_total"), metric($0, "keldra_index_v1_hot_prepared_hits_total"), metric($0, "keldra_index_v1_hot_misses_total"), metric($0, "keldra_index_v1_hot_evictions_total"), metric($0, "keldra_index_v1_selected_bytes_total"), metric($0, "keldra_index_v1_prepared_bytes_total"), metric($0, "keldra_index_v1_projected_bytes_total"), metric($0, "keldra_index_v1_sealed_bytes_total"), metric($0, "keldra_index_v1_published_source_rows_total"), metric($0, "keldra_index_v1_published_source_bytes_total"), metric($0, "keldra_index_v1_checkpointed_source_rows_total"), metric($0, "keldra_index_v1_checkpointed_source_bytes_total"), metric($0, "keldra_index_v1_catalog_source_rows_total"), metric($0, "keldra_index_v1_catalog_source_bytes_total"), metric($0, "keldra_index_v1_catalog_checkpointed_source_rows_total"), metric($0, "keldra_index_v1_catalog_checkpointed_source_bytes_total")
+      printf "{\"timestamp_utc\":\"%s\",\"summary_elapsed_milliseconds\":%s,\"hot_raw_hits_total\":%s,\"hot_prepared_hits_total\":%s,\"hot_misses_total\":%s,\"hot_evictions_total\":%s,\"selected_bytes_total\":%s,\"prepared_bytes_total\":%s,\"projected_bytes_total\":%s,\"sealed_bytes_total\":%s,\"checkpointed_source_positions_total\":%s,\"checkpointed_source_payload_bytes_total\":%s,\"catalog_checkpointed_source_positions_total\":%s,\"catalog_checkpointed_source_payload_bytes_total\":%s}\n", $1, elapsed, metric($0, "keldra_index_v1_hot_raw_hits_total"), metric($0, "keldra_index_v1_hot_prepared_hits_total"), metric($0, "keldra_index_v1_hot_misses_total"), metric($0, "keldra_index_v1_hot_evictions_total"), metric($0, "keldra_index_v1_selected_bytes_total"), metric($0, "keldra_index_v1_prepared_bytes_total"), metric($0, "keldra_index_v1_projected_bytes_total"), metric($0, "keldra_index_v1_sealed_bytes_total"), metric($0, "keldra_index_v1_checkpointed_source_positions_total"), metric($0, "keldra_index_v1_checkpointed_source_payload_bytes_total"), metric($0, "keldra_index_v1_catalog_checkpointed_source_positions_total"), metric($0, "keldra_index_v1_catalog_checkpointed_source_payload_bytes_total")
     }
     function metric(line, key, fragment, position) {
       position = index(line, key "=")
@@ -338,55 +351,60 @@ remove_cell_work() {
 }
 
 summarize_cell() {
-  local cell="$1" report="$2" progress="$3" resource_samples="$4" telemetry_samples="$5" definitions="$6" recipes="$7" workers="$8" memory_per_worker="$9" offered_rate="${10}" object_bytes="${11}" driver_status="${12}" store_bytes="${13}"
-  local resources lag throughput quality
-  resources="$(awk -F '\t' '
+  local cell="$1" report="$2" progress="$3" resource_samples="$4" telemetry_samples="$5" definitions="$6" recipes="$7" workers="$8" memory_per_worker="$9" target_data_rate="${10}" object_bytes="${11}" driver_status="${12}" store_bytes="${13}"
+  local resources pipeline_diagnostics quality window_start_ms window_end_ms
+  window_start_ms="$(jq -r '.mutations.measurement_window_started_unix_milliseconds' "${report}")"
+  window_end_ms="$(jq -r '.mutations.measurement_window_ended_unix_milliseconds' "${report}")"
+  resources="$(awk -F '\t' -v start_ms="${window_start_ms}" -v end_ms="${window_end_ms}" '
     NR == 1 { next }
-    { cpu += $3; if ($4 > rss) rss = $4; if (NR == 2) first_write = $7; last_write = $7; samples++ }
-    END { printf "{\"samples\":%d,\"average_cpu_percent\":%s,\"peak_rss_bytes\":%s,\"server_write_bytes\":%s}", samples, (samples ? cpu / samples : 0), rss * 1024, (samples ? last_write - first_write : 0) }
+    {
+      interval_ms = $10 * 1000; interval_start_ms = $2 - interval_ms; interval_end_ms = $2
+      cpu_time += $3 * $10; elapsed += $10; write_bytes += $11
+      if ($4 > rss) rss = $4
+      samples++
+      overlap_start_ms = (interval_start_ms > start_ms ? interval_start_ms : start_ms)
+      overlap_end_ms = (interval_end_ms < end_ms ? interval_end_ms : end_ms)
+      overlap_ms = overlap_end_ms - overlap_start_ms
+      if (overlap_ms > 0 && interval_ms > 0) {
+        overlap_seconds = overlap_ms / 1000
+        overlap_fraction = overlap_ms / interval_ms
+        window_cpu_time += $3 * overlap_seconds; window_elapsed += overlap_seconds
+        window_write_bytes += $11 * overlap_fraction
+        if (interval_end_ms >= start_ms && interval_end_ms < end_ms && $4 > window_rss) window_rss = $4
+        window_samples++
+      }
+    }
+    END { printf "{\"measurement_window_overlapping_intervals\":%d,\"measurement_window_observed_interval_seconds\":%s,\"measurement_window_prorated_time_weighted_process_cpu_percent\":%s,\"measurement_window_sampled_peak_process_rss_bytes\":%s,\"measurement_window_prorated_kernel_write_bytes\":%s,\"whole_run_observed_intervals\":%d,\"whole_run_observed_interval_seconds\":%s,\"whole_run_time_weighted_process_cpu_percent\":%s,\"whole_run_sampled_peak_process_rss_bytes\":%s,\"whole_run_observed_kernel_write_bytes\":%s}", window_samples, window_elapsed, (window_elapsed > 0 ? window_cpu_time / window_elapsed : 0), window_rss * 1024, window_write_bytes, samples, elapsed, (elapsed > 0 ? cpu_time / elapsed : 0), rss * 1024, write_bytes }
   ' "${resource_samples}")"
-  lag="$(jq -s '
-    map(select(.phase == "concurrent"))
-    | if length < 2 or (last.phase_elapsed_seconds <= first.phase_elapsed_seconds) then {samples:length,lag_slope_records_per_second:null}
-      else {samples:length,lag_slope_records_per_second:((last.latest_source_lag_hint - first.latest_source_lag_hint) / (last.phase_elapsed_seconds - first.phase_elapsed_seconds))} end
-  ' "${progress}" 2>/dev/null || printf '{"samples":0,"lag_slope_records_per_second":null}')"
-  throughput="$(jq -n --slurpfile progress "${progress}" --slurpfile telemetry "${telemetry_samples}" '
-    ($progress | map(select(.phase == "concurrent" and (.timestamp_unix_milliseconds? != null))) | if length == 0 then null else {start:(map(.timestamp_unix_milliseconds) | min),end:(map(.timestamp_unix_milliseconds) | max)} end) as $window
+  pipeline_diagnostics="$(jq -n --slurpfile report "${report}" --slurpfile telemetry "${telemetry_samples}" '
+    ($report[0].mutations | {start:.measurement_window_started_unix_milliseconds,end:.measurement_window_ended_unix_milliseconds}) as $window
     | if $window == null then {measurement:"missing-driver-phase-wall-clock",samples:0}
       else ($telemetry | map(select(.timestamp_unix_milliseconds >= $window.start and .timestamp_unix_milliseconds <= $window.end)) | sort_by(.timestamp_unix_milliseconds)) as $samples
       | if ($samples | length) < 2 then {measurement:"insufficient-v1-summary-samples",samples:($samples | length),window:$window}
         else ($samples[0]) as $first | ($samples[-1]) as $last
-        | ["source_rows_total","source_bytes_total","selected_bytes_total","prepared_bytes_total","projected_bytes_total","sealed_bytes_total","checkpointed_source_rows_total","checkpointed_source_bytes_total"] as $required
+        | ["selected_bytes_total","prepared_bytes_total","projected_bytes_total","sealed_bytes_total","checkpointed_source_positions_total","checkpointed_source_payload_bytes_total"] as $required
         | [$required[] | select($first[.] == null or $last[.] == null)] as $missing
         | (($last.timestamp_unix_milliseconds - $first.timestamp_unix_milliseconds) / 1000) as $seconds
         | if ($missing | length) > 0 then {measurement:"incomplete-v1-summary-counters",samples:($samples | length),window:$window,missing:$missing}
           elif $seconds <= 0 then {measurement:"nonpositive-v1-summary-interval",samples:($samples | length),window:$window}
           else def rate($key): (($last[$key] - $first[$key]) / $seconds);
-            {measurement:"v1-summary-counter-delta",samples:($samples | length),window:$window,elapsed_seconds:$seconds,source_rows_per_second:rate("source_rows_total"),source_bytes_per_second:rate("source_bytes_total"),selected_bytes_per_second:rate("selected_bytes_total"),prepared_bytes_per_second:rate("prepared_bytes_total"),projected_bytes_per_second:rate("projected_bytes_total"),sealed_bytes_per_second:rate("sealed_bytes_total"),checkpointed_source_rows_per_second:rate("checkpointed_source_rows_total"),checkpointed_source_bytes_per_second:rate("checkpointed_source_bytes_total")}
+            {measurement:"v1-summary-counter-delta",samples:($samples | length),window:$window,elapsed_seconds:$seconds,selected_bytes_per_second:rate("selected_bytes_total"),prepared_bytes_per_second:rate("prepared_bytes_total"),projected_bytes_per_second:rate("projected_bytes_total"),sealed_bytes_per_second:rate("sealed_bytes_total"),checkpointed_source_positions_per_second:rate("checkpointed_source_positions_total"),checkpointed_source_payload_bytes_per_second:rate("checkpointed_source_payload_bytes_total")}
           end
         end
       end
   ' 2>/dev/null || printf '{"measurement":"unparseable-v1-summary","samples":0}')"
-  quality="$(jq -cn --argjson status "${driver_status}" --argjson lag "${lag}" --argjson throughput "${throughput}" --argjson limit "${lag_slope_limit}" --slurpfile report "${report}" '
-    ($report[0] // {}) as $r | ($lag.lag_slope_records_per_second) as $slope
-    | (($throughput.measurement == "v1-summary-counter-delta")
-        and (($throughput.source_rows_per_second // 0) > 0)
-        and (($throughput.source_bytes_per_second // 0) > 0)
-        and (($throughput.selected_bytes_per_second // 0) > 0)
-        and (($throughput.prepared_bytes_per_second // 0) > 0)
-        and (($throughput.projected_bytes_per_second // 0) > 0)
-        and (($throughput.sealed_bytes_per_second // 0) > 0)
-        and (($throughput.checkpointed_source_rows_per_second // 0) > 0)
-        and (($throughput.checkpointed_source_bytes_per_second // 0) > 0)) as $telemetry_complete
-    | {driver_exit:$status,result:($r.result // "missing-report"),correctness:($r.correctness.passed // false),workload:($r.workload_validity.passed // false),responsiveness:($r.responsiveness.passed // false),telemetry_complete:$telemetry_complete,lag_stationary:($slope != null and $slope <= $limit),classification:(if $status == 0 and ($r.result // "") == "pass" and $telemetry_complete and $slope != null and $slope <= $limit then "sustained" elif $telemetry_complete and (($r.correctness.passed // false) and ($r.workload_validity.passed // false)) then "capacity-limit" else "failure" end)}
+  quality="$(jq -cn --argjson status "${driver_status}" --argjson pipeline "${pipeline_diagnostics}" --slurpfile report "${report}" '
+    ($report[0] // {}) as $r
+    | ($pipeline.measurement == "v1-summary-counter-delta") as $telemetry_complete
+    | {driver_exit:$status,result:($r.result // "missing-report"),correctness:($r.correctness.passed // false),workload:($r.workload_validity.passed // false),responsiveness:($r.responsiveness.passed // false),telemetry_complete:$telemetry_complete,classification:(if $status == 0 and ($r.result // "") == "pass" and $telemetry_complete then "sustained" else "qualification-failure" end)}
   ' 2>/dev/null || printf '{"classification":"failure","result":"unparseable-report"}')"
   jq -cn --arg cell "${cell}" --arg report_path "${report}" --arg progress_path "${progress}" --arg telemetry_path "${telemetry_samples}" \
     --argjson definitions "${definitions}" --argjson recipes "${recipes}" --argjson workers "${workers}" \
-    --argjson memory_per_worker "${memory_per_worker}" --argjson query_memory_bytes "${query_memory_bytes}" --argjson mutation_workers "${mutation_workers}" --argjson offered_rate "${offered_rate}" --argjson object_bytes "${object_bytes}" \
-    --argjson store_bytes "${store_bytes}" --argjson resources "${resources}" --argjson lag "${lag}" --argjson throughput "${throughput}" \
+    --argjson memory_per_worker "${memory_per_worker}" --argjson query_memory_bytes "${query_memory_bytes}" --argjson mutation_workers "${mutation_workers}" --argjson object_bytes "${object_bytes}" \
+    --argjson store_bytes "${store_bytes}" --argjson resources "${resources}" --argjson pipeline_diagnostics "${pipeline_diagnostics}" \
     --argjson quality "${quality}" --slurpfile report "${report}" '
-      ($report[0] // {}) as $r | ($workers * $memory_per_worker) as $pipeline_memory_bytes | ($pipeline_memory_bytes / 268435456) as $memory_256_mib_units | ($r.mutations // {}) as $m
-      | {cell:$cell,logical_definitions:$definitions,qualified_definitions:($r.qualified_definition_count // 0),physical_recipes:$recipes,definition_creation_seconds:($r.definition_creation_seconds // null),definition_creation_per_second:(if ($r.definition_creation_seconds // 0) > 0 then ($definitions / $r.definition_creation_seconds) else null end),qualified_definition_activation_seconds:($r.qualified_definition_activation_seconds // null),indexing_cores:$workers,memory_per_core_bytes:$memory_per_worker,pipeline_memory_bytes:$pipeline_memory_bytes,query_memory_bytes:$query_memory_bytes,mutation_workers:$mutation_workers,mutation_record_minimum_bytes:$object_bytes,offered_operations_per_second:$offered_rate,offered_operations:($m.offered_operations // 0),accepted_operations:($m.accepted_operations // 0),accepted_operations_per_second:($m.accepted_operations_per_second // 0),accepted_source_bytes:($m.accepted_bytes // 0),accepted_source_bytes_per_second:($m.accepted_bytes_per_second // 0),runtime_throughput:$throughput,indexed_source_rows_per_second:($throughput.checkpointed_source_rows_per_second // null),indexed_source_rows_per_second_per_core:(($throughput.checkpointed_source_rows_per_second // 0) / $workers),indexed_source_rows_per_second_per_256_mib:(($throughput.checkpointed_source_rows_per_second // 0) / $memory_256_mib_units),accepted_operations_per_second_per_core:(($m.accepted_operations_per_second // 0) / $workers),accepted_operations_per_second_per_256_mib:(($m.accepted_operations_per_second // 0) / $memory_256_mib_units),indexed_end_to_end_operations_per_second:(if (($m.elapsed_seconds // 0) + ($r.drain_seconds // 0)) > 0 then (($m.accepted_operations // 0) / (($m.elapsed_seconds // 0) + ($r.drain_seconds // 0))) else 0 end),drain_seconds:($r.drain_seconds // null),concurrent_query_schedule_to_response:($r.concurrent.schedule_to_response // null),concurrent_query_dispatch_to_response:($r.concurrent.dispatch_to_response // null),publication_visibility_lag:($m.publication_visibility_lag // null),lag:$lag,resources:$resources,durable_store_bytes:$store_bytes,report_path:$report_path,progress_path:$progress_path,telemetry_path:$telemetry_path,quality:$quality,raw_report:$r}
+      ($report[0] // {}) as $r | ($workers * $memory_per_worker) as $pipeline_memory_bytes | ($r.mutations // {}) as $m
+      | {cell:$cell,logical_definitions:$definitions,qualified_definitions:($r.qualified_definition_count // 0),physical_recipes:$recipes,definition_creation_seconds:($r.definition_creation_seconds // null),definition_creation_per_second:(if ($r.definition_creation_seconds // 0) > 0 then ($definitions / $r.definition_creation_seconds) else null end),qualified_definition_activation_seconds:($r.qualified_definition_activation_seconds // null),indexing_cores:$workers,memory_per_core_bytes:$memory_per_worker,pipeline_memory_bytes:$pipeline_memory_bytes,query_memory_bytes:$query_memory_bytes,mutation_workers:$mutation_workers,mutation_record_minimum_bytes:$object_bytes,target_data_operations_per_second:$m.target_data_operations_per_second,measurement_window_started_unix_milliseconds:$m.measurement_window_started_unix_milliseconds,measurement_window_ended_unix_milliseconds:$m.measurement_window_ended_unix_milliseconds,load_window_seconds:$m.load_window_seconds,total_until_all_terminal_seconds:$m.total_until_all_terminal_seconds,response_drain_seconds:$m.response_drain_seconds,scheduled_batches:$m.scheduled_batches,scheduler_deadline_missed_batches:$m.scheduler_deadline_missed_batches,scheduler_deadline_missed_data_operations:$m.scheduler_deadline_missed_data_operations,client_queue_enqueued_batches:$m.client_queue_enqueued_batches,client_queue_dropped_batches:$m.client_queue_dropped_batches,scheduled_data_operations:$m.scheduled_data_operations,client_queue_enqueued_data_operations:$m.client_queue_enqueued_data_operations,fully_successful_batches:$m.fully_successful_batches,structurally_valid_batches_with_operation_failures:$m.structurally_valid_batches_with_operation_failures,indeterminate_batches:$m.indeterminate_batches,successful_data_operations:$m.successful_data_operations,failed_data_operations:$m.failed_data_operations,indeterminate_data_operations:$m.indeterminate_data_operations,successful_data_operations_in_window:$m.successful_data_operations_in_window,successful_data_operations_after_window:$m.successful_data_operations_after_window,successful_probe_operations:$m.successful_probe_operations,failed_probe_operations:$m.failed_probe_operations,indeterminate_probe_operations:$m.indeterminate_probe_operations,successful_data_payload_bytes:$m.successful_data_payload_bytes,successful_data_payload_bytes_in_window:$m.successful_data_payload_bytes_in_window,successful_data_payload_bytes_after_window:$m.successful_data_payload_bytes_after_window,successful_probe_payload_bytes:$m.successful_probe_payload_bytes,scheduled_data_operations_per_second:$m.scheduled_data_operations_per_second,client_queue_enqueued_data_operations_per_second:$m.client_queue_enqueued_data_operations_per_second,successful_data_ingest_throughput_operations_per_second:$m.successful_data_ingest_throughput_operations_per_second,successful_data_ingest_throughput_payload_bytes_per_second:$m.successful_data_ingest_throughput_payload_bytes_per_second,structurally_valid_bulk_write_dispatch_to_response_latency:$m.structurally_valid_bulk_write_dispatch_to_response_latency,failure_classes:$m.failure_classes,failure_occurrences_omitted:$m.failure_occurrences_omitted,client_queue_capacity:$m.queue_capacity,minimum_sampled_client_queue_depth:$m.minimum_sampled_client_queue_depth,client_queue_depth_samples:$m.queue_depth_samples,sampled_client_queue_nonempty_ratio:$m.sampled_client_queue_nonempty_ratio,sampled_client_queue_empty_count:$m.sampled_client_queue_empty_count,visibility_probes_planned:$m.visibility_probes_planned,visibility_probes_with_successful_receipts:$m.visibility_probes_with_successful_receipts,visibility_probes_started:$m.visibility_probes_started,visibility_probes_succeeded:$m.visibility_probes_succeeded,visibility_probes_failed:$m.visibility_probes_failed,visibility_probe_failures:$m.visibility_probe_failures,visibility_probe_failures_omitted:$m.visibility_probe_failures_omitted,successful_receipt_to_probe_start_delay:$m.successful_receipt_to_probe_start_delay,probe_start_to_query_visibility_latency:$m.probe_start_to_query_visibility_latency,successful_receipt_to_query_visibility_latency:$m.successful_receipt_to_query_visibility_latency,index_pipeline_diagnostics:$pipeline_diagnostics,post_load:($r.post_load // null),concurrent_query_successful_schedule_to_response_latency:$r.concurrent.successful_schedule_to_response_latency,concurrent_query_successful_dispatch_to_response_latency:$r.concurrent.successful_dispatch_to_response_latency,resources:$resources,durable_store_bytes:$store_bytes,report_path:$report_path,progress_path:$progress_path,telemetry_path:$telemetry_path,quality:$quality}
     ' >>"${summary_rows}"
   jq -r '.classification' <<<"${quality}"
 }
@@ -488,14 +506,14 @@ for definitions in "${definitions_values[@]}"; do
           fi
           selected_configurations=$((selected_configurations + 1))
           reached_limit=0
-          for offered_rate in "${rates[@]}"; do
+          for target_data_rate in "${rates[@]}"; do
           if ((definitions >= catalog_only_at_or_above)) \
-            && ! awk -v current="${offered_rate}" -v catalog="${catalog_rate}" 'BEGIN { exit !(current == catalog) }'
+            && ! awk -v current="${target_data_rate}" -v catalog="${catalog_rate}" 'BEGIN { exit !(current == catalog) }'
           then
             continue
           fi
           ((reached_limit == 0)) || break
-          cell="d${definitions}-p${recipes}-w${workers}-m${memory_per_worker}-b${object_bytes}-r${offered_rate//./_}-cw${mutation_workers}"
+          cell="d${definitions}-p${recipes}-w${workers}-m${memory_per_worker}-b${object_bytes}-r${target_data_rate//./_}-cw${mutation_workers}"
           active_cell="${run_dir}/${cell}"; active_work="${work_root}/${run_id}/${cell}"
           qualification_disk_ledger_check
           mkdir -p "${active_cell}" "${active_work}"/{state,metadata,wal,payload,scratch,cache,tmp}; chmod -R 0700 "${active_cell}" "${active_work}"
@@ -516,7 +534,7 @@ for definitions in "${definitions_values[@]}"; do
           rm -f -- "${client_secret_file}"
           report="${active_cell}/report.json"; progress="${active_cell}/driver-progress.jsonl"
           set +e
-          KELDRA_INDEX_CONTENTION_ENDPOINTS="http://127.0.0.1:${port}" KELDRA_INDEX_CONTENTION_TENANT="${tenant}" KELDRA_INDEX_CONTENTION_BUCKET="${bucket}" KELDRA_INDEX_CONTENTION_CLIENT_ID="${client_id}" KELDRA_INDEX_CONTENTION_CLIENT_SECRET="${client_secret}" KELDRA_INDEX_CONTENTION_SERVER_SOURCE_COMMIT="${source_commit}" KELDRA_INDEX_CONTENTION_IMAGE="qualification-kit:${source_commit}" KELDRA_INDEX_CONTENTION_TOPOLOGY=single-node KELDRA_INDEX_CONTENTION_DURABILITY=LOCAL KELDRA_INDEX_CONTENTION_DEFINITION_COUNT="${definitions}" KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT="${recipes}" KELDRA_INDEX_CONTENTION_BASELINE_SECONDS="${baseline_seconds}" KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS="${concurrent_seconds}" KELDRA_INDEX_CONTENTION_POST_SECONDS="${post_seconds}" KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND="${offered_rate}" KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES="${object_bytes}" KELDRA_INDEX_CONTENTION_MUTATION_WORKERS="${mutation_workers}" KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=32 KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH="$((mutation_workers * 8))" KELDRA_INDEX_CONTENTION_QUERY_RATE="${query_rate}" KELDRA_INDEX_CONTENTION_QUERY_MAX_IN_FLIGHT="${query_max_in_flight}" KELDRA_INDEX_CONTENTION_REQUEST_TIMEOUT_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_DRAIN_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=2000 KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_OUTPUT="${report}" KELDRA_INDEX_CONTENTION_PROGRESS_JSONL="${progress}" "${kit_root}/bin/index-contention-qualification" >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log"
+          KELDRA_INDEX_CONTENTION_ENDPOINTS="http://127.0.0.1:${port}" KELDRA_INDEX_CONTENTION_TENANT="${tenant}" KELDRA_INDEX_CONTENTION_BUCKET="${bucket}" KELDRA_INDEX_CONTENTION_CLIENT_ID="${client_id}" KELDRA_INDEX_CONTENTION_CLIENT_SECRET="${client_secret}" KELDRA_INDEX_CONTENTION_SERVER_SOURCE_COMMIT="${source_commit}" KELDRA_INDEX_CONTENTION_IMAGE="qualification-kit:${source_commit}" KELDRA_INDEX_CONTENTION_TOPOLOGY=single-node KELDRA_INDEX_CONTENTION_DURABILITY=LOCAL KELDRA_INDEX_CONTENTION_DEFINITION_COUNT="${definitions}" KELDRA_INDEX_CONTENTION_PHYSICAL_RECIPE_COUNT="${recipes}" KELDRA_INDEX_CONTENTION_BASELINE_SECONDS="${baseline_seconds}" KELDRA_INDEX_CONTENTION_CONCURRENT_SECONDS="${concurrent_seconds}" KELDRA_INDEX_CONTENTION_POST_SECONDS="${post_seconds}" KELDRA_INDEX_CONTENTION_TARGET_DATA_OPERATIONS_PER_SECOND="${target_data_rate}" KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES="${object_bytes}" KELDRA_INDEX_CONTENTION_MUTATION_WORKERS="${mutation_workers}" KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=32 KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH="$((mutation_workers * 8))" KELDRA_INDEX_CONTENTION_QUERY_RATE="${query_rate}" KELDRA_INDEX_CONTENTION_QUERY_MAX_IN_FLIGHT="${query_max_in_flight}" KELDRA_INDEX_CONTENTION_REQUEST_TIMEOUT_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_DRAIN_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS=600 KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=2000 KELDRA_INDEX_CONTENTION_MAX_SUCCESSFUL_RECEIPT_TO_QUERY_VISIBILITY_P99_MILLISECONDS=30000 KELDRA_INDEX_CONTENTION_OUTPUT="${report}" KELDRA_INDEX_CONTENTION_PROGRESS_JSONL="${progress}" "${kit_root}/bin/index-contention-qualification" >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log"
           driver_status=$?
           set -e
           store_bytes="$(du -sb "${active_work}/metadata" "${active_work}/payload" "${active_work}/wal" 2>/dev/null | awk '{total += $1} END {print total + 0}')"
@@ -524,9 +542,9 @@ for definitions in "${definitions_values[@]}"; do
           telemetry_samples="${active_cell}/v1-summary.jsonl"
           extract_v1_telemetry "${active_cell}/server.log" "${telemetry_samples}"
           [[ -s "${report}" ]] || printf '{"result":"missing-report"}\n' >"${report}"
-          classification="$(summarize_cell "${cell}" "${report}" "${progress}" "${active_cell}/server-resources.tsv" "${telemetry_samples}" "${definitions}" "${recipes}" "${workers}" "${memory_per_worker}" "${offered_rate}" "${object_bytes}" "${driver_status}" "${store_bytes}")"
+          classification="$(summarize_cell "${cell}" "${report}" "${progress}" "${active_cell}/server-resources.tsv" "${telemetry_samples}" "${definitions}" "${recipes}" "${workers}" "${memory_per_worker}" "${target_data_rate}" "${object_bytes}" "${driver_status}" "${store_bytes}")"
           printf '%s\n' "${classification}" >"${active_cell}/status.txt"
-          case "${classification}" in sustained) ;; capacity-limit) reached_limit=1 ;; *) fatal_cells=$((fatal_cells + 1)); reached_limit=1 ;; esac
+          case "${classification}" in sustained) ;; *) fatal_cells=$((fatal_cells + 1)); reached_limit=1 ;; esac
           if [[ "${keep_work}" == 0 ]]; then remove_cell_work "${active_work}"; fi
           qualification_disk_ledger_check
           active_work=""; active_cell=""; port=$((port + 2))
@@ -541,7 +559,7 @@ done
   echo "scale shard ${shard_index}/${shard_count} selected no configurations" >&2
   exit 2
 }
-jq -s --arg run_id "${run_id}" --arg mode "${mode}" --arg source_commit "${source_commit}" --arg harness_commit "${harness_commit}" --argjson query_memory_bytes "${query_memory_bytes}" --argjson mutation_workers "${mutation_workers}" --argjson shard_index "${shard_index}" --argjson shard_count "${shard_count}" --argjson selected_configurations "${selected_configurations}" --argjson total_configurations "${configuration_index}" --argjson fatal_cells "${fatal_cells}" --slurpfile capability "${run_dir}/public-query-capabilities/report.json" '{schema:"keldra.index-v1-ssd-scale.v1",run_id:$run_id,mode:$mode,server_source_commit:$source_commit,harness_commit:$harness_commit,query_memory_bytes:$query_memory_bytes,mutation_workers:$mutation_workers,shard_index:$shard_index,shard_count:$shard_count,selected_configurations:$selected_configurations,total_configurations:$total_configurations,public_query_capabilities:$capability[0],fatal_cells:$fatal_cells,cells:.}' "${summary_rows}" >"${run_dir}/report.json"
+jq -s --arg run_id "${run_id}" --arg mode "${mode}" --arg source_commit "${source_commit}" --arg harness_commit "${harness_commit}" --argjson query_memory_bytes "${query_memory_bytes}" --argjson mutation_workers "${mutation_workers}" --argjson shard_index "${shard_index}" --argjson shard_count "${shard_count}" --argjson selected_configurations "${selected_configurations}" --argjson total_configurations "${configuration_index}" --argjson fatal_cells "${fatal_cells}" --slurpfile capability "${run_dir}/public-query-capabilities/report.json" '{schema:"keldra.index-v1-ssd-scale.v2",run_id:$run_id,mode:$mode,server_source_commit:$source_commit,harness_commit:$harness_commit,query_memory_bytes:$query_memory_bytes,mutation_workers:$mutation_workers,shard_index:$shard_index,shard_count:$shard_count,selected_configurations:$selected_configurations,total_configurations:$total_configurations,public_query_capabilities:$capability[0],fatal_cells:$fatal_cells,cells:.}' "${summary_rows}" >"${run_dir}/report.json"
 qualification_disk_ledger_check
 archive_path="${results_root}/${run_id}.results.tar.gz"
 tar -C "${results_root}" -czf "${archive_path}" "${run_id}"

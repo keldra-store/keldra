@@ -26,7 +26,7 @@ kit runner described below.
 
 The Docker and split-topology commands in this section preserve evidence from
 the superseded external-builder architecture. They are not v1 release
-qualification and must not be used to set current throughput or correctness
+qualification and must not be used to set current performance or correctness
 claims. The retained single-node and three-node wrappers now execute only their
 non-index release phases, so the command blocks below are archival evidence,
 not runnable index qualification.
@@ -55,10 +55,10 @@ keeps every input, durable database, log, raw report, and result archive below
 per worker. Sustained defaults run three non-duplicating axes: the P1 logical
 ladder D1,D64,D1K,D10K,D250K at the largest resource cell; the D64 physical
 ladder P1,P4,P16,P64 at that same resource cell; and D64/P1 with W1,W2,W4,W8
-at 128/256 MiB per worker. The D250K catalog cell uses one configurable offered
-rate (`KELDRA_V1_SCALE_CATALOG_RATE`) rather than repeating the expensive
-admission step at every rate; `qualify-index-catalog.sh` provides the separate
-create/restart catalog qualification. This avoids an uninformative full
+at 128/256 MiB per worker. The D250K catalog cell uses one configurable target
+data-operation rate (`KELDRA_V1_SCALE_CATALOG_RATE`) rather than repeating the
+expensive admission step at every rate; `qualify-index-catalog.sh` provides the
+separate create/restart catalog qualification. This avoids an uninformative full
 Cartesian product while varying each independent cause:
 
 ```text
@@ -85,17 +85,17 @@ cd ~/keldra_experiments/kit
 KELDRA_V1_SCALE_MODE=sustained ./qualify-index-v1-ssd-scale.sh
 ```
 
-Each offered-rate cell starts with fresh durable state and walks the ascending
+Each target-data-rate cell starts with fresh durable state and walks the ascending
 open-loop rate ladder (smoke: 100, 1,000; sustained: 1,000, 5,000, 10,000,
-20,000, 40,000 operations/s by default). It stops an axis at the first
-capacity-limit result, but treats correctness/workload failure as a failed run,
-not a capacity figure. A sustainable cell requires the public correctness and
-responsiveness gates plus a concurrent-phase source-lag slope no greater than
-`KELDRA_V1_SCALE_MAX_LAG_SLOPE_RECORDS_PER_SECOND` (default 1). The small
-object floor uses at least 1 KiB payloads. Sustained mode additionally runs a
-96 KiB pathological source-object stream at D1/P1 and the largest resource
-cell; it deliberately does not multiply that payload into D/P scale. Configure
-both through `KELDRA_V1_SCALE_OBJECT_SIZE_MATRIX`.
+20,000, 40,000 data operations/s by default). It stops an axis at the first
+failed qualification cell. The preceding passing cell is the highest observed
+sustainable target in that finite ladder; the runner does not mislabel a failed
+cell as a measured hardware-capacity limit. A sustainable cell requires the
+public correctness, workload-shape, and responsiveness gates. The small object
+floor uses at least 1 KiB payloads. Sustained mode additionally runs a 96 KiB
+pathological source-object stream at D1/P1 and the largest resource cell; it
+deliberately does not multiply that payload into D/P scale. Configure both
+through `KELDRA_V1_SCALE_OBJECT_SIZE_MATRIX`.
 
 Before any performance cell, a separate fresh-state public-API preflight proves
 exact and range predicates, explicit ordering, facets, aggregates, and
@@ -103,27 +103,45 @@ full-text search. Its state is destroyed before the D/P/W/memory matrix, so
 those extra capability recipes cannot contaminate the measured physical-work
 axis. Failure aborts the run and its report is embedded in the final evidence.
 
-Each summary reports offered, accepted, checkpointed-source, and end-to-end
-indexed operations/s; accepted source bytes/s; both accepted and checkpointed
-source rates per indexing core and per 256 MiB; lag
-slope; drain; concurrent query latency; publication visibility; sampled
-CPU/RSS; process write bytes (which cover WAL and RocksDB store writes); and
-final durable-store bytes. It separately records definition creation seconds,
+Each v2 summary reports the target and actual scheduled data-operation rates,
+mutation-scheduler deadline misses, client-queue admission and drop counts, and disjoint fully successful,
+structurally valid with operation failures, and indeterminate batch outcomes.
+Per-operation outcomes reconcile as successful, failed, or indeterminate;
+successful receipts are split between the measurement window and response
+drain. Successful data-operation and payload-byte throughput use only the fixed
+measurement window. A structurally valid `BulkWrite` response with failures
+does not erase successful sibling operations from the measurement. Projection
+pipeline activity is reported separately as
+checkpointed source-position and stage-byte diagnostics; it is never presented
+as data-ingest throughput.
+The summary also reports non-overlapping post-load timings, successful query
+latencies, probe coverage, observer-queue delay, active query-observation time,
+and their end-to-end successful-receipt-to-query-visibility latency. It records
+query success rate from correctness-valid completions inside the fixed phase
+window; latency distributions include every correctness-valid scheduled query,
+including responses which complete during the separately reported drain.
+Mutation response latency likewise includes every structurally valid response.
+It records
+interval-derived, time-weighted process CPU and sampled peak RSS for the load
+window separately from whole-run samples. Intervals crossing a load-window
+boundary are time-prorated for CPU and kernel write-byte attribution and named
+as estimates rather than exact boundary counters. Final durable-store bytes are
+reported separately. It also records definition creation seconds,
 definitions created/s, and recipe-spanning qualified-activation seconds, so
-D250K catalog admission is never folded into steady ingestion. The runner never estimates projected-byte
-throughput from input payload size. A development record may explicitly mark
+D250K catalog admission is never folded into the load window. The runner never estimates projected-byte
+rates from input payload size. A development record may explicitly mark
 that value `null`, with its missing telemetry provenance, but it is not
 qualification evidence. A final v1 qualification requires two
-concurrent-phase `keldra_index_v1_summary` samples and derives source,
-selected, prepared, projected, sealed, and checkpointed rows/bytes per second
-from their cumulative counters. Every required rate must be positive; missing,
-malformed, unchanged, or regressing summary evidence fails the cell. Raw driver
+concurrent-phase `keldra_index_v1_summary` samples and derives selected,
+prepared, projected, sealed, and checkpointed source-position/payload-byte
+rates from their cumulative counters. These are diagnostic stage rates, not
+object throughput; missing or malformed counter evidence fails the cell. Raw driver
 progress, process samples, VM samples, server logs, and the complete public
 report remain beside the summary and are packaged as a SHA-256 sidecar archive.
 
 Catalog cardinality D250K is qualified separately with
 `scripts/qualify-index-catalog.sh`; the contention matrix does not conflate
-catalog admission/restart cost with sustained physical indexing throughput.
+catalog admission/restart cost with sustained projection pipeline activity.
 
 ## Historical Docker comparison evidence (continued)
 
@@ -169,7 +187,7 @@ KELDRA_IMAGE=keldra:qa-<commit> \
 KELDRA_INDEX_CONTENTION_MODE=sustained \
 KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX=1,64,256,640 \
 KELDRA_INDEX_CONTENTION_MUTATION_WORKLOAD=projection-preserving \
-KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=100 \
+KELDRA_INDEX_CONTENTION_TARGET_DATA_OPERATIONS_PER_SECOND=100 \
   ./scripts/qualify-index-contention.sh
 ```
 
@@ -187,18 +205,18 @@ small-record corpus. Set it together with the batch size and worker count to
 reproduce large valid `BulkWrite` requests; the report records the value so a
 large-payload run cannot be compared silently with the default workload.
 
-To measure sustainable publication capacity instead of saturating ingress, set
-an explicit offered rate. The rate counts every public mutation operation,
-including the per-batch marker used for visibility measurement. Requests are
-scheduled open-loop; a full client queue is recorded as a dropped mutation
-batch and fails workload validity rather than silently lowering the offered
-rate:
+To measure sustainable publication capacity instead of saturating the request
+path, set an explicit target data-operation rate. This rate counts only the
+mutable data operations; the per-batch probe operation used for visibility is
+reported separately. Requests are scheduled open-loop; a full client queue is
+recorded as a dropped mutation batch and fails workload validity rather than
+silently lowering the scheduled rate:
 
 ```bash
 KELDRA_IMAGE=keldra:qa-<commit> \
 KELDRA_INDEX_CONTENTION_MODE=sustained \
 KELDRA_INDEX_CONTENTION_DEFINITION_MATRIX=1,64,1000 \
-KELDRA_INDEX_CONTENTION_MUTATION_RATE_OPERATIONS_PER_SECOND=1000 \
+KELDRA_INDEX_CONTENTION_TARGET_DATA_OPERATIONS_PER_SECOND=1000 \
   ./scripts/qualify-index-contention.sh
 ```
 
@@ -289,10 +307,12 @@ watch -n 2 cat ../../releases/keldra/index-contention/latest/status.json
 `run.json` records the source commit, immutable image ID and revision, image
 platform, topology, matrix, phase durations, host resources, and Docker resource
 allocation. It also records mutation workers, batch size, queue depth, and the
-optional fixed offered operation rate, mutation workload, plus
+optional target data-operation rate, mutation workload, plus
 the request, drain, visibility polling and total
 visibility-observation timeouts, sampling interval, and both absolute p99
-acceptance bounds. Every cell retains the client report, client stdout/stderr, and
+latency bounds. The visibility bound is configured with
+`KELDRA_INDEX_CONTENTION_MAX_SUCCESSFUL_RECEIPT_TO_QUERY_VISIBILITY_P99_MILLISECONDS`.
+Every cell retains the client report, client stdout/stderr, and
 server logs. Docker cells use `container-resources.jsonl` for CPU, memory,
 network, block-I/O, and process counters; native cells use
 `process-resources.jsonl` for host-reported server CPU and RSS.
@@ -307,13 +327,15 @@ not each partition producer's current node assignment. The three-node report
 therefore records those public observations and the assignment-observability
 limitation; it must not infer per-node producer counts from cluster-wide D or P.
 
-When a baseline is supplied, `comparison.json` gives baseline, candidate, and
+When a baseline is supplied, the v2 `comparison.json` gives baseline, candidate, and
 candidate-minus-baseline p50/p95/p99/max values for concurrent ordinary-query
-schedule-to-response latency, dispatched service latency, and
-end-to-end mutation-acceptance-to-query-visibility lag. That last measurement
-includes polling and query observation, so it is not pure server publication
-latency. Raw reports remain the authority for every phase and correctness
-counter.
+schedule-to-response latency, dispatched service latency, observer-queue delay,
+active query-observation latency, and end-to-end
+successful-mutation-receipt-to-query-visibility latency. The components prevent local
+observer contention from being mistaken for server indexing delay; the active
+measurement still includes polling resolution and query execution, so it is not
+pure server publication latency. Raw reports remain the authority for every
+phase and correctness counter.
 
 The final drain authority is exact public `HeadObject` path/version state
 compared with every index definition, plus a complete initial build, no rebuild,
@@ -337,29 +359,36 @@ can consume substantial disk.
 
 Run single-node and three-node matrices separately. A valid performance claim
 requires the sustained matrix, equivalent hardware and configuration for every
-candidate, and comparison of the raw per-cell query and publication-lag
-distributions. Smoke results must never be reported as sustained evidence.
+candidate, and comparison of the raw per-cell query and successful-receipt-to-query
+visibility distributions. Smoke results must never be reported as sustained
+evidence.
 
 For this harness, “queries remained responsive” means the open-loop driver
-recorded zero dropped schedules, request errors, and timeouts, every completed
-query satisfied its stable-result oracle, and every request stayed within the
-configured per-request timeout. Publication probes use that timeout for each
+recorded zero scheduler deadline misses, client-concurrency rejections, request
+errors, and timeouts, and every request stayed within the configured per-request
+timeout. Stable-result oracle mismatches are a separate correctness failure and
+still fail the overall qualification. Visibility probes use that timeout for each
 ordinary query RPC, but may continue polling for the separate total observation
 timeout. The latter defaults to the 600-second drain timeout and is configured
 with `KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS`; a slow
-publication is therefore measured rather than incorrectly classified as one
+visibility observation is therefore measured rather than incorrectly classified as one
 slow RPC after 30 seconds. Samples rotate across definitions by sample ordinal,
-independently of canary IDs and the sampling interval. Reports retain up to 16
+independently of canary IDs and the sampling interval. Observer concurrency is
+bounded and its queue delay is reported separately rather than silently folded
+into active observation time. Sampled probes use unique, non-overwritten object
+paths, so a later update cannot make the exact sampled version unobservable.
+Planned probes, successful probe receipts, starts, successes, and failures are
+all reported to expose missing observations. Reports retain up to 16
 failed sample identities and bounded error messages, plus an omitted count.
 
 The p50/p95/p99 values are measured evidence, not an SLO claim. The wrapper
 enforces a configurable concurrent-query p99 gate, defaulting to 2,000 ms, and
-a publication-visibility p99 gate, defaulting to 30,000 ms. Setting
+a successful-receipt-to-query-visibility p99 gate, defaulting to 30,000 ms. Setting
 `KELDRA_INDEX_CONTENTION_MAX_CONCURRENT_QUERY_P99_MILLISECONDS=disabled` removes
 that absolute latency assertion and weakens the responsiveness result, although
 the matrix distributions are still recorded. Likewise,
-`KELDRA_INDEX_CONTENTION_MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS=disabled`
-removes only the publication p99 assertion; visibility sample completeness and
+`KELDRA_INDEX_CONTENTION_MAX_SUCCESSFUL_RECEIPT_TO_QUERY_VISIBILITY_P99_MILLISECONDS=disabled`
+removes only the successful-receipt-to-query-visibility p99 assertion; visibility sample completeness and
 final exact convergence remain mandatory. A single matrix pass exposes scaling
 behavior;
 statistically credible release comparison requires repeated sustained runs on

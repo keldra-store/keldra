@@ -59,8 +59,8 @@ const QUERY_LIMIT: u32 = 1_000;
 const FRESHNESS_PROBE_PARTITION: u64 = PARTITION_COUNT;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const EXACT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
-const MIN_RELEASE_INGEST_OBJECTS_PER_SECOND: f64 = 3_000.0;
-const MIN_RELEASE_INDEX_OBJECTS_PER_SECOND: f64 = 1_000.0;
+const MIN_RELEASE_INGEST_OPERATIONS_PER_SECOND: f64 = 3_000.0;
+const MAX_INITIAL_CONVERGENCE_SECONDS_PER_1K_OPERATIONS: f64 = 1.0;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -136,8 +136,7 @@ struct QualificationReport {
     max_anonymous_growth_bytes: Option<u64>,
     observed_peak_rss_growth_bytes: Option<u64>,
     observed_peak_anonymous_growth_bytes: Option<u64>,
-    accepted_objects_per_second: f64,
-    source_complete_objects_per_second: f64,
+    successful_initial_ingest_operations_per_second: f64,
     initial_commit_revision: u64,
     final_commit_revision: u64,
     timings: Timings,
@@ -324,9 +323,9 @@ async fn main() -> Result<()> {
 
     let mut timings = Timings::default();
     set_phase(&monitor, Phase::Ingest);
-    // This starts before the first request, so the measured time to a complete
-    // commit_revision is conservatively no shorter than the RFC's first-accepted
-    // object boundary.
+    // Include client construction, worker startup, payload generation, requests,
+    // and receipt handling: this is end-to-end driver ingest time, not a narrower
+    // server-service-time estimate.
     let first_object_started = Instant::now();
     let started = first_object_started;
     let initial = write_ranges(
@@ -376,17 +375,22 @@ async fn main() -> Result<()> {
         source_complete_commit_revision_observed,
         "first complete commit_revision did not prove zero lag for every source"
     );
-    let accepted_objects_per_second = config.records as f64 / timings.ingest_seconds;
-    let source_complete_objects_per_second =
-        config.records as f64 / timings.first_complete_commit_revision_seconds;
+    let successful_initial_ingest_operations_per_second =
+        config.records as f64 / timings.ingest_seconds;
+    let maximum_initial_convergence_seconds = config.records as f64 / 1_000.0
+        * MAX_INITIAL_CONVERGENCE_SECONDS_PER_1K_OPERATIONS;
     if config.require_performance_targets {
         ensure!(
-            accepted_objects_per_second >= MIN_RELEASE_INGEST_OBJECTS_PER_SECOND,
-            "accepted object rate {accepted_objects_per_second:.3}/s is below the release target {MIN_RELEASE_INGEST_OBJECTS_PER_SECOND:.3}/s"
+            successful_initial_ingest_operations_per_second
+                >= MIN_RELEASE_INGEST_OPERATIONS_PER_SECOND,
+            "successful initial-ingest throughput {successful_initial_ingest_operations_per_second:.3} operations/s is below the release target {MIN_RELEASE_INGEST_OPERATIONS_PER_SECOND:.3} operations/s"
         );
         ensure!(
-            source_complete_objects_per_second >= MIN_RELEASE_INDEX_OBJECTS_PER_SECOND,
-            "source-complete index rate {source_complete_objects_per_second:.3}/s is below the release target {MIN_RELEASE_INDEX_OBJECTS_PER_SECOND:.3}/s"
+            timings.first_complete_commit_revision_seconds <= maximum_initial_convergence_seconds,
+            "initial corpus convergence took {:.3}s, above the {:.3}s release limit for {} objects",
+            timings.first_complete_commit_revision_seconds,
+            maximum_initial_convergence_seconds,
+            config.records,
         );
     }
 
@@ -536,7 +540,7 @@ async fn main() -> Result<()> {
         source_complete_commit_revision_observed,
     )?;
     let report = QualificationReport {
-        schema: "keldra.index-resource-qualification.v1",
+        schema: "keldra.index-resource-qualification.v2",
         records: config.records,
         indexed_fields: data::FIELD_COUNT,
         partitions: PARTITION_COUNT,
@@ -553,8 +557,7 @@ async fn main() -> Result<()> {
         max_anonymous_growth_bytes: config.max_anonymous_growth_bytes,
         observed_peak_rss_growth_bytes,
         observed_peak_anonymous_growth_bytes,
-        accepted_objects_per_second,
-        source_complete_objects_per_second,
+        successful_initial_ingest_operations_per_second,
         initial_commit_revision,
         final_commit_revision,
         timings,
@@ -866,7 +869,7 @@ fn qualification_evidence(
         timer_boundaries: TimerBoundaryEvidence {
             clock: "tokio::time::Instant monotonic elapsed time",
             ingest_seconds: TimerBoundary {
-                starts: "immediately before the first initial BulkWrite request",
+                starts: "immediately before the driver constructs and starts initial BulkWrite workers",
                 stops: "after every initial BulkWrite receipt is accepted",
             },
             initial_build_seconds: TimerBoundary {
@@ -874,7 +877,7 @@ fn qualification_evidence(
                 stops: "when one commit_revision proves zero lag through the observed tail of every topology source",
             },
             first_complete_commit_revision_seconds: TimerBoundary {
-                starts: "immediately before the first initial BulkWrite request",
+                starts: "immediately before the driver constructs and starts initial BulkWrite workers",
                 stops: "when one commit_revision proves zero lag through the observed tail of every topology source",
             },
             exact_verification_seconds: TimerBoundary {

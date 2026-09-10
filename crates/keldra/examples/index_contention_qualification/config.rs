@@ -50,7 +50,7 @@ pub struct Config {
     pub mutation_batch_size: usize,
     pub mutation_record_bytes: usize,
     pub mutation_queue_depth: usize,
-    pub mutation_rate_operations_per_second: Option<f64>,
+    pub target_data_operations_per_second: Option<f64>,
     pub query_rate: u64,
     pub query_max_in_flight: usize,
     pub baseline: Duration,
@@ -62,7 +62,7 @@ pub struct Config {
     pub visibility_observation_timeout: Duration,
     pub visibility_sample_every_batches: u64,
     pub max_concurrent_query_p99_ms: Option<f64>,
-    pub max_publication_visibility_p99_ms: Option<f64>,
+    pub max_successful_receipt_to_query_visibility_p99_ms: Option<f64>,
     pub output: Option<PathBuf>,
     pub progress_jsonl: Option<PathBuf>,
 }
@@ -86,7 +86,7 @@ pub struct PublicConfig {
     pub mutation_batch_size: usize,
     pub mutation_record_bytes: usize,
     pub mutation_queue_depth: usize,
-    pub mutation_rate_operations_per_second: Option<f64>,
+    pub target_data_operations_per_second: Option<f64>,
     pub query_rate_per_second: u64,
     pub query_max_in_flight: usize,
     pub baseline_seconds: u64,
@@ -98,7 +98,7 @@ pub struct PublicConfig {
     pub visibility_observation_timeout_seconds: u64,
     pub visibility_sample_every_batches: u64,
     pub max_concurrent_query_p99_ms: Option<f64>,
-    pub max_publication_visibility_p99_ms: Option<f64>,
+    pub max_successful_receipt_to_query_visibility_p99_ms: Option<f64>,
 }
 
 impl Config {
@@ -117,8 +117,8 @@ impl Config {
         let mutation_batch_size = number("MUTATION_BATCH_SIZE", 32)?;
         let mutation_record_bytes = number("MUTATION_RECORD_BYTES", 0)?;
         let mutation_queue_depth = number("MUTATION_QUEUE_DEPTH", 32)?;
-        let mutation_rate_operations_per_second =
-            optional_positive("MUTATION_RATE_OPERATIONS_PER_SECOND")?;
+        let target_data_operations_per_second =
+            optional_positive("TARGET_DATA_OPERATIONS_PER_SECOND")?;
         let query_rate = number("QUERY_RATE", 20)?;
         let query_max_in_flight = number("QUERY_MAX_IN_FLIGHT", 64)?;
         ensure!(!endpoints.is_empty(), "at least one endpoint is required");
@@ -157,8 +157,10 @@ impl Config {
         );
         let max_concurrent_query_p99_ms =
             optional_bound("MAX_CONCURRENT_QUERY_P99_MILLISECONDS", 2_000.0)?;
-        let max_publication_visibility_p99_ms =
-            optional_bound("MAX_PUBLICATION_VISIBILITY_P99_MILLISECONDS", 30_000.0)?;
+        let max_successful_receipt_to_query_visibility_p99_ms = optional_bound(
+            "MAX_SUCCESSFUL_RECEIPT_TO_QUERY_VISIBILITY_P99_MILLISECONDS",
+            30_000.0,
+        )?;
         ensure!(
             matches!(
                 (topology.as_str(), durability.as_str()),
@@ -194,7 +196,7 @@ impl Config {
             mutation_batch_size,
             mutation_record_bytes,
             mutation_queue_depth,
-            mutation_rate_operations_per_second,
+            target_data_operations_per_second,
             query_rate,
             query_max_in_flight,
             baseline: seconds("BASELINE_SECONDS", 30)?,
@@ -209,7 +211,7 @@ impl Config {
             )?,
             visibility_sample_every_batches,
             max_concurrent_query_p99_ms,
-            max_publication_visibility_p99_ms,
+            max_successful_receipt_to_query_visibility_p99_ms,
             output: env::var_os(name("OUTPUT")).map(PathBuf::from),
             progress_jsonl: env::var_os(name("PROGRESS_JSONL")).map(PathBuf::from),
         })
@@ -234,7 +236,7 @@ impl Config {
             mutation_batch_size: self.mutation_batch_size,
             mutation_record_bytes: self.mutation_record_bytes,
             mutation_queue_depth: self.mutation_queue_depth,
-            mutation_rate_operations_per_second: self.mutation_rate_operations_per_second,
+            target_data_operations_per_second: self.target_data_operations_per_second,
             query_rate_per_second: self.query_rate,
             query_max_in_flight: self.query_max_in_flight,
             baseline_seconds: self.baseline.as_secs(),
@@ -246,7 +248,8 @@ impl Config {
             visibility_observation_timeout_seconds: self.visibility_observation_timeout.as_secs(),
             visibility_sample_every_batches: self.visibility_sample_every_batches,
             max_concurrent_query_p99_ms: self.max_concurrent_query_p99_ms,
-            max_publication_visibility_p99_ms: self.max_publication_visibility_p99_ms,
+            max_successful_receipt_to_query_visibility_p99_ms: self
+                .max_successful_receipt_to_query_visibility_p99_ms,
         }
     }
 }

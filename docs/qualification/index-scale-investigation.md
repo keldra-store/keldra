@@ -10,6 +10,15 @@ by KELDRA-0020 and implementation in progress.
 > architecture uses partition-owned memory-first pipelines, shared physical
 > recipes, partition roots/checkpoints, and no legacy reader or builder path.
 
+> Measurement validity note: performance figures below produced by the
+> pre-v2 contention harness are retained only as historical diagnostic context.
+> Its “accepted” rate mixed data and probe operations, its “index” rate counted
+> journal positions rather than objects, and its visibility timer and load
+> window were not aligned. Those figures are invalid for throughput claims or
+> candidate comparisons. New evidence must use the v2 definitions in
+> `index-contention.md`; throughput is successful data-operation receipts in a
+> fixed load window, while drain, visibility, and pipeline activity are separate.
+
 This report explains why the superseded index runtime did not scale from one
 to many simultaneously affected logical definitions, and records the minimum
 architecture and qualification adopted for a tenfold scale increase. It is not
@@ -425,9 +434,10 @@ storage with fresh volumes:
 3. **Heterogeneous recipes:** vary field subsets, types, analyzers, source
    prefixes, facets, ordering, and dates. Work must track distinct matched
    recipes and emitted postings, with exact query parity for every definition.
-4. **Sustained keep-up:** run a fixed offered rate for at least 30 minutes.
-   Published lag must reach a stationary bound during ingestion; final drain
-   alone is not evidence of keeping pace.
+4. **Sustained keep-up:** run a fixed target data-operation rate for at least 30
+   minutes. Successful receipt throughput must sustain that target within the
+   fixed window, and successful-receipt-to-query-visibility latency must remain
+   bounded; final drain alone is not evidence of keeping pace.
 5. **Definition churn:** concurrently create, replace, and delete logical views;
    prove exact generation binding, reference accounting, and eventual orphan
    reclamation.
@@ -438,7 +448,7 @@ storage with fresh volumes:
    owner wait/hold, RocksDB writes, physical item/byte counts, memory, cache
    objects, and journal lag per phase.
 
-The primary success metric is physical work per accepted source mutation per
+The primary success metric is physical work per successful data operation per
 distinct matched recipe. Logical definition count is a control-plane dimension,
 not permission to repeat equivalent physical indexing work.
 

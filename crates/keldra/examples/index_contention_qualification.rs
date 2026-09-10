@@ -14,6 +14,9 @@ mod data;
 mod metrics;
 #[path = "index_contention_qualification/progress.rs"]
 mod progress;
+#[cfg(test)]
+#[path = "index_contention_qualification/tests.rs"]
+mod tests;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use config::{Config, MutationWorkload};
@@ -70,7 +73,7 @@ struct Report {
     baseline: QueryPhaseReport,
     concurrent: QueryPhaseReport,
     mutations: MutationReport,
-    drain_seconds: f64,
+    post_load: PostLoadReport,
     post: QueryPhaseReport,
     correctness: CorrectnessReport,
     workload_validity: WorkloadValidityReport,
@@ -95,18 +98,22 @@ struct TerminalFailure {
 
 #[derive(Debug, Default, Serialize)]
 struct QueryPhaseReport {
-    scheduling_window_seconds: f64,
-    completion_elapsed_seconds: f64,
-    offered_schedules_per_second: f64,
-    completed_queries_per_second: f64,
-    offered_schedules: u64,
-    completed: u64,
-    dropped_schedules: u64,
+    measurement_window_seconds: f64,
+    total_until_all_terminal_seconds: f64,
+    response_drain_seconds: f64,
+    actual_scheduled_queries_per_second: f64,
+    successful_queries_per_second: f64,
+    scheduled_queries: u64,
+    successful_queries: u64,
+    successful_queries_in_window: u64,
+    successful_queries_after_window: u64,
+    scheduler_deadline_misses: u64,
+    client_concurrency_rejections: u64,
     request_errors: u64,
     timeouts: u64,
     correctness_errors: u64,
-    schedule_to_response: LatencyReport,
-    dispatch_to_response: LatencyReport,
+    successful_schedule_to_response_latency: LatencyReport,
+    successful_dispatch_to_response_latency: LatencyReport,
     scheduling_lateness: LatencyReport,
     minimum_commit_revision: Option<u64>,
     maximum_commit_revision: Option<u64>,
@@ -118,42 +125,75 @@ struct QueryPhaseReport {
 #[derive(Debug, Default, Serialize)]
 struct MutationReport {
     load_mode: &'static str,
-    configured_operations_per_second: Option<f64>,
-    elapsed_seconds: f64,
-    offered_batches: u64,
-    submitted_batches: u64,
-    dropped_batches: u64,
-    offered_operations: u64,
-    accepted_batches: u64,
-    accepted_operations: u64,
-    accepted_bytes: u64,
-    accepted_operations_per_second: f64,
-    accepted_bytes_per_second: f64,
-    request_errors: u64,
+    target_data_operations_per_second: Option<f64>,
+    measurement_window_started_unix_milliseconds: u128,
+    measurement_window_ended_unix_milliseconds: u128,
+    load_window_seconds: f64,
+    total_until_all_terminal_seconds: f64,
+    response_drain_seconds: f64,
+    scheduled_batches: u64,
+    scheduler_deadline_missed_batches: u64,
+    client_queue_enqueued_batches: u64,
+    client_queue_dropped_batches: u64,
+    scheduled_data_operations: u64,
+    scheduler_deadline_missed_data_operations: u64,
+    client_queue_enqueued_data_operations: u64,
+    fully_successful_batches: u64,
+    structurally_valid_batches_with_operation_failures: u64,
+    successful_data_operations: u64,
+    successful_data_operations_in_window: u64,
+    successful_data_operations_after_window: u64,
+    successful_probe_operations: u64,
+    failed_data_operations: u64,
+    failed_probe_operations: u64,
+    successful_data_payload_bytes: u64,
+    successful_data_payload_bytes_in_window: u64,
+    successful_data_payload_bytes_after_window: u64,
+    successful_probe_payload_bytes: u64,
+    indeterminate_data_operations: u64,
+    indeterminate_probe_operations: u64,
+    scheduled_data_operations_per_second: f64,
+    client_queue_enqueued_data_operations_per_second: f64,
+    successful_data_ingest_throughput_operations_per_second: f64,
+    successful_data_ingest_throughput_payload_bytes_per_second: f64,
+    indeterminate_batches: u64,
     failure_classes: Vec<MutationFailureClass>,
     failure_occurrences_omitted: u64,
     failure_diagnostics_definition: &'static str,
     queue_capacity: usize,
-    minimum_sampled_queue_depth_while_producing: usize,
+    minimum_sampled_client_queue_depth: usize,
     queue_depth_samples: u64,
-    nonempty_queue_sample_ratio: f64,
-    queue_starvation_samples: u64,
-    request_latency: LatencyReport,
-    visibility_samples_requested: u64,
-    visibility_samples_completed: u64,
-    visibility_samples_skipped_busy: u64,
-    visibility_sample_errors: u64,
-    visibility_sample_failures: Vec<VisibilitySampleFailure>,
-    visibility_sample_failures_omitted: u64,
-    publication_visibility_lag: LatencyReport,
+    sampled_client_queue_nonempty_ratio: f64,
+    sampled_client_queue_empty_count: u64,
+    structurally_valid_bulk_write_dispatch_to_response_latency: LatencyReport,
+    visibility_probes_planned: u64,
+    visibility_probes_with_successful_receipts: u64,
+    visibility_probes_started: u64,
+    visibility_probes_succeeded: u64,
+    visibility_probes_failed: u64,
+    visibility_probe_failures: Vec<VisibilitySampleFailure>,
+    visibility_probe_failures_omitted: u64,
+    successful_receipt_to_probe_start_delay: LatencyReport,
+    probe_start_to_query_visibility_latency: LatencyReport,
+    successful_receipt_to_query_visibility_latency: LatencyReport,
     visibility_definition: &'static str,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct PostLoadReport {
+    /// Non-overlapping wall time after the concurrent query phase has reached
+    /// terminal responses, until correctness and convergence checks complete.
+    elapsed_seconds: f64,
+    outstanding_requests_and_sampled_visibility_seconds: f64,
+    credential_refresh_seconds: f64,
+    authoritative_state_read_seconds: f64,
+    final_index_convergence_seconds: f64,
 }
 
 #[derive(Debug, Serialize)]
 struct CorrectnessReport {
     passed: bool,
-    stable_oracle_checked_on_every_completed_query: bool,
-    final_canary_version_observed_by_every_qualified_definition: bool,
+    stable_oracle_checked_on_every_structurally_valid_query_response: bool,
     exact_mutable_versions_verified_by_every_qualified_definition: bool,
     final_freshness_healthy_by_every_qualified_definition: bool,
     advisory_zero_lag_verified_by_every_qualified_definition: Option<bool>,
@@ -166,17 +206,21 @@ struct WorkloadValidityReport {
     all_qualified_definitions_offered_in_every_phase: bool,
     sustained_nonempty_mutation_queue: bool,
     mutation_load_shape_valid: bool,
-    mutation_requests_complete_and_successful: bool,
+    all_enqueued_mutation_batches_reached_terminal_outcomes: bool,
+    data_operation_outcomes_reconciled: bool,
+    probe_operation_outcomes_reconciled: bool,
+    zero_failed_mutation_operations: bool,
+    successful_data_operations_observed: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct ResponsivenessReport {
     passed: bool,
     zero_query_request_errors_or_timeouts: bool,
-    zero_dropped_schedules: bool,
+    zero_query_scheduler_deadline_misses_or_client_concurrency_rejections: bool,
     concurrent_query_p99_within_configured_limit: bool,
-    publication_visibility_samples_complete: bool,
-    publication_visibility_p99_within_configured_limit: bool,
+    visibility_probe_population_complete: bool,
+    successful_receipt_to_query_visibility_p99_within_configured_limit: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,6 +264,7 @@ struct VisibilitySampleOutcome {
     canary: Canary,
     definition_position: usize,
     definition_name: String,
+    successful_receipt_to_probe_start: Duration,
     result: Result<Duration>,
 }
 
@@ -234,24 +279,32 @@ struct MutationJob {
 }
 
 struct MutationResult {
-    operations: u64,
-    bytes: u64,
+    successful_data_operations: u64,
+    successful_probe_operations: u64,
+    failed_data_operations: u64,
+    failed_probe_operations: u64,
+    successful_data_payload_bytes: u64,
+    successful_probe_payload_bytes: u64,
+    failures: Vec<MutationFailureClass>,
     elapsed: Duration,
+    completed_at: Instant,
     canary: Option<Canary>,
 }
 
 #[derive(Default)]
 struct MutationProducerReport {
-    offered_batches: u64,
-    submitted_batches: u64,
-    dropped_batches: u64,
+    scheduled_batches: u64,
+    scheduler_deadline_missed_batches: u64,
+    client_queue_enqueued_batches: u64,
+    client_queue_dropped_batches: u64,
 }
 
 #[derive(Clone, Copy)]
 struct Canary {
     id: u64,
     version: u64,
-    accepted_at: Instant,
+    completed_at: Instant,
+    sample_eligible: bool,
 }
 
 #[derive(Default)]
@@ -283,7 +336,7 @@ async fn main() -> Result<()> {
         }
         Err(error) => {
             let report = TerminalFailureReport {
-                schema: "keldra.index-contention-terminal-failure.v1",
+                schema: "keldra.index-contention-terminal-failure.v2",
                 started_unix_milliseconds,
                 completed_unix_milliseconds: unix_millis()?,
                 result: "fail",
@@ -361,16 +414,21 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         &query_channels,
         &phase_token,
         config.baseline,
+        Instant::now(),
         counters.clone(),
     )
     .await?;
     counters.phase("concurrent").await;
+    let concurrent_started = Instant::now();
+    let concurrent_started_unix_milliseconds = unix_millis()?;
     let mutation_task = tokio::spawn(run_mutations(
         config.clone(),
         mutation_channels,
         visibility_channels,
         phase_token.clone(),
         counters.clone(),
+        concurrent_started,
+        concurrent_started_unix_milliseconds,
     ));
     let concurrent = run_query_phase(
         &config,
@@ -379,41 +437,47 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         &query_channels,
         &phase_token,
         config.concurrent,
+        concurrent_started,
         counters.clone(),
     )
     .await?;
     counters.phase("drain").await;
-    let drain_started = Instant::now();
-    let mutations = tokio::time::timeout(config.drain_timeout, mutation_task)
+    let post_load_started = Instant::now();
+    let outstanding_started = Instant::now();
+    let mutation_report = tokio::time::timeout(config.drain_timeout, mutation_task)
         .await
         .context("mutation drain exceeded timeout")???;
-    let final_canary = mutations.1;
-    let mutation_report = mutations.0;
+    let outstanding_requests_and_sampled_visibility_seconds =
+        outstanding_started.elapsed().as_secs_f64();
+    let credential_refresh_started = Instant::now();
     let verification_token = fresh_token(&config, &setup_channels[0]).await?;
-    let (final_visible, mut observed) = if let Some(canary) = final_canary {
-        tokio::time::timeout(
-            config.drain_timeout,
-            wait_canary_on_all(
-                &config,
-                &names,
-                &query_channels,
-                &verification_token,
-                canary,
-            ),
-        )
-        .await
-        .context("final canary verification exceeded drain timeout")??
-    } else {
-        (false, BTreeSet::new())
-    };
+    let credential_refresh_seconds = credential_refresh_started.elapsed().as_secs_f64();
+    let authority_started = Instant::now();
+    let authority =
+        load_authoritative_mutable_state(&config, &query_channels, &verification_token).await?;
+    let authoritative_state_read_seconds = authority_started.elapsed().as_secs_f64();
+    let convergence_started = Instant::now();
     let (final_state_verified, advisory_zero_lag, final_sources) = tokio::time::timeout(
         config.drain_timeout,
-        verify_final_mutable_state(&config, &names, &query_channels, &verification_token),
+        verify_final_mutable_state(
+            &config,
+            &names,
+            &query_channels,
+            &verification_token,
+            authority,
+        ),
     )
     .await
     .context("final mutable verification exceeded drain timeout")??;
-    observed.extend(final_sources);
-    let drain_seconds = drain_started.elapsed().as_secs_f64();
+    let final_index_convergence_seconds = convergence_started.elapsed().as_secs_f64();
+    let observed = final_sources;
+    let post_load = PostLoadReport {
+        elapsed_seconds: post_load_started.elapsed().as_secs_f64(),
+        outstanding_requests_and_sampled_visibility_seconds,
+        credential_refresh_seconds,
+        authoritative_state_read_seconds,
+        final_index_convergence_seconds,
+    };
     counters.phase("post").await;
     let post = run_query_phase(
         &config,
@@ -422,6 +486,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         &query_channels,
         &verification_token,
         config.post,
+        Instant::now(),
         counters.clone(),
     )
     .await?;
@@ -435,47 +500,73 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     let zero_query_correctness_errors = [&baseline, &concurrent, &post]
         .iter()
         .all(|p| p.correctness_errors == 0);
-    let zero_dropped_schedules = [&baseline, &concurrent, &post]
-        .iter()
-        .all(|p| p.dropped_schedules == 0);
-    let mutation_requests_complete_and_successful = mutation_report.request_errors == 0
-        && mutation_report.accepted_batches > 0
-        && mutation_report.accepted_batches + mutation_report.request_errors
-            == mutation_report.submitted_batches
-        && mutation_report.accepted_operations > 0;
-    let publication_visibility_samples_complete = mutation_report.visibility_samples_requested > 0
-        && mutation_report.visibility_samples_completed
-            == mutation_report.visibility_samples_requested
-        && mutation_report.visibility_sample_errors == 0;
+    let zero_query_scheduler_deadline_misses_or_client_concurrency_rejections =
+        [&baseline, &concurrent, &post]
+            .iter()
+            .all(|p| p.scheduler_deadline_misses + p.client_concurrency_rejections == 0);
+    let all_enqueued_mutation_batches_reached_terminal_outcomes = mutation_report
+        .fully_successful_batches
+        + mutation_report.structurally_valid_batches_with_operation_failures
+        + mutation_report.indeterminate_batches
+        == mutation_report.client_queue_enqueued_batches;
+    let data_operation_outcomes_reconciled = mutation_report.successful_data_operations
+        + mutation_report.failed_data_operations
+        + mutation_report.indeterminate_data_operations
+        == mutation_report.client_queue_enqueued_data_operations;
+    let probe_operation_outcomes_reconciled = mutation_report.successful_probe_operations
+        + mutation_report.failed_probe_operations
+        + mutation_report.indeterminate_probe_operations
+        == mutation_report.client_queue_enqueued_batches;
+    let zero_failed_mutation_operations = mutation_report.failed_data_operations == 0
+        && mutation_report.failed_probe_operations == 0
+        && mutation_report.indeterminate_data_operations == 0
+        && mutation_report.indeterminate_probe_operations == 0;
+    let successful_data_operations_observed = mutation_report.successful_data_operations > 0;
+    let visibility_probe_population_complete = mutation_report.visibility_probes_planned > 0
+        && mutation_report.visibility_probes_with_successful_receipts
+            == mutation_report.visibility_probes_planned
+        && mutation_report.visibility_probes_started == mutation_report.visibility_probes_planned
+        && mutation_report.visibility_probes_succeeded == mutation_report.visibility_probes_planned
+        && mutation_report.visibility_probes_failed == 0;
     let concurrent_p99_passed = config
         .max_concurrent_query_p99_ms
-        .is_none_or(|maximum| concurrent.schedule_to_response.p99_ms <= maximum);
-    let publication_visibility_p99_passed = config
-        .max_publication_visibility_p99_ms
-        .is_none_or(|maximum| mutation_report.publication_visibility_lag.p99_ms <= maximum);
+        .is_none_or(|maximum| concurrent.successful_schedule_to_response_latency.p99_ms <= maximum);
+    let successful_receipt_to_query_visibility_p99_passed = config
+        .max_successful_receipt_to_query_visibility_p99_ms
+        .is_none_or(|maximum| {
+            mutation_report
+                .successful_receipt_to_query_visibility_latency
+                .p99_ms
+                <= maximum
+        });
     let all_qualified_definitions_offered = [&baseline, &concurrent, &post]
         .iter()
         .all(|phase| phase.offered_definition_count == names.len());
     let sustained_nonempty_mutation_queue = mutation_report.queue_depth_samples > 0
-        && mutation_report.minimum_sampled_queue_depth_while_producing > 0
-        && mutation_report.queue_starvation_samples == 0;
-    let mutation_load_shape_valid = if config.mutation_rate_operations_per_second.is_some() {
-        mutation_report.dropped_batches == 0
-            && mutation_report.offered_batches == mutation_report.submitted_batches
+        && mutation_report.minimum_sampled_client_queue_depth > 0
+        && mutation_report.sampled_client_queue_empty_count == 0;
+    let mutation_load_shape_valid = if config.target_data_operations_per_second.is_some() {
+        mutation_report.client_queue_dropped_batches == 0
+            && mutation_report.scheduler_deadline_missed_batches == 0
+            && mutation_report.scheduled_batches == mutation_report.client_queue_enqueued_batches
     } else {
         sustained_nonempty_mutation_queue
     };
-    let correctness_passed = zero_query_correctness_errors && final_visible && final_state_verified;
+    let correctness_passed = zero_query_correctness_errors && final_state_verified;
     let workload_passed = all_qualified_definitions_offered
         && mutation_load_shape_valid
-        && mutation_requests_complete_and_successful;
+        && all_enqueued_mutation_batches_reached_terminal_outcomes
+        && data_operation_outcomes_reconciled
+        && probe_operation_outcomes_reconciled
+        && zero_failed_mutation_operations
+        && successful_data_operations_observed;
     let responsiveness_passed = zero_query_request_errors_or_timeouts
-        && zero_dropped_schedules
+        && zero_query_scheduler_deadline_misses_or_client_concurrency_rejections
         && concurrent_p99_passed
-        && publication_visibility_samples_complete
-        && publication_visibility_p99_passed;
+        && visibility_probe_population_complete
+        && successful_receipt_to_query_visibility_p99_passed;
     let report = Report {
-        schema: "keldra.index-contention-qualification.v1",
+        schema: "keldra.index-contention-qualification.v2",
         started_unix_milliseconds,
         completed_unix_milliseconds: unix_millis()?,
         result: if correctness_passed && workload_passed && responsiveness_passed {
@@ -492,16 +583,15 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         physical_recipe_count: config.physical_recipe_count,
         observed_source_node_ids: observed.into_iter().collect(),
         assignment_observability: "public APIs expose source node IDs and placement epochs, but not partition-producer assignments; logical definition and physical recipe counts are cluster-wide and are not labeled as per-node concurrency",
-        responsiveness_definition: "every offered open-loop schedule completes within request_timeout with no scheduler drop, request error, timeout, or oracle mismatch; visibility probes use request_timeout per query and a separate observation timeout; optional concurrent-query and publication-visibility p99 gates are applied when configured",
+        responsiveness_definition: "every scheduled open-loop query completes within request_timeout with no scheduler deadline miss, client-concurrency rejection, request error, or timeout; oracle mismatches are reported by the separate correctness result; visibility probes use request_timeout per query and a separate observation timeout; optional concurrent-query and successful-receipt-to-query-visibility p99 gates are applied when configured",
         baseline,
         concurrent,
         mutations: mutation_report,
-        drain_seconds,
+        post_load,
         post,
         correctness: CorrectnessReport {
             passed: correctness_passed,
-            stable_oracle_checked_on_every_completed_query: true,
-            final_canary_version_observed_by_every_qualified_definition: final_visible,
+            stable_oracle_checked_on_every_structurally_valid_query_response: true,
             exact_mutable_versions_verified_by_every_qualified_definition: final_state_verified,
             final_freshness_healthy_by_every_qualified_definition: final_state_verified,
             advisory_zero_lag_verified_by_every_qualified_definition: advisory_zero_lag,
@@ -512,15 +602,20 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
             all_qualified_definitions_offered_in_every_phase: all_qualified_definitions_offered,
             sustained_nonempty_mutation_queue,
             mutation_load_shape_valid,
-            mutation_requests_complete_and_successful,
+            all_enqueued_mutation_batches_reached_terminal_outcomes,
+            data_operation_outcomes_reconciled,
+            probe_operation_outcomes_reconciled,
+            zero_failed_mutation_operations,
+            successful_data_operations_observed,
         },
         responsiveness: ResponsivenessReport {
             passed: responsiveness_passed,
             zero_query_request_errors_or_timeouts,
-            zero_dropped_schedules,
+            zero_query_scheduler_deadline_misses_or_client_concurrency_rejections,
             concurrent_query_p99_within_configured_limit: concurrent_p99_passed,
-            publication_visibility_samples_complete,
-            publication_visibility_p99_within_configured_limit: publication_visibility_p99_passed,
+            visibility_probe_population_complete,
+            successful_receipt_to_query_visibility_p99_within_configured_limit:
+                successful_receipt_to_query_visibility_p99_passed,
         },
     };
     Ok(report)
@@ -667,6 +762,7 @@ async fn run_query_phase(
     channels: &Arc<Vec<Channel>>,
     token: &str,
     duration: Duration,
+    phase_start: Instant,
     counters: Arc<Counters>,
 ) -> Result<QueryPhaseReport> {
     let mut report = QueryPhaseReport::default();
@@ -674,7 +770,6 @@ async fn run_query_phase(
     let mut service = Latencies::new()?;
     let mut lateness = Latencies::new()?;
     let permits = Arc::new(Semaphore::new(config.query_max_in_flight));
-    let phase_start = Instant::now();
     let phase_end = phase_start + duration;
     let period_nanos = 1_000_000_000u64 / config.query_rate;
     ensure!(period_nanos > 0, "query rate exceeds scheduler resolution");
@@ -690,18 +785,18 @@ async fn run_query_phase(
         }
         tokio::time::sleep_until(intended).await;
         let dispatched = Instant::now();
-        report.offered_schedules += 1;
+        report.scheduled_queries += 1;
         offered_definitions.insert(sequence as usize % names.len());
         counters.scheduled.fetch_add(1, Ordering::Relaxed);
         lateness.record(dispatched.saturating_duration_since(intended))?;
         if dispatched.saturating_duration_since(intended) >= period {
-            report.dropped_schedules += 1;
+            report.scheduler_deadline_misses += 1;
             counters.dropped.fetch_add(1, Ordering::Relaxed);
             sequence = sequence.checked_add(1).context("query schedule overflow")?;
             continue;
         }
         let Ok(permit) = permits.clone().try_acquire_owned() else {
-            report.dropped_schedules += 1;
+            report.client_concurrency_rejections += 1;
             counters.dropped.fetch_add(1, Ordering::Relaxed);
             sequence = sequence.checked_add(1).context("query schedule overflow")?;
             continue;
@@ -751,42 +846,51 @@ async fn run_query_phase(
                 counters.errors.fetch_add(1, Ordering::Relaxed);
             }
             Ok(Ok(outcome)) => {
-                report.completed += 1;
                 queried_definitions.insert(outcome.definition_position);
                 if outcome.correctness_error {
                     report.correctness_errors += 1;
+                } else {
+                    report.successful_queries += 1;
+                    if completed < phase_end {
+                        report.successful_queries_in_window += 1;
+                    } else {
+                        report.successful_queries_after_window += 1;
+                    }
+                    report.minimum_commit_revision = Some(
+                        report
+                            .minimum_commit_revision
+                            .map_or(outcome.revision, |v| v.min(outcome.revision)),
+                    );
+                    report.maximum_commit_revision = Some(
+                        report
+                            .maximum_commit_revision
+                            .map_or(outcome.revision, |v| v.max(outcome.revision)),
+                    );
+                    report.maximum_source_lag_hint =
+                        report.maximum_source_lag_hint.max(outcome.max_lag);
+                    end_to_end.record(completed.saturating_duration_since(intended))?;
+                    service.record(outcome.service)?;
+                    counters
+                        .query_completed(
+                            completed.saturating_duration_since(intended),
+                            outcome.revision,
+                            outcome.max_lag,
+                        )
+                        .await;
                 }
-                report.minimum_commit_revision = Some(
-                    report
-                        .minimum_commit_revision
-                        .map_or(outcome.revision, |v| v.min(outcome.revision)),
-                );
-                report.maximum_commit_revision = Some(
-                    report
-                        .maximum_commit_revision
-                        .map_or(outcome.revision, |v| v.max(outcome.revision)),
-                );
-                report.maximum_source_lag_hint =
-                    report.maximum_source_lag_hint.max(outcome.max_lag);
-                end_to_end.record(completed.saturating_duration_since(intended))?;
-                service.record(outcome.service)?;
-                counters
-                    .query_completed(
-                        completed.saturating_duration_since(intended),
-                        outcome.revision,
-                        outcome.max_lag,
-                    )
-                    .await;
             }
         }
     }
-    report.scheduling_window_seconds = duration.as_secs_f64();
-    report.completion_elapsed_seconds = phase_start.elapsed().as_secs_f64();
-    report.offered_schedules_per_second = report.offered_schedules as f64 / duration.as_secs_f64();
-    report.completed_queries_per_second =
-        report.completed as f64 / report.completion_elapsed_seconds;
-    report.schedule_to_response = end_to_end.report();
-    report.dispatch_to_response = service.report();
+    report.measurement_window_seconds = duration.as_secs_f64();
+    report.total_until_all_terminal_seconds = phase_start.elapsed().as_secs_f64();
+    report.response_drain_seconds =
+        (report.total_until_all_terminal_seconds - report.measurement_window_seconds).max(0.0);
+    report.actual_scheduled_queries_per_second =
+        report.scheduled_queries as f64 / report.measurement_window_seconds;
+    report.successful_queries_per_second =
+        report.successful_queries_in_window as f64 / report.measurement_window_seconds;
+    report.successful_schedule_to_response_latency = end_to_end.report();
+    report.successful_dispatch_to_response_latency = service.report();
     report.scheduling_lateness = lateness.report();
     report.offered_definition_count = offered_definitions.len();
     report.queried_definition_count = queried_definitions.len();
@@ -799,8 +903,12 @@ async fn run_mutations(
     visibility_channels: Arc<Vec<Channel>>,
     token: String,
     counters: Arc<Counters>,
-) -> Result<(MutationReport, Option<Canary>)> {
-    let mutation_started = Instant::now();
+    mutation_started: Instant,
+    measurement_window_started_unix_milliseconds: u128,
+) -> Result<MutationReport> {
+    let mutation_window_ends = mutation_started + config.concurrent;
+    let measurement_window_ended_unix_milliseconds =
+        measurement_window_started_unix_milliseconds.saturating_add(config.concurrent.as_millis());
     let (job_tx, job_rx) = mpsc::channel(config.mutation_queue_depth);
     let sampler_tx = job_tx.clone();
     let receiver = Arc::new(Mutex::new(job_rx));
@@ -809,7 +917,7 @@ async fn run_mutations(
     let minimum_depth = Arc::new(AtomicUsize::new(config.mutation_queue_depth));
     let starvation = Arc::new(AtomicU64::new(0));
     let queue_samples = Arc::new(AtomicU64::new(0));
-    let prefilled_batches = if config.mutation_rate_operations_per_second.is_none() {
+    let prefilled_batches = if config.target_data_operations_per_second.is_none() {
         config.mutation_queue_depth as u64
     } else {
         0
@@ -823,7 +931,14 @@ async fn run_mutations(
     let producer_config = config.clone();
     let producing_for_task = producing.clone();
     let producer = tokio::spawn(async move {
-        let report = produce_mutation_jobs(&producer_config, job_tx, prefilled_batches).await;
+        let report = produce_mutation_jobs(
+            &producer_config,
+            job_tx,
+            prefilled_batches,
+            mutation_started,
+            mutation_window_ends,
+        )
+        .await;
         producing_for_task.store(0, Ordering::Release);
         report
     });
@@ -859,97 +974,151 @@ async fn run_mutations(
                 let Some(job) = receiver.lock().await.recv().await else {
                     break;
                 };
-                match execute_mutation(&config, &mut client, job).await {
-                    Ok(result) => {
-                        let _ = result_tx.send(Ok(result));
-                    }
-                    Err(error) => {
-                        let _ = result_tx.send(Err(error));
-                    }
-                }
+                let outcome = execute_mutation(&config, &mut client, job).await;
+                let _ = result_tx.send((Instant::now(), job, outcome));
             }
             Ok::<(), anyhow::Error>(())
         });
     }
     drop(result_tx);
     let mut report = MutationReport {
-        load_mode: if config.mutation_rate_operations_per_second.is_some() {
+        load_mode: if config.target_data_operations_per_second.is_some() {
             "fixed-rate"
         } else {
             "saturated-queue"
         },
-        configured_operations_per_second: config.mutation_rate_operations_per_second,
+        target_data_operations_per_second: config.target_data_operations_per_second,
+        measurement_window_started_unix_milliseconds,
+        measurement_window_ended_unix_milliseconds,
+        load_window_seconds: config.concurrent.as_secs_f64(),
         queue_capacity: config.mutation_queue_depth,
         ..MutationReport::default()
     };
     let mut request_latency = Latencies::new()?;
-    let mut visibility_latency = Latencies::new()?;
+    let mut successful_receipt_to_probe_start = Latencies::new()?;
+    let mut probe_start_to_visibility = Latencies::new()?;
+    let mut successful_receipt_to_visibility = Latencies::new()?;
     let mut visibility_tasks = JoinSet::new();
-    // Exactly one acceptance-to-visible probe may run at a time. This keeps
-    // visibility evidence bounded and independent of definition count and
-    // mutation throughput, so it cannot become the load under test.
-    let visibility_permits = Arc::new(Semaphore::new(1));
+    // Bound observer traffic independently from workload queries. Every
+    // predetermined sample waits for a permit and reports that wait separately,
+    // so neither favorable censoring nor observer queueing is hidden.
+    let visibility_permits = Arc::new(Semaphore::new(config.query_max_in_flight));
     let mut visibility_sample_ordinal = 0_u64;
-    let mut final_canary: Option<Canary> = None;
-    while let Some(event) = result_rx.recv().await {
+    let mut last_terminal_response_at = mutation_started;
+    while let Some((terminal_at, job, event)) = result_rx.recv().await {
+        last_terminal_response_at = last_terminal_response_at.max(terminal_at);
+        if job.sequence % config.visibility_sample_every_batches == 0 {
+            report.visibility_probes_planned += 1;
+        }
         match event {
             Err(failure) => {
-                report.request_errors += 1;
+                report.indeterminate_batches += 1;
+                report.indeterminate_data_operations = report
+                    .indeterminate_data_operations
+                    .saturating_add(config.mutation_batch_size as u64);
+                report.indeterminate_probe_operations =
+                    report.indeterminate_probe_operations.saturating_add(1);
                 counters.mutation_errors.fetch_add(1, Ordering::Relaxed);
                 record_mutation_failure(&mut report, failure);
             }
             Ok(result) => {
-                report.accepted_batches += 1;
-                report.accepted_operations += result.operations;
-                report.accepted_bytes += result.bytes;
+                if result.failures.is_empty() {
+                    report.fully_successful_batches += 1;
+                } else {
+                    report.structurally_valid_batches_with_operation_failures += 1;
+                    counters.mutation_errors.fetch_add(1, Ordering::Relaxed);
+                    record_mutation_failure(
+                        &mut report,
+                        MutationRequestFailure {
+                            classes: result.failures.clone(),
+                        },
+                    );
+                }
+                report.successful_data_operations = report
+                    .successful_data_operations
+                    .saturating_add(result.successful_data_operations);
+                report.failed_data_operations = report
+                    .failed_data_operations
+                    .saturating_add(result.failed_data_operations);
+                report.failed_probe_operations = report
+                    .failed_probe_operations
+                    .saturating_add(result.failed_probe_operations);
+                if result.completed_at < mutation_window_ends {
+                    report.successful_data_operations_in_window = report
+                        .successful_data_operations_in_window
+                        .saturating_add(result.successful_data_operations);
+                    report.successful_data_payload_bytes_in_window = report
+                        .successful_data_payload_bytes_in_window
+                        .saturating_add(result.successful_data_payload_bytes);
+                } else {
+                    report.successful_data_operations_after_window = report
+                        .successful_data_operations_after_window
+                        .saturating_add(result.successful_data_operations);
+                    report.successful_data_payload_bytes_after_window = report
+                        .successful_data_payload_bytes_after_window
+                        .saturating_add(result.successful_data_payload_bytes);
+                }
+                report.successful_probe_operations = report
+                    .successful_probe_operations
+                    .saturating_add(result.successful_probe_operations);
+                report.successful_data_payload_bytes = report
+                    .successful_data_payload_bytes
+                    .saturating_add(result.successful_data_payload_bytes);
+                report.successful_probe_payload_bytes = report
+                    .successful_probe_payload_bytes
+                    .saturating_add(result.successful_probe_payload_bytes);
                 counters
                     .mutations
-                    .fetch_add(result.operations, Ordering::Relaxed);
+                    .fetch_add(result.successful_data_operations, Ordering::Relaxed);
                 request_latency.record(result.elapsed)?;
                 if let Some(canary) = result.canary {
-                    if final_canary.is_none_or(|current| canary.id > current.id) {
-                        final_canary = Some(canary);
-                    }
-                    if canary.id % config.visibility_sample_every_batches == 0 {
-                        if let Ok(permit) = visibility_permits.clone().try_acquire_owned() {
-                            report.visibility_samples_requested += 1;
-                            let definition_position = visibility_definition_position(
-                                visibility_sample_ordinal,
-                                config.definition_count,
-                            );
-                            visibility_sample_ordinal = visibility_sample_ordinal.saturating_add(1);
-                            let channel = visibility_channels
-                                [definition_position % visibility_channels.len()]
-                            .clone();
-                            let name = data::index_name(definition_position);
-                            let bucket = config.bucket.clone();
-                            let token = token.clone();
-                            let poll = config.visibility_poll;
-                            let request_timeout = config.request_timeout;
-                            let observation_timeout = config.visibility_observation_timeout;
-                            visibility_tasks.spawn(async move {
-                                let _permit = permit;
-                                let result = wait_canary(
-                                    &channel,
-                                    &token,
-                                    &bucket,
-                                    &name,
-                                    canary,
-                                    poll,
-                                    request_timeout,
-                                    observation_timeout,
-                                )
-                                .await;
-                                VisibilitySampleOutcome {
-                                    canary,
-                                    definition_position,
-                                    definition_name: name,
-                                    result,
+                    if canary.sample_eligible {
+                        report.visibility_probes_with_successful_receipts += 1;
+                        let definition_position = visibility_definition_position(
+                            visibility_sample_ordinal,
+                            config.definition_count,
+                        );
+                        visibility_sample_ordinal = visibility_sample_ordinal.saturating_add(1);
+                        let channel = visibility_channels
+                            [definition_position % visibility_channels.len()]
+                        .clone();
+                        let name = data::index_name(definition_position);
+                        let bucket = config.bucket.clone();
+                        let token = token.clone();
+                        let poll = config.visibility_poll;
+                        let request_timeout = config.request_timeout;
+                        let observation_timeout = config.visibility_observation_timeout;
+                        let permits = visibility_permits.clone();
+                        visibility_tasks.spawn(async move {
+                            let permit_result = permits.acquire_owned().await;
+                            let probe_started = Instant::now();
+                            let successful_receipt_to_probe_start =
+                                probe_started.saturating_duration_since(canary.completed_at);
+                            let result = match permit_result {
+                                Ok(permit) => {
+                                    let _permit = permit;
+                                    wait_canary(
+                                        &channel,
+                                        &token,
+                                        &bucket,
+                                        &name,
+                                        canary,
+                                        poll,
+                                        request_timeout,
+                                        observation_timeout,
+                                    )
+                                    .await
                                 }
-                            });
-                        } else {
-                            report.visibility_samples_skipped_busy += 1;
-                        }
+                                Err(error) => Err(anyhow!("visibility semaphore closed: {error}")),
+                            };
+                            VisibilitySampleOutcome {
+                                canary,
+                                definition_position,
+                                definition_name: name,
+                                successful_receipt_to_probe_start,
+                                result,
+                            }
+                        });
                     }
                 }
             }
@@ -959,28 +1128,41 @@ async fn run_mutations(
     // Visibility probes measure indexing lag and must not dilute ingest rate.
     let mutation_elapsed = mutation_started.elapsed();
     let producer_report = producer.await.context("mutation producer panicked")??;
-    report.offered_batches = producer_report.offered_batches;
-    report.submitted_batches = producer_report.submitted_batches;
-    report.dropped_batches = producer_report.dropped_batches;
-    report.offered_operations = producer_report
-        .offered_batches
-        .saturating_mul((config.mutation_batch_size + 1) as u64);
+    report.scheduled_batches = producer_report.scheduled_batches;
+    report.scheduler_deadline_missed_batches = producer_report.scheduler_deadline_missed_batches;
+    report.client_queue_enqueued_batches = producer_report.client_queue_enqueued_batches;
+    report.client_queue_dropped_batches = producer_report.client_queue_dropped_batches;
+    report.scheduled_data_operations = producer_report
+        .scheduled_batches
+        .saturating_mul(config.mutation_batch_size as u64);
+    report.scheduler_deadline_missed_data_operations = producer_report
+        .scheduler_deadline_missed_batches
+        .saturating_mul(config.mutation_batch_size as u64);
+    report.client_queue_enqueued_data_operations = producer_report
+        .client_queue_enqueued_batches
+        .saturating_mul(config.mutation_batch_size as u64);
     while let Some(worker) = workers.join_next().await {
         worker.context("mutation worker panicked")??;
     }
     sampler.await.context("queue sampler panicked")?;
     while let Some(sample) = visibility_tasks.join_next().await {
         let sample = sample.context("visibility task panicked")?;
+        report.visibility_probes_started += 1;
+        successful_receipt_to_probe_start.record(sample.successful_receipt_to_probe_start)?;
         match sample.result {
-            Ok(duration) => {
-                report.visibility_samples_completed += 1;
-                visibility_latency.record(duration)?;
+            Ok(successful_receipt_to_visible_duration) => {
+                report.visibility_probes_succeeded += 1;
+                successful_receipt_to_visibility.record(successful_receipt_to_visible_duration)?;
+                probe_start_to_visibility.record(
+                    successful_receipt_to_visible_duration
+                        .saturating_sub(sample.successful_receipt_to_probe_start),
+                )?;
             }
             Err(error) => {
-                report.visibility_sample_errors += 1;
-                if report.visibility_sample_failures.len() < MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS {
+                report.visibility_probes_failed += 1;
+                if report.visibility_probe_failures.len() < MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS {
                     report
-                        .visibility_sample_failures
+                        .visibility_probe_failures
                         .push(VisibilitySampleFailure {
                             canary_id: sample.canary.id,
                             object_version: sample.canary.version,
@@ -989,48 +1171,61 @@ async fn run_mutations(
                             error: bounded_error(&format!("{error:#}")),
                         });
                 } else {
-                    report.visibility_sample_failures_omitted =
-                        report.visibility_sample_failures_omitted.saturating_add(1);
+                    report.visibility_probe_failures_omitted =
+                        report.visibility_probe_failures_omitted.saturating_add(1);
                 }
             }
         }
     }
-    report.minimum_sampled_queue_depth_while_producing = minimum_depth.load(Ordering::Relaxed);
-    report.queue_starvation_samples = starvation.load(Ordering::Relaxed);
+    report.minimum_sampled_client_queue_depth = minimum_depth.load(Ordering::Relaxed);
+    report.sampled_client_queue_empty_count = starvation.load(Ordering::Relaxed);
     report.queue_depth_samples = queue_samples.load(Ordering::Relaxed);
-    report.nonempty_queue_sample_ratio = if report.queue_depth_samples == 0 {
+    report.sampled_client_queue_nonempty_ratio = if report.queue_depth_samples == 0 {
         0.0
     } else {
-        (report.queue_depth_samples - report.queue_starvation_samples) as f64
+        (report.queue_depth_samples - report.sampled_client_queue_empty_count) as f64
             / report.queue_depth_samples as f64
     };
-    report.request_latency = request_latency.report();
-    report.elapsed_seconds = mutation_elapsed.as_secs_f64();
-    report.accepted_operations_per_second =
-        report.accepted_operations as f64 / report.elapsed_seconds;
-    report.accepted_bytes_per_second = report.accepted_bytes as f64 / report.elapsed_seconds;
-    report.failure_diagnostics_definition = "request_errors counts failed BulkWrite requests; failure_classes counts RPC statuses, per-outcome failures, or driver response-validation failures by bounded code and message; at most eight distinct classes are retained and failure_occurrences_omitted counts occurrences from additional classes";
-    report.publication_visibility_lag = visibility_latency.report();
-    report.visibility_definition = "publication_visibility_lag: receipt acceptance to first ordinary query hit with the exact canary object_version; samples rotate by sample ordinal across definitions, use a separate total observation timeout, and include polling-resolution delay";
-    Ok((report, final_canary))
+    report.structurally_valid_bulk_write_dispatch_to_response_latency = request_latency.report();
+    report.total_until_all_terminal_seconds = mutation_elapsed.as_secs_f64();
+    report.response_drain_seconds = last_terminal_response_at
+        .saturating_duration_since(mutation_window_ends)
+        .as_secs_f64();
+    report.scheduled_data_operations_per_second =
+        report.scheduled_data_operations as f64 / report.load_window_seconds;
+    report.client_queue_enqueued_data_operations_per_second =
+        report.client_queue_enqueued_data_operations as f64 / report.load_window_seconds;
+    report.successful_data_ingest_throughput_operations_per_second =
+        report.successful_data_operations_in_window as f64 / report.load_window_seconds;
+    report.successful_data_ingest_throughput_payload_bytes_per_second =
+        report.successful_data_payload_bytes_in_window as f64 / report.load_window_seconds;
+    report.failure_diagnostics_definition = "fully_successful_batches, structurally_valid_batches_with_operation_failures, and indeterminate_batches are disjoint terminal outcomes; indeterminate_batches had no structurally valid per-operation response, so their operation outcomes are indeterminate rather than falsely classified as failed; successful and failed operations come from structurally valid responses; successful sibling outcomes in a partial response remain counted; failure_classes retains bounded diagnostics; at most eight distinct classes are retained and failure_occurrences_omitted counts occurrences from additional classes";
+    report.successful_receipt_to_probe_start_delay = successful_receipt_to_probe_start.report();
+    report.probe_start_to_query_visibility_latency = probe_start_to_visibility.report();
+    report.successful_receipt_to_query_visibility_latency =
+        successful_receipt_to_visibility.report();
+    report.visibility_definition = "successful_receipt_to_probe_start_delay measures local observer queueing; probe_start_to_query_visibility_latency measures active polling to the first ordinary-query hit with the exact object_version; successful_receipt_to_query_visibility_latency is their end-to-end sum from successful receipt; sampled probes use non-overwritten object paths, every predetermined successful probe receipt is retained, probes rotate across definitions, observer concurrency is bounded, and polling-resolution delay is included";
+    Ok(report)
 }
 
 async fn produce_mutation_jobs(
     config: &Config,
     job_tx: mpsc::Sender<MutationJob>,
     prefilled_batches: u64,
+    started: Instant,
+    deadline: Instant,
 ) -> Result<MutationProducerReport> {
-    let started = Instant::now();
-    let deadline = started + config.concurrent;
     let mut report = MutationProducerReport {
-        offered_batches: prefilled_batches,
-        submitted_batches: prefilled_batches,
-        dropped_batches: 0,
+        scheduled_batches: prefilled_batches,
+        scheduler_deadline_missed_batches: 0,
+        client_queue_enqueued_batches: prefilled_batches,
+        client_queue_dropped_batches: 0,
     };
     let mut sequence = prefilled_batches;
-    if let Some(operation_rate) = config.mutation_rate_operations_per_second {
+    if let Some(operation_rate) = config.target_data_operations_per_second {
         return produce_fixed_rate_jobs(
-            config.concurrent,
+            started,
+            deadline,
             config.mutation_batch_size,
             operation_rate,
             job_tx,
@@ -1038,28 +1233,33 @@ async fn produce_mutation_jobs(
         .await;
     } else {
         while Instant::now() < deadline {
-            if job_tx.send(MutationJob { sequence }).await.is_err() {
-                break;
+            match tokio::time::timeout_at(deadline, job_tx.send(MutationJob { sequence })).await {
+                Ok(Ok(())) => {
+                    report.scheduled_batches = report.scheduled_batches.saturating_add(1);
+                    report.client_queue_enqueued_batches =
+                        report.client_queue_enqueued_batches.saturating_add(1);
+                    sequence = sequence
+                        .checked_add(1)
+                        .context("mutation sequence overflow")?;
+                }
+                Ok(Err(_)) => break,
+                Err(_) => break,
             }
-            report.offered_batches = report.offered_batches.saturating_add(1);
-            report.submitted_batches = report.submitted_batches.saturating_add(1);
-            sequence = sequence
-                .checked_add(1)
-                .context("mutation sequence overflow")?;
         }
     }
     Ok(report)
 }
 
 async fn produce_fixed_rate_jobs(
-    duration: Duration,
+    started: Instant,
+    deadline: Instant,
     mutation_batch_size: usize,
     operation_rate: f64,
     job_tx: mpsc::Sender<MutationJob>,
 ) -> Result<MutationProducerReport> {
-    let started = Instant::now();
-    let deadline = started + duration;
-    let batch_rate = operation_rate / (mutation_batch_size + 1) as f64;
+    // The configured rate is the user data rate. The one marker operation per
+    // batch is qualification overhead and must never dilute that target.
+    let batch_rate = operation_rate / mutation_batch_size as f64;
     let mut report = MutationProducerReport::default();
     let mut schedule_ordinal = 1_u64;
     loop {
@@ -1073,18 +1273,34 @@ async fn produce_fixed_rate_jobs(
         // granularity as server backpressure; the bounded channel remains the
         // authority which drops work the driver cannot actually offer.
         let now = Instant::now();
+        if now >= deadline {
+            while started + Duration::from_secs_f64(schedule_ordinal as f64 / batch_rate) < deadline
+            {
+                report.scheduled_batches = report.scheduled_batches.saturating_add(1);
+                report.scheduler_deadline_missed_batches =
+                    report.scheduler_deadline_missed_batches.saturating_add(1);
+                schedule_ordinal = schedule_ordinal
+                    .checked_add(1)
+                    .context("mutation schedule overflow")?;
+            }
+            break;
+        }
         loop {
             let scheduled = started + Duration::from_secs_f64(schedule_ordinal as f64 / batch_rate);
             if scheduled >= deadline || scheduled > now {
                 break;
             }
-            report.offered_batches = report.offered_batches.saturating_add(1);
+            report.scheduled_batches = report.scheduled_batches.saturating_add(1);
             match job_tx.try_send(MutationJob {
                 sequence: schedule_ordinal - 1,
             }) {
-                Ok(()) => report.submitted_batches = report.submitted_batches.saturating_add(1),
+                Ok(()) => {
+                    report.client_queue_enqueued_batches =
+                        report.client_queue_enqueued_batches.saturating_add(1)
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    report.dropped_batches = report.dropped_batches.saturating_add(1)
+                    report.client_queue_dropped_batches =
+                        report.client_queue_dropped_batches.saturating_add(1)
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     bail!("mutation worker queue closed during fixed-rate production")
@@ -1105,7 +1321,7 @@ async fn execute_mutation(
 ) -> std::result::Result<MutationResult, MutationRequestFailure> {
     let started = Instant::now();
     let mut operations = Vec::with_capacity(config.mutation_batch_size + 1);
-    let mut bytes = 0u64;
+    let mut operation_payload_bytes = Vec::with_capacity(config.mutation_batch_size + 1);
     for offset in 0..config.mutation_batch_size {
         let ordinal = job
             .sequence
@@ -1131,7 +1347,7 @@ async fn execute_mutation(
                 config.physical_recipe_count,
             ),
         };
-        bytes = bytes.saturating_add(payload.len() as u64);
+        operation_payload_bytes.push(payload.len() as u64);
         operations.push(put(
             config,
             data::mutable_path(id),
@@ -1139,12 +1355,8 @@ async fn execute_mutation(
             format!("contention-mutation-{}-{offset}", job.sequence),
         ));
     }
-    let marker_ordinal = match config.mutation_workload {
-        MutationWorkload::MaterialChange => job.sequence,
-        MutationWorkload::ProjectionPreserving => {
-            job.sequence % data::PROJECTION_PRESERVING_MARKERS
-        }
-    };
+    let sample_eligible = job.sequence % config.visibility_sample_every_batches == 0;
+    let marker_ordinal = marker_ordinal(config.mutation_workload, job.sequence, sample_eligible);
     let marker_id = data::marker_id(marker_ordinal);
     let marker_payload = match config.mutation_workload {
         MutationWorkload::MaterialChange => data::payload(
@@ -1163,7 +1375,8 @@ async fn execute_mutation(
             config.physical_recipe_count,
         ),
     };
-    bytes = bytes.saturating_add(marker_payload.len() as u64);
+    let probe_bytes = marker_payload.len() as u64;
+    operation_payload_bytes.push(probe_bytes);
     operations.push(put(
         config,
         data::marker_path(marker_ordinal),
@@ -1193,6 +1406,13 @@ async fn execute_mutation(
     }
     let mut marker_version = None;
     let mut failures = Vec::new();
+    let mut seen = vec![false; operation_payload_bytes.len()];
+    let mut successful_data_operations = 0_u64;
+    let mut successful_probe_operations = 0_u64;
+    let mut failed_data_operations = 0_u64;
+    let mut failed_probe_operations = 0_u64;
+    let mut successful_data_payload_bytes = 0_u64;
+    let mut successful_probe_payload_bytes = 0_u64;
     for outcome in response.outcomes {
         let index = match usize::try_from(outcome.index) {
             Ok(index) => index,
@@ -1203,6 +1423,18 @@ async fn execute_mutation(
                 ));
             }
         };
+        if index >= operation_payload_bytes.len() {
+            return Err(driver_mutation_failure(
+                "outcome-index-out-of-range",
+                format!("BulkWrite outcome index {index} is out of range"),
+            ));
+        }
+        if std::mem::replace(&mut seen[index], true) {
+            return Err(driver_mutation_failure(
+                "duplicate-outcome-index",
+                format!("BulkWrite returned duplicate outcome index {index}"),
+            ));
+        }
         let Some(outcome) = outcome.outcome else {
             return Err(driver_mutation_failure(
                 "missing-outcome",
@@ -1222,35 +1454,53 @@ async fn execute_mutation(
                 }
                 if index == config.mutation_batch_size {
                     marker_version = Some(receipt.version);
+                    successful_probe_operations += 1;
+                    successful_probe_payload_bytes = successful_probe_payload_bytes
+                        .saturating_add(operation_payload_bytes[index]);
+                } else {
+                    successful_data_operations += 1;
+                    successful_data_payload_bytes = successful_data_payload_bytes
+                        .saturating_add(operation_payload_bytes[index]);
                 }
             }
-            BulkOutcomeValue::Failure(failure) => failures.push(MutationFailureClass {
-                source: "outcome",
-                code: failure.code,
-                code_name: format!("{:?}", tonic::Code::from_i32(failure.code)),
-                message: bounded_mutation_failure_message(&failure.message),
-                count: 1,
-            }),
+            BulkOutcomeValue::Failure(failure) => {
+                if index == config.mutation_batch_size {
+                    failed_probe_operations += 1;
+                } else {
+                    failed_data_operations += 1;
+                }
+                failures.push(MutationFailureClass {
+                    source: "outcome",
+                    code: failure.code,
+                    code_name: format!("{:?}", tonic::Code::from_i32(failure.code)),
+                    message: bounded_mutation_failure_message(&failure.message),
+                    count: 1,
+                });
+            }
         }
     }
-    if !failures.is_empty() {
-        return Err(MutationRequestFailure { classes: failures });
-    }
-    let Some(marker_version) = marker_version else {
+    if seen.iter().any(|seen| !seen) {
         return Err(driver_mutation_failure(
-            "missing-marker-receipt",
-            "BulkWrite response omitted the marker receipt".into(),
+            "missing-outcome-index",
+            "BulkWrite response omitted one or more operation indexes".into(),
         ));
-    };
-    let accepted_at = Instant::now();
+    }
+    let completed_at = Instant::now();
     Ok(MutationResult {
-        operations: (config.mutation_batch_size + 1) as u64,
-        bytes,
-        elapsed: accepted_at.saturating_duration_since(started),
-        canary: Some(Canary {
+        successful_data_operations,
+        successful_probe_operations,
+        failed_data_operations,
+        failed_probe_operations,
+        successful_data_payload_bytes: successful_data_payload_bytes,
+        successful_probe_payload_bytes: successful_probe_payload_bytes,
+        failures,
+        elapsed: completed_at.saturating_duration_since(started),
+        completed_at,
+        canary: marker_version.map(|version| Canary {
             id: marker_ordinal,
-            version: marker_version,
-            accepted_at,
+            version,
+            completed_at,
+            sample_eligible,
         }),
     })
 }
@@ -1265,7 +1515,7 @@ async fn wait_canary(
     request_timeout: Duration,
     observation_timeout: Duration,
 ) -> Result<Duration> {
-    let deadline = canary.accepted_at + observation_timeout;
+    let deadline = canary.completed_at + observation_timeout;
     let mut client = index_client(channel.clone(), token)?;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1287,7 +1537,7 @@ async fn wait_canary(
                     .as_ref()
                     .is_some_and(|a| a.path == data::marker_path(canary.id))
         }) {
-            return Ok(Instant::now().saturating_duration_since(canary.accepted_at));
+            return Ok(Instant::now().saturating_duration_since(canary.completed_at));
         }
         ensure!(
             Instant::now() < deadline,
@@ -1298,65 +1548,18 @@ async fn wait_canary(
     }
 }
 
-async fn wait_canary_on_all(
-    config: &Config,
-    names: &[String],
-    channels: &[Channel],
-    token: &str,
-    canary: Canary,
-) -> Result<(bool, BTreeSet<u64>)> {
-    let mut source_nodes = BTreeSet::new();
-    let mut next = names.iter().cloned().enumerate();
-    let mut tasks = JoinSet::new();
-    loop {
-        while tasks.len() < config.query_max_in_flight {
-            let Some((position, name)) = next.next() else {
-                break;
-            };
-            let channel = channels[position % channels.len()].clone();
-            let token = token.to_owned();
-            let bucket = config.bucket.clone();
-            let visibility_poll = config.visibility_poll;
-            let request_timeout = config.request_timeout;
-            let drain_timeout = config.drain_timeout;
-            tasks.spawn(async move {
-                wait_canary(
-                    &channel,
-                    &token,
-                    &bucket,
-                    &name,
-                    canary,
-                    visibility_poll,
-                    request_timeout,
-                    drain_timeout,
-                )
-                .await?;
-                let mut client = index_client(channel, &token)?;
-                Ok::<_, anyhow::Error>(
-                    marker_query(&mut client, &bucket, &name, canary.id)
-                        .await?
-                        .freshness,
-                )
-            });
-        }
-        let Some(completed) = tasks.join_next().await else {
-            break;
-        };
-        if let Some(freshness) = completed.context("final canary task panicked")?? {
-            source_nodes.extend(
-                freshness
-                    .sources
-                    .into_iter()
-                    .map(|source| source.node_id)
-                    .filter(|id| *id != 0),
-            );
-        }
-    }
-    Ok((true, source_nodes))
-}
-
 fn visibility_definition_position(sample_ordinal: u64, definition_count: usize) -> usize {
     (sample_ordinal as usize) % definition_count
+}
+
+fn marker_ordinal(workload: MutationWorkload, sequence: u64, sample_eligible: bool) -> u64 {
+    match workload {
+        MutationWorkload::MaterialChange => sequence,
+        MutationWorkload::ProjectionPreserving if sample_eligible => {
+            data::PROJECTION_PRESERVING_MARKERS.saturating_add(sequence)
+        }
+        MutationWorkload::ProjectionPreserving => sequence % data::PROJECTION_PRESERVING_MARKERS,
+    }
 }
 
 fn bounded_error(error: &str) -> String {
@@ -1396,13 +1599,11 @@ fn record_mutation_failure(report: &mut MutationReport, failure: MutationRequest
     }
 }
 
-async fn verify_final_mutable_state(
+async fn load_authoritative_mutable_state(
     config: &Config,
-    names: &[String],
     channels: &[Channel],
     token: &str,
-) -> Result<(bool, Option<bool>, BTreeSet<u64>)> {
-    let deadline = Instant::now() + config.drain_timeout;
+) -> Result<Arc<BTreeMap<String, u64>>> {
     let mut authority = BTreeMap::new();
     let mut objects = object_client(channels[0].clone(), token)?;
     for id in 0..config.mutable_records {
@@ -1423,7 +1624,17 @@ async fn verify_final_mutable_state(
         };
         authority.insert(path, version);
     }
-    let authority = Arc::new(authority);
+    Ok(Arc::new(authority))
+}
+
+async fn verify_final_mutable_state(
+    config: &Config,
+    names: &[String],
+    channels: &[Channel],
+    token: &str,
+    authority: Arc<BTreeMap<String, u64>>,
+) -> Result<(bool, Option<bool>, BTreeSet<u64>)> {
+    let deadline = Instant::now() + config.drain_timeout;
     let mut nodes = BTreeSet::new();
     let mut all_observed_tails_available = true;
     let mut next = names.iter().cloned().enumerate();
@@ -1729,143 +1940,4 @@ fn recipe_probe_pointer(recipe: usize) -> String {
 
 fn unix_millis() -> Result<u128> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn marker_ids_do_not_overlap_small_corpus_ids() {
-        assert_eq!((1u64 << 63) | 7, 9_223_372_036_854_775_815);
-        assert!(data::marker_path(7).contains("0000000000000007"));
-    }
-
-    #[test]
-    fn recipes_use_one_public_multivalue_field_and_distinct_source_pointers() {
-        assert_eq!(recipe_probe_pointer(0), "/probes/00");
-        assert_eq!(recipe_probe_pointer(1), "/probes/01");
-        assert_eq!(recipe_probe_pointer(63), "/probes/63");
-    }
-
-    #[test]
-    fn p1_definitions_have_identical_physical_recipes() {
-        assert_eq!(physical_recipe(0, 1), 0);
-        assert_eq!(physical_recipe(249_999, 1), 0);
-    }
-
-    #[test]
-    fn recipe_identity_is_bounded_independently_of_definition_count() {
-        let recipes = (0..250_000)
-            .map(|position| physical_recipe(position, 64))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(recipes.len(), 64);
-        let pointers = (0..64).map(recipe_probe_pointer).collect::<BTreeSet<_>>();
-        assert_eq!(pointers.len(), 64);
-    }
-
-    #[test]
-    fn large_catalog_uses_a_bounded_spanning_query_sample() {
-        let positions = qualification_definition_positions(250_000, 64, 1_024);
-        assert_eq!(positions.len(), MAX_ACTIVE_QUERY_DEFINITIONS);
-        assert_eq!(positions[0], 0);
-        assert_eq!(*positions.last().unwrap(), 249_999);
-        assert!((0..64).all(|recipe| positions.contains(&recipe)));
-    }
-
-    #[test]
-    fn optional_observed_tail_never_manufactures_zero_lag() {
-        let unavailable = IndexSourceFreshness {
-            indexed_next_offset: 12,
-            lag_hint: 0,
-            observed_tail: None,
-            ..Default::default()
-        };
-        assert!(source_has_no_observed_lag(&unavailable));
-        assert!(unavailable.observed_tail.is_none());
-
-        let current = IndexSourceFreshness {
-            observed_tail: Some(11),
-            ..unavailable.clone()
-        };
-        assert!(source_has_no_observed_lag(&current));
-
-        let behind = IndexSourceFreshness {
-            observed_tail: Some(12),
-            lag_hint: 1,
-            ..unavailable
-        };
-        assert!(!source_has_no_observed_lag(&behind));
-    }
-
-    #[test]
-    fn visibility_samples_rotate_independently_of_canary_interval() {
-        let positions = (0..20)
-            .map(|ordinal| visibility_definition_position(ordinal, 16))
-            .collect::<Vec<_>>();
-        assert_eq!(&positions[..16], &(0..16).collect::<Vec<_>>());
-        assert_eq!(&positions[16..], &[0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn visibility_failure_errors_are_bounded_on_character_boundaries() {
-        let error = "é".repeat(MAX_VISIBILITY_SAMPLE_ERROR_CHARS + 10);
-        let bounded = bounded_error(&error);
-        assert_eq!(bounded.chars().count(), MAX_VISIBILITY_SAMPLE_ERROR_CHARS);
-        assert!(error.starts_with(&bounded));
-    }
-
-    #[test]
-    fn mutation_failure_messages_are_bounded_on_character_boundaries() {
-        let message = "é".repeat(MAX_MUTATION_FAILURE_MESSAGE_CHARS + 10);
-        let bounded = bounded_mutation_failure_message(&message);
-        assert_eq!(bounded.chars().count(), MAX_MUTATION_FAILURE_MESSAGE_CHARS);
-        assert!(message.starts_with(&bounded));
-    }
-
-    #[test]
-    fn mutation_failure_classes_are_counted_and_bounded() {
-        let mut report = MutationReport::default();
-        for ordinal in 0..MAX_MUTATION_FAILURE_CLASSES {
-            record_mutation_failure(
-                &mut report,
-                MutationRequestFailure::one(
-                    "outcome",
-                    ordinal as i32,
-                    format!("Code{ordinal}"),
-                    format!("failure-{ordinal}"),
-                ),
-            );
-        }
-        record_mutation_failure(
-            &mut report,
-            MutationRequestFailure::one("outcome", 0, "Code0".into(), "failure-0".into()),
-        );
-        record_mutation_failure(
-            &mut report,
-            MutationRequestFailure::one(
-                "rpc-status",
-                tonic::Code::Unavailable as i32,
-                "Unavailable".into(),
-                "queue closed".into(),
-            ),
-        );
-
-        assert_eq!(report.failure_classes.len(), MAX_MUTATION_FAILURE_CLASSES);
-        assert_eq!(report.failure_classes[0].count, 2);
-        assert_eq!(report.failure_occurrences_omitted, 1);
-    }
-
-    #[tokio::test]
-    async fn fixed_rate_records_every_schedule_and_queue_drop() {
-        let (job_tx, mut job_rx) = mpsc::channel(2);
-        let report = produce_fixed_rate_jobs(Duration::from_millis(70), 32, 3_300.0, job_tx)
-            .await
-            .unwrap();
-        assert_eq!(report.offered_batches, 6);
-        assert_eq!(report.submitted_batches, 2);
-        assert_eq!(report.dropped_batches, 4);
-        assert_eq!(job_rx.recv().await.unwrap().sequence, 0);
-        assert_eq!(job_rx.recv().await.unwrap().sequence, 1);
-    }
 }
