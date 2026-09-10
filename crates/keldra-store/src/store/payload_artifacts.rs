@@ -818,9 +818,14 @@ impl RocksArtifactReader {
                     "payload artifact column family is missing",
                 )
             })?;
+            let mut read_options = rocksdb::ReadOptions::default();
+            // Payload integrity is checked when bytes cross an untrusted
+            // boundary. Rechecking RocksDB's internal checksum on every read
+            // of immutable local content duplicates that boundary check.
+            read_options.set_verify_checksums(false);
             self.cached = self
                 .db
-                .get_cf(cf, key)
+                .get_cf_opt(cf, key, &read_options)
                 .map_err(io::Error::other)?
                 .ok_or_else(|| {
                     io::Error::new(

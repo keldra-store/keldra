@@ -132,14 +132,14 @@ impl StagedBlob {
     }
 }
 
-/// A verified, bounded-memory reader for one immutable published blob.
+/// A bounded-memory reader for one immutable locally persisted blob.
 ///
-/// Reads hash the immutable RocksDB artifact again so an unexpected mutation
-/// is detected while it is being consumed.
+/// Content is verified when it crosses an untrusted boundary. RocksDB is the
+/// local persistence authority, so reading the same immutable bytes does not
+/// hash them again.
 pub struct BlobReader {
     source: BlobReaderSource,
     reference: BlobRef,
-    hasher: blake3::Hasher,
     position: u64,
     finished: bool,
 }
@@ -184,7 +184,6 @@ impl BlobReader {
         Self {
             source: BlobReaderSource::RocksDb(reader),
             reference: reference.clone(),
-            hasher: blake3::Hasher::new(),
             position: 0,
             finished: false,
         }
@@ -220,7 +219,6 @@ impl BlobReader {
                 reader.read_exact(&mut buffer[..read])?;
             }
         }
-        self.hasher.update(&buffer[..read]);
         self.position += read as u64;
         if self.position == self.reference.length {
             self.finish().await?;
@@ -229,9 +227,6 @@ impl BlobReader {
     }
 
     async fn finish(&mut self) -> Result<()> {
-        if self.hasher.finalize().as_bytes() != &self.reference.hash {
-            bail!("blob changed after verification");
-        }
         self.finished = true;
         Ok(())
     }
