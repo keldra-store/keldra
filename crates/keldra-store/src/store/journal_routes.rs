@@ -302,6 +302,7 @@ fn try_visit_routes_for_change<E>(
             }
         }
         LocalChange::AggregateChanged(_) => {}
+        LocalChange::SequenceGap(_) => {}
     }
     Ok(())
 }

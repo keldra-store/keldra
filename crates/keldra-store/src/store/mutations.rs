@@ -976,6 +976,7 @@ impl Store {
         mut status: WatchJournalStatus,
         cursor: u64,
         stage_visibility_settlement: bool,
+        stage_status: bool,
     ) -> Result<StagedLocalChanges, MutationError> {
         let journal = self.cf(CF_LOCAL_INVALIDATIONS)?;
         let metadata = self.cf(CF_METADATA)?;
@@ -1007,6 +1008,7 @@ impl Store {
                 }
                 Some(status.source_id)
             }
+            LocalReferenceEffects::AppliedInlineLane => None,
             LocalReferenceEffects::NoReferenceEffects => {
                 if changes
                     .iter()
@@ -1079,11 +1081,13 @@ impl Store {
         if visibility_settlement_staged {
             status.settled_through = status.tail;
         }
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_STATUS_KEY,
-            encode_watch_journal_status(status),
-        );
+        if stage_status {
+            batch.put_cf(
+                metadata,
+                LOCAL_INVALIDATION_STATUS_KEY,
+                encode_watch_journal_status(status),
+            );
+        }
         if let Some(source) = local_reference_cursor {
             self.stage_reference_delta_cursor(batch, source, status.tail)?;
         }
@@ -1691,7 +1695,10 @@ impl Store {
         }
         let fingerprint = operation.fingerprint();
         let apply_content_lifecycle = distributed.is_none_or(|distributed| {
-            distributed.reference_effects == LocalReferenceEffects::AppliedInline
+            matches!(
+                distributed.reference_effects,
+                LocalReferenceEffects::AppliedInline | LocalReferenceEffects::AppliedInlineLane
+            )
         });
         let released_predecessor = (versioning == ObjectVersioning::Unversioned)
             .then_some(current_stored_version.as_ref())

@@ -73,6 +73,7 @@ impl Store {
             status,
             cursor,
             reference_effects != LocalReferenceEffects::Deferred,
+            true,
         )?;
         Ok(())
     }

@@ -166,6 +166,6 @@ pub use watch::{
     LocalChangePage, LocalInvalidation, MAX_ATOMIC_BATCH_MUTATIONS,
     MAX_ATOMIC_BATCH_PUBLISHED_BYTES, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange,
     ObjectHeadChangeKind, OversizeLocalChange, ReferenceProof, ReferenceProofMutation,
-    RetainedVersionDeletedChange, SourceId, WatchCursor, WatchError, WatchJournalStatus, WatchPage,
-    WatchRetention, WatchScope, WatchStart,
+    RetainedVersionDeletedChange, SourceId, SourceSequenceGap, WatchCursor, WatchError,
+    WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
 };

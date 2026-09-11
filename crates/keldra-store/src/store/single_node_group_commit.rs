@@ -21,6 +21,7 @@ const DEFAULT_MAX_QUEUED_OPERATIONS: usize = 8_000;
 const DEFAULT_MAX_QUEUED_INLINE_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_GROUP_DWELL: Duration = Duration::from_micros(250);
 const DEFAULT_COMMIT_LANES: usize = 4;
+const MAX_COMMIT_LANES: usize = 256;
 
 /// Validated bounds and dwell time for single-node mutation group commit.
 ///
@@ -106,8 +107,8 @@ impl SingleNodeGroupCommitConfig {
     pub fn with_commit_lanes(mut self, commit_lanes: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(commit_lanes != 0, "commit lanes must be non-zero");
         anyhow::ensure!(
-            commit_lanes <= Semaphore::MAX_PERMITS,
-            "commit lanes exceed the runtime semaphore limit"
+            commit_lanes <= MAX_COMMIT_LANES,
+            "commit lanes exceed the supported maximum of {MAX_COMMIT_LANES}"
         );
         self.commit_lanes = commit_lanes;
         Ok(self)
@@ -650,7 +651,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        BucketPolicy, Durability, ObjectKey, PlacementLogId, PutMode, PutRequest, StoreOptions,
+        BucketPolicy, Durability, MutationReceiptRetention, ObjectKey, PlacementLogId, PutMode,
+        PutRequest, StoreOptions,
     };
 
     fn context(term: u64) -> ObjectMutationContext {
@@ -1092,10 +1094,15 @@ mod tests {
     }
 
     #[test]
-    fn group_commit_config_rejects_zero_lanes() {
+    fn group_commit_config_rejects_invalid_lane_counts() {
         assert!(
             SingleNodeGroupCommitConfig::default()
                 .with_commit_lanes(0)
+                .is_err()
+        );
+        assert!(
+            SingleNodeGroupCommitConfig::default()
+                .with_commit_lanes(MAX_COMMIT_LANES + 1)
                 .is_err()
         );
     }
@@ -1128,7 +1135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_reference_backlog_does_not_reject_single_node_group() {
+    async fn deferred_reference_backlog_backpressures_inline_lanes() {
         let temporary = tempfile::tempdir().unwrap();
         let config = SingleNodeGroupCommitConfig::default()
             .with_commit_lanes(1)
@@ -1181,39 +1188,11 @@ mod tests {
             ),
         );
 
-        assert!(matches!(first.as_deref(), Ok([Ok(_)])), "first={first:?}");
-        assert!(
-            matches!(second.as_deref(), Ok([Ok(_)])),
-            "second={second:?}"
-        );
-        assert_eq!(physical_commits_since(&store, before_sequence), 1);
-        for (path, expected) in [
-            ("objects/first-after-gap", b"first-after-gap".as_slice()),
-            ("objects/second-after-gap", b"second-after-gap".as_slice()),
-        ] {
-            let object = store
-                .get(&ObjectKey::new("tenant", "bucket", path).unwrap())
-                .await
-                .unwrap()
-                .expect("post-gap single-node object must remain readable");
-            assert_eq!(object.bytes, expected);
-            let reference = object
-                .version
-                .blob
-                .expect("put must retain its blob identity");
-            let state = store
-                .blob_reference_state(&reference)
-                .unwrap()
-                .expect("inline payload must retain lifecycle authority");
-            assert_eq!(state.ref_count, 1);
-            assert_eq!(
-                store.complete_copy_state(&reference).await.unwrap(),
-                crate::PayloadArtifactState::Valid
-            );
-        }
+        assert!(matches!(first, Err(MutationError::SourceJournalCapacity)));
+        assert!(matches!(second, Err(MutationError::SourceJournalCapacity)));
+        assert_eq!(physical_commits_since(&store, before_sequence), 0);
         let after = store.local_watch_status().unwrap();
-        assert!(after.tail > before.tail);
-        assert_eq!(after.settled_through, after.tail);
+        assert_eq!(after, before);
         assert_eq!(
             store.reference_delta_cursor(after.source_id).unwrap(),
             cursor
@@ -1256,42 +1235,28 @@ mod tests {
             "settlement-gap",
             governance.clone(),
         );
-        let gap_committed = store
+        let gap_error = store
             .coordinate_single_node_mutation_batch_with_settlement(gap_operation, context(1))
             .await
-            .unwrap();
-        assert_eq!(
-            gap_committed.source_journal_settlement,
-            SourceJournalSettlement::CompletedByCoordinator
-        );
-        assert!(!gap_committed.outcomes[0].as_ref().unwrap().receipt.replayed);
+            .unwrap_err();
+        assert!(matches!(gap_error, MutationError::SourceJournalCapacity));
         let after_gap = store.local_watch_status().unwrap();
-        assert!(after_gap.tail > before.tail);
-        assert_eq!(after_gap.settled_through, before.settled_through);
+        assert_eq!(after_gap, before);
 
         let operation = request("objects/settlement-retry", "settlement-retry", governance);
         let committed = store
             .coordinate_single_node_mutation_batch_with_settlement(operation.clone(), context(1))
             .await
-            .unwrap();
-        assert_eq!(
-            committed.source_journal_settlement,
-            SourceJournalSettlement::CompletedByCoordinator
-        );
-        let receipt = committed.outcomes[0].as_ref().unwrap();
-        assert!(!receipt.receipt.replayed);
+            .unwrap_err();
+        assert!(matches!(committed, MutationError::SourceJournalCapacity));
         let committed_tail = store.local_watch_status().unwrap().tail;
-        assert!(committed_tail > after_gap.tail);
+        assert_eq!(committed_tail, after_gap.tail);
 
         let replay = store
             .coordinate_single_node_mutation_batch_with_settlement(operation, context(1))
             .await
-            .unwrap();
-        assert_eq!(
-            replay.source_journal_settlement,
-            SourceJournalSettlement::CompletedByCoordinator
-        );
-        assert!(replay.outcomes[0].as_ref().unwrap().receipt.replayed);
+            .unwrap_err();
+        assert!(matches!(replay, MutationError::SourceJournalCapacity));
         let unsettled = store.local_watch_status().unwrap();
         assert_eq!(unsettled.settled_through, before.settled_through);
 
@@ -1347,6 +1312,84 @@ mod tests {
         );
         let status = store.local_watch_status().unwrap();
         assert_eq!(status.settled_through, status.tail);
+    }
+
+    #[tokio::test]
+    async fn idle_settlement_is_not_regressed_by_the_next_lane_projection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let governance = governance(&store);
+        let first = store
+            .coordinate_single_node_mutation_batch(
+                request(
+                    "objects/frontier-first",
+                    "frontier-first",
+                    governance.clone(),
+                ),
+                context(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(first.as_slice(), [Ok(_)]));
+        let first_status = store.local_watch_status().unwrap();
+        let positions = (first_status.settled_through + 1..=first_status.tail).collect::<Vec<_>>();
+        let first_position = *positions.last().unwrap();
+        assert_eq!(
+            store
+                .settle_source_journal_positions_if_contiguous(first_status.source_id, &positions)
+                .await
+                .unwrap(),
+            Some(first_position)
+        );
+
+        let second = store
+            .coordinate_single_node_mutation_batch(
+                request("objects/frontier-second", "frontier-second", governance),
+                context(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(second.as_slice(), [Ok(_)]));
+        let status = store.local_watch_status().unwrap();
+        assert!(status.tail > first_position);
+        assert_eq!(status.settled_through, status.tail);
+    }
+
+    #[tokio::test]
+    async fn legacy_journal_authority_is_refreshed_before_the_next_lane() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let governance = governance(&store);
+        let legacy = store
+            .coordinate_distributed_mutation_batch(
+                request("objects/legacy", "legacy", governance.clone()),
+                context(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(legacy.as_slice(), [Ok(_)]));
+        let legacy_status = store.local_watch_status().unwrap();
+        let legacy_receipts = store.mutation_receipt_status().unwrap();
+
+        let lane = store
+            .coordinate_single_node_mutation_batch(
+                request("objects/lane", "lane", governance),
+                context(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(lane.as_slice(), [Ok(_)]));
+        let status = store.local_watch_status().unwrap();
+        assert!(status.tail > legacy_status.tail);
+        assert!(status.retained_entries > legacy_status.retained_entries);
+        assert_eq!(
+            store.mutation_receipt_status().unwrap().entries,
+            legacy_receipts.entries + 1
+        );
     }
 
     #[tokio::test]
@@ -1434,5 +1477,39 @@ mod tests {
         );
         let status = store.local_watch_status().unwrap();
         assert_eq!(status.settled_through, status.tail);
+    }
+
+    #[tokio::test]
+    async fn exclusive_receipt_pruning_refreshes_lane_capacity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1).with_mutation_receipt_retention(
+                MutationReceiptRetention::new(1, 1, 1024 * 1024).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let governance = governance(&store);
+        let first = store
+            .coordinate_single_node_mutation_batch(
+                request("objects/receipt-first", "receipt-first", governance.clone()),
+                context(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(first.as_slice(), [Ok(_)]));
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(store.prune_expired_receipts_for_capacity().await.unwrap());
+
+        let second = store
+            .coordinate_single_node_mutation_batch(
+                request("objects/receipt-second", "receipt-second", governance),
+                context(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(second.as_slice(), [Ok(_)]), "second={second:?}");
+        assert_eq!(store.mutation_receipt_status().unwrap().entries, 1);
     }
 }

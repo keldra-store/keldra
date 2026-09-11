@@ -10,14 +10,21 @@ use keldra_store::{
     Precondition, PreparedBundleHash, ProgramBundleAuthority, ProgramGovernanceParticipant,
     ProgramHash, ProgramObjectParticipant, ProgramParticipantIntent, ProgramPathCondition,
     ProgramPathReservation, ProgramPathStage, ProgramReservation, ProgramReservationState,
-    PublishRequest, PutMode, PutRequest, ReferenceDelta, StorageTenantId, StoreOptions, Version,
-    VersionId, WatchRetention,
+    PublishRequest, PutMode, PutRequest, ReferenceDelta, SourceSequenceGap, StorageTenantId,
+    StoreOptions, Version, VersionId, WatchRetention,
 };
 use tempfile::TempDir;
 
 use super::*;
 
 mod alias_recovery;
+
+#[test]
+fn sequence_gap_is_a_self_proving_visibility_noop() {
+    assert!(locally_self_proving_visibility(&LocalChange::SequenceGap(
+        SourceSequenceGap { offset: 7 },
+    )));
+}
 
 fn placement(node_ids: &[u64], fence: u64) -> ReferencePlacement {
     let nodes = node_ids
@@ -926,7 +933,7 @@ async fn a_failed_destination_retries_without_double_applying_other_nodes() {
 }
 
 #[tokio::test]
-async fn a_failed_destination_cursor_does_not_block_visibility_settlement() {
+async fn a_failed_destination_cursor_keeps_reference_bearing_visibility_unsettled() {
     let stores = TestStores::open(&[1, 2, 3]).await;
     let source = stores.stores[&NodeId(1)].clone();
     publish(&source, "cursor-failure", b"payload", "cursor-failure").await;
@@ -961,7 +968,7 @@ async fn a_failed_destination_cursor_does_not_block_visibility_settlement() {
     ));
     assert_eq!(
         source.local_watch_status().unwrap().settled_through,
-        before.tail
+        before.settled_through
     );
 }
 

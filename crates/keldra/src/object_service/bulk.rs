@@ -253,19 +253,84 @@ pub(super) async fn execute_coordinator_groups(
 
 type LocalOperation = (BatchOperation, Option<DefinitionMutationIntent>);
 
-fn operation_key(operation: &BatchOperation) -> &ObjectKey {
-    match operation {
-        BatchOperation::Put(request) => &request.key,
-        BatchOperation::Publish(request) => &request.key,
-        BatchOperation::Clone(request) => &request.destination,
-        BatchOperation::Delete(request) => &request.key,
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LocalConflictResource {
+    Path(ObjectKey),
+    Receipt(String, String, String),
+    Blob([u8; 32], u64),
+    Definition(String, String, u8, u64),
+}
+
+fn operation_resources(
+    operation: &BatchOperation,
+    intent: Option<DefinitionMutationIntent>,
+) -> Vec<LocalConflictResource> {
+    let (key, command_id, blob) = match operation {
+        BatchOperation::Put(request) => (&request.key, request.command_id.as_deref(), None),
+        BatchOperation::Publish(request) => (
+            &request.key,
+            request.command_id.as_deref(),
+            Some(&request.blob),
+        ),
+        BatchOperation::Clone(request) => (
+            &request.destination,
+            request.command_id.as_deref(),
+            Some(&request.blob),
+        ),
+        BatchOperation::Delete(request) => (&request.key, request.command_id.as_deref(), None),
+    };
+    let mut resources = match operation {
+        BatchOperation::Clone(request) => vec![
+            LocalConflictResource::Path(request.source.clone()),
+            LocalConflictResource::Path(request.destination.clone()),
+        ],
+        _ => vec![LocalConflictResource::Path(key.clone())],
+    };
+    if let Some(command_id) = command_id {
+        resources.push(LocalConflictResource::Receipt(
+            key.tenant().to_owned(),
+            key.bucket().to_owned(),
+            command_id.to_owned(),
+        ));
+    }
+    if let Some(blob) = blob {
+        resources.push(LocalConflictResource::Blob(blob.hash, blob.length));
+    }
+    if let Some(intent) = intent {
+        resources.push(LocalConflictResource::Definition(
+            key.tenant().to_owned(),
+            key.bucket().to_owned(),
+            intent.kind as u8,
+            intent.definition_id,
+        ));
+    }
+    resources
+}
+
+fn component_root(parents: &mut [usize], index: usize) -> usize {
+    let parent = parents[index];
+    if parent != index {
+        parents[index] = component_root(parents, parent);
+    }
+    parents[index]
+}
+
+fn connect_components(parents: &mut [usize], left: usize, right: usize) {
+    let left = component_root(parents, left);
+    let right = component_root(parents, right);
+    if left != right {
+        let (first, second) = if left < right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        parents[second] = first;
     }
 }
 
-/// Splits one locally coordinated RPC into bounded exact-path lanes. Repeated
-/// paths stay in their original input order in one lane; independent paths can
-/// enter the store concurrently. The store remains the authority for broader
-/// conflicts such as clone source paths, command receipts and blob references.
+/// Splits one locally coordinated RPC into bounded connected-conflict lanes.
+/// Every operation sharing any path, receipt, blob, or definition resource is
+/// kept in input order with the whole transitive conflict component.
 fn partition_local_operations(
     indices: Vec<usize>,
     operations: Vec<LocalOperation>,
@@ -279,11 +344,24 @@ fn partition_local_operations(
     let mut lanes = (0..lane_count)
         .map(|_| (Vec::new(), Vec::new()))
         .collect::<Vec<_>>();
-    let mut assignments = BTreeMap::<ObjectKey, usize>::new();
+    let mut parents = (0..operations.len()).collect::<Vec<_>>();
+    let mut resource_owner = BTreeMap::<LocalConflictResource, usize>::new();
+    for (operation_index, (operation, intent)) in operations.iter().enumerate() {
+        for resource in operation_resources(operation, *intent) {
+            if let Some(existing) = resource_owner.get(&resource).copied() {
+                connect_components(&mut parents, operation_index, existing);
+            } else {
+                resource_owner.insert(resource, operation_index);
+            }
+        }
+    }
+    let roots = (0..operations.len())
+        .map(|index| component_root(&mut parents, index))
+        .collect::<Vec<_>>();
+    let mut assignments = BTreeMap::<usize, usize>::new();
     let mut next_lane = 0_usize;
-    for (index, operation) in indices.into_iter().zip(operations) {
-        let key = operation_key(&operation.0).clone();
-        let lane = *assignments.entry(key).or_insert_with(|| {
+    for ((index, operation), root) in indices.into_iter().zip(operations).zip(roots) {
+        let lane = *assignments.entry(root).or_insert_with(|| {
             let assigned = next_lane;
             next_lane = (next_lane + 1) % lane_count;
             assigned
@@ -350,6 +428,25 @@ mod tests {
         )
     }
 
+    fn local_clone(source: &str, destination: &str) -> LocalOperation {
+        (
+            BatchOperation::Clone(keldra_store::CloneRequest {
+                source: ObjectKey::new("tenant", "bucket", source).unwrap(),
+                source_version: keldra_store::VersionId(1),
+                destination: ObjectKey::new("tenant", "bucket", destination).unwrap(),
+                blob: keldra_store::BlobRef {
+                    hash: [7; 32],
+                    length: 8,
+                },
+                content_type: None,
+                mode: keldra_store::PutMode::Put,
+                command_id: None,
+                durability: keldra_store::Durability::Local,
+            }),
+            None,
+        )
+    }
+
     #[test]
     fn local_partition_keeps_same_path_input_order_and_balances_independent_paths() {
         let lanes = partition_local_operations(
@@ -368,6 +465,35 @@ mod tests {
         assert_eq!(lanes[0].0, vec![7, 9, 11]);
         assert_eq!(lanes[1].0, vec![8]);
         assert_eq!(lanes[2].0, vec![10]);
+    }
+
+    #[test]
+    fn local_partition_keeps_write_then_clone_dependency_in_input_order() {
+        let lanes = partition_local_operations(
+            vec![0, 1, 2],
+            vec![
+                local_put("a"),
+                local_clone("a", "b"),
+                local_put("unrelated"),
+            ],
+            2,
+        );
+        assert!(lanes.iter().any(|lane| lane.0 == vec![0, 1]));
+    }
+
+    #[test]
+    fn local_partition_keeps_clone_then_source_and_destination_writes_in_order() {
+        let lanes = partition_local_operations(
+            vec![0, 1, 2, 3],
+            vec![
+                local_clone("a", "b"),
+                local_put("b"),
+                local_put("a"),
+                local_put("unrelated"),
+            ],
+            3,
+        );
+        assert!(lanes.iter().any(|lane| lane.0 == vec![0, 1, 2]));
     }
 
     #[test]

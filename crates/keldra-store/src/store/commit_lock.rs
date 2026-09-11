@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use super::Store;
 
 pub(crate) struct CommitLockGuard<'a> {
+    _lane_fence: super::mutation_commit_lanes::ExclusiveMutationGuard<'a>,
     guard: Option<tokio::sync::MutexGuard<'a, ()>>,
     owner: &'static str,
     wait_duration: Duration,
@@ -24,6 +25,7 @@ impl Drop for CommitLockGuard<'_> {
 }
 
 pub(crate) struct OwnedCommitLockGuard {
+    _lane_fence: super::mutation_commit_lanes::ExclusiveMutationGuard<'static>,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     owner: &'static str,
     wait_duration: Duration,
@@ -41,8 +43,10 @@ impl Drop for OwnedCommitLockGuard {
 impl Store {
     pub(crate) async fn lock_commit(&self, owner: &'static str) -> CommitLockGuard<'_> {
         let started = Instant::now();
+        let lane_fence = self.mutation_commit_lanes.acquire_exclusive().await;
         let guard = self.commit_lock.lock().await;
         CommitLockGuard {
+            _lane_fence: lane_fence,
             guard: Some(guard),
             owner,
             wait_duration: started.elapsed(),
@@ -52,8 +56,10 @@ impl Store {
 
     pub(crate) async fn lock_commit_owned(&self, owner: &'static str) -> OwnedCommitLockGuard {
         let started = Instant::now();
+        let lane_fence = self.mutation_commit_lanes.acquire_exclusive().await;
         let guard = self.commit_lock.clone().lock_owned().await;
         OwnedCommitLockGuard {
+            _lane_fence: lane_fence,
             guard: Some(guard),
             owner,
             wait_duration: started.elapsed(),
@@ -66,8 +72,10 @@ impl Store {
         owner: &'static str,
     ) -> Result<CommitLockGuard<'_>, tokio::sync::TryLockError> {
         let started = Instant::now();
+        let lane_fence = self.mutation_commit_lanes.try_acquire_exclusive()?;
         let guard = self.commit_lock.try_lock()?;
         Ok(CommitLockGuard {
+            _lane_fence: lane_fence,
             guard: Some(guard),
             owner,
             wait_duration: started.elapsed(),
@@ -77,8 +85,10 @@ impl Store {
 
     pub(crate) fn blocking_lock_commit(&self, owner: &'static str) -> CommitLockGuard<'_> {
         let started = Instant::now();
+        let lane_fence = self.mutation_commit_lanes.blocking_acquire_exclusive();
         let guard = self.commit_lock.blocking_lock();
         CommitLockGuard {
+            _lane_fence: lane_fence,
             guard: Some(guard),
             owner,
             wait_duration: started.elapsed(),

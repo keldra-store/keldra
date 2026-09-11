@@ -163,9 +163,10 @@ pub struct WatchJournalStatus {
     pub source_id: SourceId,
     /// Highest offset ever allocated, including entries already pruned.
     pub tail: u64,
-    /// Highest contiguous offset whose object metadata is known to have
-    /// reached its required authority. Derived consumers must never read
-    /// beyond this boundary; retention and handoff continue to use `tail`.
+    /// Highest contiguous offset whose object metadata reached its required
+    /// authority and whose reference effects reached every current
+    /// destination. Derived consumers must never read beyond this boundary;
+    /// retention and handoff continue to use `tail`.
     pub settled_through: u64,
     /// Lowest valid resume cursor. Entries through this offset were pruned.
     pub retention_floor: u64,
@@ -503,6 +504,14 @@ pub enum LocalChange {
     AggregateChanged(AggregateChanged),
     ContentLifecycleChanged(ContentLifecycleChanged),
     AtomicBatchPublished(AtomicBatchPublished),
+    /// A source position reserved by an interrupted parallel commit. It
+    /// carries no derived effect but keeps the source cursor contiguous.
+    SequenceGap(SourceSequenceGap),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSequenceGap {
+    pub offset: u64,
 }
 
 /// One source-local journal page admitted under an explicit encoded-byte cap.
@@ -750,6 +759,10 @@ impl LocalChange {
         })
     }
 
+    pub(crate) fn sequence_gap(offset: u64) -> Self {
+        Self::SequenceGap(SourceSequenceGap { offset })
+    }
+
     pub fn offset(&self) -> u64 {
         match self {
             Self::ObjectHead(change) => change.offset,
@@ -757,6 +770,7 @@ impl LocalChange {
             Self::AggregateChanged(change) => change.offset,
             Self::ContentLifecycleChanged(change) => change.offset,
             Self::AtomicBatchPublished(change) => change.offset,
+            Self::SequenceGap(change) => change.offset,
         }
     }
 
@@ -767,6 +781,7 @@ impl LocalChange {
             Self::AggregateChanged(_) => &[],
             Self::ContentLifecycleChanged(change) => &change.reference_deltas,
             Self::AtomicBatchPublished(_) => &[],
+            Self::SequenceGap(_) => &[],
         }
     }
 
@@ -782,6 +797,7 @@ impl LocalChange {
             Self::AggregateChanged(_) => None,
             Self::ContentLifecycleChanged(_) => None,
             Self::AtomicBatchPublished(_) => None,
+            Self::SequenceGap(_) => None,
             _ => None,
         }
     }

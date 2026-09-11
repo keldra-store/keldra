@@ -68,7 +68,8 @@ impl Store {
             SourceJournalAdmission::Bounded,
             status,
             reference_cursor,
-            true,
+            false,
+            false,
         )
         .map(Some)
     }
@@ -189,11 +190,6 @@ impl Store {
             } else {
                 responses.push(Ok(SingleNodeMutationBatch {
                     outcomes,
-                    // The one-node coordinator stages the visibility frontier
-                    // in the same RocksDB batch as the object and journal
-                    // records. A gap remains hidden behind that frontier and
-                    // is recovered by the existing journal worker; issuing a
-                    // second synchronous settlement write here is redundant.
                     source_journal_settlement: SourceJournalSettlement::CompletedByCoordinator,
                 }));
             }
@@ -290,17 +286,6 @@ impl Store {
         }
         let prepare_duration = prepare_started.elapsed();
 
-        let lane_resources = prepared
-            .iter()
-            .flat_map(|item| {
-                super::mutation_commit_lanes::conflict_resources(
-                    &item.operation,
-                    item.definition_intent,
-                )
-            })
-            .collect::<Vec<_>>();
-        let _mutation_lane = self.mutation_commit_lanes.acquire(lane_resources).await;
-
         let policy_wait_started = std::time::Instant::now();
         let _policy_guard = self.policy_gate.read().await;
         let policy_wait_duration = policy_wait_started.elapsed();
@@ -310,36 +295,100 @@ impl Store {
             .acquire(
                 &prepared
                     .iter()
-                    .map(|item| object_path(item.operation.key()))
+                    .flat_map(|item| item.operation.lock_paths())
                     .collect::<Vec<_>>(),
             )
             .await;
         let path_wait_duration = path_wait_started.elapsed();
+        let lane_mode = matches!(
+            payload_preparation,
+            CoordinatorBatchPayloadPreparation::SingleNode
+        );
         let prepared_operations = prepared
             .iter()
             .map(|item| &item.operation)
             .collect::<Vec<_>>();
         let mut baseline_prefetch_duration = std::time::Duration::ZERO;
-        let mut commit_wait_duration = std::time::Duration::ZERO;
-        let mut baseline_revalidation_retries = 0_u64;
-        let (read_cache, _commit_guard) = loop {
+        let lane_read_cache = if lane_mode {
             let prefetch_started = std::time::Instant::now();
             let read_cache = MutationReadCache::load(self, &prepared_operations)?;
+            baseline_prefetch_duration = prefetch_started.elapsed();
+            Some(read_cache)
+        } else {
+            None
+        };
+        let _mutation_lane = if lane_mode {
+            let mut lane_resources = prepared
+                .iter()
+                .flat_map(|item| {
+                    super::mutation_commit_lanes::conflict_resources(
+                        &item.operation,
+                        item.definition_intent,
+                    )
+                })
+                .collect::<Vec<_>>();
+            lane_resources.extend(
+                lane_read_cache
+                    .as_ref()
+                    .expect("lane read cache was loaded")
+                    .predecessor_blob_conflict_resources(),
+            );
+            Some(self.mutation_commit_lanes.acquire(lane_resources).await)
+        } else {
+            None
+        };
+        let mut commit_wait_duration = std::time::Duration::ZERO;
+        let mut baseline_revalidation_retries = 0_u64;
+        let (read_cache, mut commit_guard) = if lane_mode {
+            // The first snapshot discovered predecessor blob identities while
+            // ordinary path locks kept the heads stable. Reload after taking
+            // those blob conflict stripes so their refcounts cannot change
+            // between the cached baseline and this lane's atomic write.
+            let mut read_cache = lane_read_cache.expect("lane read cache was loaded");
+            let prefetch_started = std::time::Instant::now();
+            read_cache.refresh_conflict_values(self)?;
             baseline_prefetch_duration =
                 baseline_prefetch_duration.saturating_add(prefetch_started.elapsed());
+            (read_cache, None)
+        } else {
+            let (read_cache, guard) = loop {
+                let prefetch_started = std::time::Instant::now();
+                let read_cache = MutationReadCache::load(self, &prepared_operations)?;
+                baseline_prefetch_duration =
+                    baseline_prefetch_duration.saturating_add(prefetch_started.elapsed());
 
-            let commit_wait_started = std::time::Instant::now();
-            let commit_guard = self.lock_commit("distributed_publish").await;
-            commit_wait_duration =
-                commit_wait_duration.saturating_add(commit_wait_started.elapsed());
-            if read_cache.is_current(self) {
-                break (read_cache, commit_guard);
-            }
-            drop(commit_guard);
-            baseline_revalidation_retries = baseline_revalidation_retries.saturating_add(1);
-            tokio::task::yield_now().await;
+                let commit_wait_started = std::time::Instant::now();
+                let commit_guard = self.lock_commit("distributed_publish").await;
+                commit_wait_duration =
+                    commit_wait_duration.saturating_add(commit_wait_started.elapsed());
+                if read_cache.is_current(self) {
+                    break (read_cache, commit_guard);
+                }
+                drop(commit_guard);
+                baseline_revalidation_retries = baseline_revalidation_retries.saturating_add(1);
+                tokio::task::yield_now().await;
+            };
+            (read_cache, Some(guard))
         };
         drop(prepared_operations);
+        let mut lane_runtime_guard = if lane_mode {
+            let commit_wait_started = std::time::Instant::now();
+            let mut guard = self.mutation_commit_lanes.sequence().await;
+            let runtime = guard.as_mut().ok_or_else(|| {
+                MutationError::Storage("mutation lane runtime is not initialized".into())
+            })?;
+            self.refresh_stale_lane_runtime(runtime)?;
+            let reference_cursor = self
+                .reference_delta_cursor(runtime.projected_watch.source_id)
+                .map_err(|error| MutationError::Storage(error.to_string()))?;
+            if reference_cursor != runtime.projected_watch.tail {
+                return Err(MutationError::SourceJournalCapacity);
+            }
+            commit_wait_duration = commit_wait_started.elapsed();
+            Some(guard)
+        } else {
+            None
+        };
         let commit_hold_started = std::time::Instant::now();
         let locked_setup_started = std::time::Instant::now();
         let mut reserved = BTreeMap::new();
@@ -356,36 +405,23 @@ impl Store {
             prepared.retain(|item| !reserved.contains_key(&item.index));
             early.extend(reserved);
         }
-        let source = self
-            .local_watch_status()
-            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let source = if let Some(runtime) = lane_runtime_guard.as_deref() {
+            runtime
+                .as_ref()
+                .ok_or_else(|| {
+                    MutationError::Storage("mutation lane runtime is not initialized".into())
+                })?
+                .reserved_watch
+        } else {
+            self.local_watch_status()
+                .map_err(|error| MutationError::Storage(error.to_string()))?
+        };
         let (reference_effects, reference_cursor) = match payload_preparation {
             CoordinatorBatchPayloadPreparation::Distributed => {
                 (LocalReferenceEffects::Deferred, None)
             }
             CoordinatorBatchPayloadPreparation::SingleNode => {
-                let cursor = self.reference_delta_cursor(source.source_id).map_err(|error| {
-                    MutationError::Storage(format!(
-                        "cannot read local reference cursor before single-node coordination: {error}"
-                    ))
-                })?;
-                if cursor > source.tail {
-                    return Err(MutationError::Storage(format!(
-                        "local reference cursor {cursor} is ahead of source-journal tail {}",
-                        source.tail
-                    )));
-                }
-                let effects = if cursor == source.tail {
-                    LocalReferenceEffects::AppliedInline
-                } else {
-                    // A derived or distributed publication may have appended
-                    // reference work that the delivery runtime has not yet
-                    // consumed. Do not advance across that gap or apply this
-                    // group's effects out of order; append them to the same
-                    // authoritative journal for contiguous delivery instead.
-                    LocalReferenceEffects::Deferred
-                };
-                (effects, Some(cursor))
+                (LocalReferenceEffects::AppliedInlineLane, Some(source.tail))
             }
         };
         let mut next_source_position = source.tail.checked_add(1).ok_or_else(|| {
@@ -393,10 +429,22 @@ impl Store {
         })?;
         let now = now_unix_millis()?;
         let mut batch = WriteBatch::default();
-        let mut receipt_status = self.mutation_receipt_status()?;
+        let mut receipt_status = if let Some(runtime) = lane_runtime_guard.as_deref() {
+            runtime
+                .as_ref()
+                .ok_or_else(|| {
+                    MutationError::Storage("mutation lane runtime is not initialized".into())
+                })?
+                .reserved_receipts
+        } else {
+            self.mutation_receipt_status()?
+        };
         let initial_receipt_status = receipt_status;
-        let pruned_receipts =
-            self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
+        let pruned_receipts = if lane_mode {
+            BTreeSet::new()
+        } else {
+            self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?
+        };
         let locked_setup_duration = locked_setup_started.elapsed();
         let mut pending_heads = BTreeMap::new();
         let mut pending_versions = BTreeMap::new();
@@ -525,7 +573,7 @@ impl Store {
         let evaluate_duration = evaluate_started.elapsed();
 
         let stage_started = std::time::Instant::now();
-        if receipt_status != initial_receipt_status {
+        if !lane_mode && receipt_status != initial_receipt_status {
             self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
         }
         let staged_local_changes = match payload_preparation {
@@ -542,29 +590,63 @@ impl Store {
                 None
             }
         };
-        if let Some(high_watermark) = high_watermark {
+        if !lane_mode && let Some(high_watermark) = high_watermark {
             batch.put_cf(
                 self.cf(CF_METADATA)?,
                 VERSION_HIGH_WATERMARK_KEY,
                 serde_json::to_vec(&high_watermark).map_err(storage_error)?,
             );
         }
+        let lane_completion = if lane_mode && !batch.is_empty() {
+            let runtime = lane_runtime_guard
+                .as_deref_mut()
+                .and_then(Option::as_mut)
+                .ok_or_else(|| {
+                    MutationError::Storage("mutation lane runtime is not initialized".into())
+                })?;
+            let watch = staged_local_changes
+                .as_ref()
+                .map_or(source, |staged| staged.status);
+            let completion = runtime.reserve(watch, receipt_status, high_watermark)?;
+            self.stage_lane_completion(&mut batch, completion)?;
+            Some(completion)
+        } else {
+            None
+        };
         let stage_duration = stage_started.elapsed();
+        if lane_mode {
+            drop(lane_runtime_guard.take());
+            drop(commit_guard.take());
+        }
         let persist_started = std::time::Instant::now();
         let physical_commit = !batch.is_empty();
         let write_batch_entries = u64::try_from(batch.len()).unwrap_or(u64::MAX);
         let write_batch_bytes = u64::try_from(batch.size_in_bytes()).unwrap_or(u64::MAX);
-        if physical_commit {
+        let persistence = if physical_commit {
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
-            self.db.write_opt(batch, &options).map_err(storage_error)?;
+            self.db.write_opt(batch, &options).map_err(storage_error)
+        } else {
+            Ok(())
+        };
+        if let Some(completion) = lane_completion {
+            let committed = match &persistence {
+                Ok(()) => true,
+                Err(_) => self
+                    .db
+                    .get_cf(self.cf(CF_METADATA)?, completion.key())
+                    .map_err(storage_error)?
+                    .is_some(),
+            };
+            self.finish_lane_commit(completion, committed).await?;
         }
+        persistence?;
         let persist_duration = persist_started.elapsed();
         let settle_started = std::time::Instant::now();
-        if !pruned_receipts.is_empty() {
+        if !lane_mode && !pruned_receipts.is_empty() {
             self.mutation_capacity_notify.notify_waiters();
         }
-        if !pending_changes.is_empty() {
+        if !lane_mode && !pending_changes.is_empty() {
             if reference_effects == LocalReferenceEffects::AppliedInline {
                 if let Some(staged) = staged_local_changes {
                     self.settle_inline_source_changes_from_status(staged.status)?;
@@ -1026,17 +1108,7 @@ mod tests {
             journal.tail
         );
         assert_eq!(source_positions.last().copied(), Some(journal.tail));
-        assert!(
-            store
-                .settle_source_journal_positions_if_contiguous(
-                    source.expect("batch must have a source"),
-                    &source_positions,
-                )
-                .await
-                .unwrap()
-                .is_none(),
-            "the production local acknowledgement must not need another durable settlement"
-        );
+        assert_eq!(source, Some(journal.source_id));
         assert_eq!(
             store
                 .db

@@ -293,7 +293,10 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
     )
     .unwrap();
     assert_eq!(mutation_status.tail, mutation.stamp.source_journal_position);
-    assert_eq!(mutation_status.settled_through, 0);
+    assert_eq!(
+        mutation_status.settled_through,
+        mutation.stamp.source_journal_position
+    );
 
     let replica_sequence = replica.db.latest_sequence_number();
     assert_eq!(

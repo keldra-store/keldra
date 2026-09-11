@@ -177,9 +177,10 @@ impl Store {
         Ok(())
     }
 
-    /// Advances the highest contiguous source offset whose metadata and
-    /// atomic-program visibility are settled. This cut never controls journal
-    /// pruning; reference-delivery safety has its own independent boundary.
+    /// Advances the highest contiguous source offset whose metadata,
+    /// atomic-program visibility, and reference delivery are settled. This cut
+    /// never controls journal pruning; reference-delivery safety retains its
+    /// independent cursor as the physical retention proof.
     pub async fn advance_source_journal_settled_through(
         &self,
         offset: u64,

@@ -9,7 +9,7 @@ use thiserror::Error;
 use super::{
     AccountingHeadTransition, AggregateChanged, AggregateKind, ContentAccountingTransition,
     ContentLifecycleChanged, LocalChange, ObjectHeadChange, ObjectHeadChangeKind,
-    RetainedVersionDeletedChange,
+    RetainedVersionDeletedChange, SourceSequenceGap,
 };
 use crate::{
     BlobRef, DefinitionKind, DefinitionOperation, DefinitionTransition, ReferenceDelta, VersionId,
@@ -25,6 +25,7 @@ const RETAINED_VERSION_DELETED: u8 = 2;
 const AGGREGATE_CHANGED: u8 = 3;
 const CONTENT_LIFECYCLE_CHANGED: u8 = 4;
 const ATOMIC_BATCH_PUBLISHED: u8 = 5;
+const SEQUENCE_GAP: u8 = 6;
 
 const PUT: u8 = 1;
 const DELETE: u8 = 2;
@@ -198,6 +199,10 @@ fn encode_body(change: &LocalChange) -> Result<(u8, Vec<u8>), LocalChangeCodecEr
             }
             Ok((ATOMIC_BATCH_PUBLISHED, body))
         }
+        LocalChange::SequenceGap(change) => {
+            put_u64(&mut body, change.offset);
+            Ok((SEQUENCE_GAP, body))
+        }
     }
 }
 
@@ -302,6 +307,9 @@ fn decode_body(kind: u8, input: &mut Input<'_>) -> Result<LocalChange, LocalChan
             change.validate().map_err(malformed)?;
             Ok(LocalChange::AtomicBatchPublished(change))
         }
+        SEQUENCE_GAP => Ok(LocalChange::SequenceGap(SourceSequenceGap {
+            offset: input.u64()?,
+        })),
         _ => Err(malformed("local change kind is unknown")),
     }
 }
@@ -686,6 +694,7 @@ mod tests {
                     source_journal_position: 17,
                 }],
             ),
+            LocalChange::sequence_gap(18),
         ];
 
         for change in changes {

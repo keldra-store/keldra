@@ -787,10 +787,11 @@ impl ReferenceDelivery {
             });
         }
 
-        // Visibility settlement and reference-delivery progress are
-        // independent cuts. Settle the captured source prefix before any
-        // destination cursor RPC can fail or stall this pass.
-        let visibility_blocked = self.settle_visibility_prefix(&initial_status).await.err();
+        // Classify the captured durable prefix before destination work, but do
+        // not expose it to watches or derived consumers until every reference
+        // destination has advanced through the same prefix.
+        let (visibility_through, visibility_blocked) =
+            self.classify_visibility_prefix(&initial_status).await?;
 
         let mut cursors = BTreeMap::new();
         for destination in &active {
@@ -824,15 +825,12 @@ impl ReferenceDelivery {
         for (node, cursor) in &cursors {
             validate_cursor(*node, *cursor, status.retention_floor, status.tail)?;
         }
-        let visibility_through = self
-            .source
-            .local_watch_status()
-            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?
-            .settled_through;
         let slowest = cursors.values().copied().min().unwrap_or(status.tail);
         if slowest == status.tail {
             let final_tail = self
                 .finish_compaction(&placement, status.source_id, &cursors)
+                .await?;
+            self.settle_reference_safe_visibility(visibility_through, status.tail)
                 .await?;
             if let Some(error) = visibility_blocked {
                 return Err(error);
@@ -860,23 +858,16 @@ impl ReferenceDelivery {
         let mut prepared = Vec::new();
         let mut blocked = None;
         for change in changes {
-            let object_metadata = matches!(
+            if change.offset() > visibility_through {
+                break;
+            }
+            if !matches!(
                 change,
                 LocalChange::ObjectHead(_) | LocalChange::RetainedVersionDeleted(_)
-            );
-            if !object_metadata && change.reference_deltas().is_empty() {
+            ) && change.reference_deltas().is_empty()
+            {
                 routed.push((change.offset(), BTreeMap::new()));
                 continue;
-            }
-            if object_metadata
-                && change.offset() > visibility_through
-                && let Err(message) = self.commits.classify(status.source_id, &change).await
-            {
-                blocked = Some(ReferenceDeliveryError::CommitProof {
-                    offset: change.offset(),
-                    message,
-                });
-                break;
             }
             if change.reference_deltas().is_empty() {
                 routed.push((change.offset(), BTreeMap::new()));
@@ -965,6 +956,9 @@ impl ReferenceDelivery {
                 return Err(error);
             }
         }
+        let reference_safe_through = cursors.values().copied().min().unwrap_or(through);
+        self.settle_reference_safe_visibility(visibility_through, reference_safe_through)
+            .await?;
         if let Some(error) = blocked {
             return Err(error);
         }
@@ -988,15 +982,14 @@ impl ReferenceDelivery {
         })
     }
 
-    /// Advances only the contiguous metadata/atomic visibility cut. Physical
-    /// reference-delivery cursors are independent and may neither prove nor
-    /// manufacture this settlement.
-    async fn settle_visibility_prefix(
+    /// Classifies the contiguous metadata/atomic visibility prefix without
+    /// publishing it. Publication is bounded by reference delivery below.
+    async fn classify_visibility_prefix(
         &self,
         status: &keldra_store::WatchJournalStatus,
-    ) -> Result<u64, ReferenceDeliveryError> {
+    ) -> Result<(u64, Option<ReferenceDeliveryError>), ReferenceDeliveryError> {
         if status.settled_through == status.tail {
-            return Ok(status.tail);
+            return Ok((status.tail, None));
         }
         let changes = self
             .source
@@ -1014,7 +1007,7 @@ impl ReferenceDelivery {
             if change.offset() > status.tail {
                 break;
             }
-            let classification = match change {
+            let classification = match &change {
                 LocalChange::ObjectHead(_) | LocalChange::RetainedVersionDeleted(_) => {
                     self.commits.classify(status.source_id, &change).await
                 }
@@ -1022,9 +1015,7 @@ impl ReferenceDelivery {
                 // object reference proof. Atomic batch publication occurs only
                 // after every path quorum is visible; aggregate and lifecycle
                 // effects share their originating local RocksDB commit.
-                LocalChange::AggregateChanged(_)
-                | LocalChange::ContentLifecycleChanged(_)
-                | LocalChange::AtomicBatchPublished(_) => {
+                _ if locally_self_proving_visibility(&change) => {
                     Ok(ReferenceCommitDisposition::CommittedOrAncestor)
                 }
                 _ => Err("source journal change type is not supported for settlement".into()),
@@ -1040,16 +1031,19 @@ impl ReferenceDelivery {
                 }
             }
         }
-        if through > status.settled_through {
-            self.source
-                .advance_source_journal_settled_through(through)
-                .await
-                .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
-        }
-        if let Some(error) = blocked {
-            return Err(error);
-        }
-        Ok(through)
+        Ok((through, blocked))
+    }
+
+    async fn settle_reference_safe_visibility(
+        &self,
+        classified_through: u64,
+        reference_safe_through: u64,
+    ) -> Result<(), ReferenceDeliveryError> {
+        let through = classified_through.min(reference_safe_through);
+        self.source
+            .advance_source_journal_settled_through(through)
+            .await
+            .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))
     }
 
     async fn finish_compaction(
@@ -1106,6 +1100,16 @@ impl ReferenceDelivery {
             .map_err(|error| ReferenceDeliveryError::Source(error.to_string()))?;
         Ok(status.tail)
     }
+}
+
+fn locally_self_proving_visibility(change: &LocalChange) -> bool {
+    matches!(
+        change,
+        LocalChange::AggregateChanged(_)
+            | LocalChange::ContentLifecycleChanged(_)
+            | LocalChange::AtomicBatchPublished(_)
+            | LocalChange::SequenceGap(_)
+    )
 }
 
 #[derive(Clone, Debug)]

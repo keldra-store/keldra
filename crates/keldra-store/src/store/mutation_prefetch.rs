@@ -225,6 +225,55 @@ impl MutationReadCache {
         store.db.latest_sequence_number() == self.sequence_number
     }
 
+    /// Refresh values whose conflict stripes were acquired after the discovery
+    /// snapshot. Object heads and versions are already stable under ordinary
+    /// path locks; only receipt, shared-blob and inline-artifact state can have
+    /// changed while this lane waited for those stripes.
+    pub(super) fn refresh_conflict_values(&mut self, store: &Store) -> Result<(), MutationError> {
+        let snapshot = store.db.snapshot();
+        self.sequence_number = snapshot.sequence_number();
+
+        let receipt_keys = self.receipts.keys().cloned().collect::<BTreeSet<_>>();
+        self.receipts = multi_get_raw(store, &snapshot, CF_RECEIPTS, &receipt_keys)?
+            .into_iter()
+            .map(|(key, cached)| {
+                let decoded = cached.and_then(|value| {
+                    value
+                        .map(|encoded| decode_stored_receipt(&encoded))
+                        .transpose()
+                });
+                (key, decoded)
+            })
+            .collect();
+
+        let blob_reference_keys = self
+            .blob_references
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.blob_references =
+            multi_get_raw(store, &snapshot, CF_BLOB_REFERENCES, &blob_reference_keys)?
+                .into_iter()
+                .map(|(key, cached)| {
+                    let decoded = cached.and_then(|value| {
+                        value
+                            .map(|encoded| decode_blob_reference_state(&encoded))
+                            .transpose()
+                    });
+                    (key, decoded)
+                })
+                .collect();
+
+        let inline_payload_keys = self
+            .inline_payloads
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.inline_payloads =
+            multi_get_raw(store, &snapshot, CF_PAYLOAD_ARTIFACTS, &inline_payload_keys)?;
+        Ok(())
+    }
+
     pub(super) fn head(&self, key: &[u8]) -> Option<Cached<Head>> {
         self.heads.get(key).cloned()
     }
@@ -245,6 +294,17 @@ impl MutationReadCache {
 
     pub(super) fn blob_reference_by_key(&self, key: &[u8]) -> Option<Cached<BlobReferenceState>> {
         self.blob_references.get(key).cloned()
+    }
+
+    /// Conflict identities for predecessor payloads read from the locked
+    /// object heads. Distinct paths may share one blob, so path locking alone
+    /// cannot protect concurrent refcount decrements.
+    pub(super) fn predecessor_blob_conflict_resources(&self) -> Vec<Vec<u8>> {
+        self.stored_versions
+            .values()
+            .filter_map(|cached| cached.as_ref().ok()?.as_ref()?.version.blob.as_ref())
+            .map(super::mutation_commit_lanes::blob_conflict_resource)
+            .collect()
     }
 
     pub(super) fn inline_payload(&self, reference: &BlobRef) -> Option<Cached<Vec<u8>>> {

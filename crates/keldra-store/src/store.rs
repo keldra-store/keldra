@@ -341,6 +341,10 @@ pub(crate) enum PendingLocalChange {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocalReferenceEffects {
     AppliedInline,
+    /// Reference counts and payload lifecycle are staged in this physical
+    /// lane batch, while the shared source cursor is advanced later by the
+    /// contiguous lane-frontier projection.
+    AppliedInlineLane,
     NoReferenceEffects,
     Deferred,
 }
@@ -1069,6 +1073,9 @@ impl Store {
             #[cfg(test)]
             test_identity_lock: Arc::new(std::sync::Mutex::new(())),
         };
+        store
+            .initialize_mutation_lane_runtime(existing_database)
+            .await?;
         let durable_floor = store.local_watch_status()?.retention_floor;
         store
             .source_journal_reference_safe_through
