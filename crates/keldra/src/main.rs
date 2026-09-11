@@ -351,6 +351,9 @@ struct Arguments {
 
     #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_GROUP_DWELL_MICROSECONDS")]
     single_node_group_commit_group_dwell_microseconds: Option<u64>,
+
+    #[arg(long, env = "KELDRA_SINGLE_NODE_GROUP_COMMIT_LANES")]
+    single_node_group_commit_lanes: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -369,6 +372,7 @@ struct FileSingleNodeGroupCommitConfig {
     max_queued_operations: Option<usize>,
     max_queued_inline_bytes: Option<usize>,
     group_dwell_microseconds: Option<u64>,
+    commit_lanes: Option<usize>,
 }
 
 impl Arguments {
@@ -415,6 +419,13 @@ impl Arguments {
                     .unwrap_or(default_dwell_microseconds),
             ),
         )
+        .and_then(|config| {
+            config.with_commit_lanes(
+                self.single_node_group_commit_lanes
+                    .or(file.commit_lanes)
+                    .unwrap_or(defaults.commit_lanes()),
+            )
+        })
         .context("validate single-node group commit configuration")
     }
 
@@ -844,13 +855,16 @@ mod tests {
             "10",
             "--single-node-group-commit-group-dwell-microseconds",
             "900",
+            "--single-node-group-commit-lanes",
+            "6",
         ]);
         let file = serde_json::from_str::<FileConfig>(
             r#"{
                 "single_node_group_commit": {
                     "max_requests": 7,
                     "max_operations": 7000,
-                    "group_dwell_microseconds": 500
+                    "group_dwell_microseconds": 500,
+                    "commit_lanes": 3
                 }
             }"#,
         )
@@ -859,6 +873,7 @@ mod tests {
         let config = arguments.single_node_group_commit_config(&file).unwrap();
         assert_eq!(config.max_group_requests(), 10);
         assert_eq!(config.max_group_operations(), 7_000);
+        assert_eq!(config.commit_lanes(), 6);
         assert_eq!(
             config.max_group_dwell(),
             std::time::Duration::from_micros(900)

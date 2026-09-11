@@ -20,6 +20,7 @@ const DEFAULT_MAX_QUEUED_REQUESTS: usize = 64;
 const DEFAULT_MAX_QUEUED_OPERATIONS: usize = 8_000;
 const DEFAULT_MAX_QUEUED_INLINE_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_GROUP_DWELL: Duration = Duration::from_micros(250);
+const DEFAULT_COMMIT_LANES: usize = 4;
 
 /// Validated bounds and dwell time for single-node mutation group commit.
 ///
@@ -35,6 +36,7 @@ pub struct SingleNodeGroupCommitConfig {
     max_queued_operations: usize,
     max_queued_inline_bytes: usize,
     max_group_dwell: Duration,
+    commit_lanes: usize,
 }
 
 impl SingleNodeGroupCommitConfig {
@@ -95,7 +97,20 @@ impl SingleNodeGroupCommitConfig {
             max_queued_operations,
             max_queued_inline_bytes,
             max_group_dwell,
+            commit_lanes: DEFAULT_COMMIT_LANES,
         })
+    }
+
+    /// Sets the bounded number of independent local commit queues. Requests
+    /// for the same primary exact path are always assigned to the same lane.
+    pub fn with_commit_lanes(mut self, commit_lanes: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(commit_lanes != 0, "commit lanes must be non-zero");
+        anyhow::ensure!(
+            commit_lanes <= Semaphore::MAX_PERMITS,
+            "commit lanes exceed the runtime semaphore limit"
+        );
+        self.commit_lanes = commit_lanes;
+        Ok(self)
     }
 
     pub fn max_group_requests(&self) -> usize {
@@ -124,6 +139,10 @@ impl SingleNodeGroupCommitConfig {
 
     pub fn max_group_dwell(&self) -> Duration {
         self.max_group_dwell
+    }
+
+    pub fn commit_lanes(&self) -> usize {
+        self.commit_lanes
     }
 }
 
@@ -243,8 +262,8 @@ enum QueueAction {
 #[derive(Clone)]
 pub(super) struct SingleNodeGroupCommit {
     config: SingleNodeGroupCommitConfig,
-    state: Arc<Mutex<QueueState>>,
-    queue_changed: Arc<Notify>,
+    states: Arc<Vec<Mutex<QueueState>>>,
+    queue_changed: Arc<Vec<Notify>>,
     queue_slots: Arc<Semaphore>,
     operation_slots: Arc<Semaphore>,
     inline_byte_slots: Arc<Semaphore>,
@@ -252,13 +271,17 @@ pub(super) struct SingleNodeGroupCommit {
 
 impl SingleNodeGroupCommit {
     pub(super) fn new(config: SingleNodeGroupCommitConfig) -> Self {
+        let states = (0..config.commit_lanes)
+            .map(|_| Mutex::new(QueueState::default()))
+            .collect();
+        let queue_changed = (0..config.commit_lanes).map(|_| Notify::new()).collect();
         Self {
             queue_slots: Arc::new(Semaphore::new(config.max_queued_requests)),
             operation_slots: Arc::new(Semaphore::new(config.max_queued_operations)),
             inline_byte_slots: Arc::new(Semaphore::new(config.max_queued_inline_bytes)),
             config,
-            state: Arc::new(Mutex::new(QueueState::default())),
-            queue_changed: Arc::new(Notify::new()),
+            states: Arc::new(states),
+            queue_changed: Arc::new(queue_changed),
         }
     }
 
@@ -266,7 +289,11 @@ impl SingleNodeGroupCommit {
     async fn wait_until_idle(&self) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if !self.state.lock().await.worker_running {
+                let mut active = false;
+                for state in self.states.iter() {
+                    active |= state.lock().await.worker_running;
+                }
+                if !active {
                     return;
                 }
                 tokio::task::yield_now().await;
@@ -274,6 +301,31 @@ impl SingleNodeGroupCommit {
         })
         .await
         .expect("single-node group worker must become idle");
+    }
+
+    fn lane_for(&self, operations: &SingleNodeOperations) -> usize {
+        let Some((operation, governance, _)) = operations.first() else {
+            return 0;
+        };
+        let path = match operation {
+            BatchOperation::Put(request) => request.key.path(),
+            BatchOperation::Publish(request) => request.key.path(),
+            BatchOperation::Clone(request) => request.destination.path(),
+            BatchOperation::Delete(request) => request.key.path(),
+        };
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in governance
+            .tenant_id
+            .to_be_bytes()
+            .into_iter()
+            .chain(governance.bucket_id.to_be_bytes())
+            .chain(path.bytes())
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let lane_count = u64::try_from(self.states.len()).expect("lane count fits u64");
+        usize::try_from(hash % lane_count).expect("lane index fits usize")
     }
 
     fn plan_group(&self, requests: &VecDeque<SingleNodeCommitRequest>) -> Option<GroupPlan> {
@@ -404,8 +456,9 @@ impl SingleNodeGroupCommit {
             .await
             .map_err(|_| MutationError::Storage("single-node commit byte queue closed".into()))?;
         let (response, received) = oneshot::channel();
+        let lane = self.lane_for(&operations);
         let start_worker = {
-            let mut state = self.state.lock().await;
+            let mut state = self.states[lane].lock().await;
             state.requests.push_back(SingleNodeCommitRequest {
                 operations,
                 context,
@@ -426,9 +479,9 @@ impl SingleNodeGroupCommit {
         };
         if start_worker {
             let queue = self.clone();
-            tokio::spawn(async move { queue.run(store).await });
+            tokio::spawn(async move { queue.run(store, lane).await });
         } else {
-            self.queue_changed.notify_one();
+            self.queue_changed[lane].notify_one();
         }
         received.await.unwrap_or_else(|_| {
             Err(MutationError::Storage(
@@ -437,13 +490,13 @@ impl SingleNodeGroupCommit {
         })
     }
 
-    async fn run(self, store: Store) {
+    async fn run(self, store: Store, lane: usize) {
         loop {
             let dwell_started = Instant::now();
             let (requests, queued_requests, stop_reason) = loop {
-                let notified = self.queue_changed.notified();
+                let notified = self.queue_changed[lane].notified();
                 let action = {
-                    let mut state = self.state.lock().await;
+                    let mut state = self.states[lane].lock().await;
                     self.next_queue_action(&mut state, Instant::now())
                 };
                 match action {
@@ -493,6 +546,7 @@ impl SingleNodeGroupCommit {
                 target: "keldra_store::single_node_group_commit_phases",
                 attempts = 1_u64,
                 physical_commits = metrics.physical_commit as u64,
+                commit_lane = lane,
                 request_count,
                 operation_count,
                 inline_bytes,
@@ -592,6 +646,8 @@ impl SingleNodeGroupCommit {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::{
         BucketPolicy, Durability, ObjectKey, PlacementLogId, PutMode, PutRequest, StoreOptions,
@@ -694,9 +750,14 @@ mod tests {
     #[tokio::test]
     async fn five_requests_share_one_commit_with_primary_settlement() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
+        let config = SingleNodeGroupCommitConfig::default()
+            .with_commit_lanes(1)
             .unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
+        )
+        .await
+        .unwrap();
         let governance = governance(&store);
         let before = store.db.latest_sequence_number();
         let (a, b, c, d, e) = tokio::join!(
@@ -742,6 +803,8 @@ mod tests {
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
             DEFAULT_MAX_GROUP_DWELL,
         )
+        .unwrap()
+        .with_commit_lanes(1)
         .unwrap();
         let store = Store::open(
             StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
@@ -816,6 +879,8 @@ mod tests {
             DEFAULT_MAX_QUEUED_INLINE_BYTES,
             Duration::from_secs(30),
         )
+        .unwrap()
+        .with_commit_lanes(1)
         .unwrap();
         let store = Store::open(
             StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
@@ -975,9 +1040,11 @@ mod tests {
             ));
         }
         assert_eq!(store.db.latest_sequence_number(), before);
-        let state = store.single_node_group_commit.state.lock().await;
-        assert!(state.requests.is_empty());
-        assert!(!state.worker_running);
+        for state in store.single_node_group_commit.states.iter() {
+            let state = state.lock().await;
+            assert!(state.requests.is_empty());
+            assert!(!state.worker_running);
+        }
     }
 
     #[test]
@@ -997,6 +1064,39 @@ mod tests {
             error
                 .to_string()
                 .contains("maximum group requests must not exceed maximum queued requests")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_primary_path_selects_one_stable_bounded_lane() {
+        let queue = SingleNodeGroupCommit::new(
+            SingleNodeGroupCommitConfig::default()
+                .with_commit_lanes(4)
+                .unwrap(),
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let governance = governance(&store);
+        let first = request("objects/stable", "first", governance.clone());
+        let second = request("objects/stable", "second", governance.clone());
+        assert_eq!(queue.lane_for(&first), queue.lane_for(&second));
+
+        let lanes = ["objects/a", "objects/b", "objects/c", "objects/d"]
+            .into_iter()
+            .map(|path| queue.lane_for(&request(path, path, governance.clone())))
+            .collect::<BTreeSet<_>>();
+        assert!(lanes.len() > 1);
+        assert!(lanes.iter().all(|lane| *lane < queue.states.len()));
+    }
+
+    #[test]
+    fn group_commit_config_rejects_zero_lanes() {
+        assert!(
+            SingleNodeGroupCommitConfig::default()
+                .with_commit_lanes(0)
+                .is_err()
         );
     }
 
@@ -1030,9 +1130,14 @@ mod tests {
     #[tokio::test]
     async fn deferred_reference_backlog_does_not_reject_single_node_group() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
+        let config = SingleNodeGroupCommitConfig::default()
+            .with_commit_lanes(1)
             .unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
+        )
+        .await
+        .unwrap();
         let governance = governance(&store);
         let deferred = store
             .coordinate_distributed_mutation_batch(
@@ -1308,16 +1413,17 @@ mod tests {
             .unwrap();
         let queue = store.single_node_group_commit.clone();
         let operations = request("objects/detached", "detached", governance(&store));
+        let lane = queue.lane_for(&operations);
         let enqueued_at = Instant::now();
         {
-            let mut state = queue.state.lock().await;
+            let mut state = queue.states[lane].lock().await;
             state
                 .requests
                 .push_back(queued_request(&queue, operations, context(1), enqueued_at));
             state.worker_running = true;
         }
 
-        queue.clone().run(store.clone()).await;
+        queue.clone().run(store.clone(), lane).await;
 
         assert!(
             store

@@ -917,6 +917,7 @@ fn log_single_node_group_commit_config(config: &SingleNodeGroupCommitConfig) {
         max_queued_operations = config.max_queued_operations(),
         max_queued_inline_bytes = config.max_queued_inline_bytes(),
         group_dwell_microseconds,
+        commit_lanes = config.commit_lanes(),
         "effective single-node group commit configuration"
     );
 }
