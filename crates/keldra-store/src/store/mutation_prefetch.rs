@@ -1,9 +1,11 @@
 //! Bounded baseline reads for one input-ordered object mutation batch.
 //!
-//! The cache is populated only while the caller holds the ordinary path locks
-//! and the store commit fence. It is not authoritative state: mutations still
-//! enter the existing pending maps in input order and share the existing final
-//! `WriteBatch`.
+//! The cache is populated from one RocksDB snapshot while the caller holds the
+//! ordinary path locks, but before it enters the ordered commit section. The
+//! snapshot sequence is revalidated after acquiring that section; a stale
+//! baseline is discarded and loaded again. The cache is not authoritative
+//! state: mutations still enter the existing pending maps in input order and
+//! share the existing final `WriteBatch`.
 
 use super::object_alias_registry::decode_registry;
 use super::receipt_codec::decode_stored_receipt;
@@ -16,6 +18,7 @@ type Cached<T> = Result<Option<T>, MutationError>;
 
 #[derive(Default)]
 pub(super) struct MutationReadCache {
+    sequence_number: u64,
     heads: BTreeMap<Vec<u8>, Cached<Head>>,
     stored_versions: BTreeMap<Vec<u8>, Cached<StoredVersion>>,
     receipts: BTreeMap<Vec<u8>, Cached<StoredReceipt>>,
@@ -51,6 +54,8 @@ impl MutationReadCache {
         store: &Store,
         operations: &[&PreparedOperation],
     ) -> Result<Self, MutationError> {
+        let snapshot = store.db.snapshot();
+        let sequence_number = snapshot.sequence_number();
         let mut metrics = PrefetchMetrics::default();
         let head_keys = operations
             .iter()
@@ -69,19 +74,21 @@ impl MutationReadCache {
             .map(|operation| operation.identity().encode().to_vec())
             .collect::<BTreeSet<_>>();
 
-        let (heads, elapsed) = multi_get_json::<Head>(store, CF_HEADS, &head_keys)?;
+        let (heads, elapsed) = multi_get_json::<Head>(store, &snapshot, CF_HEADS, &head_keys)?;
         metrics.head_keys = head_keys.len() as u64;
         metrics.head_seconds = elapsed;
 
         let started = std::time::Instant::now();
-        let alias_registries = multi_get_raw(store, CF_OBJECT_ALIAS_REGISTRIES, &head_keys)?
-            .into_iter()
-            .map(|(key, cached)| {
-                let decoded = cached
-                    .and_then(|value| value.map(|encoded| decode_registry(&encoded)).transpose());
-                (key, decoded)
-            })
-            .collect();
+        let alias_registries =
+            multi_get_raw(store, &snapshot, CF_OBJECT_ALIAS_REGISTRIES, &head_keys)?
+                .into_iter()
+                .map(|(key, cached)| {
+                    let decoded = cached.and_then(|value| {
+                        value.map(|encoded| decode_registry(&encoded)).transpose()
+                    });
+                    (key, decoded)
+                })
+                .collect();
         metrics.alias_registry_keys = head_keys.len() as u64;
         metrics.alias_registry_seconds = started.elapsed().as_secs_f64();
 
@@ -95,7 +102,7 @@ impl MutationReadCache {
             }
         }
         let started = std::time::Instant::now();
-        let versions_by_key = multi_get_raw(store, CF_VERSIONS, &version_keys)?
+        let versions_by_key = multi_get_raw(store, &snapshot, CF_VERSIONS, &version_keys)?
             .into_iter()
             .map(|(key, cached)| {
                 let decoded = cached.and_then(|value| {
@@ -120,7 +127,7 @@ impl MutationReadCache {
             .collect();
 
         let started = std::time::Instant::now();
-        let receipts = multi_get_raw(store, CF_RECEIPTS, &receipt_keys)?
+        let receipts = multi_get_raw(store, &snapshot, CF_RECEIPTS, &receipt_keys)?
             .into_iter()
             .map(|(key, cached)| {
                 let decoded = cached.and_then(|value| {
@@ -136,7 +143,7 @@ impl MutationReadCache {
         metrics.receipt_seconds = elapsed;
 
         let started = std::time::Instant::now();
-        let policies = multi_get_raw(store, CF_POLICIES, &bucket_keys)?
+        let policies = multi_get_raw(store, &snapshot, CF_POLICIES, &bucket_keys)?
             .into_iter()
             .map(|(key, cached)| {
                 let decoded = decode_bucket_policy(&key, cached);
@@ -146,7 +153,7 @@ impl MutationReadCache {
         metrics.policy_keys = bucket_keys.len() as u64;
         metrics.policy_seconds = started.elapsed().as_secs_f64();
         let started = std::time::Instant::now();
-        let versioning = multi_get_raw(store, CF_BUCKET_OPTIONS, &bucket_keys)?
+        let versioning = multi_get_raw(store, &snapshot, CF_BUCKET_OPTIONS, &bucket_keys)?
             .into_iter()
             .map(|(key, cached)| {
                 let decoded = decode_bucket_versioning(&key, cached);
@@ -176,27 +183,30 @@ impl MutationReadCache {
         }
 
         let started = std::time::Instant::now();
-        let blob_references = multi_get_raw(store, CF_BLOB_REFERENCES, &blob_reference_keys)?
-            .into_iter()
-            .map(|(key, cached)| {
-                let decoded = cached.and_then(|value| {
-                    value
-                        .map(|encoded| decode_blob_reference_state(&encoded))
-                        .transpose()
-                });
-                (key, decoded)
-            })
-            .collect();
+        let blob_references =
+            multi_get_raw(store, &snapshot, CF_BLOB_REFERENCES, &blob_reference_keys)?
+                .into_iter()
+                .map(|(key, cached)| {
+                    let decoded = cached.and_then(|value| {
+                        value
+                            .map(|encoded| decode_blob_reference_state(&encoded))
+                            .transpose()
+                    });
+                    (key, decoded)
+                })
+                .collect();
         metrics.blob_reference_keys = blob_reference_keys.len() as u64;
         metrics.blob_reference_seconds = started.elapsed().as_secs_f64();
 
         let started = std::time::Instant::now();
-        let inline_payloads = multi_get_raw(store, CF_PAYLOAD_ARTIFACTS, &inline_payload_keys)?;
+        let inline_payloads =
+            multi_get_raw(store, &snapshot, CF_PAYLOAD_ARTIFACTS, &inline_payload_keys)?;
         metrics.inline_payload_keys = inline_payload_keys.len() as u64;
         metrics.inline_payload_seconds = started.elapsed().as_secs_f64();
         metrics.emit();
 
         Ok(Self {
+            sequence_number,
             heads,
             stored_versions,
             receipts,
@@ -206,6 +216,13 @@ impl MutationReadCache {
             policies,
             versioning,
         })
+    }
+
+    /// Returns true only when no RocksDB write committed after this cache's
+    /// consistent snapshot. This intentionally uses the database-wide
+    /// sequence rather than attempting to maintain a second per-key authority.
+    pub(super) fn is_current(&self, store: &Store) -> bool {
+        store.db.latest_sequence_number() == self.sequence_number
     }
 
     pub(super) fn head(&self, key: &[u8]) -> Option<Cached<Head>> {
@@ -351,6 +368,7 @@ fn decode_bucket_versioning(
 
 fn multi_get_json<T>(
     store: &Store,
+    snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
     cf_name: &'static str,
     keys: &BTreeSet<Vec<u8>>,
 ) -> Result<(BTreeMap<Vec<u8>, Cached<T>>, f64), MutationError>
@@ -358,7 +376,7 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let started = std::time::Instant::now();
-    let values = multi_get_raw(store, cf_name, keys)?
+    let values = multi_get_raw(store, snapshot, cf_name, keys)?
         .into_iter()
         .map(|(key, cached)| {
             let decoded = cached.and_then(|value| {
@@ -374,6 +392,7 @@ where
 
 fn multi_get_raw(
     store: &Store,
+    snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
     cf_name: &'static str,
     keys: &BTreeSet<Vec<u8>>,
 ) -> Result<BTreeMap<Vec<u8>, Cached<Vec<u8>>>, MutationError> {
@@ -381,9 +400,7 @@ fn multi_get_raw(
     let mut values = BTreeMap::new();
     let ordered = keys.iter().collect::<Vec<_>>();
     for keys in ordered.chunks(PREFETCH_KEYS_PER_MULTI_GET) {
-        let fetched = store
-            .db
-            .multi_get_cf(keys.iter().map(|key| (cf, key.as_slice())));
+        let fetched = snapshot.multi_get_cf(keys.iter().map(|key| (cf, key.as_slice())));
         if fetched.len() != keys.len() {
             return Err(MutationError::Storage(format!(
                 "{cf_name} bulk prefetch returned the wrong result count"
@@ -394,6 +411,32 @@ fn multi_get_raw(
         }
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn database_write_invalidates_a_prefetched_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let cache = MutationReadCache::load(&store, &[]).unwrap();
+        assert!(cache.is_current(&store));
+
+        store
+            .db
+            .put_cf(
+                store.cf(CF_METADATA).unwrap(),
+                b"mutation-prefetch-generation-test",
+                b"changed",
+            )
+            .unwrap();
+
+        assert!(!cache.is_current(&store));
+    }
 }
 
 fn exact_version_key(head_key: &[u8], version: VersionId) -> Vec<u8> {

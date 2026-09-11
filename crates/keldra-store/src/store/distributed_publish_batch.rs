@@ -29,7 +29,8 @@ pub(super) struct CoordinatorBatchMetrics {
     pub(super) path_wait: std::time::Duration,
     pub(super) commit_wait: std::time::Duration,
     pub(super) locked_setup: std::time::Duration,
-    pub(super) locked_prefetch: std::time::Duration,
+    pub(super) baseline_prefetch: std::time::Duration,
+    pub(super) baseline_revalidation_retries: u64,
     pub(super) evaluate: std::time::Duration,
     pub(super) evaluation_subphases: EvaluationSubphaseMetrics,
     pub(super) stage: std::time::Duration,
@@ -303,9 +304,31 @@ impl Store {
             )
             .await;
         let path_wait_duration = path_wait_started.elapsed();
-        let commit_wait_started = std::time::Instant::now();
-        let _commit_guard = self.lock_commit("distributed_publish").await;
-        let commit_wait_duration = commit_wait_started.elapsed();
+        let prepared_operations = prepared
+            .iter()
+            .map(|item| &item.operation)
+            .collect::<Vec<_>>();
+        let mut baseline_prefetch_duration = std::time::Duration::ZERO;
+        let mut commit_wait_duration = std::time::Duration::ZERO;
+        let mut baseline_revalidation_retries = 0_u64;
+        let (read_cache, _commit_guard) = loop {
+            let prefetch_started = std::time::Instant::now();
+            let read_cache = MutationReadCache::load(self, &prepared_operations)?;
+            baseline_prefetch_duration =
+                baseline_prefetch_duration.saturating_add(prefetch_started.elapsed());
+
+            let commit_wait_started = std::time::Instant::now();
+            let commit_guard = self.lock_commit("distributed_publish").await;
+            commit_wait_duration =
+                commit_wait_duration.saturating_add(commit_wait_started.elapsed());
+            if read_cache.is_current(self) {
+                break (read_cache, commit_guard);
+            }
+            drop(commit_guard);
+            baseline_revalidation_retries = baseline_revalidation_retries.saturating_add(1);
+            tokio::task::yield_now().await;
+        };
+        drop(prepared_operations);
         let commit_hold_started = std::time::Instant::now();
         let locked_setup_started = std::time::Instant::now();
         let mut reserved = BTreeMap::new();
@@ -364,15 +387,6 @@ impl Store {
         let pruned_receipts =
             self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
         let locked_setup_duration = locked_setup_started.elapsed();
-        let locked_prefetch_started = std::time::Instant::now();
-        let read_cache = MutationReadCache::load(
-            self,
-            &prepared
-                .iter()
-                .map(|item| &item.operation)
-                .collect::<Vec<_>>(),
-        )?;
-        let locked_prefetch_duration = locked_prefetch_started.elapsed();
         let mut pending_heads = BTreeMap::new();
         let mut pending_versions = BTreeMap::new();
         let mut pending_receipts = BTreeMap::new();
@@ -581,7 +595,8 @@ impl Store {
                 path_wait: path_wait_duration,
                 commit_wait: commit_wait_duration,
                 locked_setup: locked_setup_duration,
-                locked_prefetch: locked_prefetch_duration,
+                baseline_prefetch: baseline_prefetch_duration,
+                baseline_revalidation_retries,
                 evaluate: evaluate_duration,
                 evaluation_subphases,
                 stage: stage_duration,
