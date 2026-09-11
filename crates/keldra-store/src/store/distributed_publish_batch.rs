@@ -19,100 +19,7 @@ struct PreparedDistributedMutation {
 struct CoordinatedBatchEvaluation {
     outcomes: Vec<Result<CoordinatedObjectMutation, MutationError>>,
     receipt_capacity_at: Option<usize>,
-    primary_source_settlement: Option<PrimarySourceSettlement>,
     metrics: CoordinatorBatchMetrics,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PrimarySourceSettlement {
-    source: SourceId,
-    previous_tail: u64,
-    through: u64,
-}
-
-impl PrimarySourceSettlement {
-    fn covers(self, settlement: &SingleNodeGroupSettlement) -> bool {
-        let Some(first) = self.previous_tail.checked_add(1) else {
-            return false;
-        };
-        self.source == settlement.source
-            && self.through >= first
-            && settlement
-                .positions
-                .iter()
-                .copied()
-                .eq(first..=self.through)
-    }
-}
-
-#[derive(Debug)]
-struct SingleNodeGroupSettlement {
-    source: SourceId,
-    positions: Vec<u64>,
-}
-
-fn single_node_group_settlement(
-    outcomes: &[Result<CoordinatedObjectMutation, MutationError>],
-) -> Result<Option<SingleNodeGroupSettlement>, MutationError> {
-    let mut source = None;
-    let mut positions = Vec::<u64>::new();
-    for outcome in outcomes {
-        let Ok(coordinated) = outcome else {
-            continue;
-        };
-        if coordinated.receipt.replayed {
-            continue;
-        }
-        let mutation = coordinated.mutation.as_ref().ok_or_else(|| {
-            MutationError::Storage(
-                "single-node group omitted a committed non-replay mutation".into(),
-            )
-        })?;
-        if source
-            .replace(mutation.stamp.source_id)
-            .is_some_and(|current| current != mutation.stamp.source_id)
-        {
-            return Err(MutationError::Storage(
-                "single-node group committed more than one source-journal identity".into(),
-            ));
-        }
-        let alias_count = mutation
-            .alias_snapshot
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.registry.aliases.len());
-        let end = mutation
-            .stamp
-            .source_journal_position
-            .checked_add(u64::try_from(alias_count).map_err(|_| {
-                MutationError::Storage("single-node alias journal range is exhausted".into())
-            })?)
-            .ok_or_else(|| {
-                MutationError::Storage("single-node alias journal range is exhausted".into())
-            })?;
-        if positions.last().is_some_and(|previous| {
-            previous.checked_add(1) != Some(mutation.stamp.source_journal_position)
-        }) {
-            return Err(MutationError::Storage(
-                "single-node group committed a non-contiguous source-journal range".into(),
-            ));
-        }
-        positions.extend(mutation.stamp.source_journal_position..=end);
-    }
-    Ok(source.map(|source| SingleNodeGroupSettlement { source, positions }))
-}
-
-fn apply_single_node_settlement_invariant_error(
-    outcomes: &mut [Result<CoordinatedObjectMutation, MutationError>],
-    error: MutationError,
-) {
-    for outcome in outcomes {
-        if outcome
-            .as_ref()
-            .is_ok_and(|coordinated| !coordinated.receipt.replayed)
-        {
-            *outcome = Err(error.clone());
-        }
-    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -255,53 +162,6 @@ impl Store {
                 );
             }
         };
-        let settle_started = std::time::Instant::now();
-        let source_journal_settlement = match single_node_group_settlement(&evaluated.outcomes) {
-            Ok(Some(settlement)) => {
-                if evaluated
-                    .primary_source_settlement
-                    .is_some_and(|primary| primary.covers(&settlement))
-                {
-                    SourceJournalSettlement::CompletedByCoordinator
-                } else {
-                    #[cfg(test)]
-                    self.single_node_group_commit.record_settlement_attempt();
-                    if self
-                        .single_node_group_commit
-                        .take_injected_settlement_failure()
-                    {
-                        SourceJournalSettlement::RequiredAfterQuorum
-                    } else {
-                        match self
-                            .settle_source_journal_positions_if_contiguous(
-                                settlement.source,
-                                &settlement.positions,
-                            )
-                            .await
-                        {
-                            Ok(_) => SourceJournalSettlement::CompletedByCoordinator,
-                            Err(error) => {
-                                tracing::warn!(
-                                    source = ?settlement.source,
-                                    count = settlement.positions.len(),
-                                    %error,
-                                    "single-node group committed but source settlement requires quorum fallback"
-                                );
-                                SourceJournalSettlement::RequiredAfterQuorum
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(None) => SourceJournalSettlement::CompletedByCoordinator,
-            Err(error) => {
-                apply_single_node_settlement_invariant_error(&mut evaluated.outcomes, error);
-                SourceJournalSettlement::RequiredAfterQuorum
-            }
-        };
-        let settle_duration = settle_started.elapsed();
-        evaluated.metrics.settle = evaluated.metrics.settle.saturating_add(settle_duration);
-        evaluated.metrics.total = evaluated.metrics.total.saturating_add(settle_duration);
         if request_operation_counts.iter().sum::<usize>() != total {
             return (
                 request_operation_counts
@@ -328,7 +188,12 @@ impl Store {
             } else {
                 responses.push(Ok(SingleNodeMutationBatch {
                     outcomes,
-                    source_journal_settlement,
+                    // The one-node coordinator stages the visibility frontier
+                    // in the same RocksDB batch as the object and journal
+                    // records. A gap remains hidden behind that frontier and
+                    // is recovered by the existing journal worker; issuing a
+                    // second synchronous settlement write here is redundant.
+                    source_journal_settlement: SourceJournalSettlement::CompletedByCoordinator,
                 }));
             }
             start = end;
@@ -356,7 +221,6 @@ impl Store {
             return Ok(CoordinatedBatchEvaluation {
                 outcomes: Vec::new(),
                 receipt_capacity_at: None,
-                primary_source_settlement: None,
                 metrics: CoordinatorBatchMetrics::default(),
             });
         }
@@ -708,23 +572,9 @@ impl Store {
             });
         }
         let commit_hold_duration = commit_hold_started.elapsed();
-        let primary_source_settlement = staged_local_changes.and_then(
-            |StagedLocalChanges {
-                 previous_tail,
-                 status,
-                 visibility_settlement_staged,
-             }| {
-                visibility_settlement_staged.then_some(PrimarySourceSettlement {
-                    source: status.source_id,
-                    previous_tail,
-                    through: status.settled_through,
-                })
-            },
-        );
         let outcome = CoordinatedBatchEvaluation {
             outcomes,
             receipt_capacity_at,
-            primary_source_settlement,
             metrics: CoordinatorBatchMetrics {
                 prepare: prepare_duration,
                 policy_wait: policy_wait_duration,
@@ -1030,9 +880,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        OBJECT_ALIAS_REGISTRY_FORMAT, ObjectAliasRegistry, ObjectAliasSnapshot, PlacementLogId,
-    };
+    use crate::PlacementLogId;
 
     fn request(path: &str, command: &str, blob: BlobRef) -> PublishRequest {
         PublishRequest {
@@ -1054,39 +902,6 @@ mod tests {
             command_id: Some(command.into()),
             durability,
         }
-    }
-
-    #[test]
-    fn primary_settlement_proof_requires_the_exact_contiguous_group_range() {
-        let source = SourceId {
-            node_id: 7,
-            source_epoch: [3; 32],
-        };
-        let primary = PrimarySourceSettlement {
-            source,
-            previous_tail: 40,
-            through: 43,
-        };
-
-        assert!(primary.covers(&SingleNodeGroupSettlement {
-            source,
-            positions: vec![41, 42, 43],
-        }));
-        assert!(!primary.covers(&SingleNodeGroupSettlement {
-            source,
-            positions: vec![42, 43],
-        }));
-        assert!(!primary.covers(&SingleNodeGroupSettlement {
-            source,
-            positions: vec![41, 43],
-        }));
-        assert!(!primary.covers(&SingleNodeGroupSettlement {
-            source: SourceId {
-                node_id: 8,
-                source_epoch: [3; 32],
-            },
-            positions: vec![41, 42, 43],
-        }));
     }
 
     #[tokio::test]
@@ -1231,90 +1046,6 @@ mod tests {
         assert_eq!(
             store.db.latest_sequence_number(),
             sequence_before_replicated
-        );
-    }
-
-    #[tokio::test]
-    async fn group_settlement_collects_aliases_and_ignores_errors_and_replays() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
-            .unwrap();
-        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
-        let governance = ObjectMutationGovernance {
-            tenant_id,
-            bucket_id,
-            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
-            policy: store.bucket_policy("tenant", "bucket").unwrap(),
-        };
-        let mut coordinated = store
-            .coordinate_single_node_mutation_batch(
-                vec![(
-                    BatchOperation::Put(put_request(
-                        "objects/alias-target",
-                        "alias-target",
-                        b"target",
-                        Durability::Local,
-                    )),
-                    governance,
-                    None,
-                )],
-                ObjectMutationContext {
-                    active_placement_log_id: PlacementLogId { term: 3, index: 7 },
-                    serving_fence_term: 3,
-                },
-            )
-            .await
-            .unwrap()
-            .remove(0)
-            .unwrap();
-        let mutation = coordinated.mutation.as_mut().unwrap();
-        let first_position = mutation.stamp.source_journal_position;
-        mutation.alias_snapshot = Some(ObjectAliasSnapshot {
-            registry: ObjectAliasRegistry {
-                format: OBJECT_ALIAS_REGISTRY_FORMAT,
-                revision: 1,
-                aliases: vec!["aliases/a".into(), "aliases/b".into()],
-                program_commit_cursor: Some(1),
-            },
-            canonical_version: mutation.version.clone(),
-        });
-        let source = mutation.stamp.source_id;
-        let mut replay = coordinated.clone();
-        replay.receipt.replayed = true;
-        replay
-            .mutation
-            .as_mut()
-            .unwrap()
-            .stamp
-            .source_id
-            .source_epoch = [9; 32];
-        let outcomes = vec![
-            Err(MutationError::Storage(
-                "pre-existing operation error".into(),
-            )),
-            Ok(coordinated.clone()),
-            Ok(replay),
-        ];
-
-        let settlement = single_node_group_settlement(&outcomes)
-            .unwrap()
-            .expect("the non-replay mutation must require settlement");
-        assert_eq!(settlement.source, source);
-        assert_eq!(
-            settlement.positions,
-            vec![first_position, first_position + 1, first_position + 2]
-        );
-
-        let mut wrong_source = coordinated;
-        let wrong_source_mutation = wrong_source.mutation.as_mut().unwrap();
-        wrong_source_mutation.stamp.source_journal_position += 3;
-        wrong_source_mutation.stamp.source_id.source_epoch = [7; 32];
-        assert!(
-            single_node_group_settlement(&[outcomes[1].clone(), Ok(wrong_source)])
-                .unwrap_err()
-                .to_string()
-                .contains("more than one source-journal identity")
         );
     }
 
