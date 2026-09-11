@@ -12,7 +12,7 @@ qualifies, records, and publishes the exact tagged commit.
 
 For a local release, the build itself is one zrunner `rust` job whose direct
 argv is the repository helper below. The accepted job evidence must contain
-`CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm`, lock
+`RUSTUP_TOOLCHAIN=1.96.0` and `CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm`, lock
 `cargo-target:debian1:keldra`, set `CARGO_TARGET_DIR` to
 `/home/zcourts/projects/projects/build/debian1/keldra`, and set
 `KELDRA_ZRUNNER_JOB_ID` to the job envelope's ULID. The helper runs fixed
@@ -84,7 +84,8 @@ the amd64 image only on a native x86_64 runner. Its argv is
 `./scripts/prepare-release-image-input.sh qualify 0.17.1
 <SOURCE_COMMIT> <IMAGE_RECORD> <OCI_ARCHIVE>
 <QUALIFICATION_MANIFEST>`, with `KELDRA_ZRUNNER_JOB_ID` bound to the job ULID.
-The wrapper requires the runner's `build/<runner>/keldra` Cargo target and
+The wrapper requires `RUSTUP_TOOLCHAIN=1.96.0`, the runner's
+`build/<runner>/keldra` Cargo target and
 matching `cargo-target:<runner>:keldra` lock,
 rejects emulation, validates and loads the exact archive, runs the
 official three-node entrypoint, and only then writes its result manifest.

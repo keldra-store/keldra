@@ -418,6 +418,7 @@ def three_node_command(args: argparse.Namespace) -> None:
     runner = job.get("runner")
     require(job.get("schema") == "zrunner.job.v1" and isinstance(runner, str) and bool(runner) and job.get("profile") == "rust", "invalid local qualification job")
     environment = job.get("env", {})
+    require(environment.get("RUSTUP_TOOLCHAIN") == "1.96.0", "local qualification Rust toolchain changed")
     require(environment.get("CARGO_PROFILE_DEV_CODEGEN_BACKEND") == "llvm", "local qualification wrapper must explicitly select LLVM")
     expected_target = f"/home/zcourts/projects/projects/build/{runner}/keldra"
     require(environment.get("CARGO_TARGET_DIR") == expected_target, "local qualification Cargo target changed")
