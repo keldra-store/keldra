@@ -390,7 +390,7 @@ impl Store {
             .map_or(0, |lane| lane.physical_slots_active_at_acquire());
         let physical_slots_peak_since_start_at_acquire = _mutation_lane
             .as_ref()
-            .map_or(0, |lane| lane.physical_slots_peak());
+            .map_or(0, |lane| lane.physical_slots_peak_since_start_at_acquire());
         let physical_slot_count = _mutation_lane
             .as_ref()
             .map_or(0, |lane| lane.physical_slot_count());

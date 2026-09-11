@@ -52,10 +52,11 @@ pub(super) struct MutationLaneGuard {
     _conflicts: Vec<OwnedMutexGuard<()>>,
     _physical_slot: tokio::sync::OwnedSemaphorePermit,
     physical_slots_active: Arc<AtomicUsize>,
+    physical_slots_peak_since_start: Arc<AtomicUsize>,
     conflict_wait: Duration,
     physical_slot_wait: Duration,
     physical_slots_active_at_acquire: usize,
-    physical_slots_peak: usize,
+    physical_slots_peak_since_start_at_acquire: usize,
     physical_slot_count: usize,
 }
 
@@ -82,12 +83,12 @@ impl MutationLaneGuard {
         self.physical_slots_active.load(Ordering::Acquire)
     }
 
-    pub(super) fn physical_slots_peak(&self) -> usize {
-        self.physical_slots_peak
+    pub(super) fn physical_slots_peak_since_start_at_acquire(&self) -> usize {
+        self.physical_slots_peak_since_start_at_acquire
     }
 
     pub(super) fn physical_slots_peak_since_start(&self) -> usize {
-        self.physical_slots_peak.load(Ordering::Acquire)
+        self.physical_slots_peak_since_start.load(Ordering::Acquire)
     }
 
     pub(super) fn physical_slot_count(&self) -> usize {
@@ -226,16 +227,18 @@ impl MutationCommitLanes {
             self.physical_slots_active.fetch_add(1, Ordering::AcqRel) + 1;
         self.physical_slots_peak
             .fetch_max(physical_slots_active_at_acquire, Ordering::AcqRel);
-        let physical_slots_peak = self.physical_slots_peak.load(Ordering::Acquire);
+        let physical_slots_peak_since_start_at_acquire =
+            self.physical_slots_peak.load(Ordering::Acquire);
         MutationLaneGuard {
             _fence: fence,
             _conflicts: conflicts,
             _physical_slot: physical_slot,
             physical_slots_active: self.physical_slots_active.clone(),
+            physical_slots_peak_since_start: self.physical_slots_peak.clone(),
             conflict_wait,
             physical_slot_wait,
             physical_slots_active_at_acquire,
-            physical_slots_peak,
+            physical_slots_peak_since_start_at_acquire,
             physical_slot_count: self.physical_slot_count,
         }
     }
@@ -1314,12 +1317,12 @@ mod tests {
         let lanes = MutationCommitLanes::new(2);
         let first = lanes.acquire([b"path:a".to_vec()]).await;
         assert_eq!(first.physical_slots_active_at_acquire(), 1);
-        assert_eq!(first.physical_slots_peak(), 1);
+        assert_eq!(first.physical_slots_peak_since_start_at_acquire(), 1);
         assert_eq!(first.physical_slot_count(), 2);
 
         let second = lanes.acquire([b"path:b".to_vec()]).await;
         assert_eq!(second.physical_slots_active_at_acquire(), 2);
-        assert_eq!(second.physical_slots_peak(), 2);
+        assert_eq!(second.physical_slots_peak_since_start_at_acquire(), 2);
         assert_eq!(first.physical_slots_active(), 2);
         assert_eq!(first.physical_slots_peak_since_start(), 2);
         drop(second);
