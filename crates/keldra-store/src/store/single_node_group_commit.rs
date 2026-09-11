@@ -651,8 +651,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        BucketPolicy, Durability, MutationReceiptRetention, ObjectKey, PlacementLogId, PutMode,
-        PutRequest, StoreOptions,
+        BucketPolicy, DestinationReferenceArtifact, DestinationReferenceDelta, Durability,
+        MutationReceiptRetention, ObjectKey, PlacementLogId, PutMode, PutRequest,
+        ReferenceDeltaBatch, StoreOptions,
     };
 
     fn context(term: u64) -> ObjectMutationContext {
@@ -1365,17 +1366,55 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(legacy.as_slice(), [Ok(_)]));
+        let legacy_mutation = legacy[0]
+            .as_ref()
+            .unwrap()
+            .mutation
+            .as_ref()
+            .expect("new distributed operation must carry its mutation");
         let legacy_status = store.local_watch_status().unwrap();
         let legacy_receipts = store.mutation_receipt_status().unwrap();
         assert!(legacy_status.settled_through < legacy_status.tail);
+        let reference_after = store
+            .reference_delta_cursor(legacy_status.source_id)
+            .unwrap();
+        store
+            .apply_reference_deltas(ReferenceDeltaBatch {
+                source: legacy_status.source_id,
+                after: reference_after,
+                through: legacy_status.tail,
+                deltas: legacy_mutation
+                    .reference_deltas
+                    .iter()
+                    .map(|delta| DestinationReferenceDelta {
+                        artifact: DestinationReferenceArtifact::CompleteBlob(delta.blob.clone()),
+                        change: delta.change,
+                    })
+                    .collect(),
+            })
+            .await
+            .unwrap();
+        let after_effects = store.local_watch_status().unwrap();
+        let after_cursor = store
+            .reference_delta_cursor(after_effects.source_id)
+            .unwrap();
+        store
+            .apply_reference_deltas(ReferenceDeltaBatch {
+                source: after_effects.source_id,
+                after: after_cursor,
+                through: after_effects.tail,
+                deltas: Vec::new(),
+            })
+            .await
+            .unwrap();
         let positions =
-            (legacy_status.settled_through + 1..=legacy_status.tail).collect::<Vec<_>>();
+            (after_effects.settled_through + 1..=after_effects.tail).collect::<Vec<_>>();
         assert_eq!(
             store
-                .settle_source_journal_positions_if_contiguous(legacy_status.source_id, &positions)
+                .settle_source_journal_positions_if_contiguous(after_effects.source_id, &positions)
                 .await
                 .unwrap(),
-            Some(legacy_status.tail)
+            Some(after_effects.tail)
         );
 
         let lane = store
@@ -1395,70 +1434,61 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn conflicting_governance_splits_physical_commits() {
-        let temporary = tempfile::tempdir().unwrap();
-        let config = SingleNodeGroupCommitConfig::default()
-            .with_commit_lanes(1)
-            .unwrap();
-        let store = Store::open(
-            StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
-        )
-        .await
-        .unwrap();
-        let first = governance(&store);
+    #[test]
+    fn conflicting_governance_stops_the_current_group() {
+        let queue = SingleNodeGroupCommit::new(SingleNodeGroupCommitConfig::default());
+        let enqueued_at = Instant::now();
+        let mut state = QueueState::default();
+        let first = governance_stub();
         let mut second = first.clone();
         second.policy = BucketPolicy {
             immutable_prefixes: vec!["immutable".into()],
             ..BucketPolicy::default()
         };
-        let before = store.db.latest_sequence_number();
-        let (first, second) = tokio::join!(
-            store.coordinate_single_node_mutation_batch(
-                request("objects/first", "first", first),
-                context(1),
-            ),
-            store.coordinate_single_node_mutation_batch(
-                request("objects/second", "second", second),
-                context(1),
-            ),
-        );
-
-        assert!(matches!(first.as_deref(), Ok([Ok(_)])), "first={first:?}");
-        assert!(
-            matches!(second.as_deref(), Ok([Ok(_)])),
-            "second={second:?}"
-        );
-        assert_eq!(physical_commits_since(&store, before), 2);
+        state.requests.push_back(queued_request(
+            &queue,
+            request("objects/first", "first", first),
+            context(1),
+            enqueued_at,
+        ));
+        state.requests.push_back(queued_request(
+            &queue,
+            request("objects/second", "second", second),
+            context(1),
+            enqueued_at,
+        ));
+        assert!(matches!(
+            queue.next_queue_action(&mut state, enqueued_at),
+            QueueAction::Group { requests, stop_reason: "governance", .. }
+                if requests.len() == 1
+        ));
+        assert_eq!(state.requests.len(), 1);
     }
 
-    #[tokio::test]
-    async fn incompatible_context_splits_physical_commits() {
-        let temporary = tempfile::tempdir().unwrap();
-        let config = SingleNodeGroupCommitConfig::default()
-            .with_commit_lanes(1)
-            .unwrap();
-        let store = Store::open(
-            StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
-        )
-        .await
-        .unwrap();
-        let governance = governance(&store);
-        let before = store.db.latest_sequence_number();
-        let (first, second) = tokio::join!(
-            store.coordinate_single_node_mutation_batch(
-                request("objects/context-first", "context-first", governance.clone()),
-                context(1),
-            ),
-            store.coordinate_single_node_mutation_batch(
-                request("objects/context-second", "context-second", governance),
-                context(2),
-            ),
-        );
-
-        assert!(matches!(first.as_deref(), Ok([Ok(_)])));
-        assert!(matches!(second.as_deref(), Ok([Ok(_)])));
-        assert_eq!(physical_commits_since(&store, before), 2);
+    #[test]
+    fn incompatible_context_stops_the_current_group() {
+        let queue = SingleNodeGroupCommit::new(SingleNodeGroupCommitConfig::default());
+        let enqueued_at = Instant::now();
+        let mut state = QueueState::default();
+        let governance = governance_stub();
+        state.requests.push_back(queued_request(
+            &queue,
+            request("objects/context-first", "context-first", governance.clone()),
+            context(1),
+            enqueued_at,
+        ));
+        state.requests.push_back(queued_request(
+            &queue,
+            request("objects/context-second", "context-second", governance),
+            context(2),
+            enqueued_at,
+        ));
+        assert!(matches!(
+            queue.next_queue_action(&mut state, enqueued_at),
+            QueueAction::Group { requests, stop_reason: "context", .. }
+                if requests.len() == 1
+        ));
+        assert_eq!(state.requests.len(), 1);
     }
 
     #[tokio::test]

@@ -294,10 +294,7 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
     )
     .unwrap();
     assert_eq!(mutation_status.tail, mutation.stamp.source_journal_position);
-    assert_eq!(
-        mutation_status.settled_through,
-        source_status_before.settled_through
-    );
+    assert_eq!(mutation_status.settled_through, source_status_before.tail);
     let final_source_status = source.local_watch_status().unwrap();
     assert_eq!(
         (
