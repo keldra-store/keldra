@@ -194,11 +194,23 @@ fn wal_batches_since(store: &Store, sequence: u64) -> usize {
 }
 
 #[derive(Default)]
-struct WalPuts(Vec<Vec<u8>>);
+struct WalPuts(Vec<(Vec<u8>, Vec<u8>)>);
+
+impl WalPuts {
+    fn contains(&self, key: &[u8]) -> bool {
+        self.0.iter().any(|(candidate, _)| candidate == key)
+    }
+
+    fn value(&self, key: &[u8]) -> Option<&[u8]> {
+        self.0
+            .iter()
+            .find_map(|(candidate, value)| (candidate == key).then_some(value.as_slice()))
+    }
+}
 
 impl WriteBatchIteratorCf for WalPuts {
-    fn put_cf(&mut self, _cf_id: u32, key: &[u8], _value: &[u8]) {
-        self.0.push(key.to_vec());
+    fn put_cf(&mut self, _cf_id: u32, key: &[u8], value: &[u8]) {
+        self.0.push((key.to_vec(), value.to_vec()));
     }
 
     fn delete_cf(&mut self, _cf_id: u32, _key: &[u8]) {}
@@ -206,7 +218,7 @@ impl WriteBatchIteratorCf for WalPuts {
     fn merge_cf(&mut self, _cf_id: u32, _key: &[u8], _value: &[u8]) {}
 }
 
-fn wal_put_batches_since(store: &Store, sequence: u64) -> Vec<Vec<Vec<u8>>> {
+fn wal_put_batches_since(store: &Store, sequence: u64) -> Vec<WalPuts> {
     store
         .db
         .get_updates_since(sequence)
@@ -215,7 +227,7 @@ fn wal_put_batches_since(store: &Store, sequence: u64) -> Vec<Vec<Vec<u8>>> {
             let (_, batch) = entry.unwrap();
             let mut puts = WalPuts::default();
             batch.iterate_cf(&mut puts);
-            puts.0
+            puts
         })
         .collect()
 }
@@ -270,15 +282,18 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
     let mutation_batch = source_batches
         .iter()
         .find(|puts| {
-            puts.contains(&head_key)
-                && puts.contains(&proof_key.to_vec())
-                && puts.contains(&journal_key.to_vec())
+            puts.contains(&head_key) && puts.contains(&proof_key) && puts.contains(&journal_key)
         })
         .expect("source metadata and proof share one batch");
-    assert!(mutation_batch.contains(&LOCAL_INVALIDATION_STATUS_KEY.to_vec()));
-    let source_status = source.local_watch_status().unwrap();
-    assert_eq!(source_status.tail, mutation.stamp.source_journal_position);
-    assert_eq!(source_status.settled_through, 0);
+    let mutation_status = decode_watch_journal_status(
+        mutation.stamp.source_id,
+        mutation_batch
+            .value(LOCAL_INVALIDATION_STATUS_KEY)
+            .expect("source mutation batch includes journal status"),
+    )
+    .unwrap();
+    assert_eq!(mutation_status.tail, mutation.stamp.source_journal_position);
+    assert_eq!(mutation_status.settled_through, 0);
 
     let replica_sequence = replica.db.latest_sequence_number();
     assert_eq!(
@@ -294,7 +309,7 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
     let replica_batches = wal_put_batches_since(&replica, replica_sequence);
     assert_eq!(replica_batches.len(), 1);
     assert!(replica_batches[0].contains(&head_key));
-    assert!(replica_batches[0].contains(&proof_key.to_vec()));
+    assert!(replica_batches[0].contains(&proof_key));
     assert_eq!(
         replica
             .read_reference_proof(

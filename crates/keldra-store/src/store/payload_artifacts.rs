@@ -1214,6 +1214,12 @@ mod tests {
         let reference = store.stage_blob(&bytes).await.unwrap();
         let state = store.blob_reference_state(&reference).unwrap().unwrap();
         let identity = complete_identity(&reference);
+        let manifest = store.read_complete_manifest(&reference).unwrap().unwrap();
+        let first_chunk = chunk_key(COMPLETE_CHUNK_TAG, &manifest.storage_id, 0);
+        assert!(matches!(
+            manifest.layout,
+            ArtifactLayout::Chunked { chunk_count: 2 }
+        ));
         store
             .db
             .delete_cf(
@@ -1231,10 +1237,7 @@ mod tests {
         assert!(
             store
                 .db
-                .get_cf(
-                    store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(),
-                    complete_inline_key(&reference),
-                )
+                .get_cf(store.cf(CF_PAYLOAD_ARTIFACTS).unwrap(), first_chunk,)
                 .unwrap()
                 .is_some()
         );
