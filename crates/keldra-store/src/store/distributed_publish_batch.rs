@@ -290,6 +290,17 @@ impl Store {
         }
         let prepare_duration = prepare_started.elapsed();
 
+        let lane_resources = prepared
+            .iter()
+            .flat_map(|item| {
+                super::mutation_commit_lanes::conflict_resources(
+                    &item.operation,
+                    item.definition_intent,
+                )
+            })
+            .collect::<Vec<_>>();
+        let _mutation_lane = self.mutation_commit_lanes.acquire(lane_resources).await;
+
         let policy_wait_started = std::time::Instant::now();
         let _policy_guard = self.policy_gate.read().await;
         let policy_wait_duration = policy_wait_started.elapsed();
