@@ -11,14 +11,13 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::object_alias_registry::decode_registry;
 use super::{
-    CF_HEADS, CF_METADATA, CF_OBJECT_ALIAS_REGISTRIES, CF_VERSIONS, MAX_OBJECT_RECORD_EXPORT_BYTES,
+    CF_HEADS, CF_OBJECT_ALIAS_REGISTRIES, CF_VERSIONS, MAX_OBJECT_RECORD_EXPORT_BYTES,
     MAX_OBJECT_RECORD_EXPORT_RECORDS, StoredVersion,
 };
 use crate::key::{
     BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TenantId,
     contains_reserved_keldra_segment,
 };
-use crate::watch::{LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_OFFSET_KEY};
 use crate::{
     Head, MAX_CONTENT_TYPE_BYTES, MUTATION_STAMP_FORMAT, ObjectAliasRegistry, ObjectKey, SourceId,
     Store, Version, VersionId,
@@ -797,37 +796,11 @@ fn run_snapshot_worker<F>(
     F: Fn(&CurrentObjectSnapshot) -> bool,
 {
     let snapshot = store.db.snapshot();
-    let metadata = match store.cf(CF_METADATA).map_err(object_storage) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            let _ = ready.send(Err(error));
-            return;
-        }
-    };
     let capture = (|| {
-        let encoded_epoch = snapshot
-            .get_cf(metadata, LOCAL_INVALIDATION_EPOCH_KEY)
-            .map_err(object_storage)?
-            .ok_or_else(|| object_storage("local source epoch is missing"))?;
-        let source_epoch: [u8; 32] = encoded_epoch
-            .as_slice()
-            .try_into()
-            .map_err(|_| object_storage("local source epoch is malformed"))?;
-        if source_epoch == [0; 32] {
-            return Err(object_storage("local source epoch is all zero"));
-        }
-        let encoded_tail = snapshot
-            .get_cf(metadata, LOCAL_INVALIDATION_OFFSET_KEY)
-            .map_err(object_storage)?
-            .ok_or_else(|| object_storage("local source tail is missing"))?;
-        let captured_tail = decode_counter(&encoded_tail)?;
-        Ok((
-            SourceId {
-                node_id: store.node_id,
-                source_epoch,
-            },
-            captured_tail,
-        ))
+        let status = store
+            .local_watch_status_at(&snapshot)
+            .map_err(object_storage)?;
+        Ok((status.source_id, status.tail))
     })();
     if ready.send(capture.clone()).is_err() || capture.is_err() {
         return;
@@ -1097,13 +1070,6 @@ fn exact_version_key(head_key: &[u8], version: VersionId) -> Vec<u8> {
 fn encoded_record_bytes(record: &CurrentObjectSnapshot) -> Result<u64, ObjectSnapshotError> {
     u64::try_from(serde_json::to_vec(record).map_err(object_storage)?.len())
         .map_err(|_| object_storage("current-head record size overflow"))
-}
-
-fn decode_counter(encoded: &[u8]) -> Result<u64, ObjectSnapshotError> {
-    let encoded: [u8; 8] = encoded
-        .try_into()
-        .map_err(|_| object_storage("local source tail is malformed"))?;
-    Ok(u64::from_be_bytes(encoded))
 }
 
 fn require_nonzero(value: u64, label: &str) -> Result<(), ObjectSnapshotError> {

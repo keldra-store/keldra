@@ -1044,11 +1044,6 @@ impl Store {
         match existing {
             Some(existing) => {
                 validate_complete_artifact(reference, &existing)?;
-                self.read_complete_manifest(reference)?.ok_or_else(|| {
-                    MutationError::Storage(
-                        "complete payload bytes exist without their manifest".into(),
-                    )
-                })?;
                 let state = self.blob_reference_state(reference)?.ok_or_else(|| {
                     MutationError::Storage(
                         "complete payload bytes exist without lifecycle authority".into(),

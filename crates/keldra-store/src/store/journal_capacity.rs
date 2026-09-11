@@ -356,23 +356,8 @@ impl Store {
         }
         batch.put_cf(
             metadata,
-            LOCAL_INVALIDATION_OFFSET_KEY,
-            status.tail.to_be_bytes(),
-        );
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_FLOOR_KEY,
-            status.retention_floor.to_be_bytes(),
-        );
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_COUNT_KEY,
-            status.retained_entries.to_be_bytes(),
-        );
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_BYTES_KEY,
-            status.retained_bytes.to_be_bytes(),
+            LOCAL_INVALIDATION_STATUS_KEY,
+            encode_watch_journal_status(status),
         );
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);

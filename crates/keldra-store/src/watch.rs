@@ -24,11 +24,7 @@ pub const MAX_ATOMIC_BATCH_PUBLISHED_BYTES: u64 = 16 * 1024 * 1024;
 /// even when paths are very short.
 pub const MAX_ATOMIC_BATCH_MUTATIONS: usize = 4_096;
 
-pub(crate) const LOCAL_INVALIDATION_OFFSET_KEY: &[u8] = b"local_invalidation_offset";
-pub(crate) const LOCAL_INVALIDATION_SETTLED_KEY: &[u8] = b"local_invalidation_settled_through";
-pub(crate) const LOCAL_INVALIDATION_FLOOR_KEY: &[u8] = b"local_invalidation_floor";
-pub(crate) const LOCAL_INVALIDATION_COUNT_KEY: &[u8] = b"local_invalidation_count";
-pub(crate) const LOCAL_INVALIDATION_BYTES_KEY: &[u8] = b"local_invalidation_bytes";
+pub(crate) const LOCAL_INVALIDATION_STATUS_KEY: &[u8] = b"local_invalidation_status";
 pub(crate) const LOCAL_INVALIDATION_EPOCH_KEY: &[u8] = b"local_invalidation_epoch";
 pub(crate) const LOCAL_INVALIDATION_TOKEN_KEY: &[u8] = b"local_invalidation_token_key";
 
@@ -177,6 +173,62 @@ pub struct WatchJournalStatus {
     /// Logical encoded key-plus-value bytes retained in the journal. RocksDB
     /// implementation overhead is deliberately not part of the API bound.
     pub retained_bytes: u64,
+}
+
+const WATCH_JOURNAL_STATUS_BYTES: usize = size_of::<u64>() * 5;
+
+pub(crate) fn encode_watch_journal_status(
+    status: WatchJournalStatus,
+) -> [u8; WATCH_JOURNAL_STATUS_BYTES] {
+    let mut encoded = [0_u8; WATCH_JOURNAL_STATUS_BYTES];
+    for (index, value) in [
+        status.tail,
+        status.settled_through,
+        status.retention_floor,
+        status.retained_entries,
+        status.retained_bytes,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let start = index * size_of::<u64>();
+        encoded[start..start + size_of::<u64>()].copy_from_slice(&value.to_be_bytes());
+    }
+    encoded
+}
+
+pub(crate) fn decode_watch_journal_status(
+    source_id: SourceId,
+    encoded: &[u8],
+) -> Result<WatchJournalStatus, WatchError> {
+    let encoded: &[u8; WATCH_JOURNAL_STATUS_BYTES] = encoded.try_into().map_err(|_| {
+        WatchError::Storage("local invalidation status metadata is malformed".into())
+    })?;
+    let read = |index: usize| {
+        let start = index * size_of::<u64>();
+        u64::from_be_bytes(
+            encoded[start..start + size_of::<u64>()]
+                .try_into()
+                .expect("fixed slice"),
+        )
+    };
+    let status = WatchJournalStatus {
+        source_id,
+        tail: read(0),
+        settled_through: read(1),
+        retention_floor: read(2),
+        retained_entries: read(3),
+        retained_bytes: read(4),
+    };
+    if status.retention_floor > status.settled_through
+        || status.settled_through > status.tail
+        || status.retained_entries != status.tail - status.retention_floor
+    {
+        return Err(WatchError::Storage(
+            "local invalidation retention metadata is inconsistent".into(),
+        ));
+    }
+    Ok(status)
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

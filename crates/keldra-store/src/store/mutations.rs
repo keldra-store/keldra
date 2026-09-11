@@ -1074,35 +1074,15 @@ impl Store {
         for (offset, encoded) in appended {
             batch.put_cf(journal, invalidation_key(offset), encoded);
         }
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_OFFSET_KEY,
-            status.tail.to_be_bytes(),
-        );
         let visibility_settlement_staged =
             stage_visibility_settlement && status.settled_through == old_tail;
         if visibility_settlement_staged {
             status.settled_through = status.tail;
-            batch.put_cf(
-                metadata,
-                LOCAL_INVALIDATION_SETTLED_KEY,
-                status.tail.to_be_bytes(),
-            );
         }
         batch.put_cf(
             metadata,
-            LOCAL_INVALIDATION_FLOOR_KEY,
-            status.retention_floor.to_be_bytes(),
-        );
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_COUNT_KEY,
-            status.retained_entries.to_be_bytes(),
-        );
-        batch.put_cf(
-            metadata,
-            LOCAL_INVALIDATION_BYTES_KEY,
-            status.retained_bytes.to_be_bytes(),
+            LOCAL_INVALIDATION_STATUS_KEY,
+            encode_watch_journal_status(status),
         );
         if let Some(source) = local_reference_cursor {
             self.stage_reference_delta_cursor(batch, source, status.tail)?;
@@ -1205,19 +1185,12 @@ impl Store {
 
     pub(super) fn mutation_receipt_status(&self) -> Result<MutationReceiptStatus, MutationError> {
         let metadata = self.cf(CF_METADATA)?;
-        let read = |key: &[u8]| {
-            self.db
-                .get_cf(metadata, key)
-                .map_err(storage_error)?
-                .ok_or_else(|| {
-                    MutationError::Storage("mutation receipt metadata is missing".into())
-                })
-                .and_then(|encoded| decode_offset(&encoded))
-        };
-        Ok(MutationReceiptStatus {
-            entries: read(MUTATION_RECEIPT_COUNT_KEY)?,
-            bytes: read(MUTATION_RECEIPT_BYTES_KEY)?,
-        })
+        let encoded = self
+            .db
+            .get_cf(metadata, MUTATION_RECEIPT_STATUS_KEY)
+            .map_err(storage_error)?
+            .ok_or_else(|| MutationError::Storage("mutation receipt metadata is missing".into()))?;
+        decode_mutation_receipt_status(&encoded)
     }
 
     pub(super) fn stage_expired_mutation_receipts(
@@ -1389,13 +1362,8 @@ impl Store {
         let metadata = self.cf(CF_METADATA)?;
         batch.put_cf(
             metadata,
-            MUTATION_RECEIPT_COUNT_KEY,
-            status.entries.to_be_bytes(),
-        );
-        batch.put_cf(
-            metadata,
-            MUTATION_RECEIPT_BYTES_KEY,
-            status.bytes.to_be_bytes(),
+            MUTATION_RECEIPT_STATUS_KEY,
+            encode_mutation_receipt_status(status),
         );
         Ok(())
     }

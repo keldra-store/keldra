@@ -9,11 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use super::object_alias_registry::decode_registry;
 use super::{
-    CF_HEADS, CF_METADATA, CF_OBJECT_ALIAS_REGISTRIES, CF_VERSIONS, Store, StoredVersion,
-    StoredVersionRetention,
+    CF_HEADS, CF_OBJECT_ALIAS_REGISTRIES, CF_VERSIONS, Store, StoredVersion, StoredVersionRetention,
 };
 use crate::key::{BucketId, BucketIdentity, TenantId};
-use crate::watch::{LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_OFFSET_KEY};
 use crate::{Head, ObjectKey, SourceId, Version, VersionId};
 
 use super::object_snapshot::ObjectSnapshotError;
@@ -702,34 +700,10 @@ fn capture_source(
     store: &Store,
     snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
 ) -> Result<(SourceId, u64), ObjectSnapshotError> {
-    let metadata = store.cf(CF_METADATA).map_err(object_storage)?;
-    let epoch = snapshot
-        .get_cf(metadata, LOCAL_INVALIDATION_EPOCH_KEY)
-        .map_err(object_storage)?
-        .ok_or_else(|| object_storage("local source epoch is missing"))?;
-    let source_epoch: [u8; 32] = epoch
-        .as_slice()
-        .try_into()
-        .map_err(|_| object_storage("local source epoch is malformed"))?;
-    if source_epoch == [0; 32] {
-        return Err(object_storage("local source epoch is all zero"));
-    }
-    let tail = snapshot
-        .get_cf(metadata, LOCAL_INVALIDATION_OFFSET_KEY)
-        .map_err(object_storage)?
-        .ok_or_else(|| object_storage("local source tail is missing"))?;
-    let captured_tail = u64::from_be_bytes(
-        tail.as_slice()
-            .try_into()
-            .map_err(|_| object_storage("local source tail is malformed"))?,
-    );
-    Ok((
-        SourceId {
-            node_id: store.node_id,
-            source_epoch,
-        },
-        captured_tail,
-    ))
+    let status = store
+        .local_watch_status_at(snapshot)
+        .map_err(object_storage)?;
+    Ok((status.source_id, status.tail))
 }
 
 fn validate_request(

@@ -134,6 +134,33 @@ async fn existing_store_without_the_integrated_format_marker_is_rejected() {
 }
 
 #[tokio::test]
+async fn v1_integrated_payload_format_is_rejected_without_migration() {
+    let temporary = tempfile::tempdir().unwrap();
+    let options = StoreOptions::new(temporary.path(), 1);
+    let store = Store::open(options.clone()).await.unwrap();
+    store
+        .db
+        .put_cf(
+            store.cf(CF_METADATA).unwrap(),
+            INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY,
+            [1],
+        )
+        .unwrap();
+    drop(store);
+
+    let error = Store::open(options)
+        .await
+        .err()
+        .expect("v1 integrated storage marker must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("integrated payload storage format marker is unsupported")
+    );
+}
+
+#[tokio::test]
 async fn existing_store_without_the_durable_mutation_record_marker_is_rejected() {
     let temporary = tempfile::tempdir().unwrap();
     let options = StoreOptions::new(temporary.path(), 1);
@@ -156,6 +183,33 @@ async fn existing_store_without_the_durable_mutation_record_marker_is_rejected()
         error
             .to_string()
             .contains("has no durable mutation record format marker")
+    );
+}
+
+#[tokio::test]
+async fn v1_durable_mutation_record_format_is_rejected_without_migration() {
+    let temporary = tempfile::tempdir().unwrap();
+    let options = StoreOptions::new(temporary.path(), 1);
+    let store = Store::open(options.clone()).await.unwrap();
+    store
+        .db
+        .put_cf(
+            store.cf(CF_METADATA).unwrap(),
+            DURABLE_MUTATION_RECORD_FORMAT_KEY,
+            [1],
+        )
+        .unwrap();
+    drop(store);
+
+    let error = Store::open(options)
+        .await
+        .err()
+        .expect("v1 durable mutation record marker must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("durable mutation record format marker is unsupported")
     );
 }
 

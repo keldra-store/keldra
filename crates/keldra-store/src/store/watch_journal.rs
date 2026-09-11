@@ -185,7 +185,7 @@ impl Store {
         offset: u64,
     ) -> Result<(), MutationError> {
         let _commit_guard = self.lock_commit("watch_journal").await;
-        let status = self
+        let mut status = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         let current = status.settled_through;
@@ -206,13 +206,14 @@ impl Store {
         if offset == current {
             return Ok(());
         }
+        status.settled_through = offset;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db
             .put_cf_opt(
                 self.cf(CF_METADATA)?,
-                LOCAL_INVALIDATION_SETTLED_KEY,
-                offset.to_be_bytes(),
+                LOCAL_INVALIDATION_STATUS_KEY,
+                encode_watch_journal_status(status),
                 &options,
             )
             .map_err(storage_error)?;
@@ -247,7 +248,7 @@ impl Store {
             return Ok(None);
         }
         let _commit_guard = self.lock_commit("watch_journal").await;
-        let status = self
+        let mut status = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         if source != status.source_id {
@@ -278,13 +279,14 @@ impl Store {
             return Ok(None);
         }
 
+        status.settled_through = through;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db
             .put_cf_opt(
                 self.cf(CF_METADATA)?,
-                LOCAL_INVALIDATION_SETTLED_KEY,
-                through.to_be_bytes(),
+                LOCAL_INVALIDATION_STATUS_KEY,
+                encode_watch_journal_status(status),
                 &options,
             )
             .map_err(storage_error)?;
@@ -413,14 +415,9 @@ impl Store {
     }
 
     pub fn local_invalidation_offset(&self) -> Result<u64, MutationError> {
-        let Some(encoded) = self
-            .db
-            .get_cf(self.cf(CF_METADATA)?, LOCAL_INVALIDATION_OFFSET_KEY)
-            .map_err(storage_error)?
-        else {
-            return Ok(0);
-        };
-        decode_offset(&encoded)
+        self.local_watch_status()
+            .map(|status| status.tail)
+            .map_err(|error| MutationError::Storage(error.to_string()))
     }
 
     pub fn local_watch_status(&self) -> Result<WatchJournalStatus, WatchError> {
@@ -435,37 +432,17 @@ impl Store {
         let metadata = self
             .cf(CF_METADATA)
             .map_err(|error| WatchError::Storage(error.to_string()))?;
-        let read_counter = |key: &[u8]| {
-            let encoded = snapshot
-                .get_cf(metadata, key)
-                .map_err(|error| WatchError::Storage(error.to_string()))?
-                .ok_or_else(|| WatchError::Storage("local watch metadata is missing".into()))?;
-            decode_watch_u64(&encoded)
-        };
-        let tail = read_counter(LOCAL_INVALIDATION_OFFSET_KEY)?;
-        let settled_through = read_counter(LOCAL_INVALIDATION_SETTLED_KEY)?;
-        let retention_floor = read_counter(LOCAL_INVALIDATION_FLOOR_KEY)?;
-        let retained_entries = read_counter(LOCAL_INVALIDATION_COUNT_KEY)?;
-        let retained_bytes = read_counter(LOCAL_INVALIDATION_BYTES_KEY)?;
-        if retention_floor > settled_through
-            || settled_through > tail
-            || retained_entries != tail - retention_floor
-        {
-            return Err(WatchError::Storage(
-                "local invalidation retention metadata is inconsistent".into(),
-            ));
-        }
-        Ok(WatchJournalStatus {
-            source_id: SourceId {
+        let encoded = snapshot
+            .get_cf(metadata, LOCAL_INVALIDATION_STATUS_KEY)
+            .map_err(|error| WatchError::Storage(error.to_string()))?
+            .ok_or_else(|| WatchError::Storage("local watch metadata is missing".into()))?;
+        decode_watch_journal_status(
+            SourceId {
                 node_id: self.node_id,
                 source_epoch: self.watch_source_epoch,
             },
-            tail,
-            settled_through,
-            retention_floor,
-            retained_entries,
-            retained_bytes,
-        })
+            &encoded,
+        )
     }
 
     pub fn start_watch(
@@ -934,12 +911,14 @@ mod tests {
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
             .unwrap();
+        let mut status = store.local_watch_status().unwrap();
+        status.settled_through = 1;
         store
             .db
             .put_cf(
                 store.cf(CF_METADATA).unwrap(),
-                LOCAL_INVALIDATION_SETTLED_KEY,
-                1_u64.to_be_bytes(),
+                LOCAL_INVALIDATION_STATUS_KEY,
+                encode_watch_journal_status(status),
             )
             .unwrap();
         drop(store);
@@ -947,7 +926,11 @@ mod tests {
         let error = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("settled cursor 1"));
+        assert!(
+            error
+                .to_string()
+                .contains("retention metadata is inconsistent")
+        );
     }
 
     #[tokio::test]

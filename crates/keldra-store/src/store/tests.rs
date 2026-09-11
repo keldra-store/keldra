@@ -68,18 +68,10 @@ impl WriteBatchIteratorCf for WalOperationCounter {
         if key == VERSION_HIGH_WATERMARK_KEY {
             self.high_watermark_puts += 1;
         }
-        if [
-            LOCAL_INVALIDATION_OFFSET_KEY,
-            LOCAL_INVALIDATION_SETTLED_KEY,
-            LOCAL_INVALIDATION_FLOOR_KEY,
-            LOCAL_INVALIDATION_COUNT_KEY,
-            LOCAL_INVALIDATION_BYTES_KEY,
-        ]
-        .contains(&key)
-        {
+        if key == LOCAL_INVALIDATION_STATUS_KEY {
             self.invalidation_metadata_puts += 1;
         }
-        if [MUTATION_RECEIPT_COUNT_KEY, MUTATION_RECEIPT_BYTES_KEY].contains(&key) {
+        if key == MUTATION_RECEIPT_STATUS_KEY {
             self.receipt_metadata_puts += 1;
         }
     }

@@ -18,14 +18,13 @@ use crate::key::{
 };
 use crate::logical_record::decode_current_value;
 use crate::watch::{
-    AggregateKind, DecodedLocalChange, InvalidationStateHint, LOCAL_INVALIDATION_BYTES_KEY,
-    LOCAL_INVALIDATION_COUNT_KEY, LOCAL_INVALIDATION_EPOCH_KEY, LOCAL_INVALIDATION_FLOOR_KEY,
-    LOCAL_INVALIDATION_OFFSET_KEY, LOCAL_INVALIDATION_SETTLED_KEY, LOCAL_INVALIDATION_TOKEN_KEY,
-    LocalChange, LocalChangePage, LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS,
-    ObjectHeadChangeKind, OversizeLocalChange, SourceId, WatchCursor, WatchError,
-    WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart, decode_local_change,
-    decode_local_change_with_length, decode_resume_token, encode_local_change, encode_resume_token,
-    invalidation_key, invalidation_record_bytes, offset_from_key,
+    AggregateKind, DecodedLocalChange, InvalidationStateHint, LOCAL_INVALIDATION_EPOCH_KEY,
+    LOCAL_INVALIDATION_STATUS_KEY, LOCAL_INVALIDATION_TOKEN_KEY, LocalChange, LocalChangePage,
+    LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChangeKind,
+    OversizeLocalChange, SourceId, WatchCursor, WatchError, WatchJournalStatus, WatchPage,
+    WatchRetention, WatchScope, WatchStart, decode_local_change, decode_local_change_with_length,
+    decode_resume_token, decode_watch_journal_status, encode_local_change, encode_resume_token,
+    encode_watch_journal_status, invalidation_key, invalidation_record_bytes, offset_from_key,
 };
 use crate::{
     AWAITING_PUBLISH, AccountingHeadTransition, BatchOperation, BatchOutcome, BlobReader, BlobRef,
@@ -123,11 +122,10 @@ pub(crate) const CF_JOURNAL_ROUTES: &str = "journal_routes";
 pub(crate) const CF_OBJECT_ALIAS_REGISTRIES: &str = "object_alias_registries";
 pub(crate) const VERSION_HIGH_WATERMARK_KEY: &[u8] = b"version_high_watermark";
 const INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY: &[u8] = b"integrated_payload_storage_format";
-const INTEGRATED_PAYLOAD_STORAGE_FORMAT: u8 = 1;
+const INTEGRATED_PAYLOAD_STORAGE_FORMAT: u8 = 2;
 const DURABLE_MUTATION_RECORD_FORMAT_KEY: &[u8] = b"durable_mutation_record_format";
-const DURABLE_MUTATION_RECORD_FORMAT: u8 = 1;
-const MUTATION_RECEIPT_COUNT_KEY: &[u8] = b"mutation_receipt_count";
-const MUTATION_RECEIPT_BYTES_KEY: &[u8] = b"mutation_receipt_bytes";
+const DURABLE_MUTATION_RECORD_FORMAT: u8 = 2;
+const MUTATION_RECEIPT_STATUS_KEY: &[u8] = b"mutation_receipt_status";
 const RECEIPT_RECORD_PREFIX: u8 = 0;
 const RECEIPT_EXPIRY_PREFIX: u8 = 1;
 
@@ -265,6 +263,27 @@ impl Default for MutationReceiptRetention {
 struct MutationReceiptStatus {
     entries: u64,
     bytes: u64,
+}
+
+const MUTATION_RECEIPT_STATUS_BYTES: usize = size_of::<u64>() * 2;
+
+fn encode_mutation_receipt_status(
+    status: MutationReceiptStatus,
+) -> [u8; MUTATION_RECEIPT_STATUS_BYTES] {
+    let mut encoded = [0_u8; MUTATION_RECEIPT_STATUS_BYTES];
+    encoded[..size_of::<u64>()].copy_from_slice(&status.entries.to_be_bytes());
+    encoded[size_of::<u64>()..].copy_from_slice(&status.bytes.to_be_bytes());
+    encoded
+}
+
+fn decode_mutation_receipt_status(encoded: &[u8]) -> Result<MutationReceiptStatus, MutationError> {
+    let encoded: &[u8; MUTATION_RECEIPT_STATUS_BYTES] = encoded.try_into().map_err(|_| {
+        MutationError::Storage("mutation receipt retention metadata is malformed".into())
+    })?;
+    Ok(MutationReceiptStatus {
+        entries: u64::from_be_bytes(encoded[..size_of::<u64>()].try_into().expect("fixed slice")),
+        bytes: u64::from_be_bytes(encoded[size_of::<u64>()..].try_into().expect("fixed slice")),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -991,7 +1010,7 @@ impl Store {
             .map(|encoded| serde_json::from_slice::<VersionId>(&encoded))
             .transpose()?;
         let (watch_source_epoch, watch_token_key) =
-            initialize_local_watch_metadata(&db, metadata_cf, options.sync_writes)?;
+            initialize_local_watch_metadata(&db, metadata_cf, options.node_id, options.sync_writes)?;
         initialize_mutation_receipt_metadata(&db, metadata_cf, options.sync_writes)?;
         let db = Arc::new(db);
         let blobs = BlobStore::new(options.pending_upload_max_bytes)?;
@@ -1526,29 +1545,14 @@ pub(crate) fn is_program_definition_path(path: &str) -> bool {
 fn initialize_local_watch_metadata(
     db: &DB,
     metadata: &rocksdb::ColumnFamily,
+    node_id: u16,
     sync_writes: bool,
 ) -> Result<([u8; 32], [u8; 32])> {
     let epoch = db.get_cf(metadata, LOCAL_INVALIDATION_EPOCH_KEY)?;
     let token_key = db.get_cf(metadata, LOCAL_INVALIDATION_TOKEN_KEY)?;
-    let offset = db.get_cf(metadata, LOCAL_INVALIDATION_OFFSET_KEY)?;
-    let settled = db.get_cf(metadata, LOCAL_INVALIDATION_SETTLED_KEY)?;
-    let floor = db.get_cf(metadata, LOCAL_INVALIDATION_FLOOR_KEY)?;
-    let count = db.get_cf(metadata, LOCAL_INVALIDATION_COUNT_KEY)?;
-    let bytes = db.get_cf(metadata, LOCAL_INVALIDATION_BYTES_KEY)?;
-    let all_absent = epoch.is_none()
-        && token_key.is_none()
-        && offset.is_none()
-        && settled.is_none()
-        && floor.is_none()
-        && count.is_none()
-        && bytes.is_none();
-    let all_present = epoch.is_some()
-        && token_key.is_some()
-        && offset.is_some()
-        && settled.is_some()
-        && floor.is_some()
-        && count.is_some()
-        && bytes.is_some();
+    let status = db.get_cf(metadata, LOCAL_INVALIDATION_STATUS_KEY)?;
+    let all_absent = epoch.is_none() && token_key.is_none() && status.is_none();
+    let all_present = epoch.is_some() && token_key.is_some() && status.is_some();
     if !all_absent && !all_present {
         anyhow::bail!("local watch metadata is only partially initialized");
     }
@@ -1562,15 +1566,21 @@ fn initialize_local_watch_metadata(
         let mut batch = WriteBatch::default();
         batch.put_cf(metadata, LOCAL_INVALIDATION_EPOCH_KEY, source_epoch);
         batch.put_cf(metadata, LOCAL_INVALIDATION_TOKEN_KEY, integrity_key);
-        for key in [
-            LOCAL_INVALIDATION_OFFSET_KEY,
-            LOCAL_INVALIDATION_SETTLED_KEY,
-            LOCAL_INVALIDATION_FLOOR_KEY,
-            LOCAL_INVALIDATION_COUNT_KEY,
-            LOCAL_INVALIDATION_BYTES_KEY,
-        ] {
-            batch.put_cf(metadata, key, 0_u64.to_be_bytes());
-        }
+        batch.put_cf(
+            metadata,
+            LOCAL_INVALIDATION_STATUS_KEY,
+            encode_watch_journal_status(WatchJournalStatus {
+                source_id: SourceId {
+                    node_id,
+                    source_epoch,
+                },
+                tail: 0,
+                settled_through: 0,
+                retention_floor: 0,
+                retained_entries: 0,
+                retained_bytes: 0,
+            }),
+        );
         let mut options = WriteOptions::default();
         options.set_sync(sync_writes);
         db.write_opt(batch, &options)?;
@@ -1582,26 +1592,22 @@ fn initialize_local_watch_metadata(
         .as_slice()
         .try_into()
         .map_err(|_| anyhow::anyhow!("local watch source epoch is malformed"))?;
+    if source_epoch == [0; 32] {
+        anyhow::bail!("local watch source epoch is all zero");
+    }
     let integrity_key = token_key
         .expect("checked present")
         .as_slice()
         .try_into()
         .map_err(|_| anyhow::anyhow!("local watch token key is malformed"))?;
-    let decode_counter = |encoded: Vec<u8>, name: &str| -> Result<u64> {
-        let bytes: [u8; size_of::<u64>()] = encoded
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("local watch {name} is malformed"))?;
-        Ok(u64::from_be_bytes(bytes))
-    };
-    let tail = decode_counter(offset.expect("checked present"), "tail")?;
-    let floor = decode_counter(floor.expect("checked present"), "retention floor")?;
-    let settled = decode_counter(settled.expect("checked present"), "settled cursor")?;
-    if floor > settled || settled > tail {
-        anyhow::bail!(
-            "local watch settled cursor {settled} is outside retention floor {floor} through tail {tail}"
-        );
-    }
+    decode_watch_journal_status(
+        SourceId {
+            node_id,
+            source_epoch,
+        },
+        &status.expect("checked present"),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok((source_epoch, integrity_key))
 }
 
@@ -1610,10 +1616,9 @@ fn initialize_mutation_receipt_metadata(
     metadata: &rocksdb::ColumnFamily,
     sync_writes: bool,
 ) -> Result<()> {
-    let count = db.get_cf(metadata, MUTATION_RECEIPT_COUNT_KEY)?;
-    let bytes = db.get_cf(metadata, MUTATION_RECEIPT_BYTES_KEY)?;
-    match (count, bytes) {
-        (None, None) => {
+    let status = db.get_cf(metadata, MUTATION_RECEIPT_STATUS_KEY)?;
+    match status {
+        None => {
             let receipts = db
                 .cf_handle(CF_RECEIPTS)
                 .context("missing receipts column family")?;
@@ -1625,17 +1630,22 @@ fn initialize_mutation_receipt_metadata(
                 anyhow::bail!("mutation receipts exist without retention metadata");
             }
             let mut batch = WriteBatch::default();
-            batch.put_cf(metadata, MUTATION_RECEIPT_COUNT_KEY, 0_u64.to_be_bytes());
-            batch.put_cf(metadata, MUTATION_RECEIPT_BYTES_KEY, 0_u64.to_be_bytes());
+            batch.put_cf(
+                metadata,
+                MUTATION_RECEIPT_STATUS_KEY,
+                encode_mutation_receipt_status(MutationReceiptStatus {
+                    entries: 0,
+                    bytes: 0,
+                }),
+            );
             let mut options = WriteOptions::default();
             options.set_sync(sync_writes);
             db.write_opt(batch, &options)?;
         }
-        (Some(count), Some(bytes)) => {
-            decode_offset(&count).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            decode_offset(&bytes).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Some(status) => {
+            decode_mutation_receipt_status(&status)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
-        _ => anyhow::bail!("mutation receipt retention metadata is only partially initialized"),
     }
     Ok(())
 }
@@ -1691,20 +1701,6 @@ pub(crate) fn decode_object_versioning(encoded: &[u8]) -> Result<ObjectVersionin
             "bucket object-versioning option is malformed".into(),
         )),
     }
-}
-
-fn decode_offset(encoded: &[u8]) -> Result<u64, MutationError> {
-    let bytes: [u8; size_of::<u64>()] = encoded.try_into().map_err(|_| {
-        MutationError::Storage("durable local invalidation offset is malformed".into())
-    })?;
-    Ok(u64::from_be_bytes(bytes))
-}
-
-fn decode_watch_u64(encoded: &[u8]) -> Result<u64, WatchError> {
-    let bytes: [u8; size_of::<u64>()] = encoded
-        .try_into()
-        .map_err(|_| WatchError::Storage("local watch counter is malformed".into()))?;
-    Ok(u64::from_be_bytes(bytes))
 }
 
 pub(crate) fn version_prefix(identity: BucketIdentity, key: &ObjectKey) -> Vec<u8> {

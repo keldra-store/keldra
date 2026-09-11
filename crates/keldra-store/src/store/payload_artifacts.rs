@@ -353,16 +353,10 @@ impl Store {
                 "inline payload artifact exceeds the chunk threshold",
             ));
         }
-        let identity = complete_identity(reference);
         batch.put_cf(
             self.cf(CF_PAYLOAD_ARTIFACTS)?,
             tagged_identity(COMPLETE_INLINE_TAG, &manifest.storage_id),
             bytes,
-        );
-        batch.put_cf(
-            self.cf(CF_PAYLOAD_MANIFESTS)?,
-            manifest_key(&identity),
-            manifest.encode(),
         );
         tracing::debug!(
             payload.kind = "complete",
@@ -379,6 +373,20 @@ impl Store {
         &self,
         reference: &BlobRef,
     ) -> Result<Option<ArtifactManifest>, MutationError> {
+        let derived = ArtifactManifest::complete(reference)?;
+        if derived.layout == ArtifactLayout::Inline {
+            if self
+                .db
+                .get_pinned_cf(
+                    self.cf(CF_PAYLOAD_ARTIFACTS)?,
+                    tagged_identity(COMPLETE_INLINE_TAG, &derived.storage_id),
+                )
+                .map_err(storage_error)?
+                .is_some()
+            {
+                return Ok(Some(derived));
+            }
+        }
         let identity = complete_identity(reference);
         let Some(encoded) = self
             .db
@@ -972,12 +980,15 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn complete_manifest_pinned_read_rejects_malformed_value() {
+    async fn chunked_complete_manifest_pinned_read_rejects_malformed_value() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
             .unwrap();
-        let reference = store.stage_blob(b"manifest-pinned-read").await.unwrap();
+        let reference = BlobRef {
+            hash: [0x71; 32],
+            length: PAYLOAD_ARTIFACT_CHUNK_BYTES as u64 + 1,
+        };
         let identity = complete_identity(&reference);
         store
             .db
@@ -990,6 +1001,35 @@ mod tests {
 
         let error = store.read_complete_manifest(&reference).unwrap_err();
         assert!(error.to_string().contains("manifest is malformed"));
+    }
+
+    #[tokio::test]
+    async fn inline_complete_manifest_is_derived_from_bytes_after_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let options = StoreOptions::new(temporary.path(), 1);
+        let bytes = b"derive-inline-manifest";
+        let store = Store::open(options.clone()).await.unwrap();
+        let reference = store.stage_blob(bytes).await.unwrap();
+        let identity = complete_identity(&reference);
+        assert!(
+            store
+                .db
+                .get_cf(
+                    store.cf(CF_PAYLOAD_MANIFESTS).unwrap(),
+                    manifest_key(&identity),
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+
+        let reopened = Store::open(options).await.unwrap();
+        let manifest = reopened
+            .read_complete_manifest(&reference)
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.layout, ArtifactLayout::Inline);
+        assert_eq!(reopened.read_blob_bytes(&reference).await.unwrap(), bytes);
     }
 
     #[tokio::test]
@@ -1170,7 +1210,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let bytes = vec![0x5c; 96 * 1024];
+        let bytes = vec![0x5c; PAYLOAD_ARTIFACT_CHUNK_BYTES + 17];
         let reference = store.stage_blob(&bytes).await.unwrap();
         let state = store.blob_reference_state(&reference).unwrap().unwrap();
         let identity = complete_identity(&reference);

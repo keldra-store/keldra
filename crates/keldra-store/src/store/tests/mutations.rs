@@ -454,6 +454,32 @@ async fn expired_receipts_are_pruned_and_the_command_id_can_be_new_again() {
 }
 
 #[tokio::test]
+async fn reopen_rejects_malformed_atomic_receipt_status() {
+    let temporary = tempfile::tempdir().unwrap();
+    let options = StoreOptions::new(temporary.path(), 1);
+    let store = Store::open(options.clone()).await.unwrap();
+    store
+        .db
+        .put_cf(
+            store.cf(CF_METADATA).unwrap(),
+            MUTATION_RECEIPT_STATUS_KEY,
+            [0_u8; MUTATION_RECEIPT_STATUS_BYTES - 1],
+        )
+        .unwrap();
+    drop(store);
+
+    let error = Store::open(options)
+        .await
+        .err()
+        .expect("malformed receipt status must fail open");
+    assert!(
+        error
+            .to_string()
+            .contains("mutation receipt retention metadata is malformed")
+    );
+}
+
+#[tokio::test]
 async fn capacity_maintenance_prunes_expired_receipts_in_bounded_passes() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(
@@ -854,13 +880,13 @@ async fn bulk_wal_contains_one_high_watermark_and_replay_adds_no_write() {
     updates[0].1.iterate_cf(&mut counter);
     // Three small raw values, blob lifecycle records, versions, heads, receipts,
     // receipt-expiry indexes, invalidations and bucket journal routes, plus one
-    // version watermark, five watch counters, the locally-applied reference
-    // cursor and two receipt counters. All metadata moves in this one physical
-    // batch rather than once per mutation.
-    assert_eq!(counter.puts, 36);
+    // version watermark, one atomic watch status, the locally-applied reference
+    // cursor and one atomic receipt status. Inline manifests are derived from
+    // the immutable raw value. All metadata moves in this one physical batch.
+    assert_eq!(counter.puts, 28);
     assert_eq!(counter.high_watermark_puts, 1);
-    assert_eq!(counter.invalidation_metadata_puts, 5);
-    assert_eq!(counter.receipt_metadata_puts, 2);
+    assert_eq!(counter.invalidation_metadata_puts, 1);
+    assert_eq!(counter.receipt_metadata_puts, 1);
     assert_eq!(counter.deletes, 0);
     assert_eq!(counter.merges, 0);
 

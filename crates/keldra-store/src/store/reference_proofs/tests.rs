@@ -275,7 +275,10 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
                 && puts.contains(&journal_key.to_vec())
         })
         .expect("source metadata and proof share one batch");
-    assert!(!mutation_batch.contains(&LOCAL_INVALIDATION_SETTLED_KEY.to_vec()));
+    assert!(mutation_batch.contains(&LOCAL_INVALIDATION_STATUS_KEY.to_vec()));
+    let source_status = source.local_watch_status().unwrap();
+    assert_eq!(source_status.tail, mutation.stamp.source_journal_position);
+    assert_eq!(source_status.settled_through, 0);
 
     let replica_sequence = replica.db.latest_sequence_number();
     assert_eq!(
