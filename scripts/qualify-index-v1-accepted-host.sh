@@ -29,7 +29,7 @@ for command in cmp findmnt jq lsblk sha256sum tar; do command -v "$command" >/de
 for required in SOURCE_COMMIT HARNESS_COMMIT CATALOG_HARNESS_COMMIT SHA256SUMS; do
   [[ -s "${kit_root}/${required}" ]] || { echo "candidate kit is missing ${required}" >&2; exit 2; }
 done
-for runner in qualify-index-v1-ssd-scale.sh qualify-index-catalog.sh qualification-disk-ledger.sh; do
+for runner in qualify-index-v1-ssd-scale.sh summarize-index-v1-instrumentation.py qualify-index-catalog.sh qualification-disk-ledger.sh; do
   cmp "${repo_root}/scripts/${runner}" "${kit_root}/${runner}" || {
     echo "candidate kit runner ${runner} differs from candidate source" >&2
     exit 2
@@ -72,7 +72,7 @@ case "$gate" in
     results="$(sed -n 's/^results=//p' "$runner_log" | tail -n1)"
     archive="$(sed -n 's/^archive=//p' "$runner_log" | tail -n1)"
     [[ -s "$archive" ]] || { echo "sustained qualification archive is missing" >&2; exit 1; }
-    jq -e '.schema == "keldra.index-v1-ssd-scale.v1" and .mode == "sustained" and .server_source_commit == $commit and .shard_index == $shard_index and .shard_count == $shard_count and .selected_configurations == 1 and .total_configurations == $shard_count and .fatal_cells == 0' \
+    jq -e '.schema == "keldra.index-v1-ssd-scale.v2" and .mode == "sustained" and .server_source_commit == $commit and .shard_index == $shard_index and .shard_count == $shard_count and .selected_configurations == 1 and .total_configurations == $shard_count and .fatal_cells == 0' \
       --arg commit "$commit" --argjson shard_index "$shard_index" --argjson shard_count "$shard_count" \
       "${results}/report.json" >/dev/null
     archive_name="index-v1-sustained-shard-${shard_index}-of-${shard_count}.results.tar.gz"

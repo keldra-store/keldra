@@ -47,8 +47,8 @@ KELDRA_INDEX_CONTENTION_TOPOLOGY=single \
 For the v1 SSD matrix, use `scripts/qualify-index-v1-ssd-scale.sh` on the SSD
 host. It is a direct binary-kit runbook, not a Docker wrapper: install the
 attested `keldra-server`, `keldra`, and `index-contention-qualification`
-binaries, this runner, `SOURCE_COMMIT`, `HARNESS_COMMIT`, and
-`SHA256SUMS` in `~/keldra_experiments/kit/` first. The checksum manifest must
+binaries, this runner, its instrumentation summarizer, `SOURCE_COMMIT`,
+`HARNESS_COMMIT`, and `SHA256SUMS` in `~/keldra_experiments/kit/` first. The checksum manifest must
 cover the runner as well as `bin/*`. It verifies the kit before work begins and
 keeps every input, durable database, log, raw report, and result archive below
 `~/keldra_experiments`. Smoke defaults cover D64/P1,P4 with W1,W4 at 256 MiB
@@ -68,6 +68,7 @@ Cartesian product while varying each independent cause:
   CATALOG_HARNESS_COMMIT                # exact 40-hex catalog harness revision
   SHA256SUMS                            # sha256sum --check manifest for this kit
   qualify-index-v1-ssd-scale.sh         # this exact runner
+  summarize-index-v1-instrumentation.py # exact-window telemetry summarizer
   qualify-index-catalog.sh              # exact restart/catalog runner
   qualification-disk-ledger.sh          # bounded owned-disk helper
   bin/keldra-server
@@ -157,17 +158,27 @@ It records
 interval-derived, time-weighted process CPU and sampled peak RSS for the load
 window separately from whole-run samples. Intervals crossing a load-window
 boundary are time-prorated for CPU and kernel write-byte attribution and named
-as estimates rather than exact boundary counters. Final durable-store bytes are
-reported separately. It also records definition creation seconds,
+as estimates rather than exact boundary counters. Block IOPS, bandwidth, busy
+time, queue depth, and write await are reported separately for every physical
+leaf device recursively resolved through sysfs; an unresolved topology fails
+qualification instead of attributing mapper statistics to an SSD. Final
+durable-store bytes are reported separately. It also records definition creation seconds,
 definitions created/s, and recipe-spanning qualified-activation seconds, so
 D250K catalog admission is never folded into the load window. The runner never estimates projected-byte
 rates from input payload size. A development record may explicitly mark
 that value `null`, with its missing telemetry provenance, but it is not
 qualification evidence. A final v1 qualification requires two
-concurrent-phase `keldra_index_v1_summary` samples and derives selected,
-prepared, projected, sealed, and checkpointed source-position/payload-byte
-rates from their cumulative counters. These are diagnostic stage rates, not
-object throughput; missing or malformed counter evidence fails the cell. Raw driver
+`keldra_index_v1_summary` samples bracketing both exact load-window boundaries.
+It linearly interpolates cumulative counters at those boundaries, so successful
+ingest and indexing rates use the identical interval rather than incidental
+summary timestamps. `indexed_physical_rows_per_second` is the rate of durably
+published physical projection rows; prepared, selected, projected, sealed, and
+checkpointed source-position/payload-byte rates remain stage diagnostics rather
+than ingest throughput. The workload does not retain enough per-operation path
+evidence to count distinct successfully acknowledged source documents, so
+`unique_source_documents_per_second` is explicitly `null` with that limitation
+instead of being inferred from operations or journal positions. Missing or
+malformed boundary evidence fails the cell. Raw driver
 progress, process samples, VM samples, server logs, and the complete public
 report remain beside the summary and are packaged as a SHA-256 sidecar archive.
 
