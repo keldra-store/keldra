@@ -100,7 +100,6 @@ pub struct ComponentStreamRoot {
     pub logical_bytes: u64,
     pub directory_bytes: u64,
 }
-
 impl ComponentStreamRoot {
     pub fn from_component_root(root: &ComponentRoot) -> Result<Self, IndexError> {
         root.validate()?;
@@ -135,20 +134,17 @@ impl ComponentStreamRoot {
         )
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentStreamAppend {
     pub root: ComponentStreamRoot,
     pub new_pages: Vec<EncodedComponentStreamPage>,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComponentStreamReverseStep {
     LoadPage { hash: [u8; 32] },
     Segment(ComponentSegmentDescriptor),
     Complete,
 }
-
 #[derive(Debug)]
 pub struct ComponentStreamReverseCursor {
     component: ComponentIdentity,
@@ -156,7 +152,6 @@ pub struct ComponentStreamReverseCursor {
     awaiting_page: Option<Child>,
     leaf_segments: Vec<ComponentSegmentDescriptor>,
 }
-
 impl ComponentStreamReverseCursor {
     pub fn new(root: ComponentStreamRoot) -> Result<Self, IndexError> {
         validate_root(root)?;
@@ -226,7 +221,6 @@ impl ComponentStreamReverseCursor {
         Ok(())
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Page {
     Leaf(Vec<ComponentSegmentDescriptor>),
