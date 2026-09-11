@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,9 +13,48 @@ SPEC = importlib.util.spec_from_file_location("index_v1_instrumentation", SCRIPT
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
+SAMPLER_SCRIPT = Path(__file__).parents[1] / "sample-index-v1-resources.py"
+SAMPLER_SPEC = importlib.util.spec_from_file_location("index_v1_resource_sampler", SAMPLER_SCRIPT)
+SAMPLER = importlib.util.module_from_spec(SAMPLER_SPEC)
+assert SAMPLER_SPEC.loader is not None
+SAMPLER_SPEC.loader.exec_module(SAMPLER)
 
 
 class InstrumentationTests(unittest.TestCase):
+    def test_process_sampler_captures_pid_identity_and_cumulative_fields(self):
+        sample = SAMPLER.process_snapshot(os.getpid())
+        self.assertGreater(sample["process_starttime_ticks"], 0)
+        self.assertIn("minor_faults_total", sample)
+        self.assertIn("voluntary_context_switches_total", sample)
+        self.assertIn("read_syscalls_total", sample)
+        changed = dict(sample, process_starttime_ticks=sample["process_starttime_ticks"] + 1)
+        with self.assertRaisesRegex(RuntimeError, "reused"):
+            SAMPLER.require_same_process(sample, changed, os.getpid())
+
+    def test_process_and_host_coverage_require_both_window_brackets(self):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as process:
+            process.write("interval_end_epoch_milliseconds\n900\n2100\n")
+            process.flush()
+            complete = MODULE.coverage(1000, 2000, "process-tsv", process.name)
+            self.assertTrue(complete["complete"])
+            missing = MODULE.coverage(800, 2000, "process-tsv", process.name)
+            self.assertFalse(missing["complete"])
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as host:
+            host.write('{"timestamp_unix_milliseconds":900}\n')
+            host.write('{"timestamp_unix_milliseconds":2100}\n')
+            host.flush()
+            self.assertTrue(MODULE.coverage(1000, 2000, "host-jsonl", host.name)["complete"])
+
+    def test_rocksdb_diagnostics_report_coverage_and_window_maxima(self):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as output:
+            output.write("1970-01-01T00:00:00.900Z DEBUG gauge.keldra_rocksdb_write_stalled=0\n")
+            output.write("1970-01-01T00:00:01.500Z DEBUG gauge.keldra_rocksdb_write_stalled=1\n")
+            output.write("1970-01-01T00:00:02.100Z DEBUG gauge.keldra_rocksdb_write_stalled=0\n")
+            output.flush()
+            result = MODULE.rocksdb_metrics(1000, 2000, output.name)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["measurement_window_maxima"]["keldra_rocksdb_write_stalled"], 1)
+
     def test_pipeline_rates_interpolate_exact_window_boundaries(self):
         samples = []
         for timestamp, multiplier in ((900, 0), (1100, 20), (1900, 100), (2100, 120)):

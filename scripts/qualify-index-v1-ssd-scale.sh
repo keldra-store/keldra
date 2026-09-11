@@ -18,7 +18,7 @@ mode="${KELDRA_V1_SCALE_MODE:-smoke}"
 keep_work="${KELDRA_V1_SCALE_KEEP_WORK:-0}"
 disk_budget_bytes="${KELDRA_V1_SCALE_DISK_BUDGET_BYTES:-214748364800}"
 base_port="${KELDRA_V1_SCALE_PORT:-51051}"
-server_rust_log="${KELDRA_V1_SCALE_RUST_LOG:-warn,keldra::index_runtime::v1_summary=info,keldra::single_node_group_commit_config=info,keldra_store::single_node_group_commit_phases=info}"
+server_rust_log="${KELDRA_V1_SCALE_RUST_LOG:-warn,keldra::index_runtime::v1_summary=info,keldra::observability::runtime=debug,keldra::single_node_group_commit_config=info,keldra_store::single_node_group_commit_phases=info}"
 query_rate="${KELDRA_V1_SCALE_QUERY_RATE:-20}"
 query_max_in_flight="${KELDRA_V1_SCALE_QUERY_MAX_IN_FLIGHT:-32}"
 query_memory_bytes="${KELDRA_V1_SCALE_QUERY_MEMORY_BYTES:-536870912}"
@@ -120,8 +120,16 @@ done
   echo "SHA256SUMS does not attest summarize-index-v1-instrumentation.py" >&2
   exit 2
 }
+(cd "${kit_root}" && awk '$2 == "sample-index-v1-resources.py" { found = 1 } END { exit !found }' SHA256SUMS) || {
+  echo "SHA256SUMS does not attest sample-index-v1-resources.py" >&2
+  exit 2
+}
 [[ -x "${kit_root}/summarize-index-v1-instrumentation.py" ]] || {
   echo "missing executable ${kit_root}/summarize-index-v1-instrumentation.py" >&2
+  exit 2
+}
+[[ -x "${kit_root}/sample-index-v1-resources.py" ]] || {
+  echo "missing executable ${kit_root}/sample-index-v1-resources.py" >&2
   exit 2
 }
 (cd "${kit_root}" && sha256sum --check SHA256SUMS)
@@ -296,8 +304,8 @@ block_device_sampler_pid=""
   echo "evidence_physical_leaf_block_devices=${physical_leaf_csv}"
 } >"${run_dir}/host-info.txt"
 
-server_pid=""; sampler_pid=""; vmstat_pid=""; profiler_pid=""; profiler_data=""
-driver_pid=""; active_work=""; active_cell=""
+server_pid=""; sampler_pid=""; vmstat_pid=""; host_sampler_pid=""; profiler_pid=""; profiler_data=""
+driver_pid=""; driver_sampler_pid=""; active_work=""; active_cell=""
 sample_block_device() {
   local devices="$1" output="$2" stop_file="$3"
   # Preserve the Linux diskstats ABI fields verbatim after the sample clock.
@@ -359,19 +367,25 @@ stop_driver() {
   fi
   wait "${driver_pid}" 2>/dev/null || true
   driver_pid=""
+  if [[ -n "${driver_sampler_pid}" ]]; then
+    kill -TERM "${driver_sampler_pid}" 2>/dev/null || true
+    wait "${driver_sampler_pid}" 2>/dev/null || true
+    driver_sampler_pid=""
+  fi
 }
 stop_server() {
   stop_profiler || true
   stop_driver || true
   if [[ -n "${sampler_pid}" ]]; then kill -TERM "${sampler_pid}" 2>/dev/null || true; wait "${sampler_pid}" 2>/dev/null || true; fi
   if [[ -n "${vmstat_pid}" ]]; then kill -TERM "${vmstat_pid}" 2>/dev/null || true; wait "${vmstat_pid}" 2>/dev/null || true; fi
+  if [[ -n "${host_sampler_pid}" ]]; then kill -TERM "${host_sampler_pid}" 2>/dev/null || true; wait "${host_sampler_pid}" 2>/dev/null || true; fi
   if [[ -n "${server_pid}" ]]; then
     kill -TERM "${server_pid}" 2>/dev/null || true
     for _ in $(seq 1 30); do kill -0 "${server_pid}" 2>/dev/null || break; sleep 1; done
     kill -KILL "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
   fi
-  server_pid=""; sampler_pid=""; vmstat_pid=""; profiler_pid=""; profiler_data=""; driver_pid=""
+  server_pid=""; sampler_pid=""; vmstat_pid=""; host_sampler_pid=""; profiler_pid=""; profiler_data=""; driver_pid=""; driver_sampler_pid=""
 }
 cleanup() {
   local status=$?
@@ -394,40 +408,6 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-sample_process() {
-  local pid="$1" output="$2"
-  local clock_ticks previous_cpu_ticks previous_time_ns previous_write_bytes
-  clock_ticks="$(getconf CLK_TCK)"
-  previous_cpu_ticks="$(awk '{print $14 + $15}' "/proc/${pid}/stat")"
-  previous_time_ns="$(date +%s%N)"
-  previous_write_bytes="$(awk '/^write_bytes:/ {print $2}' "/proc/${pid}/io" 2>/dev/null || printf 0)"
-  printf 'timestamp_utc\tinterval_end_epoch_milliseconds\tinterval_cpu_percent\trss_kib\tthreads\tread_bytes\twrite_bytes\tcancelled_write_bytes\tmem_available_kib\tinterval_seconds\tinterval_kernel_write_bytes\n' >"${output}"
-  while kill -0 "${pid}" 2>/dev/null; do
-    local now epoch_ms current_cpu_ticks current_time_ns interval_ns interval_seconds cpu rss threads read_bytes write_bytes interval_write_bytes cancelled available
-    sleep 1
-    kill -0 "${pid}" 2>/dev/null || break
-    now="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"; epoch_ms="$(date +%s%3N)"
-    current_cpu_ticks="$(awk '{print $14 + $15}' "/proc/${pid}/stat")"
-    current_time_ns="$(date +%s%N)"
-    interval_ns="$((current_time_ns - previous_time_ns))"
-    interval_seconds="$(awk -v nanoseconds="${interval_ns}" 'BEGIN {print nanoseconds / 1000000000}')"
-    cpu="$(awk -v ticks="$((current_cpu_ticks - previous_cpu_ticks))" -v nanoseconds="${interval_ns}" -v hz="${clock_ticks}" 'BEGIN {if (nanoseconds > 0 && hz > 0) print ticks * 100000000000 / (nanoseconds * hz); else print 0}')"
-    previous_cpu_ticks="${current_cpu_ticks}"
-    previous_time_ns="${current_time_ns}"
-    read -r rss threads < <(ps -p "${pid}" -o rss=,nlwp= 2>/dev/null || printf '0 0')
-    read_bytes="$(awk '/^read_bytes:/ {print $2}' "/proc/${pid}/io" 2>/dev/null || printf 0)"
-    write_bytes="$(awk '/^write_bytes:/ {print $2}' "/proc/${pid}/io" 2>/dev/null || printf 0)"
-    interval_write_bytes="$((write_bytes >= previous_write_bytes ? write_bytes - previous_write_bytes : 0))"
-    previous_write_bytes="${write_bytes}"
-    cancelled="$(awk '/^cancelled_write_bytes:/ {print $2}' "/proc/${pid}/io" 2>/dev/null || printf 0)"
-    available="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${now}" "${epoch_ms}" "${cpu}" "${rss}" "${threads}" "${read_bytes}" \
-      "${write_bytes}" "${cancelled}" "${available}" "${interval_seconds}" \
-      "${interval_write_bytes}" >>"${output}"
-  done
-}
-
 start_server() {
   local port="$1" cell_work="$2" cell_root="$3" credential_file="$4" pipeline_memory_bytes="$5" workers="$6"
   env "${group_server_env[@]}" TMPDIR="${cell_work}/tmp" RUST_LOG="${server_rust_log}" \
@@ -448,8 +428,9 @@ start_server() {
   KELDRA_INDEXING_CORES="${workers}" KELDRA_SOURCE_JOURNAL_MAX_ENTRIES="${source_journal_entries}" \
     "${kit_root}/bin/keldra-server" >"${cell_root}/server.log" 2>&1 &
   server_pid=$!
-  sample_process "${server_pid}" "${cell_root}/server-resources.tsv" & sampler_pid=$!
+  "${kit_root}/sample-index-v1-resources.py" process --pid "${server_pid}" --output "${cell_root}/server-resources.tsv" & sampler_pid=$!
   vmstat -w 1 >"${cell_root}/host-vmstat.log" & vmstat_pid=$!
+  "${kit_root}/sample-index-v1-resources.py" host --output "${cell_root}/host-proc-samples.jsonl" & host_sampler_pid=$!
   for _ in $(seq 1 180); do
     kill -0 "${server_pid}" 2>/dev/null || break
     ss -ltn "sport = :${port}" | awk 'NR > 1 { found = 1 } END { exit !found }' && return 0
@@ -681,10 +662,15 @@ remove_cell_work() {
 summarize_cell() {
   local cell="$1" report="$2" progress="$3" resource_samples="$4" telemetry_samples="$5" definitions="$6" recipes="$7" workers="$8" memory_per_worker="$9" target_data_rate="${10}" object_bytes="${11}" driver_status="${12}" store_bytes="${13}"
   local resources block_device_resources pipeline_diagnostics quality window_start_ms window_end_ms
+  local server_coverage driver_coverage host_coverage rocksdb_diagnostics
   local cell_dir leaf_metric leaf_error pipeline_error
   cell_dir="$(dirname -- "${report}")"
   window_start_ms="$(jq -r '.mutations.measurement_window_started_unix_milliseconds' "${report}")"
   window_end_ms="$(jq -r '.mutations.measurement_window_ended_unix_milliseconds' "${report}")"
+  server_coverage="$("${script_root}/summarize-index-v1-instrumentation.py" coverage --kind process-tsv --start-ms "${window_start_ms}" --end-ms "${window_end_ms}" --samples "${resource_samples}" 2>/dev/null || printf '{"measurement":"invalid-process-coverage","complete":false}')"
+  driver_coverage="$("${script_root}/summarize-index-v1-instrumentation.py" coverage --kind process-tsv --start-ms "${window_start_ms}" --end-ms "${window_end_ms}" --samples "${cell_dir}/driver-resources.tsv" 2>/dev/null || printf '{"measurement":"invalid-process-coverage","complete":false}')"
+  host_coverage="$("${script_root}/summarize-index-v1-instrumentation.py" coverage --kind host-jsonl --start-ms "${window_start_ms}" --end-ms "${window_end_ms}" --samples "${cell_dir}/host-proc-samples.jsonl" 2>/dev/null || printf '{"measurement":"invalid-host-coverage","complete":false}')"
+  rocksdb_diagnostics="$("${script_root}/summarize-index-v1-instrumentation.py" rocksdb --start-ms "${window_start_ms}" --end-ms "${window_end_ms}" --samples "${cell_dir}/rocksdb-runtime.log" 2>/dev/null || printf '{"measurement":"invalid-rocksdb-runtime-coverage","complete":false}')"
   resources="$(awk -F '\t' -v start_ms="${window_start_ms}" -v end_ms="${window_end_ms}" '
     NR == 1 { next }
     {
@@ -705,7 +691,7 @@ summarize_cell() {
       }
     }
     END { printf "{\"measurement_window_overlapping_intervals\":%d,\"measurement_window_observed_interval_seconds\":%s,\"measurement_window_prorated_time_weighted_process_cpu_percent\":%s,\"measurement_window_sampled_peak_process_rss_bytes\":%s,\"measurement_window_prorated_kernel_write_bytes\":%s,\"whole_run_observed_intervals\":%d,\"whole_run_observed_interval_seconds\":%s,\"whole_run_time_weighted_process_cpu_percent\":%s,\"whole_run_sampled_peak_process_rss_bytes\":%s,\"whole_run_observed_kernel_write_bytes\":%s}", window_samples, window_elapsed, (window_elapsed > 0 ? window_cpu_time / window_elapsed : 0), window_rss * 1024, window_write_bytes, samples, elapsed, (elapsed > 0 ? cpu_time / elapsed : 0), rss * 1024, write_bytes }
-  ' "${resource_samples}")"
+  ' "${resource_samples}" 2>/dev/null || printf '{"measurement":"invalid-process-resource-summary"}')"
   # Diskstats are cumulative. Report every recursively resolved physical leaf;
   # Linux sectors are fixed 512-byte units regardless of physical sector size.
   local leaf_metrics=() device
@@ -731,19 +717,21 @@ summarize_cell() {
     pipeline_diagnostics="$(jq -cn --arg error "${pipeline_error}" \
       '{measurement:"invalid-v1-summary-boundary-evidence",error:$error}')"
   fi
-  quality="$(jq -cn --argjson status "${driver_status}" --argjson expected_leaves "${#physical_leaf_devices[@]}" --argjson pipeline "${pipeline_diagnostics}" --argjson block_device "${block_device_resources}" --slurpfile report "${report}" '
+  quality="$(jq -cn --argjson status "${driver_status}" --argjson expected_leaves "${#physical_leaf_devices[@]}" --argjson pipeline "${pipeline_diagnostics}" --argjson block_device "${block_device_resources}" --argjson server_coverage "${server_coverage}" --argjson driver_coverage "${driver_coverage}" --argjson host_coverage "${host_coverage}" --argjson rocksdb "${rocksdb_diagnostics}" --slurpfile report "${report}" '
     ($report[0] // {}) as $r
     | ($pipeline.measurement == "v1-summary-exact-window-linear-interpolation") as $telemetry_complete
     | ($block_device.measurement == "per-physical-leaf-proc-diskstats" and ($block_device.leaves | length) == $expected_leaves and all($block_device.leaves[]; .measurement == "prorated-adjacent-proc-diskstats")) as $block_device_telemetry_complete
-    | {driver_exit:$status,result:($r.result // "missing-report"),correctness:($r.correctness.passed // false),workload:($r.workload_validity.passed // false),responsiveness:($r.responsiveness.passed // false),telemetry_complete:$telemetry_complete,block_device_telemetry_complete:$block_device_telemetry_complete,classification:(if $status == 0 and ($r.result // "") == "pass" and $telemetry_complete and $block_device_telemetry_complete then "sustained" else "qualification-failure" end)}
+    | ($server_coverage.complete and $driver_coverage.complete and $host_coverage.complete) as $resource_telemetry_complete
+    | ($rocksdb.complete == true) as $rocksdb_telemetry_complete
+    | {driver_exit:$status,result:($r.result // "missing-report"),correctness:($r.correctness.passed // false),workload:($r.workload_validity.passed // false),responsiveness:($r.responsiveness.passed // false),telemetry_complete:$telemetry_complete,block_device_telemetry_complete:$block_device_telemetry_complete,resource_telemetry_complete:$resource_telemetry_complete,rocksdb_telemetry_complete:$rocksdb_telemetry_complete,resource_coverage:{server:$server_coverage,driver:$driver_coverage,host:$host_coverage},rocksdb_runtime:$rocksdb,classification:(if $status == 0 and ($r.result // "") == "pass" and $telemetry_complete and $block_device_telemetry_complete and $resource_telemetry_complete and $rocksdb_telemetry_complete then "sustained" else "qualification-failure" end)}
   ' 2>/dev/null || printf '{"classification":"failure","result":"unparseable-report"}')"
   jq -cn --arg cell "${cell}" --arg report_path "${report}" --arg progress_path "${progress}" --arg telemetry_path "${telemetry_samples}" \
     --argjson definitions "${definitions}" --argjson recipes "${recipes}" --argjson workers "${workers}" \
     --argjson memory_per_worker "${memory_per_worker}" --argjson query_memory_bytes "${query_memory_bytes}" --argjson mutation_workers "${mutation_workers}" --argjson object_bytes "${object_bytes}" \
-    --argjson store_bytes "${store_bytes}" --argjson resources "${resources}" --argjson block_device_resources "${block_device_resources}" --argjson pipeline_diagnostics "${pipeline_diagnostics}" \
+    --argjson store_bytes "${store_bytes}" --argjson resources "${resources}" --argjson block_device_resources "${block_device_resources}" --argjson pipeline_diagnostics "${pipeline_diagnostics}" --argjson server_coverage "${server_coverage}" --argjson driver_coverage "${driver_coverage}" --argjson host_coverage "${host_coverage}" --argjson rocksdb_diagnostics "${rocksdb_diagnostics}" \
     --argjson quality "${quality}" --slurpfile report "${report}" '
       ($report[0] // {}) as $r | ($workers * $memory_per_worker) as $pipeline_memory_bytes | ($r.mutations // {}) as $m
-      | {cell:$cell,logical_definitions:$definitions,qualified_definitions:($r.qualified_definition_count // 0),physical_recipes:$recipes,definition_creation_seconds:($r.definition_creation_seconds // null),definition_creation_per_second:(if ($r.definition_creation_seconds // 0) > 0 then ($definitions / $r.definition_creation_seconds) else null end),qualified_definition_activation_seconds:($r.qualified_definition_activation_seconds // null),indexing_cores:$workers,memory_per_core_bytes:$memory_per_worker,pipeline_memory_bytes:$pipeline_memory_bytes,query_memory_bytes:$query_memory_bytes,mutation_workers:$mutation_workers,mutation_record_minimum_bytes:$object_bytes,target_data_operations_per_second:$m.target_data_operations_per_second,measurement_window_started_unix_milliseconds:$m.measurement_window_started_unix_milliseconds,measurement_window_ended_unix_milliseconds:$m.measurement_window_ended_unix_milliseconds,comparative_rate_window:{start_unix_milliseconds:$m.measurement_window_started_unix_milliseconds,end_unix_milliseconds:$m.measurement_window_ended_unix_milliseconds,seconds:$m.load_window_seconds},load_window_seconds:$m.load_window_seconds,total_until_all_terminal_seconds:$m.total_until_all_terminal_seconds,response_drain_seconds:$m.response_drain_seconds,scheduled_batches:$m.scheduled_batches,undispatched_at_measurement_deadline_batches:$m.undispatched_at_measurement_deadline_batches,undispatched_at_measurement_deadline_data_operations:$m.undispatched_at_measurement_deadline_data_operations,client_queue_enqueued_batches:$m.client_queue_enqueued_batches,client_queue_dropped_batches:$m.client_queue_dropped_batches,scheduled_data_operations:$m.scheduled_data_operations,client_queue_enqueued_data_operations:$m.client_queue_enqueued_data_operations,fully_successful_batches:$m.fully_successful_batches,structurally_valid_batches_with_operation_failures:$m.structurally_valid_batches_with_operation_failures,indeterminate_batches:$m.indeterminate_batches,successful_data_operations:$m.successful_data_operations,failed_data_operations:$m.failed_data_operations,indeterminate_data_operations:$m.indeterminate_data_operations,successful_data_operations_in_window:$m.successful_data_operations_in_window,successful_data_operations_after_window:$m.successful_data_operations_after_window,successful_probe_operations:$m.successful_probe_operations,failed_probe_operations:$m.failed_probe_operations,indeterminate_probe_operations:$m.indeterminate_probe_operations,successful_data_payload_bytes:$m.successful_data_payload_bytes,successful_data_payload_bytes_in_window:$m.successful_data_payload_bytes_in_window,successful_data_payload_bytes_after_window:$m.successful_data_payload_bytes_after_window,successful_probe_payload_bytes:$m.successful_probe_payload_bytes,scheduled_data_operations_per_second:$m.scheduled_data_operations_per_second,client_queue_enqueued_data_operations_per_second:$m.client_queue_enqueued_data_operations_per_second,successful_data_ingest_throughput_operations_per_second:$m.successful_data_ingest_throughput_operations_per_second,successful_data_ingest_throughput_payload_bytes_per_second:$m.successful_data_ingest_throughput_payload_bytes_per_second,indexed_physical_rows_per_second:$pipeline_diagnostics.indexed_physical_rows_per_second,indexed_physical_rows_definition:$pipeline_diagnostics.indexed_physical_rows_definition,unique_source_documents_per_second:$pipeline_diagnostics.unique_source_documents_per_second,unique_source_documents_limitation:$pipeline_diagnostics.unique_source_documents_limitation,structurally_valid_bulk_write_dispatch_to_response_latency:$m.structurally_valid_bulk_write_dispatch_to_response_latency,failure_classes:$m.failure_classes,failure_occurrences_omitted:$m.failure_occurrences_omitted,client_queue_capacity:$m.queue_capacity,minimum_sampled_client_queue_depth:$m.minimum_sampled_client_queue_depth,client_queue_depth_samples:$m.client_queue_depth_samples,sampled_client_queue_nonempty_ratio:$m.sampled_client_queue_nonempty_ratio,sampled_client_queue_empty_count:$m.sampled_client_queue_empty_count,visibility_probes_planned:$m.visibility_probes_planned,visibility_probes_with_successful_receipts:$m.visibility_probes_with_successful_receipts,visibility_probes_started:$m.visibility_probes_started,visibility_probes_succeeded:$m.visibility_probes_succeeded,visibility_probes_failed:$m.visibility_probes_failed,visibility_probe_failures:$m.visibility_probe_failures,visibility_probe_failures_omitted:$m.visibility_probe_failures_omitted,successful_receipt_to_probe_start_delay:$m.successful_receipt_to_probe_start_delay,probe_start_to_query_visibility_latency:$m.probe_start_to_query_visibility_latency,successful_receipt_to_query_visibility_latency:$m.successful_receipt_to_query_visibility_latency,index_pipeline_diagnostics:$pipeline_diagnostics,post_load:($r.post_load // null),concurrent_query_successful_schedule_to_response_latency:$r.concurrent.successful_schedule_to_response_latency,concurrent_query_successful_dispatch_to_response_latency:$r.concurrent.successful_dispatch_to_response_latency,resources:$resources,block_device_resources:$block_device_resources,durable_store_bytes:$store_bytes,report_path:$report_path,progress_path:$progress_path,telemetry_path:$telemetry_path,block_device_samples_path:$block_device_samples,quality:$quality}
+      | {cell:$cell,logical_definitions:$definitions,qualified_definitions:($r.qualified_definition_count // 0),physical_recipes:$recipes,definition_creation_seconds:($r.definition_creation_seconds // null),definition_creation_per_second:(if ($r.definition_creation_seconds // 0) > 0 then ($definitions / $r.definition_creation_seconds) else null end),qualified_definition_activation_seconds:($r.qualified_definition_activation_seconds // null),indexing_cores:$workers,memory_per_core_bytes:$memory_per_worker,pipeline_memory_bytes:$pipeline_memory_bytes,query_memory_bytes:$query_memory_bytes,mutation_workers:$mutation_workers,mutation_record_minimum_bytes:$object_bytes,target_data_operations_per_second:$m.target_data_operations_per_second,measurement_window_started_unix_milliseconds:$m.measurement_window_started_unix_milliseconds,measurement_window_ended_unix_milliseconds:$m.measurement_window_ended_unix_milliseconds,comparative_rate_window:{start_unix_milliseconds:$m.measurement_window_started_unix_milliseconds,end_unix_milliseconds:$m.measurement_window_ended_unix_milliseconds,seconds:$m.load_window_seconds},load_window_seconds:$m.load_window_seconds,total_until_all_terminal_seconds:$m.total_until_all_terminal_seconds,response_drain_seconds:$m.response_drain_seconds,scheduled_batches:$m.scheduled_batches,undispatched_at_measurement_deadline_batches:$m.undispatched_at_measurement_deadline_batches,undispatched_at_measurement_deadline_data_operations:$m.undispatched_at_measurement_deadline_data_operations,client_queue_enqueued_batches:$m.client_queue_enqueued_batches,client_queue_dropped_batches:$m.client_queue_dropped_batches,scheduled_data_operations:$m.scheduled_data_operations,client_queue_enqueued_data_operations:$m.client_queue_enqueued_data_operations,fully_successful_batches:$m.fully_successful_batches,structurally_valid_batches_with_operation_failures:$m.structurally_valid_batches_with_operation_failures,indeterminate_batches:$m.indeterminate_batches,successful_data_operations:$m.successful_data_operations,failed_data_operations:$m.failed_data_operations,indeterminate_data_operations:$m.indeterminate_data_operations,successful_data_operations_in_window:$m.successful_data_operations_in_window,successful_data_operations_after_window:$m.successful_data_operations_after_window,successful_probe_operations:$m.successful_probe_operations,failed_probe_operations:$m.failed_probe_operations,indeterminate_probe_operations:$m.indeterminate_probe_operations,successful_data_payload_bytes:$m.successful_data_payload_bytes,successful_data_payload_bytes_in_window:$m.successful_data_payload_bytes_in_window,successful_data_payload_bytes_after_window:$m.successful_data_payload_bytes_after_window,successful_probe_payload_bytes:$m.successful_probe_payload_bytes,scheduled_data_operations_per_second:$m.scheduled_data_operations_per_second,client_queue_enqueued_data_operations_per_second:$m.client_queue_enqueued_data_operations_per_second,successful_data_ingest_throughput_operations_per_second:$m.successful_data_ingest_throughput_operations_per_second,successful_data_ingest_throughput_payload_bytes_per_second:$m.successful_data_ingest_throughput_payload_bytes_per_second,indexed_physical_rows_per_second:$pipeline_diagnostics.indexed_physical_rows_per_second,indexed_physical_rows_definition:$pipeline_diagnostics.indexed_physical_rows_definition,unique_source_documents_per_second:$pipeline_diagnostics.unique_source_documents_per_second,unique_source_documents_limitation:$pipeline_diagnostics.unique_source_documents_limitation,structurally_valid_bulk_write_dispatch_to_response_latency:$m.structurally_valid_bulk_write_dispatch_to_response_latency,failure_classes:$m.failure_classes,failure_occurrences_omitted:$m.failure_occurrences_omitted,client_queue_capacity:$m.queue_capacity,minimum_sampled_client_queue_depth:$m.minimum_sampled_client_queue_depth,client_queue_depth_samples:$m.client_queue_depth_samples,sampled_client_queue_nonempty_ratio:$m.sampled_client_queue_nonempty_ratio,sampled_client_queue_empty_count:$m.sampled_client_queue_empty_count,visibility_probes_planned:$m.visibility_probes_planned,visibility_probes_with_successful_receipts:$m.visibility_probes_with_successful_receipts,visibility_probes_started:$m.visibility_probes_started,visibility_probes_succeeded:$m.visibility_probes_succeeded,visibility_probes_failed:$m.visibility_probes_failed,visibility_probe_failures:$m.visibility_probe_failures,visibility_probe_failures_omitted:$m.visibility_probe_failures_omitted,successful_receipt_to_probe_start_delay:$m.successful_receipt_to_probe_start_delay,probe_start_to_query_visibility_latency:$m.probe_start_to_query_visibility_latency,successful_receipt_to_query_visibility_latency:$m.successful_receipt_to_query_visibility_latency,index_pipeline_diagnostics:$pipeline_diagnostics,post_load:($r.post_load // null),concurrent_query_successful_schedule_to_response_latency:$r.concurrent.successful_schedule_to_response_latency,concurrent_query_successful_dispatch_to_response_latency:$r.concurrent.successful_dispatch_to_response_latency,resources:$resources,resource_evidence:{server:$server_coverage,driver:$driver_coverage,host:$host_coverage},rocksdb_runtime:$rocksdb_diagnostics,block_device_resources:$block_device_resources,durable_store_bytes:$store_bytes,report_path:$report_path,progress_path:$progress_path,telemetry_path:$telemetry_path,block_device_samples_path:$block_device_samples,quality:$quality}
     ' >>"${summary_rows}"
   jq -r '.classification' <<<"${quality}"
 }
@@ -908,6 +896,7 @@ for definitions in "${definitions_values[@]}"; do
             env "${driver_env[@]}" "${kit_root}/bin/index-contention-qualification" \
               >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log" &
             driver_pid=$!
+            "${kit_root}/sample-index-v1-resources.py" process --pid "${driver_pid}" --output "${active_cell}/driver-resources.tsv" & driver_sampler_pid=$!
             profile_status=0
             profile_phase concurrent drain "${progress}" "${driver_pid}" "${active_cell}" || profile_status=$?
             if ((profile_status == 0)); then
@@ -924,11 +913,19 @@ for definitions in "${definitions_values[@]}"; do
               wait "${driver_pid}"
               driver_status=$?
               driver_pid=""
+              wait "${driver_sampler_pid}" 2>/dev/null || true
+              driver_sampler_pid=""
             fi
           else
             env "${driver_env[@]}" "${kit_root}/bin/index-contention-qualification" \
-              >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log"
+              >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log" &
+            driver_pid=$!
+            "${kit_root}/sample-index-v1-resources.py" process --pid "${driver_pid}" --output "${active_cell}/driver-resources.tsv" & driver_sampler_pid=$!
+            wait "${driver_pid}"
             driver_status=$?
+            driver_pid=""
+            wait "${driver_sampler_pid}" 2>/dev/null || true
+            driver_sampler_pid=""
           fi
           set -e
           store_bytes="$(du -sb "${active_work}/metadata" "${active_work}/payload" "${active_work}/wal" 2>/dev/null | awk '{total += $1} END {print total + 0}')"
@@ -947,6 +944,8 @@ for definitions in "${definitions_values[@]}"; do
           fi
           telemetry_samples="${active_cell}/v1-summary.jsonl"
           extract_v1_telemetry "${active_cell}/server.log" "${telemetry_samples}"
+          awk '/keldra_rocksdb_|keldra_storage_wal_bytes/' "${active_cell}/server.log" \
+            >"${active_cell}/rocksdb-runtime.log"
           [[ -s "${report}" ]] || printf '{"result":"missing-report"}\n' >"${report}"
           classification="$(summarize_cell "${cell}" "${report}" "${progress}" "${active_cell}/server-resources.tsv" "${telemetry_samples}" "${definitions}" "${recipes}" "${workers}" "${memory_per_worker}" "${target_data_rate}" "${object_bytes}" "${driver_status}" "${store_bytes}")"
           printf '%s\n' "${classification}" >"${active_cell}/status.txt"

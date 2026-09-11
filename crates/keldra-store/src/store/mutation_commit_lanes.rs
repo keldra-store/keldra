@@ -2,9 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{
     Mutex, Notify, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
@@ -36,6 +35,9 @@ pub(super) struct MutationCommitLanes {
     fence: Arc<RwLock<()>>,
     conflicts: Arc<Vec<Arc<Mutex<()>>>>,
     physical_slots: Arc<Semaphore>,
+    physical_slots_active: Arc<AtomicUsize>,
+    physical_slots_peak: Arc<AtomicUsize>,
+    physical_slot_count: usize,
     sequence: Arc<Mutex<Option<LaneRuntime>>>,
     frontier_notify: Arc<Notify>,
     authorities_stale: Arc<AtomicBool>,
@@ -49,6 +51,66 @@ pub(super) struct MutationLaneGuard {
     _fence: OwnedRwLockReadGuard<()>,
     _conflicts: Vec<OwnedMutexGuard<()>>,
     _physical_slot: tokio::sync::OwnedSemaphorePermit,
+    physical_slots_active: Arc<AtomicUsize>,
+    conflict_wait: Duration,
+    physical_slot_wait: Duration,
+    physical_slots_active_at_acquire: usize,
+    physical_slots_peak: usize,
+    physical_slot_count: usize,
+}
+
+impl Drop for MutationLaneGuard {
+    fn drop(&mut self) {
+        self.physical_slots_active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl MutationLaneGuard {
+    pub(super) fn conflict_wait(&self) -> Duration {
+        self.conflict_wait
+    }
+
+    pub(super) fn physical_slot_wait(&self) -> Duration {
+        self.physical_slot_wait
+    }
+
+    pub(super) fn physical_slots_active_at_acquire(&self) -> usize {
+        self.physical_slots_active_at_acquire
+    }
+
+    pub(super) fn physical_slots_active(&self) -> usize {
+        self.physical_slots_active.load(Ordering::Acquire)
+    }
+
+    pub(super) fn physical_slots_peak(&self) -> usize {
+        self.physical_slots_peak
+    }
+
+    pub(super) fn physical_slots_peak_since_start(&self) -> usize {
+        self.physical_slots_peak.load(Ordering::Acquire)
+    }
+
+    pub(super) fn physical_slot_count(&self) -> usize {
+        self.physical_slot_count
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct LaneSettlementMetrics {
+    pub(super) completion_sequence_wait: Duration,
+    pub(super) projection_write: Duration,
+    pub(super) ordered_frontier_wait: Duration,
+    /// Number of tickets between this arrival and the next projected ticket.
+    pub(super) completion_reorder_depth: usize,
+    /// This arrival's ticket minus the already projected frontier.
+    pub(super) completion_ticket_lag: u64,
+    pub(super) contiguous_projection_completions: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct LaneProjectionMetrics {
+    pub(super) write: Duration,
+    pub(super) completions: usize,
 }
 
 enum ExclusiveFence<'a> {
@@ -109,6 +171,9 @@ impl MutationCommitLanes {
             fence: Arc::new(RwLock::new(())),
             conflicts: Arc::new(conflicts),
             physical_slots: Arc::new(Semaphore::new(commit_lanes)),
+            physical_slots_active: Arc::new(AtomicUsize::new(0)),
+            physical_slots_peak: Arc::new(AtomicUsize::new(0)),
+            physical_slot_count: commit_lanes,
             sequence: Arc::new(Mutex::new(None)),
             frontier_notify: Arc::new(Notify::new()),
             authorities_stale: Arc::new(AtomicBool::new(false)),
@@ -128,6 +193,12 @@ impl MutationCommitLanes {
         guard
     }
 
+    pub(super) async fn acquire_fence_measured(&self) -> (OwnedRwLockReadGuard<()>, Duration) {
+        let started = Instant::now();
+        let fence = self.acquire_fence().await;
+        (fence, started.elapsed())
+    }
+
     pub(super) async fn acquire_with_fence(
         &self,
         fence: OwnedRwLockReadGuard<()>,
@@ -137,20 +208,35 @@ impl MutationCommitLanes {
             .into_iter()
             .map(|resource| self.stripe(&resource))
             .collect::<BTreeSet<_>>();
+        let conflict_started = Instant::now();
         let mut conflicts = Vec::with_capacity(stripes.len());
         for stripe in stripes {
             conflicts.push(self.conflicts[stripe].clone().lock_owned().await);
         }
+        let conflict_wait = conflict_started.elapsed();
+        let physical_slot_started = Instant::now();
         let physical_slot = self
             .physical_slots
             .clone()
             .acquire_owned()
             .await
             .expect("mutation commit lane semaphore remains open");
+        let physical_slot_wait = physical_slot_started.elapsed();
+        let physical_slots_active_at_acquire =
+            self.physical_slots_active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.physical_slots_peak
+            .fetch_max(physical_slots_active_at_acquire, Ordering::AcqRel);
+        let physical_slots_peak = self.physical_slots_peak.load(Ordering::Acquire);
         MutationLaneGuard {
             _fence: fence,
             _conflicts: conflicts,
             _physical_slot: physical_slot,
+            physical_slots_active: self.physical_slots_active.clone(),
+            conflict_wait,
+            physical_slot_wait,
+            physical_slots_active_at_acquire,
+            physical_slots_peak,
+            physical_slot_count: self.physical_slot_count,
         }
     }
 
@@ -416,9 +502,12 @@ impl Store {
         &self,
         completion: LaneCompletion,
         committed: bool,
-    ) -> Result<(), MutationError> {
+    ) -> Result<LaneSettlementMetrics, MutationError> {
+        let completion_sequence_started = Instant::now();
+        let mut metrics = LaneSettlementMetrics::default();
         {
             let mut runtime = self.mutation_commit_lanes.sequence().await;
+            metrics.completion_sequence_wait = completion_sequence_started.elapsed();
             let runtime = runtime.as_mut().ok_or_else(|| {
                 MutationError::Storage("mutation lane runtime is not initialized".into())
             })?;
@@ -459,8 +548,17 @@ impl Store {
                     "mutation lane completion was reported twice".into(),
                 ));
             }
-            self.project_lane_completions(runtime)?;
+            let expected_ticket = runtime.projected_ticket.saturating_add(1);
+            metrics.completion_reorder_depth =
+                usize::try_from(completion.ticket.saturating_sub(expected_ticket))
+                    .unwrap_or(usize::MAX);
+            metrics.completion_ticket_lag =
+                completion.ticket.saturating_sub(runtime.projected_ticket);
+            let projection = self.project_lane_completions(runtime)?;
+            metrics.projection_write = projection.write;
+            metrics.contiguous_projection_completions = projection.completions;
         }
+        let frontier_wait_started = Instant::now();
         loop {
             let notified = self.mutation_commit_lanes.frontier_notify.notified();
             {
@@ -469,7 +567,8 @@ impl Store {
                     MutationError::Storage("mutation lane runtime is not initialized".into())
                 })?;
                 if runtime.projected_ticket >= completion.ticket {
-                    return Ok(());
+                    metrics.ordered_frontier_wait = frontier_wait_started.elapsed();
+                    return Ok(metrics);
                 }
             }
             notified.await;
@@ -479,11 +578,12 @@ impl Store {
     pub(super) fn project_lane_completions(
         &self,
         runtime: &mut LaneRuntime,
-    ) -> Result<(), MutationError> {
+    ) -> Result<LaneProjectionMetrics, MutationError> {
         let mut prospective = runtime.clone();
         let mut batch = WriteBatch::default();
         let mut projected = false;
         let mut requires_sync = false;
+        let mut completions = 0_usize;
         loop {
             let next = prospective.projected_ticket.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("mutation lane frontier is exhausted".into())
@@ -513,9 +613,10 @@ impl Store {
             }
             prospective.projected_ticket = next;
             projected = true;
+            completions = completions.saturating_add(1);
         }
         if !projected {
-            return Ok(());
+            return Ok(LaneProjectionMetrics::default());
         }
         prospective.reserved_watch.settled_through = prospective.projected_watch.settled_through;
         self.stage_lane_frontier_projection(&mut batch, &prospective)?;
@@ -535,12 +636,14 @@ impl Store {
                 "injected mutation lane projection failure".into(),
             ));
         }
+        let write_started = Instant::now();
         self.db.write_opt(batch, &options).map_err(storage_error)?;
+        let write = write_started.elapsed();
         *runtime = prospective;
         self.settle_inline_source_changes_from_status(runtime.projected_watch)?;
         self.mutation_commit_lanes.frontier_notify.notify_waiters();
         self.notify_local_invalidations_from_status(runtime.projected_watch);
-        Ok(())
+        Ok(LaneProjectionMetrics { write, completions })
     }
 
     fn apply_committed_lane_completion(
@@ -965,8 +1068,16 @@ mod tests {
             0
         );
 
-        store.finish_lane_commit(first, true).await.unwrap();
-        later_finish.await.unwrap().unwrap();
+        let first_metrics = store.finish_lane_commit(first, true).await.unwrap();
+        let later_metrics = later_finish.await.unwrap().unwrap();
+        assert_eq!(first_metrics.completion_reorder_depth, 0);
+        assert_eq!(first_metrics.completion_ticket_lag, 1);
+        assert_eq!(first_metrics.contiguous_projection_completions, 2);
+        assert!(first_metrics.projection_write > Duration::ZERO);
+        assert_eq!(later_metrics.completion_reorder_depth, 1);
+        assert_eq!(later_metrics.completion_ticket_lag, 2);
+        assert_eq!(later_metrics.contiguous_projection_completions, 0);
+        assert!(later_metrics.ordered_frontier_wait > Duration::ZERO);
         let encoded = store
             .db
             .get_cf(store.cf(CF_METADATA).unwrap(), LANE_FRONTIER_KEY)
@@ -1109,9 +1220,11 @@ mod tests {
 
         {
             let mut runtime = store.mutation_commit_lanes.sequence().await;
-            store
+            let retry = store
                 .project_lane_completions(runtime.as_mut().unwrap())
                 .unwrap();
+            assert_eq!(retry.completions, 1);
+            assert!(retry.write > Duration::ZERO);
         }
         assert_eq!(store.local_watch_status().unwrap().tail, 1);
         assert_eq!(
@@ -1194,6 +1307,25 @@ mod tests {
         assert!(!waiting.is_finished());
         drop(first);
         waiting.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_slot_metrics_track_current_and_peak_utilization() {
+        let lanes = MutationCommitLanes::new(2);
+        let first = lanes.acquire([b"path:a".to_vec()]).await;
+        assert_eq!(first.physical_slots_active_at_acquire(), 1);
+        assert_eq!(first.physical_slots_peak(), 1);
+        assert_eq!(first.physical_slot_count(), 2);
+
+        let second = lanes.acquire([b"path:b".to_vec()]).await;
+        assert_eq!(second.physical_slots_active_at_acquire(), 2);
+        assert_eq!(second.physical_slots_peak(), 2);
+        assert_eq!(first.physical_slots_active(), 2);
+        assert_eq!(first.physical_slots_peak_since_start(), 2);
+        drop(second);
+        assert_eq!(first.physical_slots_active(), 1);
+        drop(first);
+        assert_eq!(lanes.physical_slots_active.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

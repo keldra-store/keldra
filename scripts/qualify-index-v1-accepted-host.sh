@@ -29,7 +29,7 @@ for command in cmp findmnt jq lsblk sha256sum tar; do command -v "$command" >/de
 for required in SOURCE_COMMIT HARNESS_COMMIT CATALOG_HARNESS_COMMIT SHA256SUMS; do
   [[ -s "${kit_root}/${required}" ]] || { echo "candidate kit is missing ${required}" >&2; exit 2; }
 done
-for runner in qualify-index-v1-ssd-scale.sh summarize-index-v1-instrumentation.py qualify-index-catalog.sh qualification-disk-ledger.sh; do
+for runner in qualify-index-v1-ssd-scale.sh summarize-index-v1-instrumentation.py sample-index-v1-resources.py qualify-index-catalog.sh qualification-disk-ledger.sh; do
   cmp "${repo_root}/scripts/${runner}" "${kit_root}/${runner}" || {
     echo "candidate kit runner ${runner} differs from candidate source" >&2
     exit 2

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import json
+import re
 from fractions import Fraction
 from typing import Any
 
@@ -187,22 +189,92 @@ def disk_metrics(start: int, end: int, device: str, path: str) -> dict[str, Any]
     }
 
 
+def coverage(start: int, end: int, kind: str, path: str) -> dict[str, Any]:
+    if kind == "process-tsv":
+        with open(path, encoding="utf-8", newline="") as source:
+            timestamps = [
+                int(row["interval_end_epoch_milliseconds"])
+                for row in csv.DictReader(source, delimiter="\t")
+            ]
+    elif kind == "host-jsonl":
+        timestamps = [
+            int(sample["timestamp_unix_milliseconds"])
+            for sample in read_json_lines(path)
+        ]
+    else:
+        raise ValueError(f"unsupported coverage kind {kind}")
+    timestamps.sort()
+    before = [timestamp for timestamp in timestamps if timestamp <= start]
+    after = [timestamp for timestamp in timestamps if timestamp >= end]
+    return {
+        "measurement": "exact-window-sample-coverage",
+        "kind": kind,
+        "path": path,
+        "sample_count": len(timestamps),
+        "window": {"start": start, "end": end},
+        "start_bracket": before[-1] if before else None,
+        "end_bracket": after[0] if after else None,
+        "complete": bool(before and after),
+    }
+
+
+def rocksdb_metrics(start: int, end: int, path: str) -> dict[str, Any]:
+    timestamps: list[int] = []
+    maxima: dict[str, float] = {}
+    metric = re.compile(r"(?:gauge\.)?(keldra_(?:rocksdb|storage)_[a-z0-9_]+)=([0-9.eE+-]+)")
+    with open(path, encoding="utf-8") as source:
+        for line in source:
+            if "keldra_rocksdb_" not in line and "keldra_storage_wal_bytes" not in line:
+                continue
+            first = line.split(maxsplit=1)[0]
+            try:
+                parsed = dt.datetime.fromisoformat(first.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            timestamp = int(parsed.timestamp() * 1000)
+            timestamps.append(timestamp)
+            if start <= timestamp <= end:
+                for name, raw in metric.findall(line):
+                    value = float(raw)
+                    maxima[name] = max(maxima.get(name, value), value)
+    timestamps.sort()
+    before = [timestamp for timestamp in timestamps if timestamp <= start]
+    after = [timestamp for timestamp in timestamps if timestamp >= end]
+    return {
+        "measurement": "rocksdb-runtime-exact-window-coverage",
+        "path": path,
+        "sample_line_count": len(timestamps),
+        "window": {"start": start, "end": end},
+        "start_bracket": before[-1] if before else None,
+        "end_bracket": after[0] if after else None,
+        "complete": bool(before and after),
+        "measurement_window_maxima": maxima,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     subcommands = parser.add_subparsers(dest="command", required=True)
     pipeline = subcommands.add_parser("pipeline")
     disk = subcommands.add_parser("disk")
-    for command in (pipeline, disk):
+    coverage_command = subcommands.add_parser("coverage")
+    rocksdb = subcommands.add_parser("rocksdb")
+    for command in (pipeline, disk, coverage_command, rocksdb):
         command.add_argument("--start-ms", required=True, type=int)
         command.add_argument("--end-ms", required=True, type=int)
         command.add_argument("--samples", required=True)
     disk.add_argument("--device", required=True)
+    coverage_command.add_argument("--kind", choices=("process-tsv", "host-jsonl"), required=True)
     args = parser.parse_args()
     try:
         if args.command == "pipeline":
             result = pipeline_metrics(args.start_ms, args.end_ms, args.samples)
-        else:
+        elif args.command == "disk":
             result = disk_metrics(args.start_ms, args.end_ms, args.device, args.samples)
+        elif args.command == "coverage":
+            result = coverage(args.start_ms, args.end_ms, args.kind, args.samples)
+        else:
+            result = rocksdb_metrics(args.start_ms, args.end_ms, args.samples)
     except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
         raise SystemExit(str(error)) from error
     print(json.dumps(result, separators=(",", ":"), sort_keys=True))

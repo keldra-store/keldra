@@ -27,15 +27,39 @@ pub(super) struct CoordinatorBatchMetrics {
     pub(super) prepare: std::time::Duration,
     pub(super) policy_wait: std::time::Duration,
     pub(super) path_wait: std::time::Duration,
+    /// Legacy commit-mutex wait, or the first lane-sequence acquisition wait.
     pub(super) commit_wait: std::time::Duration,
+    pub(super) lane_fence_wait: std::time::Duration,
+    pub(super) lane_conflict_wait: std::time::Duration,
+    pub(super) physical_slot_wait: std::time::Duration,
+    pub(super) physical_slots_active_at_acquire: usize,
+    pub(super) physical_slots_active_before_release: usize,
+    pub(super) physical_slots_peak_since_start_at_acquire: usize,
+    pub(super) physical_slots_peak_since_start_before_release: usize,
+    pub(super) physical_slot_count: usize,
+    pub(super) first_sequence_wait: std::time::Duration,
+    pub(super) first_sequence_hold: std::time::Duration,
     pub(super) locked_setup: std::time::Duration,
     pub(super) baseline_prefetch: std::time::Duration,
     pub(super) baseline_revalidation_retries: u64,
     pub(super) evaluate: std::time::Duration,
     pub(super) evaluation_subphases: EvaluationSubphaseMetrics,
     pub(super) stage: std::time::Duration,
+    /// Composite primary persistence plus ordered lane settlement retained for
+    /// comparison with historical qualification evidence.
     pub(super) persist: std::time::Duration,
+    pub(super) primary_db_write: std::time::Duration,
+    pub(super) completion_sequence_wait: std::time::Duration,
+    pub(super) prior_retry_projection_db_write: std::time::Duration,
+    pub(super) completion_projection_db_write: std::time::Duration,
+    pub(super) ordered_frontier_wait: std::time::Duration,
+    pub(super) completion_reorder_depth: usize,
+    pub(super) completion_ticket_lag: u64,
+    pub(super) prior_retry_projection_completions: usize,
+    pub(super) completion_projection_completions: usize,
     pub(super) settle: std::time::Duration,
+    /// Composite path from post-commit-lock acquisition through outcomes,
+    /// retained for comparison with historical qualification evidence.
     pub(super) commit_hold: std::time::Duration,
     pub(super) total: std::time::Duration,
     pub(super) write_batch_entries: u64,
@@ -312,8 +336,11 @@ impl Store {
         // The fence must precede the discovery snapshot. Ordinary path locks do
         // not exclude legacy exclusive writers, and predecessor blob stripes
         // can only be known from a head/version snapshot protected from them.
+        let mut lane_fence_wait_duration = std::time::Duration::ZERO;
         let lane_fence = if lane_mode {
-            Some(self.mutation_commit_lanes.acquire_fence().await)
+            let (fence, wait) = self.mutation_commit_lanes.acquire_fence_measured().await;
+            lane_fence_wait_duration = wait;
+            Some(fence)
         } else {
             None
         };
@@ -352,7 +379,26 @@ impl Store {
         } else {
             None
         };
+        let lane_conflict_wait_duration = _mutation_lane
+            .as_ref()
+            .map_or(std::time::Duration::ZERO, |lane| lane.conflict_wait());
+        let physical_slot_wait_duration = _mutation_lane
+            .as_ref()
+            .map_or(std::time::Duration::ZERO, |lane| lane.physical_slot_wait());
+        let physical_slots_active_at_acquire = _mutation_lane
+            .as_ref()
+            .map_or(0, |lane| lane.physical_slots_active_at_acquire());
+        let physical_slots_peak_since_start_at_acquire = _mutation_lane
+            .as_ref()
+            .map_or(0, |lane| lane.physical_slots_peak());
+        let physical_slot_count = _mutation_lane
+            .as_ref()
+            .map_or(0, |lane| lane.physical_slot_count());
         let mut commit_wait_duration = std::time::Duration::ZERO;
+        let mut first_sequence_wait_duration = std::time::Duration::ZERO;
+        let mut first_sequence_acquired_at = None;
+        let mut prior_projection_metrics =
+            super::mutation_commit_lanes::LaneProjectionMetrics::default();
         let mut baseline_revalidation_retries = 0_u64;
         let (read_cache, mut commit_guard) = if lane_mode {
             // The first snapshot discovered predecessor blob identities while
@@ -389,20 +435,22 @@ impl Store {
         let mut lane_runtime_guard = if lane_mode {
             let commit_wait_started = std::time::Instant::now();
             let mut guard = self.mutation_commit_lanes.sequence().await;
+            first_sequence_wait_duration = commit_wait_started.elapsed();
+            first_sequence_acquired_at = Some(std::time::Instant::now());
             let runtime = guard.as_mut().ok_or_else(|| {
                 MutationError::Storage("mutation lane runtime is not initialized".into())
             })?;
             self.refresh_stale_lane_runtime(runtime)?;
             // A prior projection write can fail after a physical lane commit.
             // Retry its still-buffered completion before reserving more work.
-            self.project_lane_completions(runtime)?;
+            prior_projection_metrics = self.project_lane_completions(runtime)?;
             let reference_cursor = self
                 .reference_delta_cursor(runtime.projected_watch.source_id)
                 .map_err(|error| MutationError::Storage(error.to_string()))?;
             if reference_cursor != runtime.projected_watch.tail {
                 return Err(MutationError::SourceJournalCapacity);
             }
-            commit_wait_duration = commit_wait_started.elapsed();
+            commit_wait_duration = first_sequence_wait_duration;
             Some(guard)
         } else {
             None
@@ -632,6 +680,8 @@ impl Store {
             None
         };
         let stage_duration = stage_started.elapsed();
+        let first_sequence_hold_duration = first_sequence_acquired_at
+            .map_or(std::time::Duration::ZERO, |started| started.elapsed());
         if lane_mode {
             drop(lane_runtime_guard.take());
             drop(commit_guard.take());
@@ -640,13 +690,19 @@ impl Store {
         let physical_commit = !batch.is_empty();
         let write_batch_entries = u64::try_from(batch.len()).unwrap_or(u64::MAX);
         let write_batch_bytes = u64::try_from(batch.size_in_bytes()).unwrap_or(u64::MAX);
+        let mut primary_db_write_duration = std::time::Duration::ZERO;
         let persistence = if physical_commit {
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
-            self.db.write_opt(batch, &options).map_err(storage_error)
+            let write_started = std::time::Instant::now();
+            let result = self.db.write_opt(batch, &options).map_err(storage_error);
+            primary_db_write_duration = write_started.elapsed();
+            result
         } else {
             Ok(())
         };
+        let mut lane_settlement_metrics =
+            super::mutation_commit_lanes::LaneSettlementMetrics::default();
         if let Some(completion) = lane_completion {
             let committed = match &persistence {
                 Ok(()) => true,
@@ -656,7 +712,7 @@ impl Store {
                     .map_err(storage_error)?
                     .is_some(),
             };
-            self.finish_lane_commit(completion, committed).await?;
+            lane_settlement_metrics = self.finish_lane_commit(completion, committed).await?;
         }
         persistence?;
         let persist_duration = persist_started.elapsed();
@@ -705,6 +761,20 @@ impl Store {
                 policy_wait: policy_wait_duration,
                 path_wait: path_wait_duration,
                 commit_wait: commit_wait_duration,
+                lane_fence_wait: lane_fence_wait_duration,
+                lane_conflict_wait: lane_conflict_wait_duration,
+                physical_slot_wait: physical_slot_wait_duration,
+                physical_slots_active_at_acquire,
+                physical_slots_active_before_release: _mutation_lane
+                    .as_ref()
+                    .map_or(0, |lane| lane.physical_slots_active()),
+                physical_slots_peak_since_start_at_acquire,
+                physical_slots_peak_since_start_before_release: _mutation_lane
+                    .as_ref()
+                    .map_or(0, |lane| lane.physical_slots_peak_since_start()),
+                physical_slot_count,
+                first_sequence_wait: first_sequence_wait_duration,
+                first_sequence_hold: first_sequence_hold_duration,
                 locked_setup: locked_setup_duration,
                 baseline_prefetch: baseline_prefetch_duration,
                 baseline_revalidation_retries,
@@ -712,6 +782,16 @@ impl Store {
                 evaluation_subphases,
                 stage: stage_duration,
                 persist: persist_duration,
+                primary_db_write: primary_db_write_duration,
+                completion_sequence_wait: lane_settlement_metrics.completion_sequence_wait,
+                prior_retry_projection_db_write: prior_projection_metrics.write,
+                completion_projection_db_write: lane_settlement_metrics.projection_write,
+                ordered_frontier_wait: lane_settlement_metrics.ordered_frontier_wait,
+                completion_reorder_depth: lane_settlement_metrics.completion_reorder_depth,
+                completion_ticket_lag: lane_settlement_metrics.completion_ticket_lag,
+                prior_retry_projection_completions: prior_projection_metrics.completions,
+                completion_projection_completions: lane_settlement_metrics
+                    .contiguous_projection_completions,
                 settle: settle_duration,
                 commit_hold: commit_hold_duration,
                 total: total_started.elapsed(),

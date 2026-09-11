@@ -101,6 +101,7 @@ jobs:
           install -m 0755 "$target/release/examples/index_catalog_qualification" "$KIT_ROOT/bin/index-catalog-qualification"
           install -m 0755 scripts/qualify-index-v1-ssd-scale.sh "$KIT_ROOT/qualify-index-v1-ssd-scale.sh"
           install -m 0755 scripts/summarize-index-v1-instrumentation.py "$KIT_ROOT/summarize-index-v1-instrumentation.py"
+          install -m 0755 scripts/sample-index-v1-resources.py "$KIT_ROOT/sample-index-v1-resources.py"
           install -m 0755 scripts/qualify-index-catalog.sh "$KIT_ROOT/qualify-index-catalog.sh"
           install -m 0644 scripts/qualification-disk-ledger.sh "$KIT_ROOT/qualification-disk-ledger.sh"
           printf '%s\n' "$SOURCE_COMMIT" >"$KIT_ROOT/SOURCE_COMMIT"
@@ -109,7 +110,7 @@ jobs:
           (
             cd "$KIT_ROOT"
             sha256sum SOURCE_COMMIT HARNESS_COMMIT CATALOG_HARNESS_COMMIT \
-              qualify-index-v1-ssd-scale.sh summarize-index-v1-instrumentation.py \
+              qualify-index-v1-ssd-scale.sh summarize-index-v1-instrumentation.py sample-index-v1-resources.py \
               qualify-index-catalog.sh qualification-disk-ledger.sh \
               bin/keldra-server bin/keldra bin/index-contention-qualification \
               bin/index-catalog-qualification >SHA256SUMS
@@ -152,6 +153,8 @@ jobs:
         run: |
           chmod 0755 \
             "${RUNNER_TEMP}/keldra-v1-index-kit/qualify-index-v1-ssd-scale.sh" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/summarize-index-v1-instrumentation.py" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/sample-index-v1-resources.py" \
             "${RUNNER_TEMP}/keldra-v1-index-kit/qualify-index-catalog.sh" \
             "${RUNNER_TEMP}/keldra-v1-index-kit/bin/keldra-server" \
             "${RUNNER_TEMP}/keldra-v1-index-kit/bin/keldra" \
@@ -205,6 +208,8 @@ jobs:
         run: |
           chmod 0755 \
             "${RUNNER_TEMP}/keldra-v1-index-kit/qualify-index-v1-ssd-scale.sh" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/summarize-index-v1-instrumentation.py" \
+            "${RUNNER_TEMP}/keldra-v1-index-kit/sample-index-v1-resources.py" \
             "${RUNNER_TEMP}/keldra-v1-index-kit/qualify-index-catalog.sh" \
             "${RUNNER_TEMP}/keldra-v1-index-kit/bin/keldra-server" \
             "${RUNNER_TEMP}/keldra-v1-index-kit/bin/keldra" \
