@@ -236,6 +236,7 @@ fn wal_put_batches_since(store: &Store, sequence: u64) -> Vec<WalPuts> {
 async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
     let (_temporary, source, replica) = stores().await;
     source.resolve_bucket_identity("tenant", "bucket").unwrap();
+    let source_status_before = source.local_watch_status().unwrap();
     let source_sequence = source.db.latest_sequence_number();
     let coordinated = source
         .coordinate_object_mutation(
@@ -295,7 +296,18 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
     assert_eq!(mutation_status.tail, mutation.stamp.source_journal_position);
     assert_eq!(
         mutation_status.settled_through,
-        mutation.stamp.source_journal_position
+        source_status_before.settled_through
+    );
+    let final_source_status = source.local_watch_status().unwrap();
+    assert_eq!(
+        (
+            final_source_status.tail,
+            final_source_status.settled_through
+        ),
+        (
+            mutation.stamp.source_journal_position,
+            mutation.stamp.source_journal_position
+        )
     );
 
     let replica_sequence = replica.db.latest_sequence_number();

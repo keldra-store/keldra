@@ -1334,15 +1334,8 @@ mod tests {
             .unwrap();
         assert!(matches!(first.as_slice(), [Ok(_)]));
         let first_status = store.local_watch_status().unwrap();
-        let positions = (first_status.settled_through + 1..=first_status.tail).collect::<Vec<_>>();
-        let first_position = *positions.last().unwrap();
-        assert_eq!(
-            store
-                .settle_source_journal_positions_if_contiguous(first_status.source_id, &positions)
-                .await
-                .unwrap(),
-            Some(first_position)
-        );
+        let first_position = first_status.tail;
+        assert_eq!(first_status.settled_through, first_position);
 
         let second = store
             .coordinate_single_node_mutation_batch(
@@ -1374,6 +1367,16 @@ mod tests {
         assert!(matches!(legacy.as_slice(), [Ok(_)]));
         let legacy_status = store.local_watch_status().unwrap();
         let legacy_receipts = store.mutation_receipt_status().unwrap();
+        assert!(legacy_status.settled_through < legacy_status.tail);
+        let positions =
+            (legacy_status.settled_through + 1..=legacy_status.tail).collect::<Vec<_>>();
+        assert_eq!(
+            store
+                .settle_source_journal_positions_if_contiguous(legacy_status.source_id, &positions)
+                .await
+                .unwrap(),
+            Some(legacy_status.tail)
+        );
 
         let lane = store
             .coordinate_single_node_mutation_batch(
@@ -1395,9 +1398,14 @@ mod tests {
     #[tokio::test]
     async fn conflicting_governance_splits_physical_commits() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
+        let config = SingleNodeGroupCommitConfig::default()
+            .with_commit_lanes(1)
             .unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
+        )
+        .await
+        .unwrap();
         let first = governance(&store);
         let mut second = first.clone();
         second.policy = BucketPolicy {
@@ -1427,9 +1435,14 @@ mod tests {
     #[tokio::test]
     async fn incompatible_context_splits_physical_commits() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(StoreOptions::new(temporary.path(), 1))
-            .await
+        let config = SingleNodeGroupCommitConfig::default()
+            .with_commit_lanes(1)
             .unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config),
+        )
+        .await
+        .unwrap();
         let governance = governance(&store);
         let before = store.db.latest_sequence_number();
         let (first, second) = tokio::join!(
