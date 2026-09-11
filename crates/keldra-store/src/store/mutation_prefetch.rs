@@ -1,11 +1,11 @@
 //! Bounded baseline reads for one input-ordered object mutation batch.
 //!
-//! The cache is populated from one RocksDB snapshot while the caller holds the
-//! ordinary path locks, but before it enters the ordered commit section. The
-//! snapshot sequence is revalidated after acquiring that section; a stale
-//! baseline is discarded and loaded again. The cache is not authoritative
-//! state: mutations still enter the existing pending maps in input order and
-//! share the existing final `WriteBatch`.
+//! The cache is populated from one RocksDB snapshot before the ordered commit
+//! section. Legacy commits revalidate its database sequence under their commit
+//! lock. Commit lanes load it while holding the shared lane fence, discover
+//! predecessor conflicts, then refresh stripe-protected values after acquiring
+//! those stripes. The cache is not authoritative state: mutations still enter
+//! the existing pending maps in input order and share the final `WriteBatch`.
 
 use super::object_alias_registry::decode_registry;
 use super::receipt_codec::decode_stored_receipt;
@@ -226,9 +226,9 @@ impl MutationReadCache {
     }
 
     /// Refresh values whose conflict stripes were acquired after the discovery
-    /// snapshot. Object heads and versions are already stable under ordinary
-    /// path locks; only receipt, shared-blob and inline-artifact state can have
-    /// changed while this lane waited for those stripes.
+    /// snapshot. Object heads and versions are stable under ordinary path locks
+    /// plus the lane fence; only receipt, shared-blob and inline-artifact state
+    /// can have changed while this lane waited for those stripes.
     pub(super) fn refresh_conflict_values(&mut self, store: &Store) -> Result<(), MutationError> {
         let snapshot = store.db.snapshot();
         self.sequence_number = snapshot.sequence_number();

@@ -309,6 +309,14 @@ impl Store {
             .map(|item| &item.operation)
             .collect::<Vec<_>>();
         let mut baseline_prefetch_duration = std::time::Duration::ZERO;
+        // The fence must precede the discovery snapshot. Ordinary path locks do
+        // not exclude legacy exclusive writers, and predecessor blob stripes
+        // can only be known from a head/version snapshot protected from them.
+        let lane_fence = if lane_mode {
+            Some(self.mutation_commit_lanes.acquire_fence().await)
+        } else {
+            None
+        };
         let lane_read_cache = if lane_mode {
             let prefetch_started = std::time::Instant::now();
             let read_cache = MutationReadCache::load(self, &prepared_operations)?;
@@ -333,7 +341,14 @@ impl Store {
                     .expect("lane read cache was loaded")
                     .predecessor_blob_conflict_resources(),
             );
-            Some(self.mutation_commit_lanes.acquire(lane_resources).await)
+            Some(
+                self.mutation_commit_lanes
+                    .acquire_with_fence(
+                        lane_fence.expect("lane fence was acquired before cache discovery"),
+                        lane_resources,
+                    )
+                    .await,
+            )
         } else {
             None
         };
@@ -341,9 +356,9 @@ impl Store {
         let mut baseline_revalidation_retries = 0_u64;
         let (read_cache, mut commit_guard) = if lane_mode {
             // The first snapshot discovered predecessor blob identities while
-            // ordinary path locks kept the heads stable. Reload after taking
-            // those blob conflict stripes so their refcounts cannot change
-            // between the cached baseline and this lane's atomic write.
+            // the lane fence excluded legacy writers. Reload stripe-protected
+            // values so concurrent lanes cannot change them between the cached
+            // baseline and this lane's atomic write.
             let mut read_cache = lane_read_cache.expect("lane read cache was loaded");
             let prefetch_started = std::time::Instant::now();
             read_cache.refresh_conflict_values(self)?;
@@ -378,6 +393,9 @@ impl Store {
                 MutationError::Storage("mutation lane runtime is not initialized".into())
             })?;
             self.refresh_stale_lane_runtime(runtime)?;
+            // A prior projection write can fail after a physical lane commit.
+            // Retry its still-buffered completion before reserving more work.
+            self.project_lane_completions(runtime)?;
             let reference_cursor = self
                 .reference_delta_cursor(runtime.projected_watch.source_id)
                 .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -1144,6 +1162,80 @@ mod tests {
         assert_eq!(
             store.db.latest_sequence_number(),
             sequence_before_replicated
+        );
+    }
+
+    #[tokio::test]
+    async fn single_node_cache_is_loaded_after_legacy_exclusive_writer_finishes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: store.bucket_policy("tenant", "bucket").unwrap(),
+        };
+        let context = ObjectMutationContext {
+            active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+            serving_fence_term: 1,
+        };
+        let exclusive = store.mutation_commit_lanes.acquire_exclusive().await;
+        let mutation = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .coordinate_single_node_mutation_batch(
+                        vec![(
+                            BatchOperation::Put(put_request(
+                                "objects/raced",
+                                "put-raced",
+                                b"lane value",
+                                Durability::Local,
+                            )),
+                            governance,
+                            None,
+                        )],
+                        context,
+                    )
+                    .await
+            }
+        });
+        while store.mutation_commit_lanes.waiting_fence_readers() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let identity = BucketIdentity {
+            tenant_id,
+            bucket_id,
+        };
+        let head_key = identity.head_key("objects/raced");
+        store
+            .db
+            .put_cf(
+                store.cf(CF_HEADS).unwrap(),
+                &head_key,
+                serde_json::to_vec(&Head {
+                    version: VersionId(u64::MAX),
+                    deleted: false,
+                    mutation_stamp: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        drop(exclusive);
+
+        let outcomes = mutation.await.unwrap().unwrap();
+        assert!(outcomes[0].is_err());
+        assert_eq!(
+            store
+                .head_by_storage_key(&head_key)
+                .unwrap()
+                .unwrap()
+                .version,
+            VersionId(u64::MAX)
         );
     }
 

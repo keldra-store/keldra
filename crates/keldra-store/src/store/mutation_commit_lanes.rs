@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{
@@ -37,6 +39,10 @@ pub(super) struct MutationCommitLanes {
     sequence: Arc<Mutex<Option<LaneRuntime>>>,
     frontier_notify: Arc<Notify>,
     authorities_stale: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_next_projection: Arc<AtomicBool>,
+    #[cfg(test)]
+    fence_waiters: Arc<AtomicUsize>,
 }
 
 pub(super) struct MutationLaneGuard {
@@ -73,6 +79,7 @@ pub(super) struct LaneCompletion {
     pub(super) high_version: Option<VersionId>,
 }
 
+#[derive(Clone)]
 pub(super) struct LaneRuntime {
     pub(super) next_ticket: u64,
     pub(super) projected_ticket: u64,
@@ -84,6 +91,7 @@ pub(super) struct LaneRuntime {
     pub(super) completions: BTreeMap<u64, LaneCompletionState>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum LaneCompletionState {
     Committed(LaneCompletion),
     Abandoned(LaneCompletion),
@@ -104,14 +112,27 @@ impl MutationCommitLanes {
             sequence: Arc::new(Mutex::new(None)),
             frontier_notify: Arc::new(Notify::new()),
             authorities_stale: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_projection: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fence_waiters: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    pub(super) async fn acquire(
+    pub(super) async fn acquire_fence(&self) -> OwnedRwLockReadGuard<()> {
+        #[cfg(test)]
+        self.fence_waiters.fetch_add(1, Ordering::AcqRel);
+        let guard = self.fence.clone().read_owned().await;
+        #[cfg(test)]
+        self.fence_waiters.fetch_sub(1, Ordering::AcqRel);
+        guard
+    }
+
+    pub(super) async fn acquire_with_fence(
         &self,
+        fence: OwnedRwLockReadGuard<()>,
         resources: impl IntoIterator<Item = Vec<u8>>,
     ) -> MutationLaneGuard {
-        let fence = self.fence.clone().read_owned().await;
         let stripes = resources
             .into_iter()
             .map(|resource| self.stripe(&resource))
@@ -131,6 +152,14 @@ impl MutationCommitLanes {
             _conflicts: conflicts,
             _physical_slot: physical_slot,
         }
+    }
+
+    pub(super) async fn acquire(
+        &self,
+        resources: impl IntoIterator<Item = Vec<u8>>,
+    ) -> MutationLaneGuard {
+        let fence = self.acquire_fence().await;
+        self.acquire_with_fence(fence, resources).await
     }
 
     pub(super) async fn acquire_exclusive(&self) -> ExclusiveMutationGuard<'static> {
@@ -174,6 +203,11 @@ impl MutationCommitLanes {
         }
         let count = u64::try_from(self.conflicts.len()).expect("conflict stripe count fits u64");
         usize::try_from(hash % count).expect("conflict stripe index fits usize")
+    }
+
+    #[cfg(test)]
+    pub(super) fn waiting_fence_readers(&self) -> usize {
+        self.fence_waiters.load(Ordering::Acquire)
     }
 }
 
@@ -443,23 +477,24 @@ impl Store {
     }
 
     fn project_lane_completions(&self, runtime: &mut LaneRuntime) -> Result<(), MutationError> {
+        let mut prospective = runtime.clone();
         let mut batch = WriteBatch::default();
         let mut projected = false;
         let mut requires_sync = false;
         loop {
-            let next = runtime.projected_ticket.checked_add(1).ok_or_else(|| {
+            let next = prospective.projected_ticket.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("mutation lane frontier is exhausted".into())
             })?;
-            let Some(completion) = runtime.completions.remove(&next) else {
+            let Some(completion) = prospective.completions.remove(&next) else {
                 break;
             };
             match completion {
                 LaneCompletionState::Committed(completion) => {
                     self.apply_committed_lane_completion(
                         &mut batch,
-                        &mut runtime.projected_watch,
-                        &mut runtime.projected_receipts,
-                        &mut runtime.projected_high_version,
+                        &mut prospective.projected_watch,
+                        &mut prospective.projected_receipts,
+                        &mut prospective.projected_high_version,
                         completion,
                     )?;
                     batch.delete_cf(self.cf(CF_METADATA)?, completion.key());
@@ -468,28 +503,39 @@ impl Store {
                     requires_sync = true;
                     self.stage_abandoned_lane_range(
                         &mut batch,
-                        &mut runtime.projected_watch,
+                        &mut prospective.projected_watch,
                         completion,
                     )?;
                 }
             }
-            runtime.projected_ticket = next;
+            prospective.projected_ticket = next;
             projected = true;
         }
         if !projected {
             return Ok(());
         }
-        self.stage_lane_frontier_projection(&mut batch, runtime)?;
+        prospective.reserved_watch.settled_through = prospective.projected_watch.settled_through;
+        self.stage_lane_frontier_projection(&mut batch, &prospective)?;
         let mut options = WriteOptions::default();
         if requires_sync {
             options.set_sync(self.sync_writes);
         } else {
             options.disable_wal(true);
         }
+        #[cfg(test)]
+        if self
+            .mutation_commit_lanes
+            .fail_next_projection
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(MutationError::Storage(
+                "injected mutation lane projection failure".into(),
+            ));
+        }
         self.db.write_opt(batch, &options).map_err(storage_error)?;
+        *runtime = prospective;
+        self.settle_inline_source_changes_from_status(runtime.projected_watch)?;
         self.mutation_commit_lanes.frontier_notify.notify_waiters();
-        runtime.reserved_watch.settled_through = runtime.projected_watch.settled_through;
-        self.mutation_capacity_notify.notify_waiters();
         self.notify_local_invalidations_from_status(runtime.projected_watch);
         Ok(())
     }
@@ -1009,6 +1055,77 @@ mod tests {
             .unwrap();
         assert_eq!(page.invalidations.len(), 2);
         assert_eq!(page.checkpoint.offset(), 2);
+    }
+
+    #[tokio::test]
+    async fn projection_failure_preserves_runtime_and_retry_advances_retention_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let change = LocalChange::sequence_gap(1);
+        let encoded = encode_local_change(&change).unwrap();
+        let completion = {
+            let mut runtime = store.mutation_commit_lanes.sequence().await;
+            let runtime = runtime.as_mut().unwrap();
+            let mut watch = runtime.reserved_watch;
+            watch.tail = 1;
+            watch.retained_entries = 1;
+            watch.retained_bytes = invalidation_record_bytes(encoded.len());
+            let receipts = runtime.reserved_receipts;
+            runtime.reserve(watch, receipts, None).unwrap()
+        };
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            store.cf(CF_LOCAL_INVALIDATIONS).unwrap(),
+            invalidation_key(1),
+            encoded,
+        );
+        store.stage_lane_completion(&mut batch, completion).unwrap();
+        store.db.write(batch).unwrap();
+
+        store
+            .mutation_commit_lanes
+            .fail_next_projection
+            .store(true, Ordering::Release);
+        assert!(store.finish_lane_commit(completion, true).await.is_err());
+        {
+            let runtime = store.mutation_commit_lanes.sequence().await;
+            let runtime = runtime.as_ref().unwrap();
+            assert_eq!(runtime.projected_ticket, 0);
+            assert!(runtime.completions.contains_key(&completion.ticket));
+        }
+        assert_eq!(store.local_watch_status().unwrap().tail, 0);
+        assert!(
+            store
+                .db
+                .get_cf(store.cf(CF_METADATA).unwrap(), completion.key())
+                .unwrap()
+                .is_some()
+        );
+
+        {
+            let mut runtime = store.mutation_commit_lanes.sequence().await;
+            store
+                .project_lane_completions(runtime.as_mut().unwrap())
+                .unwrap();
+        }
+        assert_eq!(store.local_watch_status().unwrap().tail, 1);
+        assert_eq!(
+            store
+                .source_journal_reference_safe_through
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(
+            store
+                .db
+                .get_cf(store.cf(CF_METADATA).unwrap(), completion.key())
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.prune_source_journal_for_capacity().await.unwrap());
+        assert_eq!(store.local_watch_status().unwrap().retention_floor, 1);
     }
 
     #[tokio::test]
