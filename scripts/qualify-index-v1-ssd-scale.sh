@@ -9,7 +9,7 @@ source "${script_root}/qualification-disk-ledger.sh"
 # attestable kit beneath ~/keldra_experiments/kit. Durable state and evidence
 # are confined to ~/keldra_experiments.
 
-experiment_root="${HOME}/keldra_experiments"
+experiment_root="${KELDRA_V1_SCALE_EXPERIMENT_ROOT:-${HOME}/keldra_experiments}"
 kit_root="${KELDRA_V1_SCALE_KIT_ROOT:-${experiment_root}/kit}"
 results_root="${experiment_root}/results/index-v1-scale"
 work_root="${experiment_root}/work/index-v1-scale"
@@ -93,6 +93,7 @@ for command in awk base64 dd flock jq lscpu lsblk ps readlink sha256sum ss tar v
 done
 if [[ "${profile}" == 1 ]]; then
   command -v perf >/dev/null 2>&1 || { echo "perf is required when profiling is enabled" >&2; exit 2; }
+  command -v c++filt >/dev/null 2>&1 || { echo "c++filt is required when profiling is enabled" >&2; exit 2; }
   if perf stat --event cycles -- true >/dev/null 2>&1; then
     perf_prefix=()
   elif command -v sudo >/dev/null 2>&1 \
@@ -250,6 +251,12 @@ stop_profiler() {
     kill -INT "${profiler_pid}" 2>/dev/null || true
   fi
   wait "${profiler_pid}" || status=$?
+  # `perf record` reports the SIGINT used to finalize a requested capture as
+  # the conventional shell status 128 + SIGINT.  The non-empty data-file check
+  # in profile_phase still proves that the recording was actually finalized.
+  if [[ "${signal_child}" == 1 && "${status}" == 130 ]]; then
+    status=0
+  fi
   profiler_pid=""
   if ((${#perf_prefix[@]} > 0)) && [[ -n "${profiler_data}" && -e "${profiler_data}" ]]; then
     sudo -n chown -- "$(id -u):$(id -g)" "${profiler_data}" || status=1
@@ -495,12 +502,15 @@ render_perf_reports() {
   printf 'perf_version=%s\n' "$(perf version)" >>"${metadata}"
   sha256sum "${kit_root}/bin/keldra-server" "${data}" >>"${metadata}"
   report_status=0
-  perf report --input "${data}" --stdio --header --demangle --no-children \
-    --sort comm,dso,symbol \
+  # Function symbols come from the unstripped ELF symbol table.  Source/inline
+  # expansion is unnecessary here and can make perf repeatedly invoke
+  # addr2line for every sampled frame on large Rust binaries.
+  { perf report --input "${data}" --stdio --header --demangle --no-inline --no-children \
+      --sort comm,dso,symbol | c++filt; } \
     >"${output_root}/perf-${evidence_phase}-flat-demangled.txt" \
     2>"${output_root}/perf-${evidence_phase}-flat.stderr" || report_status=$?
-  perf report --input "${data}" --stdio --header --demangle --children \
-    --call-graph graph,0.1,caller,function --sort symbol \
+  { perf report --input "${data}" --stdio --header --demangle --no-inline --children \
+      --call-graph graph,0.1,caller,function --sort symbol | c++filt; } \
     >"${output_root}/perf-${evidence_phase}-dwarf-callgraph-demangled.txt" \
     2>"${output_root}/perf-${evidence_phase}-dwarf-callgraph.stderr" || report_status=$?
 
@@ -509,13 +519,30 @@ render_perf_reports() {
   # A true allocation census requires an external heap profiler; do not infer
   # one from ordinary perf samples.
   for allocator in malloc realloc free; do
-    perf report --input "${data}" --stdio --header --demangle --children \
-      --call-graph graph,0.1,caller,function --sort symbol \
-      --symbol-filter "${allocator}" \
+    { perf report --input "${data}" --stdio --header --demangle --no-inline --children \
+        --call-graph graph,0.1,caller,function --sort symbol \
+        --symbol-filter "${allocator}" | c++filt; } \
       >"${output_root}/perf-${evidence_phase}-allocation-cpu-stacks-${allocator}.txt" \
       2>"${output_root}/perf-${evidence_phase}-allocation-cpu-stacks-${allocator}.stderr" \
       || report_status=$?
   done
+  if ! grep -Eq '^# Samples: [1-9][0-9]*[KMG]? of event' \
+      "${output_root}/perf-${evidence_phase}-flat-demangled.txt" \
+    || ! grep -Fq '# Total Lost Samples: 0' \
+      "${output_root}/perf-${evidence_phase}-flat-demangled.txt"
+  then
+    printf 'profile_evidence_validation=missing-samples-or-lost-samples\n' >>"${metadata}"
+    report_status=1
+  elif ! grep -Eq 'keldra[^[:space:]]*::' \
+      "${output_root}/perf-${evidence_phase}-flat-demangled.txt" \
+    || ! grep -Eq 'keldra[^[:space:]]*::' \
+      "${output_root}/perf-${evidence_phase}-dwarf-callgraph-demangled.txt"
+  then
+    printf 'profile_evidence_validation=missing-demangled-keldra-symbols\n' >>"${metadata}"
+    report_status=1
+  else
+    printf 'profile_evidence_validation=passed\n' >>"${metadata}"
+  fi
   printf 'perf_report_exit=%s\n' "${report_status}" >>"${metadata}"
   if command -v heaptrack >/dev/null 2>&1 && command -v heaptrack_print >/dev/null 2>&1; then
     printf '%s\n' \
