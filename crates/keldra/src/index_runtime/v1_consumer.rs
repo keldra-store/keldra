@@ -26,6 +26,7 @@ use super::v1_backfill::open_partition_baseline;
 use super::v1_extractor::{SelectedV1Source, V1ProjectionExtractor, matching_recipes};
 use super::v1_journal_dispatch::{V1OrderedSourceDispatcher, V1SourceDispatch};
 use super::v1_mutation_window::coalesce_latest_by_source_path;
+use super::v1_parallel::{partition_lane_parallelism, run_bounded_ordered};
 use super::v1_publication::{
     LoadedV1ProjectionGeneration, V1ProjectionPublisher, V1PublicationPredecessor,
 };
@@ -53,6 +54,7 @@ struct Limits {
     lsm_runs: u64,
     lsm_bytes: u64,
     parallelism: usize,
+    worker_bytes: usize,
 }
 
 struct Writer {
@@ -133,7 +135,7 @@ impl V1IndexProducerTask {
             reader.clone(),
             cpu,
             hot,
-            limits.flush_bytes.saturating_div(limits.parallelism).max(1),
+            limits.worker_bytes,
         );
         let task = tokio::spawn(async move {
             let mut writers = BTreeMap::new();
@@ -206,6 +208,13 @@ fn limits(config: IndexRuntimeConfig) -> Result<Limits, Status> {
     let flush_bytes = usize::try_from(config.flush_bytes())
         .map_err(|_| Status::invalid_argument("v1 flush bytes exceed this platform"))?
         .min(bytes.saturating_div(4).max(1));
+    let parallelism = usize::try_from(config.indexing_cores())
+        .map_err(|_| Status::invalid_argument("v1 indexing cores exceed this platform"))?;
+    if parallelism == 0 {
+        return Err(Status::invalid_argument(
+            "v1 indexing cores must be positive",
+        ));
+    }
     Ok(Limits {
         bytes,
         flush_bytes,
@@ -213,8 +222,8 @@ fn limits(config: IndexRuntimeConfig) -> Result<Limits, Status> {
         flush_operations: config.flush_max_operations(),
         lsm_runs: u64::from(config.lsm_max_runs_per_level()),
         lsm_bytes: config.lsm_max_unmerged_bytes_per_level(),
-        parallelism: usize::try_from(config.indexing_cores())
-            .map_err(|_| Status::invalid_argument("v1 indexing cores exceed this platform"))?,
+        parallelism,
+        worker_bytes: flush_bytes.saturating_div(parallelism).max(1),
     })
 }
 
@@ -223,7 +232,7 @@ async fn reconcile(
     local_node: NodeId,
     decisions: &DecisionRaft,
     catalog: &IndexCatalog,
-    journal: &IndexEventJournal,
+    journal: &Arc<IndexEventJournal>,
     scanner: &super::scanner::ClusterIndexScanner,
     reader: &ClusterObjectReader,
     extractor: &V1ProjectionExtractor,
@@ -239,8 +248,9 @@ async fn reconcile(
     }
     let catalog_snapshot = catalog.physical_snapshot()?;
     let mut assigned = BTreeSet::new();
-    // `IndexCatalog` already interns these by physical family. Logical aliases
-    // therefore never repeat this loop's source work.
+    // First capture the complete stable assignment set. `IndexCatalog` already
+    // interns recipes by physical family, so logical aliases never repeat one
+    // partition's source work.
     for recipe in catalog_snapshot.recipes.iter() {
         let Some((directory, _)) = publisher
             .load_family_directory(
@@ -263,6 +273,11 @@ async fn reconcile(
                 continue;
             }
             assigned.insert(partition);
+            if writers.get(&partition).is_some_and(|writer| {
+                writer.recipe.physical_generation != recipe.physical_generation
+            }) {
+                return Err(Status::unavailable("v1 physical catalog changed"));
+            }
             if !writers.contains_key(&partition) {
                 writers.insert(
                     partition,
@@ -277,27 +292,73 @@ async fn reconcile(
                     .await?,
                 );
             }
-            let writer = writers.get_mut(&partition).expect("writer was inserted");
-            if writer.recipe.physical_generation != recipe.physical_generation {
-                return Err(Status::unavailable("v1 physical catalog changed"));
-            }
-            advance(
-                writer,
-                &target,
-                catalog_snapshot.identity,
-                journal,
-                scanner,
-                reader,
-                extractor,
-                publisher,
-                credits,
-                limits,
-            )
-            .await?;
         }
     }
     writers.retain(|partition, _| assigned.contains(partition));
-    Ok(())
+    let physical_catalog_identity = catalog_snapshot.identity;
+    let active_writers = assigned.len().min(limits.parallelism.max(1));
+    // Moving each Writer into one task makes the partition's generation chain
+    // unshareable: preparation, immutable publication, and the Current CAS stay
+    // ordered even while unrelated partitions overlap.
+    let work = assigned
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, partition)| {
+            let writer = writers
+                .remove(&partition)
+                .expect("assigned v1 writer was opened");
+            let mut writer_limits = limits;
+            writer_limits.parallelism = partition_lane_parallelism(
+                limits.parallelism,
+                active_writers,
+                ordinal,
+            );
+            (partition, (writer, writer_limits))
+        })
+        .collect();
+    let outcomes = run_bounded_ordered(work, active_writers, {
+        let target = target.clone();
+        let journal = Arc::clone(journal);
+        let scanner = scanner.clone();
+        let reader = reader.clone();
+        let extractor = extractor.clone();
+        let publisher = publisher.clone();
+        let credits = credits.clone();
+        move |(mut writer, writer_limits)| {
+            let target = target.clone();
+            let journal = Arc::clone(&journal);
+            let scanner = scanner.clone();
+            let reader = reader.clone();
+            let extractor = extractor.clone();
+            let publisher = publisher.clone();
+            let credits = credits.clone();
+            async move {
+                let result = advance(
+                    &mut writer,
+                    &target,
+                    physical_catalog_identity,
+                    &journal,
+                    &scanner,
+                    &reader,
+                    &extractor,
+                    &publisher,
+                    &credits,
+                    writer_limits,
+                )
+                .await;
+                (writer, result)
+            }
+        }
+    })
+    .await?;
+    let mut first_error = None;
+    for (partition, (writer, result)) in outcomes {
+        writers.insert(partition, writer);
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 async fn open_writer(
@@ -456,7 +517,7 @@ async fn backfill(
         .unwrap_or(usize::MAX)
         .min(4_096)
         .max(1);
-    let selected_bytes = limits.flush_bytes.saturating_div(limits.parallelism).max(1);
+    let selected_bytes = limits.worker_bytes;
     let batch = baseline
         .next_selected_batch(
             extractor,
@@ -821,7 +882,7 @@ async fn prepare_lane(
     let current = writer.current.clone();
     let recipe = writer.recipe.clone();
     let scope = source_scope(writer.source);
-    let input_bytes = limits.flush_bytes.saturating_div(limits.parallelism).max(1);
+    let input_bytes = limits.worker_bytes;
     let mut selected = Vec::new();
     for chunk in mutations.chunks(limits.parallelism) {
         let mut jobs = tokio::task::JoinSet::new();
@@ -1652,6 +1713,7 @@ mod tests {
             lsm_runs: 64,
             lsm_bytes: 1_024,
             parallelism: 1,
+            worker_bytes: 64,
         };
 
         let writers = (0..5)

@@ -28,6 +28,7 @@ pub(crate) mod v1_consumer;
 pub(crate) mod v1_extractor;
 pub(crate) mod v1_journal_dispatch;
 pub(crate) mod v1_mutation_window;
+mod v1_parallel;
 pub(crate) mod v1_publication;
 pub(crate) mod v1_query_compile;
 pub(crate) mod v1_query_runtime;
