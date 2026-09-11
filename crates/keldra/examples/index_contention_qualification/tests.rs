@@ -39,6 +39,111 @@ fn large_catalog_uses_a_bounded_spanning_query_sample() {
 }
 
 #[test]
+fn initial_corpus_batches_never_exceed_the_public_bulk_limit() {
+    let ranges = initial_write_ranges(2_001).collect::<Vec<_>>();
+    assert_eq!(ranges, vec![0..1_000, 1_000..2_000, 2_000..2_001]);
+    assert!(
+        ranges
+            .iter()
+            .all(|range| range.len() <= INITIAL_WRITE_BATCH_SIZE)
+    );
+    assert!(initial_write_ranges(0).next().is_none());
+}
+
+#[test]
+fn mutable_record_mapping_distinguishes_hot_and_disjoint_windows() {
+    assert_eq!(mutable_record_id(0, 0, 32, 256), 0);
+    assert_eq!(mutable_record_id(7, 31, 32, 256), 255);
+    assert_eq!(mutable_record_id(8, 0, 32, 256), 0);
+
+    let ids = (0..64)
+        .flat_map(|sequence| {
+            (0..32).map(move |offset| mutable_record_id(sequence, offset, 32, 262_144))
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(ids.len(), 64 * 32);
+    assert_eq!(mutable_record_id(4_687, 31, 32, 262_144), 150_015);
+    assert_eq!(mutable_record_id(8_192, 0, 32, 262_144), 0);
+}
+
+#[test]
+fn authoritative_state_rejects_duplicate_paths() {
+    let mut authority = BTreeMap::new();
+    insert_authoritative_entry(&mut authority, "contention/mutable/00000001.json".into(), 1)
+        .unwrap();
+    assert!(
+        insert_authoritative_entry(&mut authority, "contention/mutable/00000001.json".into(), 2,)
+            .is_err()
+    );
+}
+
+fn paginated_response(
+    ids: impl IntoIterator<Item = u64>,
+    next_page_token: &[u8],
+    commit_revision: u64,
+) -> QueryIndexResponse {
+    QueryIndexResponse {
+        hits: ids
+            .into_iter()
+            .map(|id| keldra_storage::v1::IndexQueryHit {
+                address: Some(ObjectAddress {
+                    tenant: "tenant".into(),
+                    bucket: "bucket".into(),
+                    path: data::mutable_path(id),
+                }),
+                object_version: id + 1,
+                score: None,
+            })
+            .collect(),
+        next_page_token: next_page_token.to_vec(),
+        freshness: Some(keldra_storage::v1::IndexFreshness {
+            commit_revision,
+            authorization_revision: 11,
+            index_id: 13,
+            definition_version: 17,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn paginated_mutable_query_collects_more_than_one_page() {
+    let mut result = PaginatedQueryResult::default();
+    assert_eq!(
+        result
+            .absorb(paginated_response(0..1_000, b"page-2", 7))
+            .unwrap(),
+        Some(b"page-2".to_vec())
+    );
+    assert_eq!(
+        result.absorb(paginated_response([1_000], b"", 7)).unwrap(),
+        None
+    );
+    assert_eq!(result.hits.len(), 1_001);
+    assert_eq!(result.hits[data::mutable_path(1_000).as_str()], 1_001);
+}
+
+#[test]
+fn paginated_mutable_query_rejects_duplicates_token_cycles_and_revision_changes() {
+    let mut duplicate = PaginatedQueryResult::default();
+    duplicate
+        .absorb(paginated_response([1], b"page-2", 7))
+        .unwrap();
+    assert!(duplicate.absorb(paginated_response([1], b"", 7)).is_err());
+
+    let mut cycle = PaginatedQueryResult::default();
+    cycle.absorb(paginated_response([1], b"page-2", 7)).unwrap();
+    assert!(cycle.absorb(paginated_response([2], b"page-2", 7)).is_err());
+
+    let mut changed = PaginatedQueryResult::default();
+    changed
+        .absorb(paginated_response([1], b"page-2", 7))
+        .unwrap();
+    assert!(changed.absorb(paginated_response([2], b"", 8)).is_err());
+}
+
+#[test]
 fn optional_observed_tail_never_manufactures_zero_lag() {
     let unavailable = IndexSourceFreshness {
         indexed_next_offset: 12,

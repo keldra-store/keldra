@@ -4,6 +4,7 @@ use std::{env, path::PathBuf, time::Duration};
 
 const MAX_QUALIFICATION_DEFINITIONS: usize = 250_000;
 const MAX_QUALIFICATION_PHYSICAL_RECIPES: usize = 64;
+pub(super) const MAX_QUALIFICATION_MUTABLE_RECORDS: u64 = 1_000_000;
 
 const PREFIX: &str = "KELDRA_INDEX_CONTENTION_";
 
@@ -123,14 +124,7 @@ impl Config {
         let query_max_in_flight = number("QUERY_MAX_IN_FLIGHT", 64)?;
         ensure!(!endpoints.is_empty(), "at least one endpoint is required");
         validate_scale(definition_count, physical_recipe_count)?;
-        ensure!(
-            (1..=1_000).contains(&stable_records),
-            "stable records must be 1..=1000"
-        );
-        ensure!(
-            (1..=1_000).contains(&mutable_records),
-            "mutable records must be 1..=1000 for exact final verification"
-        );
+        validate_record_counts(stable_records, mutable_records)?;
         ensure!(mutation_workers > 0 && mutation_batch_size > 0);
         ensure!(
             mutation_record_bytes <= 64 * 1024 * 1024,
@@ -270,6 +264,18 @@ fn validate_scale(definition_count: usize, physical_recipe_count: usize) -> Resu
     Ok(())
 }
 
+fn validate_record_counts(stable_records: u64, mutable_records: u64) -> Result<()> {
+    ensure!(
+        (1..=1_000).contains(&stable_records),
+        "stable records must be 1..=1000"
+    );
+    ensure!(
+        (1..=MAX_QUALIFICATION_MUTABLE_RECORDS).contains(&mutable_records),
+        "mutable records must be 1..={MAX_QUALIFICATION_MUTABLE_RECORDS}"
+    );
+    Ok(())
+}
+
 fn name(suffix: &str) -> String {
     format!("{PREFIX}{suffix}")
 }
@@ -343,5 +349,15 @@ mod tests {
         assert!(validate_scale(64, 0).is_err());
         assert!(validate_scale(64, 65).is_err());
         assert!(validate_scale(4, 16).is_err());
+    }
+
+    #[test]
+    fn record_bounds_allow_high_cardinality_qualification() {
+        assert!(validate_record_counts(1, 1).is_ok());
+        assert!(validate_record_counts(1_000, MAX_QUALIFICATION_MUTABLE_RECORDS).is_ok());
+        assert!(validate_record_counts(0, 1).is_err());
+        assert!(validate_record_counts(1_001, 1).is_err());
+        assert!(validate_record_counts(1, 0).is_err());
+        assert!(validate_record_counts(1, MAX_QUALIFICATION_MUTABLE_RECORDS + 1).is_err());
     }
 }

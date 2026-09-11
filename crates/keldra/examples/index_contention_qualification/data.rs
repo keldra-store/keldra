@@ -197,6 +197,11 @@ mod tests {
             payload_at_least(7, 2, "mutable", 1, 1, 1),
             payload(7, 2, "mutable", 1, 1)
         );
+        assert_eq!(
+            mutable_path(100_000_000),
+            "contention/mutable/100000000.json"
+        );
+        assert_ne!(mutable_path(99_999_999), mutable_path(100_000_000));
     }
 
     #[test]

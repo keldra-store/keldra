@@ -17,6 +17,8 @@ mod progress;
 #[cfg(test)]
 #[path = "index_contention_qualification/tests.rs"]
 mod tests;
+#[path = "index_contention_qualification/verification.rs"]
+mod verification;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use config::{Config, MutationWorkload};
@@ -25,12 +27,11 @@ use keldra_storage::v1::bulk_operation::Operation as BulkOperationValue;
 use keldra_storage::v1::bulk_outcome::Outcome as BulkOutcomeValue;
 use keldra_storage::v1::index_query::Query as QueryValue;
 use keldra_storage::v1::index_service_client::IndexServiceClient;
-use keldra_storage::v1::object_head::State as ObjectHeadState;
 use keldra_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
-    Durability, HeadObjectRequest, IndexPredicate, IndexPredicateExpression,
-    IndexPredicateOperator, IndexQuery, IndexSourceFreshness, ObjectAddress, ObjectVersioning,
-    QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
+    Durability, IndexPredicate, IndexPredicateExpression, IndexPredicateOperator, IndexQuery,
+    IndexSourceFreshness, ObjectAddress, ObjectVersioning, QueryIndexRequest, QueryIndexResponse,
+    TypedJsonIndexQuery,
 };
 use keldra_storage::{
     BearerToken, KeywordField, RawClient, TypedJsonIndexBuilder, administration_client,
@@ -40,6 +41,7 @@ use metrics::{Latencies, LatencyReport};
 use progress::Counters;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -50,9 +52,13 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
+#[cfg(test)]
+use verification::{PaginatedQueryResult, insert_authoritative_entry, source_has_no_observed_lag};
+use verification::{load_authoritative_mutable_state, verify_final_mutable_state};
 
 type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
 const MAX_ACTIVE_QUERY_DEFINITIONS: usize = 1_024;
+const INITIAL_WRITE_BATCH_SIZE: usize = 1_000;
 
 #[derive(Debug, Serialize)]
 struct Report {
@@ -640,51 +646,19 @@ async fn setup(config: &Config, channel: &Channel, token: &str) -> Result<()> {
         .await
         .context("create contention bucket")?;
     let mut client = object_client(channel.clone(), token)?;
-    let mut operations = Vec::new();
-    for id in 0..config.stable_records {
-        operations.push(put(
-            config,
-            data::stable_path(id),
-            data::payload(config.seed, id, "stable", 0, config.physical_recipe_count),
-            format!("contention-initial-stable-{id}"),
-        ));
-    }
-    for id in 0..config.mutable_records {
-        operations.push(put(
-            config,
-            data::mutable_path(id),
-            data::payload(config.seed, id, "mutable", 0, config.physical_recipe_count),
-            format!("contention-initial-mutable-{id}"),
-        ));
-    }
-    if config.mutation_workload == MutationWorkload::ProjectionPreserving {
-        for ordinal in 0..data::PROJECTION_PRESERVING_MARKERS {
-            let id = data::marker_id(ordinal);
-            operations.push(put(
-                config,
-                data::marker_path(ordinal),
-                data::payload_with_generations(
-                    config.seed,
-                    id,
-                    "marker",
-                    0,
-                    0,
-                    config.physical_recipe_count,
-                ),
-                format!("contention-initial-marker-{ordinal}"),
-            ));
-        }
-    }
-    for (batch, chunk) in operations.chunks(1_000).enumerate() {
+    let total = initial_operation_count(config)?;
+    for (batch, range) in initial_write_ranges(total).enumerate() {
+        let operations = range
+            .map(|ordinal| initial_operation(config, ordinal as u64))
+            .collect::<Result<Vec<_>>>()?;
+        let expected_outcomes = operations.len();
         let outcomes = client
-            .bulk_write(BulkWriteRequest {
-                operations: chunk.to_vec(),
-            })
+            .bulk_write(BulkWriteRequest { operations })
             .await
             .with_context(|| format!("initial bulk batch {batch}"))?
             .into_inner()
             .outcomes;
-        ensure!(outcomes.len() == chunk.len());
+        ensure!(outcomes.len() == expected_outcomes);
         for outcome in outcomes {
             ensure!(
                 matches!(outcome.outcome, Some(BulkOutcomeValue::Receipt(_))),
@@ -693,6 +667,79 @@ async fn setup(config: &Config, channel: &Channel, token: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn initial_write_ranges(total: usize) -> impl Iterator<Item = Range<usize>> {
+    (0..total).step_by(INITIAL_WRITE_BATCH_SIZE).map(|first| {
+        let end = first.saturating_add(INITIAL_WRITE_BATCH_SIZE).min(total);
+        first..end
+    })
+}
+
+fn initial_operation_count(config: &Config) -> Result<usize> {
+    let marker_records = if config.mutation_workload == MutationWorkload::ProjectionPreserving {
+        data::PROJECTION_PRESERVING_MARKERS
+    } else {
+        0
+    };
+    let total = config
+        .stable_records
+        .checked_add(config.mutable_records)
+        .and_then(|total| total.checked_add(marker_records))
+        .context("initial qualification corpus size overflow")?;
+    usize::try_from(total).context("initial qualification corpus does not fit in memory indexes")
+}
+
+fn initial_operation(config: &Config, ordinal: u64) -> Result<BulkOperation> {
+    if ordinal < config.stable_records {
+        return Ok(put(
+            config,
+            data::stable_path(ordinal),
+            data::payload(
+                config.seed,
+                ordinal,
+                "stable",
+                0,
+                config.physical_recipe_count,
+            ),
+            format!("contention-initial-stable-{ordinal}"),
+        ));
+    }
+    let ordinal = ordinal - config.stable_records;
+    if ordinal < config.mutable_records {
+        return Ok(put(
+            config,
+            data::mutable_path(ordinal),
+            data::payload(
+                config.seed,
+                ordinal,
+                "mutable",
+                0,
+                config.physical_recipe_count,
+            ),
+            format!("contention-initial-mutable-{ordinal}"),
+        ));
+    }
+    let marker_ordinal = ordinal - config.mutable_records;
+    ensure!(
+        config.mutation_workload == MutationWorkload::ProjectionPreserving
+            && marker_ordinal < data::PROJECTION_PRESERVING_MARKERS,
+        "initial qualification operation ordinal is out of range"
+    );
+    let marker_id = data::marker_id(marker_ordinal);
+    Ok(put(
+        config,
+        data::marker_path(marker_ordinal),
+        data::payload_with_generations(
+            config.seed,
+            marker_id,
+            "marker",
+            0,
+            0,
+            config.physical_recipe_count,
+        ),
+        format!("contention-initial-marker-{marker_ordinal}"),
+    ))
 }
 
 async fn create_definitions(config: &Config, channel: &Channel, token: &str) -> Result<Vec<u64>> {
@@ -1325,11 +1372,12 @@ async fn execute_mutation(
     let mut operations = Vec::with_capacity(config.mutation_batch_size + 1);
     let mut operation_payload_bytes = Vec::with_capacity(config.mutation_batch_size + 1);
     for offset in 0..config.mutation_batch_size {
-        let ordinal = job
-            .sequence
-            .saturating_mul(config.mutation_batch_size as u64)
-            .saturating_add(offset as u64);
-        let id = ordinal % config.mutable_records;
+        let id = mutable_record_id(
+            job.sequence,
+            offset,
+            config.mutation_batch_size,
+            config.mutable_records,
+        );
         let payload = match config.mutation_workload {
             MutationWorkload::MaterialChange => data::payload_at_least(
                 config.seed,
@@ -1507,6 +1555,13 @@ async fn execute_mutation(
     })
 }
 
+fn mutable_record_id(sequence: u64, offset: usize, batch_size: usize, mutable_records: u64) -> u64 {
+    sequence
+        .saturating_mul(batch_size as u64)
+        .saturating_add(offset as u64)
+        % mutable_records
+}
+
 async fn wait_canary(
     channel: &Channel,
     token: &str,
@@ -1601,159 +1656,6 @@ fn record_mutation_failure(report: &mut MutationReport, failure: MutationRequest
     }
 }
 
-async fn load_authoritative_mutable_state(
-    config: &Config,
-    channels: &[Channel],
-    token: &str,
-) -> Result<Arc<BTreeMap<String, u64>>> {
-    let mut authority = BTreeMap::new();
-    let mut objects = object_client(channels[0].clone(), token)?;
-    for id in 0..config.mutable_records {
-        let path = data::mutable_path(id);
-        let head = objects
-            .head_object(HeadObjectRequest {
-                address: Some(ObjectAddress {
-                    tenant: config.tenant.clone(),
-                    bucket: config.bucket.clone(),
-                    path: path.clone(),
-                }),
-            })
-            .await?
-            .into_inner();
-        let version = match head.state.context("mutable head omitted state")? {
-            ObjectHeadState::Present(present) => present.version,
-            _ => bail!("mutable authority path {path} is not present"),
-        };
-        authority.insert(path, version);
-    }
-    Ok(Arc::new(authority))
-}
-
-async fn verify_final_mutable_state(
-    config: &Config,
-    names: &[String],
-    channels: &[Channel],
-    token: &str,
-    authority: Arc<BTreeMap<String, u64>>,
-) -> Result<(bool, Option<bool>, BTreeSet<u64>)> {
-    let deadline = Instant::now() + config.drain_timeout;
-    let mut nodes = BTreeSet::new();
-    let mut all_observed_tails_available = true;
-    let mut next = names.iter().cloned().enumerate();
-    let mut tasks = JoinSet::new();
-    loop {
-        while tasks.len() < config.query_max_in_flight {
-            let Some((position, name)) = next.next() else {
-                break;
-            };
-            let channel = channels[position % channels.len()].clone();
-            let token = token.to_owned();
-            let bucket = config.bucket.clone();
-            let visibility_poll = config.visibility_poll;
-            let request_timeout = config.request_timeout;
-            let expected_source_count = config.endpoints.len();
-            let authority = authority.clone();
-            tasks.spawn(async move {
-                verify_one_final_definition(
-                    channel,
-                    token,
-                    bucket,
-                    name,
-                    authority,
-                    deadline,
-                    visibility_poll,
-                    request_timeout,
-                    expected_source_count,
-                )
-                .await
-            });
-        }
-        let Some(completed) = tasks.join_next().await else {
-            break;
-        };
-        let (observed_tails_available, source_nodes) =
-            completed.context("final mutable verification task panicked")??;
-        all_observed_tails_available &= observed_tails_available;
-        nodes.extend(source_nodes);
-    }
-    Ok((true, all_observed_tails_available.then_some(true), nodes))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn verify_one_final_definition(
-    channel: Channel,
-    token: String,
-    bucket: String,
-    name: String,
-    authority: Arc<BTreeMap<String, u64>>,
-    deadline: Instant,
-    visibility_poll: Duration,
-    request_timeout: Duration,
-    expected_source_count: usize,
-) -> Result<(bool, BTreeSet<u64>)> {
-    let mut client = index_client(channel, &token)?;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        ensure!(
-            !remaining.is_zero(),
-            "index {name} did not converge to authoritative mutable state and zero lag"
-        );
-        let response = tokio::time::timeout(
-            remaining.min(request_timeout),
-            class_query(&mut client, &bucket, &name, "mutable", 1_000),
-        )
-        .await;
-        if let Ok(Ok(response)) = response {
-            let indexed = response
-                .hits
-                .iter()
-                .map(|hit| {
-                    Ok((
-                        hit.address
-                            .as_ref()
-                            .context("mutable query hit omitted address")?
-                            .path
-                            .clone(),
-                        hit.object_version,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>>>()?;
-            let exact = indexed.len() == response.hits.len() && indexed == *authority;
-            if let Some(freshness) = response.freshness {
-                let source_ids = freshness
-                    .sources
-                    .iter()
-                    .map(|source| source.node_id)
-                    .collect::<BTreeSet<_>>();
-                let healthy = freshness.initial_build_complete
-                    && !freshness.rebuilding
-                    && freshness.sources.len() == expected_source_count
-                    && source_ids.len() == expected_source_count
-                    && freshness
-                        .sources
-                        .iter()
-                        .all(|source| source.node_id != 0 && source.source_epoch.len() == 32);
-                let observed_tails_available = freshness
-                    .sources
-                    .iter()
-                    .all(|source| source.observed_tail.is_some());
-                let no_observed_lag = freshness.sources.iter().all(source_has_no_observed_lag);
-                if exact && healthy && no_observed_lag {
-                    return Ok((observed_tails_available, source_ids));
-                }
-            }
-        }
-        tokio::time::sleep(visibility_poll).await;
-    }
-}
-
-fn source_has_no_observed_lag(source: &IndexSourceFreshness) -> bool {
-    source.lag_hint == 0
-        && source
-            .observed_tail
-            .is_none_or(|tail| tail.checked_add(1) == Some(source.indexed_next_offset))
-}
-
 fn put(config: &Config, path: String, bytes: Vec<u8>, command_id: String) -> BulkOperation {
     BulkOperation {
         operation: Some(BulkOperationValue::Put(BulkPutRequest {
@@ -1822,6 +1724,19 @@ async fn query(
     value: Vec<u8>,
     limit: u32,
 ) -> Result<QueryIndexResponse> {
+    query_page(client, bucket, index_name, field, value, limit, Vec::new()).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn query_page(
+    client: &mut IndexClient,
+    bucket: &str,
+    index_name: &str,
+    field: &str,
+    value: Vec<u8>,
+    limit: u32,
+    page_token: Vec<u8>,
+) -> Result<QueryIndexResponse> {
     client
         .query_index(QueryIndexRequest {
             bucket: bucket.into(),
@@ -1839,7 +1754,7 @@ async fn query(
                 })),
             }),
             limit,
-            page_token: Vec::new(),
+            page_token,
             tenant: String::new(),
             required_freshness: None,
         })
