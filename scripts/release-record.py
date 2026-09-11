@@ -9,6 +9,7 @@ import json
 import pathlib
 import re
 import sys
+import tarfile
 from typing import Any
 
 
@@ -56,6 +57,45 @@ def sha256_file(path: str) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def archive_attestations(path: str, runnable: str, required_values: list[str]) -> dict[str, str]:
+    found: dict[str, str] = {}
+    subject = runnable.removeprefix("sha256:")
+
+    def strings(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            return [item for child in value.values() for item in strings(child)]
+        if isinstance(value, list):
+            return [item for child in value for item in strings(child)]
+        return []
+
+    with tarfile.open(path, "r:*") as archive:
+        index = json.load(archive.extractfile("index.json"))
+        all_attestations = [item for item in index.get("manifests", []) if item.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"]
+        referenced_attestations = [item for item in all_attestations if item.get("annotations", {}).get("vnd.docker.reference.digest") == runnable]
+        require(len(all_attestations) == len(referenced_attestations), "archive attestation references another subject")
+        for descriptor in referenced_attestations:
+            digest = descriptor.get("digest", "")
+            manifest_bytes = archive.extractfile("blobs/sha256/" + digest.removeprefix("sha256:")).read()
+            require("sha256:" + hashlib.sha256(manifest_bytes).hexdigest() == digest, "attestation manifest digest changed")
+            manifest = json.loads(manifest_bytes)
+            for layer in manifest.get("layers", []):
+                statement_digest = layer.get("digest", "")
+                statement_bytes = archive.extractfile("blobs/sha256/" + statement_digest.removeprefix("sha256:")).read()
+                require("sha256:" + hashlib.sha256(statement_bytes).hexdigest() == statement_digest, "attestation statement digest changed")
+                statement = json.loads(statement_bytes)
+                require(any(item.get("digest", {}).get("sha256") == subject for item in statement.get("subject", [])), "attestation subject changed")
+                predicate = statement.get("predicateType", "")
+                if predicate.startswith("https://slsa.dev/provenance/"):
+                    values = strings(statement)
+                    require(all(value in values for value in required_values), "provenance omits an exact build input")
+                    found["provenance"] = digest
+                elif predicate == "https://spdx.dev/Document":
+                    found["sbom"] = digest
+    return found
+
+
 def validate_identity(value: dict[str, Any], version: str, commit: str, label: str) -> None:
     require(value.get("version") == version, f"{label} version does not match {version}")
     require(value.get("source_commit") == commit, f"{label} source commit does not match {commit}")
@@ -73,9 +113,24 @@ def validate_image(value: dict[str, Any], version: str, commit: str) -> None:
         require(bool(SHA256.fullmatch(str(value.get(field, "")))), f"invalid release-image {field}")
     inputs = value.get("build_inputs")
     require(isinstance(inputs, dict), "release image build inputs are missing")
-    require(bool(re.fullmatch(r"rust:1\.96-trixie@sha256:[0-9a-f]{64}", str(inputs.get("builder_image", "")))), "builder image is not digest-pinned")
     require(bool(re.fullmatch(r"debian:trixie-slim@sha256:[0-9a-f]{64}", str(inputs.get("runtime_image", "")))), "runtime image is not digest-pinned")
     require(inputs.get("rust_toolchain") == "1.96.0", "release image Rust toolchain is not 1.96.0")
+    build_mode = inputs.get("build_mode", "container-native")
+    if build_mode == "container-native":
+        require(bool(re.fullmatch(r"rust:1\.96-trixie@sha256:[0-9a-f]{64}", str(inputs.get("builder_image", "")))), "builder image is not digest-pinned")
+        require(inputs.get("compiler", "cargo build") == "cargo build", "container image build must use cargo build")
+    elif build_mode == "prebuilt-native":
+        require(platform == "linux/arm64", "native prebuilt release input is only valid for linux/arm64")
+        require(inputs.get("compiler") == "cargo build", "native prebuilt release input must use cargo build")
+        require("builder_image" not in inputs, "prebuilt release input must not claim a builder image")
+        require(bool(re.fullmatch(r"debian:trixie-slim@sha256:[0-9a-f]{64}", str(inputs.get("package_image", "")))), "prebuilt package image is not digest-pinned")
+    elif build_mode == "prebuilt-zigbuild":
+        require(platform == "linux/amd64", "zigbuild release input is only valid for linux/amd64")
+        require(inputs.get("compiler") == "cargo zigbuild", "amd64 prebuilt release input must use cargo zigbuild")
+        require("builder_image" not in inputs, "prebuilt release input must not claim a builder image")
+        require(bool(re.fullmatch(r"debian:trixie-slim@sha256:[0-9a-f]{64}", str(inputs.get("package_image", "")))), "prebuilt package image is not digest-pinned")
+    else:
+        fail(f"unsupported release image build mode {build_mode!r}")
     binaries = value.get("binaries")
     require(isinstance(binaries, dict), "release image binaries are missing")
     for name in ("keldra-server", "keldra"):
@@ -83,18 +138,53 @@ def validate_image(value: dict[str, Any], version: str, commit: str) -> None:
         require(isinstance(binary, dict), f"release image is missing {name}")
         require(bool(SHA256.fullmatch(str(binary.get("sha256", "")))), f"invalid {name} SHA-256")
         require(binary.get("architecture") == architecture, f"{name} architecture does not match image")
+        if build_mode.startswith("prebuilt-"):
+            elf = binary.get("elf")
+            require(isinstance(elf, dict) and elf.get("format") == "elf64", f"{name} ELF evidence is missing")
+            require(elf.get("interpreter") in ("/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1"), f"{name} ELF interpreter is invalid")
+            require(isinstance(elf.get("needed"), list) and bool(elf["needed"]), f"{name} ELF dependencies are missing")
+    attestations = value.get("attestations")
+    require(isinstance(attestations, dict) and set(attestations) == {"provenance", "sbom"}, "release image requires provenance and SBOM attestations")
+    require(all(bool(SHA256.fullmatch(str(item))) for item in attestations.values()), "release image attestation digest is invalid")
+    if build_mode.startswith("prebuilt-"):
+        evidence = inputs.get("zrunner_evidence")
+        require(isinstance(evidence, dict), "prebuilt image is missing zrunner build evidence")
+        require(bool(re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", str(evidence.get("job_id", "")))), "invalid zrunner build job ID")
+        for field in ("job_sha256", "completion_sha256", "build_manifest_sha256", "sealed_input_sha256"):
+            require(bool(SHA256.fullmatch(str(evidence.get(field, "")))), f"invalid zrunner {field}")
+        command = inputs.get("command")
+        compiler = "zigbuild" if platform == "linux/amd64" else "build"
+        cargo_target = "x86_64-unknown-linux-gnu.2.17" if platform == "linux/amd64" else "aarch64-unknown-linux-gnu"
+        require(isinstance(command, list) and len(command) == 16, "prebuilt Cargo command is invalid")
+        expected_command = ["cargo", compiler, "--locked", "--release", "--jobs", command[5], "--target", cargo_target, "-p", "keldra-server", "--bin", "keldra-server", "-p", "keldra-cli", "--bin", "keldra"]
+        require(command == expected_command and command[5] in ("1", "2"), "prebuilt Cargo command changed")
+        toolchain = inputs.get("toolchain")
+        require(isinstance(toolchain, dict) and str(toolchain.get("rustc", "")).startswith("rustc 1.96.0 "), "prebuilt rustc version changed")
+        require(bool(COMMIT.fullmatch(str(toolchain.get("rustc_commit", "")))), "prebuilt rustc commit is invalid")
 
 
-def validate_three_node(value: dict[str, Any], version: str, commit: str, amd64: dict[str, Any]) -> None:
+def validate_three_node(value: dict[str, Any], version: str, commit: str, qualified_image: dict[str, Any]) -> None:
     require(value.get("schema") == "keldra.qualification-result.v1", "invalid three-node result schema")
     require(value.get("gate_id") == "three-node-release", "three-node result has the wrong gate ID")
     require(value.get("result") == "pass", "three-node release qualification did not pass")
     validate_identity(value, version, commit, "three-node result")
-    require(value.get("platform") == "linux/amd64", "three-node result must qualify linux/amd64")
-    require(value.get("oci_index_digest") == amd64["oci_index_digest"], "three-node result qualified a different OCI index")
-    require(value.get("runnable_manifest_digest") == amd64["runnable_manifest_digest"], "three-node result qualified a different runnable manifest")
-    require(str(value.get("run_id", "")).isdigit(), "three-node result is missing its run ID")
-    require(str(value.get("run_attempt", "")).isdigit(), "three-node result is missing its run attempt")
+    require(value.get("platform") == qualified_image["platform"], "three-node result platform changed")
+    require(value.get("oci_index_digest") == qualified_image["oci_index_digest"], "three-node result qualified a different OCI index")
+    require(value.get("runnable_manifest_digest") == qualified_image["runnable_manifest_digest"], "three-node result qualified a different runnable manifest")
+    executor = value.get("executor", "github-actions")
+    if executor == "github-actions":
+        require(value.get("platform") == "linux/amd64", "GitHub three-node qualification must remain amd64")
+        require(str(value.get("run_id", "")).isdigit(), "three-node result is missing its GitHub run ID")
+        require(str(value.get("run_attempt", "")).isdigit(), "three-node result is missing its GitHub run attempt")
+    elif executor == "local-zrunner":
+        evidence = value.get("zrunner_evidence")
+        require(isinstance(evidence, dict), "local three-node result is missing zrunner evidence")
+        require(bool(re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", str(evidence.get("job_id", "")))), "invalid local three-node job ID")
+        require(value.get("run_id") == evidence.get("job_id") and value.get("run_attempt") == 1, "local three-node run identity is inconsistent")
+        for field in ("job_sha256", "completion_sha256", "qualification_manifest_sha256"):
+            require(bool(SHA256.fullmatch(str(evidence.get(field, "")))), f"invalid local three-node {field}")
+    else:
+        fail(f"unsupported three-node executor {executor!r}")
 
 
 def expected_index_runners() -> dict[str, str]:
@@ -250,6 +340,53 @@ def image_command(args: argparse.Namespace) -> None:
     require(bool(SHA256.fullmatch(args.oci_index_digest)), "invalid OCI index digest")
     require(bool(SHA256.fullmatch(args.runnable_manifest_digest)), "invalid runnable manifest digest")
     target, architecture = TARGETS[args.platform]
+    build_inputs = {
+        "build_mode": args.build_mode,
+        "compiler": args.compiler,
+        "runtime_image": args.runtime_image,
+        "rust_toolchain": "1.96.0",
+    }
+    if args.builder_image:
+        build_inputs["builder_image"] = args.builder_image
+    if args.package_image:
+        build_inputs["package_image"] = args.package_image
+    input_manifest = read_json(args.input_manifest) if args.input_manifest else None
+    if input_manifest:
+        require(input_manifest.get("schema") == "keldra.release-image-input.v1", "invalid sealed image input")
+        validate_identity(input_manifest, args.version, args.commit, "sealed image input")
+        require(input_manifest.get("platform") == args.platform, "sealed image input platform changed")
+        require(input_manifest.get("build_mode") == args.build_mode, "sealed image input build mode changed")
+        build_inputs["command"] = input_manifest.get("command")
+        build_inputs["toolchain"] = input_manifest.get("toolchain")
+        build_inputs["zrunner_evidence"] = {
+            "job_id": input_manifest.get("zrunner_job_id"),
+            **input_manifest.get("evidence", {}),
+            "sealed_input_sha256": sha256_file(args.input_manifest),
+        }
+        require(sha256_file(args.server_binary) == input_manifest["binaries"]["keldra-server"]["sha256"], "server bytes do not match sealed input")
+        require(sha256_file(args.cli_binary) == input_manifest["binaries"]["keldra"]["sha256"], "CLI bytes do not match sealed input")
+    attestations = {}
+    for specification in args.attestation:
+        name, separator, digest = specification.partition("=")
+        require(separator == "=" and name in ("provenance", "sbom") and bool(SHA256.fullmatch(digest)), "attestation must use provenance|sbom=sha256:<digest>")
+        require(name not in attestations, f"duplicate {name} attestation")
+        attestations[name] = digest
+    required_provenance = [args.commit, args.runtime_image]
+    if args.builder_image:
+        required_provenance.append(args.builder_image)
+    if args.package_image:
+        required_provenance.append(args.package_image)
+    if input_manifest:
+        required_provenance.extend([
+            input_manifest["binaries"]["keldra-server"]["sha256"].removeprefix("sha256:"),
+            input_manifest["binaries"]["keldra"]["sha256"].removeprefix("sha256:"),
+            sha256_file(args.input_manifest).removeprefix("sha256:"),
+        ])
+    discovered_attestations = archive_attestations(args.oci_archive, args.runnable_manifest_digest, required_provenance)
+    if attestations:
+        require(attestations == discovered_attestations, "asserted attestation digests do not match parsed predicates")
+    else:
+        attestations = discovered_attestations
     value = {
         "schema": "keldra.release-image.v1",
         "version": args.version,
@@ -260,17 +397,59 @@ def image_command(args: argparse.Namespace) -> None:
         "oci_archive_sha256": sha256_file(args.oci_archive),
         "oci_index_digest": args.oci_index_digest,
         "runnable_manifest_digest": args.runnable_manifest_digest,
-        "build_inputs": {
-            "builder_image": args.builder_image,
-            "runtime_image": args.runtime_image,
-            "rust_toolchain": "1.96.0",
-        },
+        "build_inputs": build_inputs,
+        "attestations": attestations,
         "binaries": {
-            "keldra-server": {"sha256": sha256_file(args.server_binary), "architecture": architecture},
-            "keldra": {"sha256": sha256_file(args.cli_binary), "architecture": architecture},
+            "keldra-server": {"sha256": sha256_file(args.server_binary), "architecture": architecture, **({"elf": input_manifest["binaries"]["keldra-server"]["elf"]} if input_manifest else {})},
+            "keldra": {"sha256": sha256_file(args.cli_binary), "architecture": architecture, **({"elf": input_manifest["binaries"]["keldra"]["elf"]} if input_manifest else {})},
         },
     }
     validate_image(value, args.version, args.commit)
+    write_json(args.output, value)
+
+
+def three_node_command(args: argparse.Namespace) -> None:
+    image = read_json(args.image)
+    validate_image(image, args.version, args.commit)
+    job = read_json(args.zrunner_job)
+    completion = read_json(args.zrunner_completion)
+    run = read_json(args.qualification_manifest)
+    job_id = str(job.get("id", ""))
+    runner = job.get("runner")
+    require(job.get("schema") == "zrunner.job.v1" and isinstance(runner, str) and bool(runner) and job.get("profile") == "rust", "invalid local qualification job")
+    environment = job.get("env", {})
+    require(environment.get("CARGO_PROFILE_DEV_CODEGEN_BACKEND") == "llvm", "local qualification wrapper must explicitly select LLVM")
+    expected_target = f"/home/zcourts/projects/projects/build/{runner}/keldra"
+    require(environment.get("CARGO_TARGET_DIR") == expected_target, "local qualification Cargo target changed")
+    require(f"cargo-target:{runner}:keldra" in job.get("locks", []), "local qualification Cargo lock is missing")
+    require(job.get("argv") == ["./scripts/prepare-release-image-input.sh", "qualify", args.version, args.commit, args.image, args.oci_archive, args.qualification_manifest], "local qualification used the wrong entrypoint or inputs")
+    require(environment.get("KELDRA_ZRUNNER_JOB_ID") == job_id, "local qualification job ID binding changed")
+    require(completion.get("schema") == "zrunner.event.v1" and completion.get("job") == job_id and completion.get("runner") == runner and completion.get("state") == "completed" and bool(re.fullmatch(r"elapsed_ms=[0-9]+(?: exit_code=0)?", str(completion.get("detail", "")))), "local qualification did not complete successfully")
+    expected_hosts = {"linux/amd64": {"x86_64"}, "linux/arm64": {"aarch64", "arm64"}}
+    require(run.get("schema") == "keldra.local-three-node-run.v1" and run.get("result") == "pass" and run.get("platform") == image["platform"] and run.get("host_architecture") in expected_hosts[image["platform"]], "local qualification manifest is invalid")
+    require(run.get("version") == args.version and run.get("source_commit") == args.commit and run.get("zrunner_job_id") == job_id, "local qualification identity changed")
+    require(run.get("image_record_sha256") == sha256_file(args.image) and run.get("oci_archive_sha256") == image["oci_archive_sha256"], "local qualification input bytes changed")
+    require(run.get("oci_index_digest") == image["oci_index_digest"] and run.get("runnable_manifest_digest") == image["runnable_manifest_digest"], "local qualification image identity changed")
+    value = {
+        "schema": "keldra.qualification-result.v1",
+        "gate_id": "three-node-release",
+        "result": "pass",
+        "version": args.version,
+        "source_commit": args.commit,
+        "platform": image["platform"],
+        "oci_index_digest": image["oci_index_digest"],
+        "runnable_manifest_digest": image["runnable_manifest_digest"],
+        "executor": "local-zrunner",
+        "run_id": job_id,
+        "run_attempt": 1,
+        "zrunner_evidence": {
+            "job_id": job_id,
+            "job_sha256": sha256_file(args.zrunner_job),
+            "completion_sha256": sha256_file(args.zrunner_completion),
+            "qualification_manifest_sha256": sha256_file(args.qualification_manifest),
+        },
+    }
+    validate_three_node(value, args.version, args.commit, image)
     write_json(args.output, value)
 
 
@@ -284,7 +463,9 @@ def assemble_command(args: argparse.Namespace) -> None:
     require(set(by_platform) == set(TARGETS), "release record requires exactly linux/amd64 and linux/arm64")
     require(len(by_platform) == len(images), "release record contains a duplicate platform")
     three_node = read_json(args.three_node)
-    validate_three_node(three_node, args.version, args.commit, by_platform["linux/amd64"])
+    qualification_platform = three_node.get("platform")
+    require(qualification_platform in by_platform, "three-node result qualified an unknown platform")
+    validate_three_node(three_node, args.version, args.commit, by_platform[qualification_platform])
     prerelease = bool(re.search(r"[.-][0-9A-Za-z]", args.version.split(".", 2)[2]))
     package_paths: dict[str, str] = {}
     for specification in args.package_crate:
@@ -322,7 +503,10 @@ def verify_record(value: dict[str, Any], version: str, commit: str) -> None:
     qualification = value.get("qualification")
     require(isinstance(qualification, dict), "release record qualification is missing")
     require(set(qualification) == {"three_node"}, "release record qualification set is invalid")
-    validate_three_node(qualification.get("three_node", {}), version, commit, by_platform["linux/amd64"])
+    three_node = qualification.get("three_node", {})
+    qualification_platform = three_node.get("platform") if isinstance(three_node, dict) else None
+    require(qualification_platform in by_platform, "three-node result qualified an unknown platform")
+    validate_three_node(three_node, version, commit, by_platform[qualification_platform])
     expected_prerelease = bool(re.search(r"[.-][0-9A-Za-z]", version.split(".", 2)[2]))
     require(value.get("release") == {"prerelease": expected_prerelease, "make_latest": not expected_prerelease}, "release channel does not derive from candidate version")
     packages = value.get("packages")
@@ -349,13 +533,29 @@ def verify_command(args: argparse.Namespace) -> None:
         print(str(current).lower() if isinstance(current, bool) else current)
 
 
+def verify_image_command(args: argparse.Namespace) -> None:
+    value = read_json(args.record)
+    validate_image(value, args.version, args.commit)
+    require(value.get("platform") == args.platform, "release image platform changed")
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
     image = commands.add_parser("image")
-    for name in ("version", "commit", "platform", "oci-archive", "oci-index-digest", "runnable-manifest-digest", "builder-image", "runtime-image", "server-binary", "cli-binary", "output"):
+    for name in ("version", "commit", "platform", "oci-archive", "oci-index-digest", "runnable-manifest-digest", "runtime-image", "server-binary", "cli-binary", "output"):
         image.add_argument("--" + name, required=True)
+    image.add_argument("--build-mode", default="container-native")
+    image.add_argument("--compiler", default="cargo build")
+    image.add_argument("--builder-image")
+    image.add_argument("--package-image")
+    image.add_argument("--input-manifest")
+    image.add_argument("--attestation", action="append", default=[])
     image.set_defaults(function=image_command)
+    three_node = commands.add_parser("three-node")
+    for name in ("version", "commit", "image", "oci-archive", "qualification-manifest", "zrunner-job", "zrunner-completion", "output"):
+        three_node.add_argument("--" + name, required=True)
+    three_node.set_defaults(function=three_node_command)
     assemble = commands.add_parser("assemble")
     assemble.add_argument("--version", required=True)
     assemble.add_argument("--commit", required=True)
@@ -376,6 +576,10 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--commit", required=True)
     verify.add_argument("--print-field")
     verify.set_defaults(function=verify_command)
+    verify_image = commands.add_parser("verify-image")
+    for name in ("record", "version", "commit", "platform"):
+        verify_image.add_argument("--" + name, required=True)
+    verify_image.set_defaults(function=verify_image_command)
     return root
 
 

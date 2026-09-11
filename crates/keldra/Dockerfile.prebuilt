@@ -1,0 +1,100 @@
+# syntax=docker/dockerfile:1.7
+
+# This image path only packages release binaries built and qualified outside
+# Docker. Every RUN executes on BUILDPLATFORM; the target image is never
+# executed, so an amd64 image can be assembled on the Debian ARM64 controller
+# without QEMU.
+ARG KELDRA_PACKAGE_IMAGE=debian:trixie-slim
+ARG KELDRA_RUNTIME_IMAGE=debian:trixie-slim
+
+FROM --platform=$TARGETPLATFORM ${KELDRA_RUNTIME_IMAGE} AS runtime-base
+
+FROM --platform=$BUILDPLATFORM ${KELDRA_PACKAGE_IMAGE} AS runtime-packages
+ARG TARGETARCH
+RUN --mount=from=runtime-base,source=/var/lib/dpkg/status,target=/tmp/base-status,ro \
+    set -eux; \
+    mkdir -p /tmp/apt-state/lists/partial /tmp/debs/partial /runtime-overlay; \
+    cp /tmp/base-status /tmp/apt-state/status; \
+    apt-get update \
+      -o APT::Architecture="${TARGETARCH}" \
+      -o APT::Architectures::="${TARGETARCH}" \
+      -o Dir::State::status=/tmp/apt-state/status \
+      -o Dir::State::lists=/tmp/apt-state/lists; \
+    apt-get --download-only --no-install-recommends -y \
+      -o APT::Architecture="${TARGETARCH}" \
+      -o APT::Architectures::="${TARGETARCH}" \
+      -o Dir::State::status=/tmp/apt-state/status \
+      -o Dir::State::lists=/tmp/apt-state/lists \
+      -o Dir::Cache::archives=/tmp/debs \
+      install \
+      ca-certificates git libbz2-1.0 liblz4-1 libsnappy1v5 libssl3t64 \
+      libstdc++6 libzstd1 zlib1g; \
+    for package in /tmp/debs/*.deb; do dpkg-deb --extract "$package" /runtime-overlay; done; \
+    install -d /runtime-overlay/var/lib/dpkg; \
+    cp /tmp/apt-state/status /runtime-overlay/var/lib/dpkg/status; \
+    for package in /tmp/debs/*.deb; do \
+      dpkg-deb --field "$package" >>/runtime-overlay/var/lib/dpkg/status; \
+      printf '%s\n\n' 'Status: install ok installed' >>/runtime-overlay/var/lib/dpkg/status; \
+    done; \
+    mkdir -p /runtime-overlay/etc/ssl/certs /runtime-overlay/usr/share/doc/keldra; \
+    find /runtime-overlay/usr/share/ca-certificates -type f -name '*.crt' -print0 \
+      | sort -z \
+      | xargs -0 cat > /runtime-overlay/etc/ssl/certs/ca-certificates.crt; \
+    install -d -m 0755 -o 10001 -g 10001 /runtime-overlay/var/lib/keldra
+RUN --mount=from=runtime-base,source=/etc/passwd,target=/tmp/base-passwd,ro \
+    --mount=from=runtime-base,source=/etc/group,target=/tmp/base-group,ro \
+    cp /tmp/base-passwd /runtime-overlay/etc/passwd; \
+    cp /tmp/base-group /runtime-overlay/etc/group; \
+    printf '%s\n' 'keldra:x:10001:10001::/var/lib/keldra:/usr/sbin/nologin' \
+      >>/runtime-overlay/etc/passwd; \
+    printf '%s\n' 'keldra:x:10001:' >>/runtime-overlay/etc/group
+
+FROM --platform=$BUILDPLATFORM ${KELDRA_PACKAGE_IMAGE} AS verified-binaries
+ARG KELDRA_SERVER_SHA256
+ARG KELDRA_CLI_SHA256
+ARG KELDRA_INPUT_MANIFEST_SHA256
+COPY --from=keldra-binaries /keldra-server /verified/keldra-server
+COPY --from=keldra-binaries /keldra /verified/keldra
+COPY --from=keldra-binaries /input.json /verified/input.json
+RUN printf '%s  %s\n%s  %s\n%s  %s\n' \
+      "$KELDRA_SERVER_SHA256" /verified/keldra-server \
+      "$KELDRA_CLI_SHA256" /verified/keldra \
+      "$KELDRA_INPUT_MANIFEST_SHA256" /verified/input.json \
+      | sha256sum --check --strict
+
+FROM runtime-base
+ARG KELDRA_SOURCE_REVISION
+ARG KELDRA_SERVER_SHA256
+ARG KELDRA_CLI_SHA256
+ARG KELDRA_INPUT_MANIFEST_SHA256
+
+LABEL org.opencontainers.image.revision="${KELDRA_SOURCE_REVISION}"
+LABEL org.opencontainers.image.title="Keldra"
+LABEL org.opencontainers.image.source="https://github.com/keldra-store/keldra"
+LABEL io.keldra.binary.keldra-server.sha256="sha256:${KELDRA_SERVER_SHA256}"
+LABEL io.keldra.binary.keldra.sha256="sha256:${KELDRA_CLI_SHA256}"
+LABEL io.keldra.build-input.sha256="sha256:${KELDRA_INPUT_MANIFEST_SHA256}"
+
+COPY --from=runtime-packages /runtime-overlay/ /
+COPY --from=verified-binaries --chmod=0555 /verified/keldra-server /usr/local/bin/keldra-server
+COPY --from=verified-binaries --chmod=0555 /verified/keldra /usr/local/bin/keldra
+COPY LICENSE /usr/share/doc/keldra/LICENSE
+
+ENV KELDRA_LISTEN=0.0.0.0:50051 \
+    KELDRA_DATA_DIR=/var/lib/keldra \
+    HOME=/var/lib/keldra \
+    KELDRA_NODE_ID=1 \
+    KELDRA_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
+    KELDRA_MAX_ATOMIC_COMMIT_ENTRIES=4096 \
+    KELDRA_MAX_ATOMIC_COMMIT_BYTES=16777216 \
+    KELDRA_AWAITING_PUBLISH_TTL_SECONDS=86400 \
+    KELDRA_MUTATION_RECEIPT_RETENTION_SECONDS=86400 \
+    KELDRA_MAX_MUTATION_RECEIPT_ENTRIES=2000000 \
+    KELDRA_MAX_MUTATION_RECEIPT_BYTES=536870912 \
+    KELDRA_SOURCE_JOURNAL_MAX_ENTRIES=1000000 \
+    KELDRA_SOURCE_JOURNAL_MAX_BYTES=536870912
+USER 10001:10001
+WORKDIR /var/lib/keldra
+
+EXPOSE 50051 50052
+CMD ["keldra-server"]

@@ -15,7 +15,7 @@ for required in \
   'runner: ubuntu-24.04' \
   'runner: ubuntu-24.04-arm' \
   '--platform "$KELDRA_DOCKER_PLATFORM"' \
-  '--provenance=true' \
+  '--provenance=mode=max' \
   '--sbom=true' \
   '--output "type=oci,dest=${OCI_ARCHIVE}"' \
   'name: keldra-release-image-${{ matrix.arch }}' \
@@ -138,6 +138,8 @@ fi
 runner_target_setup='run: printf '\''CARGO_TARGET_DIR=%s\n'\'' "$RUNNER_TEMP/keldra-cargo-target" >> "$GITHUB_ENV"'
 host_target_overrides="$(
   grep -REn --exclude='check-release-image-surface.sh' \
+    --exclude='prepare-release-image-input.sh' \
+    --exclude='release-record.py' \
     --exclude='Dockerfile' \
     'CARGO_TARGET_DIR|--target-dir' \
     .cargo .github/workflows crates/keldra scripts |
@@ -229,11 +231,6 @@ if grep -Fq 'docs/dependency-licenses.md' crates/keldra/Dockerfile; then
   exit 1
 fi
 
-if [[ -e crates/keldra/Dockerfile.prebuilt ]]; then
-  echo "the prebuilt-binary image path must remain removed" >&2
-  exit 1
-fi
-
 for excluded_context in \
   '.git/' \
   '.idea/' \
@@ -250,10 +247,10 @@ do
 done
 
 if grep -REn \
-  'Dockerfile\.prebuilt|cargo-zigbuild|zigbuild|tmp/docker-bin|KELDRA_ZIG_TARGET|KELDRA_USE_NATIVE_CARGO|KELDRA_RUNTIME_BASE' \
+  'tmp/docker-bin|KELDRA_ZIG_TARGET|KELDRA_USE_NATIVE_CARGO|KELDRA_RUNTIME_BASE' \
   .github/workflows scripts/build-image.sh README.md .dockerignore crates/keldra/build-and-run.sh
 then
-  echo "image tooling must build from source in the target-platform Dockerfile" >&2
+  echo "obsolete image build escape hatch is present" >&2
   exit 1
 fi
 
@@ -281,6 +278,58 @@ grep -Fq -- '--build-arg "KELDRA_SOURCE_REVISION=${source_revision}"' scripts/bu
 grep -Fq -- '--build-arg "KELDRA_SOURCE_REVISION=${SOURCE_COMMIT}"' "${release_workflow}"
 grep -Fq -- '--build-arg "KELDRA_RUST_BUILDER_IMAGE=${KELDRA_RUST_BUILDER_IMAGE}"' "${release_workflow}"
 grep -Fq -- '--build-arg "KELDRA_RUNTIME_IMAGE=${KELDRA_RUNTIME_IMAGE}"' "${release_workflow}"
+
+prebuilt_dockerfile=crates/keldra/Dockerfile.prebuilt
+grep -Fq 'FROM --platform=$BUILDPLATFORM ${KELDRA_PACKAGE_IMAGE} AS runtime-packages' "$prebuilt_dockerfile"
+grep -Fq 'FROM --platform=$TARGETPLATFORM ${KELDRA_RUNTIME_IMAGE} AS runtime-base' "$prebuilt_dockerfile"
+grep -Fq 'FROM runtime-base' "$prebuilt_dockerfile"
+grep -Fq 'COPY --from=keldra-binaries /keldra-server' "$prebuilt_dockerfile"
+grep -Fq 'COPY --from=keldra-binaries /keldra ' "$prebuilt_dockerfile"
+grep -Fq 'io.keldra.binary.keldra-server.sha256=' "$prebuilt_dockerfile"
+grep -Fq 'io.keldra.binary.keldra.sha256=' "$prebuilt_dockerfile"
+grep -Fq 'io.keldra.build-input.sha256=' "$prebuilt_dockerfile"
+grep -Fq 'sha256sum --check --strict' "$prebuilt_dockerfile"
+grep -Fxq 'EXPOSE 50051 50052' "$prebuilt_dockerfile"
+final_stage_line="$(grep -nF 'FROM runtime-base' "$prebuilt_dockerfile" | cut -d: -f1)"
+if tail -n "+${final_stage_line}" "$prebuilt_dockerfile" | grep -Eq '^RUN[[:space:]]'; then
+  echo "prebuilt target image must not execute target-architecture commands" >&2
+  exit 1
+fi
+
+for helper in \
+  scripts/prepare-release-image-input.sh \
+  scripts/record-release-image-archive.sh \
+  scripts/publish-release-image-archives.sh
+do
+  if [[ ! -x "$helper" ]]; then
+    echo "local release image helper is not executable: $helper" >&2
+    exit 1
+  fi
+done
+grep -Fq 'build_mode == "prebuilt-zigbuild"' scripts/release-record.py
+grep -Fq 'platform == "linux/amd64"' scripts/release-record.py
+grep -Fq 'build_mode == "prebuilt-native"' scripts/release-record.py
+grep -Fq 'platform == "linux/arm64"' scripts/release-record.py
+grep -Fq 'inputs.get("package_image"' scripts/release-record.py
+grep -Fq -- '--provenance=mode=max' docs/release-process.md
+grep -Fq -- '--sbom=true' docs/release-process.md
+grep -Fq -- '--build-context "keldra-binaries=' docs/release-process.md
+grep -Fq 'KELDRA_INPUT_MANIFEST_SHA256' docs/release-process.md
+grep -Fq 'readelf --version-info' scripts/prepare-release-image-input.sh
+grep -Fq 'keldra.zrunner-release-build.v1' scripts/prepare-release-image-input.sh
+grep -Fq 'zrunner.job.v1' scripts/prepare-release-image-input.sh
+grep -Fq 'https://spdx.dev/Document' scripts/record-release-image-archive.sh
+grep -Fq 'https://slsa.dev/provenance/' scripts/record-release-image-archive.sh
+grep -Fq 'commands.add_parser("three-node")' scripts/release-record.py
+grep -Fq 'executor == "local-zrunner"' scripts/release-record.py
+if [[ "$(grep -Fc 'docker buildx imagetools create' scripts/publish-release-image-archives.sh)" != 1 ]]; then
+  echo "local publication must assemble exactly one multi-architecture image" >&2
+  exit 1
+fi
+if grep -Eq -- '--tag.*(amd64|arm64)' scripts/publish-release-image-archives.sh; then
+  echo "local publication must not create public per-architecture tags" >&2
+  exit 1
+fi
 
 for required in \
   'keldra.release-record.v1' \

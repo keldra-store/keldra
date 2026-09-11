@@ -178,7 +178,7 @@ jobs:
             --build-arg "KELDRA_SOURCE_REVISION=${SOURCE_COMMIT}" \
             --build-arg "KELDRA_RUST_BUILDER_IMAGE=${KELDRA_RUST_BUILDER_IMAGE}" \
             --build-arg "KELDRA_RUNTIME_IMAGE=${KELDRA_RUNTIME_IMAGE}" \
-            --provenance=true \
+            --provenance=mode=max \
             --sbom=true \
             --output "type=oci,dest=${OCI_ARCHIVE}" \
             --file crates/keldra/Dockerfile \

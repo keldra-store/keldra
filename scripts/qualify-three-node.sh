@@ -1065,6 +1065,7 @@ done
 echo "[keldra-qualification] rolling populated restart preserved replicated objects"
 assert_zero_accounting_traffic_drops
 qualification_disk_ledger_check
+assert_source_tree_exact
 
 if [[ "${qualification_mode}" == "release" ]]; then
   echo "[keldra-qualification] PASS release phases image=${image_id} platform=${KELDRA_DOCKER_PLATFORM}"
