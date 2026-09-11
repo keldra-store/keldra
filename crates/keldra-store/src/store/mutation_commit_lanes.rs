@@ -7,7 +7,8 @@ use tokio::sync::{
     Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore,
 };
 
-use super::{DefinitionMutationIntent, PreparedOperation, receipt_key};
+use super::{PreparedOperation, receipt_key};
+use crate::DefinitionMutationIntent;
 
 const CONFLICT_STRIPES_PER_COMMIT_LANE: usize = 64;
 
