@@ -17,6 +17,8 @@ use crate::authorization::ObjectPermission;
 use crate::cluster_peer::ClusterPeerTransport;
 use crate::object_distribution::ObjectDistribution;
 
+const LOCAL_COORDINATOR_LANES: usize = 4;
+
 /// Validates a bulk item without cloning its payload so a locally-coordinated
 /// item can move the original bytes directly into the storage batch.
 pub(super) fn validate_operation(
@@ -165,15 +167,18 @@ pub(super) async fn execute_coordinator_groups(
     route_budget: Duration,
 ) -> Result<Vec<BulkOutcome>, Status> {
     let mut tasks = tokio::task::JoinSet::new();
-    if !local_operations.is_empty() {
+    for (lane_indices, lane_operations) in
+        partition_local_operations(local_indices, local_operations, LOCAL_COORDINATOR_LANES)
+    {
+        let distribution = distribution.clone();
         tasks.spawn(async move {
             let outcomes = distribution
-                .mutate_many_with_definition_intents(local_operations)
+                .mutate_many_with_definition_intents(lane_operations)
                 .await
                 .into_iter()
-                .enumerate()
-                .map(|(index, result)| BulkOutcome {
-                    index: local_indices[index] as u32,
+                .zip(lane_indices)
+                .map(|(result, original_index)| BulkOutcome {
+                    index: original_index as u32,
                     outcome: Some(match result {
                         Ok(receipt) => Outcome::Receipt(api_receipt(receipt)),
                         Err(error) => Outcome::Failure(api_mutation_failure(error)),
@@ -246,6 +251,52 @@ pub(super) async fn execute_coordinator_groups(
     Ok(outcomes)
 }
 
+type LocalOperation = (BatchOperation, Option<DefinitionMutationIntent>);
+
+fn operation_key(operation: &BatchOperation) -> &ObjectKey {
+    match operation {
+        BatchOperation::Put(request) => &request.key,
+        BatchOperation::Publish(request) => &request.key,
+        BatchOperation::Clone(request) => &request.destination,
+        BatchOperation::Delete(request) => &request.key,
+    }
+}
+
+/// Splits one locally coordinated RPC into bounded exact-path lanes. Repeated
+/// paths stay in their original input order in one lane; independent paths can
+/// enter the store concurrently. The store remains the authority for broader
+/// conflicts such as clone source paths, command receipts and blob references.
+fn partition_local_operations(
+    indices: Vec<usize>,
+    operations: Vec<LocalOperation>,
+    lane_count: usize,
+) -> Vec<(Vec<usize>, Vec<LocalOperation>)> {
+    debug_assert_eq!(indices.len(), operations.len());
+    if operations.is_empty() {
+        return Vec::new();
+    }
+    let lane_count = lane_count.max(1).min(operations.len());
+    let mut lanes = (0..lane_count)
+        .map(|_| (Vec::new(), Vec::new()))
+        .collect::<Vec<_>>();
+    let mut assignments = BTreeMap::<ObjectKey, usize>::new();
+    let mut next_lane = 0_usize;
+    for (index, operation) in indices.into_iter().zip(operations) {
+        let key = operation_key(&operation.0).clone();
+        let lane = *assignments.entry(key).or_insert_with(|| {
+            let assigned = next_lane;
+            next_lane = (next_lane + 1) % lane_count;
+            assigned
+        });
+        lanes[lane].0.push(index);
+        lanes[lane].1.push(operation);
+    }
+    lanes
+        .into_iter()
+        .filter(|(_, operations)| !operations.is_empty())
+        .collect()
+}
+
 fn remap_remote_outcomes(
     routed: Vec<BulkOutcome>,
     original_indices: &[usize],
@@ -283,6 +334,40 @@ mod tests {
             index,
             outcome: Some(Outcome::Receipt(MutationReceipt::default())),
         }
+    }
+
+    fn local_put(path: &str) -> LocalOperation {
+        (
+            BatchOperation::Put(keldra_store::PutRequest {
+                key: ObjectKey::new("tenant", "bucket", path).unwrap(),
+                bytes: Vec::new(),
+                content_type: None,
+                mode: keldra_store::PutMode::Put,
+                command_id: None,
+                durability: keldra_store::Durability::Local,
+            }),
+            None,
+        )
+    }
+
+    #[test]
+    fn local_partition_keeps_same_path_input_order_and_balances_independent_paths() {
+        let lanes = partition_local_operations(
+            vec![7, 8, 9, 10, 11],
+            vec![
+                local_put("same"),
+                local_put("a"),
+                local_put("same"),
+                local_put("b"),
+                local_put("c"),
+            ],
+            3,
+        );
+
+        assert_eq!(lanes.len(), 3);
+        assert_eq!(lanes[0].0, vec![7, 9, 11]);
+        assert_eq!(lanes[1].0, vec![8]);
+        assert_eq!(lanes[2].0, vec![10]);
     }
 
     #[test]
