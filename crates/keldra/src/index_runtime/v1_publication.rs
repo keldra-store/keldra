@@ -7,14 +7,8 @@ use std::io::Read;
 
 use bytes::Bytes;
 use keldra_index::v1::{
-    CanonicalRecipeState, ComponentIdentity, ComponentRecordLookup, ComponentStreamReverseCursor,
-    ComponentStreamReverseStep, ComponentStreamRoot, PreparedAtomicProjectionGeneration,
-    PreparedQueryMutationBatch, ProjectedDocumentState, ProjectionCatalogActivation,
-    ProjectionCurrent, ProjectionFamilyPartitionDirectory, ProjectionGeneration,
-    ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits, QueryBlockLimits,
-    QueryRunPage, StableDocumentKey, component_stream_child_hashes, decode_document_head,
-    decode_projection_catalog_activation, decode_projection_current,
-    decode_projection_family_directory, decode_projection_generation,
+    component_stream_child_hashes, decode_document_head, decode_projection_catalog_activation,
+    decode_projection_current, decode_projection_family_directory, decode_projection_generation,
     decode_projection_generation_header, decode_query_run_page, decode_source_records,
     encode_projection_catalog_activation, encode_projection_family_directory,
     lookup_component_record_in_verified_pack, prepare_atomic_projection_generation,
@@ -22,30 +16,36 @@ use keldra_index::v1::{
     projection_catalog_routing_id, projection_component_page_path, projection_current_path,
     projection_family_directory_path, projection_generation_path, projection_pack_path,
     projection_query_run_pack_path, projection_query_run_stream_page_path, projection_routing_id,
-    projection_stream_page_path,
+    projection_stream_page_path, CanonicalRecipeState, ComponentIdentity, ComponentRecordLookup,
+    ComponentStreamReverseCursor, ComponentStreamReverseStep, ComponentStreamRoot,
+    PreparedAtomicProjectionGeneration, PreparedQueryMutationBatch, ProjectedDocumentState,
+    ProjectionCatalogActivation, ProjectionCurrent, ProjectionFamilyPartitionDirectory,
+    ProjectionGeneration, ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits,
+    QueryBlockLimits, QueryRunPage, StableDocumentKey,
 };
 use keldra_store::{
-    BlobRef, MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES, MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS,
-    MutationError, ObjectKey, PAYLOAD_ARTIFACT_CHUNK_BYTES, Store, VersionId,
+    BlobRef, MutationError, ObjectKey, Store, VersionId, MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES,
+    MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS, PAYLOAD_ARTIFACT_CHUNK_BYTES,
 };
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
 
 use super::publication::{DerivedArtifactAdmission, IndexArtifactPublish, IndexArtifactRouter};
+use super::v1_artifact_cache::ImmutableArtifactCache;
 use super::v1_compaction::{V1CompactionArtifacts, V1CompactionBase};
 
 const MAX_STREAM_PAGE_BYTES: usize = 32 * 1024;
 const MAX_GENERATION_BYTES: usize = 256 * 1024;
 const MAX_FAMILY_DIRECTORY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CATALOG_ACTIVATION_BYTES: usize = 32 * 1024 * 1024;
-
 #[derive(Clone)]
 pub(crate) struct V1ProjectionPublisher {
     store: Store,
     reader: ClusterObjectReader,
     artifacts: IndexArtifactRouter,
     changes: tokio::sync::broadcast::Sender<()>,
+    immutable_cache: ImmutableArtifactCache,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +111,7 @@ impl V1ProjectionPublisher {
             reader,
             artifacts,
             changes,
+            immutable_cache: ImmutableArtifactCache::default(),
         }
     }
 
@@ -788,14 +789,14 @@ impl V1ProjectionPublisher {
             match cursor.next().map_err(index_status)? {
                 ComponentStreamReverseStep::LoadPage { hash } => {
                     let path = projection_stream_page_path(generation.partition, hash);
-                    let (bytes, _) = self
-                        .read_object(
+                    let bytes = self
+                        .read_immutable_object(
                             storage_tenant,
                             bucket,
                             tenant_id,
                             bucket_id,
                             &path,
-                            Some(hash),
+                            hash,
                             MAX_STREAM_PAGE_BYTES,
                         )
                         .await?
@@ -808,14 +809,14 @@ impl V1ProjectionPublisher {
                     }
                     let path = projection_pack_path(generation.partition, descriptor.pack_hash);
                     let maximum = 64 * 1024 * 1024;
-                    let (bytes, _) = self
-                        .read_object(
+                    let bytes = self
+                        .read_immutable_object(
                             storage_tenant,
                             bucket,
                             tenant_id,
                             bucket_id,
                             &path,
-                            Some(descriptor.pack_hash),
+                            descriptor.pack_hash,
                             maximum,
                         )
                         .await?
@@ -1149,6 +1150,46 @@ impl V1ProjectionPublisher {
             .stage_derived_progress_blob(bytes)
             .await
             .map_err(|error| Status::unavailable(error.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_immutable_object(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        path: &str,
+        expected_hash: [u8; 32],
+        maximum_bytes: usize,
+    ) -> Result<Option<Bytes>, Status> {
+        // Keep reuse inside the same authoritative object path. A content hash
+        // alone must not allow another tenant, bucket, family, or artifact kind
+        // to satisfy this read.
+        if let Some(bytes) =
+            self.immutable_cache
+                .get(tenant_id, bucket_id, path, expected_hash, maximum_bytes)?
+        {
+            return Ok(Some(bytes));
+        }
+        let Some((bytes, _)) = self
+            .read_object(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                path,
+                Some(expected_hash),
+                maximum_bytes,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let bytes = Bytes::from(bytes);
+        self.immutable_cache
+            .insert(tenant_id, bucket_id, path, expected_hash, bytes.clone());
+        Ok(Some(bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1638,10 +1679,10 @@ fn index_status(error: keldra_index::IndexError) -> Status {
 #[cfg(test)]
 mod tests {
     use keldra_index::v1::{
-        IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage,
-        PreparedQueryMembershipDelta, PreparedQueryMutationBatch, ProjectionPackCredits,
-        QueryBlockCredits, QueryBlockLimits, QueryDocumentGate, RecipeIdentity, StableDocumentKey,
-        prepare_atomic_projection_generation,
+        prepare_atomic_projection_generation, IndexingMemoryCredits, IndexingMemoryLimits,
+        IndexingMemoryStage, PreparedQueryMembershipDelta, PreparedQueryMutationBatch,
+        ProjectionPackCredits, QueryBlockCredits, QueryBlockLimits, QueryDocumentGate,
+        RecipeIdentity, StableDocumentKey,
     };
 
     use super::*;

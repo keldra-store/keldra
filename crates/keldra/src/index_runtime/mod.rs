@@ -20,6 +20,7 @@ pub(crate) mod scanner;
 pub(crate) mod source;
 pub(crate) mod typed_json_schema;
 pub(crate) mod v1_atomic_dispatch;
+mod v1_artifact_cache;
 pub(crate) mod v1_backfill;
 pub(crate) mod v1_catalog_lifecycle;
 pub(crate) mod v1_compaction;
