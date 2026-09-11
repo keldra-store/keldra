@@ -60,11 +60,13 @@ impl IndexQueryMemoryBudget {
     }
 
     pub(crate) fn maximum_bounded_lease(&self, maximum_bytes: u64) -> u64 {
-        maximum_bytes.min(self.fair_share_bytes.max(
-            self.memory
-                .hard_limit()
-                .saturating_sub(self.memory.share(WorkingMemoryAccount::IndexingPipeline)),
-        ))
+        maximum_bytes.min(
+            self.fair_share_bytes.max(
+                self.memory
+                    .hard_limit()
+                    .saturating_sub(self.memory.share(WorkingMemoryAccount::IndexingPipeline)),
+            ),
+        )
     }
 
     /// Wait for the mandatory query reservation, then borrow any permits which

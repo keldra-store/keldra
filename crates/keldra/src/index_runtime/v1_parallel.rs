@@ -131,11 +131,7 @@ mod tests {
                 async move {
                     tokio::task::yield_now().await;
                     completed.fetch_add(1, Ordering::AcqRel);
-                    if value == 2 {
-                        Err(value)
-                    } else {
-                        Ok(value)
-                    }
+                    if value == 2 { Err(value) } else { Ok(value) }
                 }
             }
         })

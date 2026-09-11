@@ -72,8 +72,7 @@ fn lookup_rejects_a_wrong_component_and_record_count() {
 #[test]
 fn lookup_stops_after_an_early_match() {
     let component = ComponentIdentity::DocumentHead;
-    let (descriptor, mut pack) =
-        packed(component, &[(1, Some(b"first")), (2, Some(b"second"))]);
+    let (descriptor, mut pack) = packed(component, &[(1, Some(b"first")), (2, Some(b"second"))]);
     let second_key = pack
         .windows(32)
         .rposition(|window| window == [2_u8; 32])

@@ -131,12 +131,7 @@ impl V1IndexProducerTask {
         let mut catalog_changes = catalog.subscribe();
         let mut publication_changes = publisher.subscribe();
         let mut journal_changes = hot.subscribe();
-        let extractor = V1ProjectionExtractor::new(
-            reader.clone(),
-            cpu,
-            hot,
-            limits.worker_bytes,
-        );
+        let extractor = V1ProjectionExtractor::new(reader.clone(), cpu, hot, limits.worker_bytes);
         let task = tokio::spawn(async move {
             let mut writers = BTreeMap::new();
             loop {
@@ -308,11 +303,8 @@ async fn reconcile(
                 .remove(&partition)
                 .expect("assigned v1 writer was opened");
             let mut writer_limits = limits;
-            writer_limits.parallelism = partition_lane_parallelism(
-                limits.parallelism,
-                active_writers,
-                ordinal,
-            );
+            writer_limits.parallelism =
+                partition_lane_parallelism(limits.parallelism, active_writers, ordinal);
             (partition, (writer, writer_limits))
         })
         .collect();

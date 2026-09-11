@@ -7,8 +7,14 @@ use std::io::Read;
 
 use bytes::Bytes;
 use keldra_index::v1::{
-    component_stream_child_hashes, decode_document_head, decode_projection_catalog_activation,
-    decode_projection_current, decode_projection_family_directory, decode_projection_generation,
+    CanonicalRecipeState, ComponentIdentity, ComponentRecordLookup, ComponentStreamReverseCursor,
+    ComponentStreamReverseStep, ComponentStreamRoot, PreparedAtomicProjectionGeneration,
+    PreparedQueryMutationBatch, ProjectedDocumentState, ProjectionCatalogActivation,
+    ProjectionCurrent, ProjectionFamilyPartitionDirectory, ProjectionGeneration,
+    ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits, QueryBlockLimits,
+    QueryRunPage, StableDocumentKey, component_stream_child_hashes, decode_document_head,
+    decode_projection_catalog_activation, decode_projection_current,
+    decode_projection_family_directory, decode_projection_generation,
     decode_projection_generation_header, decode_query_run_page, decode_source_records,
     encode_projection_catalog_activation, encode_projection_family_directory,
     lookup_component_record_in_verified_pack, prepare_atomic_projection_generation,
@@ -16,16 +22,11 @@ use keldra_index::v1::{
     projection_catalog_routing_id, projection_component_page_path, projection_current_path,
     projection_family_directory_path, projection_generation_path, projection_pack_path,
     projection_query_run_pack_path, projection_query_run_stream_page_path, projection_routing_id,
-    projection_stream_page_path, CanonicalRecipeState, ComponentIdentity, ComponentRecordLookup,
-    ComponentStreamReverseCursor, ComponentStreamReverseStep, ComponentStreamRoot,
-    PreparedAtomicProjectionGeneration, PreparedQueryMutationBatch, ProjectedDocumentState,
-    ProjectionCatalogActivation, ProjectionCurrent, ProjectionFamilyPartitionDirectory,
-    ProjectionGeneration, ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits,
-    QueryBlockLimits, QueryRunPage, StableDocumentKey,
+    projection_stream_page_path,
 };
 use keldra_store::{
-    BlobRef, MutationError, ObjectKey, Store, VersionId, MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES,
-    MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS, PAYLOAD_ARTIFACT_CHUNK_BYTES,
+    BlobRef, MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES, MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS,
+    MutationError, ObjectKey, PAYLOAD_ARTIFACT_CHUNK_BYTES, Store, VersionId,
 };
 use tonic::Status;
 
@@ -1702,10 +1703,10 @@ fn index_status(error: keldra_index::IndexError) -> Status {
 #[cfg(test)]
 mod tests {
     use keldra_index::v1::{
-        prepare_atomic_projection_generation, IndexingMemoryCredits, IndexingMemoryLimits,
-        IndexingMemoryStage, PreparedQueryMembershipDelta, PreparedQueryMutationBatch,
-        ProjectionPackCredits, QueryBlockCredits, QueryBlockLimits, QueryDocumentGate,
-        RecipeIdentity, StableDocumentKey,
+        IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage,
+        PreparedQueryMembershipDelta, PreparedQueryMutationBatch, ProjectionPackCredits,
+        QueryBlockCredits, QueryBlockLimits, QueryDocumentGate, RecipeIdentity, StableDocumentKey,
+        prepare_atomic_projection_generation,
     };
 
     use super::*;

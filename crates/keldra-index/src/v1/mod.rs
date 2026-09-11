@@ -114,8 +114,7 @@ pub use stream::{
     append_component_delta, append_component_stream, build_component_stream,
     compact_component_runs, component_stream_child_hashes, decode_component_stream,
     lookup_component_record_in_verified_pack, resolve_component_record_from_verified_artifacts,
-    select_component_compaction,
-    splice_compacted_component_runs,
+    select_component_compaction, splice_compacted_component_runs,
 };
 pub use typed_document::{
     PreparedTypedJsonDocument, TypedJsonDocumentInput, TypedJsonSelectedField,

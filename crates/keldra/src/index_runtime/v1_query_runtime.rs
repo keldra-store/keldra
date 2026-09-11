@@ -749,10 +749,7 @@ fn next_query_memory_lease(current: u64, required: usize, maximum: u64) -> Resul
             "v1 query requires more than the bounded per-query memory maximum",
         ));
     }
-    let geometric = current
-        .checked_mul(2)
-        .unwrap_or(maximum)
-        .min(maximum);
+    let geometric = current.checked_mul(2).unwrap_or(maximum).min(maximum);
     let next = geometric.max(required);
     if next <= current {
         return Err(Status::internal(
@@ -1028,12 +1025,8 @@ mod tests {
             32 * 1024 * 1024
         );
         assert_eq!(
-            next_query_memory_lease(
-                16 * 1024 * 1024,
-                40 * 1024 * 1024,
-                MAX_QUERY_MEMORY_BYTES,
-            )
-            .unwrap(),
+            next_query_memory_lease(16 * 1024 * 1024, 40 * 1024 * 1024, MAX_QUERY_MEMORY_BYTES,)
+                .unwrap(),
             40 * 1024 * 1024
         );
     }
@@ -1042,12 +1035,8 @@ mod tests {
     fn adaptive_query_growth_is_bounded_by_retry_count_and_memory_maximum() {
         let mut lease = MIN_QUERY_MEMORY_BYTES;
         for _ in 0..4 {
-            lease = next_query_memory_lease(
-                lease,
-                (lease + 1) as usize,
-                MAX_QUERY_MEMORY_BYTES,
-            )
-            .unwrap();
+            lease = next_query_memory_lease(lease, (lease + 1) as usize, MAX_QUERY_MEMORY_BYTES)
+                .unwrap();
         }
         assert_eq!(lease, MAX_QUERY_MEMORY_BYTES);
         assert_eq!(
@@ -1056,8 +1045,8 @@ mod tests {
                 (MAX_QUERY_MEMORY_BYTES + 1) as usize,
                 MAX_QUERY_MEMORY_BYTES,
             )
-                .unwrap_err()
-                .code(),
+            .unwrap_err()
+            .code(),
             tonic::Code::ResourceExhausted
         );
     }
