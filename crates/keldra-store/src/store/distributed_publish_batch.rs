@@ -1208,8 +1208,8 @@ mod tests {
         }
 
         let identity = BucketIdentity {
-            tenant_id,
-            bucket_id,
+            tenant_id: TenantId(tenant_id),
+            bucket_id: BucketId(bucket_id),
         };
         let head_key = identity.head_key("objects/raced");
         store
