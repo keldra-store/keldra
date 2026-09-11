@@ -121,10 +121,11 @@ pub(crate) const CF_DEFINITION_STATE: &str = "definition_state";
 pub(crate) const CF_JOURNAL_ROUTES: &str = "journal_routes";
 pub(crate) const CF_OBJECT_ALIAS_REGISTRIES: &str = "object_alias_registries";
 pub(crate) const VERSION_HIGH_WATERMARK_KEY: &[u8] = b"version_high_watermark";
-const INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY: &[u8] = b"integrated_payload_storage_format";
-const INTEGRATED_PAYLOAD_STORAGE_FORMAT: u8 = 2;
-const DURABLE_MUTATION_RECORD_FORMAT_KEY: &[u8] = b"durable_mutation_record_format";
-const DURABLE_MUTATION_RECORD_FORMAT: u8 = 2;
+const INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY: &[u8] =
+    b"integrated_payload_storage_format_current_v1";
+const INTEGRATED_PAYLOAD_STORAGE_FORMAT: u8 = 1;
+const DURABLE_MUTATION_RECORD_FORMAT_KEY: &[u8] = b"durable_mutation_record_format_current_v1";
+const DURABLE_MUTATION_RECORD_FORMAT: u8 = 1;
 const MUTATION_RECEIPT_STATUS_KEY: &[u8] = b"mutation_receipt_status";
 const RECEIPT_RECORD_PREFIX: u8 = 0;
 const RECEIPT_EXPIRY_PREFIX: u8 = 1;
@@ -1009,8 +1010,12 @@ impl Store {
             .get_cf(metadata_cf, VERSION_HIGH_WATERMARK_KEY)?
             .map(|encoded| serde_json::from_slice::<VersionId>(&encoded))
             .transpose()?;
-        let (watch_source_epoch, watch_token_key) =
-            initialize_local_watch_metadata(&db, metadata_cf, options.node_id, options.sync_writes)?;
+        let (watch_source_epoch, watch_token_key) = initialize_local_watch_metadata(
+            &db,
+            metadata_cf,
+            options.node_id,
+            options.sync_writes,
+        )?;
         initialize_mutation_receipt_metadata(&db, metadata_cf, options.sync_writes)?;
         let db = Arc::new(db);
         let blobs = BlobStore::new(options.pending_upload_max_bytes)?;

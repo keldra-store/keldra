@@ -134,7 +134,7 @@ async fn existing_store_without_the_integrated_format_marker_is_rejected() {
 }
 
 #[tokio::test]
-async fn v1_integrated_payload_format_is_rejected_without_migration() {
+async fn pre_current_integrated_payload_layout_is_rejected_without_migration() {
     let temporary = tempfile::tempdir().unwrap();
     let options = StoreOptions::new(temporary.path(), 1);
     let store = Store::open(options.clone()).await.unwrap();
@@ -142,8 +142,15 @@ async fn v1_integrated_payload_format_is_rejected_without_migration() {
         .db
         .put_cf(
             store.cf(CF_METADATA).unwrap(),
-            INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY,
+            b"integrated_payload_storage_format",
             [1],
+        )
+        .unwrap();
+    store
+        .db
+        .delete_cf(
+            store.cf(CF_METADATA).unwrap(),
+            INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY,
         )
         .unwrap();
     drop(store);
@@ -151,12 +158,12 @@ async fn v1_integrated_payload_format_is_rejected_without_migration() {
     let error = Store::open(options)
         .await
         .err()
-        .expect("v1 integrated storage marker must fail");
+        .expect("pre-current integrated storage marker must fail");
 
     assert!(
         error
             .to_string()
-            .contains("integrated payload storage format marker is unsupported")
+            .contains("has no integrated payload storage marker")
     );
 }
 
@@ -187,7 +194,7 @@ async fn existing_store_without_the_durable_mutation_record_marker_is_rejected()
 }
 
 #[tokio::test]
-async fn v1_durable_mutation_record_format_is_rejected_without_migration() {
+async fn pre_current_durable_mutation_layout_is_rejected_without_migration() {
     let temporary = tempfile::tempdir().unwrap();
     let options = StoreOptions::new(temporary.path(), 1);
     let store = Store::open(options.clone()).await.unwrap();
@@ -195,8 +202,15 @@ async fn v1_durable_mutation_record_format_is_rejected_without_migration() {
         .db
         .put_cf(
             store.cf(CF_METADATA).unwrap(),
-            DURABLE_MUTATION_RECORD_FORMAT_KEY,
+            b"durable_mutation_record_format",
             [1],
+        )
+        .unwrap();
+    store
+        .db
+        .delete_cf(
+            store.cf(CF_METADATA).unwrap(),
+            DURABLE_MUTATION_RECORD_FORMAT_KEY,
         )
         .unwrap();
     drop(store);
@@ -204,12 +218,12 @@ async fn v1_durable_mutation_record_format_is_rejected_without_migration() {
     let error = Store::open(options)
         .await
         .err()
-        .expect("v1 durable mutation record marker must fail");
+        .expect("pre-current durable mutation record marker must fail");
 
     assert!(
         error
             .to_string()
-            .contains("durable mutation record format marker is unsupported")
+            .contains("has no durable mutation record format marker")
     );
 }
 
