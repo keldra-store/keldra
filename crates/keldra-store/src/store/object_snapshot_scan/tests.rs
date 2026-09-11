@@ -1,3 +1,5 @@
+use crate::store::CF_METADATA;
+use crate::watch::LOCAL_INVALIDATION_EPOCH_KEY;
 use crate::{
     BatchOperation, DeleteRequest, Durability, ObjectKey, ObjectMutationContext, PlacementLogId,
     Precondition, PutMode, PutRequest, StoreOptions,
