@@ -9,7 +9,8 @@ source "${script_root}/qualification-disk-ledger.sh"
 # attestable kit beneath ~/keldra_experiments/kit. Durable state and evidence
 # are confined to ~/keldra_experiments.
 
-experiment_root="${KELDRA_V1_SCALE_EXPERIMENT_ROOT:-${HOME}/keldra_experiments}"
+experiment_root="$(readlink -m -- "${KELDRA_V1_SCALE_EXPERIMENT_ROOT:-${HOME}/keldra_experiments}")"
+allowed_experiment_root="$(readlink -m -- "${HOME}/keldra_experiments")"
 kit_root="${KELDRA_V1_SCALE_KIT_ROOT:-${experiment_root}/kit}"
 results_root="${experiment_root}/results/index-v1-scale"
 work_root="${experiment_root}/work/index-v1-scale"
@@ -72,7 +73,7 @@ case "${mode}" in
 esac
 
 case "${experiment_root}" in
-  "${HOME}/keldra_experiments") ;;
+  "${allowed_experiment_root}"|"${allowed_experiment_root}/"*) ;;
   *) echo "experiment root escaped HOME/keldra_experiments" >&2; exit 2 ;;
 esac
 case "${keep_work}" in 0|1) ;; *) echo "KELDRA_V1_SCALE_KEEP_WORK must be 0 or 1" >&2; exit 2 ;; esac
