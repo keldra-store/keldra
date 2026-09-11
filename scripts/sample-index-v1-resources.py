@@ -87,7 +87,7 @@ def require_same_process(previous: dict[str, int], current: dict[str, int], pid:
 
 def sample_process(pid: int, output: Path, interval: float) -> None:
     ticks_per_second = os.sysconf("SC_CLK_TCK")
-    previous_ns = time.time_ns()
+    previous_monotonic_ns = time.monotonic_ns()
     previous = process_snapshot(pid)
     with output.open("w", encoding="utf-8", newline="") as target:
         writer = csv.DictWriter(target, fieldnames=PROCESS_FIELDS, delimiter="\t")
@@ -96,12 +96,13 @@ def sample_process(pid: int, output: Path, interval: float) -> None:
         while True:
             time.sleep(interval)
             now_ns = time.time_ns()
+            now_monotonic_ns = time.monotonic_ns()
             try:
                 current = process_snapshot(pid)
             except (FileNotFoundError, ProcessLookupError):
                 return
             require_same_process(previous, current, pid)
-            seconds = (now_ns - previous_ns) / 1_000_000_000
+            seconds = (now_monotonic_ns - previous_monotonic_ns) / 1_000_000_000
             row: dict[str, Any] = {
                 "timestamp_utc": utc_timestamp(now_ns),
                 "interval_end_epoch_milliseconds": now_ns // 1_000_000,
@@ -112,7 +113,7 @@ def sample_process(pid: int, output: Path, interval: float) -> None:
             row.update({key: current[key] for key in PROCESS_FIELDS if key in current})
             writer.writerow(row)
             target.flush()
-            previous_ns, previous = now_ns, current
+            previous_monotonic_ns, previous = now_monotonic_ns, current
 
 
 def read_lines(path: str) -> list[str]:
