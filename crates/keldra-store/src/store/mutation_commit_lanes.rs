@@ -476,7 +476,10 @@ impl Store {
         }
     }
 
-    fn project_lane_completions(&self, runtime: &mut LaneRuntime) -> Result<(), MutationError> {
+    pub(super) fn project_lane_completions(
+        &self,
+        runtime: &mut LaneRuntime,
+    ) -> Result<(), MutationError> {
         let mut prospective = runtime.clone();
         let mut batch = WriteBatch::default();
         let mut projected = false;
