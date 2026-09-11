@@ -1233,13 +1233,36 @@ impl V1ProjectionPublisher {
                 "v1 projection path and payload hash differ",
             ));
         }
-        let bytes = self.read_blob_local_first(blob, maximum_bytes).await?;
+        let bytes = self
+            .read_blob_local_first_uncached(blob, maximum_bytes)
+            .await?;
         Ok(Some((bytes, version.id)))
     }
 
     /// Reads an immutable artifact from the local integrated blob store when
     /// present, reconstructing it from peers only when this node lacks it.
     pub(crate) async fn read_blob_local_first(
+        &self,
+        blob: &BlobRef,
+        maximum_bytes: usize,
+    ) -> Result<Bytes, Status> {
+        if blob.length > maximum_bytes as u64 {
+            return Err(Status::data_loss(
+                "v1 projection artifact violates its exact byte bound",
+            ));
+        }
+        if let Some(bytes) = self.immutable_cache.get_blob(blob, maximum_bytes)? {
+            return Ok(bytes);
+        }
+        let bytes = Bytes::from(
+            self.read_blob_local_first_uncached(blob, maximum_bytes)
+                .await?,
+        );
+        self.immutable_cache.insert_blob(blob, bytes.clone());
+        Ok(bytes)
+    }
+
+    async fn read_blob_local_first_uncached(
         &self,
         blob: &BlobRef,
         maximum_bytes: usize,

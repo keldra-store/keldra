@@ -624,7 +624,7 @@ impl QueryArtifactLoader for RuntimeArtifactLoader {
     fn load_query_artifact(
         &mut self,
         request: QueryArtifactLoad,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, IndexError>> + Send {
+    ) -> impl std::future::Future<Output = Result<bytes::Bytes, IndexError>> + Send {
         async move {
             let blob = BlobRef {
                 hash: request.hash,

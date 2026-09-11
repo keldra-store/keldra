@@ -9,4 +9,5 @@ publish = false
 
 [dependencies]
 blake3 = "1.8"
+bytes = "1"
 thiserror = "2"

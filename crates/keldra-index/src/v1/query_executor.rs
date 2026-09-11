@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use bytes::Bytes;
+
 use crate::IndexError;
 use crate::typed_json::{
     AggregateRequest, AggregateResult, FacetRequest, FacetResult, FieldId, FieldSchema, OrderField,
@@ -146,12 +148,13 @@ pub struct QueryLoadEvidence {
 ///
 /// Implementations must verify bytes when they cross an untrusted boundary.
 /// Callers may then decode the returned trusted-local bytes without hashing the
-/// complete artifact again on every query.
+/// complete artifact again on every query. The reference-counted return value
+/// lets implementations reuse immutable cached storage without copying it.
 pub trait QueryArtifactLoader: Send {
     fn load_query_artifact(
         &mut self,
         request: QueryArtifactLoad,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, IndexError>> + Send;
+    ) -> impl std::future::Future<Output = Result<Bytes, IndexError>> + Send;
 }
 
 struct Budget {
@@ -286,7 +289,7 @@ async fn load_exact_pre_admitted<L: QueryArtifactLoader>(
     encoded_bytes: usize,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<Vec<u8>, IndexError> {
+) -> Result<Bytes, IndexError> {
     if encoded_bytes == 0 {
         return Err(IndexError::Integrity);
     }

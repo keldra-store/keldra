@@ -1,5 +1,6 @@
 use super::*;
 use crate::typed_json::{AggregateOperation, Cardinality, FieldCapabilities, FieldType};
+use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -15,14 +16,14 @@ fn credits(bytes: usize) -> QueryBlockCredits {
 }
 
 struct Loader {
-    artifacts: BTreeMap<[u8; 32], Vec<u8>>,
+    artifacts: BTreeMap<[u8; 32], Bytes>,
     payload_loads: usize,
 }
 impl QueryArtifactLoader for Loader {
     fn load_query_artifact(
         &mut self,
         request: QueryArtifactLoad,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, IndexError>> + Send {
+    ) -> impl std::future::Future<Output = Result<Bytes, IndexError>> + Send {
         self.payload_loads += 1;
         let value = self.artifacts.get(&request.hash).cloned();
         async move { value.ok_or(IndexError::Integrity) }
@@ -71,7 +72,7 @@ fn artifact_memory_refusal_happens_before_payload_loader() {
     let bytes = vec![1; 1024];
     let hash = *crate::profiled_blake3_hash!(&bytes).as_bytes();
     let mut loader = Loader {
-        artifacts: [(hash, bytes)].into(),
+        artifacts: [(hash, Bytes::from(bytes))].into(),
         payload_loads: 0,
     };
     let mut credits = credits(512);
@@ -95,25 +96,26 @@ fn artifact_memory_refusal_happens_before_payload_loader() {
 fn preverified_artifact_loader_is_not_rehashed() {
     let hash = [9; 32];
     let bytes = vec![1; 32];
+    let artifact = Bytes::from(bytes.clone());
+    let artifact_pointer = artifact.as_ptr();
     let mut loader = Loader {
-        artifacts: [(hash, bytes.clone())].into(),
+        artifacts: [(hash, artifact)].into(),
         payload_loads: 0,
     };
     let mut credits = credits(bytes.len());
     let mut budget = budget();
 
-    assert_eq!(
-        ready(load_exact_pre_admitted(
-            &mut loader,
-            QueryArtifactKind::Block,
-            hash,
-            bytes.len(),
-            &mut credits,
-            &mut budget,
-        ))
-        .unwrap(),
-        bytes
-    );
+    let loaded = ready(load_exact_pre_admitted(
+        &mut loader,
+        QueryArtifactKind::Block,
+        hash,
+        bytes.len(),
+        &mut credits,
+        &mut budget,
+    ))
+    .unwrap();
+    assert_eq!(loaded, bytes);
+    assert_eq!(loaded.as_ptr(), artifact_pointer);
     assert_eq!(loader.payload_loads, 1);
 }
 
@@ -157,7 +159,7 @@ fn sequential_block_scans_reuse_transient_heap_credits() {
     .unwrap();
     let hash = encoded.descriptor.hash;
     let mut loader = Loader {
-        artifacts: [(hash, encoded.bytes)].into(),
+        artifacts: [(hash, Bytes::from(encoded.bytes))].into(),
         payload_loads: 0,
     };
     let resident_bytes = encoded.descriptor.records as usize * std::mem::size_of::<OwnedRecord>()

@@ -2436,6 +2436,7 @@ name = "keldra-index"
 version = "0.17.1"
 dependencies = [
  "blake3",
+ "bytes",
  "thiserror 2.0.19",
 ]
 
