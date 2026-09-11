@@ -377,8 +377,8 @@ async fn main() -> Result<()> {
     );
     let successful_initial_ingest_operations_per_second =
         config.records as f64 / timings.ingest_seconds;
-    let maximum_initial_convergence_seconds = config.records as f64 / 1_000.0
-        * MAX_INITIAL_CONVERGENCE_SECONDS_PER_1K_OPERATIONS;
+    let maximum_initial_convergence_seconds =
+        config.records as f64 / 1_000.0 * MAX_INITIAL_CONVERGENCE_SECONDS_PER_1K_OPERATIONS;
     if config.require_performance_targets {
         ensure!(
             successful_initial_ingest_operations_per_second

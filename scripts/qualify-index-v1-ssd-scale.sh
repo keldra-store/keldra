@@ -35,6 +35,7 @@ group_max_queued_requests="${KELDRA_V1_SCALE_GROUP_MAX_QUEUED_REQUESTS:-}"
 group_max_queued_operations="${KELDRA_V1_SCALE_GROUP_MAX_QUEUED_OPERATIONS:-}"
 group_max_queued_inline_bytes="${KELDRA_V1_SCALE_GROUP_MAX_QUEUED_INLINE_BYTES:-}"
 group_dwell_microseconds="${KELDRA_V1_SCALE_GROUP_DWELL_MICROSECONDS:-}"
+group_commit_lanes="${KELDRA_V1_SCALE_GROUP_COMMIT_LANES:-}"
 shard_index="${KELDRA_V1_SCALE_SHARD_INDEX:-0}"
 shard_count="${KELDRA_V1_SCALE_SHARD_COUNT:-1}"
 # Profiling is opt-in and restricted to one exact matrix cell so raw DWARF
@@ -176,7 +177,7 @@ done
 }
 for value in "${group_max_requests}" "${group_max_operations}" "${group_max_inline_bytes}" \
   "${group_max_queued_requests}" "${group_max_queued_operations}" \
-  "${group_max_queued_inline_bytes}" "${group_dwell_microseconds}"
+  "${group_max_queued_inline_bytes}" "${group_dwell_microseconds}" "${group_commit_lanes}"
 do
   [[ -z "${value}" ]] || positive_integer "${value}" || {
     echo "KELDRA_V1_SCALE_GROUP_* overrides must be positive integers" >&2
@@ -192,6 +193,7 @@ group_server_env=()
 [[ -z "${group_max_queued_operations}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_OPERATIONS=${group_max_queued_operations}")
 [[ -z "${group_max_queued_inline_bytes}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_MAX_QUEUED_INLINE_BYTES=${group_max_queued_inline_bytes}")
 [[ -z "${group_dwell_microseconds}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_GROUP_DWELL_MICROSECONDS=${group_dwell_microseconds}")
+[[ -z "${group_commit_lanes}" ]] || group_server_env+=("KELDRA_SINGLE_NODE_GROUP_COMMIT_LANES=${group_commit_lanes}")
 
 mkdir -p "${results_root}" "${work_root}"
 chmod 0700 "${experiment_root}" "${results_root}" "${work_root}"
@@ -234,6 +236,7 @@ summary_rows="${run_dir}/cells.jsonl"
   echo "group_max_queued_operations=${group_max_queued_operations:-server-default}"
   echo "group_max_queued_inline_bytes=${group_max_queued_inline_bytes:-server-default}"
   echo "group_dwell_microseconds=${group_dwell_microseconds:-server-default}"
+  echo "group_commit_lanes=${group_commit_lanes:-server-default}"
   echo "profile=${profile}"
   echo "profile_cell=${profile_cell:-none}"
   echo "profile_frequency=${profile_frequency}"
