@@ -50,7 +50,7 @@ pub(super) struct MutationCommitLanes {
 pub(super) struct MutationLaneGuard {
     _fence: OwnedRwLockReadGuard<()>,
     _conflicts: Vec<OwnedMutexGuard<()>>,
-    _physical_slot: tokio::sync::OwnedSemaphorePermit,
+    physical_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     physical_slots_active: Arc<AtomicUsize>,
     physical_slots_peak_since_start: Arc<AtomicUsize>,
     conflict_wait: Duration,
@@ -62,11 +62,21 @@ pub(super) struct MutationLaneGuard {
 
 impl Drop for MutationLaneGuard {
     fn drop(&mut self) {
-        self.physical_slots_active.fetch_sub(1, Ordering::AcqRel);
+        self.release_physical_slot();
     }
 }
 
 impl MutationLaneGuard {
+    /// Releases only the bounded physical-commit admission slot. The lane
+    /// fence and conflict guards remain held until this guard is dropped, so
+    /// ordered settlement cannot overlap a legacy writer or a conflicting
+    /// mutation even after the primary RocksDB write has finished.
+    pub(super) fn release_physical_slot(&mut self) {
+        if self.physical_slot.take().is_some() {
+            self.physical_slots_active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     pub(super) fn conflict_wait(&self) -> Duration {
         self.conflict_wait
     }
@@ -232,7 +242,7 @@ impl MutationCommitLanes {
         MutationLaneGuard {
             _fence: fence,
             _conflicts: conflicts,
-            _physical_slot: physical_slot,
+            physical_slot: Some(physical_slot),
             physical_slots_active: self.physical_slots_active.clone(),
             physical_slots_peak_since_start: self.physical_slots_peak.clone(),
             conflict_wait,
@@ -1328,6 +1338,41 @@ mod tests {
         drop(second);
         assert_eq!(first.physical_slots_active(), 1);
         drop(first);
+        assert_eq!(lanes.physical_slots_active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn physical_slot_can_be_released_without_releasing_conflict_guard() {
+        let lanes = MutationCommitLanes::new(1);
+        let mut first = lanes.acquire([b"path:a".to_vec()]).await;
+        let conflicting = tokio::spawn({
+            let lanes = lanes.clone();
+            async move { lanes.acquire([b"path:a".to_vec()]).await }
+        });
+        let independent = tokio::spawn({
+            let lanes = lanes.clone();
+            async move { lanes.acquire([b"path:b".to_vec()]).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!conflicting.is_finished());
+        assert!(!independent.is_finished());
+
+        first.release_physical_slot();
+        let independent = tokio::time::timeout(Duration::from_secs(1), independent)
+            .await
+            .expect("an independent lane can use the released physical slot")
+            .unwrap();
+        assert!(
+            !conflicting.is_finished(),
+            "releasing the physical slot must retain the conflict guard"
+        );
+
+        drop(first);
+        drop(independent);
+        tokio::time::timeout(Duration::from_secs(1), conflicting)
+            .await
+            .expect("the conflict guard is released when the lane guard drops")
+            .unwrap();
         assert_eq!(lanes.physical_slots_active.load(Ordering::Acquire), 0);
     }
 

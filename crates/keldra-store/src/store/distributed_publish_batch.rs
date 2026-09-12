@@ -352,7 +352,7 @@ impl Store {
         } else {
             None
         };
-        let _mutation_lane = if lane_mode {
+        let mut mutation_lane = if lane_mode {
             let mut lane_resources = prepared
                 .iter()
                 .flat_map(|item| {
@@ -379,19 +379,19 @@ impl Store {
         } else {
             None
         };
-        let lane_conflict_wait_duration = _mutation_lane
+        let lane_conflict_wait_duration = mutation_lane
             .as_ref()
             .map_or(std::time::Duration::ZERO, |lane| lane.conflict_wait());
-        let physical_slot_wait_duration = _mutation_lane
+        let physical_slot_wait_duration = mutation_lane
             .as_ref()
             .map_or(std::time::Duration::ZERO, |lane| lane.physical_slot_wait());
-        let physical_slots_active_at_acquire = _mutation_lane
+        let physical_slots_active_at_acquire = mutation_lane
             .as_ref()
             .map_or(0, |lane| lane.physical_slots_active_at_acquire());
-        let physical_slots_peak_since_start_at_acquire = _mutation_lane
+        let physical_slots_peak_since_start_at_acquire = mutation_lane
             .as_ref()
             .map_or(0, |lane| lane.physical_slots_peak_since_start_at_acquire());
-        let physical_slot_count = _mutation_lane
+        let physical_slot_count = mutation_lane
             .as_ref()
             .map_or(0, |lane| lane.physical_slot_count());
         let mut commit_wait_duration = std::time::Duration::ZERO;
@@ -701,6 +701,15 @@ impl Store {
         } else {
             Ok(())
         };
+        let physical_slots_active_before_release = mutation_lane
+            .as_ref()
+            .map_or(0, |lane| lane.physical_slots_active());
+        let physical_slots_peak_since_start_before_release = mutation_lane
+            .as_ref()
+            .map_or(0, |lane| lane.physical_slots_peak_since_start());
+        if let Some(lane) = mutation_lane.as_mut() {
+            lane.release_physical_slot();
+        }
         let mut lane_settlement_metrics =
             super::mutation_commit_lanes::LaneSettlementMetrics::default();
         if let Some(completion) = lane_completion {
@@ -765,13 +774,9 @@ impl Store {
                 lane_conflict_wait: lane_conflict_wait_duration,
                 physical_slot_wait: physical_slot_wait_duration,
                 physical_slots_active_at_acquire,
-                physical_slots_active_before_release: _mutation_lane
-                    .as_ref()
-                    .map_or(0, |lane| lane.physical_slots_active()),
+                physical_slots_active_before_release,
                 physical_slots_peak_since_start_at_acquire,
-                physical_slots_peak_since_start_before_release: _mutation_lane
-                    .as_ref()
-                    .map_or(0, |lane| lane.physical_slots_peak_since_start()),
+                physical_slots_peak_since_start_before_release,
                 physical_slot_count,
                 first_sequence_wait: first_sequence_wait_duration,
                 first_sequence_hold: first_sequence_hold_duration,
