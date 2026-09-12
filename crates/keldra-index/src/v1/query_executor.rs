@@ -565,7 +565,7 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
             keys = resumed;
         }
         if !needs_universe {
-            gates = load_latest_gates_for_keys(
+            let aligned = load_latest_gates_for_keys(
                 loader,
                 manifest,
                 request.logical.membership,
@@ -576,6 +576,35 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
                 &mut budget,
             )
             .await?;
+            let (aligned_gates, aligned_bytes) = aligned.into_parts();
+            if aligned_gates.len() != keys.len() {
+                return Err(IndexError::Integrity);
+            }
+            for (document, gate) in keys.into_iter().zip(aligned_gates) {
+                let gate = gate.ok_or(IndexError::Integrity)?;
+                if gate.live {
+                    let candidate = QueryAdmissionCandidate {
+                        partition: view.pin.partition,
+                        handoff_lineage_id: view.pin.handoff_lineage_id,
+                        covered_through_source_position: view
+                            .pin
+                            .covered_through_source_position()?,
+                        document,
+                        material_source_version: gate.material_source_version,
+                        current_source_version: gate.current_source_version,
+                        source_path: gate.source_path.ok_or(IndexError::Integrity)?,
+                        result_path: gate.result_path.ok_or(IndexError::Integrity)?,
+                        result_version: gate.result_version,
+                    };
+                    select_handoff_candidate(&mut selected, candidate, block_credits, &mut budget)?;
+                    budget.candidates(selected.len())?;
+                }
+            }
+            budget.release_heap(block_credits, aligned_bytes)?;
+            if let Some(bytes) = key_bytes {
+                budget.release_heap(block_credits, bytes)?;
+            }
+            continue;
         }
         for document in keys {
             let gate = gates.remove(&document).ok_or(IndexError::Integrity)?;
@@ -1012,11 +1041,31 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<BTreeMap<StableDocumentKey, QueryDocumentGate>, IndexError> {
-    let mut gates = BTreeMap::new();
+) -> Result<AlignedGates, IndexError> {
     if keys.is_empty() {
-        return Ok(gates);
+        return Ok(AlignedGates::default());
     }
+    let key_index_bytes = keys
+        .len()
+        .checked_mul(std::mem::size_of::<StableDocumentKey>())
+        .ok_or(IndexError::OffsetOverflow)?;
+    let slot_bytes = keys
+        .len()
+        .checked_mul(std::mem::size_of::<Option<QueryDocumentGate>>())
+        .ok_or(IndexError::OffsetOverflow)?;
+    budget.reserve_heap(
+        credits,
+        key_index_bytes
+            .checked_add(slot_bytes)
+            .ok_or(IndexError::OffsetOverflow)?,
+    )?;
+    let mut ordered_keys = Vec::with_capacity(keys.len());
+    ordered_keys.extend(keys.iter().copied());
+    let mut gates = std::iter::repeat_with(|| None)
+        .take(ordered_keys.len())
+        .collect::<Vec<_>>();
+    let mut resident_bytes = slot_bytes;
+    let mut found = 0usize;
     for (run_index, descriptor) in manifest.matching_blocks(kind, recipe) {
         let minimum = StableDocumentKey::from_bytes(
             descriptor
@@ -1032,7 +1081,9 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
                 .try_into()
                 .map_err(|_| IndexError::Integrity)?,
         )?;
-        if keys.range(minimum..=maximum).next().is_none() {
+        let first = ordered_keys.partition_point(|key| *key < minimum);
+        let end = ordered_keys.partition_point(|key| *key <= maximum);
+        if first == end {
             continue;
         }
         let generation = manifest
@@ -1050,26 +1101,24 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
         )
         .await?;
         let result = (|| {
-            let first_candidate = keys
-                .range(minimum..=maximum)
-                .next()
-                .ok_or(IndexError::Integrity)?;
-            let first_candidate_bytes = first_candidate.bytes();
+            let first_candidate_bytes = ordered_keys[first].bytes();
             let mut records = block.records_from(&first_candidate_bytes).peekable();
-            let mut candidates = keys.range(minimum..=maximum).peekable();
-            while let (Some(record), Some(key)) =
-                (records.peek().copied(), candidates.peek().map(|key| **key))
-            {
-                if gates.contains_key(&key) {
-                    candidates.next();
+            let mut candidate = first;
+            while let Some(record) = records.peek().copied() {
+                if candidate == end {
+                    break;
+                }
+                if gates[candidate].is_some() {
+                    candidate += 1;
                     continue;
                 }
+                let key = ordered_keys[candidate];
                 match record.key.cmp(key.bytes().as_slice()) {
                     Ordering::Less => {
                         records.next();
                     }
                     Ordering::Greater => {
-                        candidates.next();
+                        candidate += 1;
                     }
                     Ordering::Equal => {
                         let gate = decode_document_gate(record)?;
@@ -1078,10 +1127,15 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
                         {
                             return Err(IndexError::Integrity);
                         }
-                        budget.reserve_heap(credits, resident_gate_bytes(&gate)?)?;
-                        gates.insert(key, gate);
+                        let dynamic_bytes = resident_gate_dynamic_bytes(&gate)?;
+                        budget.reserve_heap(credits, dynamic_bytes)?;
+                        resident_bytes = resident_bytes
+                            .checked_add(dynamic_bytes)
+                            .ok_or(IndexError::OffsetOverflow)?;
+                        gates[candidate] = Some(gate);
+                        found += 1;
                         records.next();
-                        candidates.next();
+                        candidate += 1;
                     }
                 }
             }
@@ -1090,11 +1144,36 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
         let release = credits.release_loaded_block(block.encoded_bytes());
         result?;
         release?;
-        if gates.len() == keys.len() {
+        if found == ordered_keys.len() {
             break;
         }
     }
-    Ok(gates)
+    budget.release_heap(credits, key_index_bytes)?;
+    Ok(AlignedGates {
+        gates,
+        resident_bytes,
+    })
+}
+
+#[derive(Default)]
+struct AlignedGates {
+    gates: Vec<Option<QueryDocumentGate>>,
+    resident_bytes: usize,
+}
+
+impl AlignedGates {
+    fn into_parts(self) -> (Vec<Option<QueryDocumentGate>>, usize) {
+        (self.gates, self.resident_bytes)
+    }
+}
+
+fn resident_gate_dynamic_bytes(gate: &QueryDocumentGate) -> Result<usize, IndexError> {
+    resident_gate_bytes(gate)?
+        .checked_sub(
+            std::mem::size_of::<StableDocumentKey>()
+                .saturating_add(std::mem::size_of::<QueryDocumentGate>()),
+        )
+        .ok_or(IndexError::Integrity)
 }
 
 async fn load_decoded_block<L: QueryArtifactLoader>(
@@ -1343,19 +1422,21 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
             keys = resumed;
         }
         let memberships = if universe.is_empty() {
-            load_latest_gates_for_keys(
-                loader,
-                manifest,
-                membership_recipe,
-                QueryBlockKind::Gate,
-                &keys,
-                block_limits,
-                credits,
-                budget,
+            Some(
+                load_latest_gates_for_keys(
+                    loader,
+                    manifest,
+                    membership_recipe,
+                    QueryBlockKind::Gate,
+                    &keys,
+                    block_limits,
+                    credits,
+                    budget,
+                )
+                .await?,
             )
-            .await?
         } else {
-            BTreeMap::new()
+            None
         };
         budget.reserve_heap(
             credits,
@@ -1369,25 +1450,25 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
                 .checked_add(resident_gate_bytes(gate)?)
                 .ok_or(IndexError::OffsetOverflow)
         })?;
-        let output = presence
-            .into_iter()
-            .filter_map(|(key, gate)| {
-                (gate.live
-                    && if universe.is_empty() {
-                        memberships
-                            .get(&key)
-                            .is_some_and(|membership| membership.live)
-                    } else {
-                        universe.get(&key).is_some_and(|membership| membership.live)
-                    })
-                .then_some(key)
-            })
-            .collect();
-        let membership_bytes = memberships.values().try_fold(0usize, |total, gate| {
-            total
-                .checked_add(resident_gate_bytes(gate)?)
-                .ok_or(IndexError::OffsetOverflow)
-        })?;
+        let (output, membership_bytes) = if let Some(memberships) = memberships {
+            let (memberships, membership_bytes) = memberships.into_parts();
+            let output = keys
+                .into_iter()
+                .zip(memberships)
+                .filter_map(|(key, membership)| {
+                    membership
+                        .is_some_and(|membership| membership.live)
+                        .then_some(key)
+                })
+                .collect();
+            (output, membership_bytes)
+        } else {
+            let output = keys
+                .into_iter()
+                .filter(|key| universe.get(key).is_some_and(|membership| membership.live))
+                .collect();
+            (output, 0)
+        };
         budget.release_heap(credits, presence_bytes)?;
         budget.release_heap(credits, membership_bytes)?;
         return Ok(output);
@@ -1545,41 +1626,45 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
     )
     .await?;
     let memberships = if universe.is_empty() {
-        load_latest_gates_for_keys(
-            loader,
-            manifest,
-            membership_recipe,
-            QueryBlockKind::Gate,
-            &candidate_keys,
-            block_limits,
-            credits,
-            budget,
+        Some(
+            load_latest_gates_for_keys(
+                loader,
+                manifest,
+                membership_recipe,
+                QueryBlockKind::Gate,
+                &candidate_keys,
+                block_limits,
+                credits,
+                budget,
+            )
+            .await?,
         )
-        .await?
     } else {
-        BTreeMap::new()
+        None
     };
+    let (presence, presence_bytes) = presence.into_parts();
+    let (memberships, membership_bytes) = memberships
+        .map(AlignedGates::into_parts)
+        .map_or((None, 0), |(gates, bytes)| (Some(gates), bytes));
+    if presence.len() != candidates.len()
+        || memberships
+            .as_ref()
+            .is_some_and(|memberships| memberships.len() != candidates.len())
+    {
+        return Err(IndexError::Integrity);
+    }
+    let mut ordinal = 0usize;
     candidates.retain(|key, material_source_version| {
-        candidate_is_current(
-            if universe.is_empty() {
-                memberships.get(key)
-            } else {
-                universe.get(key)
-            },
-            presence.get(key),
+        let current = candidate_is_current(
+            memberships
+                .as_ref()
+                .map_or_else(|| universe.get(key), |gates| gates[ordinal].as_ref()),
+            presence[ordinal].as_ref(),
             *material_source_version,
-        )
+        );
+        ordinal += 1;
+        current
     });
-    let presence_bytes = presence.values().try_fold(0usize, |total, gate| {
-        total
-            .checked_add(resident_gate_bytes(gate)?)
-            .ok_or(IndexError::OffsetOverflow)
-    })?;
-    let membership_bytes = memberships.values().try_fold(0usize, |total, gate| {
-        total
-            .checked_add(resident_gate_bytes(gate)?)
-            .ok_or(IndexError::OffsetOverflow)
-    })?;
     budget.release_heap(credits, presence_bytes)?;
     budget.release_heap(credits, membership_bytes)?;
     budget.release_heap(
