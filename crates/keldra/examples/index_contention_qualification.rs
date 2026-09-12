@@ -30,8 +30,7 @@ use keldra_storage::v1::index_service_client::IndexServiceClient;
 use keldra_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
     Durability, IndexPredicate, IndexPredicateExpression, IndexPredicateOperator, IndexQuery,
-    IndexSourceFreshness, ObjectAddress, ObjectVersioning, QueryIndexRequest, QueryIndexResponse,
-    TypedJsonIndexQuery,
+    ObjectAddress, ObjectVersioning, QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
 };
 use keldra_storage::{
     BearerToken, KeywordField, RawClient, TypedJsonIndexBuilder, administration_client,
@@ -40,7 +39,7 @@ use keldra_storage::{
 use metrics::{Latencies, LatencyReport};
 use progress::Counters;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::{
     Arc,
