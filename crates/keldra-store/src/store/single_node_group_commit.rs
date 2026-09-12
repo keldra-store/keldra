@@ -683,6 +683,18 @@ impl SingleNodeGroupCommit {
                 physical_slot_count = metrics.physical_slot_count,
                 first_sequence_wait_seconds = metrics.first_sequence_wait.as_secs_f64(),
                 first_sequence_hold_seconds = metrics.first_sequence_hold.as_secs_f64(),
+                authority_retry_snapshot_sequence_wait_seconds = metrics
+                    .authority_retry_snapshot_sequence_wait
+                    .as_secs_f64(),
+                authority_retry_snapshot_sequence_hold_seconds = metrics
+                    .authority_retry_snapshot_sequence_hold
+                    .as_secs_f64(),
+                reservation_sequence_wait_seconds = metrics
+                    .reservation_sequence_wait
+                    .as_secs_f64(),
+                reservation_sequence_hold_seconds = metrics
+                    .reservation_sequence_hold
+                    .as_secs_f64(),
                 locked_setup_seconds = metrics.locked_setup.as_secs_f64(),
                 baseline_prefetch_seconds = metrics.baseline_prefetch.as_secs_f64(),
                 baseline_revalidation_retries = metrics.baseline_revalidation_retries,

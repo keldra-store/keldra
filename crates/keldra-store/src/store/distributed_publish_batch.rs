@@ -38,20 +38,18 @@ struct MutationBatchAttempt {
 
 #[derive(Clone, Copy)]
 struct LaneAuthoritySnapshot {
-    next_ticket: u64,
     watch: WatchJournalStatus,
     receipts: MutationReceiptStatus,
 }
 
 impl LaneAuthoritySnapshot {
     /// The exact path, receipt, blob and definition guards keep every object
-    /// fact used by the attempt stable. Only these global allocation
+    /// fact used by the attempt stable. Only these source/receipt allocation
     /// authorities can advance while evaluation runs without the sequence
     /// mutex. `settled_through` is projection progress rather than reservation
     /// authority and is refreshed immediately before reservation.
     fn still_current(self, runtime: &super::mutation_commit_lanes::LaneRuntime) -> bool {
-        self.next_ticket == runtime.next_ticket
-            && self.watch.source_id == runtime.reserved_watch.source_id
+        self.watch.source_id == runtime.reserved_watch.source_id
             && self.watch.tail == runtime.reserved_watch.tail
             && self.watch.retention_floor == runtime.reserved_watch.retention_floor
             && self.watch.retained_entries == runtime.reserved_watch.retained_entries
@@ -75,8 +73,16 @@ pub(super) struct CoordinatorBatchMetrics {
     pub(super) physical_slots_peak_since_start_at_acquire: usize,
     pub(super) physical_slots_peak_since_start_before_release: usize,
     pub(super) physical_slot_count: usize,
+    /// Wait and hold for the first authority snapshot only.
     pub(super) first_sequence_wait: std::time::Duration,
     pub(super) first_sequence_hold: std::time::Duration,
+    /// Cumulative wait and hold for replacement snapshots after failed
+    /// authority comparisons.
+    pub(super) authority_retry_snapshot_sequence_wait: std::time::Duration,
+    pub(super) authority_retry_snapshot_sequence_hold: std::time::Duration,
+    /// Cumulative wait and hold for compare-and-reserve acquisitions.
+    pub(super) reservation_sequence_wait: std::time::Duration,
+    pub(super) reservation_sequence_hold: std::time::Duration,
     pub(super) locked_setup: std::time::Duration,
     pub(super) baseline_prefetch: std::time::Duration,
     pub(super) baseline_revalidation_retries: u64,
@@ -705,6 +711,11 @@ impl Store {
             prior_projection_metrics = self.project_lane_completions().await?;
         }
         let mut first_sequence_hold_duration = std::time::Duration::ZERO;
+        let mut authority_retry_snapshot_sequence_wait_duration = std::time::Duration::ZERO;
+        let mut authority_retry_snapshot_sequence_hold_duration = std::time::Duration::ZERO;
+        let mut reservation_sequence_wait_duration = std::time::Duration::ZERO;
+        let mut reservation_sequence_hold_duration = std::time::Duration::ZERO;
+        let mut authority_snapshot_count = 0_u64;
         let mut retry_evaluate_duration = std::time::Duration::ZERO;
         let mut retry_stage_duration = std::time::Duration::ZERO;
         let mut retry_evaluation_subphases = EvaluationSubphaseMetrics::default();
@@ -718,20 +729,29 @@ impl Store {
             let authority = if lane_mode {
                 let wait_started = std::time::Instant::now();
                 let mut guard = self.mutation_commit_lanes.sequence().await;
-                first_sequence_wait_duration =
-                    first_sequence_wait_duration.saturating_add(wait_started.elapsed());
+                let wait_duration = wait_started.elapsed();
                 let hold_started = std::time::Instant::now();
                 let runtime = guard.as_mut().ok_or_else(|| {
                     MutationError::Storage("mutation lane runtime is not initialized".into())
                 })?;
                 self.refresh_stale_lane_runtime(runtime)?;
                 let snapshot = LaneAuthoritySnapshot {
-                    next_ticket: runtime.next_ticket,
                     watch: runtime.reserved_watch,
                     receipts: runtime.reserved_receipts,
                 };
-                first_sequence_hold_duration =
-                    first_sequence_hold_duration.saturating_add(hold_started.elapsed());
+                let hold_duration = hold_started.elapsed();
+                if authority_snapshot_count == 0 {
+                    first_sequence_wait_duration = wait_duration;
+                    first_sequence_hold_duration = hold_duration;
+                } else {
+                    authority_retry_snapshot_sequence_wait_duration =
+                        authority_retry_snapshot_sequence_wait_duration
+                            .saturating_add(wait_duration);
+                    authority_retry_snapshot_sequence_hold_duration =
+                        authority_retry_snapshot_sequence_hold_duration
+                            .saturating_add(hold_duration);
+                }
+                authority_snapshot_count = authority_snapshot_count.saturating_add(1);
                 drop(guard);
                 #[cfg(test)]
                 self.mutation_commit_lanes
@@ -769,16 +789,16 @@ impl Store {
 
             let wait_started = std::time::Instant::now();
             let mut guard = self.mutation_commit_lanes.sequence().await;
-            first_sequence_wait_duration =
-                first_sequence_wait_duration.saturating_add(wait_started.elapsed());
+            reservation_sequence_wait_duration =
+                reservation_sequence_wait_duration.saturating_add(wait_started.elapsed());
             let hold_started = std::time::Instant::now();
             let runtime = guard.as_mut().ok_or_else(|| {
                 MutationError::Storage("mutation lane runtime is not initialized".into())
             })?;
             let authority = authority.expect("lane authority was captured");
             if !authority.still_current(runtime) {
-                first_sequence_hold_duration =
-                    first_sequence_hold_duration.saturating_add(hold_started.elapsed());
+                reservation_sequence_hold_duration =
+                    reservation_sequence_hold_duration.saturating_add(hold_started.elapsed());
                 lane_authority_revalidation_retries =
                     lane_authority_revalidation_retries.saturating_add(1);
                 drop(guard);
@@ -798,17 +818,13 @@ impl Store {
                 .map_or(authority.watch, |staged| staged.status);
             let completion = runtime.reserve(watch, built.receipt_status, built.high_watermark)?;
             self.stage_lane_completion(&mut built.batch, completion)?;
-            first_sequence_hold_duration =
-                first_sequence_hold_duration.saturating_add(hold_started.elapsed());
+            reservation_sequence_hold_duration =
+                reservation_sequence_hold_duration.saturating_add(hold_started.elapsed());
             drop(guard);
             break (built, Some(completion));
         };
-        commit_wait_duration = if lane_mode {
-            first_sequence_wait_duration
-        } else {
-            commit_wait_duration
-        };
         if lane_mode {
+            commit_wait_duration = first_sequence_wait_duration;
             drop(commit_guard.take());
         }
         let receipt_capacity_at = attempt.receipt_capacity_at;
@@ -867,21 +883,10 @@ impl Store {
             self.mutation_capacity_notify.notify_waiters();
         }
         if !lane_mode && !pending_changes.is_empty() {
-            if reference_effects == LocalReferenceEffects::AppliedInline {
-                if let Some(staged) = staged_local_changes {
-                    self.settle_inline_source_changes_from_status(staged.status)?;
-                } else {
-                    self.settle_inline_source_changes()?;
-                }
-            } else if staged_local_changes.is_some_and(|staged| staged.visibility_settlement_staged)
-            {
-                self.mutation_capacity_notify.notify_waiters();
-            }
-            if let Some(staged) = staged_local_changes {
-                self.notify_local_invalidations_from_status(staged.status);
-            } else {
-                self.notify_local_invalidations();
-            }
+            // Distributed coordination always stages deferred local reference
+            // effects; the single-node lane path owns inline settlement above.
+            debug_assert!(staged_local_changes.is_none());
+            self.notify_local_invalidations();
         }
         let settle_duration = settle_started.elapsed();
         let mut outcomes = Vec::with_capacity(total);
@@ -917,6 +922,12 @@ impl Store {
                 physical_slot_count,
                 first_sequence_wait: first_sequence_wait_duration,
                 first_sequence_hold: first_sequence_hold_duration,
+                authority_retry_snapshot_sequence_wait:
+                    authority_retry_snapshot_sequence_wait_duration,
+                authority_retry_snapshot_sequence_hold:
+                    authority_retry_snapshot_sequence_hold_duration,
+                reservation_sequence_wait: reservation_sequence_wait_duration,
+                reservation_sequence_hold: reservation_sequence_hold_duration,
                 locked_setup: locked_setup_duration,
                 baseline_prefetch: baseline_prefetch_duration,
                 baseline_revalidation_retries,
