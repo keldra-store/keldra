@@ -31,6 +31,9 @@ pub use admission::{
 mod authorization;
 use admission::{match_all_live_documents, resident_gate_bytes, resident_selected_candidate_bytes};
 use authorization::authorize_selected_candidates;
+#[path = "query_executor_natural.rs"]
+mod natural;
+use natural::execute_bounded_natural_equal;
 #[path = "query_executor_values.rs"]
 mod values;
 use values::{
@@ -510,6 +513,41 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
         manifests.push(
             load_partition_manifest(loader, view, block_limits, block_credits, &mut budget).await?,
         );
+    }
+
+    if let Some(candidates) = execute_bounded_natural_equal(
+        loader,
+        admission,
+        common_cut,
+        &manifests,
+        request,
+        &contracts,
+        block_limits,
+        block_credits,
+        &mut budget,
+    )
+    .await?
+    {
+        let manifest_bytes = manifests.iter().try_fold(0usize, |total, manifest| {
+            total
+                .checked_add(manifest.resident_bytes)
+                .ok_or(IndexError::OffsetOverflow)
+        })?;
+        let manifest_index_bytes = manifests.iter().try_fold(0usize, |total, manifest| {
+            total
+                .checked_add(manifest.index_bytes)
+                .ok_or(IndexError::OffsetOverflow)
+        })?;
+        drop(manifests);
+        block_credits.release(manifest_bytes)?;
+        budget.release_heap(block_credits, manifest_index_bytes)?;
+        return Ok(TypedJsonQueryResult {
+            through_atomic_position: common_cut.through_atomic_position,
+            candidates,
+            facets: Vec::new(),
+            aggregates: Vec::new(),
+            loads: budget.evidence,
+        });
     }
 
     let mut selected = BTreeMap::<StableDocumentKey, QueryAdmissionCandidate>::new();
