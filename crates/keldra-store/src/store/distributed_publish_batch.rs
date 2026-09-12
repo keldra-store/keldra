@@ -432,6 +432,11 @@ impl Store {
             (read_cache, Some(guard))
         };
         drop(prepared_operations);
+        if lane_mode && self.mutation_commit_lanes.projection_retry_needed() {
+            // Retry a prior physical commit's buffered projection without
+            // retaining the global reservation sequence during RocksDB I/O.
+            prior_projection_metrics = self.project_lane_completions().await?;
+        }
         let mut lane_runtime_guard = if lane_mode {
             let commit_wait_started = std::time::Instant::now();
             let mut guard = self.mutation_commit_lanes.sequence().await;
@@ -441,9 +446,6 @@ impl Store {
                 MutationError::Storage("mutation lane runtime is not initialized".into())
             })?;
             self.refresh_stale_lane_runtime(runtime)?;
-            // A prior projection write can fail after a physical lane commit.
-            // Retry its still-buffered completion before reserving more work.
-            prior_projection_metrics = self.project_lane_completions(runtime)?;
             let reference_cursor = self
                 .reference_delta_cursor(runtime.projected_watch.source_id)
                 .map_err(|error| MutationError::Storage(error.to_string()))?;
