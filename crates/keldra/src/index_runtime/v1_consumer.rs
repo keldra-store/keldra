@@ -49,6 +49,7 @@ impl Drop for V1IndexProducerTask {
 struct Limits {
     bytes: usize,
     flush_bytes: usize,
+    projection_batch_bytes: usize,
     flush_age: Duration,
     flush_operations: u64,
     lsm_runs: u64,
@@ -203,6 +204,11 @@ fn limits(config: IndexRuntimeConfig) -> Result<Limits, Status> {
     let flush_bytes = usize::try_from(config.flush_bytes())
         .map_err(|_| Status::invalid_argument("v1 flush bytes exceed this platform"))?
         .min(bytes.saturating_div(4).max(1));
+    // `flush_bytes` bounds source-journal input, but prepared rows and their
+    // transient projection overlay can legitimately be larger than that input.
+    // Give one publication cycle a bounded share of the configured producer
+    // memory instead of turning the flush threshold into a hard output cap.
+    let projection_batch_bytes = bytes.saturating_div(4).max(flush_bytes);
     let parallelism = usize::try_from(config.indexing_cores())
         .map_err(|_| Status::invalid_argument("v1 indexing cores exceed this platform"))?;
     if parallelism == 0 {
@@ -213,6 +219,7 @@ fn limits(config: IndexRuntimeConfig) -> Result<Limits, Status> {
     Ok(Limits {
         bytes,
         flush_bytes,
+        projection_batch_bytes,
         flush_age: config.flush_max_age(),
         flush_operations: config.flush_max_operations(),
         lsm_runs: u64::from(config.lsm_max_runs_per_level()),
@@ -411,7 +418,7 @@ async fn open_writer(
         source_scope(source),
         partition,
         accumulator_start,
-        limits.flush_bytes,
+        limits.projection_batch_bytes,
         credits.clone(),
     )
     .map_err(index_status)?;
@@ -1091,8 +1098,9 @@ fn apply_rows(
         return Ok(());
     }
     rows.sort_by_key(|row| (row.source_offset, row.mutation_ordinal));
-    let reservation = PreparedProjectionBatchReservation::reserve(credits, limits.flush_bytes)
-        .map_err(|_| Status::resource_exhausted("v1 prepared-row memory unavailable"))?;
+    let reservation =
+        PreparedProjectionBatchReservation::reserve(credits, limits.projection_batch_bytes)
+            .map_err(|_| Status::resource_exhausted("v1 prepared-row memory unavailable"))?;
     let batch = reservation
         .finish(source_scope(writer.source), first, next, rows)
         .map_err(index_status)?;
@@ -1700,6 +1708,7 @@ mod tests {
         let limits = Limits {
             bytes,
             flush_bytes: 64,
+            projection_batch_bytes: 256,
             flush_age: Duration::from_secs(1),
             flush_operations: 64,
             lsm_runs: 64,
@@ -1717,6 +1726,19 @@ mod tests {
             credits.stage_used_bytes(IndexingMemoryStage::OrderingCatalog),
             5
         );
+    }
+
+    #[test]
+    fn projection_batch_headroom_scales_with_pipeline_memory() {
+        let config = IndexRuntimeConfig::new(4)
+            .unwrap()
+            .with_pipeline_memory_bytes(4 * 1024 * 1024 * 1024)
+            .unwrap();
+        let limits = limits(config).unwrap();
+
+        assert_eq!(limits.bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(limits.flush_bytes, 16 * 1024 * 1024);
+        assert_eq!(limits.projection_batch_bytes, 512 * 1024 * 1024);
     }
 
     #[test]
