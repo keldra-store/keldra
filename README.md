@@ -717,9 +717,9 @@ println!("freshness: {:?}", response.freshness);
 Typed JSON Date fields accept ISO-8601 strings by default, or one validated
 POSIX strftime pattern selected in their definition. Values with an explicit
 offset are normalized to UTC; offset-less values are interpreted as UTC. Keldra
-stores exactly signed Unix epoch milliseconds in points and doc values, rejects
-inputs with finer-than-millisecond precision rather than truncating them, and
-does not retain the source date string. Date fields support exact and range
+stores exactly signed Unix epoch milliseconds in points and doc values,
+truncates finer input precision to milliseconds, and does not retain the source
+date string. Date fields support exact and range
 predicates, ordering, and facets, but not aggregates. Date predicate literals
 use the field's configured format, and facet bucket values are formatted back
 with that same format.

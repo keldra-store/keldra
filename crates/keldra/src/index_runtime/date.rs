@@ -12,7 +12,6 @@ const MAX_DATE_PATTERN_BYTES: usize = 256;
 pub(crate) enum DateError {
     InvalidFormat,
     InvalidValue,
-    PrecisionLoss,
     OutOfRange,
 }
 
@@ -21,7 +20,6 @@ impl Display for DateError {
         formatter.write_str(match self {
             Self::InvalidFormat => "date format is invalid or unsupported",
             Self::InvalidValue => "date value does not match its field format",
-            Self::PrecisionLoss => "date value has non-zero precision finer than milliseconds",
             Self::OutOfRange => "date value is outside the signed Unix-millisecond range",
         })
     }
@@ -60,9 +58,10 @@ pub(crate) fn parse_millis(value: &str, format: &DateFormat) -> Result<i64, Date
             timestamp_from_broken_down(&parsed)?
         }
     };
-    if timestamp.subsec_nanosecond() % 1_000_000 != 0 {
-        return Err(DateError::PrecisionLoss);
-    }
+    // Date indexes use signed Unix epoch milliseconds. ISO 8601 and custom
+    // inputs may carry finer precision; normalize them by discarding the
+    // sub-millisecond remainder instead of rejecting an otherwise valid
+    // timestamp.
     Ok(timestamp.as_millisecond())
 }
 
@@ -185,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_patterns_and_sub_millisecond_values_are_rejected() {
+    fn invalid_patterns_are_rejected_and_sub_millisecond_values_are_truncated() {
         for pattern in ["", "%H:%M", "%Y-%B-%d", "%Y-%m-%d %Q", "%"] {
             assert_eq!(
                 validate_format(&DateFormat::Strftime(pattern.into())),
@@ -194,8 +193,8 @@ mod tests {
             );
         }
         assert_eq!(
-            parse_millis("2024-07-15T20:24:59.123000001Z", &DateFormat::Iso8601),
-            Err(DateError::PrecisionLoss)
+            parse_millis("2024-07-15T20:24:59.123907Z", &DateFormat::Iso8601).unwrap(),
+            parse_millis("2024-07-15T20:24:59.123Z", &DateFormat::Iso8601).unwrap()
         );
     }
 }

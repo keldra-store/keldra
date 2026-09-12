@@ -124,7 +124,7 @@ impl V1ProjectionExtractor {
             })
             .await
             .map_err(|error| Status::internal(error.to_string()))?
-            .map_err(index_status)?;
+            .map_err(|error| object_index_status(&object.path, error))?;
         let telemetry = super::v1_telemetry::global();
         super::v1_telemetry::V1PipelineTelemetry::add(
             &telemetry.payload_parsed_bytes,
@@ -179,6 +179,7 @@ impl V1ProjectionExtractor {
                 (identity.path.clone(), identity.version, None, false)
             }
         };
+        let diagnostic_path = path.clone();
         let fields = recipe
             .fields
             .iter()
@@ -193,7 +194,7 @@ impl V1ProjectionExtractor {
                             .and_then(|selected| selected.get(&field.source_selector))
                             .map(|selected| normalize_selected_values(field, &selected.values))
                             .transpose()
-                            .map_err(index_status)?
+                            .map_err(|error| object_index_status(&diagnostic_path, error))?
                     } else {
                         None
                     },
@@ -214,7 +215,7 @@ impl V1ProjectionExtractor {
             previous,
             credits,
         )
-        .map_err(index_status)
+        .map_err(|error| object_index_status(&diagnostic_path, error))
     }
 
     async fn open_payload(
@@ -254,26 +255,28 @@ fn normalize_selected_value(
     if value == ScalarValue::Null {
         return Ok(value);
     }
-    let invalid = || {
+    let diagnostic_value = diagnostic_scalar_value(&value);
+    let invalid = |reason: &str| {
         IndexError::Decode(format!(
-            "Typed JSON field `{}` contains a value outside its declared type",
-            field.name
+            "Typed JSON field `{}` refused value {} for declared type {:?}: {reason}",
+            field.name, diagnostic_value, field.field_type
         ))
     };
     Ok(match (field.field_type, value) {
         (FieldType::Boolean, ScalarValue::Boolean(value)) => ScalarValue::Boolean(value),
         (FieldType::SignedInteger, ScalarValue::Signed(value)) => ScalarValue::Signed(value),
-        (FieldType::SignedInteger, ScalarValue::Unsigned(value)) => {
-            ScalarValue::Signed(i64::try_from(value).map_err(|_| invalid())?)
-        }
+        (FieldType::SignedInteger, ScalarValue::Unsigned(value)) => ScalarValue::Signed(
+            i64::try_from(value)
+                .map_err(|_| invalid("unsigned integer exceeds the signed range"))?,
+        ),
         (FieldType::UnsignedInteger, ScalarValue::Unsigned(value)) => ScalarValue::Unsigned(value),
         (FieldType::UnsignedInteger, ScalarValue::Signed(0)) => ScalarValue::Unsigned(0),
         (FieldType::Float, ScalarValue::Number(bits)) => ScalarValue::Number(bits),
-        (FieldType::Float, ScalarValue::Signed(value)) => {
-            ScalarValue::exact_number_from_i64(value).ok_or_else(invalid)?
-        }
+        (FieldType::Float, ScalarValue::Signed(value)) => ScalarValue::exact_number_from_i64(value)
+            .ok_or_else(|| invalid("integer cannot be represented exactly as a float"))?,
         (FieldType::Float, ScalarValue::Unsigned(value)) => {
-            ScalarValue::exact_number_from_u64(value).ok_or_else(invalid)?
+            ScalarValue::exact_number_from_u64(value)
+                .ok_or_else(|| invalid("integer cannot be represented exactly as a float"))?
         }
         (FieldType::Date, ScalarValue::String(value)) => ScalarValue::Signed(
             parse_millis(
@@ -282,13 +285,36 @@ fn normalize_selected_value(
                     IndexError::InvalidDefinition("Date field has no format".into())
                 })?,
             )
-            .map_err(|_| invalid())?,
+            .map_err(|error| invalid(&error.to_string()))?,
         ),
         (FieldType::Keyword | FieldType::Text, ScalarValue::String(value)) => {
             ScalarValue::String(value)
         }
-        _ => return Err(invalid()),
+        _ => return Err(invalid("value does not match the declared field type")),
     })
+}
+
+const MAX_DIAGNOSTIC_VALUE_CHARS: usize = 256;
+
+fn diagnostic_scalar_value(value: &ScalarValue) -> String {
+    let rendered = match value {
+        ScalarValue::Null => "null".to_owned(),
+        ScalarValue::Boolean(value) => value.to_string(),
+        ScalarValue::Signed(value) => value.to_string(),
+        ScalarValue::Number(bits) => f64::from_bits(*bits).to_string(),
+        ScalarValue::Unsigned(value) => value.to_string(),
+        ScalarValue::String(value) => serde_json::to_string(value)
+            .unwrap_or_else(|_| "<string could not be rendered>".to_owned()),
+    };
+    if rendered.chars().count() <= MAX_DIAGNOSTIC_VALUE_CHARS {
+        return rendered;
+    }
+    let mut truncated = rendered
+        .chars()
+        .take(MAX_DIAGNOSTIC_VALUE_CHARS)
+        .collect::<String>();
+    truncated.push_str("…");
+    truncated
 }
 
 fn index_status(error: keldra_index::IndexError) -> Status {
@@ -297,6 +323,16 @@ fn index_status(error: keldra_index::IndexError) -> Status {
             Status::resource_exhausted(error.to_string())
         }
         _ => Status::data_loss(error.to_string()),
+    }
+}
+
+fn object_index_status(path: &str, error: keldra_index::IndexError) -> Status {
+    let resource_limit = matches!(error, keldra_index::IndexError::ResourceLimit { .. });
+    let message = format!("object {path:?} cannot be indexed: {error}");
+    if resource_limit {
+        Status::resource_exhausted(message)
+    } else {
+        Status::data_loss(message)
     }
 }
 
@@ -379,10 +415,36 @@ mod tests {
         assert_eq!(
             normalize_selected_values(
                 &field(FieldType::Date),
-                &[ScalarValue::String("1970-01-02".into())]
+                &[
+                    ScalarValue::String("1970-01-02".into()),
+                    ScalarValue::String("2026-09-12T16:55:26.353907Z".into()),
+                ]
             )
             .unwrap(),
-            [ScalarValue::Signed(86_400_000)]
+            [
+                ScalarValue::Signed(86_400_000),
+                ScalarValue::Signed(1_789_232_126_353),
+            ]
+        );
+    }
+
+    #[test]
+    fn refused_scalar_names_the_field_value_type_and_reason() {
+        let error = normalize_selected_values(
+            &field(FieldType::Date),
+            &[ScalarValue::String("not-a-date".into())],
+        )
+        .unwrap_err();
+        let status = object_index_status("content/example.json", error);
+        let error = status.message();
+
+        assert!(error.contains("object \"content/example.json\""), "{error}");
+        assert!(error.contains("field `value`"), "{error}");
+        assert!(error.contains("\"not-a-date\""), "{error}");
+        assert!(error.contains("declared type Date"), "{error}");
+        assert!(
+            error.contains("date value does not match its field format"),
+            "{error}"
         );
     }
 }

@@ -35,8 +35,9 @@ locale-dependent names, and named time zones are not supported.
 
 An ISO 8601 value must contain a calendar date. A missing time means midnight.
 A missing numeric offset means UTC. Custom patterns without an offset also use
-UTC. Values with non-zero precision finer than one millisecond are rejected;
-indexing never silently rounds an instant.
+UTC. The physical representation has millisecond resolution, so valid inputs
+with finer precision are truncated to signed Unix epoch milliseconds. The
+sub-millisecond remainder is not retained.
 
 ### 2.2 Physical and query representation
 
