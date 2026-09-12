@@ -1279,6 +1279,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
                 binding.recipe,
                 std::slice::from_ref(value),
                 None,
+                minimum_document_exclusive,
                 block_limits,
                 credits,
                 budget,
@@ -1292,6 +1293,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
                 binding.recipe,
                 values,
                 None,
+                minimum_document_exclusive,
                 block_limits,
                 credits,
                 budget,
@@ -1305,6 +1307,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
                 binding.recipe,
                 &[],
                 Some(prefix),
+                minimum_document_exclusive,
                 block_limits,
                 credits,
                 budget,
@@ -1327,6 +1330,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
                 binding.recipe,
                 &terms,
                 None,
+                minimum_document_exclusive,
                 block_limits,
                 credits,
                 budget,
@@ -1551,6 +1555,7 @@ async fn seek_terms<L: QueryArtifactLoader>(
     recipe: RecipeIdentity,
     exact: &[ScalarValue],
     prefix: Option<&str>,
+    minimum_document_exclusive: Option<StableDocumentKey>,
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
@@ -1561,6 +1566,7 @@ async fn seek_terms<L: QueryArtifactLoader>(
         recipe,
         exact,
         prefix,
+        minimum_document_exclusive,
         block_limits,
         credits,
         budget,
@@ -1592,6 +1598,7 @@ async fn seek_term_postings<L: QueryArtifactLoader>(
     recipe: RecipeIdentity,
     exact: &[ScalarValue],
     prefix: Option<&str>,
+    minimum_document_exclusive: Option<StableDocumentKey>,
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
@@ -1611,25 +1618,57 @@ async fn seek_term_postings<L: QueryArtifactLoader>(
         for entry in entries {
             let term = newest.entry(entry.term).or_default();
             for shard in entry.posting_shards {
+                if minimum_document_exclusive
+                    .is_some_and(|minimum| shard.maximum_document <= minimum)
+                {
+                    continue;
+                }
                 let posting_descriptor = manifest.find_run_block(
                     run,
                     shard.posting_block_hash,
                     QueryBlockKind::Posting,
                     recipe,
                 )?;
-                let (postings, posting_bytes) =
-                    load_block(loader, posting_descriptor, block_limits, credits, budget).await?;
-                if postings.len() != shard.posting_records as usize {
+                if posting_descriptor.records != shard.posting_records
+                    || posting_descriptor.minimum_key != shard.minimum_document.bytes()
+                    || posting_descriptor.maximum_key != shard.maximum_document.bytes()
+                {
                     return Err(IndexError::Integrity);
                 }
-                for record in postings {
-                    let posting = decode_posting(record.as_ref())?;
+                let encoded_bytes = usize::try_from(posting_descriptor.encoded_bytes)
+                    .map_err(|_| IndexError::Integrity)?;
+                let bytes = load_exact_pre_admitted(
+                    loader,
+                    QueryArtifactKind::Block,
+                    posting_descriptor.hash,
+                    encoded_bytes,
+                    credits,
+                    budget,
+                )
+                .await?;
+                credits.release(bytes.len())?;
+                let mut cursor = QueryBlockCursor::from_verified_content(
+                    posting_descriptor,
+                    &bytes,
+                    block_limits,
+                    credits,
+                )?;
+                let mut next = match minimum_document_exclusive {
+                    Some(minimum) if shard.minimum_document <= minimum => {
+                        cursor.seek_to(&minimum.bytes())?
+                    }
+                    _ => cursor.next()?,
+                };
+                while let Some(record) = next {
+                    let posting = decode_posting(record)?;
                     if posting.document < shard.minimum_document
                         || posting.document > shard.maximum_document
                     {
                         return Err(IndexError::Integrity);
                     }
-                    if !term.contains_key(&posting.document) {
+                    if minimum_document_exclusive.is_none_or(|minimum| posting.document > minimum)
+                        && !term.contains_key(&posting.document)
+                    {
                         budget.reserve_heap(
                             credits,
                             std::mem::size_of::<StableDocumentKey>()
@@ -1637,8 +1676,10 @@ async fn seek_term_postings<L: QueryArtifactLoader>(
                         )?;
                         term.insert(posting.document, (run, posting));
                     }
+                    next = cursor.next()?;
                 }
-                budget.release_heap(credits, posting_bytes)?;
+                drop(cursor);
+                credits.release_loaded_block(bytes.len())?;
             }
             if newest.len() > budget.limits.maximum_expanded_terms {
                 return resource(newest.len(), budget.limits.maximum_expanded_terms);
