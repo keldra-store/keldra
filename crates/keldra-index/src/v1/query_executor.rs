@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -159,6 +160,25 @@ pub trait QueryArtifactLoader: Send {
         &mut self,
         request: QueryArtifactLoad,
     ) -> impl std::future::Future<Output = Result<Bytes, IndexError>> + Send;
+
+    /// Returns an already validated immutable run descriptor when the loader
+    /// keeps a decoded view beside its byte cache. Implementations may omit
+    /// this optimization; query correctness never depends on it.
+    fn cached_projection_query_run(
+        &self,
+        _request: QueryArtifactLoad,
+    ) -> Result<Option<Arc<ProjectionQueryRunDescriptor>>, IndexError> {
+        Ok(None)
+    }
+
+    /// Publishes a decoded immutable run descriptor for reuse by later
+    /// queries. The default is deliberately a no-op for uncached loaders.
+    fn cache_projection_query_run(
+        &mut self,
+        _request: QueryArtifactLoad,
+        _descriptor: Arc<ProjectionQueryRunDescriptor>,
+    ) {
+    }
 }
 
 struct Budget {
@@ -241,9 +261,11 @@ struct PartitionView<'a> {
 
 struct PartitionManifest<'a> {
     view: PartitionView<'a>,
-    runs: Vec<ProjectionQueryRunDescriptor>,
-    blocks: BTreeMap<(QueryBlockKind, RecipeIdentity), Vec<(usize, usize)>>,
-    run_blocks: Vec<BTreeMap<([u8; 32], QueryBlockKind, RecipeIdentity), usize>>,
+    runs: Vec<Arc<ProjectionQueryRunDescriptor>>,
+    // Contiguous sorted directories avoid a tree node allocation and element
+    // shuffle for every immutable block on every query.
+    blocks: Vec<(QueryBlockKind, RecipeIdentity, usize, usize)>,
+    run_blocks: Vec<Vec<([u8; 32], QueryBlockKind, RecipeIdentity, usize)>>,
     resident_bytes: usize,
     index_bytes: usize,
 }
@@ -254,11 +276,13 @@ impl PartitionManifest<'_> {
         kind: QueryBlockKind,
         recipe: RecipeIdentity,
     ) -> impl Iterator<Item = (usize, &QueryBlockDescriptor)> {
-        self.blocks
-            .get(&(kind, recipe))
-            .into_iter()
-            .flatten()
-            .map(|&(run, block)| (run, &self.runs[run].blocks[block]))
+        let start = self
+            .blocks
+            .partition_point(|entry| (entry.0, entry.1) < (kind, recipe));
+        self.blocks[start..]
+            .iter()
+            .take_while(move |entry| (entry.0, entry.1) == (kind, recipe))
+            .map(|entry| (entry.2, &self.runs[entry.2].blocks[entry.3]))
     }
 
     fn find_run_block(
@@ -271,8 +295,14 @@ impl PartitionManifest<'_> {
         let block = self
             .run_blocks
             .get(run)
-            .and_then(|blocks| blocks.get(&(hash, kind, recipe)))
-            .copied()
+            .and_then(|blocks| {
+                blocks
+                    .binary_search_by_key(&(hash, kind, recipe), |entry| {
+                        (entry.0, entry.1, entry.2)
+                    })
+                    .ok()
+                    .map(|index| blocks[index].3)
+            })
             .ok_or(IndexError::Integrity)?;
         Ok(&self.runs[run].blocks[block])
     }
@@ -812,7 +842,7 @@ async fn load_next_descriptor<L: QueryArtifactLoader>(
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<Option<(ProjectionQueryRunDescriptor, usize)>, IndexError> {
+) -> Result<Option<(Arc<ProjectionQueryRunDescriptor>, usize)>, IndexError> {
     let Some(reference) = stream.next(loader, credits, budget).await? else {
         return Ok(None);
     };
@@ -821,17 +851,40 @@ async fn load_next_descriptor<L: QueryArtifactLoader>(
     if encoded_bytes > block_limits.maximum_run_descriptor_bytes {
         return resource(encoded_bytes, block_limits.maximum_run_descriptor_bytes);
     }
+    let request = QueryArtifactLoad {
+        kind: QueryArtifactKind::Run,
+        hash: reference.hash,
+        encoded_bytes,
+    };
+    if let Some(descriptor) = loader.cached_projection_query_run(request)? {
+        // Cached decoding removes allocation and parsing, not the established
+        // logical run/byte limits or their evidence counters.
+        budget.load(request.kind, request.encoded_bytes)?;
+        descriptor.validate(block_limits)?;
+        validate_loaded_descriptor(view, &reference, &descriptor)?;
+        return Ok(Some((descriptor, 0)));
+    }
     let bytes = load_exact_pre_admitted(
         loader,
-        QueryArtifactKind::Run,
-        reference.hash,
-        encoded_bytes,
+        request.kind,
+        request.hash,
+        request.encoded_bytes,
         credits,
         budget,
     )
     .await?;
-    let descriptor = decode_projection_query_run(&bytes, block_limits, credits)?;
+    let descriptor = Arc::new(decode_projection_query_run(&bytes, block_limits, credits)?);
     credits.release(bytes.len())?;
+    validate_loaded_descriptor(view, &reference, &descriptor)?;
+    loader.cache_projection_query_run(request, descriptor.clone());
+    Ok(Some((descriptor, bytes.len())))
+}
+
+fn validate_loaded_descriptor(
+    view: &PartitionView<'_>,
+    reference: &QueryRunReference,
+    descriptor: &ProjectionQueryRunDescriptor,
+) -> Result<(), IndexError> {
     if descriptor.partition != view.pin.partition
         || descriptor.sequence != reference.sequence
         || descriptor.source_start_offset != reference.source_start_offset
@@ -857,7 +910,7 @@ async fn load_next_descriptor<L: QueryArtifactLoader>(
             return Err(IndexError::Integrity);
         }
     }
-    Ok(Some((descriptor, bytes.len())))
+    Ok(())
 }
 
 async fn load_partition_manifest<'a, L: QueryArtifactLoader>(
@@ -878,35 +931,33 @@ async fn load_partition_manifest<'a, L: QueryArtifactLoader>(
             .ok_or(IndexError::OffsetOverflow)?;
         runs.push(run);
     }
-    let mut blocks = BTreeMap::<(QueryBlockKind, RecipeIdentity), Vec<(usize, usize)>>::new();
+    let block_count = runs.iter().map(|run| run.blocks.len()).sum::<usize>();
+    let mut blocks = Vec::with_capacity(block_count);
     let mut run_blocks = Vec::with_capacity(runs.len());
     for (run_index, run) in runs.iter().enumerate() {
-        let mut directory = BTreeMap::new();
+        let mut directory = Vec::with_capacity(run.blocks.len());
         for (block_index, block) in run.blocks.iter().enumerate() {
-            blocks
-                .entry((block.kind, block.recipe))
-                .or_default()
-                .push((run_index, block_index));
-            if directory
-                .insert((block.hash, block.kind, block.recipe), block_index)
-                .is_some()
-            {
-                return Err(IndexError::Integrity);
-            }
+            blocks.push((block.kind, block.recipe, run_index, block_index));
+            directory.push((block.hash, block.kind, block.recipe, block_index));
+        }
+        directory.sort_unstable_by_key(|entry| (entry.0, entry.1, entry.2));
+        if directory
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 && pair[0].2 == pair[1].2)
+        {
+            return Err(IndexError::Integrity);
         }
         run_blocks.push(directory);
     }
-    let block_count = runs.iter().map(|run| run.blocks.len()).sum::<usize>();
+    blocks.sort_unstable_by_key(|entry| (entry.0, entry.1, entry.2, entry.3));
     let index_bytes = block_count
         .checked_mul(
-            std::mem::size_of::<(usize, usize)>()
-                + std::mem::size_of::<([u8; 32], QueryBlockKind, RecipeIdentity, usize)>()
-                + 128,
+            std::mem::size_of::<(QueryBlockKind, RecipeIdentity, usize, usize)>()
+                + std::mem::size_of::<([u8; 32], QueryBlockKind, RecipeIdentity, usize)>(),
         )
-        .and_then(|bytes| bytes.checked_add(blocks.len().saturating_mul(96)))
         .and_then(|bytes| {
             bytes.checked_add(run_blocks.capacity().saturating_mul(std::mem::size_of::<
-                BTreeMap<([u8; 32], QueryBlockKind, RecipeIdentity), usize>,
+                Vec<([u8; 32], QueryBlockKind, RecipeIdentity, usize)>,
             >()))
         })
         .ok_or(IndexError::OffsetOverflow)?;

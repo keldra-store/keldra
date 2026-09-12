@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use keldra_index::v1::{
@@ -11,10 +12,10 @@ use keldra_index::v1::{
     ComponentStreamReverseStep, ComponentStreamRoot, PreparedAtomicProjectionGeneration,
     PreparedQueryMutationBatch, ProjectedDocumentState, ProjectionCatalogActivation,
     ProjectionCurrent, ProjectionFamilyPartitionDirectory, ProjectionGeneration,
-    ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits, QueryBlockLimits,
-    QueryRunPage, StableDocumentKey, component_stream_child_hashes, decode_document_head,
-    decode_projection_catalog_activation, decode_projection_current,
-    decode_projection_family_directory, decode_projection_generation,
+    ProjectionPackCredits, ProjectionPartitionIdentity, ProjectionQueryRunDescriptor,
+    QueryBlockCredits, QueryBlockLimits, QueryRunPage, StableDocumentKey,
+    component_stream_child_hashes, decode_document_head, decode_projection_catalog_activation,
+    decode_projection_current, decode_projection_family_directory, decode_projection_generation,
     decode_projection_generation_header, decode_query_run_page, decode_source_records,
     encode_projection_catalog_activation, encode_projection_family_directory,
     lookup_component_record_in_verified_pack, prepare_atomic_projection_generation,
@@ -1261,6 +1262,22 @@ impl V1ProjectionPublisher {
         );
         self.immutable_cache.insert_blob(blob, bytes.clone());
         Ok(bytes)
+    }
+
+    pub(crate) fn cached_query_run(
+        &self,
+        blob: &BlobRef,
+        maximum_bytes: usize,
+    ) -> Result<Option<Arc<ProjectionQueryRunDescriptor>>, Status> {
+        self.immutable_cache.get_query_run(blob, maximum_bytes)
+    }
+
+    pub(crate) fn cache_query_run(
+        &self,
+        blob: &BlobRef,
+        descriptor: Arc<ProjectionQueryRunDescriptor>,
+    ) {
+        self.immutable_cache.insert_query_run(blob, descriptor);
     }
 
     async fn read_blob_local_first_uncached(

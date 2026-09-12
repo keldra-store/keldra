@@ -15,11 +15,11 @@ use keldra_index::v1::{
     AuthorizedQueryCandidate, LogicalFieldBinding, LogicalProjectionBinding,
     MAX_QUERY_CANDIDATE_ADMISSION_BATCH, PinnedPartitionQueryRoot, ProjectionCatalogActivation,
     ProjectionFamilyPartitionDirectory, ProjectionGenerationHeader, ProjectionPartitionIdentity,
-    QueryAdmissionContext, QueryArtifactLoad, QueryArtifactLoader, QueryBlockCredits,
-    QueryBlockLimits, QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits,
-    QueryFieldBinding, QueryMemoryPermit, QueryRootCutProof, RecipeIdentity, StableDocumentKey,
-    TypedJsonQueryRequest, decode_projection_generation_header, execute_typed_json_query,
-    projection_generation_path,
+    ProjectionQueryRunDescriptor, QueryAdmissionContext, QueryArtifactLoad, QueryArtifactLoader,
+    QueryBlockCredits, QueryBlockLimits, QueryCandidateAdmission, QueryCommonCut,
+    QueryExecutionLimits, QueryFieldBinding, QueryMemoryPermit, QueryRootCutProof, RecipeIdentity,
+    StableDocumentKey, TypedJsonQueryRequest, decode_projection_generation_header,
+    execute_typed_json_query, projection_generation_path,
 };
 use keldra_store::{BlobRef, PlacementLogId};
 use tonic::Status;
@@ -664,6 +664,38 @@ impl QueryArtifactLoader for RuntimeArtifactLoader {
                 .await
                 .map_err(|error| IndexError::Io(error.to_string()))?;
             Ok(bytes)
+        }
+    }
+
+    fn cached_projection_query_run(
+        &self,
+        request: QueryArtifactLoad,
+    ) -> Result<Option<Arc<ProjectionQueryRunDescriptor>>, IndexError> {
+        if request.kind != keldra_index::v1::QueryArtifactKind::Run {
+            return Ok(None);
+        }
+        let blob = BlobRef {
+            hash: request.hash,
+            length: request.encoded_bytes as u64,
+        };
+        self.projections
+            .cached_query_run(&blob, request.encoded_bytes)
+            .map_err(|error| IndexError::Io(error.to_string()))
+    }
+
+    fn cache_projection_query_run(
+        &mut self,
+        request: QueryArtifactLoad,
+        descriptor: Arc<ProjectionQueryRunDescriptor>,
+    ) {
+        if request.kind == keldra_index::v1::QueryArtifactKind::Run {
+            self.projections.cache_query_run(
+                &BlobRef {
+                    hash: request.hash,
+                    length: request.encoded_bytes as u64,
+                },
+                descriptor,
+            );
         }
     }
 }

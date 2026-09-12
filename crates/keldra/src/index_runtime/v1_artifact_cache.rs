@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use keldra_index::v1::{ProjectionQueryRunDescriptor, QueryBlockDescriptor};
 use keldra_store::BlobRef;
 use tonic::Status;
 
@@ -47,8 +48,14 @@ struct State {
     // Nest by authority and path so hits can compare the caller's borrowed
     // path without allocating another owned copy.
     entries: HashMap<Authority, HashMap<Arc<str>, HashMap<[u8; 32], Bytes>>>,
-    blobs: HashMap<BlobKey, Bytes>,
+    blobs: HashMap<BlobKey, CachedBlob>,
     fifo: VecDeque<CacheKey>,
+}
+
+struct CachedBlob {
+    bytes: Bytes,
+    query_run: Option<Arc<ProjectionQueryRunDescriptor>>,
+    resident_bytes: usize,
 }
 
 impl Default for State {
@@ -153,9 +160,10 @@ impl ImmutableArtifactCache {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(bytes) = state.blobs.get(&BlobKey::from(blob)) else {
+        let Some(cached) = state.blobs.get(&BlobKey::from(blob)) else {
             return Ok(None);
         };
+        let bytes = &cached.bytes;
         if bytes.len() > maximum_bytes || bytes.len() as u64 != blob.length {
             return Err(Status::data_loss(
                 "v1 projection artifact violates its exact byte bound",
@@ -177,8 +185,59 @@ impl ImmutableArtifactCache {
             return;
         }
         state.bytes += bytes.len();
-        state.blobs.insert(key, bytes);
+        let resident_bytes = bytes.len();
+        state.blobs.insert(
+            key,
+            CachedBlob {
+                bytes,
+                query_run: None,
+                resident_bytes,
+            },
+        );
         state.fifo.push_back(CacheKey::Blob(key));
+        Self::evict_to_capacity(&mut state);
+    }
+
+    pub(super) fn get_query_run(
+        &self,
+        blob: &BlobRef,
+        maximum_bytes: usize,
+    ) -> Result<Option<Arc<ProjectionQueryRunDescriptor>>, Status> {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(cached) = state.blobs.get(&BlobKey::from(blob)) else {
+            return Ok(None);
+        };
+        if cached.bytes.len() > maximum_bytes || cached.bytes.len() as u64 != blob.length {
+            return Err(Status::data_loss(
+                "v1 projection artifact violates its exact byte bound",
+            ));
+        }
+        Ok(cached.query_run.clone())
+    }
+
+    pub(super) fn insert_query_run(
+        &self,
+        blob: &BlobRef,
+        descriptor: Arc<ProjectionQueryRunDescriptor>,
+    ) {
+        let key = BlobKey::from(blob);
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(cached) = state.blobs.get_mut(&key) else {
+            return;
+        };
+        if cached.query_run.is_some() {
+            return;
+        }
+        let descriptor_bytes = resident_query_run_bytes(&descriptor);
+        cached.resident_bytes = cached.resident_bytes.saturating_add(descriptor_bytes);
+        cached.query_run = Some(descriptor);
+        state.bytes = state.bytes.saturating_add(descriptor_bytes);
         Self::evict_to_capacity(&mut state);
     }
 
@@ -213,7 +272,7 @@ impl ImmutableArtifactCache {
                 CacheKey::Blob(oldest) => state
                     .blobs
                     .remove(&oldest)
-                    .map_or(0, |evicted| evicted.len()),
+                    .map_or(0, |evicted| evicted.resident_bytes),
             };
             state.bytes -= evicted_bytes;
         }
@@ -226,6 +285,21 @@ impl ImmutableArtifactCache {
             ..State::default()
         })))
     }
+}
+
+fn resident_query_run_bytes(descriptor: &ProjectionQueryRunDescriptor) -> usize {
+    std::mem::size_of::<ProjectionQueryRunDescriptor>()
+        .saturating_add(
+            descriptor
+                .blocks
+                .capacity()
+                .saturating_mul(std::mem::size_of::<QueryBlockDescriptor>()),
+        )
+        .saturating_add(descriptor.blocks.iter().fold(0usize, |bytes, block| {
+            bytes
+                .saturating_add(block.minimum_key.capacity())
+                .saturating_add(block.maximum_key.capacity())
+        }))
 }
 
 #[cfg(test)]
@@ -353,5 +427,32 @@ mod tests {
 
         assert!(cache.get(1, 2, "/first", [1; 32], 3).unwrap().is_none());
         assert!(cache.get_blob(&blob, 3).unwrap().is_some());
+    }
+
+    #[test]
+    fn decoded_query_runs_are_reference_counted_beside_their_blob() {
+        let cache = ImmutableArtifactCache::default();
+        let blob = BlobRef {
+            hash: [9; 32],
+            length: 8,
+        };
+        cache.insert_blob(&blob, Bytes::from_static(b"artifact"));
+        let descriptor = Arc::new(ProjectionQueryRunDescriptor {
+            partition: keldra_index::v1::ProjectionPartitionIdentity::new(
+                [1; 32], 2, [3; 32], 4, 5, 6,
+            )
+            .unwrap(),
+            physical_catalog_generation: [7; 32],
+            sequence: 1,
+            source_start_offset: 1,
+            next_offset: 2,
+            through_atomic_position: 1,
+            blocks: Vec::new(),
+        });
+
+        cache.insert_query_run(&blob, descriptor.clone());
+        let cached = cache.get_query_run(&blob, 8).unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(&cached, &descriptor));
     }
 }
