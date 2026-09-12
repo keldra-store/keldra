@@ -35,6 +35,12 @@ const RETRY: Duration = Duration::from_millis(250);
 const SAFETY_RECONCILE: Duration = Duration::from_secs(30);
 const JOURNAL_PAGE_RESIDENT_MULTIPLIER: usize = 4;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconcileOutcome {
+    Stable,
+    RetryPartition,
+}
+
 pub(crate) struct V1IndexProducerTask {
     task: tokio::task::JoinHandle<()>,
 }
@@ -150,17 +156,26 @@ impl V1IndexProducerTask {
                     &mut writers,
                 )
                 .await;
-                if let Err(error) = result {
-                    writers.clear();
-                    tracing::warn!(%error, "v1 producer will replay from Current");
-                    tokio::time::sleep(RETRY).await;
-                } else {
-                    let deadline = next_reconcile_delay(&writers, limits);
-                    tokio::select! {
-                        _ = wait_for_physical_catalog_change(&mut catalog_changes) => {}
-                        _ = journal_changes.recv() => {}
-                        _ = publication_changes.recv() => {}
-                        () = tokio::time::sleep(deadline) => {}
+                match result {
+                    Err(error) => {
+                        writers.clear();
+                        tracing::warn!(%error, "v1 producer will replay from Current");
+                        tokio::time::sleep(RETRY).await;
+                    }
+                    Ok(ReconcileOutcome::RetryPartition) => {
+                        // A failed partition was removed without disturbing the
+                        // successful writers. Retry that partition promptly from
+                        // its durable Current while the others retain progress.
+                        tokio::time::sleep(RETRY).await;
+                    }
+                    Ok(ReconcileOutcome::Stable) => {
+                        let deadline = next_reconcile_delay(&writers, limits);
+                        tokio::select! {
+                            _ = wait_for_physical_catalog_change(&mut catalog_changes) => {}
+                            _ = journal_changes.recv() => {}
+                            _ = publication_changes.recv() => {}
+                            () = tokio::time::sleep(deadline) => {}
+                        }
                     }
                 }
             }
@@ -242,7 +257,7 @@ async fn reconcile(
     credits: &IndexingMemoryCredits,
     limits: Limits,
     writers: &mut BTreeMap<ProjectionPartitionIdentity, Writer>,
-) -> Result<(), Status> {
+) -> Result<ReconcileOutcome, Status> {
     let placement = current_placement(decisions)?;
     let target = journal.capture_barrier().await.map_err(event_status)?;
     if placement.fence() != target.fence {
@@ -350,14 +365,28 @@ async fn reconcile(
         }
     })
     .await?;
-    let mut first_error = None;
+    let mut partition_failed = false;
     for (partition, (writer, result)) in outcomes {
-        writers.insert(partition, writer);
-        if let Err(error) = result {
-            first_error.get_or_insert(error);
+        match result {
+            Ok(()) => {
+                writers.insert(partition, writer);
+            }
+            Err(error) => {
+                partition_failed = true;
+                tracing::warn!(
+                    %error,
+                    ?partition,
+                    family_id = ?writer.recipe.family.family_id,
+                    "v1 projection partition will replay from Current; unrelated partitions continue"
+                );
+            }
         }
     }
-    first_error.map_or(Ok(()), Err)
+    Ok(if partition_failed {
+        ReconcileOutcome::RetryPartition
+    } else {
+        ReconcileOutcome::Stable
+    })
 }
 
 async fn open_writer(
