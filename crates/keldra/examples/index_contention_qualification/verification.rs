@@ -17,7 +17,7 @@ use tonic::transport::Channel;
 // microbenchmark. Use the public API's maximum bounded page so a 90k-row
 // correctness scan does not re-evaluate the shrinking suffix roughly ninety
 // times. Dedicated query tests retain small-page continuation coverage.
-const FINAL_VERIFICATION_PAGE_SIZE: usize = 10_000;
+const FINAL_VERIFICATION_PAGE_SIZE: u32 = 10_000;
 
 pub(super) async fn load_authoritative_mutable_state(
     config: &Config,
