@@ -482,6 +482,7 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
                 &contracts,
                 request.logical.membership,
                 predicate,
+                request.resume_after_document,
                 block_limits,
                 block_credits,
                 &mut budget,
@@ -1028,6 +1029,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
     contracts: &'a BTreeMap<FieldId, QueryFieldBinding>,
     membership_recipe: RecipeIdentity,
     predicate: &'a Predicate,
+    minimum_document_exclusive: Option<StableDocumentKey>,
     block_limits: QueryBlockLimits,
     credits: &'a mut QueryBlockCredits,
     budget: &'a mut Budget,
@@ -1052,6 +1054,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
                     contracts,
                     membership_recipe,
                     first,
+                    minimum_document_exclusive,
                     block_limits,
                     credits,
                     budget,
@@ -1065,6 +1068,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
                         contracts,
                         membership_recipe,
                         child,
+                        minimum_document_exclusive,
                         block_limits,
                         credits,
                         budget,
@@ -1096,6 +1100,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
                         contracts,
                         membership_recipe,
                         child,
+                        minimum_document_exclusive,
                         block_limits,
                         credits,
                         budget,
@@ -1126,6 +1131,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
                     contracts,
                     membership_recipe,
                     child,
+                    minimum_document_exclusive,
                     block_limits,
                     credits,
                     budget,
@@ -1141,7 +1147,10 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
                 let output = universe
                     .iter()
                     .filter_map(|(key, gate)| {
-                        (gate.live && !excluded.contains(key)).then_some(*key)
+                        (gate.live
+                            && minimum_document_exclusive.is_none_or(|resume| *key > resume)
+                            && !excluded.contains(key))
+                        .then_some(*key)
                     })
                     .collect();
                 budget.release_heap(
@@ -1160,6 +1169,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
                     contracts,
                     membership_recipe,
                     leaf,
+                    minimum_document_exclusive,
                     block_limits,
                     credits,
                     budget,
@@ -1180,6 +1190,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
     contracts: &BTreeMap<FieldId, QueryFieldBinding>,
     membership_recipe: RecipeIdentity,
     predicate: &Predicate,
+    minimum_document_exclusive: Option<StableDocumentKey>,
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
@@ -1201,10 +1212,15 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
             budget,
         )
         .await?;
-        let keys = presence
+        let mut keys = presence
             .iter()
             .filter_map(|(key, gate)| gate.live.then_some(*key))
             .collect::<BTreeSet<_>>();
+        if let Some(resume) = minimum_document_exclusive {
+            let mut resumed = keys.split_off(&resume);
+            resumed.remove(&resume);
+            keys = resumed;
+        }
         let memberships = if universe.is_empty() {
             load_latest_gates_for_keys(
                 loader,
@@ -1379,6 +1395,11 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
         }
         _ => return Err(IndexError::InvalidQuery("expected Typed JSON leaf".into())),
     };
+    if let Some(resume) = minimum_document_exclusive {
+        let mut resumed = candidates.split_off(&resume);
+        resumed.remove(&resume);
+        candidates = resumed;
+    }
     let candidate_keys = candidates.keys().copied().collect::<BTreeSet<_>>();
     budget.reserve_heap(
         credits,
