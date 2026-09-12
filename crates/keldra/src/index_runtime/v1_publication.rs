@@ -1280,6 +1280,26 @@ impl V1ProjectionPublisher {
         self.immutable_cache.insert_query_run(blob, descriptor);
     }
 
+    pub(crate) fn cached_query_block(
+        &self,
+        blob: &BlobRef,
+        generation: [u8; 32],
+        maximum_bytes: usize,
+    ) -> Result<Option<Arc<keldra_index::v1::DecodedQueryBlock>>, Status> {
+        self.immutable_cache
+            .get_query_block(blob, generation, maximum_bytes)
+    }
+
+    pub(crate) fn cache_query_block(
+        &self,
+        blob: &BlobRef,
+        generation: [u8; 32],
+        block: Arc<keldra_index::v1::DecodedQueryBlock>,
+    ) {
+        self.immutable_cache
+            .insert_query_block(blob, generation, block);
+    }
+
     async fn read_blob_local_first_uncached(
         &self,
         blob: &BlobRef,

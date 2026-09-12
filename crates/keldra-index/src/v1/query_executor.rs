@@ -11,13 +11,13 @@ use crate::typed_json::{
 };
 
 use super::{
-    LogicalProjectionBinding, MAX_QUERY_DOCUMENT_PATH_BYTES, ProjectionPartitionIdentity,
-    ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot, QueryBlockCredits, QueryBlockCursor,
-    QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryDocumentGate, QueryPosting,
-    QueryRecipeCatalogProof, QueryRunChild, QueryRunPage, QueryRunReference, QueryTermEntry,
-    RecipeIdentity, StableDocumentKey, decode_doc_value, decode_document_gate, decode_point,
-    decode_positions, decode_posting, decode_projection_query_run, decode_query_run_page,
-    decode_term_entry,
+    DecodedQueryBlock, LogicalProjectionBinding, MAX_QUERY_DOCUMENT_PATH_BYTES,
+    ProjectionPartitionIdentity, ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot,
+    QueryBlockCredits, QueryBlockCursor, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits,
+    QueryDocumentGate, QueryPosting, QueryRecipeCatalogProof, QueryRunChild, QueryRunPage,
+    QueryRunReference, QueryTermEntry, RecipeIdentity, StableDocumentKey, decode_doc_value,
+    decode_document_gate, decode_point, decode_positions, decode_posting,
+    decode_projection_query_run, decode_query_run_page, decode_term_entry,
 };
 
 #[path = "query_executor_admission.rs"]
@@ -177,6 +177,25 @@ pub trait QueryArtifactLoader: Send {
         &mut self,
         _request: QueryArtifactLoad,
         _descriptor: Arc<ProjectionQueryRunDescriptor>,
+    ) {
+    }
+
+    /// Returns a structurally validated lookup view for an immutable block.
+    /// Generation is part of the key so a publication cut cannot accidentally
+    /// reuse a view admitted for another generation.
+    fn cached_query_block(
+        &self,
+        _generation: [u8; 32],
+        _request: QueryArtifactLoad,
+    ) -> Result<Option<Arc<DecodedQueryBlock>>, IndexError> {
+        Ok(None)
+    }
+
+    fn cache_query_block(
+        &mut self,
+        _generation: [u8; 32],
+        _request: QueryArtifactLoad,
+        _block: Arc<DecodedQueryBlock>,
     ) {
     }
 }
@@ -998,7 +1017,7 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
     if keys.is_empty() {
         return Ok(gates);
     }
-    for (_, descriptor) in manifest.matching_blocks(kind, recipe) {
+    for (run_index, descriptor) in manifest.matching_blocks(kind, recipe) {
         let minimum = StableDocumentKey::from_bytes(
             descriptor
                 .minimum_key
@@ -1016,42 +1035,111 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
         if keys.range(minimum..=maximum).next().is_none() {
             continue;
         }
-        let encoded_bytes =
-            usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-        let bytes = load_exact_pre_admitted(
+        let generation = manifest
+            .runs
+            .get(run_index)
+            .ok_or(IndexError::Integrity)?
+            .physical_catalog_generation;
+        let block = load_decoded_block(
             loader,
-            QueryArtifactKind::Block,
-            descriptor.hash,
-            encoded_bytes,
+            generation,
+            descriptor,
+            block_limits,
             credits,
             budget,
         )
         .await?;
-        credits.release(bytes.len())?;
-        let mut cursor =
-            QueryBlockCursor::from_verified_content(descriptor, &bytes, block_limits, credits)?;
-        for key in keys.range(minimum..=maximum) {
-            if gates.contains_key(key) {
-                continue;
-            }
-            if let Some(record) = cursor.seek_to(&key.bytes())? {
-                let gate = decode_document_gate(record)?;
-                if gate.document == *key {
-                    if (kind == QueryBlockKind::Gate) != gate.source_path.is_some() {
-                        return Err(IndexError::Integrity);
+        let result = (|| {
+            let first_candidate = keys
+                .range(minimum..=maximum)
+                .next()
+                .ok_or(IndexError::Integrity)?;
+            let first_candidate_bytes = first_candidate.bytes();
+            let mut records = block.records_from(&first_candidate_bytes).peekable();
+            let mut candidates = keys.range(minimum..=maximum).peekable();
+            while let (Some(record), Some(key)) =
+                (records.peek().copied(), candidates.peek().map(|key| **key))
+            {
+                if gates.contains_key(&key) {
+                    candidates.next();
+                    continue;
+                }
+                match record.key.cmp(key.bytes().as_slice()) {
+                    Ordering::Less => {
+                        records.next();
                     }
-                    budget.reserve_heap(credits, resident_gate_bytes(&gate)?)?;
-                    gates.insert(*key, gate);
+                    Ordering::Greater => {
+                        candidates.next();
+                    }
+                    Ordering::Equal => {
+                        let gate = decode_document_gate(record)?;
+                        if gate.document != key
+                            || (kind == QueryBlockKind::Gate) != gate.source_path.is_some()
+                        {
+                            return Err(IndexError::Integrity);
+                        }
+                        budget.reserve_heap(credits, resident_gate_bytes(&gate)?)?;
+                        gates.insert(key, gate);
+                        records.next();
+                        candidates.next();
+                    }
                 }
             }
-        }
-        drop(cursor);
-        credits.release_loaded_block(bytes.len())?;
+            Ok(())
+        })();
+        let release = credits.release_loaded_block(block.encoded_bytes());
+        result?;
+        release?;
         if gates.len() == keys.len() {
             break;
         }
     }
     Ok(gates)
+}
+
+async fn load_decoded_block<L: QueryArtifactLoader>(
+    loader: &mut L,
+    generation: [u8; 32],
+    descriptor: &QueryBlockDescriptor,
+    block_limits: QueryBlockLimits,
+    credits: &mut QueryBlockCredits,
+    budget: &mut Budget,
+) -> Result<Arc<DecodedQueryBlock>, IndexError> {
+    let encoded_bytes =
+        usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
+    let request = QueryArtifactLoad {
+        kind: QueryArtifactKind::Block,
+        hash: descriptor.hash,
+        encoded_bytes,
+    };
+    if let Some(block) = loader.cached_query_block(generation, request)? {
+        if !block.matches_descriptor(descriptor) {
+            return Err(IndexError::Integrity);
+        }
+        budget.load(QueryArtifactKind::Block, encoded_bytes)?;
+        credits.reserve_loaded_block(encoded_bytes, block_limits.maximum_loaded_blocks)?;
+        return Ok(block);
+    }
+
+    let bytes = load_exact_pre_admitted(
+        loader,
+        QueryArtifactKind::Block,
+        descriptor.hash,
+        encoded_bytes,
+        credits,
+        budget,
+    )
+    .await?;
+    credits.release(bytes.len())?;
+    let block = Arc::new(DecodedQueryBlock::from_verified_content(
+        descriptor,
+        bytes,
+        block_limits,
+        credits,
+    )?);
+    loader.cache_query_block(generation, request, block.clone());
+    credits.reserve_loaded_block(encoded_bytes, block_limits.maximum_loaded_blocks)?;
+    Ok(block)
 }
 
 #[allow(clippy::too_many_arguments)]

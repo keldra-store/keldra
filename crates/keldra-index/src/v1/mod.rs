@@ -71,7 +71,7 @@ pub use publication::{
     prepare_projection_generation,
 };
 pub use query_blocks::{
-    DEFAULT_QUERY_BLOCK_BYTES, EncodedProjectionQueryRun, EncodedQueryBlock,
+    DEFAULT_QUERY_BLOCK_BYTES, DecodedQueryBlock, EncodedProjectionQueryRun, EncodedQueryBlock,
     PreparedQueryFieldDelta, PreparedQueryTermDelta, ProjectionQueryRunDescriptor,
     QueryBlockCursor, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryBlockRecord,
     QueryBlockRecordRef, QueryDocValue, QueryPoint, QueryPositions, QueryPosting,

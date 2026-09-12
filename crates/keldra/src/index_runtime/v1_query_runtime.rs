@@ -698,6 +698,41 @@ impl QueryArtifactLoader for RuntimeArtifactLoader {
             );
         }
     }
+
+    fn cached_query_block(
+        &self,
+        generation: [u8; 32],
+        request: QueryArtifactLoad,
+    ) -> Result<Option<Arc<keldra_index::v1::DecodedQueryBlock>>, IndexError> {
+        if request.kind != keldra_index::v1::QueryArtifactKind::Block {
+            return Ok(None);
+        }
+        let blob = BlobRef {
+            hash: request.hash,
+            length: request.encoded_bytes as u64,
+        };
+        self.projections
+            .cached_query_block(&blob, generation, request.encoded_bytes)
+            .map_err(|error| IndexError::Io(error.to_string()))
+    }
+
+    fn cache_query_block(
+        &mut self,
+        generation: [u8; 32],
+        request: QueryArtifactLoad,
+        block: Arc<keldra_index::v1::DecodedQueryBlock>,
+    ) {
+        if request.kind == keldra_index::v1::QueryArtifactKind::Block {
+            self.projections.cache_query_block(
+                &BlobRef {
+                    hash: request.hash,
+                    length: request.encoded_bytes as u64,
+                },
+                generation,
+                block,
+            );
+        }
+    }
 }
 
 struct RuntimeCandidateAdmission {

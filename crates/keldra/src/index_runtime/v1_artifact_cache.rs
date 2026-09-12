@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use keldra_index::v1::{ProjectionQueryRunDescriptor, QueryBlockDescriptor};
+use keldra_index::v1::{DecodedQueryBlock, ProjectionQueryRunDescriptor, QueryBlockDescriptor};
 use keldra_store::BlobRef;
 use tonic::Status;
 
@@ -55,7 +55,13 @@ struct State {
 struct CachedBlob {
     bytes: Bytes,
     query_run: Option<Arc<ProjectionQueryRunDescriptor>>,
+    query_block: Option<CachedQueryBlock>,
     resident_bytes: usize,
+}
+
+struct CachedQueryBlock {
+    generation: [u8; 32],
+    block: Arc<DecodedQueryBlock>,
 }
 
 impl Default for State {
@@ -191,6 +197,7 @@ impl ImmutableArtifactCache {
             CachedBlob {
                 bytes,
                 query_run: None,
+                query_block: None,
                 resident_bytes,
             },
         );
@@ -238,6 +245,72 @@ impl ImmutableArtifactCache {
         cached.resident_bytes = cached.resident_bytes.saturating_add(descriptor_bytes);
         cached.query_run = Some(descriptor);
         state.bytes = state.bytes.saturating_add(descriptor_bytes);
+        Self::evict_to_capacity(&mut state);
+    }
+
+    pub(super) fn get_query_block(
+        &self,
+        blob: &BlobRef,
+        generation: [u8; 32],
+        maximum_bytes: usize,
+    ) -> Result<Option<Arc<DecodedQueryBlock>>, Status> {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(cached) = state.blobs.get(&BlobKey::from(blob)) else {
+            return Ok(None);
+        };
+        if cached.bytes.len() > maximum_bytes || cached.bytes.len() as u64 != blob.length {
+            return Err(Status::data_loss(
+                "v1 projection artifact violates its exact byte bound",
+            ));
+        }
+        Ok(cached
+            .query_block
+            .as_ref()
+            .filter(|block| block.generation == generation)
+            .map(|block| block.block.clone()))
+    }
+
+    pub(super) fn insert_query_block(
+        &self,
+        blob: &BlobRef,
+        generation: [u8; 32],
+        block: Arc<DecodedQueryBlock>,
+    ) {
+        let key = BlobKey::from(blob);
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(cached) = state.blobs.get_mut(&key) else {
+            return;
+        };
+        if !block.matches_content(blob.hash, cached.bytes.len()) {
+            return;
+        }
+        let index_bytes = block.resident_index_bytes();
+        let replaced_bytes = cached
+            .query_block
+            .as_ref()
+            .map_or(0, |cached| cached.block.resident_index_bytes());
+        if cached
+            .query_block
+            .as_ref()
+            .is_some_and(|cached| cached.generation == generation)
+        {
+            return;
+        }
+        cached.resident_bytes = cached
+            .resident_bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(index_bytes);
+        cached.query_block = Some(CachedQueryBlock { generation, block });
+        state.bytes = state
+            .bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(index_bytes);
         Self::evict_to_capacity(&mut state);
     }
 

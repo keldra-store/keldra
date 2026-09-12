@@ -1,6 +1,9 @@
 //! Bounded, content-addressed query blocks for v1 projection mini-runs.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
+
+use bytes::Bytes;
 
 use crate::IndexError;
 use crate::typed_json::{
@@ -190,6 +193,130 @@ pub struct EncodedQueryBlock {
 pub struct QueryBlockRecordRef<'a> {
     pub key: &'a [u8],
     pub value: &'a [u8],
+}
+
+#[derive(Clone, Debug)]
+struct DecodedQueryBlockRecord {
+    key: Range<usize>,
+    value: Range<usize>,
+}
+
+/// Disposable, bounded lookup view over an immutable encoded query block.
+///
+/// The encoded bytes remain authoritative. This view records only byte ranges,
+/// so repeated queries do not reparse record lengths or copy keys and values.
+pub struct DecodedQueryBlock {
+    bytes: Bytes,
+    records: Vec<DecodedQueryBlockRecord>,
+    kind: QueryBlockKind,
+    recipe: RecipeIdentity,
+    hash: [u8; 32],
+    record_count: u32,
+}
+
+impl DecodedQueryBlock {
+    pub(crate) fn from_verified_content(
+        descriptor: &QueryBlockDescriptor,
+        bytes: Bytes,
+        limits: QueryBlockLimits,
+        credits: &mut QueryBlockCredits,
+    ) -> Result<Self, IndexError> {
+        let index_bytes = (descriptor.records as usize)
+            .checked_mul(std::mem::size_of::<DecodedQueryBlockRecord>())
+            .ok_or(IndexError::OffsetOverflow)?;
+        credits.reserve(index_bytes)?;
+        let mut records = Vec::with_capacity(descriptor.records as usize);
+        let base = bytes.as_ptr() as usize;
+        let mut loaded = false;
+        let parsed = (|| {
+            let mut cursor = QueryBlockCursor::from_verified_content(
+                descriptor,
+                bytes.as_ref(),
+                limits,
+                credits,
+            )?;
+            loaded = true;
+            while let Some(record) = cursor.next()? {
+                let key_start = (record.key.as_ptr() as usize)
+                    .checked_sub(base)
+                    .ok_or(IndexError::Integrity)?;
+                let value_start = (record.value.as_ptr() as usize)
+                    .checked_sub(base)
+                    .ok_or(IndexError::Integrity)?;
+                records.push(DecodedQueryBlockRecord {
+                    key: key_start..key_start + record.key.len(),
+                    value: value_start..value_start + record.value.len(),
+                });
+            }
+            Ok(())
+        })();
+        // The cache owns the resulting allocation; query credits cover only
+        // construction and validation of that bounded disposable view.
+        let release_loaded = if loaded {
+            credits.release_loaded_block(bytes.len())
+        } else {
+            Ok(())
+        };
+        let release_index = credits.release(index_bytes);
+        parsed?;
+        release_loaded?;
+        release_index?;
+        Ok(Self {
+            bytes,
+            records,
+            kind: descriptor.kind,
+            recipe: descriptor.recipe,
+            hash: descriptor.hash,
+            record_count: descriptor.records,
+        })
+    }
+
+    pub fn encoded_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn resident_index_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(
+            self.records
+                .capacity()
+                .saturating_mul(std::mem::size_of::<DecodedQueryBlockRecord>()),
+        )
+    }
+
+    pub fn matches_descriptor(&self, descriptor: &QueryBlockDescriptor) -> bool {
+        self.kind == descriptor.kind
+            && self.recipe == descriptor.recipe
+            && self.hash == descriptor.hash
+            && self.record_count == descriptor.records
+            && self.bytes.len() as u64 == descriptor.encoded_bytes
+    }
+
+    pub fn matches_content(&self, hash: [u8; 32], encoded_bytes: usize) -> bool {
+        self.hash == hash && self.bytes.len() == encoded_bytes
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = QueryBlockRecordRef<'_>> {
+        self.records_from_index(0)
+    }
+
+    pub fn records_from(
+        &self,
+        minimum_key: &[u8],
+    ) -> impl Iterator<Item = QueryBlockRecordRef<'_>> {
+        let first = self
+            .records
+            .partition_point(|record| &self.bytes[record.key.clone()] < minimum_key);
+        self.records_from_index(first)
+    }
+
+    fn records_from_index(&self, first: usize) -> impl Iterator<Item = QueryBlockRecordRef<'_>> {
+        self.records[first..]
+            .iter()
+            .map(|record| QueryBlockRecordRef {
+                key: &self.bytes[record.key.clone()],
+                value: &self.bytes[record.value.clone()],
+            })
+    }
 }
 
 /// Borrowing cursor over one verified bounded block. It never allocates after
@@ -872,7 +999,6 @@ impl<'a> QueryBlockCursor<'a> {
         {
             return Err(IndexError::Integrity);
         }
-        credits.reserve_loaded_block(bytes.len(), limits.maximum_loaded_blocks)?;
         let payload = bytes;
         let mut input = BlockInput::new(payload);
         input.expect(BLOCK_MAGIC)?;
@@ -916,6 +1042,7 @@ impl<'a> QueryBlockCursor<'a> {
             }
             prior = Some(offset);
         }
+        credits.reserve_loaded_block(bytes.len(), limits.maximum_loaded_blocks)?;
         Ok(Self {
             descriptor,
             bytes: payload,
@@ -1712,6 +1839,49 @@ mod tests {
         corrupt[0] ^= 1;
         assert!(
             QueryBlockCursor::new(&encoded.descriptor, &corrupt, limits, &mut credits).is_err()
+        );
+    }
+
+    #[test]
+    fn decoded_block_reuses_encoded_storage_and_releases_fill_credits() {
+        let limits = QueryBlockLimits::default_for_memory();
+        let mut credits = credits(2 * DEFAULT_QUERY_BLOCK_BYTES);
+        let encoded = encode_query_block(
+            QueryBlockKind::TermDictionary,
+            recipe(),
+            &records(),
+            limits,
+            &mut credits,
+        )
+        .unwrap();
+        let before_fill = credits.remaining();
+        let bytes = Bytes::from(encoded.bytes);
+        let decoded = DecodedQueryBlock::from_verified_content(
+            &encoded.descriptor,
+            bytes.clone(),
+            limits,
+            &mut credits,
+        )
+        .unwrap();
+
+        assert_eq!(credits.remaining(), before_fill);
+        assert_eq!(decoded.encoded_bytes(), bytes.len());
+        assert_eq!(
+            decoded
+                .records_from(b"beta")
+                .map(|record| record.key)
+                .collect::<Vec<_>>(),
+            vec![b"beta".as_slice()]
+        );
+        assert_eq!(
+            decoded
+                .records()
+                .map(|record| (record.key, record.value))
+                .collect::<Vec<_>>(),
+            vec![
+                (b"alpha".as_slice(), b"one".as_slice()),
+                (b"beta".as_slice(), b"two".as_slice()),
+            ]
         );
     }
 
