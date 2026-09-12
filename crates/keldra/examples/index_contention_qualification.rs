@@ -670,10 +670,12 @@ async fn setup(config: &Config, channel: &Channel, token: &str) -> Result<()> {
 }
 
 fn initial_write_ranges(total: usize) -> impl Iterator<Item = Range<usize>> {
-    (0..total).step_by(INITIAL_WRITE_BATCH_SIZE).map(|first| {
-        let end = first.saturating_add(INITIAL_WRITE_BATCH_SIZE).min(total);
-        first..end
-    })
+    (0..total)
+        .step_by(INITIAL_WRITE_BATCH_SIZE)
+        .map(move |first| {
+            let end = first.saturating_add(INITIAL_WRITE_BATCH_SIZE).min(total);
+            first..end
+        })
 }
 
 fn initial_operation_count(config: &Config) -> Result<usize> {
