@@ -772,7 +772,7 @@ impl Store {
                 || self.mutation_receipt_status(),
                 |snapshot| Ok(snapshot.receipts),
             )?;
-            let mut built = self
+            let built = self
                 .build_mutation_batch_attempt(
                     &prepared,
                     &bucket_governance,
@@ -782,7 +782,37 @@ impl Store {
                     source,
                     receipts,
                 )
-                .await?;
+                .await;
+            let mut built = match built {
+                Ok(built) => built,
+                Err(error) if lane_mode => {
+                    // Optimistic evaluation can observe a source-position
+                    // proof committed after its authority snapshot. Compare
+                    // authority before reporting any evaluation error: stale
+                    // work must be discarded and rebuilt from the new source
+                    // and receipt frontier.
+                    let wait_started = std::time::Instant::now();
+                    let mut guard = self.mutation_commit_lanes.sequence().await;
+                    reservation_sequence_wait_duration =
+                        reservation_sequence_wait_duration.saturating_add(wait_started.elapsed());
+                    let hold_started = std::time::Instant::now();
+                    let runtime = guard.as_mut().ok_or_else(|| {
+                        MutationError::Storage("mutation lane runtime is not initialized".into())
+                    })?;
+                    let authority = authority.expect("lane authority was captured");
+                    if authority.still_current(runtime) {
+                        return Err(error);
+                    }
+                    reservation_sequence_hold_duration =
+                        reservation_sequence_hold_duration.saturating_add(hold_started.elapsed());
+                    lane_authority_revalidation_retries =
+                        lane_authority_revalidation_retries.saturating_add(1);
+                    drop(guard);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if !lane_mode || built.batch.is_empty() {
                 break (built, None);
             }
