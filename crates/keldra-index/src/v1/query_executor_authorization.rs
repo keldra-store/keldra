@@ -18,6 +18,7 @@ pub(super) async fn authorize_selected_candidates<A: QueryCandidateAdmission>(
     common_cut: QueryCommonCut,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
+    maximum_authorized: Option<usize>,
 ) -> Result<
     (
         BTreeMap<(ProjectionPartitionIdentity, StableDocumentKey), AuthorizedQueryCandidate>,
@@ -29,9 +30,18 @@ pub(super) async fn authorize_selected_candidates<A: QueryCandidateAdmission>(
     let mut candidates = Vec::new();
     let mut selected = selected.into_values();
     loop {
+        let remaining = maximum_authorized
+            .map(|maximum| maximum.saturating_sub(candidates.len()))
+            .unwrap_or(MAX_QUERY_CANDIDATE_ADMISSION_BATCH);
+        if remaining == 0 {
+            for candidate in selected {
+                budget.release_heap(credits, resident_selected_candidate_bytes(&candidate)?)?;
+            }
+            break;
+        }
         let batch = selected
             .by_ref()
-            .take(MAX_QUERY_CANDIDATE_ADMISSION_BATCH)
+            .take(MAX_QUERY_CANDIDATE_ADMISSION_BATCH.min(remaining))
             .collect::<Vec<_>>();
         if batch.is_empty() {
             break;

@@ -117,6 +117,10 @@ pub struct TypedJsonQueryRequest {
     pub order: Vec<OrderField>,
     pub facets: Vec<FacetRequest>,
     pub aggregates: Vec<AggregateRequest>,
+    /// Exclusive stable-document cursor for the natural document order.
+    /// This is only valid when no explicit order, facets, or aggregates are
+    /// requested, because those operations require the complete candidate set.
+    pub resume_after_document: Option<StableDocumentKey>,
     pub result_limit: usize,
 }
 
@@ -511,6 +515,13 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
         for document in keys {
             let gate = gates.remove(&document).ok_or(IndexError::Integrity)?;
             let gate_bytes = resident_gate_bytes(&gate)?;
+            if request
+                .resume_after_document
+                .is_some_and(|resume| document <= resume)
+            {
+                budget.release_heap(block_credits, gate_bytes)?;
+                continue;
+            }
             if gate.live {
                 let candidate = QueryAdmissionCandidate {
                     partition: view.pin.partition,
@@ -548,6 +559,8 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
         common_cut,
         block_credits,
         &mut budget,
+        (request.order.is_empty() && request.facets.is_empty() && request.aggregates.is_empty())
+            .then_some(request.result_limit),
     )
     .await?;
 
@@ -676,6 +689,16 @@ fn validate_request(
     }
     if request.aggregates.len() > limits.maximum_aggregates {
         return resource(request.aggregates.len(), limits.maximum_aggregates);
+    }
+    if request.resume_after_document.is_some()
+        && (!request.order.is_empty()
+            || !request.facets.is_empty()
+            || !request.aggregates.is_empty())
+    {
+        return Err(IndexError::InvalidQuery(
+            "a stable document cursor cannot be combined with ordering, facets, or aggregates"
+                .into(),
+        ));
     }
     let mut nodes = 0usize;
     if let Some(predicate) = request.predicate.as_ref() {

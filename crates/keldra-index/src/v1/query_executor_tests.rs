@@ -352,6 +352,7 @@ fn sixty_four_candidates_use_one_aligned_admission_batch_with_denials() {
         },
         &mut credits,
         &mut budget,
+        None,
     ))
     .unwrap();
 
@@ -392,9 +393,39 @@ fn reordered_admission_batch_is_rejected() {
             },
             &mut credits,
             &mut budget,
+            None,
         )),
         Err(IndexError::Integrity)
     ));
+}
+
+#[test]
+fn natural_order_admission_stops_after_requested_visible_candidates() {
+    let mut credits = credits(1024 * 1024);
+    let mut budget = budget();
+    let selected = selected_candidates(64, &mut credits, &mut budget);
+    let mut admission = BatchAdmission {
+        calls: 0,
+        reorder: false,
+    };
+    let (authorized, candidates) = ready(authorize_selected_candidates(
+        &mut admission,
+        selected,
+        1,
+        2,
+        QueryCommonCut {
+            through_atomic_position: 3,
+        },
+        &mut credits,
+        &mut budget,
+        Some(5),
+    ))
+    .unwrap();
+
+    assert_eq!(admission.calls, 3);
+    assert_eq!(authorized.len(), 5);
+    assert_eq!(candidates.len(), 5);
+    assert_eq!(candidates.last().unwrap().document.bytes()[0], 8);
 }
 
 #[test]

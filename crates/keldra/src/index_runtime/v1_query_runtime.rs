@@ -17,8 +17,9 @@ use keldra_index::v1::{
     ProjectionFamilyPartitionDirectory, ProjectionGenerationHeader, ProjectionPartitionIdentity,
     QueryAdmissionContext, QueryArtifactLoad, QueryArtifactLoader, QueryBlockCredits,
     QueryBlockLimits, QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits,
-    QueryFieldBinding, QueryMemoryPermit, QueryRootCutProof, RecipeIdentity, TypedJsonQueryRequest,
-    decode_projection_generation_header, execute_typed_json_query, projection_generation_path,
+    QueryFieldBinding, QueryMemoryPermit, QueryRootCutProof, RecipeIdentity, StableDocumentKey,
+    TypedJsonQueryRequest, decode_projection_generation_header, execute_typed_json_query,
+    projection_generation_path,
 };
 use keldra_store::{BlobRef, PlacementLogId};
 use tonic::Status;
@@ -93,6 +94,25 @@ impl V1LocalIndexQueryExecutor {
             .iter()
             .map(|facet| facet.limit)
             .collect::<Vec<_>>();
+        let natural_page = compiled.order.is_empty()
+            && compiled.facets.is_empty()
+            && compiled.aggregates.is_empty();
+        let resume_after_document = if natural_page {
+            request
+                .resume
+                .as_ref()
+                .map(|cursor| {
+                    let bytes: [u8; 32] = cursor
+                        .last_position
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Status::invalid_argument("v1 query cursor is invalid"))?;
+                    StableDocumentKey::from_bytes(bytes).map_err(index_status)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         // Subscribe before the first pin so a Current publication between the
         // read and the wait cannot be lost. The publisher is the authority for
         // root-vector progress; no catalogue/directory polling interval is
@@ -154,10 +174,15 @@ impl V1LocalIndexQueryExecutor {
                 })
                 .collect(),
             aggregates: compiled.aggregates,
-            // The stable document cursor is applied below. Core execution must
-            // retain every bounded authorized candidate so continuation never
-            // skips an order position hidden by an earlier truncation.
-            result_limit: limits.maximum_results,
+            // Natural-order pages push their stable cursor into core execution
+            // and retain one lookahead candidate. Explicit ordering, facets,
+            // and aggregates still require the complete bounded candidate set.
+            resume_after_document,
+            result_limit: if natural_page {
+                request.limit.saturating_add(1)
+            } else {
+                limits.maximum_results
+            },
         };
         let maximum_memory = self.memory.maximum_bounded_lease(MAX_QUERY_MEMORY_BYTES);
         let mut requested_memory = MIN_QUERY_MEMORY_BYTES.min(maximum_memory);
@@ -233,8 +258,11 @@ impl V1LocalIndexQueryExecutor {
                 "index query placement changed during v1 execution",
             ));
         }
-        let (page, next_position) =
-            page_candidates(result.candidates, request.resume.as_ref(), request.limit)?;
+        let (page, next_position) = page_candidates(
+            result.candidates,
+            (!natural_page).then_some(request.resume.as_ref()).flatten(),
+            request.limit,
+        )?;
         let hits = page
             .into_iter()
             .map(|candidate| IndexQueryHit {
