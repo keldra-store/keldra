@@ -960,6 +960,18 @@ impl<'a> QueryBlockCursor<'a> {
     }
 
     pub fn seek_to(&mut self, key: &[u8]) -> Result<Option<QueryBlockRecordRef<'a>>, IndexError> {
+        // Repeated seeks in query execution are naturally monotonic: candidate
+        // document keys arrive in stable order. Keep walking from the current
+        // record in that case instead of binary-searching the restart table and
+        // decoding the same restart interval again for every key.
+        if self.previous.is_some_and(|previous| previous < key) {
+            while let Some(record) = self.next()? {
+                if record.key >= key {
+                    return Ok(Some(record));
+                }
+            }
+            return Ok(None);
+        }
         let mut lower = 0u32;
         let mut upper = self.restart_count;
         while lower < upper {
@@ -1730,6 +1742,56 @@ mod tests {
         );
         assert!(cursor.record_index < 192);
         assert!(cursor.record_index > 128);
+    }
+
+    #[test]
+    fn ascending_seeks_continue_from_the_current_record() {
+        let limits = QueryBlockLimits::default_for_memory();
+        let records = (0u16..192)
+            .map(|value| QueryBlockRecord {
+                key: format!("term-{value:03}").into_bytes(),
+                value: value.to_be_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        let mut credits = credits(DEFAULT_QUERY_BLOCK_BYTES);
+        let encoded = encode_query_block(
+            QueryBlockKind::TermDictionary,
+            recipe(),
+            &records,
+            limits,
+            &mut credits,
+        )
+        .unwrap();
+        let mut cursor =
+            QueryBlockCursor::new(&encoded.descriptor, &encoded.bytes, limits, &mut credits)
+                .unwrap();
+
+        assert_eq!(
+            cursor.seek_to(b"term-130").unwrap().unwrap().key,
+            b"term-130"
+        );
+        let after_first = cursor.record_index;
+        assert_eq!(
+            cursor.seek_to(b"term-131").unwrap().unwrap().key,
+            b"term-131"
+        );
+        assert_eq!(cursor.record_index, after_first + 1);
+        assert_eq!(
+            cursor.seek_to(b"term-150").unwrap().unwrap().key,
+            b"term-150"
+        );
+        assert_eq!(cursor.record_index, after_first + 20);
+
+        // Backward and repeated seeks retain the public random-access
+        // behavior by falling back to the restart table.
+        assert_eq!(
+            cursor.seek_to(b"term-010").unwrap().unwrap().key,
+            b"term-010"
+        );
+        assert_eq!(
+            cursor.seek_to(b"term-010").unwrap().unwrap().key,
+            b"term-010"
+        );
     }
 
     #[test]
