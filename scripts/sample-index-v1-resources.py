@@ -41,11 +41,13 @@ def read_key_values(path: Path) -> dict[str, int]:
     values: dict[str, int] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         key, _, value = line.partition(":")
-        if value:
-            try:
-                values[key] = int(value.strip().split()[0])
-            except ValueError:
-                continue
+        fields = value.split()
+        if not fields:
+            continue
+        try:
+            values[key] = int(fields[0])
+        except ValueError:
+            continue
     return values
 
 

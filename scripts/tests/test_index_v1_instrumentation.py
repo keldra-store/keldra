@@ -30,6 +30,13 @@ class InstrumentationTests(unittest.TestCase):
         self.assertIn('printf "\\n"', source)
         self.assertNotIn('printf "\\\\t%s", $field', source)
         self.assertNotIn('printf "\\\\n"', source)
+        self.assertNotIn("for (index =", source)
+
+    def test_key_value_sampler_ignores_empty_and_non_numeric_values(self):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as source:
+            source.write("VmRSS: 1234 kB\nEmpty:\nState: R (running)\n")
+            source.flush()
+            self.assertEqual(SAMPLER.read_key_values(Path(source.name)), {"VmRSS": 1234})
 
     def test_process_sampler_captures_pid_identity_and_cumulative_fields(self):
         sample = SAMPLER.process_snapshot(os.getpid())

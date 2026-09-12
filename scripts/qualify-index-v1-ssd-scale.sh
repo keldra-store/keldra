@@ -319,7 +319,7 @@ sample_block_device() {
   printf 'timestamp_unix_milliseconds\tmajor\tminor\tdevice\treads_completed\treads_merged\tsectors_read\tread_milliseconds\twrites_completed\twrites_merged\tsectors_written\twrite_milliseconds\tio_in_progress\tio_milliseconds\tweighted_io_milliseconds\tdiscards_completed\tdiscards_merged\tsectors_discarded\tdiscard_milliseconds\tflushes_completed\tflush_milliseconds\n' >"${output}"
   while [[ ! -e "${stop_file}" ]]; do
     awk -v timestamp="$(date +%s%3N)" -v devices="${devices}" '
-      BEGIN { count = split(devices, names, ","); for (index = 1; index <= count; index++) wanted[names[index]] = 1 }
+      BEGIN { count = split(devices, names, ","); for (device_index = 1; device_index <= count; device_index++) wanted[names[device_index]] = 1 }
       ($3 in wanted) && NF >= 20 {
         printf "%s", timestamp
         for (field = 1; field <= 20; field++) printf "\t%s", $field
