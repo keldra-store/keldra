@@ -13,6 +13,12 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tonic::transport::Channel;
 
+// Final-state qualification verifies every hit, but it is not a pagination
+// microbenchmark. Use the public API's maximum bounded page so a 90k-row
+// correctness scan does not re-evaluate the shrinking suffix roughly ninety
+// times. Dedicated query tests retain small-page continuation coverage.
+const FINAL_VERIFICATION_PAGE_SIZE: usize = 10_000;
+
 pub(super) async fn load_authoritative_mutable_state(
     config: &Config,
     channels: &[Channel],
@@ -349,7 +355,7 @@ async fn paginated_class_query(
                 index_name,
                 "probe",
                 value.clone(),
-                1_000,
+                FINAL_VERIFICATION_PAGE_SIZE,
                 page_token,
             ),
         )
