@@ -1,9 +1,10 @@
-use super::{IndexClient, config::Config, data, index_client, query_page};
+use super::{IndexClient, config::Config, index_client, query_page};
 use anyhow::{Context, Result, bail, ensure};
 use keldra_storage::object_client;
 use keldra_storage::v1::object_head::State as ObjectHeadState;
 use keldra_storage::v1::{
-    HeadObjectRequest, IndexFreshness, IndexSourceFreshness, ObjectAddress, QueryIndexResponse,
+    HeadObjectRequest, IndexFreshness, IndexSourceFreshness, ListObjectsRequest, ObjectAddress,
+    QueryIndexResponse,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -17,23 +18,63 @@ pub(super) async fn load_authoritative_mutable_state(
     channels: &[Channel],
     token: &str,
 ) -> Result<Arc<BTreeMap<String, u64>>> {
+    let prefix = "contention/mutable/";
+    let mut listing = object_client(channels[0].clone(), token)?;
+    let mut paths = Vec::new();
+    let mut start_after = None;
+    loop {
+        let page = listing
+            .list_objects(ListObjectsRequest {
+                tenant: config.tenant.clone(),
+                bucket: config.bucket.clone(),
+                prefix: prefix.into(),
+                start_after,
+                limit: 1_000,
+            })
+            .await?
+            .into_inner();
+        ensure!(
+            page.paths.iter().all(|path| path.starts_with(prefix)),
+            "mutable authority listing returned a path outside its prefix"
+        );
+        ensure!(
+            paths.len().saturating_add(page.paths.len()) <= config.mutable_records as usize,
+            "mutable authority listing exceeded the configured keyspace"
+        );
+        paths.extend(page.paths);
+        if !page.has_more {
+            break;
+        }
+        start_after = Some(
+            paths
+                .last()
+                .context("mutable authority listing has_more without a continuation path")?
+                .clone(),
+        );
+    }
+    ensure!(
+        paths.len() >= config.preseeded_mutable_records as usize,
+        "mutable authority returned {} paths, fewer than the {} preseeded paths",
+        paths.len(),
+        config.preseeded_mutable_records
+    );
+
     let mut authority = BTreeMap::new();
-    let worker_count = config
-        .query_max_in_flight
-        .min(usize::try_from(config.mutable_records).unwrap_or(usize::MAX));
+    let worker_count = config.query_max_in_flight.min(paths.len());
+    let paths = Arc::new(paths);
     let mut workers = JoinSet::new();
     for worker in 0..worker_count {
         let channel = channels[worker % channels.len()].clone();
         let token = token.to_owned();
         let tenant = config.tenant.clone();
         let bucket = config.bucket.clone();
-        let mutable_records = config.mutable_records;
+        let paths = paths.clone();
         workers.spawn(async move {
             let mut objects = object_client(channel, &token)?;
             let mut entries = Vec::new();
-            let mut id = worker as u64;
-            while id < mutable_records {
-                let path = data::mutable_path(id);
+            let mut position = worker;
+            while position < paths.len() {
+                let path = paths[position].clone();
                 let head = objects
                     .head_object(HeadObjectRequest {
                         address: Some(ObjectAddress {
@@ -49,8 +90,8 @@ pub(super) async fn load_authoritative_mutable_state(
                     _ => bail!("mutable authority path {path} is not present"),
                 };
                 entries.push((path, version));
-                id = id
-                    .checked_add(worker_count as u64)
+                position = position
+                    .checked_add(worker_count)
                     .context("mutable authority worker index overflow")?;
             }
             Ok::<_, anyhow::Error>(entries)
@@ -62,10 +103,8 @@ pub(super) async fn load_authoritative_mutable_state(
         }
     }
     ensure!(
-        authority.len() == config.mutable_records as usize,
-        "mutable authority returned {} of {} paths",
-        authority.len(),
-        config.mutable_records
+        authority.len() == paths.len(),
+        "mutable authority omitted listed paths"
     );
     Ok(Arc::new(authority))
 }
