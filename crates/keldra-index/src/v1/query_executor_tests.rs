@@ -50,6 +50,45 @@ fn budget() -> Budget {
         heap_bytes: 0,
     }
 }
+
+#[test]
+fn canonical_run_directory_is_searched_without_materializing_an_index() {
+    let first = RecipeIdentity::new([1; 32]).unwrap();
+    let second = RecipeIdentity::new([2; 32]).unwrap();
+    let block = |kind, recipe, key: u8, hash: u8| QueryBlockDescriptor {
+        kind,
+        recipe,
+        minimum_key: vec![key],
+        maximum_key: vec![key],
+        hash: [hash; 32],
+        encoded_bytes: 64,
+        records: 1,
+    };
+    let run = ProjectionQueryRunDescriptor {
+        partition: partition(1),
+        physical_catalog_generation: [3; 32],
+        sequence: 1,
+        source_start_offset: 1,
+        next_offset: 2,
+        through_atomic_position: 1,
+        blocks: vec![
+            block(QueryBlockKind::Posting, first, 1, 1),
+            block(QueryBlockKind::Gate, first, 1, 2),
+            block(QueryBlockKind::Gate, first, 2, 3),
+            block(QueryBlockKind::Gate, second, 1, 4),
+        ],
+    };
+    run.validate(QueryBlockLimits::default_for_memory())
+        .unwrap();
+
+    let matching = matching_run_blocks(&run, QueryBlockKind::Gate, first);
+
+    assert_eq!(matching.len(), 2);
+    assert_eq!(matching[0].hash, [2; 32]);
+    assert_eq!(matching[1].hash, [3; 32]);
+    assert!(matching_run_blocks(&run, QueryBlockKind::Point, first).is_empty());
+}
+
 fn partition(index: u64) -> ProjectionPartitionIdentity {
     ProjectionPartitionIdentity::new([1; 32], index, [2; 32], 3, 4, index).unwrap()
 }

@@ -262,10 +262,6 @@ struct PartitionView<'a> {
 struct PartitionManifest<'a> {
     view: PartitionView<'a>,
     runs: Vec<Arc<ProjectionQueryRunDescriptor>>,
-    // Contiguous sorted directories avoid a tree node allocation and element
-    // shuffle for every immutable block on every query.
-    blocks: Vec<(QueryBlockKind, RecipeIdentity, usize, usize)>,
-    run_blocks: Vec<Vec<([u8; 32], QueryBlockKind, RecipeIdentity, usize)>>,
     resident_bytes: usize,
     index_bytes: usize,
 }
@@ -276,13 +272,14 @@ impl PartitionManifest<'_> {
         kind: QueryBlockKind,
         recipe: RecipeIdentity,
     ) -> impl Iterator<Item = (usize, &QueryBlockDescriptor)> {
-        let start = self
-            .blocks
-            .partition_point(|entry| (entry.0, entry.1) < (kind, recipe));
-        self.blocks[start..]
+        self.runs
             .iter()
-            .take_while(move |entry| (entry.0, entry.1) == (kind, recipe))
-            .map(|entry| (entry.2, &self.runs[entry.2].blocks[entry.3]))
+            .enumerate()
+            .flat_map(move |(run_index, run)| {
+                matching_run_blocks(run, kind, recipe)
+                    .iter()
+                    .map(move |block| (run_index, block))
+            })
     }
 
     fn find_run_block(
@@ -293,19 +290,32 @@ impl PartitionManifest<'_> {
         recipe: RecipeIdentity,
     ) -> Result<&QueryBlockDescriptor, IndexError> {
         let block = self
-            .run_blocks
+            .runs
             .get(run)
-            .and_then(|blocks| {
-                blocks
-                    .binary_search_by_key(&(hash, kind, recipe), |entry| {
-                        (entry.0, entry.1, entry.2)
-                    })
-                    .ok()
-                    .map(|index| blocks[index].3)
+            .and_then(|run| {
+                matching_run_blocks(run, kind, recipe)
+                    .iter()
+                    .find(|block| block.hash == hash)
             })
             .ok_or(IndexError::Integrity)?;
-        Ok(&self.runs[run].blocks[block])
+        Ok(block)
     }
+}
+
+fn matching_run_blocks(
+    run: &ProjectionQueryRunDescriptor,
+    kind: QueryBlockKind,
+    recipe: RecipeIdentity,
+) -> &[QueryBlockDescriptor] {
+    // Descriptor validation guarantees canonical
+    // (kind, recipe, minimum, maximum, hash) order, so each kind/recipe group
+    // is already contiguous and needs no per-query materialized directory.
+    let start = run
+        .blocks
+        .partition_point(|block| (block.kind, block.recipe) < (kind, recipe));
+    let end = start
+        + run.blocks[start..].partition_point(|block| (block.kind, block.recipe) == (kind, recipe));
+    &run.blocks[start..end]
 }
 
 struct QueryRunStream {
@@ -931,42 +941,14 @@ async fn load_partition_manifest<'a, L: QueryArtifactLoader>(
             .ok_or(IndexError::OffsetOverflow)?;
         runs.push(run);
     }
-    let block_count = runs.iter().map(|run| run.blocks.len()).sum::<usize>();
-    let mut blocks = Vec::with_capacity(block_count);
-    let mut run_blocks = Vec::with_capacity(runs.len());
-    for (run_index, run) in runs.iter().enumerate() {
-        let mut directory = Vec::with_capacity(run.blocks.len());
-        for (block_index, block) in run.blocks.iter().enumerate() {
-            blocks.push((block.kind, block.recipe, run_index, block_index));
-            directory.push((block.hash, block.kind, block.recipe, block_index));
-        }
-        directory.sort_unstable_by_key(|entry| (entry.0, entry.1, entry.2));
-        if directory
-            .windows(2)
-            .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 && pair[0].2 == pair[1].2)
-        {
-            return Err(IndexError::Integrity);
-        }
-        run_blocks.push(directory);
-    }
-    blocks.sort_unstable_by_key(|entry| (entry.0, entry.1, entry.2, entry.3));
-    let index_bytes = block_count
-        .checked_mul(
-            std::mem::size_of::<(QueryBlockKind, RecipeIdentity, usize, usize)>()
-                + std::mem::size_of::<([u8; 32], QueryBlockKind, RecipeIdentity, usize)>(),
-        )
-        .and_then(|bytes| {
-            bytes.checked_add(run_blocks.capacity().saturating_mul(std::mem::size_of::<
-                Vec<([u8; 32], QueryBlockKind, RecipeIdentity, usize)>,
-            >()))
-        })
+    let index_bytes = runs
+        .capacity()
+        .checked_mul(std::mem::size_of::<Arc<ProjectionQueryRunDescriptor>>())
         .ok_or(IndexError::OffsetOverflow)?;
     budget.reserve_heap(credits, index_bytes)?;
     Ok(PartitionManifest {
         view,
         runs,
-        blocks,
-        run_blocks,
         resident_bytes,
         index_bytes,
     })
