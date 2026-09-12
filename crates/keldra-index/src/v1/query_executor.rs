@@ -474,7 +474,7 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
         } else {
             BTreeMap::new()
         };
-        let keys = if let Some(predicate) = request.predicate.as_ref() {
+        let mut keys = if let Some(predicate) = request.predicate.as_ref() {
             evaluate_predicate(
                 loader,
                 manifest,
@@ -490,6 +490,20 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
         } else {
             match_all_live_documents(&gates)
         };
+        let key_bytes = request
+            .predicate
+            .as_ref()
+            .map(|_| {
+                keys.len()
+                    .checked_mul(std::mem::size_of::<StableDocumentKey>())
+                    .ok_or(IndexError::OffsetOverflow)
+            })
+            .transpose()?;
+        if let Some(resume) = request.resume_after_document {
+            let mut resumed = keys.split_off(&resume);
+            resumed.remove(&resume);
+            keys = resumed;
+        }
         if !needs_universe {
             gates = load_latest_gates_for_keys(
                 loader,
@@ -503,25 +517,9 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
             )
             .await?;
         }
-        let key_bytes = request
-            .predicate
-            .as_ref()
-            .map(|_| {
-                keys.len()
-                    .checked_mul(std::mem::size_of::<StableDocumentKey>())
-                    .ok_or(IndexError::OffsetOverflow)
-            })
-            .transpose()?;
         for document in keys {
             let gate = gates.remove(&document).ok_or(IndexError::Integrity)?;
             let gate_bytes = resident_gate_bytes(&gate)?;
-            if request
-                .resume_after_document
-                .is_some_and(|resume| document <= resume)
-            {
-                budget.release_heap(block_credits, gate_bytes)?;
-                continue;
-            }
             if gate.live {
                 let candidate = QueryAdmissionCandidate {
                     partition: view.pin.partition,
