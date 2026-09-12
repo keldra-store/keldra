@@ -462,18 +462,14 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         load_authoritative_mutable_state(&config, &query_channels, &verification_token).await?;
     let authoritative_state_read_seconds = authority_started.elapsed().as_secs_f64();
     let convergence_started = Instant::now();
-    let (final_state_verified, advisory_zero_lag, final_sources) = tokio::time::timeout(
-        config.drain_timeout,
-        verify_final_mutable_state(
-            &config,
-            &names,
-            &query_channels,
-            &verification_token,
-            authority,
-        ),
+    let (final_state_verified, advisory_zero_lag, final_sources) = verify_final_mutable_state(
+        &config,
+        &names,
+        &query_channels,
+        &verification_token,
+        authority,
     )
-    .await
-    .context("final mutable verification exceeded drain timeout")??;
+    .await?;
     let final_index_convergence_seconds = convergence_started.elapsed().as_secs_f64();
     let observed = final_sources;
     let post_load = PostLoadReport {

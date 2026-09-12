@@ -184,11 +184,12 @@ async fn verify_one_final_definition(
     expected_source_count: usize,
 ) -> Result<(bool, BTreeSet<u64>)> {
     let mut client = index_client(channel, &token)?;
+    let mut last_observation = "no query attempt completed".to_owned();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(
             !remaining.is_zero(),
-            "index {name} did not converge to authoritative mutable state and zero lag"
+            "index {name} did not converge to authoritative mutable state and zero lag; last observation: {last_observation}"
         );
         let response = paginated_class_query(
             &mut client,
@@ -198,35 +199,85 @@ async fn verify_one_final_definition(
             deadline,
             request_timeout,
         )
-        .await?;
-        if let Some(response) = response {
-            let exact = response.hits == *authority;
-            if let Some(freshness) = response.freshness {
-                let source_ids = freshness
-                    .sources
-                    .iter()
-                    .map(|source| source.node_id)
-                    .collect::<BTreeSet<_>>();
-                let healthy = freshness.initial_build_complete
-                    && !freshness.rebuilding
-                    && freshness.sources.len() == expected_source_count
-                    && source_ids.len() == expected_source_count
-                    && freshness
+        .await;
+        match response {
+            Ok(response) => {
+                let exact = response.hits == *authority;
+                last_observation = mutable_query_observation(&response, &authority);
+                if let Some(freshness) = response.freshness {
+                    let source_ids = freshness
                         .sources
                         .iter()
-                        .all(|source| source.node_id != 0 && source.source_epoch.len() == 32);
-                let observed_tails_available = freshness
-                    .sources
-                    .iter()
-                    .all(|source| source.observed_tail.is_some());
-                let no_observed_lag = freshness.sources.iter().all(source_has_no_observed_lag);
-                if exact && healthy && no_observed_lag {
-                    return Ok((observed_tails_available, source_ids));
+                        .map(|source| source.node_id)
+                        .collect::<BTreeSet<_>>();
+                    let healthy = freshness.initial_build_complete
+                        && !freshness.rebuilding
+                        && freshness.sources.len() == expected_source_count
+                        && source_ids.len() == expected_source_count
+                        && freshness
+                            .sources
+                            .iter()
+                            .all(|source| source.node_id != 0 && source.source_epoch.len() == 32);
+                    let observed_tails_available = freshness
+                        .sources
+                        .iter()
+                        .all(|source| source.observed_tail.is_some());
+                    let no_observed_lag = freshness.sources.iter().all(source_has_no_observed_lag);
+                    if exact && healthy && no_observed_lag {
+                        return Ok((observed_tails_available, source_ids));
+                    }
                 }
             }
+            Err(error) => last_observation = format!("query failed: {error:#}"),
         }
         tokio::time::sleep(visibility_poll).await;
     }
+}
+
+fn mutable_query_observation(
+    response: &PaginatedQueryResult,
+    authority: &BTreeMap<String, u64>,
+) -> String {
+    let first_difference = authority
+        .iter()
+        .find_map(|(path, version)| match response.hits.get(path) {
+            None => Some(format!("missing {path}@{version}")),
+            Some(actual) if actual != version => {
+                Some(format!("version {path}: expected {version}, got {actual}"))
+            }
+            Some(_) => None,
+        })
+        .or_else(|| {
+            response
+                .hits
+                .iter()
+                .find(|(path, _)| !authority.contains_key(*path))
+                .map(|(path, version)| format!("extra {path}@{version}"))
+        })
+        .unwrap_or_else(|| "none".into());
+    let freshness = response.freshness.as_ref().map_or_else(
+        || "absent".into(),
+        |freshness| {
+            format!(
+                "commit={}, build_complete={}, rebuilding={}, sources={}, max_lag={}",
+                freshness.commit_revision,
+                freshness.initial_build_complete,
+                freshness.rebuilding,
+                freshness.sources.len(),
+                freshness
+                    .sources
+                    .iter()
+                    .map(|source| source.lag_hint)
+                    .max()
+                    .unwrap_or(0)
+            )
+        },
+    );
+    format!(
+        "hits={}/{}, first_difference={first_difference}, freshness=[{freshness}]",
+        response.hits.len(),
+        authority.len()
+    )
 }
 
 #[derive(Default)]
@@ -280,11 +331,11 @@ async fn paginated_class_query(
     class: &str,
     deadline: Instant,
     request_timeout: Duration,
-) -> Result<Option<PaginatedQueryResult>> {
+) -> Result<PaginatedQueryResult> {
     let value = serde_json::to_vec(class)?;
     let mut page_token = Vec::new();
     let mut result = PaginatedQueryResult::default();
-    loop {
+    for page_ordinal in 1usize.. {
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(
             !remaining.is_zero(),
@@ -305,13 +356,22 @@ async fn paginated_class_query(
         .await;
         let response = match response {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) | Err(_) => return Ok(None),
+            Ok(Err(error)) => {
+                return Err(anyhow::anyhow!("page {page_ordinal} RPC failed: {error:#}"));
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "page {page_ordinal} exceeded its {:?} request timeout",
+                    remaining.min(request_timeout)
+                ));
+            }
         };
         let Some(next_page_token) = result.absorb(response)? else {
-            return Ok(Some(result));
+            return Ok(result);
         };
         page_token = next_page_token;
     }
+    unreachable!("unbounded page ordinal iterator ended")
 }
 
 pub(super) fn source_has_no_observed_lag(source: &IndexSourceFreshness) -> bool {
