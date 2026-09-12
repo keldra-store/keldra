@@ -446,12 +446,6 @@ impl Store {
                 MutationError::Storage("mutation lane runtime is not initialized".into())
             })?;
             self.refresh_stale_lane_runtime(runtime)?;
-            let reference_cursor = self
-                .reference_delta_cursor(runtime.projected_watch.source_id)
-                .map_err(|error| MutationError::Storage(error.to_string()))?;
-            if reference_cursor != runtime.projected_watch.tail {
-                return Err(MutationError::SourceJournalCapacity);
-            }
             commit_wait_duration = first_sequence_wait_duration;
             Some(guard)
         } else {
@@ -489,6 +483,11 @@ impl Store {
                 (LocalReferenceEffects::Deferred, None)
             }
             CoordinatorBatchPayloadPreparation::SingleNode => {
+                // Lane primary batches apply reference effects inline but do
+                // not publish the durable reference cursor. The ordered lane
+                // projector owns that cursor, and `reserved_watch` is the
+                // in-memory source-position authority while projection is in
+                // flight.
                 (LocalReferenceEffects::AppliedInlineLane, Some(source.tail))
             }
         };

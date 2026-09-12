@@ -48,9 +48,9 @@ pub(super) struct MutationCommitLanes {
     #[cfg(test)]
     pause_next_projection: Arc<AtomicBool>,
     #[cfg(test)]
-    projection_write_started: Arc<Semaphore>,
+    projection_write_completed: Arc<Semaphore>,
     #[cfg(test)]
-    projection_write_continue: Arc<Semaphore>,
+    projection_publish_continue: Arc<Semaphore>,
     #[cfg(test)]
     fence_waiters: Arc<AtomicUsize>,
 }
@@ -211,9 +211,9 @@ impl MutationCommitLanes {
             #[cfg(test)]
             pause_next_projection: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
-            projection_write_started: Arc::new(Semaphore::new(0)),
+            projection_write_completed: Arc::new(Semaphore::new(0)),
             #[cfg(test)]
-            projection_write_continue: Arc::new(Semaphore::new(0)),
+            projection_publish_continue: Arc::new(Semaphore::new(0)),
             #[cfg(test)]
             fence_waiters: Arc::new(AtomicUsize::new(0)),
         }
@@ -657,6 +657,11 @@ impl Store {
                 "injected mutation lane projection failure".into(),
             ));
         }
+        let write_started = Instant::now();
+        self.db
+            .write_opt(std::mem::take(&mut plan.batch), &options)
+            .map_err(storage_error)?;
+        let write = write_started.elapsed();
         #[cfg(test)]
         if self
             .mutation_commit_lanes
@@ -664,20 +669,15 @@ impl Store {
             .swap(false, Ordering::AcqRel)
         {
             self.mutation_commit_lanes
-                .projection_write_started
+                .projection_write_completed
                 .add_permits(1);
             self.mutation_commit_lanes
-                .projection_write_continue
+                .projection_publish_continue
                 .acquire()
                 .await
                 .expect("projection test gate remains open")
                 .forget();
         }
-        let write_started = Instant::now();
-        self.db
-            .write_opt(std::mem::take(&mut plan.batch), &options)
-            .map_err(storage_error)?;
-        let write = write_started.elapsed();
         {
             let mut runtime = self.mutation_commit_lanes.sequence().await;
             let runtime = runtime.as_mut().ok_or_else(|| {
@@ -1077,7 +1077,11 @@ fn tagged_resource<'a>(tag: u8, parts: impl IntoIterator<Item = &'a [u8]>) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlobRef, ReferenceDelta, StoreOptions, WatchCursor, WatchScope};
+    use crate::{
+        BatchOperation, BlobRef, Durability, ObjectKey, ObjectMutationContext,
+        ObjectMutationGovernance, PlacementLogId, PutMode, PutRequest, ReferenceDelta,
+        StoreOptions, WatchCursor, WatchScope,
+    };
 
     fn status(tail: u64, entries: u64, bytes: u64) -> WatchJournalStatus {
         WatchJournalStatus {
@@ -1401,7 +1405,7 @@ mod tests {
         });
         store
             .mutation_commit_lanes
-            .projection_write_started
+            .projection_write_completed
             .acquire()
             .await
             .unwrap()
@@ -1437,7 +1441,7 @@ mod tests {
         store.db.write(batch).unwrap();
         store
             .mutation_commit_lanes
-            .projection_write_continue
+            .projection_publish_continue
             .add_permits(1);
         finishing_first.await.unwrap().unwrap();
 
@@ -1472,6 +1476,122 @@ mod tests {
         assert_eq!((runtime.projected_ticket, runtime.next_ticket), (2, 2));
         assert_eq!(runtime.projected_receipts, runtime.reserved_receipts);
         assert!(runtime.completions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_projection_ahead_of_runtime_does_not_reject_a_lane_reservation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: store.bucket_policy("tenant", "bucket").unwrap(),
+        };
+        let change = LocalChange::sequence_gap(1);
+        let encoded = encode_local_change(&change).unwrap();
+        let (completion, source_id) = {
+            let mut runtime = store.mutation_commit_lanes.sequence().await;
+            let runtime = runtime.as_mut().unwrap();
+            let mut watch = runtime.reserved_watch;
+            let source_id = watch.source_id;
+            watch.tail = 1;
+            watch.retained_entries = 1;
+            watch.retained_bytes = invalidation_record_bytes(encoded.len());
+            let receipts = runtime.reserved_receipts;
+            (runtime.reserve(watch, receipts, None).unwrap(), source_id)
+        };
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            store.cf(CF_LOCAL_INVALIDATIONS).unwrap(),
+            invalidation_key(1),
+            encoded,
+        );
+        store.stage_lane_completion(&mut batch, completion).unwrap();
+        store.db.write(batch).unwrap();
+        store
+            .mutation_commit_lanes
+            .pause_next_projection
+            .store(true, Ordering::Release);
+        let finishing_projection = tokio::spawn({
+            let store = store.clone();
+            async move { store.finish_lane_commit(completion, true).await }
+        });
+        store
+            .mutation_commit_lanes
+            .projection_write_completed
+            .acquire()
+            .await
+            .unwrap()
+            .forget();
+        assert_eq!(store.reference_delta_cursor(source_id).unwrap(), 1);
+        {
+            let runtime = store.mutation_commit_lanes.sequence().await;
+            assert_eq!(runtime.as_ref().unwrap().projected_watch.tail, 0);
+        }
+
+        let group = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .coordinate_single_node_mutation_batch(
+                        vec![(
+                            BatchOperation::Put(PutRequest {
+                                key: ObjectKey::new("tenant", "bucket", "objects/next").unwrap(),
+                                bytes: b"next".to_vec(),
+                                content_type: Some("application/octet-stream".into()),
+                                mode: PutMode::PutIfAbsent,
+                                command_id: Some("next-command".into()),
+                                durability: Durability::Local,
+                            }),
+                            governance,
+                            None,
+                        )],
+                        ObjectMutationContext {
+                            active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+                            serving_fence_term: 1,
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let next_ticket = store
+                    .mutation_commit_lanes
+                    .sequence()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .next_ticket;
+                if next_ticket == 2 {
+                    break;
+                }
+                assert!(
+                    !group.is_finished(),
+                    "the lane group failed before reserving its source range"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the lane group reserves while volatile projection publication is paused");
+        assert!(
+            !group.is_finished(),
+            "the lane group still waits for ordered projection acknowledgement"
+        );
+
+        store
+            .mutation_commit_lanes
+            .projection_publish_continue
+            .add_permits(1);
+        finishing_projection.await.unwrap().unwrap();
+        let outcomes = group.await.unwrap().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].is_ok());
     }
 
     #[tokio::test]
