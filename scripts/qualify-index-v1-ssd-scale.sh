@@ -27,6 +27,7 @@ query_memory_bytes="${KELDRA_V1_SCALE_QUERY_MEMORY_BYTES:-536870912}"
 # not show whether additional server CPU or memory increased throughput.
 mutation_workers="${KELDRA_V1_SCALE_MUTATION_WORKERS:-64}"
 mutable_records="${KELDRA_V1_SCALE_MUTABLE_RECORDS:-256}"
+preseeded_mutable_records="${KELDRA_V1_SCALE_PRESEEDED_MUTABLE_RECORDS:-256}"
 source_journal_entries="${KELDRA_V1_SCALE_SOURCE_JOURNAL_MAX_ENTRIES:-10000000}"
 catalog_only_at_or_above="${KELDRA_V1_SCALE_CATALOG_ONLY_AT_OR_ABOVE_DEFINITIONS:-250000}"
 group_max_requests="${KELDRA_V1_SCALE_GROUP_MAX_REQUESTS:-}"
@@ -186,6 +187,10 @@ positive_integer "${mutable_records}" && ((mutable_records <= 1000000)) || {
   echo "KELDRA_V1_SCALE_MUTABLE_RECORDS must be a positive integer no greater than 1000000" >&2
   exit 2
 }
+positive_integer "${preseeded_mutable_records}" && ((preseeded_mutable_records <= mutable_records)) || {
+  echo "KELDRA_V1_SCALE_PRESEEDED_MUTABLE_RECORDS must be positive and no greater than KELDRA_V1_SCALE_MUTABLE_RECORDS" >&2
+  exit 2
+}
 for value in "${base_port}" "${query_rate}" "${query_max_in_flight}" "${source_journal_entries}" \
   "${baseline_seconds}" "${concurrent_seconds}" "${post_seconds}" "${catalog_only_at_or_above}"
 do
@@ -285,6 +290,7 @@ block_device_sampler_pid=""
   echo "indexing_worker_matrix=${worker_matrix}"
   echo "mutation_workers=${mutation_workers}"
   echo "mutable_records=${mutable_records}"
+  echo "preseeded_mutable_records=${preseeded_mutable_records}"
   echo "memory_per_worker_matrix=${memory_per_worker_matrix}"
   echo "target_data_operations_rate_ladder=${rate_ladder}"
   echo "mutation_object_size_matrix=${object_size_matrix}"
@@ -884,6 +890,7 @@ for definitions in "${definitions_values[@]}"; do
             "KELDRA_INDEX_CONTENTION_TARGET_DATA_OPERATIONS_PER_SECOND=${target_data_rate}"
             "KELDRA_INDEX_CONTENTION_MUTATION_RECORD_BYTES=${object_bytes}"
             "KELDRA_INDEX_CONTENTION_MUTABLE_RECORDS=${mutable_records}"
+            "KELDRA_INDEX_CONTENTION_PRESEEDED_MUTABLE_RECORDS=${preseeded_mutable_records}"
             "KELDRA_INDEX_CONTENTION_MUTATION_WORKERS=${mutation_workers}"
             "KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=32"
             "KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=$((mutation_workers * 8))"

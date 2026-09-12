@@ -686,7 +686,7 @@ fn initial_operation_count(config: &Config) -> Result<usize> {
     };
     let total = config
         .stable_records
-        .checked_add(config.mutable_records)
+        .checked_add(config.preseeded_mutable_records)
         .and_then(|total| total.checked_add(marker_records))
         .context("initial qualification corpus size overflow")?;
     usize::try_from(total).context("initial qualification corpus does not fit in memory indexes")
@@ -708,7 +708,7 @@ fn initial_operation(config: &Config, ordinal: u64) -> Result<BulkOperation> {
         ));
     }
     let ordinal = ordinal - config.stable_records;
-    if ordinal < config.mutable_records {
+    if ordinal < config.preseeded_mutable_records {
         return Ok(put(
             config,
             data::mutable_path(ordinal),
@@ -722,7 +722,7 @@ fn initial_operation(config: &Config, ordinal: u64) -> Result<BulkOperation> {
             format!("contention-initial-mutable-{ordinal}"),
         ));
     }
-    let marker_ordinal = ordinal - config.mutable_records;
+    let marker_ordinal = ordinal - config.preseeded_mutable_records;
     ensure!(
         config.mutation_workload == MutationWorkload::ProjectionPreserving
             && marker_ordinal < data::PROJECTION_PRESERVING_MARKERS,

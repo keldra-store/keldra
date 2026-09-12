@@ -45,6 +45,7 @@ pub struct Config {
     pub physical_recipe_count: usize,
     pub stable_records: u64,
     pub mutable_records: u64,
+    pub preseeded_mutable_records: u64,
     pub seed: u64,
     pub mutation_workers: usize,
     pub mutation_workload: MutationWorkload,
@@ -81,6 +82,7 @@ pub struct PublicConfig {
     pub physical_recipe_count: usize,
     pub stable_records: u64,
     pub mutable_records: u64,
+    pub preseeded_mutable_records: u64,
     pub seed_hex: String,
     pub mutation_workers: usize,
     pub mutation_workload: MutationWorkload,
@@ -114,6 +116,7 @@ impl Config {
         let physical_recipe_count = number("PHYSICAL_RECIPE_COUNT", 1)?;
         let stable_records = number("STABLE_RECORDS", 64)?;
         let mutable_records = number("MUTABLE_RECORDS", 256)?;
+        let preseeded_mutable_records = number("PRESEEDED_MUTABLE_RECORDS", mutable_records)?;
         let mutation_workers = number("MUTATION_WORKERS", 4)?;
         let mutation_batch_size = number("MUTATION_BATCH_SIZE", 32)?;
         let mutation_record_bytes = number("MUTATION_RECORD_BYTES", 0)?;
@@ -125,6 +128,10 @@ impl Config {
         ensure!(!endpoints.is_empty(), "at least one endpoint is required");
         validate_scale(definition_count, physical_recipe_count)?;
         validate_record_counts(stable_records, mutable_records)?;
+        ensure!(
+            preseeded_mutable_records <= mutable_records,
+            "preseeded mutable records must not exceed mutable records"
+        );
         ensure!(mutation_workers > 0 && mutation_batch_size > 0);
         ensure!(
             mutation_record_bytes <= 64 * 1024 * 1024,
@@ -184,6 +191,7 @@ impl Config {
             physical_recipe_count,
             stable_records,
             mutable_records,
+            preseeded_mutable_records,
             seed: number("SEED", 0x6b65_6c64_7261_0016)?,
             mutation_workers,
             mutation_workload: MutationWorkload::from_env()?,
@@ -224,6 +232,7 @@ impl Config {
             physical_recipe_count: self.physical_recipe_count,
             stable_records: self.stable_records,
             mutable_records: self.mutable_records,
+            preseeded_mutable_records: self.preseeded_mutable_records,
             seed_hex: format!("0x{:016x}", self.seed),
             mutation_workers: self.mutation_workers,
             mutation_workload: self.mutation_workload,
