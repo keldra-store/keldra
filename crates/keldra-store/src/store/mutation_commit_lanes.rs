@@ -52,6 +52,12 @@ pub(super) struct MutationCommitLanes {
     #[cfg(test)]
     projection_publish_continue: Arc<Semaphore>,
     #[cfg(test)]
+    pause_next_evaluation: Arc<AtomicBool>,
+    #[cfg(test)]
+    evaluation_snapshot_taken: Arc<Semaphore>,
+    #[cfg(test)]
+    evaluation_continue: Arc<Semaphore>,
+    #[cfg(test)]
     fence_waiters: Arc<AtomicUsize>,
 }
 
@@ -215,6 +221,12 @@ impl MutationCommitLanes {
             #[cfg(test)]
             projection_publish_continue: Arc::new(Semaphore::new(0)),
             #[cfg(test)]
+            pause_next_evaluation: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            evaluation_snapshot_taken: Arc::new(Semaphore::new(0)),
+            #[cfg(test)]
+            evaluation_continue: Arc::new(Semaphore::new(0)),
+            #[cfg(test)]
             fence_waiters: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -320,6 +332,48 @@ impl MutationCommitLanes {
 
     pub(super) fn projection_retry_needed(&self) -> bool {
         self.projection_retry_needed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn pause_lane_evaluation_after_snapshot(&self) {
+        if self.pause_next_evaluation.swap(false, Ordering::AcqRel) {
+            self.evaluation_snapshot_taken.add_permits(1);
+            self.evaluation_continue
+                .acquire()
+                .await
+                .expect("lane evaluation test gate remains open")
+                .forget();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_next_lane_evaluation(&self) {
+        self.pause_next_evaluation.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) async fn wait_for_paused_lane_evaluation(&self) {
+        self.evaluation_snapshot_taken
+            .acquire()
+            .await
+            .expect("lane evaluation test gate remains open")
+            .forget();
+    }
+
+    #[cfg(test)]
+    pub(super) fn resume_paused_lane_evaluation(&self) {
+        self.evaluation_continue.add_permits(1);
+    }
+
+    #[cfg(test)]
+    pub(super) fn conflict_stripes_for_test(
+        &self,
+        resources: impl IntoIterator<Item = Vec<u8>>,
+    ) -> BTreeSet<usize> {
+        resources
+            .into_iter()
+            .map(|resource| self.stripe(&resource))
+            .collect()
     }
 
     fn stripe(&self, resource: &[u8]) -> usize {

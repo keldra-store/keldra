@@ -132,6 +132,37 @@ impl EvaluationSubphaseMetrics {
             .saturating_add(proofs);
     }
 
+    pub(super) fn accumulate(&mut self, other: Self) {
+        self.enabled |= other.enabled;
+        self.current_precondition_governance += other.current_precondition_governance;
+        self.mutation_planning += other.mutation_planning;
+        self.mutation_construction_validation += other.mutation_construction_validation;
+        self.mutation_construction_validation_operations = self
+            .mutation_construction_validation_operations
+            .saturating_add(other.mutation_construction_validation_operations);
+        self.inline_payload_receipt_stage += other.inline_payload_receipt_stage;
+        self.inline_payload_receipt_stage_operations = self
+            .inline_payload_receipt_stage_operations
+            .saturating_add(other.inline_payload_receipt_stage_operations);
+        self.durable_record_encoding += other.durable_record_encoding;
+        self.blob_lifecycle_stage += other.blob_lifecycle_stage;
+        self.object_state_stage += other.object_state_stage;
+        self.coordinator_bookkeeping += other.coordinator_bookkeeping;
+        self.proof_bookkeeping += other.proof_bookkeeping;
+        self.proof_construction += other.proof_construction;
+        self.proof_construction_proofs = self
+            .proof_construction_proofs
+            .saturating_add(other.proof_construction_proofs);
+        self.proof_multi_get_lookup += other.proof_multi_get_lookup;
+        self.proof_multi_get_lookup_proofs = self
+            .proof_multi_get_lookup_proofs
+            .saturating_add(other.proof_multi_get_lookup_proofs);
+        self.proof_validate_encode_stage += other.proof_validate_encode_stage;
+        self.proof_validate_encode_stage_proofs = self
+            .proof_validate_encode_stage_proofs
+            .saturating_add(other.proof_validate_encode_stage_proofs);
+    }
+
     pub(super) fn categorized(&self) -> Duration {
         self.current_precondition_governance
             .saturating_add(self.mutation_planning)

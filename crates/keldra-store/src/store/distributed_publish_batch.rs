@@ -22,6 +22,44 @@ struct CoordinatedBatchEvaluation {
     metrics: CoordinatorBatchMetrics,
 }
 
+struct MutationBatchAttempt {
+    batch: WriteBatch,
+    evaluated: BTreeMap<usize, Result<CoordinatedObjectMutation, MutationError>>,
+    receipt_capacity_at: Option<usize>,
+    receipt_status: MutationReceiptStatus,
+    pruned_receipts: BTreeSet<Vec<u8>>,
+    pending_changes: Vec<PendingLocalChange>,
+    high_watermark: Option<VersionId>,
+    staged_local_changes: Option<StagedLocalChanges>,
+    evaluate_duration: std::time::Duration,
+    evaluation_subphases: EvaluationSubphaseMetrics,
+    stage_duration: std::time::Duration,
+}
+
+#[derive(Clone, Copy)]
+struct LaneAuthoritySnapshot {
+    next_ticket: u64,
+    watch: WatchJournalStatus,
+    receipts: MutationReceiptStatus,
+}
+
+impl LaneAuthoritySnapshot {
+    /// The exact path, receipt, blob and definition guards keep every object
+    /// fact used by the attempt stable. Only these global allocation
+    /// authorities can advance while evaluation runs without the sequence
+    /// mutex. `settled_through` is projection progress rather than reservation
+    /// authority and is refreshed immediately before reservation.
+    fn still_current(self, runtime: &super::mutation_commit_lanes::LaneRuntime) -> bool {
+        self.next_ticket == runtime.next_ticket
+            && self.watch.source_id == runtime.reserved_watch.source_id
+            && self.watch.tail == runtime.reserved_watch.tail
+            && self.watch.retention_floor == runtime.reserved_watch.retention_floor
+            && self.watch.retained_entries == runtime.reserved_watch.retained_entries
+            && self.watch.retained_bytes == runtime.reserved_watch.retained_bytes
+            && self.receipts == runtime.reserved_receipts
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct CoordinatorBatchMetrics {
     pub(super) prepare: std::time::Duration,
@@ -42,6 +80,7 @@ pub(super) struct CoordinatorBatchMetrics {
     pub(super) locked_setup: std::time::Duration,
     pub(super) baseline_prefetch: std::time::Duration,
     pub(super) baseline_revalidation_retries: u64,
+    pub(super) lane_authority_revalidation_retries: u64,
     pub(super) evaluate: std::time::Duration,
     pub(super) evaluation_subphases: EvaluationSubphaseMetrics,
     pub(super) stage: std::time::Duration,
@@ -96,6 +135,217 @@ impl Store {
             false,
         )
         .map(Some)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_mutation_batch_attempt(
+        &self,
+        prepared: &[PreparedDistributedMutation],
+        bucket_governance: &BTreeMap<Vec<u8>, ObjectMutationGovernance>,
+        read_cache: &MutationReadCache,
+        context: ObjectMutationContext,
+        payload_preparation: CoordinatorBatchPayloadPreparation,
+        source: WatchJournalStatus,
+        initial_receipt_status: MutationReceiptStatus,
+    ) -> Result<MutationBatchAttempt, MutationError> {
+        let (reference_effects, reference_cursor) = match payload_preparation {
+            CoordinatorBatchPayloadPreparation::Distributed => {
+                (LocalReferenceEffects::Deferred, None)
+            }
+            CoordinatorBatchPayloadPreparation::SingleNode => {
+                // Lane primary batches apply reference effects inline but do
+                // not publish the durable reference cursor. The ordered lane
+                // projector owns that cursor, and `reserved_watch` is the
+                // in-memory source-position authority while projection is in
+                // flight.
+                (LocalReferenceEffects::AppliedInlineLane, Some(source.tail))
+            }
+        };
+        let mut next_source_position = source.tail.checked_add(1).ok_or_else(|| {
+            MutationError::Storage("local invalidation offset is exhausted".into())
+        })?;
+        let now = now_unix_millis()?;
+        let mut batch = WriteBatch::default();
+        let mut receipt_status = initial_receipt_status;
+        let pruned_receipts = if matches!(
+            payload_preparation,
+            CoordinatorBatchPayloadPreparation::SingleNode
+        ) {
+            BTreeSet::new()
+        } else {
+            self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?
+        };
+        let mut pending_heads = BTreeMap::new();
+        let mut pending_versions = BTreeMap::new();
+        let mut pending_receipts = BTreeMap::new();
+        let mut pending_blob_references = PendingBlobReferences::new();
+        let mut pending_inline_payloads = BTreeSet::new();
+        let mut policy_cache = bucket_governance
+            .iter()
+            .map(|(identity, governance)| (identity.clone(), Ok(governance.policy.clone())))
+            .collect();
+        let mut versioning_cache = bucket_governance
+            .iter()
+            .map(|(identity, governance)| (identity.clone(), Ok(governance.versioning)))
+            .collect();
+        let mut pending_changes = Vec::new();
+        let mut high_watermark = None;
+        let mut evaluated = BTreeMap::new();
+        let mut receipt_capacity_at = None;
+        let mut evaluation_subphases = match payload_preparation {
+            CoordinatorBatchPayloadPreparation::SingleNode => {
+                EvaluationSubphaseMetrics::single_node_group()
+            }
+            CoordinatorBatchPayloadPreparation::Distributed => EvaluationSubphaseMetrics::default(),
+        };
+
+        let evaluate_started = std::time::Instant::now();
+        for item in prepared {
+            let outcome = self
+                .evaluate_operation(
+                    &item.operation,
+                    &mut batch,
+                    &mut pending_heads,
+                    &mut pending_versions,
+                    &mut pending_receipts,
+                    &mut pending_blob_references,
+                    &mut pending_inline_payloads,
+                    read_cache,
+                    &mut policy_cache,
+                    &mut versioning_cache,
+                    &pruned_receipts,
+                    &mut receipt_status,
+                    now,
+                    Some(DistributedEvaluationContext {
+                        mutation: context,
+                        source_id: source.source_id,
+                        source_journal_position: next_source_position,
+                        reference_effects,
+                        materialize_inline_payload: matches!(
+                            payload_preparation,
+                            CoordinatorBatchPayloadPreparation::SingleNode
+                        ),
+                    }),
+                    item.definition_intent,
+                    &mut evaluation_subphases,
+                )
+                .await;
+            let coordinator_bookkeeping_started = evaluation_subphases.start();
+            if outcome
+                .as_ref()
+                .is_err_and(|error| matches!(error, MutationError::ReceiptCapacity))
+            {
+                receipt_capacity_at = Some(item.index);
+                break;
+            }
+            if let Ok(value) = &outcome
+                && !value.receipt.replayed
+            {
+                let mutation = value.mutation.as_ref().ok_or_else(|| {
+                    MutationError::Storage("distributed batch mutation result is missing".into())
+                })?;
+                if mutation.stamp.source_journal_position != next_source_position {
+                    return Err(MutationError::Storage(
+                        "distributed batch source position changed during evaluation".into(),
+                    ));
+                }
+                next_source_position = next_source_position
+                    .checked_add(
+                        1 + mutation
+                            .alias_snapshot
+                            .as_ref()
+                            .map_or(0, |snapshot| snapshot.registry.aliases.len() as u64),
+                    )
+                    .ok_or_else(|| {
+                        MutationError::Storage("local invalidation offset is exhausted".into())
+                    })?;
+                high_watermark = Some(
+                    high_watermark.map_or(value.receipt.version, |current: VersionId| {
+                        current.max(value.receipt.version)
+                    }),
+                );
+                pending_changes.extend(
+                    value.pending_head_changes(
+                        item.operation.identity(),
+                        item.operation.key().path(),
+                    ),
+                );
+            }
+            evaluated.insert(
+                item.index,
+                outcome.map(|value| CoordinatedObjectMutation {
+                    receipt: value.receipt,
+                    mutation: value.mutation,
+                }),
+            );
+            evaluation_subphases.record_since(
+                super::evaluation_telemetry::EvaluationSubphase::Coordinator,
+                coordinator_bookkeeping_started,
+            );
+        }
+        let proof_mutations = evaluation_subphases.measure(
+            super::evaluation_telemetry::EvaluationSubphase::Coordinator,
+            || {
+                evaluated
+                    .values()
+                    .filter_map(|outcome| outcome.as_ref().ok()?.mutation.as_ref())
+                    .collect::<Vec<_>>()
+            },
+        );
+        self.stage_object_mutation_reference_proofs(
+            &mut batch,
+            &proof_mutations,
+            &mut evaluation_subphases,
+        )?;
+        let evaluate_duration = evaluate_started.elapsed();
+
+        let stage_started = std::time::Instant::now();
+        if matches!(
+            payload_preparation,
+            CoordinatorBatchPayloadPreparation::Distributed
+        ) && receipt_status != initial_receipt_status
+        {
+            self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
+        }
+        let staged_local_changes = match payload_preparation {
+            CoordinatorBatchPayloadPreparation::SingleNode => self
+                .stage_single_node_local_changes(
+                    &mut batch,
+                    &pending_changes,
+                    reference_effects,
+                    source,
+                    reference_cursor.expect("single-node reference cursor was read"),
+                )?,
+            CoordinatorBatchPayloadPreparation::Distributed => {
+                self.stage_local_changes(&mut batch, &pending_changes, reference_effects)?;
+                None
+            }
+        };
+        if matches!(
+            payload_preparation,
+            CoordinatorBatchPayloadPreparation::Distributed
+        ) && let Some(high_watermark) = high_watermark
+        {
+            batch.put_cf(
+                self.cf(CF_METADATA)?,
+                VERSION_HIGH_WATERMARK_KEY,
+                serde_json::to_vec(&high_watermark).map_err(storage_error)?,
+            );
+        }
+        let stage_duration = stage_started.elapsed();
+        Ok(MutationBatchAttempt {
+            batch,
+            evaluated,
+            receipt_capacity_at,
+            receipt_status,
+            pruned_receipts,
+            pending_changes,
+            high_watermark,
+            staged_local_changes,
+            evaluate_duration,
+            evaluation_subphases,
+            stage_duration,
+        })
     }
 
     /// Evaluate independently receipted operations for one metadata replica
@@ -396,10 +646,10 @@ impl Store {
             .map_or(0, |lane| lane.physical_slot_count());
         let mut commit_wait_duration = std::time::Duration::ZERO;
         let mut first_sequence_wait_duration = std::time::Duration::ZERO;
-        let mut first_sequence_acquired_at = None;
         let mut prior_projection_metrics =
             super::mutation_commit_lanes::LaneProjectionMetrics::default();
         let mut baseline_revalidation_retries = 0_u64;
+        let mut lane_authority_revalidation_retries = 0_u64;
         let (read_cache, mut commit_guard) = if lane_mode {
             // The first snapshot discovered predecessor blob identities while
             // the lane fence excluded legacy writers. Reload stripe-protected
@@ -432,25 +682,6 @@ impl Store {
             (read_cache, Some(guard))
         };
         drop(prepared_operations);
-        if lane_mode && self.mutation_commit_lanes.projection_retry_needed() {
-            // Retry a prior physical commit's buffered projection without
-            // retaining the global reservation sequence during RocksDB I/O.
-            prior_projection_metrics = self.project_lane_completions().await?;
-        }
-        let mut lane_runtime_guard = if lane_mode {
-            let commit_wait_started = std::time::Instant::now();
-            let mut guard = self.mutation_commit_lanes.sequence().await;
-            first_sequence_wait_duration = commit_wait_started.elapsed();
-            first_sequence_acquired_at = Some(std::time::Instant::now());
-            let runtime = guard.as_mut().ok_or_else(|| {
-                MutationError::Storage("mutation lane runtime is not initialized".into())
-            })?;
-            self.refresh_stale_lane_runtime(runtime)?;
-            commit_wait_duration = first_sequence_wait_duration;
-            Some(guard)
-        } else {
-            None
-        };
         let commit_hold_started = std::time::Instant::now();
         let locked_setup_started = std::time::Instant::now();
         let mut reserved = BTreeMap::new();
@@ -467,226 +698,131 @@ impl Store {
             prepared.retain(|item| !reserved.contains_key(&item.index));
             early.extend(reserved);
         }
-        let source = if let Some(runtime) = lane_runtime_guard.as_deref() {
-            runtime
-                .as_ref()
-                .ok_or_else(|| {
-                    MutationError::Storage("mutation lane runtime is not initialized".into())
-                })?
-                .reserved_watch
-        } else {
-            self.local_watch_status()
-                .map_err(|error| MutationError::Storage(error.to_string()))?
-        };
-        let (reference_effects, reference_cursor) = match payload_preparation {
-            CoordinatorBatchPayloadPreparation::Distributed => {
-                (LocalReferenceEffects::Deferred, None)
-            }
-            CoordinatorBatchPayloadPreparation::SingleNode => {
-                // Lane primary batches apply reference effects inline but do
-                // not publish the durable reference cursor. The ordered lane
-                // projector owns that cursor, and `reserved_watch` is the
-                // in-memory source-position authority while projection is in
-                // flight.
-                (LocalReferenceEffects::AppliedInlineLane, Some(source.tail))
-            }
-        };
-        let mut next_source_position = source.tail.checked_add(1).ok_or_else(|| {
-            MutationError::Storage("local invalidation offset is exhausted".into())
-        })?;
-        let now = now_unix_millis()?;
-        let mut batch = WriteBatch::default();
-        let mut receipt_status = if let Some(runtime) = lane_runtime_guard.as_deref() {
-            runtime
-                .as_ref()
-                .ok_or_else(|| {
-                    MutationError::Storage("mutation lane runtime is not initialized".into())
-                })?
-                .reserved_receipts
-        } else {
-            self.mutation_receipt_status()?
-        };
-        let initial_receipt_status = receipt_status;
-        let pruned_receipts = if lane_mode {
-            BTreeSet::new()
-        } else {
-            self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?
-        };
         let locked_setup_duration = locked_setup_started.elapsed();
-        let mut pending_heads = BTreeMap::new();
-        let mut pending_versions = BTreeMap::new();
-        let mut pending_receipts = BTreeMap::new();
-        let mut pending_blob_references = PendingBlobReferences::new();
-        let mut pending_inline_payloads = BTreeSet::new();
-        let mut policy_cache = bucket_governance
-            .iter()
-            .map(|(identity, governance)| (identity.clone(), Ok(governance.policy.clone())))
-            .collect();
-        let mut versioning_cache = bucket_governance
-            .iter()
-            .map(|(identity, governance)| (identity.clone(), Ok(governance.versioning)))
-            .collect();
-        let mut pending_changes = Vec::new();
-        let mut high_watermark = None;
-        let mut evaluated = BTreeMap::new();
-        let mut receipt_capacity_exhausted = false;
-        let mut receipt_capacity_at = None;
-        let mut evaluation_subphases = match payload_preparation {
-            CoordinatorBatchPayloadPreparation::SingleNode => {
-                EvaluationSubphaseMetrics::single_node_group()
-            }
-            CoordinatorBatchPayloadPreparation::Distributed => EvaluationSubphaseMetrics::default(),
-        };
-
-        let evaluate_started = std::time::Instant::now();
-        for item in &prepared {
-            let outcome = self
-                .evaluate_operation(
-                    &item.operation,
-                    &mut batch,
-                    &mut pending_heads,
-                    &mut pending_versions,
-                    &mut pending_receipts,
-                    &mut pending_blob_references,
-                    &mut pending_inline_payloads,
-                    &read_cache,
-                    &mut policy_cache,
-                    &mut versioning_cache,
-                    &pruned_receipts,
-                    &mut receipt_status,
-                    now,
-                    Some(DistributedEvaluationContext {
-                        mutation: context,
-                        source_id: source.source_id,
-                        source_journal_position: next_source_position,
-                        reference_effects,
-                        materialize_inline_payload: matches!(
-                            payload_preparation,
-                            CoordinatorBatchPayloadPreparation::SingleNode
-                        ),
-                    }),
-                    item.definition_intent,
-                    &mut evaluation_subphases,
-                )
-                .await;
-            let coordinator_bookkeeping_started = evaluation_subphases.start();
-            if outcome
-                .as_ref()
-                .is_err_and(|error| matches!(error, MutationError::ReceiptCapacity))
-            {
-                receipt_capacity_exhausted = true;
-                receipt_capacity_at = Some(item.index);
-                break;
-            }
-            if let Ok(value) = &outcome {
-                if !value.receipt.replayed {
-                    let mutation = value.mutation.as_ref().ok_or_else(|| {
-                        MutationError::Storage(
-                            "distributed batch mutation result is missing".into(),
-                        )
-                    })?;
-                    if mutation.stamp.source_journal_position != next_source_position {
-                        return Err(MutationError::Storage(
-                            "distributed batch source position changed during evaluation".into(),
-                        ));
-                    }
-                    next_source_position = next_source_position
-                        .checked_add(
-                            1 + mutation
-                                .alias_snapshot
-                                .as_ref()
-                                .map_or(0, |snapshot| snapshot.registry.aliases.len() as u64),
-                        )
-                        .ok_or_else(|| {
-                            MutationError::Storage("local invalidation offset is exhausted".into())
-                        })?;
-                    high_watermark = Some(
-                        high_watermark.map_or(value.receipt.version, |current: VersionId| {
-                            current.max(value.receipt.version)
-                        }),
-                    );
-                    pending_changes.extend(value.pending_head_changes(
-                        item.operation.identity(),
-                        item.operation.key().path(),
-                    ));
-                }
-            }
-            evaluated.insert(
-                item.index,
-                outcome.map(|value| CoordinatedObjectMutation {
-                    receipt: value.receipt,
-                    mutation: value.mutation,
-                }),
-            );
-            evaluation_subphases.record_since(
-                super::evaluation_telemetry::EvaluationSubphase::Coordinator,
-                coordinator_bookkeeping_started,
-            );
+        if lane_mode && self.mutation_commit_lanes.projection_retry_needed() {
+            // Retry a prior physical commit's buffered projection without
+            // retaining the global reservation sequence during RocksDB I/O.
+            prior_projection_metrics = self.project_lane_completions().await?;
         }
-        let proof_mutations = evaluation_subphases.measure(
-            super::evaluation_telemetry::EvaluationSubphase::Coordinator,
-            || {
-                evaluated
-                    .values()
-                    .filter_map(|outcome| outcome.as_ref().ok()?.mutation.as_ref())
-                    .collect::<Vec<_>>()
-            },
-        );
-        self.stage_object_mutation_reference_proofs(
-            &mut batch,
-            &proof_mutations,
-            &mut evaluation_subphases,
-        )?;
-        let evaluate_duration = evaluate_started.elapsed();
-
-        let stage_started = std::time::Instant::now();
-        if !lane_mode && receipt_status != initial_receipt_status {
-            self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
-        }
-        let staged_local_changes = match payload_preparation {
-            CoordinatorBatchPayloadPreparation::SingleNode => self
-                .stage_single_node_local_changes(
-                    &mut batch,
-                    &pending_changes,
-                    reference_effects,
-                    source,
-                    reference_cursor.expect("single-node reference cursor was read"),
-                )?,
-            CoordinatorBatchPayloadPreparation::Distributed => {
-                self.stage_local_changes(&mut batch, &pending_changes, reference_effects)?;
-                None
-            }
-        };
-        if !lane_mode && let Some(high_watermark) = high_watermark {
-            batch.put_cf(
-                self.cf(CF_METADATA)?,
-                VERSION_HIGH_WATERMARK_KEY,
-                serde_json::to_vec(&high_watermark).map_err(storage_error)?,
-            );
-        }
-        let lane_completion = if lane_mode && !batch.is_empty() {
-            let runtime = lane_runtime_guard
-                .as_deref_mut()
-                .and_then(Option::as_mut)
-                .ok_or_else(|| {
+        let mut first_sequence_hold_duration = std::time::Duration::ZERO;
+        let mut retry_evaluate_duration = std::time::Duration::ZERO;
+        let mut retry_stage_duration = std::time::Duration::ZERO;
+        let mut retry_evaluation_subphases = EvaluationSubphaseMetrics::default();
+        let (mut attempt, lane_completion) = loop {
+            // Take a short optimistic authority snapshot. Object reads,
+            // planning, encoding and proof construction then run concurrently
+            // under their exact conflict guards. If another independent lane
+            // allocates source/receipt authority first, discard the uncommitted
+            // attempt and rebuild it from the new authority rather than
+            // weakening offsets, receipts or capacity accounting.
+            let authority = if lane_mode {
+                let wait_started = std::time::Instant::now();
+                let mut guard = self.mutation_commit_lanes.sequence().await;
+                first_sequence_wait_duration =
+                    first_sequence_wait_duration.saturating_add(wait_started.elapsed());
+                let hold_started = std::time::Instant::now();
+                let runtime = guard.as_mut().ok_or_else(|| {
                     MutationError::Storage("mutation lane runtime is not initialized".into())
                 })?;
-            let watch = staged_local_changes
+                self.refresh_stale_lane_runtime(runtime)?;
+                let snapshot = LaneAuthoritySnapshot {
+                    next_ticket: runtime.next_ticket,
+                    watch: runtime.reserved_watch,
+                    receipts: runtime.reserved_receipts,
+                };
+                first_sequence_hold_duration =
+                    first_sequence_hold_duration.saturating_add(hold_started.elapsed());
+                drop(guard);
+                #[cfg(test)]
+                self.mutation_commit_lanes
+                    .pause_lane_evaluation_after_snapshot()
+                    .await;
+                Some(snapshot)
+            } else {
+                None
+            };
+            let source = authority.map_or_else(
+                || {
+                    self.local_watch_status()
+                        .map_err(|error| MutationError::Storage(error.to_string()))
+                },
+                |snapshot| Ok(snapshot.watch),
+            )?;
+            let receipts = authority.map_or_else(
+                || self.mutation_receipt_status(),
+                |snapshot| Ok(snapshot.receipts),
+            )?;
+            let mut built = self
+                .build_mutation_batch_attempt(
+                    &prepared,
+                    &bucket_governance,
+                    &read_cache,
+                    context,
+                    payload_preparation,
+                    source,
+                    receipts,
+                )
+                .await?;
+            if !lane_mode || built.batch.is_empty() {
+                break (built, None);
+            }
+
+            let wait_started = std::time::Instant::now();
+            let mut guard = self.mutation_commit_lanes.sequence().await;
+            first_sequence_wait_duration =
+                first_sequence_wait_duration.saturating_add(wait_started.elapsed());
+            let hold_started = std::time::Instant::now();
+            let runtime = guard.as_mut().ok_or_else(|| {
+                MutationError::Storage("mutation lane runtime is not initialized".into())
+            })?;
+            let authority = authority.expect("lane authority was captured");
+            if !authority.still_current(runtime) {
+                first_sequence_hold_duration =
+                    first_sequence_hold_duration.saturating_add(hold_started.elapsed());
+                lane_authority_revalidation_retries =
+                    lane_authority_revalidation_retries.saturating_add(1);
+                drop(guard);
+                retry_evaluate_duration =
+                    retry_evaluate_duration.saturating_add(built.evaluate_duration);
+                retry_stage_duration = retry_stage_duration.saturating_add(built.stage_duration);
+                retry_evaluation_subphases.accumulate(built.evaluation_subphases);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            if let Some(staged) = built.staged_local_changes.as_mut() {
+                staged.status.settled_through = runtime.reserved_watch.settled_through;
+            }
+            let watch = built
+                .staged_local_changes
                 .as_ref()
-                .map_or(source, |staged| staged.status);
-            let completion = runtime.reserve(watch, receipt_status, high_watermark)?;
-            self.stage_lane_completion(&mut batch, completion)?;
-            Some(completion)
-        } else {
-            None
+                .map_or(authority.watch, |staged| staged.status);
+            let completion = runtime.reserve(watch, built.receipt_status, built.high_watermark)?;
+            self.stage_lane_completion(&mut built.batch, completion)?;
+            first_sequence_hold_duration =
+                first_sequence_hold_duration.saturating_add(hold_started.elapsed());
+            drop(guard);
+            break (built, Some(completion));
         };
-        let stage_duration = stage_started.elapsed();
-        let first_sequence_hold_duration = first_sequence_acquired_at
-            .map_or(std::time::Duration::ZERO, |started| started.elapsed());
+        commit_wait_duration = if lane_mode {
+            first_sequence_wait_duration
+        } else {
+            commit_wait_duration
+        };
         if lane_mode {
-            drop(lane_runtime_guard.take());
             drop(commit_guard.take());
         }
+        let receipt_capacity_at = attempt.receipt_capacity_at;
+        let pruned_receipts = std::mem::take(&mut attempt.pruned_receipts);
+        let pending_changes = std::mem::take(&mut attempt.pending_changes);
+        let staged_local_changes = attempt.staged_local_changes.take();
+        let evaluate_duration = attempt
+            .evaluate_duration
+            .saturating_add(retry_evaluate_duration);
+        let mut evaluation_subphases = attempt.evaluation_subphases;
+        evaluation_subphases.accumulate(retry_evaluation_subphases);
+        let stage_duration = attempt.stage_duration.saturating_add(retry_stage_duration);
+        let mut evaluated = std::mem::take(&mut attempt.evaluated);
+        let batch = attempt.batch;
         let persist_started = std::time::Instant::now();
         let physical_commit = !batch.is_empty();
         let write_batch_entries = u64::try_from(batch.len()).unwrap_or(u64::MAX);
@@ -754,7 +890,7 @@ impl Store {
                 outcome
             } else if let Some(error) = early.remove(&index) {
                 Err(error)
-            } else if receipt_capacity_exhausted {
+            } else if receipt_capacity_at.is_some() {
                 Err(MutationError::ReceiptCapacity)
             } else {
                 return Err(MutationError::Storage(
@@ -784,6 +920,7 @@ impl Store {
                 locked_setup: locked_setup_duration,
                 baseline_prefetch: baseline_prefetch_duration,
                 baseline_revalidation_retries,
+                lane_authority_revalidation_retries,
                 evaluate: evaluate_duration,
                 evaluation_subphases,
                 stage: stage_duration,
@@ -1114,6 +1251,241 @@ mod tests {
             command_id: Some(command.into()),
             durability,
         }
+    }
+
+    fn governed_put(
+        path: &str,
+        command: &str,
+        bytes: &[u8],
+        governance: ObjectMutationGovernance,
+    ) -> (
+        BatchOperation,
+        ObjectMutationGovernance,
+        Option<DefinitionMutationIntent>,
+    ) {
+        (
+            BatchOperation::Put(put_request(path, command, bytes, Durability::Local)),
+            governance,
+            None,
+        )
+    }
+
+    async fn conflict_stripes_for_put(
+        store: &Store,
+        governance: &ObjectMutationGovernance,
+        path: &str,
+        command: &str,
+        bytes: &[u8],
+    ) -> BTreeSet<usize> {
+        let identity = BucketIdentity {
+            tenant_id: TenantId(governance.tenant_id),
+            bucket_id: BucketId(governance.bucket_id),
+        };
+        let prepared = store
+            .prepare_single_node_coordinated(
+                BatchOperation::Put(put_request(path, command, bytes, Durability::Local)),
+                identity,
+            )
+            .await
+            .unwrap();
+        store.mutation_commit_lanes.conflict_stripes_for_test(
+            super::super::mutation_commit_lanes::conflict_resources(&prepared, None),
+        )
+    }
+
+    #[tokio::test]
+    async fn independent_lane_evaluation_retries_without_holding_sequence_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: store.bucket_policy("tenant", "bucket").unwrap(),
+        };
+        let context = ObjectMutationContext {
+            active_placement_log_id: PlacementLogId { term: 7, index: 9 },
+            serving_fence_term: 7,
+        };
+        let first_path = "objects/paused";
+        let first_stripes =
+            conflict_stripes_for_put(&store, &governance, first_path, "paused-command", b"paused")
+                .await;
+        let mut second = None;
+        for candidate in 0..256 {
+            let path = format!("objects/independent-{candidate}");
+            let command = format!("independent-command-{candidate}");
+            let bytes = format!("independent-{candidate}").into_bytes();
+            let stripes =
+                conflict_stripes_for_put(&store, &governance, &path, &command, &bytes).await;
+            if first_stripes.is_disjoint(&stripes) {
+                second = Some((path, command, bytes));
+                break;
+            }
+        }
+        let (second_path, second_command, second_bytes) =
+            second.expect("the bounded conflict stripe set has an independent candidate");
+        let before = store.local_watch_status().unwrap().tail;
+
+        store.mutation_commit_lanes.pause_next_lane_evaluation();
+        let paused = tokio::spawn({
+            let store = store.clone();
+            let governance = governance.clone();
+            async move {
+                store
+                    .coordinate_mutation_batch(
+                        vec![governed_put(
+                            first_path,
+                            "paused-command",
+                            b"paused",
+                            governance,
+                        )],
+                        context,
+                        CoordinatorBatchPayloadPreparation::SingleNode,
+                    )
+                    .await
+            }
+        });
+        store
+            .mutation_commit_lanes
+            .wait_for_paused_lane_evaluation()
+            .await;
+        let sequence = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.mutation_commit_lanes.sequence(),
+        )
+        .await
+        .expect("evaluation must not retain the sequence authority");
+        drop(sequence);
+
+        let independent = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.coordinate_mutation_batch(
+                vec![governed_put(
+                    &second_path,
+                    &second_command,
+                    &second_bytes,
+                    governance.clone(),
+                )],
+                context,
+                CoordinatorBatchPayloadPreparation::SingleNode,
+            ),
+        )
+        .await
+        .expect("independent lane must commit while the first evaluation is paused")
+        .unwrap();
+        store.mutation_commit_lanes.resume_paused_lane_evaluation();
+        let paused = paused.await.unwrap().unwrap();
+
+        assert_eq!(independent.metrics.lane_authority_revalidation_retries, 0);
+        assert_eq!(paused.metrics.lane_authority_revalidation_retries, 1);
+        let independent_mutation = independent.outcomes[0]
+            .as_ref()
+            .unwrap()
+            .mutation
+            .as_ref()
+            .unwrap();
+        let paused_mutation = paused.outcomes[0]
+            .as_ref()
+            .unwrap()
+            .mutation
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            independent_mutation.stamp.source_journal_position,
+            before + 1
+        );
+        assert_eq!(paused_mutation.stamp.source_journal_position, before + 2);
+        assert_eq!(store.local_watch_status().unwrap().tail, before + 2);
+
+        let replay_tail = store.local_watch_status().unwrap().tail;
+        let replays: [(&str, &str, &[u8]); 2] = [
+            (first_path, "paused-command", b"paused".as_slice()),
+            (&second_path, &second_command, second_bytes.as_slice()),
+        ];
+        for (path, command, bytes) in replays {
+            let replay = store
+                .coordinate_mutation_batch(
+                    vec![governed_put(path, command, bytes, governance.clone())],
+                    context,
+                    CoordinatorBatchPayloadPreparation::SingleNode,
+                )
+                .await
+                .unwrap();
+            assert!(replay.outcomes[0].as_ref().unwrap().receipt.replayed);
+        }
+        assert_eq!(store.local_watch_status().unwrap().tail, replay_tail);
+    }
+
+    #[tokio::test]
+    async fn failed_lane_evaluation_does_not_reserve_sequence_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: store.bucket_policy("tenant", "bucket").unwrap(),
+        };
+        let context = ObjectMutationContext {
+            active_placement_log_id: PlacementLogId { term: 8, index: 1 },
+            serving_fence_term: 8,
+        };
+        store
+            .coordinate_mutation_batch(
+                vec![governed_put(
+                    "objects/existing",
+                    "create-existing",
+                    b"existing",
+                    governance.clone(),
+                )],
+                context,
+                CoordinatorBatchPayloadPreparation::SingleNode,
+            )
+            .await
+            .unwrap();
+        let before_watch = store.local_watch_status().unwrap();
+        let before_ticket = store
+            .mutation_commit_lanes
+            .sequence()
+            .await
+            .as_ref()
+            .unwrap()
+            .next_ticket;
+
+        let failed = store
+            .coordinate_mutation_batch(
+                vec![governed_put(
+                    "objects/existing",
+                    "must-not-reserve",
+                    b"replacement",
+                    governance,
+                )],
+                context,
+                CoordinatorBatchPayloadPreparation::SingleNode,
+            )
+            .await
+            .unwrap();
+
+        assert!(failed.outcomes[0].is_err());
+        assert!(!failed.metrics.physical_commit);
+        assert_eq!(store.local_watch_status().unwrap(), before_watch);
+        assert_eq!(
+            store
+                .mutation_commit_lanes
+                .sequence()
+                .await
+                .as_ref()
+                .unwrap()
+                .next_ticket,
+            before_ticket
+        );
     }
 
     #[tokio::test]

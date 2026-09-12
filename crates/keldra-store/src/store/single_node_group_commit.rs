@@ -686,6 +686,8 @@ impl SingleNodeGroupCommit {
                 locked_setup_seconds = metrics.locked_setup.as_secs_f64(),
                 baseline_prefetch_seconds = metrics.baseline_prefetch.as_secs_f64(),
                 baseline_revalidation_retries = metrics.baseline_revalidation_retries,
+                lane_authority_revalidation_retries = metrics
+                    .lane_authority_revalidation_retries,
                 evaluate_seconds = metrics.evaluate.as_secs_f64(),
                 evaluation_current_precondition_governance_seconds = metrics
                     .evaluation_subphases
