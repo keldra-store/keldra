@@ -735,6 +735,12 @@ impl Store {
                     MutationError::Storage("mutation lane runtime is not initialized".into())
                 })?;
                 self.refresh_stale_lane_runtime(runtime)?;
+                let reference_cursor = self
+                    .reference_delta_cursor(runtime.projected_watch.source_id)
+                    .map_err(|error| MutationError::Storage(error.to_string()))?;
+                if reference_cursor < runtime.projected_watch.tail {
+                    return Err(MutationError::SourceJournalCapacity);
+                }
                 let snapshot = LaneAuthoritySnapshot {
                     watch: runtime.reserved_watch,
                     receipts: runtime.reserved_receipts,
