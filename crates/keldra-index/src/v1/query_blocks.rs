@@ -1143,14 +1143,20 @@ impl ProjectionQueryRunDescriptor {
     pub fn validate(&self, limits: QueryBlockLimits) -> Result<(), IndexError> {
         limits.validate()?;
         self.partition.validate()?;
-        if self.physical_catalog_generation == [0; 32]
-            || self.sequence == 0
-            || self.source_start_offset >= self.next_offset
-            || self.blocks.len() > limits.maximum_loaded_blocks.saturating_mul(4096)
-        {
-            return Err(IndexError::InvalidDefinition(
-                "v1 query run descriptor is invalid".into(),
-            ));
+        for (valid, invariant) in [
+            (
+                self.physical_catalog_generation != [0; 32],
+                "physical_catalog_generation",
+            ),
+            (self.sequence != 0, "sequence"),
+            (
+                self.source_start_offset < self.next_offset,
+                "source_offset_range",
+            ),
+        ] {
+            if !valid {
+                return Err(query_run_integrity(self, invariant));
+            }
         }
         let mut total_descriptor_key_bytes = 0usize;
         let mut previous = None::<(&QueryBlockKind, &RecipeIdentity, &[u8], &[u8], &[u8; 32])>;
@@ -1211,6 +1217,22 @@ impl ProjectionQueryRunDescriptor {
                 && block.minimum_key.as_slice() <= upper
         })
     }
+}
+
+fn query_run_integrity(run: &ProjectionQueryRunDescriptor, invariant: &str) -> IndexError {
+    let generation = run
+        .physical_catalog_generation
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    IndexError::IntegrityViolation(format!(
+        "projection query run {invariant}; partition={:?}, catalog_generation={generation}, sequence={}, source_range={}..{}, blocks={}",
+        run.partition,
+        run.sequence,
+        run.source_start_offset,
+        run.next_offset,
+        run.blocks.len()
+    ))
 }
 
 pub fn encode_projection_query_run(
@@ -1286,9 +1308,6 @@ pub fn decode_projection_query_run(
     let next_offset = input.u64()?;
     let through_atomic_position = input.u64()?;
     let count = input.u32()? as usize;
-    if count > limits.maximum_loaded_blocks.saturating_mul(4096) {
-        return Err(IndexError::InvalidFormat("v1 query run block count"));
-    }
     const MINIMUM_DESCRIPTOR_BLOCK_BYTES: usize = 1 + 32 + 8 + 4 + 4 + 4 + 32;
     if count > input.remaining() / MINIMUM_DESCRIPTOR_BLOCK_BYTES {
         return Err(IndexError::UnexpectedEof {
@@ -2174,5 +2193,67 @@ mod tests {
             decode_projection_query_run(&encoded.bytes, limits, &mut credits).unwrap(),
             descriptor
         );
+    }
+
+    #[test]
+    fn run_block_count_is_bounded_by_descriptor_bytes_not_query_concurrency() {
+        let limits = QueryBlockLimits {
+            maximum_loaded_blocks: 1,
+            ..QueryBlockLimits::default_for_memory()
+        };
+        let blocks = (0_u64..4097)
+            .map(|ordinal| {
+                let key = ordinal.to_be_bytes().to_vec();
+                let mut hash = [0_u8; 32];
+                hash[24..].copy_from_slice(&ordinal.saturating_add(1).to_be_bytes());
+                QueryBlockDescriptor {
+                    kind: QueryBlockKind::Point,
+                    recipe: recipe(),
+                    minimum_key: key.clone(),
+                    maximum_key: key,
+                    hash,
+                    encoded_bytes: 1,
+                    records: 1,
+                }
+            })
+            .collect();
+        let descriptor = ProjectionQueryRunDescriptor {
+            partition: partition(),
+            physical_catalog_generation: [8; 32],
+            sequence: 1,
+            source_start_offset: 9,
+            next_offset: 10,
+            through_atomic_position: 11,
+            blocks,
+        };
+        let mut encode_credits = credits(2 * 1024 * 1024);
+        let encoded = encode_projection_query_run(&descriptor, limits, &mut encode_credits)
+            .expect("persistent run cardinality is independent of loaded-block concurrency");
+        let mut decode_credits = credits(2 * 1024 * 1024);
+        assert_eq!(
+            decode_projection_query_run(&encoded.bytes, limits, &mut decode_credits).unwrap(),
+            descriptor
+        );
+    }
+
+    #[test]
+    fn self_built_run_identity_failure_names_the_exact_invariant() {
+        let descriptor = ProjectionQueryRunDescriptor {
+            partition: partition(),
+            physical_catalog_generation: [8; 32],
+            sequence: 0,
+            source_start_offset: 9,
+            next_offset: 10,
+            through_atomic_position: 11,
+            blocks: Vec::new(),
+        };
+        let error = descriptor
+            .validate(QueryBlockLimits::default_for_memory())
+            .unwrap_err();
+        assert!(matches!(error, IndexError::IntegrityViolation(_)));
+        let message = error.to_string();
+        assert!(message.contains("projection query run sequence"));
+        assert!(message.contains("partition="));
+        assert!(message.contains("source_range=9..10"));
     }
 }
