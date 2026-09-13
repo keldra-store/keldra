@@ -16,7 +16,13 @@ use crate::authentication::{Caller, PluginObjectScope};
 use crate::authorization::ObjectPermission;
 use crate::object_path_access;
 
-pub(crate) const MAX_CANDIDATE_VISIBILITY_BATCH: usize = 256;
+// The authoritative authorization API accepts at most 1,000 checks. Preserve
+// that bound here so query admission can use one full storage/auth round per
+// authoritative batch instead of imposing a smaller, redundant subdivision.
+pub(crate) const MAX_CANDIDATE_VISIBILITY_BATCH: usize = crate::authz_service::MAX_CHECKS;
+const _: () = assert!(
+    keldra_index::v1::MAX_QUERY_CANDIDATE_ADMISSION_BATCH <= MAX_CANDIDATE_VISIBILITY_BATCH
+);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IndexCandidateIdentity {
@@ -581,6 +587,18 @@ mod tests {
             visibility().evaluate(&oversized).await.unwrap_err().code(),
             tonic::Code::ResourceExhausted
         );
+    }
+
+    #[tokio::test]
+    async fn maximum_authoritative_batch_is_admitted_without_subdivision() {
+        let candidates = vec![candidate("docs/live"); MAX_CANDIDATE_VISIBILITY_BATCH];
+
+        let result = visibility().evaluate(&candidates).await.unwrap();
+
+        assert_eq!(result.visible.len(), MAX_CANDIDATE_VISIBILITY_BATCH);
+        assert!(result.visible.iter().all(|visible| *visible));
+        assert_eq!(result.denied, 0);
+        assert_eq!(result.stale, 0);
     }
 
     #[tokio::test]

@@ -26,7 +26,7 @@ pub(crate) use distributed::DistributedAuthzService;
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 1_000;
 const MAX_PAGE_TOKEN_BYTES: usize = 128 * 1024;
-const MAX_CHECKS: usize = 1_000;
+pub(crate) const MAX_CHECKS: usize = 1_000;
 
 #[derive(Clone)]
 pub struct AuthzServiceImpl {

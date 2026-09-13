@@ -126,7 +126,11 @@ pub struct QueryAdmissionContext {
     pub candidate: QueryAdmissionCandidate,
 }
 
-pub const MAX_QUERY_CANDIDATE_ADMISSION_BATCH: usize = 256;
+// Match Keldra's authoritative Zanzibar batch ceiling. The admission boundary
+// remains memory charged, while using the full native batch avoids splitting a
+// 10,000-hit query page into forty serialized current-version and authorization
+// rounds.
+pub const MAX_QUERY_CANDIDATE_ADMISSION_BATCH: usize = 1_000;
 
 pub(super) fn resident_gate_bytes(gate: &QueryDocumentGate) -> Result<usize, IndexError> {
     std::mem::size_of::<StableDocumentKey>()
