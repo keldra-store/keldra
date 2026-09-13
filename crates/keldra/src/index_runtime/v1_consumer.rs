@@ -442,6 +442,31 @@ fn record_lag_telemetry(
             .current
             .as_ref()
             .map_or(0, |current| current.current.next_offset);
+        let scanned_next = writer
+            .scanned
+            .sources
+            .get(&NodeId(u64::from(writer.source.node_id)))
+            .filter(|cursor| cursor.source == writer.source)
+            .map_or(0, |cursor| cursor.next_offset);
+        tracing::debug!(
+            target: "keldra::index_runtime::v1_consumer_state",
+            ?partition,
+            family_id = ?writer.recipe.family.family_id,
+            published_next_offset = published_next,
+            scanned_next_offset = scanned_next,
+            pending_next_offset = writer.pending_next,
+            accumulator_next_offset = writer.accumulator.next_offset(),
+            observed_next_offset = cursor.next_offset,
+            pending_mutations = writer.pending_mutations.len(),
+            pending_mutation_bytes = writer.pending_mutation_bytes,
+            pending_operations = writer.pending_operations,
+            pending_prepared_rows = writer.pending_prepared_rows,
+            pending_age_milliseconds = writer
+                .since
+                .map_or(0_u64, |since| since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+            halted_on_integrity_failure = writer.halted_on_integrity_failure,
+            "v1 projection partition state"
+        );
         local_next = local_next.min(published_next);
         local_tail = local_tail.max(cursor.next_offset.saturating_sub(1));
         let partition_lag = cursor.next_offset.saturating_sub(published_next);

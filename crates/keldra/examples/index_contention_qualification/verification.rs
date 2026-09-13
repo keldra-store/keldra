@@ -190,6 +190,7 @@ async fn verify_one_final_definition(
 ) -> Result<(bool, BTreeSet<u64>)> {
     let mut client = index_client(channel, &token)?;
     let mut last_observation = "no query attempt completed".to_owned();
+    let mut last_successful_observation = None::<String>;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(
@@ -209,6 +210,7 @@ async fn verify_one_final_definition(
             Ok(response) => {
                 let exact = response.hits == *authority;
                 last_observation = mutable_query_observation(&response, &authority);
+                last_successful_observation = Some(last_observation.clone());
                 if let Some(freshness) = response.freshness {
                     let source_ids = freshness
                         .sources
@@ -233,7 +235,14 @@ async fn verify_one_final_definition(
                     }
                 }
             }
-            Err(error) => last_observation = format!("query failed: {error:#}"),
+            Err(error) => {
+                last_observation = match &last_successful_observation {
+                    Some(successful) => format!(
+                        "query failed: {error:#}; last successful observation: {successful}"
+                    ),
+                    None => format!("query failed: {error:#}"),
+                };
+            }
         }
         tokio::time::sleep(visibility_poll).await;
     }
