@@ -101,11 +101,13 @@ pub fn prepare_projection_query_run(
                     IndexError::InvalidDefinition("membership gate has no result path".into())
                 })?
                 .len();
+            let canonical_bytes = gate.canonical_source_path.as_ref().map_or(0, String::len);
             charge_fixed_record(
                 &mut credits,
                 32,
-                33usize
+                37usize
                     .checked_add(path_bytes)
+                    .and_then(|bytes| bytes.checked_add(canonical_bytes))
                     .and_then(|bytes| bytes.checked_add(result_bytes))
                     .ok_or(IndexError::OffsetOverflow)?,
             )?;
@@ -121,6 +123,7 @@ pub fn prepare_projection_query_run(
     for field in batch.fields {
         let recipe = field.recipe;
         if field.delta.presence.source_path.is_some()
+            || field.delta.presence.canonical_source_path.is_some()
             || field.delta.presence.result_path.is_some()
             || field.delta.presence.result_version != 0
         {
@@ -128,7 +131,7 @@ pub fn prepare_projection_query_run(
                 "field-presence gate contains a source path".into(),
             ));
         }
-        charge_fixed_record(&mut credits, 32, 33)?;
+        charge_fixed_record(&mut credits, 32, 37)?;
         insert_unique(
             grouped
                 .ordinary
@@ -726,6 +729,7 @@ mod tests {
                         current_source_version: 7,
                         live: true,
                         source_path: Some("objects/document.json".into()),
+                        canonical_source_path: None,
                         result_path: Some("objects/document.json".into()),
                         result_version: 7,
                     }],
@@ -804,6 +808,7 @@ mod tests {
                             current_source_version: 1,
                             live: true,
                             source_path: None,
+                            canonical_source_path: None,
                             result_path: None,
                             result_version: 0,
                         },
@@ -978,6 +983,7 @@ mod tests {
                             current_source_version: 1,
                             live: true,
                             source_path: None,
+                            canonical_source_path: None,
                             result_path: None,
                             result_version: 0,
                         },

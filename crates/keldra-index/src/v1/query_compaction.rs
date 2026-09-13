@@ -385,7 +385,10 @@ fn validate_ordinary_record(
         }
         QueryBlockKind::Presence => {
             let gate = decode_document_gate(record)?;
-            if gate.source_path.is_some() || gate.result_path.is_some() || gate.result_version != 0
+            if gate.source_path.is_some()
+                || gate.canonical_source_path.is_some()
+                || gate.result_path.is_some()
+                || gate.result_version != 0
             {
                 return Err(IndexError::Integrity);
             }
@@ -975,6 +978,7 @@ mod tests {
                     current_source_version: version,
                     live: true,
                     source_path: Some("objects/document.json".into()),
+                    canonical_source_path: None,
                     result_path: Some("objects/document.json".into()),
                     result_version: version,
                 }],
@@ -988,6 +992,7 @@ mod tests {
                         current_source_version: version,
                         live: true,
                         source_path: None,
+                        canonical_source_path: None,
                         result_path: None,
                         result_version: 0,
                     },

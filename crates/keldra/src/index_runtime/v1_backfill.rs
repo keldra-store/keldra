@@ -140,11 +140,15 @@ impl V1PartitionBaseline {
                     self.recipe.family.bucket_id,
                     match &source {
                         IndexSourceMutation::Upsert(object) => &object.path,
-                        IndexSourceMutation::Remove(_) => unreachable!("baseline is live-only"),
+                        IndexSourceMutation::Remove { .. } => {
+                            unreachable!("baseline is live-only")
+                        }
                     },
                     match &source {
                         IndexSourceMutation::Upsert(object) => object.content_type.as_deref(),
-                        IndexSourceMutation::Remove(_) => unreachable!("baseline is live-only"),
+                        IndexSourceMutation::Remove { .. } => {
+                            unreachable!("baseline is live-only")
+                        }
                     },
                 );
                 if recipes.is_empty() {
@@ -298,6 +302,7 @@ fn baseline_object(
     Ok(Some((
         IndexBuildObject {
             path: head.exact_path,
+            canonical_path: None,
             version: head.version.id.0,
             content_type: head.version.content_type,
             content_hash: blob.hash,
@@ -315,14 +320,27 @@ fn selected_resident_bytes(selected: &SelectedV1Source) -> Result<usize, Status>
             .and_then(|bytes| {
                 bytes.checked_add(
                     object
+                        .canonical_path
+                        .as_ref()
+                        .map_or(0, |path| path.capacity()),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    object
                         .content_type
                         .as_ref()
                         .map_or(0, |content_type| content_type.capacity()),
                 )
             }),
-        IndexSourceMutation::Remove(identity) => {
-            std::mem::size_of_val(identity).checked_add(identity.path.capacity())
-        }
+        IndexSourceMutation::Remove {
+            identity,
+            canonical_path,
+        } => std::mem::size_of_val(identity)
+            .checked_add(identity.path.capacity())
+            .and_then(|bytes| {
+                bytes.checked_add(canonical_path.as_ref().map_or(0, |path| path.capacity()))
+            }),
     }
     .ok_or_else(|| Status::resource_exhausted("v1 baseline selection size overflow"))?;
     selected.selected.as_ref().map_or(Ok(source), |projection| {

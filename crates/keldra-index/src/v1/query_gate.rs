@@ -15,6 +15,9 @@ pub struct QueryDocumentGate {
     pub current_source_version: u64,
     pub live: bool,
     pub source_path: Option<String>,
+    /// Canonical authorization identity when `source_path` is an alias.
+    /// Query/result identity deliberately remains the exact source path.
+    pub canonical_source_path: Option<String>,
     pub result_path: Option<String>,
     pub result_version: u64,
 }
@@ -32,7 +35,11 @@ pub fn encode_document_gate(gate: QueryDocumentGate) -> Result<QueryBlockRecord,
     value.extend_from_slice(&gate.current_source_version.to_be_bytes());
     value.extend_from_slice(&gate.result_version.to_be_bytes());
     value.push(u8::from(gate.live));
-    for path in [&gate.source_path, &gate.result_path] {
+    for path in [
+        &gate.source_path,
+        &gate.canonical_source_path,
+        &gate.result_path,
+    ] {
         let path = path.as_deref().unwrap_or_default().as_bytes();
         value.extend_from_slice(&(path.len() as u32).to_be_bytes());
         value.extend_from_slice(path);
@@ -46,7 +53,7 @@ pub fn encode_document_gate(gate: QueryDocumentGate) -> Result<QueryBlockRecord,
 pub fn decode_document_gate(
     record: QueryBlockRecordRef<'_>,
 ) -> Result<QueryDocumentGate, IndexError> {
-    if record.value.len() < 33 {
+    if record.value.len() < 37 {
         return Err(IndexError::InvalidFormat("v1 document gate"));
     }
     let material_source_version = read_u64(record.value, 0)?;
@@ -64,15 +71,23 @@ pub fn decode_document_gate(
     {
         return Err(IndexError::InvalidFormat("v1 document gate"));
     }
-    let result_length_offset = 29usize
+    let canonical_length_offset = 29usize
         .checked_add(source_len)
+        .ok_or(IndexError::OffsetOverflow)?;
+    let canonical_len = read_u32(record.value, canonical_length_offset)? as usize;
+    let result_length_offset = canonical_length_offset
+        .checked_add(4)
+        .and_then(|offset| offset.checked_add(canonical_len))
         .ok_or(IndexError::OffsetOverflow)?;
     let result_len = read_u32(record.value, result_length_offset)? as usize;
     let paths_end = result_length_offset
         .checked_add(4)
         .and_then(|offset| offset.checked_add(result_len))
         .ok_or(IndexError::OffsetOverflow)?;
-    if result_len > MAX_QUERY_DOCUMENT_PATH_BYTES || paths_end != record.value.len() {
+    if canonical_len > MAX_QUERY_DOCUMENT_PATH_BYTES
+        || result_len > MAX_QUERY_DOCUMENT_PATH_BYTES
+        || paths_end != record.value.len()
+    {
         return Err(IndexError::InvalidFormat("v1 document gate path"));
     }
     let gate = QueryDocumentGate {
@@ -85,7 +100,10 @@ pub fn decode_document_gate(
         material_source_version,
         current_source_version,
         live,
-        source_path: decode_path(&record.value[29..result_length_offset])?,
+        source_path: decode_path(&record.value[29..canonical_length_offset])?,
+        canonical_source_path: decode_path(
+            &record.value[canonical_length_offset + 4..result_length_offset],
+        )?,
         result_path: decode_path(&record.value[result_length_offset + 4..paths_end])?,
         result_version,
     };
@@ -128,14 +146,25 @@ fn decode_path(bytes: &[u8]) -> Result<Option<String>, IndexError> {
 }
 
 fn valid_identity(gate: &QueryDocumentGate) -> bool {
-    match (&gate.source_path, &gate.result_path, gate.result_version) {
-        (None, None, 0) => true,
-        (Some(source), Some(result), version) => {
+    match (
+        &gate.source_path,
+        &gate.canonical_source_path,
+        &gate.result_path,
+        gate.result_version,
+    ) {
+        (None, None, None, 0) => true,
+        (Some(source), canonical, Some(result), version) => {
             version != 0
                 && [source, result].into_iter().all(|path| {
                     !path.is_empty()
                         && path.len() <= MAX_QUERY_DOCUMENT_PATH_BYTES
                         && !path.contains('\0')
+                })
+                && canonical.as_ref().is_none_or(|path| {
+                    !path.is_empty()
+                        && path.len() <= MAX_QUERY_DOCUMENT_PATH_BYTES
+                        && !path.contains('\0')
+                        && path != source
                 })
         }
         _ => false,
@@ -153,6 +182,7 @@ mod tests {
             current_source_version: 5,
             live: true,
             source_path: Some(path.clone()),
+            canonical_source_path: None,
             result_path: Some(path),
             result_version: 5,
         }
@@ -177,5 +207,23 @@ mod tests {
         assert_eq!(MAX_QUERY_DOCUMENT_PATH_BYTES, 4_096);
         assert!(encode_document_gate(gate("p".repeat(4_096))).is_ok());
         assert!(encode_document_gate(gate("p".repeat(4_097))).is_err());
+    }
+
+    #[test]
+    fn canonical_authorization_identity_round_trips_without_replacing_exact_identity() {
+        let mut expected = gate("aliases/a.json".into());
+        expected.canonical_source_path = Some("objects/a.json".into());
+        let encoded = encode_document_gate(expected.clone()).unwrap();
+        assert_eq!(
+            decode_document_gate(QueryBlockRecordRef {
+                key: &encoded.key,
+                value: &encoded.value,
+            })
+            .unwrap(),
+            expected
+        );
+
+        expected.canonical_source_path = expected.source_path.clone();
+        assert!(encode_document_gate(expected).is_err());
     }
 }

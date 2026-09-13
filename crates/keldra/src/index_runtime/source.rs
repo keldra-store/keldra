@@ -5,6 +5,7 @@ use keldra_index::v1::ObjectIdentity;
 #[derive(Clone, Debug)]
 pub(crate) struct IndexBuildObject {
     pub path: String,
+    pub canonical_path: Option<String>,
     pub version: u64,
     pub content_type: Option<String>,
     pub content_hash: [u8; 32],
@@ -24,7 +25,10 @@ impl IndexBuildObject {
 #[derive(Clone, Debug)]
 pub(crate) enum IndexSourceMutation {
     Upsert(IndexBuildObject),
-    Remove(ObjectIdentity),
+    Remove {
+        identity: ObjectIdentity,
+        canonical_path: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

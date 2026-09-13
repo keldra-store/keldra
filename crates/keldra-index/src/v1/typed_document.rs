@@ -30,6 +30,8 @@ pub struct TypedJsonSelectedField {
 pub struct TypedJsonDocumentInput {
     pub source_scope: [u8; 32],
     pub source_path: String,
+    /// Canonical authorization identity when `source_path` names an alias.
+    pub canonical_source_path: Option<String>,
     pub source_version: u64,
     pub result: Option<ObjectIdentity>,
     pub live: bool,
@@ -109,6 +111,7 @@ pub fn prepare_typed_json_document(
                 current_source_version: input.source_version,
                 live: false,
                 source_path: Some(input.source_path.clone()),
+                canonical_source_path: input.canonical_source_path.clone(),
                 result_path: Some(previous_state.unwrap().head.result_or_source().path),
                 result_version: previous_state.unwrap().head.result_or_source().version,
             }],
@@ -159,6 +162,7 @@ pub fn prepare_typed_json_document(
                         current_source_version: input.source_version,
                         live: true,
                         source_path: Some(input.source_path.clone()),
+                        canonical_source_path: input.canonical_source_path.clone(),
                         result_path: Some(result.path),
                         result_version: result.version,
                     }],
@@ -199,6 +203,7 @@ pub fn prepare_typed_json_document(
                     current_source_version: input.source_version,
                     live: true,
                     source_path: Some(input.source_path.clone()),
+                    canonical_source_path: input.canonical_source_path.clone(),
                     result_path: Some(result.path),
                     result_version: result.version,
                 }],
@@ -245,6 +250,9 @@ fn validate_input(
     if input.source_scope == [0; 32]
         || input.source_path.is_empty()
         || input.source_path.contains('\0')
+        || input.canonical_source_path.as_ref().is_some_and(|path| {
+            path.is_empty() || path.contains('\0') || path == &input.source_path
+        })
         || input.source_version == 0
         || !input.live && input.result.is_some()
         || !input.live && input.fields.iter().any(|field| field.selected.is_some())
@@ -296,6 +304,14 @@ fn preparation_bound(
 ) -> Result<usize, IndexError> {
     let mut bytes = size_of::<PreparedTypedJsonDocument>()
         .checked_add(input.source_path.len().saturating_mul(2))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                input
+                    .canonical_source_path
+                    .as_ref()
+                    .map_or(0, |path| path.len().saturating_mul(2)),
+            )
+        })
         .and_then(|bytes| {
             bytes.checked_add(
                 input
@@ -381,6 +397,7 @@ mod tests {
         TypedJsonDocumentInput {
             source_scope: [5; 32],
             source_path: "objects/a.json".into(),
+            canonical_source_path: None,
             source_version: version,
             result: live.then_some(ObjectIdentity {
                 path: format!("results/{version}.json"),
@@ -576,6 +593,41 @@ mod tests {
         assert!(field.terms.iter().all(|term| !term.live));
         assert!(field.points.iter().all(|point| !point.live));
         assert_eq!(field.doc_value.as_ref().unwrap().value, None);
+    }
+
+    #[test]
+    fn alias_live_and_delete_gates_preserve_canonical_authorization_identity() {
+        let mut live_input = input(1, Some(vec!["alpha"]), true);
+        live_input.source_path = "aliases/reserved.json".into();
+        live_input.canonical_source_path = Some("objects/target.json".into());
+        let mut live_memory = credits();
+        let live = prepare_typed_json_document(live_input, &[], &mut live_memory).unwrap();
+        let live_gate = &live.query.membership.as_ref().unwrap().gates[0];
+        assert_eq!(
+            live_gate.source_path.as_deref(),
+            Some("aliases/reserved.json")
+        );
+        assert_eq!(
+            live_gate.canonical_source_path.as_deref(),
+            Some("objects/target.json")
+        );
+
+        let mut delete_input = input(2, None, false);
+        delete_input.source_path = "aliases/reserved.json".into();
+        delete_input.canonical_source_path = Some("objects/target.json".into());
+        let mut delete_memory = credits();
+        let deleted =
+            prepare_typed_json_document(delete_input, &live.current, &mut delete_memory).unwrap();
+        let delete_gate = &deleted.query.membership.as_ref().unwrap().gates[0];
+        assert!(!delete_gate.live);
+        assert_eq!(
+            delete_gate.canonical_source_path.as_deref(),
+            Some("objects/target.json")
+        );
+        assert_eq!(
+            delete_gate.source_path.as_deref(),
+            Some("aliases/reserved.json")
+        );
     }
 
     #[test]

@@ -27,13 +27,16 @@ use super::v1_extractor::{SelectedV1Source, V1ProjectionExtractor, matching_reci
 use super::v1_journal_dispatch::{V1OrderedSourceDispatcher, V1SourceDispatch};
 use super::v1_mutation_window::coalesce_latest_by_source_path;
 use super::v1_parallel::{partition_lane_parallelism, run_bounded_ordered};
+use super::v1_producer_state::{PartitionEvidence, PartitionEvidenceMap, ProducerStage};
 use super::v1_publication::{
     LoadedV1ProjectionGeneration, V1ProjectionPublisher, V1PublicationPredecessor,
 };
 
 const RETRY: Duration = Duration::from_millis(250);
 const SAFETY_RECONCILE: Duration = Duration::from_secs(30);
+const STALL_AFTER: Duration = Duration::from_secs(30);
 const JOURNAL_PAGE_RESIDENT_MULTIPLIER: usize = 4;
+const MAX_PUBLICATION_MUTATIONS: u64 = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReconcileOutcome {
@@ -76,6 +79,9 @@ struct Writer {
     baseline: Option<super::v1_backfill::V1PartitionBaseline>,
     query: PreparedQueryMutationBatch,
     query_credits: QueryBlockCredits,
+    /// Per-document preparation credits retained until the merged query input
+    /// has been consumed into immutable artifacts.
+    query_input_credits: Vec<QueryBlockCredits>,
     since: Option<Instant>,
     source_bytes: u64,
     pending_prepared_rows: u64,
@@ -89,6 +95,7 @@ struct Writer {
     pending_mutation_capacity: usize,
     pending_mutation_permit: IndexingMemoryPermit,
     halted_on_integrity_failure: bool,
+    stage: ProducerStage,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +105,7 @@ struct Mutation {
     tenant_id: u64,
     bucket_id: u64,
     path: String,
+    canonical_path: Option<String>,
     version: u64,
     deleted: bool,
 }
@@ -142,7 +150,7 @@ impl V1IndexProducerTask {
         let extractor = V1ProjectionExtractor::new(reader.clone(), cpu, hot, limits.worker_bytes);
         let task = tokio::spawn(async move {
             let mut writers = BTreeMap::new();
-            let mut lag_started = BTreeMap::new();
+            let mut evidence = PartitionEvidenceMap::new();
             loop {
                 let result = reconcile(
                     local_node,
@@ -156,7 +164,7 @@ impl V1IndexProducerTask {
                     &credits,
                     limits,
                     &mut writers,
-                    &mut lag_started,
+                    &mut evidence,
                 )
                 .await;
                 match result {
@@ -240,7 +248,7 @@ fn limits(config: IndexRuntimeConfig) -> Result<Limits, Status> {
         flush_bytes,
         projection_batch_bytes,
         flush_age: config.flush_max_age(),
-        flush_operations: config.flush_max_operations(),
+        flush_operations: config.flush_max_operations().min(MAX_PUBLICATION_MUTATIONS),
         lsm_runs: u64::from(config.lsm_max_runs_per_level()),
         lsm_bytes: config.lsm_max_unmerged_bytes_per_level(),
         parallelism,
@@ -261,7 +269,7 @@ async fn reconcile(
     credits: &IndexingMemoryCredits,
     limits: Limits,
     writers: &mut BTreeMap<ProjectionPartitionIdentity, Writer>,
-    lag_started: &mut BTreeMap<ProjectionPartitionIdentity, Instant>,
+    evidence: &mut PartitionEvidenceMap,
 ) -> Result<ReconcileOutcome, Status> {
     let placement = current_placement(decisions)?;
     let target = journal.capture_barrier().await.map_err(event_status)?;
@@ -300,24 +308,45 @@ async fn reconcile(
             }) {
                 return Err(Status::unavailable("v1 physical catalog changed"));
             }
-            if !writers.contains_key(&partition) {
-                writers.insert(
+            if !writers.contains_key(&partition)
+                && !evidence.get(&partition).is_some_and(|state| state.halted)
+            {
+                let writer = open_writer(
+                    recipe.clone(),
                     partition,
-                    open_writer(
-                        recipe.clone(),
-                        partition,
-                        &target,
-                        publisher,
-                        credits,
-                        limits,
-                    )
-                    .await?,
-                );
+                    &target,
+                    publisher,
+                    credits,
+                    limits,
+                )
+                .await?;
+                let published_next = writer
+                    .current
+                    .as_ref()
+                    .map_or(0, |current| current.current.next_offset);
+                match evidence.entry(partition) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(PartitionEvidence::opened(
+                            writer.source,
+                            writer.recipe.family.family_id,
+                            published_next,
+                        ));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().reopened(
+                            writer.source,
+                            writer.recipe.family.family_id,
+                            published_next,
+                        );
+                    }
+                }
+                writers.insert(partition, writer);
             }
         }
     }
     writers.retain(|partition, _| assigned.contains(partition));
-    record_lag_telemetry(&target, writers, lag_started);
+    evidence.retain(|partition, _| assigned.contains(partition));
+    record_lag_telemetry(&target, writers, evidence);
     let physical_catalog_identity = catalog_snapshot.identity;
     let runnable = assigned
         .into_iter()
@@ -383,31 +412,61 @@ async fn reconcile(
     for (partition, (writer, result)) in outcomes {
         match result {
             Ok(()) => {
+                if let Some(state) = evidence.get_mut(&partition) {
+                    let published_next = writer
+                        .current
+                        .as_ref()
+                        .map_or(0, |current| current.current.next_offset);
+                    state.observe_progress(published_next, writer.stage);
+                }
                 writers.insert(partition, writer);
             }
             Err(error) if halts_partition(&error) => {
                 let mut writer = writer;
+                let failed_stage = writer.stage;
                 writer.halted_on_integrity_failure = true;
+                writer.stage = ProducerStage::Halted;
+                if let Some(state) = evidence.get_mut(&partition) {
+                    state.halt(&error);
+                }
                 tracing::error!(
                     %error,
                     ?partition,
                     family_id = ?writer.recipe.family.family_id,
+                    failed_stage = failed_stage.label(),
                     "v1 projection partition halted after integrity failure; unrelated partitions continue"
                 );
                 writers.insert(partition, writer);
             }
             Err(error) => {
-                partition_failed = true;
-                tracing::warn!(
-                    %error,
-                    ?partition,
-                    family_id = ?writer.recipe.family.family_id,
-                    "v1 projection partition will replay from Current; unrelated partitions continue"
-                );
+                let state = evidence
+                    .get_mut(&partition)
+                    .expect("opened v1 partition has runtime evidence");
+                state.stage = writer.stage;
+                if state.record_retry(writer.stage, &error) {
+                    tracing::error!(
+                        %error,
+                        ?partition,
+                        family_id = ?writer.recipe.family.family_id,
+                        failed_stage = writer.stage.label(),
+                        identical_retries = state.identical_retries,
+                        "v1 projection partition halted after bounded identical retries; unrelated partitions continue"
+                    );
+                } else {
+                    partition_failed = true;
+                    tracing::warn!(
+                        %error,
+                        ?partition,
+                        family_id = ?writer.recipe.family.family_id,
+                        failed_stage = writer.stage.label(),
+                        identical_retries = state.identical_retries,
+                        "v1 projection partition will replay from Current; unrelated partitions continue"
+                    );
+                }
             }
         }
     }
-    record_lag_telemetry(&target, writers, lag_started);
+    record_lag_telemetry(&target, writers, evidence);
     Ok(if partition_failed {
         ReconcileOutcome::RetryPartition
     } else {
@@ -422,68 +481,109 @@ fn halts_partition(error: &Status) -> bool {
 fn record_lag_telemetry(
     target: &IndexBarrier,
     writers: &BTreeMap<ProjectionPartitionIdentity, Writer>,
-    lag_started: &mut BTreeMap<ProjectionPartitionIdentity, Instant>,
+    evidence: &mut PartitionEvidenceMap,
 ) {
     let now = Instant::now();
     let mut local_next = u64::MAX;
     let mut local_tail = 0_u64;
     let mut lag_entries = 0_u64;
-    let mut active = BTreeSet::new();
     for (partition, writer) in writers {
-        let Some(cursor) = target
-            .sources
-            .get(&NodeId(u64::from(writer.source.node_id)))
-        else {
-            continue;
-        };
-        if cursor.source != writer.source {
-            continue;
-        }
         let published_next = writer
             .current
             .as_ref()
             .map_or(0, |current| current.current.next_offset);
+        evidence
+            .entry(*partition)
+            .or_insert_with(|| {
+                PartitionEvidence::opened(
+                    writer.source,
+                    writer.recipe.family.family_id,
+                    published_next,
+                )
+            })
+            .observe_progress(published_next, writer.stage);
+    }
+    let mut oldest_age = 0_u64;
+    let mut oldest_no_progress_age = 0_u64;
+    let mut stalled_partitions = 0_u64;
+    let mut halted_partitions = 0_u64;
+    let mut retrying_partitions = 0_u64;
+    for (partition, state) in evidence.iter_mut() {
+        let Some(cursor) = target.sources.get(&NodeId(u64::from(state.source.node_id))) else {
+            continue;
+        };
+        if cursor.source != state.source {
+            continue;
+        }
+        let writer = writers.get(partition);
         let scanned_next = writer
-            .scanned
-            .sources
-            .get(&NodeId(u64::from(writer.source.node_id)))
-            .filter(|cursor| cursor.source == writer.source)
-            .map_or(0, |cursor| cursor.next_offset);
+            .and_then(|writer| {
+                writer
+                    .scanned
+                    .sources
+                    .get(&NodeId(u64::from(writer.source.node_id)))
+                    .filter(|cursor| cursor.source == writer.source)
+                    .map(|cursor| cursor.next_offset)
+            })
+            .unwrap_or(state.published_next);
+        let partition_lag = cursor.next_offset.saturating_sub(state.published_next);
+        if partition_lag == 0 {
+            state.lag_started_at = None;
+            state.last_progress_at = now;
+        } else if state.lag_started_at.is_none() {
+            // A caught-up partition becoming newly eligible for work is not a
+            // stall. Start both lag and no-progress clocks at observation.
+            state.lag_started_at = Some(now);
+            state.last_progress_at = now;
+        }
+        let no_progress_age = now
+            .saturating_duration_since(state.last_progress_at)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         tracing::debug!(
             target: "keldra::index_runtime::v1_consumer_state",
             ?partition,
-            family_id = ?writer.recipe.family.family_id,
-            published_next_offset = published_next,
+            family_id = ?state.family_id,
+            producer_stage = state.stage.label(),
+            published_next_offset = state.published_next,
             scanned_next_offset = scanned_next,
-            pending_next_offset = writer.pending_next,
-            accumulator_next_offset = writer.accumulator.next_offset(),
+            pending_next_offset = writer.map_or(state.published_next, |writer| writer.pending_next),
+            accumulator_next_offset = writer.map_or(state.published_next, |writer| writer.accumulator.next_offset()),
             observed_next_offset = cursor.next_offset,
-            pending_mutations = writer.pending_mutations.len(),
-            pending_mutation_bytes = writer.pending_mutation_bytes,
-            pending_operations = writer.pending_operations,
-            pending_prepared_rows = writer.pending_prepared_rows,
+            pending_mutations = writer.map_or(0, |writer| writer.pending_mutations.len()),
+            pending_mutation_bytes = writer.map_or(0, |writer| writer.pending_mutation_bytes),
+            pending_operations = writer.map_or(0, |writer| writer.pending_operations),
+            pending_prepared_rows = writer.map_or(0, |writer| writer.pending_prepared_rows),
             pending_age_milliseconds = writer
-                .since
+                .and_then(|writer| writer.since)
                 .map_or(0_u64, |since| since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
-            halted_on_integrity_failure = writer.halted_on_integrity_failure,
+            last_progress_age_milliseconds = no_progress_age,
+            identical_retries = state.identical_retries,
+            last_error = state.last_error_message.as_deref().unwrap_or(""),
+            halted = state.halted,
             "v1 projection partition state"
         );
-        local_next = local_next.min(published_next);
+        local_next = local_next.min(state.published_next);
         local_tail = local_tail.max(cursor.next_offset.saturating_sub(1));
-        let partition_lag = cursor.next_offset.saturating_sub(published_next);
         lag_entries = lag_entries.saturating_add(partition_lag);
         if partition_lag > 0 {
-            active.insert(*partition);
-            lag_started.entry(*partition).or_insert(now);
+            let lag_started = state
+                .lag_started_at
+                .expect("lagging v1 partition has a start instant");
+            oldest_age = oldest_age.max(
+                now.saturating_duration_since(lag_started)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+            oldest_no_progress_age = oldest_no_progress_age.max(no_progress_age);
+            if now.saturating_duration_since(state.last_progress_at) >= STALL_AFTER {
+                stalled_partitions = stalled_partitions.saturating_add(1);
+            }
         }
+        halted_partitions = halted_partitions.saturating_add(u64::from(state.halted));
+        retrying_partitions =
+            retrying_partitions.saturating_add(u64::from(state.stage == ProducerStage::Backoff));
     }
-    lag_started.retain(|partition, _| active.contains(partition));
-    let oldest_age = lag_started
-        .values()
-        .map(|started| now.saturating_duration_since(*started).as_millis())
-        .max()
-        .unwrap_or(0)
-        .min(u128::from(u64::MAX)) as u64;
     let telemetry = super::v1_telemetry::global();
     super::v1_telemetry::V1PipelineTelemetry::set(
         &telemetry.local_next_offset,
@@ -496,6 +596,19 @@ fn record_lag_telemetry(
     super::v1_telemetry::V1PipelineTelemetry::set(&telemetry.local_tail, local_tail);
     super::v1_telemetry::V1PipelineTelemetry::set(&telemetry.lag_entries, lag_entries);
     super::v1_telemetry::V1PipelineTelemetry::set(&telemetry.lag_oldest_age_millis, oldest_age);
+    super::v1_telemetry::V1PipelineTelemetry::set(
+        &telemetry.oldest_no_progress_age_millis,
+        oldest_no_progress_age,
+    );
+    super::v1_telemetry::V1PipelineTelemetry::set(
+        &telemetry.stalled_partitions,
+        stalled_partitions,
+    );
+    super::v1_telemetry::V1PipelineTelemetry::set(
+        &telemetry.retrying_partitions,
+        retrying_partitions,
+    );
+    super::v1_telemetry::V1PipelineTelemetry::set(&telemetry.halted_partitions, halted_partitions);
 }
 
 async fn open_writer(
@@ -581,6 +694,7 @@ async fn open_writer(
         baseline: None,
         query: PreparedQueryMutationBatch::default(),
         query_credits,
+        query_input_credits: Vec::new(),
         since: None,
         source_bytes: 0,
         pending_prepared_rows: 0,
@@ -594,6 +708,7 @@ async fn open_writer(
         pending_mutation_capacity,
         pending_mutation_permit,
         halted_on_integrity_failure: false,
+        stage: ProducerStage::Opening,
     })
 }
 
@@ -633,6 +748,7 @@ async fn backfill(
     credits: &IndexingMemoryCredits,
     limits: Limits,
 ) -> Result<(), Status> {
+    writer.stage = ProducerStage::Backfill;
     if writer.baseline.is_none() {
         let frame_bytes = u64::try_from(limits.flush_bytes).unwrap_or(u64::MAX);
         writer.baseline = Some(
@@ -675,7 +791,7 @@ async fn backfill(
         for item in batch {
             let (path, version) = match &item.selected.source {
                 IndexSourceMutation::Upsert(object) => (object.path.clone(), object.version),
-                IndexSourceMutation::Remove(_) => {
+                IndexSourceMutation::Remove { .. } => {
                     return Err(Status::data_loss("v1 current baseline contains a delete"));
                 }
             };
@@ -751,6 +867,7 @@ async fn advance(
     // entering journal replay after the first non-empty batch would prepare the
     // same source versions twice in one unpublished query run.
     if writer.current.is_none() {
+        writer.stage = ProducerStage::Backfill;
         backfill(
             writer,
             physical_catalog_identity,
@@ -764,6 +881,7 @@ async fn advance(
         .await?;
         return Ok(());
     }
+    writer.stage = ProducerStage::JournalScan;
     // A mutation-window entry owns two path strings plus its map node. Keep
     // journal pages below one quarter of the charged window so one fresh page
     // can always be represented conservatively before the threshold flush.
@@ -822,19 +940,42 @@ async fn advance(
                     )
                     .await?;
                 }
-                writer.through_atomic = writer.through_atomic.max(page_atomic);
-                queue_mutations(writer, mutations, safe_next)?;
-                if should_flush(writer, limits) {
-                    flush(
-                        writer,
-                        physical_catalog_identity,
-                        reader,
-                        extractor,
-                        publisher,
-                        credits,
-                        limits,
-                    )
-                    .await?;
+                let chunks =
+                    mutation_publication_chunks(mutations, safe_next, limits.flush_operations)?;
+                let chunk_count = chunks.len();
+                for (index, (mutations, chunk_next)) in chunks.into_iter().enumerate() {
+                    let operations = u64::try_from(mutations.len()).unwrap_or(u64::MAX);
+                    if !writer.pending_mutations.is_empty()
+                        && writer.pending_operations.saturating_add(operations)
+                            > limits.flush_operations
+                    {
+                        flush(
+                            writer,
+                            physical_catalog_identity,
+                            reader,
+                            extractor,
+                            publisher,
+                            credits,
+                            limits,
+                        )
+                        .await?;
+                    }
+                    if index + 1 == chunk_count {
+                        writer.through_atomic = writer.through_atomic.max(page_atomic);
+                    }
+                    queue_mutations(writer, mutations, chunk_next)?;
+                    if index + 1 != chunk_count || should_flush(writer, limits) {
+                        flush(
+                            writer,
+                            physical_catalog_identity,
+                            reader,
+                            extractor,
+                            publisher,
+                            credits,
+                            limits,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -854,7 +995,54 @@ async fn advance(
         )
         .await?;
     }
+    let target_next = target
+        .sources
+        .get(&NodeId(u64::from(writer.source.node_id)))
+        .filter(|cursor| cursor.source == writer.source)
+        .map_or(0, |cursor| cursor.next_offset);
+    let published_next = writer
+        .current
+        .as_ref()
+        .map_or(0, |current| current.current.next_offset);
+    writer.stage = if published_next >= target_next {
+        ProducerStage::CaughtUp
+    } else {
+        ProducerStage::JournalScan
+    };
     Ok(())
+}
+
+fn mutation_publication_chunks(
+    mutations: Vec<Mutation>,
+    safe_next: u64,
+    maximum_operations: u64,
+) -> Result<Vec<(Vec<Mutation>, u64)>, Status> {
+    if mutations.is_empty() {
+        return Ok(vec![(Vec::new(), safe_next)]);
+    }
+    let maximum_operations = usize::try_from(maximum_operations)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let mut chunks = Vec::new();
+    let mut remaining = mutations;
+    while remaining.len() > maximum_operations {
+        let mut split = maximum_operations;
+        while split < remaining.len() && remaining[split - 1].offset == remaining[split].offset {
+            split += 1;
+        }
+        if split == remaining.len() {
+            break;
+        }
+        let rest = remaining.split_off(split);
+        let next = rest
+            .first()
+            .map(|mutation| mutation.offset)
+            .ok_or_else(|| Status::data_loss("v1 publication split lost its next mutation"))?;
+        chunks.push((remaining, next));
+        remaining = rest;
+    }
+    chunks.push((remaining, safe_next));
+    Ok(chunks)
 }
 
 fn prepare_page(
@@ -1002,6 +1190,12 @@ fn mutation_window_needed(
 fn mutation_window_bytes(mutation: &Mutation) -> usize {
     std::mem::size_of::<Mutation>()
         .saturating_add(mutation.path.capacity().saturating_mul(2))
+        .saturating_add(
+            mutation
+                .canonical_path
+                .as_ref()
+                .map_or(0, |path| path.capacity()),
+        )
         .saturating_add(std::mem::size_of::<usize>().saturating_mul(4))
 }
 
@@ -1021,12 +1215,13 @@ async fn prepare_lane(
     let recipe = writer.recipe.clone();
     let scope = source_scope(writer.source);
     let input_bytes = limits.worker_bytes;
-    let mut selected = Vec::new();
+    let mut prepared_values = Vec::new();
     for chunk in mutations.chunks(limits.parallelism) {
         let mut jobs = tokio::task::JoinSet::new();
         for mutation in chunk.iter().cloned() {
             let reader = reader.clone();
             let extractor = extractor.clone();
+            let prepare_extractor = extractor.clone();
             let publisher = publisher.clone();
             let recipe = recipe.clone();
             let current = current.clone();
@@ -1037,41 +1232,71 @@ async fn prepare_lane(
                     .map_err(|_| {
                         Status::resource_exhausted("v1 replay input memory unavailable")
                     })?;
-                select_mutation(
+                let Some(value) = select_mutation(
                     reader,
                     extractor,
                     publisher,
-                    recipe,
+                    recipe.clone(),
                     current,
                     physical_catalog_identity,
                     scope,
                     mutation,
                     input,
                 )
-                .await
+                .await?
+                else {
+                    return Ok(None);
+                };
+                let SelectedMutation {
+                    mutation,
+                    selected,
+                    previous,
+                    source_bytes,
+                    _input,
+                } = value;
+                let query_credits = empty_query_credits(&credits, limits)?;
+                let (selected, previous, prepared, query_credits) = prepare_extractor
+                    .prepare_owned(scope, selected, recipe, previous, query_credits)
+                    .await?;
+                Ok::<_, Status>(Some((
+                    SelectedMutation {
+                        mutation,
+                        selected,
+                        previous,
+                        source_bytes,
+                        _input,
+                    },
+                    prepared,
+                    query_credits,
+                )))
             });
         }
+        let mut first_failure = None;
         while let Some(joined) = jobs.join_next().await {
-            let result = joined
-                .map_err(|error| Status::internal(format!("v1 selection task failed: {error}")))?;
-            if let Some(value) = result? {
-                selected.push(value);
+            match joined {
+                Ok(Ok(Some(value))) => prepared_values.push(value),
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    first_failure.get_or_insert(error);
+                }
+                Err(error) => {
+                    first_failure.get_or_insert_with(|| {
+                        Status::internal(format!("v1 selection task failed: {error}"))
+                    });
+                }
             }
         }
+        if let Some(error) = first_failure {
+            return Err(error);
+        }
     }
-    selected.sort_by_key(|value| (value.mutation.offset, value.mutation.ordinal));
-    let mut rows = Vec::with_capacity(selected.len());
+    prepared_values.sort_by_key(|(value, _, _)| (value.mutation.offset, value.mutation.ordinal));
+    let mut rows = Vec::with_capacity(prepared_values.len());
     let mut previous = BTreeMap::new();
-    for value in selected {
+    for (value, prepared, query_credits) in prepared_values {
         let mutation = value.mutation;
-        let prepared = V1ProjectionExtractor::prepare(
-            scope,
-            &value.selected,
-            &writer.recipe,
-            &value.previous,
-            &mut writer.query_credits,
-        )?;
         merge_query(&mut writer.query, prepared.query)?;
+        writer.query_input_credits.push(query_credits);
         previous.insert(mutation.path.clone(), value.previous);
         writer.source_bytes = writer.source_bytes.saturating_add(value.source_bytes);
         rows.push(PreparedProjectionRow {
@@ -1100,17 +1325,18 @@ async fn select_mutation(
         &reader,
         &recipe,
         &mutation.path,
+        mutation.canonical_path.clone(),
         mutation.version,
         mutation.deleted,
     )
     .await?;
     let source_bytes = match &source {
         IndexSourceMutation::Upsert(object) => object.content_length,
-        IndexSourceMutation::Remove(_) => 0,
+        IndexSourceMutation::Remove { .. } => 0,
     };
     let content_type = match &source {
         IndexSourceMutation::Upsert(object) => object.content_type.as_deref(),
-        IndexSourceMutation::Remove(_) => None,
+        IndexSourceMutation::Remove { .. } => None,
     };
     let matched = matching_recipes(
         std::slice::from_ref(&recipe),
@@ -1182,6 +1408,14 @@ fn selected_mutation_resident_bytes(
 ) -> Result<usize, Status> {
     let mut bytes = std::mem::size_of::<SelectedMutation>()
         .checked_add(mutation.path.capacity())
+        .and_then(|bytes| {
+            bytes.checked_add(
+                mutation
+                    .canonical_path
+                    .as_ref()
+                    .map_or(0, |path| path.capacity()),
+            )
+        })
         .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?;
     bytes = bytes
         .checked_add(
@@ -1191,14 +1425,27 @@ fn selected_mutation_resident_bytes(
                     .and_then(|value| {
                         value.checked_add(
                             object
+                                .canonical_path
+                                .as_ref()
+                                .map_or(0, |path| path.capacity()),
+                        )
+                    })
+                    .and_then(|value| {
+                        value.checked_add(
+                            object
                                 .content_type
                                 .as_ref()
                                 .map_or(0, |content_type| content_type.capacity()),
                         )
                     }),
-                IndexSourceMutation::Remove(identity) => {
-                    std::mem::size_of_val(identity).checked_add(identity.path.capacity())
-                }
+                IndexSourceMutation::Remove {
+                    identity,
+                    canonical_path,
+                } => std::mem::size_of_val(identity)
+                    .checked_add(identity.path.capacity())
+                    .and_then(|value| {
+                        value.checked_add(canonical_path.as_ref().map_or(0, |path| path.capacity()))
+                    }),
             }
             .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?,
         )
@@ -1311,6 +1558,7 @@ async fn flush(
     limits: Limits,
 ) -> Result<(), Status> {
     if !writer.pending_mutations.is_empty() {
+        writer.stage = ProducerStage::Preparing;
         let next = writer.pending_next;
         let mut mutations = writer
             .pending_mutations
@@ -1349,6 +1597,7 @@ async fn flush(
                 root.segment_count >= limits.lsm_runs || root.encoded_bytes >= limits.lsm_bytes
             })
     });
+    writer.stage = ProducerStage::Sealing;
     let sealed = writer.accumulator.seal_and_reset().map_err(index_status)?;
     let (sealed, source_permit) = sealed.into_parts();
     let packed = sealed.deltas.iter().try_fold(0usize, |sum, delta| {
@@ -1363,6 +1612,7 @@ async fn flush(
         .acquire(IndexingMemoryStage::ReplayInput, preload_bytes)
         .map_err(|_| Status::resource_exhausted("v1 spine preload memory unavailable"))?;
     let compaction = if needs_compaction {
+        writer.stage = ProducerStage::Compacting;
         let component_permit = credits
             .acquire(
                 IndexingMemoryStage::SealScratch,
@@ -1408,6 +1658,7 @@ async fn flush(
     let placeholder = empty_query_credits(credits, limits)?;
     let query_credits = std::mem::replace(&mut writer.query_credits, placeholder);
     let prepared = if let Some((base, _)) = &compaction {
+        writer.stage = ProducerStage::Publishing;
         publisher
             .prepare_atomic_generation_after_compaction(
                 &writer.recipe.storage_tenant,
@@ -1432,6 +1683,7 @@ async fn flush(
             )
             .await?
     } else {
+        writer.stage = ProducerStage::Publishing;
         publisher
             .prepare_atomic_generation(
                 &writer.recipe.storage_tenant,
@@ -1452,6 +1704,9 @@ async fn flush(
             )
             .await?
     };
+    // The merged query input has now been encoded into the charged immutable
+    // artifacts owned by `prepared`; release its independent lane credits.
+    writer.query_input_credits.clear();
     drop(source_permit);
     let rows = next
         .checked_sub(start)
@@ -1544,6 +1799,7 @@ fn dispatch_mutations(dispatch: V1SourceDispatch) -> Result<(u64, Vec<Mutation>)
                         tenant_id: mutation.tenant_id,
                         bucket_id: mutation.bucket_id,
                         path: mutation.exact_path,
+                        canonical_path: mutation.canonical_path,
                         version: mutation.path_version.0,
                         deleted: mutation.deleted,
                     })
@@ -1561,6 +1817,7 @@ fn head_mutation(head: ObjectHeadChange, ordinal: u32) -> Mutation {
         tenant_id: head.tenant_id,
         bucket_id: head.bucket_id,
         path: head.exact_path,
+        canonical_path: head.canonical_path,
         version: head.path_version.0,
         deleted: matches!(head.kind, ObjectHeadChangeKind::Delete),
     }
@@ -1570,6 +1827,7 @@ async fn load_exact_mutation(
     reader: &ClusterObjectReader,
     recipe: &PhysicalCatalogRecipe,
     path: &str,
+    canonical_path: Option<String>,
     version: u64,
     deleted: bool,
 ) -> Result<IndexSourceMutation, Status> {
@@ -1578,7 +1836,10 @@ async fn load_exact_mutation(
         version,
     };
     if deleted {
-        return Ok(IndexSourceMutation::Remove(identity));
+        return Ok(IndexSourceMutation::Remove {
+            identity,
+            canonical_path,
+        });
     }
     let key = ObjectKey::new(&recipe.storage_tenant, &recipe.bucket, path)
         .map_err(|error| Status::data_loss(error.to_string()))?;
@@ -1601,6 +1862,7 @@ async fn load_exact_mutation(
         .ok_or_else(|| Status::data_loss("v1 source blob is absent"))?;
     Ok(IndexSourceMutation::Upsert(IndexBuildObject {
         path: path.into(),
+        canonical_path,
         version,
         content_type: selected.content_type,
         content_hash: blob.hash,
@@ -1712,447 +1974,5 @@ fn current_placement(decisions: &DecisionRaft) -> Result<ClusterPlacement, Statu
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn integrity_failure_halts_only_the_affected_partition() {
-        assert!(halts_partition(&Status::data_loss(
-            "broken compaction plan"
-        )));
-        assert!(!halts_partition(&Status::unavailable("retryable source")));
-    }
-
-    fn partition() -> ProjectionPartitionIdentity {
-        ProjectionPartitionIdentity {
-            family_id: [3; 32],
-            source_node: 1,
-            source_epoch: [4; 32],
-            producer_node: 1,
-            placement_term: 1,
-            placement_index: 1,
-        }
-    }
-
-    fn loaded_current(
-        physical_catalog_generation: [u8; 32],
-        current_object_version: VersionId,
-    ) -> LoadedV1ProjectionGeneration {
-        let generation = keldra_index::v1::ProjectionGeneration::initial(
-            partition(),
-            physical_catalog_generation,
-            12,
-            12,
-            Vec::new(),
-        )
-        .unwrap();
-        let current = keldra_index::v1::ProjectionCurrent::new([9; 32], &generation).unwrap();
-        LoadedV1ProjectionGeneration {
-            current,
-            current_object_version,
-            generation,
-        }
-    }
-
-    fn query_update(
-        document: keldra_index::v1::StableDocumentKey,
-        path: &str,
-        version: u64,
-    ) -> PreparedQueryMutationBatch {
-        PreparedQueryMutationBatch {
-            membership: Some(keldra_index::v1::PreparedQueryMembershipDelta {
-                recipe: keldra_index::v1::RecipeIdentity::new([3; 32]).unwrap(),
-                gates: vec![keldra_index::v1::QueryDocumentGate {
-                    document,
-                    material_source_version: version,
-                    current_source_version: version,
-                    live: true,
-                    source_path: Some(path.into()),
-                    result_path: Some(path.into()),
-                    result_version: version,
-                }],
-            }),
-            fields: Vec::new(),
-        }
-    }
-
-    fn query_field_update(
-        document: keldra_index::v1::StableDocumentKey,
-        version: u64,
-    ) -> keldra_index::v1::PreparedQueryRecipeDelta {
-        keldra_index::v1::PreparedQueryRecipeDelta {
-            recipe: keldra_index::v1::RecipeIdentity::new([4; 32]).unwrap(),
-            delta: keldra_index::v1::PreparedQueryFieldDelta {
-                presence: keldra_index::v1::QueryDocumentGate {
-                    document,
-                    material_source_version: version,
-                    current_source_version: version,
-                    live: true,
-                    source_path: None,
-                    result_path: None,
-                    result_version: 0,
-                },
-                doc_value: None,
-                terms: Vec::new(),
-                points: Vec::new(),
-            },
-        }
-    }
-
-    fn mutation(path: &str, offset: u64) -> Mutation {
-        Mutation {
-            offset,
-            ordinal: 0,
-            tenant_id: 1,
-            bucket_id: 2,
-            path: path.into(),
-            version: offset,
-            deleted: false,
-        }
-    }
-
-    #[test]
-    fn fresh_partition_publication_starts_at_the_zero_sentinel() {
-        assert_eq!(publication_start(None), 0);
-    }
-
-    #[test]
-    fn stale_catalog_current_is_only_the_cas_guard_for_a_fresh_rebuild() {
-        let current = loaded_current([7; 32], VersionId(41));
-
-        let (resumed, replacement) = current_for_catalog(Some(current.clone()), [7; 32]);
-        assert_eq!(
-            resumed.unwrap().current_object_version,
-            current.current_object_version
-        );
-        assert_eq!(replacement, None);
-
-        let (resumed, replacement) = current_for_catalog(Some(current), [8; 32]);
-        assert!(resumed.is_none());
-        assert_eq!(replacement, Some(VersionId(41)));
-
-        let (resumed, replacement) = current_for_catalog(None, [8; 32]);
-        assert!(resumed.is_none());
-        assert_eq!(replacement, None);
-    }
-
-    #[test]
-    fn empty_physical_family_writers_do_not_preallocate_query_capacity() {
-        let bytes = 1_024;
-        let credits = IndexingMemoryCredits::new(
-            bytes,
-            IndexingMemoryLimits {
-                hot_payload_bytes: bytes,
-                worker_scratch_bytes: bytes,
-                prepared_rows_bytes: bytes,
-                replay_input_bytes: bytes,
-                projection_accumulator_bytes: bytes,
-                seal_scratch_bytes: bytes,
-                ordering_catalog_bytes: bytes,
-            },
-        )
-        .unwrap();
-        let limits = Limits {
-            bytes,
-            flush_bytes: 64,
-            projection_batch_bytes: 256,
-            flush_age: Duration::from_secs(1),
-            flush_operations: 64,
-            lsm_runs: 64,
-            lsm_bytes: 1_024,
-            parallelism: 1,
-            worker_bytes: 64,
-        };
-
-        let writers = (0..5)
-            .map(|_| empty_query_credits(&credits, limits).unwrap())
-            .collect::<Vec<_>>();
-
-        assert_eq!(writers.len(), 5);
-        assert_eq!(
-            credits.stage_used_bytes(IndexingMemoryStage::OrderingCatalog),
-            5
-        );
-    }
-
-    #[test]
-    fn projection_batch_headroom_scales_with_pipeline_memory() {
-        let config = IndexRuntimeConfig::new(4)
-            .unwrap()
-            .with_pipeline_memory_bytes(4 * 1024 * 1024 * 1024)
-            .unwrap();
-        let limits = limits(config).unwrap();
-
-        assert_eq!(limits.bytes, 2 * 1024 * 1024 * 1024);
-        assert_eq!(limits.flush_bytes, 16 * 1024 * 1024);
-        assert_eq!(limits.projection_batch_bytes, 512 * 1024 * 1024);
-    }
-
-    #[test]
-    fn reserved_only_progress_does_not_request_an_empty_current_publication() {
-        // A fresh partition needs its one baseline Current for activation,
-        // even when the baseline contains no matching objects.
-        assert!(has_publication_work(false, 0));
-
-        // Once Current exists, filtered control events advance only the replay
-        // cursor. They cannot generate another Current/source event alone.
-        assert!(!has_publication_work(true, 0));
-
-        // The first later matching mutation makes the complete contiguous
-        // range, including the skipped control positions, publishable.
-        assert!(has_publication_work(true, 1));
-    }
-
-    #[test]
-    fn repeated_hot_paths_coalesce_without_losing_the_safe_atomic_cut() {
-        let units = (0..10_000_u64)
-            .map(|offset| {
-                (
-                    offset + 10,
-                    vec![mutation(
-                        &format!("objects/{:03}", offset % 256),
-                        offset + 1,
-                    )],
-                )
-            })
-            .collect();
-        let (through_atomic, output) = coalesce_units(7, units).unwrap();
-        assert_eq!(through_atomic, 10_009);
-        assert_eq!(output.len(), 256);
-        assert!(
-            output
-                .windows(2)
-                .all(|pair| pair[0].offset < pair[1].offset)
-        );
-        assert!(output.iter().all(|mutation| mutation.offset > 9_744));
-    }
-
-    #[test]
-    fn duplicate_path_inside_one_atomic_unit_still_fails_closed() {
-        let error = coalesce_units(
-            0,
-            vec![(9, vec![mutation("objects/a", 3), mutation("objects/a", 3)])],
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::DataLoss);
-    }
-
-    #[test]
-    fn publication_window_is_newest_wins_across_page_boundaries() {
-        let mut latest = BTreeMap::new();
-        let mut bytes = 0;
-        let mut operations = 0;
-        let mut next = 1;
-        let mut changed = mutation("objects/a", 2);
-        changed.version = 20;
-        queue_mutation_window(
-            &mut latest,
-            &mut bytes,
-            &mut operations,
-            &mut next,
-            usize::MAX,
-            vec![changed],
-            3,
-        )
-        .unwrap();
-        let mut restored = mutation("objects/a", 3);
-        restored.version = 10;
-        queue_mutation_window(
-            &mut latest,
-            &mut bytes,
-            &mut operations,
-            &mut next,
-            usize::MAX,
-            vec![restored],
-            4,
-        )
-        .unwrap();
-
-        assert_eq!(latest.len(), 1);
-        assert_eq!(latest["objects/a"].version, 10);
-        assert_eq!(next, 4);
-        assert_eq!(operations, 2);
-    }
-
-    #[test]
-    fn create_then_delete_remains_an_empty_latest_mutation_and_advances() {
-        let mut latest = BTreeMap::new();
-        let mut bytes = 0;
-        let mut operations = 0;
-        let mut next = 0;
-        queue_mutation_window(
-            &mut latest,
-            &mut bytes,
-            &mut operations,
-            &mut next,
-            usize::MAX,
-            vec![mutation("objects/a", 1)],
-            2,
-        )
-        .unwrap();
-        let mut deleted = mutation("objects/a", 2);
-        deleted.deleted = true;
-        queue_mutation_window(
-            &mut latest,
-            &mut bytes,
-            &mut operations,
-            &mut next,
-            usize::MAX,
-            vec![deleted],
-            3,
-        )
-        .unwrap();
-
-        assert!(latest["objects/a"].deleted);
-        assert_eq!(latest.len(), 1);
-        assert_eq!(next, 3);
-    }
-
-    #[test]
-    fn ten_thousand_hot_updates_prepare_only_256_query_documents() {
-        let scope = [9; 32];
-        let mut latest = BTreeMap::new();
-        let mut bytes = 0;
-        let mut operations = 0;
-        let mut next = 0;
-        for offset in 1..=10_000_u64 {
-            queue_mutation_window(
-                &mut latest,
-                &mut bytes,
-                &mut operations,
-                &mut next,
-                usize::MAX,
-                vec![mutation(&format!("objects/{:03}", offset % 256), offset)],
-                offset + 1,
-            )
-            .unwrap();
-        }
-        assert_eq!(latest.len(), 256);
-        assert_eq!(operations, 10_000);
-        assert_eq!(next, 10_001);
-
-        let mut pending = PreparedQueryMutationBatch::default();
-        let mut preparations = 0;
-        for mutation in latest.into_values() {
-            let document =
-                keldra_index::v1::StableDocumentKey::derive(scope, &mutation.path, 0).unwrap();
-            merge_query(
-                &mut pending,
-                query_update(document, &mutation.path, mutation.version),
-            )
-            .unwrap();
-            preparations += 1;
-        }
-
-        let membership = pending.membership.as_ref().unwrap();
-        assert_eq!(membership.gates.len(), 256);
-        assert_eq!(preparations, 256);
-        assert!(membership.gates.iter().all(|gate| {
-            let path = gate.source_path.as_deref().unwrap();
-            let suffix = path.rsplit('/').next().unwrap().parse::<u64>().unwrap();
-            gate.current_source_version == 10_000 - ((10_000 - suffix) % 256)
-        }));
-
-        let bytes = 4 * 1024 * 1024;
-        let memory = IndexingMemoryCredits::new(
-            bytes,
-            IndexingMemoryLimits {
-                hot_payload_bytes: bytes,
-                worker_scratch_bytes: bytes,
-                prepared_rows_bytes: bytes,
-                replay_input_bytes: bytes,
-                projection_accumulator_bytes: bytes,
-                seal_scratch_bytes: bytes,
-                ordering_catalog_bytes: bytes,
-            },
-        )
-        .unwrap();
-        let credits = QueryBlockCredits::from_pipeline_permit(
-            memory
-                .acquire(IndexingMemoryStage::OrderingCatalog, bytes)
-                .unwrap(),
-        );
-        let artifacts = keldra_index::v1::prepare_projection_query_run(
-            ProjectionPartitionIdentity::new([1; 32], 2, [3; 32], 2, 4, 5).unwrap(),
-            [6; 32],
-            1,
-            1,
-            10_001,
-            10_000,
-            pending,
-            keldra_index::v1::QueryBlockLimits::default_for_memory(),
-            credits,
-        )
-        .unwrap();
-        assert!(!artifacts.artifacts().blocks.is_empty());
-    }
-
-    #[test]
-    fn repeated_unpublished_document_preparation_keeps_only_the_latest_query_delta() {
-        let document =
-            keldra_index::v1::StableDocumentKey::derive([9; 32], "objects/a", 0).unwrap();
-        let mut pending = PreparedQueryMutationBatch::default();
-        let mut first = query_update(document, "objects/a", 1);
-        first.fields.push(query_field_update(document, 1));
-        merge_query(&mut pending, first).unwrap();
-        let mut second = query_update(document, "objects/a", 2);
-        second.fields.push(query_field_update(document, 2));
-        merge_query(&mut pending, second).unwrap();
-
-        let membership = pending.membership.as_ref().unwrap();
-        assert_eq!(membership.gates.len(), 1);
-        assert_eq!(membership.gates[0].current_source_version, 2);
-        assert_eq!(pending.fields.len(), 1);
-        assert_eq!(pending.fields[0].delta.presence.current_source_version, 2);
-
-        let bytes = 1024 * 1024;
-        let memory = IndexingMemoryCredits::new(
-            bytes,
-            IndexingMemoryLimits {
-                hot_payload_bytes: bytes,
-                worker_scratch_bytes: bytes,
-                prepared_rows_bytes: bytes,
-                replay_input_bytes: bytes,
-                projection_accumulator_bytes: bytes,
-                seal_scratch_bytes: bytes,
-                ordering_catalog_bytes: bytes,
-            },
-        )
-        .unwrap();
-        let credits = QueryBlockCredits::from_pipeline_permit(
-            memory
-                .acquire(IndexingMemoryStage::OrderingCatalog, bytes)
-                .unwrap(),
-        );
-        let artifacts = keldra_index::v1::prepare_projection_query_run(
-            partition(),
-            [6; 32],
-            1,
-            1,
-            3,
-            2,
-            pending,
-            keldra_index::v1::QueryBlockLimits::default_for_memory(),
-            credits,
-        )
-        .unwrap();
-        assert!(!artifacts.artifacts().blocks.is_empty());
-    }
-
-    #[test]
-    fn replay_selection_holds_measured_metadata_not_construction_headroom() {
-        let mutation = mutation("objects/a", 7);
-        let selected = SelectedV1Source {
-            source: IndexSourceMutation::Remove(keldra_index::v1::ObjectIdentity {
-                path: "objects/a".into(),
-                version: 7,
-            }),
-            selected: None,
-        };
-
-        let retained = selected_mutation_resident_bytes(&mutation, &selected, &[]).unwrap();
-
-        assert!(retained < 1024);
-        assert!(retained >= std::mem::size_of::<SelectedMutation>());
-    }
-}
+#[path = "v1_consumer_tests.rs"]
+mod tests;

@@ -62,11 +62,17 @@ impl V1ProjectionExtractor {
     ) -> Result<SelectedV1Source, Status> {
         let object = match source {
             IndexSourceMutation::Upsert(object) => object,
-            IndexSourceMutation::Remove(identity) => {
+            IndexSourceMutation::Remove {
+                identity,
+                canonical_path,
+            } => {
                 self.hot
                     .discard_through(tenant_id, bucket_id, &identity.path, identity.version);
                 return Ok(SelectedV1Source {
-                    source: IndexSourceMutation::Remove(identity),
+                    source: IndexSourceMutation::Remove {
+                        identity,
+                        canonical_path,
+                    },
                     selected: None,
                 });
             }
@@ -168,16 +174,24 @@ impl V1ProjectionExtractor {
         previous: &[ProjectedDocumentState],
         credits: &mut QueryBlockCredits,
     ) -> Result<PreparedTypedJsonDocument, Status> {
-        let (path, version, result, live) = match &selected.source {
+        let (path, canonical_source_path, version, result, live) = match &selected.source {
             IndexSourceMutation::Upsert(object) => (
                 object.path.clone(),
+                object.canonical_path.clone(),
                 object.version,
                 Some(object.identity()),
                 true,
             ),
-            IndexSourceMutation::Remove(identity) => {
-                (identity.path.clone(), identity.version, None, false)
-            }
+            IndexSourceMutation::Remove {
+                identity,
+                canonical_path,
+            } => (
+                identity.path.clone(),
+                canonical_path.clone(),
+                identity.version,
+                None,
+                false,
+            ),
         };
         let diagnostic_path = path.clone();
         let fields = recipe
@@ -205,6 +219,7 @@ impl V1ProjectionExtractor {
             TypedJsonDocumentInput {
                 source_scope,
                 source_path: path,
+                canonical_source_path,
                 source_version: version,
                 result,
                 live,
@@ -216,6 +231,35 @@ impl V1ProjectionExtractor {
             credits,
         )
         .map_err(|error| object_index_status(&diagnostic_path, error))
+    }
+
+    /// Prepare one already-selected source on the process-owned projection
+    /// pool. Owned inputs and credits cross the worker boundary together so
+    /// the async coordinator can merge results later in stable source order.
+    pub(crate) async fn prepare_owned(
+        &self,
+        source_scope: [u8; 32],
+        selected: SelectedV1Source,
+        recipe: PhysicalCatalogRecipe,
+        previous: Vec<ProjectedDocumentState>,
+        mut credits: QueryBlockCredits,
+    ) -> Result<
+        (
+            SelectedV1Source,
+            Vec<ProjectedDocumentState>,
+            PreparedTypedJsonDocument,
+            QueryBlockCredits,
+        ),
+        Status,
+    > {
+        self.cpu
+            .submit(move || {
+                let prepared =
+                    Self::prepare(source_scope, &selected, &recipe, &previous, &mut credits)?;
+                Ok((selected, previous, prepared, credits))
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
     }
 
     async fn open_payload(

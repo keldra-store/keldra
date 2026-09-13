@@ -52,6 +52,10 @@ counters!(
     local_tail,
     lag_entries,
     lag_oldest_age_millis,
+    oldest_no_progress_age_millis,
+    stalled_partitions,
+    retrying_partitions,
+    halted_partitions,
 );
 
 static TELEMETRY: OnceLock<Arc<V1PipelineTelemetry>> = OnceLock::new();
@@ -118,6 +122,10 @@ impl V1PipelineTelemetry {
             keldra_index_v1_local_tail = Self::load(&self.local_tail),
             keldra_index_v1_lag_entries = Self::load(&self.lag_entries),
             keldra_index_v1_lag_oldest_age_milliseconds = Self::load(&self.lag_oldest_age_millis),
+            keldra_index_v1_oldest_no_progress_age_milliseconds = Self::load(&self.oldest_no_progress_age_millis),
+            keldra_index_v1_stalled_partitions = Self::load(&self.stalled_partitions),
+            keldra_index_v1_retrying_partitions = Self::load(&self.retrying_partitions),
+            keldra_index_v1_halted_partitions = Self::load(&self.halted_partitions),
             "keldra_index_v1_summary"
         );
         for snapshot in keldra_index::hash_profile_snapshots() {
