@@ -877,16 +877,14 @@ async fn exact_head_is_rechecked_before_atomic_apply() {
     batch.put_cf(
         store.program_cf(CF_VERSIONS).unwrap(),
         version_key(identity, &key, rogue_id),
-        serde_json::to_vec(&StoredVersion::new(
-            rogue,
-            StoredVersionRetention::JournalPending,
-        ))
-        .unwrap(),
+        StoredVersion::new(rogue, StoredVersionRetention::JournalPending)
+            .encode()
+            .unwrap(),
     );
     batch.put_cf(
         store.program_cf(CF_HEADS).unwrap(),
         identity.head_key(key.path()),
-        serde_json::to_vec(&Head {
+        encode_head(&Head {
             version: rogue_id,
             deleted: false,
             mutation_stamp: None,

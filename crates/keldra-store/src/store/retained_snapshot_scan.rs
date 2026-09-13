@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use super::object_alias_registry::decode_registry;
 use super::{
-    CF_HEADS, CF_OBJECT_ALIAS_REGISTRIES, CF_VERSIONS, Store, StoredVersion, StoredVersionRetention,
+    CF_HEADS, CF_OBJECT_ALIAS_REGISTRIES, CF_VERSIONS, Store, StoredVersion,
+    StoredVersionRetention, decode_head,
 };
 use crate::key::{BucketId, BucketIdentity, TenantId};
-use crate::{Head, ObjectKey, SourceId, Version, VersionId};
+use crate::{ObjectKey, SourceId, Version, VersionId};
 
 use super::object_snapshot::ObjectSnapshotError;
 
@@ -624,7 +625,7 @@ fn decode_retained_record(
                 .get_cf(heads, head_key)
                 .map_err(object_storage)?
                 .ok_or_else(|| object_storage("retained descriptor has no current head"))?;
-            let head: Head = serde_json::from_slice(&encoded_head).map_err(object_storage)?;
+            let head = decode_head(&encoded_head).map_err(object_storage)?;
             let state = RetainedHeadState {
                 version: head.version,
                 deleted: head.deleted,

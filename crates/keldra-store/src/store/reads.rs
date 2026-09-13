@@ -9,7 +9,11 @@ impl Store {
         &self,
         encoded_key: &[u8],
     ) -> Result<Option<Head>, MutationError> {
-        self.read_json(CF_HEADS, encoded_key)
+        self.db
+            .get_cf(self.cf(CF_HEADS)?, encoded_key)
+            .map_err(storage_error)?
+            .map(|encoded| decode_head(&encoded))
+            .transpose()
     }
 
     /// Lists current live paths directly from the prefix-sortable head keys.
@@ -175,7 +179,7 @@ impl Store {
             let path = identity
                 .decode_head_path(&stored_key)
                 .map_err(storage_error)?;
-            let head = serde_json::from_slice::<Head>(&encoded_head).map_err(storage_error)?;
+            let head = decode_head(&encoded_head)?;
             if head.deleted
                 || (contains_reserved_keldra_segment(path) && !reserved_scope.allows(path))
                 || start_after.is_some_and(|cursor| path <= cursor)
@@ -526,21 +530,17 @@ impl Store {
             batch.put_cf(
                 self.cf(CF_VERSIONS)?,
                 version_key(identity, key, tombstone_id),
-                serde_json::to_vec(&StoredVersion::new(
-                    tombstone.clone(),
-                    StoredVersionRetention::UserRetained,
-                ))
-                .map_err(storage_error)?,
+                StoredVersion::new(tombstone.clone(), StoredVersionRetention::UserRetained)
+                    .encode()?,
             );
             batch.put_cf(
                 self.cf(CF_HEADS)?,
                 identity.head_key(key.path()),
-                serde_json::to_vec(&Head {
+                encode_head(&Head {
                     version: tombstone_id,
                     deleted: true,
                     mutation_stamp: None,
-                })
-                .map_err(storage_error)?,
+                })?,
             );
             batch.put_cf(
                 self.cf(CF_METADATA)?,
@@ -639,9 +639,7 @@ impl Store {
                         None => snapshot
                             .get_cf(self.cf(CF_HEADS)?, identity.head_key(key.path()))
                             .map_err(storage_error)?
-                            .map(|bytes| {
-                                serde_json::from_slice::<Head>(&bytes).map_err(storage_error)
-                            })
+                            .map(|bytes| decode_head(&bytes))
                             .transpose()?,
                     };
                     let version_id = requested_version

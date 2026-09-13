@@ -1016,16 +1016,12 @@ fn assert_same_mutation_metadata(coordinator: &Store, replica: &Store, mutation:
     let version_key = mutation_version_key(mutation);
     let receipt_key = receipt_key(identity, &mutation.command_id);
     assert_eq!(
-        coordinator.read_json::<Head>(CF_HEADS, &head_key).unwrap(),
-        replica.read_json::<Head>(CF_HEADS, &head_key).unwrap()
+        coordinator.head_by_storage_key(&head_key).unwrap(),
+        replica.head_by_storage_key(&head_key).unwrap()
     );
     assert_eq!(
-        coordinator
-            .read_json::<StoredVersion>(CF_VERSIONS, &version_key)
-            .unwrap(),
-        replica
-            .read_json::<StoredVersion>(CF_VERSIONS, &version_key)
-            .unwrap()
+        coordinator.stored_version_by_key(&version_key).unwrap(),
+        replica.stored_version_by_key(&version_key).unwrap()
     );
     assert_eq!(
         coordinator.read_stored_receipt(&receipt_key).unwrap(),
@@ -1256,7 +1252,7 @@ async fn typed_mutation_replicates_exactly_and_retries_after_head_and_journal_mo
     );
     assert!(
         coordinator
-            .read_json::<StoredVersion>(CF_VERSIONS, &mutation_version_key(&first_mutation))
+            .stored_version_by_key(&mutation_version_key(&first_mutation))
             .unwrap()
             .is_none()
     );
@@ -1518,16 +1514,14 @@ async fn first_typed_mutation_accepts_an_unstamped_050_baseline() {
     seed.put_cf(
         replica.cf(CF_HEADS).unwrap(),
         identity.head_key(logical_key.path()),
-        serde_json::to_vec(&baseline_head).unwrap(),
+        encode_head(&baseline_head).unwrap(),
     );
     seed.put_cf(
         replica.cf(CF_VERSIONS).unwrap(),
         version_key(identity, &logical_key, baseline.version),
-        serde_json::to_vec(&StoredVersion::new(
-            baseline_version,
-            StoredVersionRetention::JournalPending,
-        ))
-        .unwrap(),
+        StoredVersion::new(baseline_version, StoredVersionRetention::JournalPending)
+            .encode()
+            .unwrap(),
     );
     replica.db.write(seed).unwrap();
 
@@ -1570,7 +1564,7 @@ async fn first_typed_mutation_accepts_an_unstamped_050_baseline() {
     assert_same_mutation_metadata(&coordinator, &replica, &typed);
     assert_eq!(
         replica
-            .read_json::<Head>(CF_HEADS, &identity.head_key(logical_key.path()))
+            .head_by_storage_key(&identity.head_key(logical_key.path()))
             .unwrap()
             .unwrap()
             .mutation_stamp,

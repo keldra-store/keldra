@@ -224,11 +224,11 @@ impl Store {
                                 batch.put_cf(
                                     self.cf(CF_VERSIONS)?,
                                     predecessor_key,
-                                    serde_json::to_vec(&StoredVersion::new(
+                                    StoredVersion::new(
                                         stored.version,
                                         StoredVersionRetention::UserRetained,
-                                    ))
-                                    .map_err(storage_error)?,
+                                    )
+                                    .encode()?,
                                 );
                             }
                             StoredVersionRetention::JournalReleased
@@ -237,11 +237,11 @@ impl Store {
                                 batch.put_cf(
                                     self.cf(CF_VERSIONS)?,
                                     predecessor_key,
-                                    serde_json::to_vec(&StoredVersion::new(
+                                    StoredVersion::new(
                                         stored.version,
                                         StoredVersionRetention::UserRetained,
-                                    ))
-                                    .map_err(storage_error)?,
+                                    )
+                                    .encode()?,
                                 );
                             }
                             StoredVersionRetention::JournalReleased => {
@@ -255,19 +255,14 @@ impl Store {
                 batch.put_cf(
                     self.cf(CF_VERSIONS)?,
                     &encoded_version_key,
-                    serde_json::to_vec(&StoredVersion::new(mutation.version.clone(), retention))
-                        .map_err(storage_error)?,
+                    StoredVersion::new(mutation.version.clone(), retention).encode()?,
                 );
                 let head = Head {
                     version: mutation.version.id,
                     deleted: mutation.version.deleted,
                     mutation_stamp: Some(mutation.stamp),
                 };
-                batch.put_cf(
-                    self.cf(CF_HEADS)?,
-                    &encoded_head_key,
-                    serde_json::to_vec(&head).map_err(storage_error)?,
-                );
+                batch.put_cf(self.cf(CF_HEADS)?, &encoded_head_key, encode_head(&head)?);
                 deleted_versions.remove(&encoded_version_key);
                 pending_versions.insert(encoded_version_key.clone(), mutation.version.clone());
                 pending_heads.insert(encoded_head_key.clone(), head);
@@ -669,13 +664,14 @@ mod tests {
             .stored_version_by_key(&predecessor_key)
             .unwrap()
             .unwrap();
+        predecessor.version.content_type = Some(crate::OBJECT_LINK_CONTENT_TYPE.into());
         predecessor.version.protected_link_descriptor = true;
         replica
             .db
             .put_cf(
                 replica.cf(CF_VERSIONS).unwrap(),
                 &predecessor_key,
-                serde_json::to_vec(&predecessor).unwrap(),
+                predecessor.encode().unwrap(),
             )
             .unwrap();
 

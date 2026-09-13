@@ -4,41 +4,30 @@ use super::mutation_helpers::exact_version_key;
 use super::*;
 use crate::{ReferenceProof, ReferenceProofMutation};
 
-const STORED_VERSION_FORMAT: u16 = 1;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoredVersionRetention {
     JournalPending,
     JournalReleased,
     UserRetained,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredVersion {
-    format: u16,
     pub(crate) retention: StoredVersionRetention,
     pub(crate) version: Version,
 }
 
 impl StoredVersion {
     pub(crate) fn new(version: Version, retention: StoredVersionRetention) -> Self {
-        Self {
-            format: STORED_VERSION_FORMAT,
-            retention,
-            version,
-        }
+        Self { retention, version }
     }
 
     pub(crate) fn decode(encoded: &[u8]) -> Result<Self, MutationError> {
-        let stored: Self = serde_json::from_slice(encoded).map_err(storage_error)?;
-        if stored.format != STORED_VERSION_FORMAT {
-            return Err(MutationError::Storage(format!(
-                "unsupported stored-version format {}",
-                stored.format
-            )));
-        }
-        Ok(stored)
+        decode_stored_version(encoded)
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, MutationError> {
+        encode_stored_version(self)
     }
 }
 
@@ -189,11 +178,7 @@ impl Store {
             batch.put_cf(
                 self.cf(CF_VERSIONS)?,
                 &version_key,
-                serde_json::to_vec(&StoredVersion::new(
-                    version,
-                    StoredVersionRetention::JournalReleased,
-                ))
-                .map_err(storage_error)?,
+                StoredVersion::new(version, StoredVersionRetention::JournalReleased).encode()?,
             );
             return Ok(None);
         }

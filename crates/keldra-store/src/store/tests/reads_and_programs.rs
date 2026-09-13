@@ -656,7 +656,7 @@ async fn local_cluster_listing_has_no_total_result_cap_across_pages() {
         batch.put_cf(
             store.cf(CF_HEADS).unwrap(),
             identity.head_key(&format!("many/{index:04}")),
-            serde_json::to_vec(&Head {
+            encode_head(&Head {
                 version: VersionId(index as u64 + 1),
                 deleted: false,
                 mutation_stamp: None,

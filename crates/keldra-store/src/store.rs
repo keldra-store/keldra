@@ -1497,6 +1497,7 @@ pub use single_node_group_commit::{
     SingleNodeGroupCommitConfig, SingleNodeMutationBatch, SourceJournalSettlement,
 };
 mod object_alias_registry;
+mod object_metadata_codec;
 mod object_mutation_codec;
 mod object_mutation_replica_batch;
 mod object_snapshot;
@@ -1515,6 +1516,9 @@ mod runtime_metrics;
 mod shards;
 mod source_journal_preflight;
 mod source_version_retention;
+pub(crate) use object_metadata_codec::{
+    decode_head, decode_stored_version, encode_head, encode_stored_version,
+};
 pub(crate) use source_version_retention::{StoredVersion, StoredVersionRetention};
 mod watch_journal;
 

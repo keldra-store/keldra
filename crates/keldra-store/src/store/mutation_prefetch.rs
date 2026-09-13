@@ -74,7 +74,7 @@ impl MutationReadCache {
             .map(|operation| operation.identity().encode().to_vec())
             .collect::<BTreeSet<_>>();
 
-        let (heads, elapsed) = multi_get_json::<Head>(store, &snapshot, CF_HEADS, &head_keys)?;
+        let (heads, elapsed) = multi_get_heads(store, &snapshot, CF_HEADS, &head_keys)?;
         metrics.head_keys = head_keys.len() as u64;
         metrics.head_seconds = elapsed;
 
@@ -426,24 +426,18 @@ fn decode_bucket_versioning(
     }
 }
 
-fn multi_get_json<T>(
+fn multi_get_heads(
     store: &Store,
     snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
     cf_name: &'static str,
     keys: &BTreeSet<Vec<u8>>,
-) -> Result<(BTreeMap<Vec<u8>, Cached<T>>, f64), MutationError>
-where
-    T: for<'de> Deserialize<'de>,
-{
+) -> Result<(BTreeMap<Vec<u8>, Cached<Head>>, f64), MutationError> {
     let started = std::time::Instant::now();
     let values = multi_get_raw(store, snapshot, cf_name, keys)?
         .into_iter()
         .map(|(key, cached)| {
-            let decoded = cached.and_then(|value| {
-                value
-                    .map(|encoded| serde_json::from_slice(&encoded).map_err(storage_error))
-                    .transpose()
-            });
+            let decoded =
+                cached.and_then(|value| value.map(|encoded| decode_head(&encoded)).transpose());
             (key, decoded)
         })
         .collect();

@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::object_alias_registry::decode_registry;
 use super::{
     CF_HEADS, CF_OBJECT_ALIAS_REGISTRIES, CF_VERSIONS, MAX_OBJECT_RECORD_EXPORT_BYTES,
-    MAX_OBJECT_RECORD_EXPORT_RECORDS, StoredVersion,
+    MAX_OBJECT_RECORD_EXPORT_RECORDS, StoredVersion, decode_head,
 };
 use crate::key::{
     BucketId, BucketIdentity, STORAGE_KEY_FORMAT_VERSION, TenantId,
@@ -409,7 +409,7 @@ impl Store {
             let Some(encoded_head) = encoded_head.map_err(object_storage)? else {
                 continue;
             };
-            let head: Head = serde_json::from_slice(&encoded_head).map_err(object_storage)?;
+            let head = decode_head(&encoded_head).map_err(object_storage)?;
             present.push((
                 index,
                 head.clone(),
@@ -944,7 +944,7 @@ fn decode_current_head(
         .decode_head_path(encoded_head_key)
         .map_err(object_storage)?
         .to_owned();
-    let head: Head = serde_json::from_slice(encoded_head).map_err(object_storage)?;
+    let head = decode_head(encoded_head).map_err(object_storage)?;
     let encoded_version = snapshot
         .get_cf(
             versions_cf,

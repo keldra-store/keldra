@@ -322,21 +322,17 @@ impl Store {
             batch.put_cf(
                 self.cf(CF_VERSIONS)?,
                 version_key(identity, &key, replacement.id),
-                serde_json::to_vec(&StoredVersion::new(
-                    replacement.clone(),
-                    StoredVersionRetention::UserRetained,
-                ))
-                .map_err(storage_error)?,
+                StoredVersion::new(replacement.clone(), StoredVersionRetention::UserRetained)
+                    .encode()?,
             );
             batch.put_cf(
                 self.cf(CF_HEADS)?,
                 identity.head_key(&mutation.exact_path),
-                serde_json::to_vec(&Head {
+                encode_head(&Head {
                     version: replacement.id,
                     deleted: true,
                     mutation_stamp: Some(mutation.stamp),
-                })
-                .map_err(storage_error)?,
+                })?,
             );
             let high_watermark = self
                 .read_json::<VersionId>(CF_METADATA, VERSION_HIGH_WATERMARK_KEY)?

@@ -768,9 +768,9 @@ impl Store {
 
         let mut batch = WriteBatch::default();
         let encoded_version_key = version_key(identity, &key, stage.version.id);
-        let encoded_version =
-            serde_json::to_vec(&StoredVersion::new(stage.version.clone(), retention))
-                .map_err(program_storage_error)?;
+        let encoded_version = StoredVersion::new(stage.version.clone(), retention)
+            .encode()
+            .map_err(program_storage_error)?;
         if let Some(existing) = self.raw_get(CF_VERSIONS, &encoded_version_key)?
             && existing != encoded_version
         {
@@ -801,7 +801,7 @@ impl Store {
                         batch.put_cf(
                             self.program_cf(CF_VERSIONS)?,
                             predecessor_key,
-                            serde_json::to_vec(&stored).map_err(program_storage_error)?,
+                            stored.encode().map_err(program_storage_error)?,
                         );
                     }
                     StoredVersionRetention::JournalReleased
@@ -811,7 +811,7 @@ impl Store {
                         batch.put_cf(
                             self.program_cf(CF_VERSIONS)?,
                             predecessor_key,
-                            serde_json::to_vec(&stored).map_err(program_storage_error)?,
+                            stored.encode().map_err(program_storage_error)?,
                         );
                     }
                     StoredVersionRetention::JournalReleased => {
@@ -825,7 +825,7 @@ impl Store {
         batch.put_cf(
             self.program_cf(CF_HEADS)?,
             encoded_head_key,
-            serde_json::to_vec(&Head {
+            crate::store::encode_head(&Head {
                 version: stage.version.id,
                 deleted: stage.version.deleted,
                 mutation_stamp: Some(mutation.stamp),

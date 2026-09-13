@@ -16,7 +16,8 @@ use crate::model::{MUTATION_STAMP_FORMAT, MutationStamp};
 use crate::store::{
     CF_HEADS, CF_METADATA, CF_VERSIONS, LocalReferenceEffects, PendingBlobReferences,
     PendingLocalChange, StoredVersion, StoredVersionRetention, VERSION_HIGH_WATERMARK_KEY,
-    is_program_definition_path, now_unix_millis, version_blob_reference, version_key,
+    decode_head, encode_head, is_program_definition_path, now_unix_millis, version_blob_reference,
+    version_key,
 };
 use crate::{
     AccountingHeadTransition, BlobRef, Head, MutationError, ObjectKey, ObjectMutationContext,
@@ -476,7 +477,7 @@ impl StateReader for Store {
                         identity.head_key(key.path()),
                     )
                     .map_err(|error| error.to_string())?
-                    .map(|encoded| serde_json::from_slice::<Head>(&encoded))
+                    .map(|encoded| decode_head(&encoded))
                     .transpose()
                     .map_err(|error| error.to_string())?;
                 let version = match head {
@@ -1294,9 +1295,9 @@ impl Store {
             let retention = self
                 .version_retention_for_bucket(identity)
                 .map_err(program_mutation_error)?;
-            let version_bytes =
-                serde_json::to_vec(&StoredVersion::new(write.version.clone(), retention))
-                    .map_err(program_storage_error)?;
+            let version_bytes = StoredVersion::new(write.version.clone(), retention)
+                .encode()
+                .map_err(program_storage_error)?;
             let old_version = current_versions
                 .get(&write.path)
                 .ok_or_else(|| {
@@ -1318,7 +1319,7 @@ impl Store {
                             batch.put_cf(
                                 self.program_cf(CF_VERSIONS)?,
                                 old_key,
-                                serde_json::to_vec(&stored).map_err(program_storage_error)?,
+                                stored.encode().map_err(program_storage_error)?,
                             );
                         }
                         StoredVersionRetention::JournalReleased
@@ -1328,7 +1329,7 @@ impl Store {
                             batch.put_cf(
                                 self.program_cf(CF_VERSIONS)?,
                                 old_key,
-                                serde_json::to_vec(&stored).map_err(program_storage_error)?,
+                                stored.encode().map_err(program_storage_error)?,
                             );
                         }
                         StoredVersionRetention::JournalReleased => {
@@ -1414,7 +1415,7 @@ impl Store {
             batch.put_cf(
                 self.program_cf(CF_HEADS)?,
                 identity.head_key(key.path()),
-                serde_json::to_vec(&Head {
+                encode_head(&Head {
                     version: write.version.id,
                     deleted: write.version.deleted,
                     mutation_stamp: Some(MutationStamp {

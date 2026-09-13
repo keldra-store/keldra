@@ -1727,7 +1727,7 @@ mod tests {
             .put_cf(
                 store.cf(CF_HEADS).unwrap(),
                 &head_key,
-                serde_json::to_vec(&Head {
+                encode_head(&Head {
                     version: VersionId(u64::MAX),
                     deleted: false,
                     mutation_stamp: None,

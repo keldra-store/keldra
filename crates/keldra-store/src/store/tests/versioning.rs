@@ -175,7 +175,7 @@ async fn get_version_rejects_a_descriptor_id_that_disagrees_with_its_key() {
         .put_cf(
             store.cf(CF_VERSIONS).unwrap(),
             descriptor_key,
-            serde_json::to_vec(&stored).unwrap(),
+            stored.encode().unwrap(),
         )
         .unwrap();
 
@@ -207,13 +207,14 @@ async fn batch_get_rejects_a_descriptor_that_disagrees_with_its_current_head() {
         .unwrap()
         .unwrap();
     stored.version.blob = None;
+    stored.version.content_type = None;
     stored.version.deleted = true;
     store
         .db
         .put_cf(
             store.cf(CF_VERSIONS).unwrap(),
             descriptor_key,
-            serde_json::to_vec(&stored).unwrap(),
+            stored.encode().unwrap(),
         )
         .unwrap();
 

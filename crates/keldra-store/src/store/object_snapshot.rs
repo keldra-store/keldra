@@ -650,14 +650,15 @@ impl Store {
                 batch.put_cf(
                     versions,
                     exact_version_key(&head_key, version.id),
-                    serde_json::to_vec(&super::StoredVersion::new(version.clone(), retention))
+                    super::StoredVersion::new(version.clone(), retention)
+                        .encode()
                         .map_err(object_storage)?,
                 );
             }
             batch.put_cf(
                 self.cf(CF_HEADS).map_err(object_storage)?,
                 &head_key,
-                serde_json::to_vec(&selected.head).map_err(object_storage)?,
+                super::encode_head(&selected.head).map_err(object_storage)?,
             );
             self.stage_object_high_watermark(&mut batch, selected.head.version)?;
         }
@@ -711,14 +712,15 @@ impl Store {
             batch.put_cf(
                 self.cf(CF_VERSIONS).map_err(object_storage)?,
                 exact_version_key(&head_key, version.id),
-                serde_json::to_vec(&super::StoredVersion::new(version.clone(), retention))
+                super::StoredVersion::new(version.clone(), retention)
+                    .encode()
                     .map_err(object_storage)?,
             );
         }
         batch.put_cf(
             self.cf(CF_HEADS).map_err(object_storage)?,
             &head_key,
-            serde_json::to_vec(&record.head).map_err(object_storage)?,
+            super::encode_head(&record.head).map_err(object_storage)?,
         );
         self.stage_snapshot_locator(
             &mut batch,
@@ -973,7 +975,7 @@ where
     let exact_path = std::str::from_utf8(&encoded_head_key[17..])
         .map_err(object_storage)?
         .to_owned();
-    let head: Head = serde_json::from_slice(encoded_head).map_err(object_storage)?;
+    let head = super::decode_head(encoded_head).map_err(object_storage)?;
     let version_prefix = version_prefix_for_head(encoded_head_key);
     let mut retained = Vec::new();
     let mut journal_pending_versions = Vec::new();
