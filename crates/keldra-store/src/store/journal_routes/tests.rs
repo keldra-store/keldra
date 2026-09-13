@@ -578,3 +578,38 @@ async fn routed_cursor_and_missing_primary_fail_distinctly() {
         RoutedJournalError::MissingPrimary { offset: 1 }
     );
 }
+
+#[tokio::test]
+async fn routed_scan_ignores_reserved_route_beyond_ordered_target() {
+    let (_temporary, store) = store().await;
+    store
+        .put(put("tenant", "bucket", "a", "put-a"))
+        .await
+        .unwrap();
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let status = store.local_watch_status().unwrap();
+    assert_eq!(status.tail, 1);
+    let route = JournalRoute::Bucket {
+        tenant_id,
+        bucket_id,
+    };
+
+    // Parallel mutation lanes may make a later reserved lane's physical route
+    // key visible before the ordered journal frontier publishes that offset.
+    // The captured target is the authority for this scan, so later route keys
+    // are outside its view rather than evidence of lost history.
+    store
+        .db
+        .put_cf(
+            store.cf(CF_JOURNAL_ROUTES).unwrap(),
+            route_key(route, status.source_id.source_epoch, 2).unwrap(),
+            [],
+        )
+        .unwrap();
+
+    let page = store
+        .scan_routed_local_changes(route, status.source_id, 0, status.tail, 10, 1024)
+        .unwrap();
+    assert_eq!(page.changes.len(), 1);
+    assert_eq!(page.through_offset, status.tail);
+}

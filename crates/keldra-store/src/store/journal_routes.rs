@@ -107,9 +107,6 @@ impl Store {
             if offset <= after_offset {
                 continue;
             }
-            if offset > status.tail {
-                return Err(RoutedJournalError::RouteMismatch { offset });
-            }
             if offset > target_offset {
                 complete_to_target = true;
                 break;
