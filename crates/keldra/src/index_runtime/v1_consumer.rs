@@ -88,6 +88,7 @@ struct Writer {
     pending_next: u64,
     pending_mutation_capacity: usize,
     pending_mutation_permit: IndexingMemoryPermit,
+    halted_on_integrity_failure: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +142,7 @@ impl V1IndexProducerTask {
         let extractor = V1ProjectionExtractor::new(reader.clone(), cpu, hot, limits.worker_bytes);
         let task = tokio::spawn(async move {
             let mut writers = BTreeMap::new();
+            let mut lag_started = BTreeMap::new();
             loop {
                 let result = reconcile(
                     local_node,
@@ -154,6 +156,7 @@ impl V1IndexProducerTask {
                     &credits,
                     limits,
                     &mut writers,
+                    &mut lag_started,
                 )
                 .await;
                 match result {
@@ -257,6 +260,7 @@ async fn reconcile(
     credits: &IndexingMemoryCredits,
     limits: Limits,
     writers: &mut BTreeMap<ProjectionPartitionIdentity, Writer>,
+    lag_started: &mut BTreeMap<ProjectionPartitionIdentity, Instant>,
 ) -> Result<ReconcileOutcome, Status> {
     let placement = current_placement(decisions)?;
     let target = journal.capture_barrier().await.map_err(event_status)?;
@@ -312,12 +316,21 @@ async fn reconcile(
         }
     }
     writers.retain(|partition, _| assigned.contains(partition));
+    record_lag_telemetry(&target, writers, lag_started);
     let physical_catalog_identity = catalog_snapshot.identity;
-    let active_writers = assigned.len().min(limits.parallelism.max(1));
+    let runnable = assigned
+        .into_iter()
+        .filter(|partition| {
+            !writers
+                .get(partition)
+                .is_some_and(|writer| writer.halted_on_integrity_failure)
+        })
+        .collect::<Vec<_>>();
+    let active_writers = runnable.len().min(limits.parallelism.max(1));
     // Moving each Writer into one task makes the partition's generation chain
     // unshareable: preparation, immutable publication, and the Current CAS stay
     // ordered even while unrelated partitions overlap.
-    let work = assigned
+    let work = runnable
         .into_iter()
         .enumerate()
         .map(|(ordinal, partition)| {
@@ -371,6 +384,17 @@ async fn reconcile(
             Ok(()) => {
                 writers.insert(partition, writer);
             }
+            Err(error) if halts_partition(&error) => {
+                let mut writer = writer;
+                writer.halted_on_integrity_failure = true;
+                tracing::error!(
+                    %error,
+                    ?partition,
+                    family_id = ?writer.recipe.family.family_id,
+                    "v1 projection partition halted after integrity failure; unrelated partitions continue"
+                );
+                writers.insert(partition, writer);
+            }
             Err(error) => {
                 partition_failed = true;
                 tracing::warn!(
@@ -382,11 +406,70 @@ async fn reconcile(
             }
         }
     }
+    record_lag_telemetry(&target, writers, lag_started);
     Ok(if partition_failed {
         ReconcileOutcome::RetryPartition
     } else {
         ReconcileOutcome::Stable
     })
+}
+
+fn halts_partition(error: &Status) -> bool {
+    error.code() == tonic::Code::DataLoss
+}
+
+fn record_lag_telemetry(
+    target: &IndexBarrier,
+    writers: &BTreeMap<ProjectionPartitionIdentity, Writer>,
+    lag_started: &mut BTreeMap<ProjectionPartitionIdentity, Instant>,
+) {
+    let now = Instant::now();
+    let mut local_next = u64::MAX;
+    let mut local_tail = 0_u64;
+    let mut lag_entries = 0_u64;
+    let mut active = BTreeSet::new();
+    for (partition, writer) in writers {
+        let Some(cursor) = target
+            .sources
+            .get(&NodeId(u64::from(writer.source.node_id)))
+        else {
+            continue;
+        };
+        if cursor.source != writer.source {
+            continue;
+        }
+        let published_next = writer
+            .current
+            .as_ref()
+            .map_or(0, |current| current.current.next_offset);
+        local_next = local_next.min(published_next);
+        local_tail = local_tail.max(cursor.next_offset.saturating_sub(1));
+        let partition_lag = cursor.next_offset.saturating_sub(published_next);
+        lag_entries = lag_entries.saturating_add(partition_lag);
+        if partition_lag > 0 {
+            active.insert(*partition);
+            lag_started.entry(*partition).or_insert(now);
+        }
+    }
+    lag_started.retain(|partition, _| active.contains(partition));
+    let oldest_age = lag_started
+        .values()
+        .map(|started| now.saturating_duration_since(*started).as_millis())
+        .max()
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX)) as u64;
+    let telemetry = super::v1_telemetry::global();
+    super::v1_telemetry::V1PipelineTelemetry::set(
+        &telemetry.local_next_offset,
+        if local_next == u64::MAX {
+            0
+        } else {
+            local_next
+        },
+    );
+    super::v1_telemetry::V1PipelineTelemetry::set(&telemetry.local_tail, local_tail);
+    super::v1_telemetry::V1PipelineTelemetry::set(&telemetry.lag_entries, lag_entries);
+    super::v1_telemetry::V1PipelineTelemetry::set(&telemetry.lag_oldest_age_millis, oldest_age);
 }
 
 async fn open_writer(
@@ -484,6 +567,7 @@ async fn open_writer(
         pending_next: accumulator_start,
         pending_mutation_capacity,
         pending_mutation_permit,
+        halted_on_integrity_failure: false,
     })
 }
 
@@ -1604,6 +1688,14 @@ fn current_placement(decisions: &DecisionRaft) -> Result<ClusterPlacement, Statu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integrity_failure_halts_only_the_affected_partition() {
+        assert!(halts_partition(&Status::data_loss(
+            "broken compaction plan"
+        )));
+        assert!(!halts_partition(&Status::unavailable("retryable source")));
+    }
 
     fn partition() -> ProjectionPartitionIdentity {
         ProjectionPartitionIdentity {

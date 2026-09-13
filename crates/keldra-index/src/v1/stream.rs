@@ -880,55 +880,90 @@ where
     })
 }
 fn validate_compaction_plan(plan: &ComponentCompactionPlan) -> Result<(), IndexError> {
-    if plan.inputs.len() < 2
-        || plan.inputs.len() > COMPONENT_STREAM_DIRECTORY_FANOUT
-        || plan.target_level == 0
-        || plan.inputs.iter().any(|run| run.validate().is_err())
-        || plan
-            .inputs
-            .windows(2)
-            .any(|pair| pair[0].sequence >= pair[1].sequence)
-        || plan.minimum_key
-            != plan
-                .inputs
-                .iter()
-                .map(|run| run.minimum_key)
-                .min()
-                .ok_or(IndexError::Integrity)?
-        || plan.maximum_key
-            != plan
-                .inputs
-                .iter()
-                .map(|run| run.maximum_key)
-                .max()
-                .ok_or(IndexError::Integrity)?
-        || plan.source_start_offset
-            != plan
-                .inputs
-                .iter()
-                .map(|run| run.source_start_offset)
-                .min()
-                .ok_or(IndexError::Integrity)?
-        || plan.next_offset
-            != plan
-                .inputs
-                .iter()
-                .map(|run| run.next_offset)
-                .max()
-                .ok_or(IndexError::Integrity)?
-        || plan.through_atomic_position
-            != plan
-                .inputs
-                .iter()
-                .map(|run| run.through_atomic_position)
-                .max()
-                .ok_or(IndexError::Integrity)?
+    if !(2..=COMPONENT_STREAM_DIRECTORY_FANOUT).contains(&plan.inputs.len()) {
+        return Err(compaction_plan_integrity(plan, "input_count"));
+    }
+    if plan.target_level == 0 {
+        return Err(compaction_plan_integrity(plan, "target_level"));
+    }
+    if let Some((index, _)) = plan
+        .inputs
+        .iter()
+        .enumerate()
+        .find(|(_, run)| run.validate().is_err())
     {
-        return Err(IndexError::InvalidDefinition(
-            "projection compaction plan coverage is invalid".into(),
+        return Err(compaction_plan_integrity(
+            plan,
+            &format!("input_descriptor[{index}]"),
         ));
     }
+    if plan
+        .inputs
+        .windows(2)
+        .any(|pair| pair[0].sequence >= pair[1].sequence)
+    {
+        return Err(compaction_plan_integrity(plan, "input_sequence_order"));
+    }
+    let expected_minimum_key = plan
+        .inputs
+        .iter()
+        .map(|run| run.minimum_key)
+        .min()
+        .ok_or(IndexError::Integrity)?;
+    let expected_maximum_key = plan
+        .inputs
+        .iter()
+        .map(|run| run.maximum_key)
+        .max()
+        .ok_or(IndexError::Integrity)?;
+    let expected_source_start_offset = plan
+        .inputs
+        .iter()
+        .map(|run| run.source_start_offset)
+        .min()
+        .ok_or(IndexError::Integrity)?;
+    let expected_next_offset = plan
+        .inputs
+        .iter()
+        .map(|run| run.next_offset)
+        .max()
+        .ok_or(IndexError::Integrity)?;
+    let expected_through_atomic_position = plan
+        .inputs
+        .iter()
+        .map(|run| run.through_atomic_position)
+        .max()
+        .ok_or(IndexError::Integrity)?;
+    for (matches, invariant) in [
+        (plan.minimum_key == expected_minimum_key, "minimum_key"),
+        (plan.maximum_key == expected_maximum_key, "maximum_key"),
+        (
+            plan.source_start_offset == expected_source_start_offset,
+            "source_start_offset",
+        ),
+        (plan.next_offset == expected_next_offset, "next_offset"),
+        (
+            plan.through_atomic_position == expected_through_atomic_position,
+            "through_atomic_position",
+        ),
+    ] {
+        if !matches {
+            return Err(compaction_plan_integrity(plan, invariant));
+        }
+    }
     Ok(())
+}
+
+fn compaction_plan_integrity(plan: &ComponentCompactionPlan, invariant: &str) -> IndexError {
+    let root = plan
+        .stream_root_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    IndexError::IntegrityViolation(format!(
+        "component compaction plan {invariant}; component={:?}, stream_root={root}",
+        plan.component
+    ))
 }
 fn splice_subtree<PageBytes>(
     component: ComponentIdentity,
@@ -1822,6 +1857,20 @@ mod tests {
         assert_eq!(spliced.root.segment_count, 299);
         assert_eq!(spliced.new_pages.len(), 2, "leaf plus its root path");
         assert!(spliced.new_pages.len() < directory.pages.len());
+        let mut invalid_coverage = plan.clone();
+        invalid_coverage.minimum_key = key(2);
+        let error = splice_compacted_component_runs(
+            directory.root(),
+            &invalid_coverage,
+            &[delta.clone()],
+            |_| Err::<Vec<u8>, _>(IndexError::Integrity),
+        )
+        .unwrap_err();
+        assert!(matches!(error, IndexError::IntegrityViolation(_)));
+        let message = error.to_string();
+        assert!(message.contains("minimum_key"));
+        assert!(message.contains("component=DocumentHead"));
+        assert!(message.contains("stream_root="));
         assert!(matches!(
             splice_compacted_component_runs(
                 directory.root(),

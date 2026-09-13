@@ -12,6 +12,8 @@ pub enum IndexError {
     InvalidFormat(&'static str),
     #[error("index bytes failed their BLAKE3 integrity check")]
     Integrity,
+    #[error("index integrity invariant failed: {0}")]
+    IntegrityViolation(String),
     #[error("index records must have unique keys in ascending byte order")]
     UnsortedRecords,
     #[error("invalid index definition: {0}")]
