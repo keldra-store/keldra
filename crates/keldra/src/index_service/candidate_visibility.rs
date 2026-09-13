@@ -1,9 +1,13 @@
-//! Mandatory Zanzibar and exact-current validation for index candidates.
+//! Mandatory Zanzibar validation for candidates already proven current by a
+//! pinned immutable index snapshot.
 //!
 //! Format-v1 query plans call this boundary before admitting arbitrary-order
 //! candidates to a top-K heap and while refilling a physically ordered page.
 //! Keeping the operation inside the executor makes it impossible for another
-//! query surface to omit authorization or liveness as optional post-processing.
+//! query surface to omit authorization as optional post-processing. Liveness
+//! and version currentness belong to the same pinned gate snapshot as the
+//! postings; consulting a later object-store cut here would violate snapshot
+//! semantics and add two redundant read batches per candidate wave.
 
 use std::sync::Arc;
 
@@ -11,13 +15,13 @@ use keldra_api::v1::{IndexKind, IndexQueryHit};
 use keldra_store::ObjectKey;
 use tonic::Status;
 
-use super::boundary::{IndexAuthorization, IndexLiveVersionReader, ResolvedIndexCurrentSnapshot};
+use super::boundary::IndexAuthorization;
 use crate::authentication::{Caller, PluginObjectScope};
 use crate::authorization::ObjectPermission;
 use crate::object_path_access;
 
 // The authoritative authorization API accepts at most 1,000 checks. Preserve
-// that bound here so query admission can use one full storage/auth round per
+// that bound here so query admission can use one full authorization round per
 // authoritative batch instead of imposing a smaller, redundant subdivision.
 pub(crate) const MAX_CANDIDATE_VISIBILITY_BATCH: usize = crate::authz_service::MAX_CHECKS;
 const _: () = assert!(
@@ -26,8 +30,13 @@ const _: () = assert!(
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IndexCandidateIdentity {
-    /// Ordinary source object whose current version controls this projection.
+    /// Exact source identity retained by the immutable projection snapshot.
     pub(crate) source_path: String,
+    /// Canonical source identity used at the authorization boundary. This is
+    /// distinct from `source_path` when the indexed object was reached through
+    /// a transparent alias.
+    pub(crate) authorization_source_path: String,
+    /// Current source version recorded by that same pinned gate.
     pub(crate) source_version: u64,
     /// Public object returned and Zanzibar-authorized if this candidate wins.
     pub(crate) result: IndexQueryHit,
@@ -38,7 +47,6 @@ pub(crate) struct CandidateVisibilityEvidence {
     pub(crate) visible: Vec<bool>,
     pub(crate) authorization_revision: u64,
     pub(crate) denied: u64,
-    pub(crate) stale: u64,
 }
 
 #[tonic::async_trait]
@@ -50,21 +58,17 @@ pub(crate) trait IndexCandidateVisibility: Send + Sync + 'static {
 }
 
 #[derive(Clone)]
-pub(crate) struct AuthorizedCurrentCandidates {
+pub(crate) struct AuthorizedSnapshotCandidates {
     caller: Caller,
     authorization_revision: u64,
     bucket: String,
     path_prefix: String,
     kind: IndexKind,
-    tenant_id: u64,
-    bucket_id: u64,
-    deadline: tokio::time::Instant,
     plugin_scope: Option<PluginObjectScope>,
     authorization: Arc<dyn IndexAuthorization>,
-    live_versions: Arc<dyn IndexLiveVersionReader>,
 }
 
-impl AuthorizedCurrentCandidates {
+impl AuthorizedSnapshotCandidates {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         caller: Caller,
@@ -72,12 +76,8 @@ impl AuthorizedCurrentCandidates {
         bucket: String,
         path_prefix: String,
         kind: IndexKind,
-        tenant_id: u64,
-        bucket_id: u64,
-        deadline: tokio::time::Instant,
         plugin_scope: Option<PluginObjectScope>,
         authorization: Arc<dyn IndexAuthorization>,
-        live_versions: Arc<dyn IndexLiveVersionReader>,
     ) -> Self {
         Self {
             caller,
@@ -85,12 +85,8 @@ impl AuthorizedCurrentCandidates {
             bucket,
             path_prefix,
             kind,
-            tenant_id,
-            bucket_id,
-            deadline,
             plugin_scope,
             authorization,
-            live_versions,
         }
     }
 
@@ -131,7 +127,7 @@ impl AuthorizedCurrentCandidates {
         let source = ObjectKey::new(
             self.caller.storage_tenant().as_str(),
             &self.bucket,
-            &candidate.source_path,
+            &candidate.authorization_source_path,
         )
         .map_err(|_| Status::data_loss("index candidate has an invalid source address"))?;
         Ok((source, result))
@@ -147,7 +143,7 @@ impl AuthorizedCurrentCandidates {
 }
 
 #[tonic::async_trait]
-impl IndexCandidateVisibility for AuthorizedCurrentCandidates {
+impl IndexCandidateVisibility for AuthorizedSnapshotCandidates {
     async fn evaluate(
         &self,
         candidates: &[IndexCandidateIdentity],
@@ -167,59 +163,22 @@ impl IndexCandidateVisibility for AuthorizedCurrentCandidates {
                 visible: Vec::new(),
                 authorization_revision: self.authorization_revision,
                 denied: 0,
-                stale: 0,
             });
         }
 
-        let mut sources = Vec::with_capacity(candidates.len());
-        let mut results = Vec::with_capacity(candidates.len());
+        let mut checks = Vec::with_capacity(candidates.len());
         let mut capability_allowed = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             let (source, result) = self.validate_candidate(candidate)?;
             capability_allowed
                 .push(self.capability_allows(&source) && self.capability_allows(&result));
-            sources.push(source);
-            results.push(result);
+            let resource = if matches!(self.kind, IndexKind::GitSource | IndexKind::Tensor) {
+                result
+            } else {
+                source
+            };
+            checks.push((resource, ObjectPermission::Get));
         }
-        let source_snapshots = self
-            .live_versions
-            .resolved_current_snapshots(
-                &sources,
-                self.tenant_id,
-                self.bucket_id,
-                crate::object_service::deadline_remaining(self.deadline)?,
-            )
-            .await?;
-        let result_snapshots = if results == sources {
-            source_snapshots.clone()
-        } else {
-            self.live_versions
-                .resolved_current_snapshots(
-                    &results,
-                    self.tenant_id,
-                    self.bucket_id,
-                    crate::object_service::deadline_remaining(self.deadline)?,
-                )
-                .await?
-        };
-        if source_snapshots.len() != candidates.len() || result_snapshots.len() != candidates.len()
-        {
-            return Err(Status::data_loss(
-                "resolved current object batch returned the wrong result count",
-            ));
-        }
-        for ((allowed, source), result) in capability_allowed
-            .iter_mut()
-            .zip(&source_snapshots)
-            .zip(&result_snapshots)
-        {
-            *allowed &= self.capability_allows(&source.canonical)
-                && self.capability_allows(&result.canonical);
-        }
-        let checks = result_snapshots
-            .iter()
-            .map(|resolved| (resolved.canonical.clone(), ObjectPermission::Get))
-            .collect::<Vec<_>>();
         let evidence = self
             .authorization
             .allows_objects_with_evidence(&self.caller, &checks)
@@ -234,7 +193,7 @@ impl IndexCandidateVisibility for AuthorizedCurrentCandidates {
                 "authorization revision changed during index execution",
             ));
         }
-        let mut visible = evidence
+        let visible = evidence
             .allowed
             .into_iter()
             .zip(capability_allowed)
@@ -242,127 +201,19 @@ impl IndexCandidateVisibility for AuthorizedCurrentCandidates {
             .collect::<Vec<_>>();
         let denied = u64::try_from(visible.iter().filter(|allowed| !**allowed).count())
             .map_err(|_| Status::resource_exhausted("candidate count exceeds u64"))?;
-        let (authorized_positions, authorized_keys) = retain_authorized_sources(&visible, sources);
-        if authorized_keys.is_empty() {
-            return Ok(CandidateVisibilityEvidence {
-                visible,
-                authorization_revision: evidence.revision,
-                denied,
-                stale: 0,
-            });
-        }
-        let snapshots = authorized_positions
-            .iter()
-            .map(|position| source_snapshots[*position].clone())
-            .collect();
-        let mut stale = apply_current_snapshots(
-            &mut visible,
-            &authorized_positions,
-            &authorized_keys,
-            snapshots,
-            self.tenant_id,
-            self.bucket_id,
-            |position| candidates[position].source_version,
-        )?;
-
-        let result_positions = (0..candidates.len()).collect::<Vec<_>>();
-        stale = stale.saturating_add(apply_current_snapshots(
-            &mut visible,
-            &result_positions,
-            &results,
-            result_snapshots,
-            self.tenant_id,
-            self.bucket_id,
-            |position| candidates[position].result.object_version,
-        )?);
         Ok(CandidateVisibilityEvidence {
             visible,
             authorization_revision: evidence.revision,
             denied,
-            stale,
         })
     }
 }
 
-fn apply_current_snapshots(
-    visible: &mut [bool],
-    positions: &[usize],
-    keys: &[ObjectKey],
-    snapshots: Vec<ResolvedIndexCurrentSnapshot>,
-    tenant_id: u64,
-    bucket_id: u64,
-    mut expected_version: impl FnMut(usize) -> u64,
-) -> Result<u64, Status> {
-    if positions.len() != keys.len() || snapshots.len() != positions.len() {
-        return Err(Status::data_loss(
-            "current object batch returned the wrong result count",
-        ));
-    }
-    let mut stale = 0_u64;
-    for ((position, key), resolved) in positions.iter().copied().zip(keys).zip(snapshots) {
-        if !visible[position] {
-            continue;
-        }
-        let expected_version = expected_version(position);
-        let Some(snapshot) = resolved.snapshot else {
-            visible[position] = false;
-            stale = stale.saturating_add(1);
-            continue;
-        };
-        snapshot
-            .validate()
-            .map_err(|error| Status::data_loss(error.to_string()))?;
-        if snapshot.tenant_id != tenant_id
-            || snapshot.bucket_id != bucket_id
-            || resolved.canonical.tenant() != key.tenant()
-            || resolved.canonical.bucket() != key.bucket()
-            || snapshot.exact_path != resolved.canonical.path()
-        {
-            return Err(Status::data_loss(format!(
-                "current object batch returned another identity at position {position}"
-            )));
-        }
-        if snapshot.head.deleted
-            || snapshot.version.deleted
-            || snapshot.head.version.0 != expected_version
-            || snapshot.version.id.0 != expected_version
-        {
-            visible[position] = false;
-            stale = stale.saturating_add(1);
-        }
-    }
-    Ok(stale)
-}
-
-/// Retain authorized source keys in their existing allocation and separately
-/// preserve their positions in the candidate wave. The subsequent exact-head
-/// read therefore owns one source key per authorized candidate, not two cloned
-/// key vectors.
-fn retain_authorized_sources(
-    visible: &[bool],
-    mut sources: Vec<ObjectKey>,
-) -> (Vec<usize>, Vec<ObjectKey>) {
-    debug_assert_eq!(visible.len(), sources.len());
-    let mut positions = Vec::with_capacity(visible.iter().filter(|allowed| **allowed).count());
-    let mut position = 0usize;
-    sources.retain(|_| {
-        let authorized = visible[position];
-        if authorized {
-            positions.push(position);
-        }
-        position += 1;
-        authorized
-    });
-    (positions, sources)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-    use std::time::Duration;
-
     use keldra_api::v1::ObjectAddress;
-    use keldra_store::{BlobRef, CurrentObjectSnapshot, Head, StorageTenantId, Version, VersionId};
+    use keldra_store::StorageTenantId;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::index_service::IndexAuthorizationEvidence;
@@ -408,116 +259,10 @@ mod tests {
         }
     }
 
-    struct TestLiveVersions;
-
-    #[tonic::async_trait]
-    impl IndexLiveVersionReader for TestLiveVersions {
-        async fn resolved_current_snapshots(
-            &self,
-            keys: &[ObjectKey],
-            _tenant_id: u64,
-            _bucket_id: u64,
-            _budget: Duration,
-        ) -> Result<Vec<ResolvedIndexCurrentSnapshot>, Status> {
-            Ok(keys
-                .iter()
-                .map(|key| {
-                    let version = if matches!(key.path(), "docs/stale" | "payloads/stale.bin") {
-                        2
-                    } else {
-                        1
-                    };
-                    ResolvedIndexCurrentSnapshot {
-                        canonical: key.clone(),
-                        snapshot: Some(snapshot(key.path(), version)),
-                    }
-                })
-                .collect())
-        }
-    }
-
-    struct RecordingLiveVersions {
-        batches: Mutex<Vec<Vec<String>>>,
-    }
-
-    struct ReservedCanonicalLiveVersions;
-
-    #[tonic::async_trait]
-    impl IndexLiveVersionReader for ReservedCanonicalLiveVersions {
-        async fn resolved_current_snapshots(
-            &self,
-            keys: &[ObjectKey],
-            _tenant_id: u64,
-            _bucket_id: u64,
-            _budget: Duration,
-        ) -> Result<Vec<ResolvedIndexCurrentSnapshot>, Status> {
-            Ok(keys
-                .iter()
-                .map(|key| {
-                    let canonical =
-                        ObjectKey::new(key.tenant(), key.bucket(), "_keldra/private-target")
-                            .unwrap();
-                    ResolvedIndexCurrentSnapshot {
-                        snapshot: Some(snapshot(canonical.path(), 1)),
-                        canonical,
-                    }
-                })
-                .collect())
-        }
-    }
-
-    #[tonic::async_trait]
-    impl IndexLiveVersionReader for RecordingLiveVersions {
-        async fn resolved_current_snapshots(
-            &self,
-            keys: &[ObjectKey],
-            _tenant_id: u64,
-            _bucket_id: u64,
-            _budget: Duration,
-        ) -> Result<Vec<ResolvedIndexCurrentSnapshot>, Status> {
-            self.batches
-                .lock()
-                .unwrap()
-                .push(keys.iter().map(|key| key.path().to_owned()).collect());
-            Ok(keys
-                .iter()
-                .map(|key| ResolvedIndexCurrentSnapshot {
-                    canonical: key.clone(),
-                    snapshot: Some(snapshot(key.path(), 1)),
-                })
-                .collect())
-        }
-    }
-
-    fn snapshot(path: &str, version_id: u64) -> CurrentObjectSnapshot {
-        let version = Version {
-            id: VersionId(version_id),
-            blob: Some(BlobRef {
-                hash: [1; 32],
-                length: 1,
-            }),
-            content_type: Some("application/octet-stream".into()),
-            deleted: false,
-            committed_at_unix_millis: 1,
-            protected_link_descriptor: false,
-        };
-        CurrentObjectSnapshot {
-            tenant_id: 11,
-            bucket_id: 12,
-            exact_path: path.into(),
-            head: Head {
-                version: version.id,
-                deleted: false,
-                mutation_stamp: None,
-            },
-            version,
-            alias_registry: None,
-        }
-    }
-
     fn candidate(path: &str) -> IndexCandidateIdentity {
         IndexCandidateIdentity {
             source_path: path.into(),
+            authorization_source_path: path.into(),
             source_version: 1,
             result: IndexQueryHit {
                 address: Some(ObjectAddress {
@@ -531,12 +276,12 @@ mod tests {
         }
     }
 
-    fn visibility() -> AuthorizedCurrentCandidates {
+    fn visibility() -> AuthorizedSnapshotCandidates {
         visibility_for(IndexKind::Path)
     }
 
-    fn visibility_for(kind: IndexKind) -> AuthorizedCurrentCandidates {
-        AuthorizedCurrentCandidates::new(
+    fn visibility_for(kind: IndexKind) -> AuthorizedSnapshotCandidates {
+        AuthorizedSnapshotCandidates::new(
             Caller::from_authenticated_application(
                 StorageTenantId::parse("tenant").unwrap(),
                 "application",
@@ -546,30 +291,25 @@ mod tests {
             "objects".into(),
             "docs/".into(),
             kind,
-            11,
-            12,
-            tokio::time::Instant::now() + Duration::from_secs(5),
             None,
             Arc::new(TestAuthorization),
-            Arc::new(TestLiveVersions),
         )
     }
 
     #[tokio::test]
-    async fn authorization_and_exact_current_filter_one_bounded_batch() {
+    async fn authorization_filters_one_snapshot_current_batch() {
         let result = visibility()
             .evaluate(&[
                 candidate("docs/live"),
                 candidate("docs/denied"),
-                candidate("docs/stale"),
+                candidate("docs/live-too"),
             ])
             .await
             .unwrap();
 
         assert_eq!(result.authorization_revision, 9);
-        assert_eq!(result.visible, vec![true, false, false]);
+        assert_eq!(result.visible, vec![true, false, true]);
         assert_eq!(result.denied, 1);
-        assert_eq!(result.stale, 1);
     }
 
     #[tokio::test]
@@ -598,36 +338,16 @@ mod tests {
         assert_eq!(result.visible.len(), MAX_CANDIDATE_VISIBILITY_BATCH);
         assert!(result.visible.iter().all(|visible| *visible));
         assert_eq!(result.denied, 0);
-        assert_eq!(result.stale, 0);
     }
 
     #[tokio::test]
-    async fn public_candidate_cannot_resolve_through_alias_to_reserved_target() {
-        let mut visibility = visibility();
-        visibility.live_versions = Arc::new(ReservedCanonicalLiveVersions);
-        let result = visibility
-            .evaluate(&[candidate("docs/live")])
-            .await
-            .unwrap();
+    async fn canonical_alias_target_cannot_bypass_reserved_path_policy() {
+        let visibility = visibility();
+        let mut aliased = candidate("docs/live");
+        aliased.authorization_source_path = "_keldra/private-target".into();
+        let result = visibility.evaluate(&[aliased]).await.unwrap();
         assert_eq!(result.visible, [false]);
         assert_eq!(result.denied, 1);
-    }
-
-    #[test]
-    fn authorized_source_selection_moves_keys_without_cloning_paths() {
-        let sources = vec![
-            ObjectKey::new("tenant", "objects", "docs/first").unwrap(),
-            ObjectKey::new("tenant", "objects", "docs/denied").unwrap(),
-            ObjectKey::new("tenant", "objects", "docs/last").unwrap(),
-        ];
-        let retained_path_pointers = [sources[0].path().as_ptr(), sources[2].path().as_ptr()];
-
-        let (positions, retained) = retain_authorized_sources(&[true, false, true], sources);
-
-        assert_eq!(positions, [0, 2]);
-        assert_eq!(retained.len(), 2);
-        assert_eq!(retained[0].path().as_ptr(), retained_path_pointers[0]);
-        assert_eq!(retained[1].path().as_ptr(), retained_path_pointers[1]);
     }
 
     #[tokio::test]
@@ -639,7 +359,6 @@ mod tests {
                 visible: Vec::new(),
                 authorization_revision: 9,
                 denied: 0,
-                stale: 0,
             }
         );
 
@@ -656,7 +375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reference_projection_requires_current_source_and_distinct_result() {
+    async fn reference_projection_authorizes_the_distinct_result() {
         for kind in [IndexKind::GitSource, IndexKind::Tensor] {
             let mut live_candidate = candidate("docs/source.json");
             live_candidate.result.address.as_mut().unwrap().path = "payloads/referenced.bin".into();
@@ -667,59 +386,7 @@ mod tests {
                 .unwrap();
             assert_eq!(result.visible, vec![true]);
             assert_eq!(result.authorization_revision, 9);
-
-            let mut stale_source = candidate("docs/stale");
-            stale_source.result.address.as_mut().unwrap().path = "payloads/referenced.bin".into();
-            let result = visibility_for(kind)
-                .evaluate(&[stale_source])
-                .await
-                .unwrap();
-            assert_eq!(result.visible, vec![false]);
-            assert_eq!(result.stale, 1);
-
-            let mut stale_result = candidate("docs/source.json");
-            stale_result.result.address.as_mut().unwrap().path = "payloads/stale.bin".into();
-            let result = visibility_for(kind)
-                .evaluate(&[stale_result])
-                .await
-                .unwrap();
-            assert_eq!(result.visible, vec![false]);
-            assert_eq!(result.stale, 1);
         }
-    }
-
-    #[tokio::test]
-    async fn identical_source_and_result_identity_needs_one_current_read() {
-        let live_versions = Arc::new(RecordingLiveVersions {
-            batches: Mutex::new(Vec::new()),
-        });
-        let visibility = AuthorizedCurrentCandidates::new(
-            Caller::from_authenticated_application(
-                StorageTenantId::parse("tenant").unwrap(),
-                "application",
-            )
-            .unwrap(),
-            9,
-            "objects".into(),
-            "docs/".into(),
-            IndexKind::Path,
-            11,
-            12,
-            tokio::time::Instant::now() + Duration::from_secs(5),
-            None,
-            Arc::new(TestAuthorization),
-            live_versions.clone(),
-        );
-
-        let result = visibility
-            .evaluate(&[candidate("docs/live")])
-            .await
-            .unwrap();
-        assert_eq!(result.visible, vec![true]);
-        assert_eq!(
-            *live_versions.batches.lock().unwrap(),
-            vec![vec!["docs/live".to_owned()]]
-        );
     }
 
     #[tokio::test]
@@ -727,7 +394,7 @@ mod tests {
         let authorization = Arc::new(RecordingAuthorization {
             seen: Mutex::new(Vec::new()),
         });
-        let visibility = AuthorizedCurrentCandidates::new(
+        let visibility = AuthorizedSnapshotCandidates::new(
             Caller::from_authenticated_application(
                 StorageTenantId::parse("tenant").unwrap(),
                 "application",
@@ -737,21 +404,16 @@ mod tests {
             "objects".into(),
             "docs/".into(),
             IndexKind::Path,
-            11,
-            12,
-            tokio::time::Instant::now() + Duration::from_secs(5),
             None,
             authorization.clone(),
-            Arc::new(TestLiveVersions),
         );
 
-        visibility
-            .evaluate(&[candidate("docs/live")])
-            .await
-            .unwrap();
+        let mut aliased = candidate("docs/live");
+        aliased.authorization_source_path = "canonical/live".into();
+        visibility.evaluate(&[aliased]).await.unwrap();
         assert_eq!(
             *authorization.seen.lock().unwrap(),
-            vec!["docs/live".to_owned()]
+            vec!["canonical/live".to_owned()]
         );
     }
 

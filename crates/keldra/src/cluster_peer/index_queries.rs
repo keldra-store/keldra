@@ -24,9 +24,8 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::distributed_list::OriginalBearer;
 use crate::index_runtime::placement::{IndexIdentity, IndexPlacement};
 use crate::index_service::{
-    AuthorizedCurrentCandidates, ExecutedIndexQuery, IndexAuthorization, IndexCandidateVisibility,
-    IndexFreshnessRequirement, IndexLiveVersionReader, IndexPageCursor,
-    RequiredIndexSourceCheckpoint, definition_path,
+    AuthorizedSnapshotCandidates, ExecutedIndexQuery, IndexAuthorization, IndexCandidateVisibility,
+    IndexFreshnessRequirement, IndexPageCursor, RequiredIndexSourceCheckpoint, definition_path,
 };
 use crate::logical_name_resolution::LogicalNameResolver;
 
@@ -120,7 +119,6 @@ pub(crate) struct AuthorizedIndexQueryHandler {
     tokens: JwtManager,
     names: LogicalNameResolver,
     authorization: Arc<dyn IndexAuthorization>,
-    live_versions: Arc<dyn IndexLiveVersionReader>,
     executor: Arc<dyn LocalIndexQueryExecutor>,
 }
 
@@ -130,7 +128,6 @@ impl AuthorizedIndexQueryHandler {
         tokens: JwtManager,
         names: LogicalNameResolver,
         authorization: Arc<dyn IndexAuthorization>,
-        live_versions: Arc<dyn IndexLiveVersionReader>,
         executor: Arc<dyn LocalIndexQueryExecutor>,
     ) -> Self {
         Self {
@@ -138,7 +135,6 @@ impl AuthorizedIndexQueryHandler {
             tokens,
             names,
             authorization,
-            live_versions,
             executor,
         }
     }
@@ -201,18 +197,14 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
         let kind = IndexKind::try_from(request.definition.kind)
             .map_err(|_| Status::data_loss("routed index definition has an unknown kind"))?;
         let candidate_visibility: Arc<dyn IndexCandidateVisibility> =
-            Arc::new(AuthorizedCurrentCandidates::new(
+            Arc::new(AuthorizedSnapshotCandidates::new(
                 caller.clone(),
                 authorization_revision,
                 request.definition.bucket.clone(),
                 request.definition.path_prefix.clone(),
                 kind,
-                request.tenant_id,
-                request.bucket_id,
-                call.deadline,
                 plugin_scope,
                 self.authorization.clone(),
-                self.live_versions.clone(),
             ));
         let result = self
             .executor

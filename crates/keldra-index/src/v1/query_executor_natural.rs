@@ -26,7 +26,7 @@ pub(super) async fn execute_bounded_natural_equal<
     loader: &mut L,
     admission: &mut A,
     common_cut: QueryCommonCut,
-    manifests: &[PartitionManifest<'_>],
+    manifests: &[PartitionManifest],
     request: &TypedJsonQueryRequest,
     contracts: &BTreeMap<crate::typed_json::FieldId, super::QueryFieldBinding>,
     block_limits: QueryBlockLimits,
@@ -132,7 +132,7 @@ struct PartitionCandidatePage {
 #[allow(clippy::too_many_arguments)]
 async fn scan_equal_partition_page<L: QueryArtifactLoader>(
     loader: &mut L,
-    manifest: &PartitionManifest<'_>,
+    manifest: &PartitionManifest,
     membership_recipe: super::RecipeIdentity,
     field_recipe: super::RecipeIdentity,
     value: &ScalarValue,
@@ -214,6 +214,7 @@ async fn scan_equal_partition_page<L: QueryArtifactLoader>(
                 material_source_version: posting.material_source_version,
                 current_source_version: gate.current_source_version,
                 source_path: gate.source_path.clone().ok_or(IndexError::Integrity)?,
+                canonical_source_path: gate.canonical_source_path.clone(),
                 result_path: gate.result_path.clone().ok_or(IndexError::Integrity)?,
                 result_version: gate.result_version,
             };
@@ -243,7 +244,7 @@ async fn scan_equal_partition_page<L: QueryArtifactLoader>(
 #[allow(clippy::too_many_arguments)]
 async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
     loader: &mut L,
-    manifest: &PartitionManifest<'_>,
+    manifest: &PartitionManifest,
     recipe: super::RecipeIdentity,
     value: &ScalarValue,
     resume: Option<StableDocumentKey>,
@@ -453,8 +454,8 @@ mod tests {
     use crate::v1::{
         ProjectionPartitionIdentity, ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot,
         QueryArtifactLoad, QueryBlockRecord, QueryMemoryPermit, QueryPostingShard,
-        QueryRecipeCatalogProof, QueryRootCutProof, QueryTermEntry, RecipeIdentity, encode_posting,
-        encode_query_block, encode_term_entry,
+        QueryRootCutProof, QueryTermEntry, RecipeIdentity, encode_posting, encode_query_block,
+        encode_term_entry,
     };
 
     struct Permit(usize);
@@ -592,8 +593,6 @@ mod tests {
             blocks,
         });
         run.validate(block_limits).unwrap();
-        let catalog_ordinals = BTreeMap::new();
-        let recipe_catalog_proofs = Vec::<QueryRecipeCatalogProof>::new();
         let manifest = PartitionManifest {
             view: super::super::PartitionView {
                 pin: crate::v1::PinnedPartitionQueryRoot {
@@ -618,12 +617,8 @@ mod tests {
                     },
                     handoff_lineage_id: [6; 32],
                 },
-                catalog_ordinals: &catalog_ordinals,
-                recipe_catalog_proofs: &recipe_catalog_proofs,
             },
             runs: vec![run],
-            resident_bytes: 0,
-            index_bytes: 0,
         };
         let mut loader = Loader {
             artifacts: [

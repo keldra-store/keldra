@@ -34,6 +34,15 @@ use authorization::authorize_selected_candidates;
 #[path = "query_executor_natural.rs"]
 mod natural;
 use natural::execute_bounded_natural_equal;
+#[path = "query_executor_snapshot.rs"]
+mod snapshot;
+use snapshot::{
+    PartitionManifest, PartitionView, load_exact_pre_admitted, load_partition_manifest,
+};
+#[path = "query_executor_validate.rs"]
+mod validate;
+pub use snapshot::{QuerySnapshotIdentity, ValidatedQuerySnapshot, query_snapshot_identity};
+use validate::validate_request;
 #[path = "query_executor_values.rs"]
 mod values;
 use values::{
@@ -274,57 +283,7 @@ impl Budget {
     }
 }
 
-#[derive(Clone, Copy)]
-struct PartitionView<'a> {
-    pin: PinnedPartitionQueryRoot,
-    catalog_ordinals: &'a BTreeMap<[u8; 32], u32>,
-    recipe_catalog_proofs: &'a [QueryRecipeCatalogProof],
-}
-
-struct PartitionManifest<'a> {
-    view: PartitionView<'a>,
-    runs: Vec<Arc<ProjectionQueryRunDescriptor>>,
-    resident_bytes: usize,
-    index_bytes: usize,
-}
-
-impl PartitionManifest<'_> {
-    fn matching_blocks(
-        &self,
-        kind: QueryBlockKind,
-        recipe: RecipeIdentity,
-    ) -> impl Iterator<Item = (usize, &QueryBlockDescriptor)> {
-        self.runs
-            .iter()
-            .enumerate()
-            .flat_map(move |(run_index, run)| {
-                matching_run_blocks(run, kind, recipe)
-                    .iter()
-                    .map(move |block| (run_index, block))
-            })
-    }
-
-    fn find_run_block(
-        &self,
-        run: usize,
-        hash: [u8; 32],
-        kind: QueryBlockKind,
-        recipe: RecipeIdentity,
-    ) -> Result<&QueryBlockDescriptor, IndexError> {
-        let block = self
-            .runs
-            .get(run)
-            .and_then(|run| {
-                matching_run_blocks(run, kind, recipe)
-                    .iter()
-                    .find(|block| block.hash == hash)
-            })
-            .ok_or(IndexError::Integrity)?;
-        Ok(block)
-    }
-}
-
-fn matching_run_blocks(
+pub(super) fn matching_run_blocks(
     run: &ProjectionQueryRunDescriptor,
     kind: QueryBlockKind,
     recipe: RecipeIdentity,
@@ -340,180 +299,77 @@ fn matching_run_blocks(
     &run.blocks[start..end]
 }
 
-struct QueryRunStream {
-    stack: Vec<QueryRunChild>,
-    pending: Vec<QueryRunReference>,
-    emitted: u64,
-    expected_runs: u64,
-    previous_sequence: Option<u64>,
-}
-
-async fn load_exact_pre_admitted<L: QueryArtifactLoader>(
-    loader: &mut L,
-    kind: QueryArtifactKind,
-    hash: [u8; 32],
-    encoded_bytes: usize,
-    credits: &mut QueryBlockCredits,
-    budget: &mut Budget,
-) -> Result<Bytes, IndexError> {
-    if encoded_bytes == 0 {
-        return Err(IndexError::Integrity);
-    }
-    budget.load(kind, encoded_bytes)?;
-    credits.reserve(encoded_bytes)?;
-    let loaded = loader
-        .load_query_artifact(QueryArtifactLoad {
-            kind,
-            hash,
-            encoded_bytes,
-        })
-        .await;
-    let bytes = match loaded {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            credits.release(encoded_bytes)?;
-            return Err(error);
-        }
-    };
-    if bytes.len() != encoded_bytes {
-        credits.release(encoded_bytes)?;
-        return Err(IndexError::Integrity);
-    }
-    Ok(bytes)
-}
-
-impl QueryRunStream {
-    fn new(root: ProjectionQueryStreamRoot) -> Self {
-        let mut stack = Vec::new();
-        if root.run_count != 0 {
-            stack.push(QueryRunChild {
-                hash: root.stream_root_hash,
-                encoded_bytes: root.stream_root_encoded_bytes,
-                run_count: root.run_count,
-                first_sequence: root.first_sequence,
-                last_sequence: root.last_sequence,
-                source_start_offset: root.source_start_offset,
-                next_offset: root.next_offset,
-                through_atomic_position: root.through_atomic_position,
-            });
-        }
-        Self {
-            stack,
-            pending: Vec::new(),
-            emitted: 0,
-            expected_runs: root.run_count,
-            previous_sequence: None,
-        }
-    }
-
-    async fn next<L: QueryArtifactLoader>(
-        &mut self,
-        loader: &mut L,
-        credits: &mut QueryBlockCredits,
-        budget: &mut Budget,
-    ) -> Result<Option<QueryRunReference>, IndexError> {
-        loop {
-            if let Some(reference) = self.pending.pop() {
-                if self
-                    .previous_sequence
-                    .is_some_and(|sequence| sequence <= reference.sequence)
-                {
-                    return Err(IndexError::Integrity);
-                }
-                self.previous_sequence = Some(reference.sequence);
-                self.emitted = self
-                    .emitted
-                    .checked_add(1)
-                    .ok_or(IndexError::OffsetOverflow)?;
-                if self.emitted > self.expected_runs {
-                    return Err(IndexError::Integrity);
-                }
-                return Ok(Some(reference));
-            }
-            let Some(expected) = self.stack.pop() else {
-                if self.emitted != self.expected_runs {
-                    return Err(IndexError::Integrity);
-                }
-                return Ok(None);
-            };
-            let encoded_bytes =
-                usize::try_from(expected.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-            if encoded_bytes > budget.limits.maximum_page_bytes {
-                return resource(encoded_bytes, budget.limits.maximum_page_bytes);
-            }
-            let bytes = load_exact_pre_admitted(
-                loader,
-                QueryArtifactKind::Page,
-                expected.hash,
-                encoded_bytes,
-                credits,
-                budget,
-            )
-            .await?;
-            budget.reserve_heap(credits, bytes.len())?;
-            let page = decode_query_run_page(&bytes)?;
-            credits.release(bytes.len())?;
-            if page_summary(expected.hash, &page, bytes.len())? != expected {
-                return Err(IndexError::Integrity);
-            }
-            match page {
-                QueryRunPage::Leaf(runs) => self.pending.extend(runs),
-                QueryRunPage::Branch(children) => self.stack.extend(children),
-            }
-        }
-    }
-}
-
 pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateAdmission>(
     loader: &mut L,
     admission: &mut A,
     common_cut: QueryCommonCut,
     pins: &[PinnedPartitionQueryRoot],
+    validated_snapshot: Option<Arc<ValidatedQuerySnapshot>>,
     request: &TypedJsonQueryRequest,
     execution_limits: QueryExecutionLimits,
     block_limits: QueryBlockLimits,
     block_credits: &mut QueryBlockCredits,
-) -> Result<TypedJsonQueryResult, IndexError> {
+) -> Result<(TypedJsonQueryResult, Arc<ValidatedQuerySnapshot>), IndexError> {
     let execution_limits = execution_limits.validate()?;
     let block_limits = block_limits.validate()?;
-    let contracts = validate_request(common_cut, pins, request, execution_limits)?;
-    let catalog_ordinals = request
-        .catalog_lineage
-        .iter()
-        .enumerate()
-        .map(|(ordinal, generation)| {
-            Ok((
-                *generation,
-                u32::try_from(ordinal).map_err(|_| IndexError::OffsetOverflow)?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, IndexError>>()?;
+    let snapshot_identity = validated_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.identity())
+        .map_or_else(
+            || query_snapshot_identity(common_cut, pins),
+            Result::<_, IndexError>::Ok,
+        )?;
+    if let Some(snapshot) = validated_snapshot.as_ref() {
+        snapshot.validate_for(snapshot_identity, common_cut, pins, request)?;
+    }
+    let contracts = validate_request(
+        common_cut,
+        pins,
+        request,
+        execution_limits,
+        validated_snapshot.is_none(),
+    )?;
     let mut budget = Budget {
         limits: execution_limits,
         evidence: QueryLoadEvidence::default(),
         heap_bytes: 0,
     };
-    budget.reserve_heap(
-        block_credits,
-        pins.len()
-            .checked_mul(std::mem::size_of::<PartitionView>())
-            .ok_or(IndexError::OffsetOverflow)?,
-    )?;
-    let views = pins
-        .iter()
-        .copied()
-        .map(|pin| PartitionView {
-            pin,
-            catalog_ordinals: &catalog_ordinals,
-            recipe_catalog_proofs: &request.recipe_catalog_proofs,
+    let mut snapshot_resident_bytes = 0usize;
+    let mut snapshot_index_bytes = 0usize;
+    let snapshot = if let Some(snapshot) = validated_snapshot {
+        snapshot
+    } else {
+        let mut manifests = Vec::with_capacity(pins.len());
+        for pin in pins.iter().copied() {
+            let (manifest, resident_bytes, index_bytes) = load_partition_manifest(
+                loader,
+                PartitionView { pin },
+                &request.catalog_lineage,
+                &request.recipe_catalog_proofs,
+                block_limits,
+                block_credits,
+                &mut budget,
+            )
+            .await?;
+            snapshot_resident_bytes = snapshot_resident_bytes
+                .checked_add(resident_bytes)
+                .ok_or(IndexError::OffsetOverflow)?;
+            snapshot_index_bytes = snapshot_index_bytes
+                .checked_add(index_bytes)
+                .ok_or(IndexError::OffsetOverflow)?;
+            manifests.push(manifest);
+        }
+        Arc::new(ValidatedQuerySnapshot {
+            identity: snapshot_identity,
+            common_cut,
+            pins: pins.to_vec(),
+            logical: request.logical.clone(),
+            catalog_lineage: request.catalog_lineage.clone(),
+            recipe_catalog_proofs: request.recipe_catalog_proofs.clone(),
+            manifests,
         })
-        .collect::<Vec<_>>();
-    let mut manifests = Vec::with_capacity(views.len());
-    for view in views.iter().copied() {
-        manifests.push(
-            load_partition_manifest(loader, view, block_limits, block_credits, &mut budget).await?,
-        );
-    }
+    };
+    let manifests = snapshot.manifests.as_slice();
 
     if let Some(candidates) = execute_bounded_natural_equal(
         loader,
@@ -528,30 +384,22 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
     )
     .await?
     {
-        let manifest_bytes = manifests.iter().try_fold(0usize, |total, manifest| {
-            total
-                .checked_add(manifest.resident_bytes)
-                .ok_or(IndexError::OffsetOverflow)
-        })?;
-        let manifest_index_bytes = manifests.iter().try_fold(0usize, |total, manifest| {
-            total
-                .checked_add(manifest.index_bytes)
-                .ok_or(IndexError::OffsetOverflow)
-        })?;
-        drop(manifests);
-        block_credits.release(manifest_bytes)?;
-        budget.release_heap(block_credits, manifest_index_bytes)?;
-        return Ok(TypedJsonQueryResult {
-            through_atomic_position: common_cut.through_atomic_position,
-            candidates,
-            facets: Vec::new(),
-            aggregates: Vec::new(),
-            loads: budget.evidence,
-        });
+        block_credits.release(snapshot_resident_bytes)?;
+        budget.release_heap(block_credits, snapshot_index_bytes)?;
+        return Ok((
+            TypedJsonQueryResult {
+                through_atomic_position: common_cut.through_atomic_position,
+                candidates,
+                facets: Vec::new(),
+                aggregates: Vec::new(),
+                loads: budget.evidence,
+            },
+            snapshot,
+        ));
     }
 
     let mut selected = BTreeMap::<StableDocumentKey, QueryAdmissionCandidate>::new();
-    for manifest in &manifests {
+    for manifest in manifests {
         let view = &manifest.view;
         let needs_universe = request
             .predicate
@@ -631,6 +479,7 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
                         material_source_version: gate.material_source_version,
                         current_source_version: gate.current_source_version,
                         source_path: gate.source_path.ok_or(IndexError::Integrity)?,
+                        canonical_source_path: gate.canonical_source_path,
                         result_path: gate.result_path.ok_or(IndexError::Integrity)?,
                         result_version: gate.result_version,
                     };
@@ -656,6 +505,7 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
                     material_source_version: gate.material_source_version,
                     current_source_version: gate.current_source_version,
                     source_path: gate.source_path.ok_or(IndexError::Integrity)?,
+                    canonical_source_path: gate.canonical_source_path,
                     result_path: gate.result_path.ok_or(IndexError::Integrity)?,
                     result_version: gate.result_version,
                 };
@@ -691,7 +541,7 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
 
     let needed_values = requested_value_recipes(request, &contracts)?;
     let mut values = BTreeMap::new();
-    for manifest in &manifests {
+    for manifest in manifests {
         let view = &manifest.view;
         let partition_count = candidates
             .iter()
@@ -769,280 +619,23 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
                 .ok_or(IndexError::Integrity)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let manifest_bytes = manifests.iter().try_fold(0usize, |total, manifest| {
-        total
-            .checked_add(manifest.resident_bytes)
-            .ok_or(IndexError::OffsetOverflow)
-    })?;
-    let manifest_index_bytes = manifests.iter().try_fold(0usize, |total, manifest| {
-        total
-            .checked_add(manifest.index_bytes)
-            .ok_or(IndexError::OffsetOverflow)
-    })?;
-    drop(manifests);
-    block_credits.release(manifest_bytes)?;
-    budget.release_heap(block_credits, manifest_index_bytes)?;
-    Ok(TypedJsonQueryResult {
-        through_atomic_position: common_cut.through_atomic_position,
-        candidates,
-        facets,
-        aggregates,
-        loads: budget.evidence,
-    })
-}
-
-fn validate_request(
-    common_cut: QueryCommonCut,
-    pins: &[PinnedPartitionQueryRoot],
-    request: &TypedJsonQueryRequest,
-    limits: QueryExecutionLimits,
-) -> Result<BTreeMap<FieldId, QueryFieldBinding>, IndexError> {
-    if pins.is_empty() || pins.len() > limits.maximum_partitions {
-        return resource(pins.len(), limits.maximum_partitions);
-    }
-    if let Some(predicate) = request.predicate.as_ref() {
-        predicate.validate()?;
-    }
-    if request.result_limit == 0 || request.result_limit > limits.maximum_results {
-        return resource(request.result_limit, limits.maximum_results);
-    }
-    if request.order.len() > limits.maximum_order_fields {
-        return resource(request.order.len(), limits.maximum_order_fields);
-    }
-    if request.facets.len() > limits.maximum_facets {
-        return resource(request.facets.len(), limits.maximum_facets);
-    }
-    if request.aggregates.len() > limits.maximum_aggregates {
-        return resource(request.aggregates.len(), limits.maximum_aggregates);
-    }
-    if request.resume_after_document.is_some()
-        && (!request.order.is_empty()
-            || !request.facets.is_empty()
-            || !request.aggregates.is_empty())
-    {
-        return Err(IndexError::InvalidQuery(
-            "a stable document cursor cannot be combined with ordering, facets, or aggregates"
-                .into(),
-        ));
-    }
-    let mut nodes = 0usize;
-    if let Some(predicate) = request.predicate.as_ref() {
-        count_predicate_nodes(predicate, &mut nodes)?;
-    }
-    if nodes > limits.maximum_boolean_nodes {
-        return resource(nodes, limits.maximum_boolean_nodes);
-    }
-    if request.logical.logical_index_id == 0 || request.logical.logical_definition_version == 0 {
-        return Err(IndexError::InvalidQuery(
-            "logical query binding identity is zero".into(),
-        ));
-    }
-    let mut partitions = BTreeSet::new();
-    for pin in pins {
-        pin.validate_at(common_cut)?;
-        if pin.partition.family_id != request.logical.family_id
-            || pin.physical_catalog_generation != request.logical.physical_catalog_generation
-            || pin.physical_catalog_generation == [0; 32]
-            || !partitions.insert(pin.partition)
-        {
-            return Err(IndexError::InvalidQuery(
-                "v1 query roots are not one unique common-cut vector".into(),
-            ));
-        }
-    }
-    if request.recipe_catalog_proofs.is_empty()
-        || request
-            .recipe_catalog_proofs
-            .windows(2)
-            .any(|pair| pair[0].recipe >= pair[1].recipe)
-    {
-        return Err(IndexError::InvalidQuery(
-            "v1 query recipe catalog proofs are absent or non-canonical".into(),
-        ));
-    }
-    let logical = request
-        .logical
-        .fields
-        .iter()
-        .map(|field| (field.public_field_id, field.recipe))
-        .collect::<BTreeMap<_, _>>();
-    if logical.len() != request.logical.fields.len() {
-        return Err(IndexError::InvalidQuery(
-            "logical query binding has duplicate public fields".into(),
-        ));
-    }
-    let mut contracts = BTreeMap::new();
-    for binding in &request.fields {
-        binding.field.validate()?;
-        if logical.get(&binding.field.id.get()) != Some(&binding.recipe)
-            || contracts
-                .insert(binding.field.id, binding.clone())
-                .is_some()
-        {
-            return Err(IndexError::InvalidQuery(
-                "v1 query field contract disagrees with its logical binding".into(),
-            ));
-        }
-    }
-    for recipe in std::iter::once(request.logical.membership)
-        .chain(contracts.values().map(|binding| binding.recipe))
-    {
-        if recipe_proof(request, recipe).is_none() {
-            return Err(IndexError::InvalidQuery(
-                "v1 query recipe lacks a catalog-lineage proof".into(),
-            ));
-        }
-    }
-    if request.catalog_lineage.is_empty()
-        || request.catalog_lineage.len() > super::MAX_CATALOG_LINEAGE_GENERATIONS
-        || request.catalog_lineage.last() != Some(&request.logical.physical_catalog_generation)
-        || request
-            .catalog_lineage
-            .iter()
-            .any(|generation| *generation == [0; 32])
-        || request
-            .catalog_lineage
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .len()
-            != request.catalog_lineage.len()
-    {
-        return Err(IndexError::InvalidQuery(
-            "v1 query catalog lineage is invalid".into(),
-        ));
-    }
-    let active_ordinal =
-        u32::try_from(request.catalog_lineage.len() - 1).map_err(|_| IndexError::OffsetOverflow)?;
-    for proof in &request.recipe_catalog_proofs {
-        proof.validate(request.catalog_lineage.len(), active_ordinal)?;
-    }
-    Ok(contracts)
-}
-
-fn recipe_proof(
-    request: &TypedJsonQueryRequest,
-    recipe: RecipeIdentity,
-) -> Option<&QueryRecipeCatalogProof> {
-    request
-        .recipe_catalog_proofs
-        .binary_search_by_key(&recipe, |proof| proof.recipe)
-        .ok()
-        .map(|index| &request.recipe_catalog_proofs[index])
-}
-
-async fn load_next_descriptor<L: QueryArtifactLoader>(
-    loader: &mut L,
-    view: &PartitionView<'_>,
-    stream: &mut QueryRunStream,
-    block_limits: QueryBlockLimits,
-    credits: &mut QueryBlockCredits,
-    budget: &mut Budget,
-) -> Result<Option<(Arc<ProjectionQueryRunDescriptor>, usize)>, IndexError> {
-    let Some(reference) = stream.next(loader, credits, budget).await? else {
-        return Ok(None);
-    };
-    let encoded_bytes =
-        usize::try_from(reference.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-    if encoded_bytes > block_limits.maximum_run_descriptor_bytes {
-        return resource(encoded_bytes, block_limits.maximum_run_descriptor_bytes);
-    }
-    let request = QueryArtifactLoad {
-        kind: QueryArtifactKind::Run,
-        hash: reference.hash,
-        encoded_bytes,
-    };
-    if let Some(descriptor) = loader.cached_projection_query_run(request)? {
-        // Cached decoding removes allocation and parsing, not the established
-        // logical run/byte limits or their evidence counters.
-        budget.load(request.kind, request.encoded_bytes)?;
-        descriptor.validate(block_limits)?;
-        validate_loaded_descriptor(view, &reference, &descriptor)?;
-        return Ok(Some((descriptor, 0)));
-    }
-    let bytes = load_exact_pre_admitted(
-        loader,
-        request.kind,
-        request.hash,
-        request.encoded_bytes,
-        credits,
-        budget,
-    )
-    .await?;
-    let descriptor = Arc::new(decode_projection_query_run(&bytes, block_limits, credits)?);
-    credits.release(bytes.len())?;
-    validate_loaded_descriptor(view, &reference, &descriptor)?;
-    loader.cache_projection_query_run(request, descriptor.clone());
-    Ok(Some((descriptor, bytes.len())))
-}
-
-fn validate_loaded_descriptor(
-    view: &PartitionView<'_>,
-    reference: &QueryRunReference,
-    descriptor: &ProjectionQueryRunDescriptor,
-) -> Result<(), IndexError> {
-    if descriptor.partition != view.pin.partition
-        || descriptor.sequence != reference.sequence
-        || descriptor.source_start_offset != reference.source_start_offset
-        || descriptor.next_offset != reference.next_offset
-        || descriptor.through_atomic_position != reference.through_atomic_position
-        || descriptor.through_atomic_position > view.pin.root.through_atomic_position
-    {
-        return Err(IndexError::Integrity);
-    }
-    for block in &descriptor.blocks {
-        let proof = view
-            .recipe_catalog_proofs
-            .binary_search_by_key(&block.recipe, |proof| proof.recipe)
-            .ok()
-            .map(|index| &view.recipe_catalog_proofs[index])
-            .ok_or(IndexError::Integrity)?;
-        let ordinal = view
-            .catalog_ordinals
-            .get(&descriptor.physical_catalog_generation)
-            .copied()
-            .ok_or(IndexError::Integrity)?;
-        if !proof.accepts_ordinal(ordinal) {
-            return Err(IndexError::Integrity);
-        }
-    }
-    Ok(())
-}
-
-async fn load_partition_manifest<'a, L: QueryArtifactLoader>(
-    loader: &mut L,
-    view: PartitionView<'a>,
-    block_limits: QueryBlockLimits,
-    credits: &mut QueryBlockCredits,
-    budget: &mut Budget,
-) -> Result<PartitionManifest<'a>, IndexError> {
-    let mut stream = QueryRunStream::new(view.pin.root);
-    let mut runs = Vec::new();
-    let mut resident_bytes = 0usize;
-    while let Some((run, run_bytes)) =
-        load_next_descriptor(loader, &view, &mut stream, block_limits, credits, budget).await?
-    {
-        resident_bytes = resident_bytes
-            .checked_add(run_bytes)
-            .ok_or(IndexError::OffsetOverflow)?;
-        runs.push(run);
-    }
-    let index_bytes = runs
-        .capacity()
-        .checked_mul(std::mem::size_of::<Arc<ProjectionQueryRunDescriptor>>())
-        .ok_or(IndexError::OffsetOverflow)?;
-    budget.reserve_heap(credits, index_bytes)?;
-    Ok(PartitionManifest {
-        view,
-        runs,
-        resident_bytes,
-        index_bytes,
-    })
+    block_credits.release(snapshot_resident_bytes)?;
+    budget.release_heap(block_credits, snapshot_index_bytes)?;
+    Ok((
+        TypedJsonQueryResult {
+            through_atomic_position: common_cut.through_atomic_position,
+            candidates,
+            facets,
+            aggregates,
+            loads: budget.evidence,
+        },
+        snapshot,
+    ))
 }
 
 async fn load_latest_gates<L: QueryArtifactLoader>(
     loader: &mut L,
-    manifest: &PartitionManifest<'_>,
+    manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     kind: QueryBlockKind,
     block_limits: QueryBlockLimits,
@@ -1072,7 +665,7 @@ async fn load_latest_gates<L: QueryArtifactLoader>(
 #[allow(clippy::too_many_arguments)]
 async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
     loader: &mut L,
-    manifest: &PartitionManifest<'_>,
+    manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     kind: QueryBlockKind,
     keys: &BTreeSet<StableDocumentKey>,
@@ -1262,7 +855,7 @@ async fn load_decoded_block<L: QueryArtifactLoader>(
 #[allow(clippy::too_many_arguments)]
 fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
     loader: &'a mut L,
-    manifest: &'a PartitionManifest<'_>,
+    manifest: &'a PartitionManifest,
     universe: &'a BTreeMap<StableDocumentKey, QueryDocumentGate>,
     contracts: &'a BTreeMap<FieldId, QueryFieldBinding>,
     membership_recipe: RecipeIdentity,
@@ -1423,7 +1016,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_leaf<L: QueryArtifactLoader>(
     loader: &mut L,
-    manifest: &PartitionManifest<'_>,
+    manifest: &PartitionManifest,
     universe: &BTreeMap<StableDocumentKey, QueryDocumentGate>,
     contracts: &BTreeMap<FieldId, QueryFieldBinding>,
     membership_recipe: RecipeIdentity,
@@ -1795,7 +1388,7 @@ fn replace_selected_candidate_charge(
 #[allow(clippy::too_many_arguments)]
 async fn seek_terms<L: QueryArtifactLoader>(
     loader: &mut L,
-    manifest: &PartitionManifest<'_>,
+    manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     exact: &[ScalarValue],
     prefix: Option<&str>,
@@ -1838,7 +1431,7 @@ type TermPostingMap = BTreeMap<ScalarValue, BTreeMap<StableDocumentKey, (usize, 
 #[allow(clippy::too_many_arguments)]
 async fn seek_term_postings<L: QueryArtifactLoader>(
     loader: &mut L,
-    manifest: &PartitionManifest<'_>,
+    manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     exact: &[ScalarValue],
     prefix: Option<&str>,
@@ -1937,7 +1530,7 @@ async fn seek_term_postings<L: QueryArtifactLoader>(
 #[allow(clippy::too_many_arguments)]
 async fn seek_range<L: QueryArtifactLoader>(
     loader: &mut L,
-    manifest: &PartitionManifest<'_>,
+    manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     lower: Option<&RangeBound>,
     upper: Option<&RangeBound>,
@@ -2010,7 +1603,7 @@ fn in_range(value: &ScalarValue, lower: Option<&RangeBound>, upper: Option<&Rang
 #[allow(clippy::too_many_arguments)]
 async fn verify_phrase<L: QueryArtifactLoader>(
     loader: &mut L,
-    manifest: &PartitionManifest<'_>,
+    manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     terms: &[ScalarValue],
     postings: &TermPostingMap,
@@ -2237,7 +1830,7 @@ async fn load_selected_terms<L: QueryArtifactLoader>(
 #[allow(clippy::too_many_arguments)]
 async fn load_candidate_doc_values<L: QueryArtifactLoader>(
     loader: &mut L,
-    manifest: &PartitionManifest<'_>,
+    manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     candidates: &BTreeSet<StableDocumentKey>,
     block_limits: QueryBlockLimits,

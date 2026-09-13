@@ -101,6 +101,7 @@ fn candidate(partition: ProjectionPartitionIdentity, covered: u64) -> QueryAdmis
         material_source_version: covered,
         current_source_version: covered,
         source_path: "objects/candidate.json".into(),
+        canonical_source_path: None,
         result_path: "results/candidate.json".into(),
         result_version: covered,
     }
@@ -258,6 +259,109 @@ fn unequal_partition_roots_can_prove_one_common_cut() {
 }
 
 #[test]
+fn query_snapshot_identity_pins_the_exact_canonical_root_vector() {
+    let cut = QueryCommonCut {
+        through_atomic_position: 20,
+    };
+    let pin = |index: u64, root_hash: u8| {
+        let root = ProjectionQueryStreamRoot {
+            stream_root_hash: [root_hash; 32],
+            stream_root_encoded_bytes: 1,
+            run_count: 1,
+            first_sequence: 1,
+            last_sequence: 1,
+            source_start_offset: 1,
+            next_offset: 2,
+            through_atomic_position: 20,
+        };
+        PinnedPartitionQueryRoot {
+            partition: partition(index),
+            physical_catalog_generation: [4; 32],
+            root,
+            cut_proof: QueryRootCutProof {
+                common_cut: cut,
+                selected_stream_root_hash: root.stream_root_hash,
+                next_newer_through_atomic_position: None,
+            },
+            handoff_lineage_id: [5; 32],
+        }
+    };
+    let first = pin(1, 7);
+    let second = pin(2, 8);
+    let identity = query_snapshot_identity(cut, &[first, second]).unwrap();
+
+    assert_eq!(
+        query_snapshot_identity(cut, &[first, second]).unwrap(),
+        identity
+    );
+    assert_ne!(
+        query_snapshot_identity(cut, &[first, pin(2, 9)]).unwrap(),
+        identity
+    );
+    assert!(query_snapshot_identity(cut, &[second, first]).is_err());
+}
+
+#[test]
+fn query_snapshot_binding_distinguishes_logical_definitions_on_the_same_roots() {
+    let cut = QueryCommonCut {
+        through_atomic_position: 20,
+    };
+    let root = ProjectionQueryStreamRoot {
+        stream_root_hash: [7; 32],
+        stream_root_encoded_bytes: 1,
+        run_count: 1,
+        first_sequence: 1,
+        last_sequence: 1,
+        source_start_offset: 1,
+        next_offset: 2,
+        through_atomic_position: 20,
+    };
+    let pin = PinnedPartitionQueryRoot {
+        partition: partition(1),
+        physical_catalog_generation: [4; 32],
+        root,
+        cut_proof: QueryRootCutProof {
+            common_cut: cut,
+            selected_stream_root_hash: root.stream_root_hash,
+            next_newer_through_atomic_position: None,
+        },
+        handoff_lineage_id: [5; 32],
+    };
+    let identity = query_snapshot_identity(cut, &[pin]).unwrap();
+    let snapshot = |logical_definition_version| ValidatedQuerySnapshot {
+        identity,
+        common_cut: cut,
+        pins: vec![pin],
+        logical: LogicalProjectionBinding {
+            logical_index_id: 1,
+            logical_definition_version,
+            family_id: [1; 32],
+            physical_catalog_generation: [4; 32],
+            membership: RecipeIdentity::new([3; 32]).unwrap(),
+            fields: Vec::new(),
+        },
+        catalog_lineage: vec![[4; 32]],
+        recipe_catalog_proofs: Vec::new(),
+        manifests: Vec::new(),
+    };
+    let first = snapshot(1);
+    let second = snapshot(2);
+
+    assert_eq!(first.identity(), second.identity());
+    assert!(!first.has_same_binding(&second));
+    assert!(first.matches_binding(
+        &first.logical,
+        &first.catalog_lineage,
+        &first.recipe_catalog_proofs,
+    ));
+    assert!(!first.matches_binding(
+        &second.logical,
+        &second.catalog_lineage,
+        &second.recipe_catalog_proofs,
+    ));
+}
+
+#[test]
 fn handoff_dedup_selects_furthest_source_position() {
     let mut selected = BTreeMap::new();
     let mut credits = credits(4096);
@@ -329,7 +433,7 @@ struct BatchAdmission {
 }
 
 impl QueryCandidateAdmission for BatchAdmission {
-    fn admit_exact_current_authorized_batch(
+    fn admit_snapshot_current_authorized_batch(
         &mut self,
         contexts: Vec<QueryAdmissionContext>,
     ) -> impl std::future::Future<Output = Result<Vec<Option<AuthorizedQueryCandidate>>, IndexError>>
@@ -342,8 +446,6 @@ impl QueryCandidateAdmission for BatchAdmission {
                 .enumerate()
                 .map(|(index, context)| {
                     (index % 3 != 1).then(|| AuthorizedQueryCandidate {
-                        result_path: context.candidate.result_path.clone(),
-                        result_version: context.candidate.result_version,
                         candidate: context.candidate,
                     })
                 })
@@ -477,6 +579,7 @@ fn absent_predicate_matches_the_live_membership_universe_only() {
         current_source_version: 1,
         live,
         source_path: Some("objects/a.json".into()),
+        canonical_source_path: None,
         result_path: Some("objects/a.json".into()),
         result_version: 1,
     };

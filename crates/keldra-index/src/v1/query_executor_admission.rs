@@ -78,6 +78,9 @@ pub struct QueryAdmissionCandidate {
     pub material_source_version: u64,
     pub current_source_version: u64,
     pub source_path: String,
+    /// Canonical ordinary-object identity used for authorization when the
+    /// indexed source path is a transparent alias.
+    pub canonical_source_path: Option<String>,
     pub result_path: String,
     pub result_version: u64,
 }
@@ -85,32 +88,28 @@ pub struct QueryAdmissionCandidate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizedQueryCandidate {
     pub candidate: QueryAdmissionCandidate,
-    /// Exact current ordinary result identity, returned only after runtime
-    /// authorization succeeds at the pinned logical definition and cut.
-    pub result_path: String,
-    pub result_version: u64,
 }
 
 impl AuthorizedQueryCandidate {
-    pub(crate) fn validate_for(
-        &self,
-        expected: &QueryAdmissionCandidate,
-    ) -> Result<(), IndexError> {
-        if &self.candidate != expected
-            || expected.source_path.is_empty()
-            || expected.source_path.len() > MAX_QUERY_DOCUMENT_PATH_BYTES
-            || expected.source_path.contains('\0')
-            || expected.current_source_version < expected.material_source_version
-            || expected.result_path.is_empty()
-            || expected.result_path.len() > MAX_QUERY_DOCUMENT_PATH_BYTES
-            || expected.result_path.contains('\0')
-            || expected.result_version == 0
-            || self.result_path.is_empty()
-            || self.result_path.len() > MAX_QUERY_DOCUMENT_PATH_BYTES
-            || self.result_path.contains('\0')
-            || self.result_path != expected.result_path
-            || self.result_version != expected.result_version
-            || self.result_version == 0
+    pub(crate) fn validate(&self) -> Result<(), IndexError> {
+        let candidate = &self.candidate;
+        if candidate.source_path.is_empty()
+            || candidate.source_path.len() > MAX_QUERY_DOCUMENT_PATH_BYTES
+            || candidate.source_path.contains('\0')
+            || candidate
+                .canonical_source_path
+                .as_ref()
+                .is_some_and(|path| {
+                    path.is_empty()
+                        || path.len() > MAX_QUERY_DOCUMENT_PATH_BYTES
+                        || path.contains('\0')
+                        || path == &candidate.source_path
+                })
+            || candidate.current_source_version < candidate.material_source_version
+            || candidate.result_path.is_empty()
+            || candidate.result_path.len() > MAX_QUERY_DOCUMENT_PATH_BYTES
+            || candidate.result_path.contains('\0')
+            || candidate.result_version == 0
         {
             return Err(IndexError::Integrity);
         }
@@ -128,14 +127,16 @@ pub struct QueryAdmissionContext {
 
 // Match Keldra's authoritative Zanzibar batch ceiling. The admission boundary
 // remains memory charged, while using the full native batch avoids splitting a
-// 10,000-hit query page into forty serialized current-version and authorization
-// rounds.
+// 10,000-hit query page into forty serialized authorization rounds.
 pub const MAX_QUERY_CANDIDATE_ADMISSION_BATCH: usize = 1_000;
 
 pub(super) fn resident_gate_bytes(gate: &QueryDocumentGate) -> Result<usize, IndexError> {
     std::mem::size_of::<StableDocumentKey>()
         .checked_add(std::mem::size_of::<QueryDocumentGate>())
         .and_then(|bytes| bytes.checked_add(gate.source_path.as_ref().map_or(0, String::len)))
+        .and_then(|bytes| {
+            bytes.checked_add(gate.canonical_source_path.as_ref().map_or(0, String::len))
+        })
         .and_then(|bytes| bytes.checked_add(gate.result_path.as_ref().map_or(0, String::len)))
         .ok_or(IndexError::OffsetOverflow)
 }
@@ -146,24 +147,31 @@ pub(super) fn resident_selected_candidate_bytes(
     std::mem::size_of::<StableDocumentKey>()
         .checked_add(std::mem::size_of::<QueryAdmissionCandidate>())
         .and_then(|bytes| bytes.checked_add(candidate.source_path.len()))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                candidate
+                    .canonical_source_path
+                    .as_ref()
+                    .map_or(0, String::len),
+            )
+        })
         .and_then(|bytes| bytes.checked_add(candidate.result_path.len()))
         .ok_or(IndexError::OffsetOverflow)
 }
 
 pub(super) fn resident_admission_context_bytes(
-    candidate: &QueryAdmissionCandidate,
+    _candidate: &QueryAdmissionCandidate,
 ) -> Result<usize, IndexError> {
-    std::mem::size_of::<QueryAdmissionContext>()
-        .checked_add(candidate.source_path.len())
-        .and_then(|bytes| bytes.checked_add(candidate.result_path.len()))
-        .ok_or(IndexError::OffsetOverflow)
+    // The candidate and its path buffers are moved out of the selected map;
+    // only the contiguous context-vector cell is a new allocation.
+    Ok(std::mem::size_of::<QueryAdmissionContext>())
 }
 
-/// Runtime trust-boundary admission. Results are position-aligned with the
-/// bounded input. `None` means either not exact-current or unauthorized; the
-/// executor deliberately does not distinguish those cases.
+/// Runtime trust-boundary admission. Every input is already current at the
+/// immutable gate snapshot; results are position-aligned with the bounded
+/// input and `None` means query-time authorization denied it.
 pub trait QueryCandidateAdmission: Send {
-    fn admit_exact_current_authorized_batch(
+    fn admit_snapshot_current_authorized_batch(
         &mut self,
         contexts: Vec<QueryAdmissionContext>,
     ) -> impl std::future::Future<Output = Result<Vec<Option<AuthorizedQueryCandidate>>, IndexError>>

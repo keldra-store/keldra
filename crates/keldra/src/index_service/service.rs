@@ -38,7 +38,7 @@ use super::boundary::{
     IndexServiceDependencies, RequiredIndexSourceCheckpoint,
 };
 use super::{
-    AuthorizedCurrentCandidates, IndexCandidateVisibility, StoredIndexDefinition, definition_path,
+    AuthorizedSnapshotCandidates, IndexCandidateVisibility, StoredIndexDefinition, definition_path,
     derive_index_id, validate_command_id, validate_create_definition, validate_update_definition,
 };
 
@@ -718,18 +718,14 @@ impl IndexServiceRpc for IndexServiceImpl {
                 let kind = IndexKind::try_from(loaded.api.kind)
                     .map_err(|_| Status::data_loss("index definition has an unknown kind"))?;
                 let candidate_visibility: Arc<dyn IndexCandidateVisibility> =
-                    Arc::new(AuthorizedCurrentCandidates::new(
+                    Arc::new(AuthorizedSnapshotCandidates::new(
                         context.caller().clone(),
                         admission.revision,
                         loaded.stored.bucket.clone(),
                         loaded.stored.path_prefix.clone(),
                         kind,
-                        tenant_id,
-                        bucket_id,
-                        deadline,
                         context.plugin_scope().cloned(),
                         self.dependencies.authorization.clone(),
-                        self.dependencies.live_versions.clone(),
                     ));
                 let mut executed = self
                     .dependencies

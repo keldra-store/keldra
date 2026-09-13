@@ -1,7 +1,7 @@
 //! Format-v1 local query execution over one verified family root vector.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use keldra_api::v1::{
     IndexAggregateOperation, IndexAggregateResult, IndexFacetBucket, IndexFacetResult,
@@ -17,9 +17,10 @@ use keldra_index::v1::{
     ProjectionFamilyPartitionDirectory, ProjectionGenerationHeader, ProjectionPartitionIdentity,
     ProjectionQueryRunDescriptor, QueryAdmissionContext, QueryArtifactLoad, QueryArtifactLoader,
     QueryBlockCredits, QueryBlockLimits, QueryCandidateAdmission, QueryCommonCut,
-    QueryExecutionLimits, QueryFieldBinding, QueryMemoryPermit, QueryRootCutProof, RecipeIdentity,
-    StableDocumentKey, TypedJsonQueryRequest, decode_projection_generation_header,
-    execute_typed_json_query, projection_generation_path,
+    QueryExecutionLimits, QueryFieldBinding, QueryMemoryPermit, QueryRootCutProof,
+    QuerySnapshotIdentity, RecipeIdentity, StableDocumentKey, TypedJsonQueryRequest,
+    ValidatedQuerySnapshot, decode_projection_generation_header, execute_typed_json_query,
+    projection_generation_path, query_snapshot_identity,
 };
 use keldra_store::{BlobRef, PlacementLogId};
 use tonic::Status;
@@ -49,6 +50,8 @@ const MIN_QUERY_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_QUERY_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 // This is a logical-work limit, not a conversion of the memory lease.
 const MAX_QUERY_CANDIDATES: usize = 1_000_000;
+const QUERY_POSITION_BYTES: usize = 64;
+const QUERY_SNAPSHOT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 impl QueryMemoryPermit for IndexQueryMemoryPermit {
     fn admitted_bytes(&self) -> usize {
@@ -63,6 +66,7 @@ pub(crate) struct V1LocalIndexQueryExecutor {
     catalog: IndexCatalog,
     projections: V1ProjectionPublisher,
     memory: IndexQueryMemoryBudget,
+    snapshots: V1QuerySnapshotCache,
 }
 
 impl V1LocalIndexQueryExecutor {
@@ -79,6 +83,7 @@ impl V1LocalIndexQueryExecutor {
             catalog,
             projections,
             memory,
+            snapshots: V1QuerySnapshotCache::default(),
         }
     }
 
@@ -97,45 +102,71 @@ impl V1LocalIndexQueryExecutor {
         let natural_page = compiled.order.is_empty()
             && compiled.facets.is_empty()
             && compiled.aggregates.is_empty();
-        let resume_after_document = if natural_page {
-            request
-                .resume
-                .as_ref()
-                .map(|cursor| {
-                    let bytes: [u8; 32] = cursor
-                        .last_position
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| Status::invalid_argument("v1 query cursor is invalid"))?;
-                    StableDocumentKey::from_bytes(bytes).map_err(index_status)
-                })
-                .transpose()?
-        } else {
-            None
-        };
+        let continuation = request
+            .resume
+            .as_ref()
+            .map(|cursor| decode_query_position(&cursor.last_position))
+            .transpose()?;
+        let resume_after_document = natural_page
+            .then(|| continuation.map(|(_, document)| document))
+            .flatten();
         // Subscribe before the first pin so a Current publication between the
         // read and the wait cannot be lost. The publisher is the authority for
         // root-vector progress; no catalogue/directory polling interval is
         // needed.
         let mut publication_changes = self.projections.subscribe();
-        let pinned = loop {
-            let pinned = self.pin_root_vector(&request, &recipe).await?;
-            if requirement_is_covered(&pinned, request.required_freshness.as_ref()) {
-                break pinned;
-            }
-            if tokio::time::Instant::now() >= request.deadline {
-                return Err(Status::deadline_exceeded(
-                    "no v1 root vector reached the required freshness checkpoint",
+        let cached = continuation.and_then(|(identity, _)| {
+            self.snapshots.get(
+                identity,
+                &logical,
+                &activation.catalog_lineage,
+                &activation.recipe_catalog_proofs,
+            )
+        });
+        let (pinned, validated_snapshot) = if let Some(cached) = cached {
+            if cached.pinned.cut.through_atomic_position
+                != request
+                    .resume
+                    .as_ref()
+                    .expect("continuation exists")
+                    .commit_revision
+            {
+                return Err(Status::invalid_argument(
+                    "v1 query cursor snapshot revision is invalid",
                 ));
             }
-            tokio::select! {
-                _ = publication_changes.recv() => {}
-                () = tokio::time::sleep_until(request.deadline) => {
+            ((*cached.pinned).clone(), Some(cached.snapshot.clone()))
+        } else {
+            let pinned = loop {
+                let pinned = self.pin_root_vector(&request, &recipe).await?;
+                if request.resume.is_some()
+                    || requirement_is_covered(&pinned, request.required_freshness.as_ref())
+                {
+                    break pinned;
+                }
+                if tokio::time::Instant::now() >= request.deadline {
                     return Err(Status::deadline_exceeded(
                         "no v1 root vector reached the required freshness checkpoint",
                     ));
                 }
+                tokio::select! {
+                    _ = publication_changes.recv() => {}
+                    () = tokio::time::sleep_until(request.deadline) => {
+                        return Err(Status::deadline_exceeded(
+                            "no v1 root vector reached the required freshness checkpoint",
+                        ));
+                    }
+                }
+            };
+            if let Some((expected, _)) = continuation
+                && query_snapshot_identity(pinned.cut, &pinned.roots).map_err(index_status)?
+                    != expected
+            {
+                return Err(Status::failed_precondition(
+                    "v1 query continuation snapshot is no longer retained",
+                ));
             }
+            (pinned, None)
         };
         tracing::debug!(
             query.partition_count = pinned.roots.len(),
@@ -216,6 +247,7 @@ impl V1LocalIndexQueryExecutor {
                 &mut admission,
                 pinned.cut,
                 &pinned.roots,
+                validated_snapshot.clone(),
                 &query,
                 limits,
                 QueryBlockLimits::default_for_memory(),
@@ -249,6 +281,7 @@ impl V1LocalIndexQueryExecutor {
                 }
             }
         };
+        let (result, snapshot) = result;
         tracing::debug!("v1 query completed artifact execution and candidate admission");
 
         self.verify_pin(&request, &recipe, &activation, &pinned)
@@ -263,15 +296,20 @@ impl V1LocalIndexQueryExecutor {
             (!natural_page).then_some(request.resume.as_ref()).flatten(),
             request.limit,
         )?;
+        if next_position.is_some() {
+            self.snapshots.insert(pinned.clone(), snapshot.clone());
+        }
+        let next_position =
+            next_position.map(|document| encode_query_position(snapshot.identity(), document));
         let hits = page
             .into_iter()
             .map(|candidate| IndexQueryHit {
                 address: Some(ObjectAddress {
                     tenant: request.storage_tenant.clone(),
                     bucket: request.definition.bucket.clone(),
-                    path: candidate.result_path,
+                    path: candidate.candidate.result_path,
                 }),
-                object_version: candidate.result_version,
+                object_version: candidate.candidate.result_version,
                 score: None,
             })
             .collect();
@@ -631,11 +669,113 @@ impl LocalIndexQueryExecutor for V1LocalIndexQueryExecutor {
     }
 }
 
+#[derive(Clone)]
 struct PinnedRootVector {
     cut: QueryCommonCut,
     roots: Vec<PinnedPartitionQueryRoot>,
     directory: ProjectionFamilyPartitionDirectory,
     directory_version: keldra_store::VersionId,
+}
+
+struct CachedRuntimeQuerySnapshot {
+    pinned: Arc<PinnedRootVector>,
+    snapshot: Arc<ValidatedQuerySnapshot>,
+    resident_bytes: usize,
+}
+
+#[derive(Default)]
+struct QuerySnapshotCacheState {
+    resident_bytes: usize,
+    entries: HashMap<QuerySnapshotIdentity, Vec<Arc<CachedRuntimeQuerySnapshot>>>,
+    recency: VecDeque<Arc<CachedRuntimeQuerySnapshot>>,
+}
+
+#[derive(Clone, Default)]
+struct V1QuerySnapshotCache(Arc<Mutex<QuerySnapshotCacheState>>);
+
+impl V1QuerySnapshotCache {
+    fn get(
+        &self,
+        identity: QuerySnapshotIdentity,
+        logical: &LogicalProjectionBinding,
+        catalog_lineage: &[[u8; 32]],
+        recipe_catalog_proofs: &[keldra_index::v1::QueryRecipeCatalogProof],
+    ) -> Option<Arc<CachedRuntimeQuerySnapshot>> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = state.entries.get(&identity).and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| {
+                    entry
+                        .snapshot
+                        .matches_binding(logical, catalog_lineage, recipe_catalog_proofs)
+                })
+                .cloned()
+        })?;
+        state.recency.retain(|entry| !Arc::ptr_eq(entry, &found));
+        state.recency.push_back(found.clone());
+        Some(found)
+    }
+
+    fn insert(&self, pinned: PinnedRootVector, snapshot: Arc<ValidatedQuerySnapshot>) {
+        let identity = snapshot.identity();
+        let resident_bytes = snapshot
+            .resident_bytes()
+            .saturating_add(std::mem::size_of::<PinnedRootVector>())
+            .saturating_add(
+                pinned
+                    .roots
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PinnedPartitionQueryRoot>()),
+            )
+            .saturating_add(pinned.directory.entries.capacity().saturating_mul(
+                std::mem::size_of::<keldra_index::v1::ProjectionPartitionDirectoryEntry>(),
+            ));
+        if resident_bytes > QUERY_SNAPSHOT_CACHE_BYTES {
+            return;
+        }
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.entries.get(&identity).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.snapshot.has_same_binding(&snapshot))
+        }) {
+            return;
+        }
+        let cached = Arc::new(CachedRuntimeQuerySnapshot {
+            pinned: Arc::new(pinned),
+            snapshot,
+            resident_bytes,
+        });
+        state.resident_bytes = state.resident_bytes.saturating_add(resident_bytes);
+        state
+            .entries
+            .entry(identity)
+            .or_default()
+            .push(cached.clone());
+        state.recency.push_back(cached);
+        while state.resident_bytes > QUERY_SNAPSHOT_CACHE_BYTES {
+            let Some(oldest) = state.recency.pop_front() else {
+                break;
+            };
+            let oldest_identity = oldest.snapshot.identity();
+            let mut remove_bucket = false;
+            if let Some(entries) = state.entries.get_mut(&oldest_identity) {
+                entries.retain(|entry| !Arc::ptr_eq(entry, &oldest));
+                remove_bucket = entries.is_empty();
+            }
+            if remove_bucket {
+                state.entries.remove(&oldest_identity);
+            }
+            state.resident_bytes = state.resident_bytes.saturating_sub(oldest.resident_bytes);
+        }
+    }
 }
 
 struct RuntimeArtifactLoader {
@@ -743,7 +883,7 @@ struct RuntimeCandidateAdmission {
 }
 
 impl QueryCandidateAdmission for RuntimeCandidateAdmission {
-    fn admit_exact_current_authorized_batch(
+    fn admit_snapshot_current_authorized_batch(
         &mut self,
         contexts: Vec<QueryAdmissionContext>,
     ) -> impl std::future::Future<Output = Result<Vec<Option<AuthorizedQueryCandidate>>, IndexError>>
@@ -768,6 +908,12 @@ impl QueryCandidateAdmission for RuntimeCandidateAdmission {
                     .iter()
                     .map(|context| IndexCandidateIdentity {
                         source_path: context.candidate.source_path.clone(),
+                        authorization_source_path: context
+                            .candidate
+                            .canonical_source_path
+                            .as_ref()
+                            .unwrap_or(&context.candidate.source_path)
+                            .clone(),
                         source_version: context.candidate.current_source_version,
                         result: IndexQueryHit {
                             address: Some(ObjectAddress {
@@ -795,14 +941,8 @@ impl QueryCandidateAdmission for RuntimeCandidateAdmission {
                     return Err(IndexError::Integrity);
                 }
                 output.extend(batch.into_iter().zip(visible).map(|(context, visible)| {
-                    visible.then(|| {
-                        let result_path = context.candidate.result_path.clone();
-                        let result_version = context.candidate.result_version;
-                        AuthorizedQueryCandidate {
-                            candidate: context.candidate,
-                            result_path,
-                            result_version,
-                        }
+                    visible.then(|| AuthorizedQueryCandidate {
+                        candidate: context.candidate,
                     })
                 }));
             }
@@ -826,7 +966,7 @@ fn require_request(request: &LocalIndexQueryRequest) -> Result<(), Status> {
     if request.resume.as_ref().is_some_and(|cursor| {
         cursor.commit_revision == 0
             || cursor.authorization_revision != request.authorization_revision
-            || cursor.last_position.len() != 32
+            || cursor.last_position.len() != QUERY_POSITION_BYTES
     }) {
         return Err(Status::invalid_argument(
             "local v1 query cursor identity is invalid",
@@ -904,14 +1044,12 @@ fn page_candidates(
     candidates: Vec<AuthorizedQueryCandidate>,
     resume: Option<&crate::index_service::IndexPageCursor>,
     limit: usize,
-) -> Result<(Vec<AuthorizedQueryCandidate>, Option<Vec<u8>>), Status> {
+) -> Result<(Vec<AuthorizedQueryCandidate>, Option<StableDocumentKey>), Status> {
     let start = if let Some(resume) = resume {
-        if resume.last_position.len() != 32 {
-            return Err(Status::invalid_argument("v1 query cursor is invalid"));
-        }
+        let (_, resume_document) = decode_query_position(&resume.last_position)?;
         candidates
             .iter()
-            .position(|candidate| candidate.candidate.document.bytes() == resume.last_position[..])
+            .position(|candidate| candidate.candidate.document == resume_document)
             .map(|position| position + 1)
             .ok_or_else(|| {
                 Status::failed_precondition("v1 query cursor position is no longer visible")
@@ -927,12 +1065,37 @@ fn page_candidates(
         .take(limit)
         .collect::<Vec<_>>();
     let next = has_more
-        .then(|| {
-            page.last()
-                .map(|candidate| candidate.candidate.document.bytes().to_vec())
-        })
+        .then(|| page.last().map(|candidate| candidate.candidate.document))
         .flatten();
     Ok((page, next))
+}
+
+fn decode_query_position(
+    position: &[u8],
+) -> Result<(QuerySnapshotIdentity, StableDocumentKey), Status> {
+    let position: [u8; QUERY_POSITION_BYTES] = position
+        .try_into()
+        .map_err(|_| Status::invalid_argument("v1 query cursor is invalid"))?;
+    let snapshot = QuerySnapshotIdentity::from_bytes(
+        position[..32]
+            .try_into()
+            .expect("fixed query position snapshot width"),
+    )
+    .map_err(index_status)?;
+    let document = StableDocumentKey::from_bytes(
+        position[32..]
+            .try_into()
+            .expect("fixed query position document width"),
+    )
+    .map_err(index_status)?;
+    Ok((snapshot, document))
+}
+
+fn encode_query_position(snapshot: QuerySnapshotIdentity, document: StableDocumentKey) -> Vec<u8> {
+    let mut position = Vec::with_capacity(QUERY_POSITION_BYTES);
+    position.extend_from_slice(&snapshot.bytes());
+    position.extend_from_slice(&document.bytes());
+    position
 }
 
 fn freshness(
@@ -941,28 +1104,27 @@ fn freshness(
     fence: PlacementLogId,
     atomic: u64,
 ) -> Result<IndexFreshness, Status> {
-    let mut sources = BTreeMap::new();
+    let mut sources = Vec::<IndexSourceFreshness>::with_capacity(pinned.roots.len());
     for root in &pinned.roots {
-        sources
-            .entry((root.partition.source_node, root.partition.source_epoch))
-            .and_modify(|offset: &mut u64| *offset = (*offset).max(root.root.next_offset))
-            .or_insert(root.root.next_offset);
+        if let Some(last) = sources.last_mut()
+            && last.node_id == root.partition.source_node
+            && last.source_epoch.as_slice() == root.partition.source_epoch
+        {
+            last.indexed_next_offset = last.indexed_next_offset.max(root.root.next_offset);
+            continue;
+        }
+        sources.push(IndexSourceFreshness {
+            node_id: root.partition.source_node,
+            source_epoch: root.partition.source_epoch.to_vec(),
+            indexed_next_offset: root.root.next_offset,
+            observed_tail: None,
+            lag_hint: 0,
+        });
     }
     Ok(IndexFreshness {
         commit_revision: atomic,
         published_at: None,
-        sources: sources
-            .into_iter()
-            .map(
-                |((node_id, source_epoch), indexed_next_offset)| IndexSourceFreshness {
-                    node_id,
-                    source_epoch: source_epoch.to_vec(),
-                    indexed_next_offset,
-                    observed_tail: None,
-                    lag_hint: 0,
-                },
-            )
-            .collect(),
+        sources,
         initial_build_complete: true,
         rebuilding: false,
         authorization_revision: request.authorization_revision,
@@ -1197,14 +1359,11 @@ mod tests {
             material_source_version: 10,
             current_source_version: 12,
             source_path: format!("sources/{path}"),
+            canonical_source_path: None,
             result_path: format!("results/{path}"),
             result_version: 15,
         };
-        AuthorizedQueryCandidate {
-            candidate,
-            result_path: format!("results/{path}"),
-            result_version: 15,
-        }
+        AuthorizedQueryCandidate { candidate }
     }
 
     #[test]
@@ -1240,14 +1399,22 @@ mod tests {
     #[test]
     fn result_cursor_resumes_after_the_exact_stable_document() {
         let values = vec![authorized(1, "a"), authorized(2, "b"), authorized(3, "c")];
+        let snapshot = QuerySnapshotIdentity::from_bytes([9; 32]).unwrap();
         let resume = crate::index_service::IndexPageCursor {
             commit_revision: 9,
-            last_position: vec![1; 32],
+            last_position: encode_query_position(
+                snapshot,
+                StableDocumentKey::from_bytes([1; 32]).unwrap(),
+            ),
             authorization_revision: 4,
         };
         let (page, next) = page_candidates(values, Some(&resume), 1).unwrap();
         assert_eq!(page[0].candidate.document.bytes(), [2; 32]);
-        assert_eq!(next, Some(vec![2; 32]));
+        assert_eq!(next, Some(StableDocumentKey::from_bytes([2; 32]).unwrap()));
+        assert_eq!(
+            decode_query_position(&encode_query_position(snapshot, next.unwrap())).unwrap(),
+            (snapshot, StableDocumentKey::from_bytes([2; 32]).unwrap())
+        );
     }
 
     struct Visibility;
@@ -1270,13 +1437,12 @@ mod tests {
                 visible: vec![true],
                 authorization_revision: 4,
                 denied: 0,
-                stale: 0,
             })
         }
     }
 
     #[tokio::test]
-    async fn admission_uses_exact_current_source_and_result_not_material_version() {
+    async fn admission_uses_snapshot_current_source_and_result_versions() {
         let candidate = authorized(1, "a").candidate;
         let mut admission = RuntimeCandidateAdmission {
             visibility: Arc::new(Visibility),
@@ -1285,7 +1451,7 @@ mod tests {
             authorization_revision: 4,
         };
         let admitted = admission
-            .admit_exact_current_authorized_batch(vec![QueryAdmissionContext {
+            .admit_snapshot_current_authorized_batch(vec![QueryAdmissionContext {
                 logical_index_id: 1,
                 logical_definition_version: 2,
                 common_cut: QueryCommonCut {
@@ -1298,8 +1464,64 @@ mod tests {
             .pop()
             .unwrap();
         let admitted = admitted.unwrap();
-        assert_eq!(admitted.result_path, "results/a");
-        assert_eq!(admitted.result_version, 15);
+        assert_eq!(admitted.candidate.result_path, "results/a");
+        assert_eq!(admitted.candidate.result_version, 15);
+    }
+
+    struct CanonicalAliasVisibility;
+
+    #[tonic::async_trait]
+    impl IndexCandidateVisibility for CanonicalAliasVisibility {
+        async fn evaluate(
+            &self,
+            candidates: &[IndexCandidateIdentity],
+        ) -> Result<CandidateVisibilityEvidence, Status> {
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].source_path, "sources/alias");
+            assert_eq!(
+                candidates[0].authorization_source_path,
+                "_keldra/reserved/target.json"
+            );
+            assert_eq!(
+                candidates[0].result.address.as_ref().unwrap().path,
+                "results/alias"
+            );
+            Ok(CandidateVisibilityEvidence {
+                visible: vec![true],
+                authorization_revision: 4,
+                denied: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_authorizes_an_alias_by_its_canonical_reserved_target() {
+        let mut candidate = authorized(1, "alias").candidate;
+        candidate.canonical_source_path = Some("_keldra/reserved/target.json".into());
+        let mut admission = RuntimeCandidateAdmission {
+            visibility: Arc::new(CanonicalAliasVisibility),
+            storage_tenant: "tenant".into(),
+            bucket: "bucket".into(),
+            authorization_revision: 4,
+        };
+
+        let admitted = admission
+            .admit_snapshot_current_authorized_batch(vec![QueryAdmissionContext {
+                logical_index_id: 1,
+                logical_definition_version: 2,
+                common_cut: QueryCommonCut {
+                    through_atomic_position: 9,
+                },
+                candidate,
+            }])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(admitted.candidate.source_path, "sources/alias");
+        assert_eq!(admitted.candidate.result_path, "results/alias");
     }
 
     struct BatchVisibility {
@@ -1318,7 +1540,6 @@ mod tests {
                 visible: (0..candidates.len()).map(|index| index % 3 != 1).collect(),
                 authorization_revision: 4,
                 denied: 21,
-                stale: 0,
             })
         }
     }
@@ -1345,7 +1566,7 @@ mod tests {
             })
             .collect();
         let admitted = admission
-            .admit_exact_current_authorized_batch(contexts)
+            .admit_snapshot_current_authorized_batch(contexts)
             .await
             .unwrap();
 

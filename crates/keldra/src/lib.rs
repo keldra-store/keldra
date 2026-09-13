@@ -569,7 +569,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             config.token_manager.clone(),
             name_resolver.clone(),
             index_authorization.clone(),
-            Arc::new(object_service.clone()),
             index_runtime.local_queries.clone(),
         )))
         .map_err(|_| anyhow::anyhow!("routed index query handler was installed more than once"))?;
@@ -582,7 +581,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             authorization: index_authorization,
             page_tokens: Arc::new(config.token_manager.clone()),
             definition_reader: Arc::new(object_reader.clone()),
-            live_versions: Arc::new(object_service.clone()),
         },
         config.atomic_program_timeout,
         config.index_query_timeout,

@@ -2,11 +2,10 @@
 //!
 //! The service owns request validation, definition admission, ordinary-object
 //! lifecycle calls, and opaque page tokens. Local revision execution owns
-//! mandatory candidate Zanzibar/exact-current checks through the supplied
+//! mandatory candidate Zanzibar checks over snapshot-current gates through the supplied
 //! visibility boundary; it cannot return a page through optional post-filtering.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use keldra_api::v1::{
     IndexAggregateResult, IndexDefinition, IndexFacetResult, IndexFreshness, IndexQuery,
@@ -148,23 +147,6 @@ pub(crate) trait IndexDefinitionReader: Send + Sync + 'static {
 }
 
 #[tonic::async_trait]
-pub(crate) trait IndexLiveVersionReader: Send + Sync + 'static {
-    async fn resolved_current_snapshots(
-        &self,
-        keys: &[ObjectKey],
-        tenant_id: u64,
-        bucket_id: u64,
-        budget: Duration,
-    ) -> Result<Vec<ResolvedIndexCurrentSnapshot>, Status>;
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedIndexCurrentSnapshot {
-    pub(crate) canonical: ObjectKey,
-    pub(crate) snapshot: Option<keldra_store::CurrentObjectSnapshot>,
-}
-
-#[tonic::async_trait]
 impl IndexDefinitionReader for crate::cluster_object_read::ClusterObjectReader {
     async fn current_snapshot(
         &self,
@@ -258,5 +240,4 @@ pub(crate) struct IndexServiceDependencies {
     pub(crate) authorization: Arc<dyn IndexAuthorization>,
     pub(crate) page_tokens: Arc<dyn IndexPageTokenCodec>,
     pub(crate) definition_reader: Arc<dyn IndexDefinitionReader>,
-    pub(crate) live_versions: Arc<dyn IndexLiveVersionReader>,
 }

@@ -88,8 +88,9 @@ pub use query_executor::{
     AuthorizedQueryCandidate, MAX_QUERY_CANDIDATE_ADMISSION_BATCH, PinnedPartitionQueryRoot,
     QueryAdmissionCandidate, QueryAdmissionContext, QueryArtifactKind, QueryArtifactLoad,
     QueryArtifactLoader, QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits,
-    QueryFieldBinding, QueryLoadEvidence, QueryRootCutProof, TypedJsonQueryRequest,
-    TypedJsonQueryResult, execute_typed_json_query,
+    QueryFieldBinding, QueryLoadEvidence, QueryRootCutProof, QuerySnapshotIdentity,
+    TypedJsonQueryRequest, TypedJsonQueryResult, ValidatedQuerySnapshot, execute_typed_json_query,
+    query_snapshot_identity,
 };
 pub use query_gate::{
     MAX_QUERY_DOCUMENT_PATH_BYTES, QueryDocumentGate, decode_document_gate, encode_document_gate,
