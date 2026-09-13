@@ -346,6 +346,7 @@ async fn paginated_class_query(
     deadline: Instant,
     request_timeout: Duration,
 ) -> Result<PaginatedQueryResult> {
+    let traversal_started = Instant::now();
     let value = serde_json::to_vec(class)?;
     let mut page_token = Vec::new();
     let mut result = PaginatedQueryResult::default();
@@ -355,8 +356,10 @@ async fn paginated_class_query(
             !remaining.is_zero(),
             "paginated mutable query exceeded its verification deadline"
         );
+        let page_timeout = remaining.min(request_timeout);
+        let page_started = Instant::now();
         let response = tokio::time::timeout(
-            remaining.min(request_timeout),
+            page_timeout,
             query_page(
                 client,
                 bucket,
@@ -371,12 +374,21 @@ async fn paginated_class_query(
         let response = match response {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
-                return Err(anyhow::anyhow!("page {page_ordinal} RPC failed: {error:#}"));
+                return Err(anyhow::anyhow!(
+                    "page {page_ordinal} RPC failed after {:?}; completed_pages={}, accumulated_hits={}, traversal_elapsed={:?}: {error:#}",
+                    page_started.elapsed(),
+                    page_ordinal - 1,
+                    result.hits.len(),
+                    traversal_started.elapsed(),
+                ));
             }
             Err(_) => {
                 return Err(anyhow::anyhow!(
-                    "page {page_ordinal} exceeded its {:?} request timeout",
-                    remaining.min(request_timeout)
+                    "page {page_ordinal} exceeded its {:?} request timeout; completed_pages={}, accumulated_hits={}, traversal_elapsed={:?}",
+                    page_timeout,
+                    page_ordinal - 1,
+                    result.hits.len(),
+                    traversal_started.elapsed(),
                 ));
             }
         };

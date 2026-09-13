@@ -446,7 +446,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         counters.clone(),
     )
     .await?;
-    counters.phase("drain").await;
+    counters.phase("mutation_response_drain").await;
     let post_load_started = Instant::now();
     let outstanding_started = Instant::now();
     let mutation_report = tokio::time::timeout(config.drain_timeout, mutation_task)
@@ -457,10 +457,12 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     let credential_refresh_started = Instant::now();
     let verification_token = fresh_token(&config, &setup_channels[0]).await?;
     let credential_refresh_seconds = credential_refresh_started.elapsed().as_secs_f64();
+    counters.phase("authority_snapshot_load").await;
     let authority_started = Instant::now();
     let authority =
         load_authoritative_mutable_state(&config, &query_channels, &verification_token).await?;
     let authoritative_state_read_seconds = authority_started.elapsed().as_secs_f64();
+    counters.phase("final_pagination").await;
     let convergence_started = Instant::now();
     let (final_state_verified, advisory_zero_lag, final_sources) = verify_final_mutable_state(
         &config,
