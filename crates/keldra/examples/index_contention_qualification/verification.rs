@@ -1,4 +1,4 @@
-use super::{IndexClient, config::Config, index_client, query_page};
+use super::{IndexClient, config::Config, index_client, progress::Counters, query_page};
 use anyhow::{Context, Result, bail, ensure};
 use keldra_storage::object_client;
 use keldra_storage::v1::object_head::State as ObjectHeadState;
@@ -132,6 +132,7 @@ pub(super) async fn verify_final_mutable_state(
     channels: &[Channel],
     token: &str,
     authority: Arc<BTreeMap<String, u64>>,
+    counters: Arc<Counters>,
 ) -> Result<(bool, Option<bool>, BTreeSet<u64>)> {
     let deadline = Instant::now() + config.drain_timeout;
     let mut nodes = BTreeSet::new();
@@ -150,6 +151,7 @@ pub(super) async fn verify_final_mutable_state(
             let request_timeout = config.request_timeout;
             let expected_source_count = config.endpoints.len();
             let authority = authority.clone();
+            let counters = counters.clone();
             tasks.spawn(async move {
                 verify_one_final_definition(
                     channel,
@@ -161,6 +163,7 @@ pub(super) async fn verify_final_mutable_state(
                     visibility_poll,
                     request_timeout,
                     expected_source_count,
+                    counters,
                 )
                 .await
             });
@@ -187,6 +190,7 @@ async fn verify_one_final_definition(
     visibility_poll: Duration,
     request_timeout: Duration,
     expected_source_count: usize,
+    counters: Arc<Counters>,
 ) -> Result<(bool, BTreeSet<u64>)> {
     let mut client = index_client(channel, &token)?;
     let mut last_observation = "no query attempt completed".to_owned();
@@ -204,6 +208,7 @@ async fn verify_one_final_definition(
             "mutable",
             deadline,
             request_timeout,
+            counters.clone(),
         )
         .await;
         match response {
@@ -345,17 +350,19 @@ async fn paginated_class_query(
     class: &str,
     deadline: Instant,
     request_timeout: Duration,
+    counters: Arc<Counters>,
 ) -> Result<PaginatedQueryResult> {
+    counters.pagination_attempt_started();
     let traversal_started = Instant::now();
     let value = serde_json::to_vec(class)?;
     let mut page_token = Vec::new();
     let mut result = PaginatedQueryResult::default();
     for page_ordinal in 1usize.. {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        ensure!(
-            !remaining.is_zero(),
-            "paginated mutable query exceeded its verification deadline"
-        );
+        if remaining.is_zero() {
+            counters.pagination_attempt_failed(traversal_started.elapsed());
+            bail!("paginated mutable query exceeded its verification deadline");
+        }
         let page_timeout = remaining.min(request_timeout);
         let page_started = Instant::now();
         let response = tokio::time::timeout(
@@ -374,6 +381,8 @@ async fn paginated_class_query(
         let response = match response {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
+                counters.pagination_page_failed(page_started.elapsed());
+                counters.pagination_attempt_failed(traversal_started.elapsed());
                 return Err(anyhow::anyhow!(
                     "page {page_ordinal} RPC failed after {:?}; completed_pages={}, accumulated_hits={}, traversal_elapsed={:?}: {error:#}",
                     page_started.elapsed(),
@@ -383,6 +392,8 @@ async fn paginated_class_query(
                 ));
             }
             Err(_) => {
+                counters.pagination_page_failed(page_started.elapsed());
+                counters.pagination_attempt_failed(traversal_started.elapsed());
                 return Err(anyhow::anyhow!(
                     "page {page_ordinal} exceeded its {:?} request timeout; completed_pages={}, accumulated_hits={}, traversal_elapsed={:?}",
                     page_timeout,
@@ -392,9 +403,30 @@ async fn paginated_class_query(
                 ));
             }
         };
-        let Some(next_page_token) = result.absorb(response)? else {
+        let next_page_token = match result.absorb(response) {
+            Ok(next_page_token) => next_page_token,
+            Err(error) => {
+                counters.pagination_page_failed(page_started.elapsed());
+                counters.pagination_attempt_failed(traversal_started.elapsed());
+                return Err(error.context(format!(
+                    "page {page_ordinal} response validation failed after {:?}; completed_pages={}, accumulated_hits={}, traversal_elapsed={:?}",
+                    page_started.elapsed(),
+                    page_ordinal - 1,
+                    result.hits.len(),
+                    traversal_started.elapsed(),
+                )));
+            }
+        };
+        let Some(next_page_token) = next_page_token else {
+            counters.pagination_page_completed(
+                page_ordinal,
+                result.hits.len(),
+                page_started.elapsed(),
+            );
+            counters.pagination_attempt_completed(traversal_started.elapsed());
             return Ok(result);
         };
+        counters.pagination_page_completed(page_ordinal, result.hits.len(), page_started.elapsed());
         page_token = next_page_token;
     }
     unreachable!("unbounded page ordinal iterator ended")

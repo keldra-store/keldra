@@ -470,6 +470,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         &query_channels,
         &verification_token,
         authority,
+        counters.clone(),
     )
     .await?;
     let final_index_convergence_seconds = convergence_started.elapsed().as_secs_f64();

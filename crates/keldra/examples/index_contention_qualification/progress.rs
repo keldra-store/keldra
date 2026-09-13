@@ -24,6 +24,16 @@ pub struct Counters {
     pub timeouts: AtomicU64,
     pub mutations: AtomicU64,
     pub mutation_errors: AtomicU64,
+    pub pagination_attempts: AtomicU64,
+    pub pagination_attempts_completed: AtomicU64,
+    pub pagination_attempt_failures: AtomicU64,
+    pub pagination_pages_completed: AtomicU64,
+    pub pagination_page_failures: AtomicU64,
+    pub pagination_furthest_page: AtomicU64,
+    pub pagination_furthest_hits: AtomicU64,
+    pub pagination_last_page_microseconds: AtomicU64,
+    pub pagination_maximum_page_microseconds: AtomicU64,
+    pub pagination_last_attempt_microseconds: AtomicU64,
     pub latest_commit_revision: AtomicU64,
     pub latest_source_lag_hint: AtomicU64,
     pub maximum_source_lag_hint: AtomicU64,
@@ -47,6 +57,16 @@ struct Snapshot {
     query_latency: LatencyReport,
     accepted_mutations: u64,
     mutation_errors: u64,
+    pagination_attempts: u64,
+    pagination_attempts_completed: u64,
+    pagination_attempt_failures: u64,
+    pagination_pages_completed: u64,
+    pagination_page_failures: u64,
+    pagination_furthest_page: u64,
+    pagination_furthest_hits: u64,
+    pagination_last_page_milliseconds: f64,
+    pagination_maximum_page_milliseconds: f64,
+    pagination_last_attempt_milliseconds: f64,
     latest_observed_commit_revision: u64,
     latest_source_lag_hint: u64,
     maximum_source_lag_hint: u64,
@@ -80,6 +100,56 @@ impl Counters {
         }
     }
 
+    pub fn pagination_attempt_started(&self) {
+        self.pagination_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn pagination_attempt_completed(&self, elapsed: Duration) {
+        self.pagination_attempts_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.record_pagination_attempt_elapsed(elapsed);
+    }
+
+    pub fn pagination_attempt_failed(&self, elapsed: Duration) {
+        self.pagination_attempt_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.record_pagination_attempt_elapsed(elapsed);
+    }
+
+    pub fn pagination_page_completed(
+        &self,
+        page: usize,
+        accumulated_hits: usize,
+        elapsed: Duration,
+    ) {
+        self.pagination_pages_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.pagination_furthest_page
+            .fetch_max(page as u64, Ordering::Relaxed);
+        self.pagination_furthest_hits
+            .fetch_max(accumulated_hits as u64, Ordering::Relaxed);
+        self.record_pagination_page_elapsed(elapsed);
+    }
+
+    pub fn pagination_page_failed(&self, elapsed: Duration) {
+        self.pagination_page_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.record_pagination_page_elapsed(elapsed);
+    }
+
+    fn record_pagination_page_elapsed(&self, elapsed: Duration) {
+        let elapsed = duration_microseconds(elapsed);
+        self.pagination_last_page_microseconds
+            .store(elapsed, Ordering::Relaxed);
+        self.pagination_maximum_page_microseconds
+            .fetch_max(elapsed, Ordering::Relaxed);
+    }
+
+    fn record_pagination_attempt_elapsed(&self, elapsed: Duration) {
+        self.pagination_last_attempt_microseconds
+            .store(duration_microseconds(elapsed), Ordering::Relaxed);
+    }
+
     async fn snapshot(&self, started: Instant, phase_elapsed: Duration) -> Snapshot {
         let latency = self
             .query_latencies
@@ -105,11 +175,36 @@ impl Counters {
             query_latency: latency,
             accepted_mutations: self.mutations.load(Ordering::Relaxed),
             mutation_errors: self.mutation_errors.load(Ordering::Relaxed),
+            pagination_attempts: self.pagination_attempts.load(Ordering::Relaxed),
+            pagination_attempts_completed: self
+                .pagination_attempts_completed
+                .load(Ordering::Relaxed),
+            pagination_attempt_failures: self.pagination_attempt_failures.load(Ordering::Relaxed),
+            pagination_pages_completed: self.pagination_pages_completed.load(Ordering::Relaxed),
+            pagination_page_failures: self.pagination_page_failures.load(Ordering::Relaxed),
+            pagination_furthest_page: self.pagination_furthest_page.load(Ordering::Relaxed),
+            pagination_furthest_hits: self.pagination_furthest_hits.load(Ordering::Relaxed),
+            pagination_last_page_milliseconds: self
+                .pagination_last_page_microseconds
+                .load(Ordering::Relaxed) as f64
+                / 1_000.0,
+            pagination_maximum_page_milliseconds: self
+                .pagination_maximum_page_microseconds
+                .load(Ordering::Relaxed) as f64
+                / 1_000.0,
+            pagination_last_attempt_milliseconds: self
+                .pagination_last_attempt_microseconds
+                .load(Ordering::Relaxed) as f64
+                / 1_000.0,
             latest_observed_commit_revision: self.latest_commit_revision.load(Ordering::Relaxed),
             latest_source_lag_hint: self.latest_source_lag_hint.load(Ordering::Relaxed),
             maximum_source_lag_hint: self.maximum_source_lag_hint.load(Ordering::Relaxed),
         }
     }
+}
+
+fn duration_microseconds(elapsed: Duration) -> u64 {
+    elapsed.as_micros().min(u64::MAX as u128) as u64
 }
 
 pub fn start(
@@ -143,4 +238,62 @@ pub fn start(
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pagination_counters_distinguish_attempts_pages_and_failures() {
+        let counters = Counters::default();
+        counters.pagination_attempt_started();
+        counters.pagination_page_completed(1, 1_000, Duration::from_millis(12));
+        counters.pagination_page_completed(2, 1_750, Duration::from_millis(18));
+        counters.pagination_attempt_completed(Duration::from_millis(31));
+        counters.pagination_attempt_started();
+        counters.pagination_page_completed(1, 900, Duration::from_millis(8));
+        counters.pagination_page_failed(Duration::from_millis(25));
+        counters.pagination_attempt_failed(Duration::from_millis(34));
+
+        assert_eq!(counters.pagination_attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            counters
+                .pagination_attempts_completed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters.pagination_attempt_failures.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters.pagination_pages_completed.load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(counters.pagination_page_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.pagination_furthest_page.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            counters.pagination_furthest_hits.load(Ordering::Relaxed),
+            1_750
+        );
+        assert_eq!(
+            counters
+                .pagination_last_page_microseconds
+                .load(Ordering::Relaxed),
+            25_000
+        );
+        assert_eq!(
+            counters
+                .pagination_maximum_page_microseconds
+                .load(Ordering::Relaxed),
+            25_000
+        );
+        assert_eq!(
+            counters
+                .pagination_last_attempt_microseconds
+                .load(Ordering::Relaxed),
+            34_000
+        );
+    }
 }
