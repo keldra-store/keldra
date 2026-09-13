@@ -28,12 +28,10 @@ pub(super) const LANE_COMPLETION_PREFIX: &[u8] = b"mutation_lane_completion_v1/"
 const LANE_COMPLETION_FORMAT: u8 = 1;
 const LANE_COMPLETION_BYTES: usize = 1 + 8 * 7 + 1 + 8;
 
-const CONFLICT_STRIPES_PER_COMMIT_LANE: usize = 64;
-
 #[derive(Clone)]
 pub(super) struct MutationCommitLanes {
     fence: Arc<RwLock<()>>,
-    conflicts: Arc<Vec<Arc<Mutex<()>>>>,
+    conflicts: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     physical_slots: Arc<Semaphore>,
     physical_slots_active: Arc<AtomicUsize>,
     physical_slots_peak: Arc<AtomicUsize>,
@@ -63,7 +61,10 @@ pub(super) struct MutationCommitLanes {
 
 pub(super) struct MutationLaneGuard {
     _fence: OwnedRwLockReadGuard<()>,
-    _conflicts: Vec<OwnedMutexGuard<()>>,
+    conflicts: Vec<OwnedMutexGuard<()>>,
+    conflict_keys: Vec<Vec<u8>>,
+    conflict_registry:
+        Arc<std::sync::Mutex<BTreeMap<Vec<u8>, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     physical_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     physical_slots_active: Arc<AtomicUsize>,
     physical_slots_peak_since_start: Arc<AtomicUsize>,
@@ -77,6 +78,19 @@ pub(super) struct MutationLaneGuard {
 impl Drop for MutationLaneGuard {
     fn drop(&mut self) {
         self.release_physical_slot();
+        self.conflicts.clear();
+        let mut registry = self
+            .conflict_registry
+            .lock()
+            .expect("mutation conflict registry lock is not poisoned");
+        for key in &self.conflict_keys {
+            if registry
+                .get(key)
+                .is_some_and(|entry| entry.strong_count() == 0)
+            {
+                registry.remove(key);
+            }
+        }
     }
 }
 
@@ -194,15 +208,9 @@ pub(super) enum LaneCompletionState {
 
 impl MutationCommitLanes {
     pub(super) fn new(commit_lanes: usize) -> Self {
-        let conflict_count = commit_lanes
-            .checked_mul(CONFLICT_STRIPES_PER_COMMIT_LANE)
-            .expect("validated commit-lane count has bounded conflict stripes");
-        let conflicts = (0..conflict_count)
-            .map(|_| Arc::new(Mutex::new(())))
-            .collect();
         Self {
             fence: Arc::new(RwLock::new(())),
-            conflicts: Arc::new(conflicts),
+            conflicts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             physical_slots: Arc::new(Semaphore::new(commit_lanes)),
             physical_slots_active: Arc::new(AtomicUsize::new(0)),
             physical_slots_peak: Arc::new(AtomicUsize::new(0)),
@@ -251,14 +259,29 @@ impl MutationCommitLanes {
         fence: OwnedRwLockReadGuard<()>,
         resources: impl IntoIterator<Item = Vec<u8>>,
     ) -> MutationLaneGuard {
-        let stripes = resources
-            .into_iter()
-            .map(|resource| self.stripe(&resource))
-            .collect::<BTreeSet<_>>();
+        let conflict_keys = resources.into_iter().collect::<BTreeSet<_>>();
+        let conflict_locks = {
+            let mut registry = self
+                .conflicts
+                .lock()
+                .expect("mutation conflict registry lock is not poisoned");
+            conflict_keys
+                .iter()
+                .map(|key| {
+                    if let Some(lock) = registry.get(key).and_then(std::sync::Weak::upgrade) {
+                        lock
+                    } else {
+                        let lock = Arc::new(Mutex::new(()));
+                        registry.insert(key.clone(), Arc::downgrade(&lock));
+                        lock
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
         let conflict_started = Instant::now();
-        let mut conflicts = Vec::with_capacity(stripes.len());
-        for stripe in stripes {
-            conflicts.push(self.conflicts[stripe].clone().lock_owned().await);
+        let mut conflicts = Vec::with_capacity(conflict_locks.len());
+        for lock in conflict_locks {
+            conflicts.push(lock.lock_owned().await);
         }
         let conflict_wait = conflict_started.elapsed();
         let physical_slot_started = Instant::now();
@@ -277,7 +300,9 @@ impl MutationCommitLanes {
             self.physical_slots_peak.load(Ordering::Acquire);
         MutationLaneGuard {
             _fence: fence,
-            _conflicts: conflicts,
+            conflicts,
+            conflict_keys: conflict_keys.into_iter().collect(),
+            conflict_registry: self.conflicts.clone(),
             physical_slot: Some(physical_slot),
             physical_slots_active: self.physical_slots_active.clone(),
             physical_slots_peak_since_start: self.physical_slots_peak.clone(),
@@ -366,24 +391,11 @@ impl MutationCommitLanes {
     }
 
     #[cfg(test)]
-    pub(super) fn conflict_stripes_for_test(
+    pub(super) fn conflict_resources_for_test(
         &self,
         resources: impl IntoIterator<Item = Vec<u8>>,
-    ) -> BTreeSet<usize> {
-        resources
-            .into_iter()
-            .map(|resource| self.stripe(&resource))
-            .collect()
-    }
-
-    fn stripe(&self, resource: &[u8]) -> usize {
-        let mut hash = 0xcbf29ce484222325_u64;
-        for byte in resource {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        let count = u64::try_from(self.conflicts.len()).expect("conflict stripe count fits u64");
-        usize::try_from(hash % count).expect("conflict stripe index fits usize")
+    ) -> BTreeSet<Vec<u8>> {
+        resources.into_iter().collect()
     }
 
     #[cfg(test)]

@@ -1317,13 +1317,13 @@ mod tests {
         )
     }
 
-    async fn conflict_stripes_for_put(
+    async fn conflict_resources_for_put(
         store: &Store,
         governance: &ObjectMutationGovernance,
         path: &str,
         command: &str,
         bytes: &[u8],
-    ) -> BTreeSet<usize> {
+    ) -> BTreeSet<Vec<u8>> {
         let identity = BucketIdentity {
             tenant_id: TenantId(governance.tenant_id),
             bucket_id: BucketId(governance.bucket_id),
@@ -1335,7 +1335,7 @@ mod tests {
             )
             .await
             .unwrap();
-        store.mutation_commit_lanes.conflict_stripes_for_test(
+        store.mutation_commit_lanes.conflict_resources_for_test(
             super::super::mutation_commit_lanes::conflict_resources(&prepared, None),
         )
     }
@@ -1358,23 +1358,28 @@ mod tests {
             serving_fence_term: 7,
         };
         let first_path = "objects/paused";
-        let first_stripes =
-            conflict_stripes_for_put(&store, &governance, first_path, "paused-command", b"paused")
-                .await;
+        let first_resources = conflict_resources_for_put(
+            &store,
+            &governance,
+            first_path,
+            "paused-command",
+            b"paused",
+        )
+        .await;
         let mut second = None;
         for candidate in 0..256 {
             let path = format!("objects/independent-{candidate}");
             let command = format!("independent-command-{candidate}");
             let bytes = format!("independent-{candidate}").into_bytes();
-            let stripes =
-                conflict_stripes_for_put(&store, &governance, &path, &command, &bytes).await;
-            if first_stripes.is_disjoint(&stripes) {
+            let resources =
+                conflict_resources_for_put(&store, &governance, &path, &command, &bytes).await;
+            if first_resources.is_disjoint(&resources) {
                 second = Some((path, command, bytes));
                 break;
             }
         }
         let (second_path, second_command, second_bytes) =
-            second.expect("the bounded conflict stripe set has an independent candidate");
+            second.expect("the exact conflict resource set has an independent candidate");
         let before = store.local_watch_status().unwrap().tail;
 
         store.mutation_commit_lanes.pause_next_lane_evaluation();
