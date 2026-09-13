@@ -7,10 +7,9 @@ use crate::typed_json::{Predicate, ScalarValue};
 use super::admission::resident_selected_candidate_bytes;
 use super::{
     AuthorizedQueryCandidate, Budget, PartitionManifest, QueryAdmissionCandidate,
-    QueryArtifactKind, QueryArtifactLoader, QueryBlockCredits, QueryBlockCursor,
-    QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryCandidateAdmission,
-    QueryCommonCut, QueryPosting, StableDocumentKey, TypedJsonQueryRequest,
-    authorize_selected_candidates, candidate_is_current, decode_posting, load_exact_pre_admitted,
+    QueryArtifactLoader, QueryBlockCredits, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits,
+    QueryCandidateAdmission, QueryCommonCut, QueryPosting, StableDocumentKey,
+    TypedJsonQueryRequest, authorize_selected_candidates, candidate_is_current, decode_posting,
     load_latest_gates_for_keys, load_selected_terms, select_handoff_candidate,
 };
 
@@ -287,6 +286,11 @@ async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
                 }
                 sources.push(PostingSource {
                     run,
+                    generation: manifest
+                        .runs
+                        .get(run)
+                        .ok_or(IndexError::Integrity)?
+                        .physical_catalog_generation,
                     descriptor: posting_descriptor,
                     minimum_document: shard.minimum_document,
                     maximum_document: shard.maximum_document,
@@ -369,6 +373,7 @@ async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
 
 struct PostingSource<'a> {
     run: usize,
+    generation: [u8; 32],
     descriptor: &'a QueryBlockDescriptor,
     minimum_document: StableDocumentKey,
     maximum_document: StableDocumentKey,
@@ -390,23 +395,21 @@ async fn refill_posting_source<L: QueryArtifactLoader>(
     }
     let encoded_bytes =
         usize::try_from(source.descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-    let bytes = load_exact_pre_admitted(
+    let block = super::load_decoded_block(
         loader,
-        QueryArtifactKind::Block,
-        source.descriptor.hash,
-        encoded_bytes,
+        source.generation,
+        source.descriptor,
+        block_limits,
         credits,
         budget,
     )
     .await?;
-    credits.release(bytes.len())?;
-    let mut cursor =
-        QueryBlockCursor::from_verified_content(source.descriptor, &bytes, block_limits, credits)?;
-    let mut next = match source.resume {
-        Some(minimum) if source.minimum_document <= minimum => cursor.seek_to(&minimum.bytes())?,
-        _ => cursor.next()?,
-    };
-    while let Some(record) = next {
+    let minimum = source
+        .resume
+        .filter(|minimum| source.minimum_document <= *minimum)
+        .unwrap_or(source.minimum_document);
+    let mut exhausted = true;
+    for record in block.records_from(&minimum.bytes()) {
         let posting = decode_posting(record)?;
         if posting.document < source.minimum_document || posting.document > source.maximum_document
         {
@@ -420,14 +423,13 @@ async fn refill_posting_source<L: QueryArtifactLoader>(
             budget.reserve_heap(credits, posting_buffer_bytes())?;
             source.buffered.push_back(posting);
             if source.buffered.len() == POSTING_SOURCE_CHUNK {
+                exhausted = false;
                 break;
             }
         }
-        next = cursor.next()?;
     }
-    source.exhausted = next.is_none();
-    drop(cursor);
-    credits.release_loaded_block(bytes.len())?;
+    source.exhausted = exhausted;
+    credits.release_loaded_block(encoded_bytes)?;
     Ok(())
 }
 
@@ -463,15 +465,37 @@ mod tests {
         }
     }
 
-    struct Loader(BTreeMap<[u8; 32], Bytes>);
+    struct Loader {
+        artifacts: BTreeMap<[u8; 32], Bytes>,
+        decoded: BTreeMap<[u8; 32], Arc<super::super::DecodedQueryBlock>>,
+        loads: BTreeMap<[u8; 32], usize>,
+    }
 
     impl QueryArtifactLoader for Loader {
         fn load_query_artifact(
             &mut self,
             request: QueryArtifactLoad,
         ) -> impl std::future::Future<Output = Result<Bytes, IndexError>> + Send {
-            let value = self.0.get(&request.hash).cloned();
+            *self.loads.entry(request.hash).or_default() += 1;
+            let value = self.artifacts.get(&request.hash).cloned();
             async move { value.ok_or(IndexError::Integrity) }
+        }
+
+        fn cached_query_block(
+            &self,
+            _generation: [u8; 32],
+            request: QueryArtifactLoad,
+        ) -> Result<Option<Arc<super::super::DecodedQueryBlock>>, IndexError> {
+            Ok(self.decoded.get(&request.hash).cloned())
+        }
+
+        fn cache_query_block(
+            &mut self,
+            _generation: [u8; 32],
+            request: QueryArtifactLoad,
+            block: Arc<super::super::DecodedQueryBlock>,
+        ) {
+            self.decoded.insert(request.hash, block);
         }
     }
 
@@ -601,13 +625,15 @@ mod tests {
             resident_bytes: 0,
             index_bytes: 0,
         };
-        let mut loader = Loader(
-            [
+        let mut loader = Loader {
+            artifacts: [
                 (dictionary.descriptor.hash, Bytes::from(dictionary.bytes)),
                 (posting.descriptor.hash, Bytes::from(posting.bytes)),
             ]
             .into(),
-        );
+            decoded: BTreeMap::new(),
+            loads: BTreeMap::new(),
+        };
 
         let mut resume = None;
         for (expected, expected_truncated) in [
@@ -638,5 +664,7 @@ mod tests {
             assert_eq!(truncated, expected_truncated);
             resume = page.keys().next_back().copied();
         }
+        assert_eq!(loader.loads[&posting.descriptor.hash], 1);
+        assert_eq!(loader.loads[&dictionary.descriptor.hash], 3);
     }
 }
