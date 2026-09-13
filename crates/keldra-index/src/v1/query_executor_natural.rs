@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 use crate::IndexError;
 use crate::typed_json::{Predicate, ScalarValue};
@@ -6,12 +7,14 @@ use crate::typed_json::{Predicate, ScalarValue};
 use super::admission::resident_selected_candidate_bytes;
 use super::{
     AuthorizedQueryCandidate, Budget, PartitionManifest, QueryAdmissionCandidate,
-    QueryArtifactKind, QueryArtifactLoader, QueryBlockCredits, QueryBlockCursor, QueryBlockKind,
-    QueryBlockLimits, QueryCandidateAdmission, QueryCommonCut, QueryPosting, StableDocumentKey,
-    TypedJsonQueryRequest, authorize_selected_candidates, candidate_is_current, decode_posting,
-    load_exact_pre_admitted, load_latest_gates_for_keys, load_selected_terms,
-    select_handoff_candidate,
+    QueryArtifactKind, QueryArtifactLoader, QueryBlockCredits, QueryBlockCursor,
+    QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryCandidateAdmission,
+    QueryCommonCut, QueryPosting, StableDocumentKey, TypedJsonQueryRequest,
+    authorize_selected_candidates, candidate_is_current, decode_posting, load_exact_pre_admitted,
+    load_latest_gates_for_keys, load_selected_terms, select_handoff_candidate,
 };
+
+const POSTING_SOURCE_CHUNK: usize = 32;
 
 /// Natural-order equality pages are the common exact-query path. Keep their
 /// work proportional to the requested page instead of rebuilding the complete
@@ -250,8 +253,7 @@ async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
 ) -> Result<(BTreeMap<StableDocumentKey, (usize, QueryPosting)>, bool), IndexError> {
-    let mut newest = BTreeMap::new();
-    let mut truncated = false;
+    let mut sources = Vec::new();
     for (run, descriptor) in manifest.matching_blocks(QueryBlockKind::TermDictionary, recipe) {
         let (entries, entry_bytes) = load_selected_terms(
             loader,
@@ -271,14 +273,6 @@ async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
                 if resume.is_some_and(|minimum| shard.maximum_document <= minimum) {
                     continue;
                 }
-                if newest.len() == limit
-                    && newest
-                        .last_key_value()
-                        .is_some_and(|(maximum, _)| shard.minimum_document > *maximum)
-                {
-                    truncated = true;
-                    continue;
-                }
                 let posting_descriptor = manifest.find_run_block(
                     run,
                     shard.posting_block_hash,
@@ -291,71 +285,158 @@ async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
                 {
                     return Err(IndexError::Integrity);
                 }
-                let encoded_bytes = usize::try_from(posting_descriptor.encoded_bytes)
-                    .map_err(|_| IndexError::Integrity)?;
-                let bytes = load_exact_pre_admitted(
-                    loader,
-                    QueryArtifactKind::Block,
-                    posting_descriptor.hash,
-                    encoded_bytes,
-                    credits,
-                    budget,
-                )
-                .await?;
-                credits.release(bytes.len())?;
-                let mut cursor = QueryBlockCursor::from_verified_content(
-                    posting_descriptor,
-                    &bytes,
-                    block_limits,
-                    credits,
-                )?;
-                let mut next = match resume {
-                    Some(minimum) if shard.minimum_document <= minimum => {
-                        cursor.seek_to(&minimum.bytes())?
-                    }
-                    _ => cursor.next()?,
-                };
-                while let Some(record) = next {
-                    let posting = decode_posting(record)?;
-                    if posting.document < shard.minimum_document
-                        || posting.document > shard.maximum_document
-                    {
-                        return Err(IndexError::Integrity);
-                    }
-                    if resume.is_some_and(|minimum| posting.document <= minimum)
-                        || newest.contains_key(&posting.document)
-                    {
-                        next = cursor.next()?;
-                        continue;
-                    }
-                    if newest.len() < limit {
-                        budget.reserve_heap(credits, posting_entry_bytes())?;
-                        newest.insert(posting.document, (run, posting));
-                    } else {
-                        let maximum = *newest.last_key_value().ok_or(IndexError::Integrity)?.0;
-                        if posting.document < maximum {
-                            newest.insert(posting.document, (run, posting));
-                            newest.pop_last().ok_or(IndexError::Integrity)?;
-                        }
-                        truncated = true;
-                        if posting.document >= maximum {
-                            break;
-                        }
-                    }
-                    next = cursor.next()?;
-                }
-                drop(cursor);
-                credits.release_loaded_block(bytes.len())?;
+                sources.push(PostingSource {
+                    run,
+                    descriptor: posting_descriptor,
+                    minimum_document: shard.minimum_document,
+                    maximum_document: shard.maximum_document,
+                    resume,
+                    buffered: VecDeque::new(),
+                    exhausted: false,
+                });
             }
         }
         budget.release_heap(credits, entry_bytes)?;
     }
+
+    let source_bytes = sources
+        .capacity()
+        .checked_mul(std::mem::size_of::<PostingSource<'_>>())
+        .ok_or(IndexError::OffsetOverflow)?;
+    budget.reserve_heap(credits, source_bytes)?;
+    let mut heap = BinaryHeap::new();
+    for (source_index, source) in sources.iter_mut().enumerate() {
+        refill_posting_source(loader, source, block_limits, credits, budget).await?;
+        if let Some(posting) = source.buffered.front() {
+            heap.push(Reverse((posting.document, source_index)));
+        }
+    }
+
+    let mut newest = BTreeMap::new();
+    while newest.len() < limit {
+        let Some(Reverse((document, source_index))) = heap.pop() else {
+            break;
+        };
+        let mut same_document_sources = vec![source_index];
+        while heap
+            .peek()
+            .is_some_and(|Reverse((next, _))| *next == document)
+        {
+            let Reverse((_, source_index)) = heap.pop().ok_or(IndexError::Integrity)?;
+            same_document_sources.push(source_index);
+        }
+
+        let mut selected = None::<(usize, QueryPosting)>;
+        for source_index in same_document_sources {
+            let source = sources.get_mut(source_index).ok_or(IndexError::Integrity)?;
+            let posting = source.buffered.pop_front().ok_or(IndexError::Integrity)?;
+            if posting.document != document {
+                return Err(IndexError::Integrity);
+            }
+            budget.release_heap(credits, posting_buffer_bytes())?;
+            if selected
+                .as_ref()
+                .is_none_or(|(selected_run, _)| source.run < *selected_run)
+            {
+                selected = Some((source.run, posting));
+            }
+            if source.buffered.is_empty() {
+                refill_posting_source(loader, source, block_limits, credits, budget).await?;
+            }
+            if let Some(next) = source.buffered.front() {
+                heap.push(Reverse((next.document, source_index)));
+            }
+        }
+        let selected = selected.ok_or(IndexError::Integrity)?;
+        budget.reserve_heap(credits, posting_entry_bytes())?;
+        newest.insert(document, selected);
+    }
+    let truncated = !heap.is_empty();
+    for source in sources {
+        budget.release_heap(
+            credits,
+            source
+                .buffered
+                .len()
+                .checked_mul(posting_buffer_bytes())
+                .ok_or(IndexError::OffsetOverflow)?,
+        )?;
+    }
+    budget.release_heap(credits, source_bytes)?;
     budget.candidates(newest.len())?;
     Ok((newest, truncated))
 }
 
+struct PostingSource<'a> {
+    run: usize,
+    descriptor: &'a QueryBlockDescriptor,
+    minimum_document: StableDocumentKey,
+    maximum_document: StableDocumentKey,
+    resume: Option<StableDocumentKey>,
+    buffered: VecDeque<QueryPosting>,
+    exhausted: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refill_posting_source<L: QueryArtifactLoader>(
+    loader: &mut L,
+    source: &mut PostingSource<'_>,
+    block_limits: QueryBlockLimits,
+    credits: &mut QueryBlockCredits,
+    budget: &mut Budget,
+) -> Result<(), IndexError> {
+    if source.exhausted || !source.buffered.is_empty() {
+        return Ok(());
+    }
+    let encoded_bytes =
+        usize::try_from(source.descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
+    let bytes = load_exact_pre_admitted(
+        loader,
+        QueryArtifactKind::Block,
+        source.descriptor.hash,
+        encoded_bytes,
+        credits,
+        budget,
+    )
+    .await?;
+    credits.release(bytes.len())?;
+    let mut cursor =
+        QueryBlockCursor::from_verified_content(source.descriptor, &bytes, block_limits, credits)?;
+    let mut next = match source.resume {
+        Some(minimum) if source.minimum_document <= minimum => cursor.seek_to(&minimum.bytes())?,
+        _ => cursor.next()?,
+    };
+    while let Some(record) = next {
+        let posting = decode_posting(record)?;
+        if posting.document < source.minimum_document || posting.document > source.maximum_document
+        {
+            return Err(IndexError::Integrity);
+        }
+        if source
+            .resume
+            .is_none_or(|minimum| posting.document > minimum)
+        {
+            source.resume = Some(posting.document);
+            budget.reserve_heap(credits, posting_buffer_bytes())?;
+            source.buffered.push_back(posting);
+            if source.buffered.len() == POSTING_SOURCE_CHUNK {
+                break;
+            }
+        }
+        next = cursor.next()?;
+    }
+    source.exhausted = next.is_none();
+    drop(cursor);
+    credits.release_loaded_block(bytes.len())?;
+    Ok(())
+}
+
 const fn posting_entry_bytes() -> usize {
     std::mem::size_of::<StableDocumentKey>() + std::mem::size_of::<QueryPosting>()
+}
+
+const fn posting_buffer_bytes() -> usize {
+    std::mem::size_of::<QueryPosting>()
 }
 
 #[cfg(test)]
