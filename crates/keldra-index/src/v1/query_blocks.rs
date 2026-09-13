@@ -75,7 +75,12 @@ impl QueryBlockLimits {
             maximum_key_bytes: 32_768,
             maximum_value_bytes: DEFAULT_QUERY_BLOCK_BYTES,
             maximum_loaded_blocks: 16,
-            maximum_run_descriptor_bytes: 8 * 1024 * 1024,
+            // A full 65,536-operation publication can legitimately describe
+            // more than 8 MiB of query blocks. Keep the descriptor bounded to
+            // one eighth of the default 512 MiB query-memory budget instead
+            // of rejecting a producer-built run that the query runtime can
+            // load within its bounded lease.
+            maximum_run_descriptor_bytes: 64 * 1024 * 1024,
         }
     }
 
@@ -2233,6 +2238,14 @@ mod tests {
         assert_eq!(
             decode_projection_query_run(&encoded.bytes, limits, &mut decode_credits).unwrap(),
             descriptor
+        );
+    }
+
+    #[test]
+    fn default_run_descriptor_limit_covers_full_publication_batches() {
+        assert_eq!(
+            QueryBlockLimits::default_for_memory().maximum_run_descriptor_bytes,
+            64 * 1024 * 1024
         );
     }
 
