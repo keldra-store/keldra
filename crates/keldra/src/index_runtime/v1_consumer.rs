@@ -205,6 +205,7 @@ fn next_reconcile_delay(
 ) -> Duration {
     writers
         .values()
+        .filter(|writer| !writer.halted_on_integrity_failure)
         .filter_map(|writer| writer.since)
         .map(|since| limits.flush_age.saturating_sub(since.elapsed()))
         .min()
