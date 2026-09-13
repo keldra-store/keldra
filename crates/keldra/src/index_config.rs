@@ -27,10 +27,7 @@ impl IndexRuntimeConfig {
     pub const DEFAULT_QUERY_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
     pub const DEFAULT_FLUSH_BYTES: u64 = 16 * 1024 * 1024;
     pub const DEFAULT_FLUSH_MAX_AGE_MILLIS: u64 = 1_000;
-    // Bound one publication below the point where ordinary high-cardinality
-    // fields can turn a source batch into tens of thousands of immutable query
-    // blocks. The byte and age limits remain independent earlier triggers.
-    pub const DEFAULT_FLUSH_MAX_OPERATIONS: u64 = 16_384;
+    pub const DEFAULT_FLUSH_MAX_OPERATIONS: u64 = 65_536;
     pub const DEFAULT_LSM_MAX_RUNS_PER_LEVEL: u32 = 64;
     pub const DEFAULT_LSM_MAX_UNMERGED_BYTES_PER_LEVEL: u64 = 1024 * 1024 * 1024;
 

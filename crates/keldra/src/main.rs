@@ -248,7 +248,7 @@ struct Arguments {
     )]
     index_segment_flush_max_age_millis: u64,
 
-    /// Maximum complete mutation units accumulated in one segment (default: 16384).
+    /// Maximum complete mutation units accumulated in one segment (default: 65536).
     #[arg(
         long = "index-flush-max-operations",
         env = "KELDRA_INDEX_FLUSH_MAX_OPERATIONS",
