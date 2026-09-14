@@ -783,8 +783,9 @@ impl V1ProjectionPublisher {
         let Some(root) = generation.root(component) else {
             return Ok(None);
         };
-        let mut cursor = ComponentStreamReverseCursor::new(
+        let mut cursor = ComponentStreamReverseCursor::for_key(
             ComponentStreamRoot::from_component_root(root).map_err(index_status)?,
+            key,
         )
         .map_err(index_status)?;
         loop {

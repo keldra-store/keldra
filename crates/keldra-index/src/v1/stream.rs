@@ -148,15 +148,28 @@ pub enum ComponentStreamReverseStep {
 #[derive(Debug)]
 pub struct ComponentStreamReverseCursor {
     component: ComponentIdentity,
+    key: Option<StableDocumentKey>,
     pending_pages: Vec<Child>,
     awaiting_page: Option<Child>,
     leaf_segments: Vec<ComponentSegmentDescriptor>,
 }
 impl ComponentStreamReverseCursor {
     pub fn new(root: ComponentStreamRoot) -> Result<Self, IndexError> {
+        Self::new_inner(root, None)
+    }
+
+    pub fn for_key(root: ComponentStreamRoot, key: StableDocumentKey) -> Result<Self, IndexError> {
+        Self::new_inner(root, Some(key))
+    }
+
+    fn new_inner(
+        root: ComponentStreamRoot,
+        key: Option<StableDocumentKey>,
+    ) -> Result<Self, IndexError> {
         validate_root(root)?;
         Ok(Self {
             component: root.component,
+            key,
             pending_pages: vec![Child {
                 first_sequence: root.first_sequence,
                 last_sequence: root.last_sequence,
@@ -208,14 +221,24 @@ impl ComponentStreamReverseCursor {
                 if !child_matches(&actual, &expected) {
                     return Err(IndexError::Integrity);
                 }
-                self.leaf_segments = segments;
+                self.leaf_segments = match self.key {
+                    Some(key) => segments
+                        .into_iter()
+                        .filter(|segment| key >= segment.minimum_key && key <= segment.maximum_key)
+                        .collect(),
+                    None => segments,
+                };
             }
             Page::Branch(children) => {
                 let actual = Child::from_children(&children, hash, bytes.len() as u64)?;
                 if !child_matches(&actual, &expected) {
                     return Err(IndexError::Integrity);
                 }
-                self.pending_pages.extend(children);
+                self.pending_pages
+                    .extend(children.into_iter().filter(|child| {
+                        self.key
+                            .is_none_or(|key| key >= child.minimum_key && key <= child.maximum_key)
+                    }));
             }
         }
         Ok(())

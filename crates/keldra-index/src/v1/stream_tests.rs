@@ -328,6 +328,49 @@ fn reverse_cursor_reaches_newest_segment_without_opening_all_pages() {
 }
 
 #[test]
+fn key_cursor_does_not_open_page_subtrees_outside_the_target_range() {
+    let segments = (1_u64..=256)
+        .map(|sequence| {
+            let target = if sequence <= 128 { key(1) } else { key(2) };
+            ComponentSegmentDescriptor {
+                minimum_key: target,
+                maximum_key: target,
+                ..run(sequence)
+            }
+        })
+        .collect::<Vec<_>>();
+    let directory = build_component_stream(ComponentIdentity::DocumentHead, &segments).unwrap();
+    let pages = directory
+        .pages
+        .iter()
+        .map(|page| (page.hash, page.bytes.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut cursor = ComponentStreamReverseCursor::for_key(directory.root(), key(1)).unwrap();
+    let mut page_loads = 0;
+    let mut returned = Vec::new();
+    loop {
+        match cursor.next().unwrap() {
+            ComponentStreamReverseStep::LoadPage { hash } => {
+                page_loads += 1;
+                cursor
+                    .provide_page(hash, pages.get(&hash).unwrap())
+                    .unwrap();
+            }
+            ComponentStreamReverseStep::Segment(descriptor) => returned.push(descriptor),
+            ComponentStreamReverseStep::Complete => break,
+        }
+    }
+
+    assert_eq!(returned.len(), 128);
+    assert!(
+        returned
+            .iter()
+            .all(|descriptor| descriptor.minimum_key == key(1))
+    );
+    assert_eq!(page_loads, 2, "root plus only the matching leaf");
+}
+
+#[test]
 fn append_path_copies_only_the_logarithmic_right_spine() {
     let component = ComponentIdentity::DocumentHead;
     let segments = (1_u64..=65_536).map(run).collect::<Vec<_>>();
