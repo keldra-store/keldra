@@ -1388,7 +1388,7 @@ async fn select_mutation(
                     &recipe.bucket,
                     mutation.tenant_id,
                     mutation.bucket_id,
-                    &current,
+                    &current.generation,
                     scope,
                     &mutation.path,
                 )
