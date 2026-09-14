@@ -111,7 +111,7 @@ pub(super) async fn read_routed_source_journal(
     }
     let store = service.store.clone();
     let page = tokio::task::spawn_blocking(move || {
-        store.scan_routed_local_changes(
+        store.scan_routed_local_changes_accounted(
             route,
             source_id,
             value.after_offset,
@@ -123,11 +123,17 @@ pub(super) async fn read_routed_source_journal(
     .await
     .map_err(|error| Status::internal(format!("routed journal read task failed: {error}")))?
     .map_err(map_routed_journal_error)?;
+    let (page, change_encoded_bytes) = page.into_parts();
     let changes_json = encode_page(page.changes)?;
+    let individual_lengths_match = changes_json.len() == change_encoded_bytes.len()
+        && changes_json
+            .iter()
+            .zip(&change_encoded_bytes)
+            .all(|(encoded, expected)| encoded.len() as u64 == *expected);
     let measured = changes_json
         .iter()
         .try_fold(0_u64, |total, value| total.checked_add(value.len() as u64));
-    if measured != Some(page.encoded_bytes) {
+    if !individual_lengths_match || measured != Some(page.encoded_bytes) {
         return Err(Status::internal(
             "routed source-journal byte accounting is inconsistent",
         ));

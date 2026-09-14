@@ -44,7 +44,7 @@ pub(super) async fn read(
     let page = service
         .bounded(&metadata, async move {
             tokio::task::spawn_blocking(move || {
-                store.scan_local_changes_bounded(after, limit, max_bytes)
+                store.scan_local_changes_bounded_accounted(after, limit, max_bytes)
             })
             .await
             .map_err(|error| Status::internal(format!("join journal read: {error}")))?
@@ -55,13 +55,19 @@ pub(super) async fn read(
 }
 
 pub(super) fn encode_page_response(
-    page: keldra_store::LocalChangePage,
+    accounted: keldra_store::AccountedJournalPage<keldra_store::LocalChangePage>,
 ) -> Result<Response<wire::SourceJournalPage>, Status> {
+    let (page, change_encoded_bytes) = accounted.into_parts();
     let changes_json = encode_page(page.changes)?;
+    let individual_lengths_match = changes_json.len() == change_encoded_bytes.len()
+        && changes_json
+            .iter()
+            .zip(&change_encoded_bytes)
+            .all(|(encoded, expected)| encoded.len() as u64 == *expected);
     let actual_bytes = changes_json.iter().try_fold(0_u64, |total, encoded| {
         total.checked_add(encoded.len() as u64)
     });
-    if actual_bytes != Some(page.encoded_bytes) {
+    if !individual_lengths_match || actual_bytes != Some(page.encoded_bytes) {
         return Err(Status::internal(
             "source journal page byte accounting is inconsistent",
         ));

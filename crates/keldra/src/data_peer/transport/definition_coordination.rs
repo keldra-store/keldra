@@ -11,7 +11,7 @@ pub(super) fn decode_routed_source_journal_page(
     after_offset: u64,
     target_offset: u64,
     max_bytes: u64,
-) -> Result<RoutedLocalChangePage, Status> {
+) -> Result<keldra_store::AccountedJournalPage<RoutedLocalChangePage>, Status> {
     require_response_schema(response.schema_version)?;
     require_source_page_limit(max_bytes)?;
     let node_id = u16::try_from(response.source_node_id)
@@ -65,6 +65,11 @@ pub(super) fn decode_routed_source_journal_page(
             ));
         }
     };
+    let change_encoded_bytes = response
+        .changes_json
+        .iter()
+        .map(|encoded| encoded.len() as u64)
+        .collect::<Vec<_>>();
     let changes = response
         .changes_json
         .iter()
@@ -80,13 +85,16 @@ pub(super) fn decode_routed_source_journal_page(
         }
         previous = offset;
     }
-    Ok(RoutedLocalChangePage {
-        source_id,
-        changes,
-        encoded_bytes: response.encoded_bytes,
-        through_offset: response.through_offset,
-        oversize,
-    })
+    Ok(keldra_store::AccountedJournalPage::new(
+        RoutedLocalChangePage {
+            source_id,
+            changes,
+            encoded_bytes: response.encoded_bytes,
+            through_offset: response.through_offset,
+            oversize,
+        },
+        change_encoded_bytes,
+    ))
 }
 
 pub(super) fn encode_assignment_mutation(

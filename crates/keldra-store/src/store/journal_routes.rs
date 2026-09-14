@@ -26,6 +26,27 @@ impl Store {
         limit: usize,
         max_bytes: u64,
     ) -> Result<RoutedLocalChangePage, RoutedJournalError> {
+        self.scan_routed_local_changes_accounted(
+            route,
+            source_id,
+            after_offset,
+            target_offset,
+            limit,
+            max_bytes,
+        )
+        .map(crate::AccountedJournalPage::into_page)
+    }
+
+    #[doc(hidden)]
+    pub fn scan_routed_local_changes_accounted(
+        &self,
+        route: JournalRoute,
+        source_id: SourceId,
+        after_offset: u64,
+        target_offset: u64,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<crate::AccountedJournalPage<RoutedLocalChangePage>, RoutedJournalError> {
         if limit == 0 || limit > MAX_LOCAL_INVALIDATION_SCAN_RECORDS || max_bytes == 0 {
             return Err(RoutedJournalError::InvalidLimits);
         }
@@ -68,13 +89,16 @@ impl Store {
             });
         }
         if after_offset == target_offset {
-            return Ok(RoutedLocalChangePage {
-                source_id,
-                changes: Vec::new(),
-                encoded_bytes: 0,
-                through_offset: after_offset,
-                oversize: None,
-            });
+            return Ok(crate::AccountedJournalPage::new(
+                RoutedLocalChangePage {
+                    source_id,
+                    changes: Vec::new(),
+                    encoded_bytes: 0,
+                    through_offset: after_offset,
+                    oversize: None,
+                },
+                Vec::new(),
+            ));
         }
 
         let prefix = route_prefix(route, source_id.source_epoch);
@@ -119,13 +143,12 @@ impl Store {
         }
         drop(iterator);
 
-        let journal_keys = routed_offsets
-            .iter()
-            .copied()
-            .map(invalidation_key)
-            .collect::<Vec<_>>();
-        let records =
-            snapshot.multi_get_cf(journal_keys.iter().map(|key| (journal_cf, key.as_slice())));
+        let records = snapshot.multi_get_cf(
+            routed_offsets
+                .iter()
+                .copied()
+                .map(|offset| (journal_cf, invalidation_key(offset))),
+        );
         if records.len() != routed_offsets.len() {
             return Err(RoutedJournalError::Storage(
                 "routed journal multi-get returned the wrong result count".into(),
@@ -134,6 +157,7 @@ impl Store {
 
         let routed_count = routed_offsets.len();
         let mut changes = Vec::with_capacity(routed_count);
+        let mut change_encoded_bytes = Vec::with_capacity(routed_count);
         let mut encoded_bytes = 0_u64;
         let mut through_offset = after_offset;
         let mut stopped_at_byte_limit = false;
@@ -168,22 +192,26 @@ impl Store {
             })?;
             if projected > max_bytes {
                 if changes.is_empty() {
-                    return Ok(RoutedLocalChangePage {
-                        source_id,
-                        changes,
-                        encoded_bytes: 0,
-                        through_offset: after_offset,
-                        oversize: Some(OversizeLocalChange {
-                            offset,
-                            encoded_bytes: change_bytes,
-                        }),
-                    });
+                    return Ok(crate::AccountedJournalPage::new(
+                        RoutedLocalChangePage {
+                            source_id,
+                            changes,
+                            encoded_bytes: 0,
+                            through_offset: after_offset,
+                            oversize: Some(OversizeLocalChange {
+                                offset,
+                                encoded_bytes: change_bytes,
+                            }),
+                        },
+                        change_encoded_bytes,
+                    ));
                 }
                 stopped_at_byte_limit = true;
                 break;
             }
             encoded_bytes = projected;
             through_offset = offset;
+            change_encoded_bytes.push(change_bytes);
             changes.push(change);
         }
 
@@ -192,13 +220,16 @@ impl Store {
         if complete_to_target && !stopped_at_byte_limit && changes.len() == routed_count {
             through_offset = target_offset;
         }
-        Ok(RoutedLocalChangePage {
-            source_id,
-            changes,
-            encoded_bytes,
-            through_offset,
-            oversize: None,
-        })
+        Ok(crate::AccountedJournalPage::new(
+            RoutedLocalChangePage {
+                source_id,
+                changes,
+                encoded_bytes,
+                through_offset,
+                oversize: None,
+            },
+            change_encoded_bytes,
+        ))
     }
 
     pub(crate) fn stage_journal_routes(

@@ -136,7 +136,7 @@ pub(super) async fn read_source_journal(
     source_journal::require_page_bound(max_bytes)?;
     let store = service.store.clone();
     let page = tokio::task::spawn_blocking(move || {
-        store.scan_local_changes_bounded(after, limit, max_bytes)
+        store.scan_local_changes_bounded_accounted(after, limit, max_bytes)
     })
     .await
     .map_err(join_status)?

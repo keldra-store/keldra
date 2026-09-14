@@ -143,6 +143,7 @@ fn memory_page(
     let journals = journals.lock().unwrap();
     let (status, changes) = journals.get(&source.node).unwrap();
     let mut selected = Vec::new();
+    let mut change_encoded_bytes = Vec::new();
     let mut encoded_bytes = 0_u64;
     let mut oversize = None;
     let matching = changes
@@ -165,6 +166,7 @@ fn memory_page(
             break;
         }
         encoded_bytes = projected;
+        change_encoded_bytes.push(bytes);
         selected.push(change.clone());
     }
     let through_offset = if oversize.is_some() {
@@ -181,6 +183,7 @@ fn memory_page(
             expected_source
         },
         changes: selected,
+        change_encoded_bytes,
         encoded_bytes,
         through_offset,
         oversize,
@@ -1239,11 +1242,14 @@ fn shared_bucket_page_is_trimmed_without_changing_its_cached_source() {
     };
     let first = change(1, 1);
     let second = change(1, 2);
-    let first_bytes = encoded_len(&first).unwrap();
-    let second_bytes = encoded_len(&second).unwrap();
+    // Deliberately differ from the changes' JSON sizes: cache trimming must
+    // use the exact charges preserved by the source scan, not re-encode them.
+    let first_bytes = 17;
+    let second_bytes = 29;
     let page = IndexSourcePage {
         source_id: source_id(1),
         changes: vec![first, second],
+        change_encoded_bytes: vec![first_bytes, second_bytes],
         encoded_bytes: first_bytes + second_bytes,
         through_offset: 2,
         oversize: None,
@@ -1256,13 +1262,32 @@ fn shared_bucket_page_is_trimmed_without_changing_its_cached_source() {
     assert_eq!(trimmed.changes[0].offset(), 1);
     assert_eq!(trimmed.through_offset, 1);
     assert_eq!(trimmed.encoded_bytes, first_bytes);
+    assert_eq!(trimmed.change_encoded_bytes, [first_bytes]);
 
     let complete = cache
         .get(&key, 2, first_bytes + second_bytes)
         .unwrap()
         .unwrap();
     assert_eq!(complete.changes, page.changes);
+    assert_eq!(complete.change_encoded_bytes, page.change_encoded_bytes);
     assert_eq!(complete.through_offset, 2);
+}
+
+#[test]
+fn cached_bucket_page_rejects_missing_per_change_byte_evidence() {
+    let page = IndexSourcePage {
+        source_id: source_id(1),
+        changes: vec![change(1, 1)],
+        change_encoded_bytes: Vec::new(),
+        encoded_bytes: 17,
+        through_offset: 1,
+        oversize: None,
+    };
+
+    assert!(matches!(
+        trim_cached_page(&page, 0, 1, 17),
+        Err(IndexEventError::PageLengthMismatch { .. })
+    ));
 }
 
 #[test]
@@ -1282,7 +1307,8 @@ fn shared_bucket_cache_evicts_old_pages_at_its_process_bound() {
             10 * 1024 * 1024,
             IndexSourcePage {
                 source_id: source_id(1),
-                changes: Vec::new(),
+                changes: vec![change(1, after_offset + 1)],
+                change_encoded_bytes: vec![10 * 1024 * 1024],
                 encoded_bytes: 10 * 1024 * 1024,
                 through_offset: after_offset + 1,
                 oversize: None,
@@ -1313,6 +1339,7 @@ fn cached_terminal_page_is_not_used_for_a_later_target() {
         IndexSourcePage {
             source_id: source_id(1),
             changes: vec![change(1, 1)],
+            change_encoded_bytes: vec![encoded_len(&change(1, 1)).unwrap()],
             encoded_bytes: encoded_len(&change(1, 1)).unwrap(),
             through_offset: 1,
             oversize: None,

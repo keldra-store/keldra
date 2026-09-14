@@ -377,6 +377,27 @@ impl DataPeerTransport {
         limit: usize,
         max_bytes: u64,
     ) -> Result<LocalChangePage, Status> {
+        self.read_source_journal_accounted(
+            target,
+            address,
+            expected_source,
+            after_offset,
+            limit,
+            max_bytes,
+        )
+        .await
+        .map(keldra_store::AccountedJournalPage::into_page)
+    }
+
+    pub(crate) async fn read_source_journal_accounted(
+        &self,
+        target: NodeId,
+        address: &str,
+        expected_source: SourceId,
+        after_offset: u64,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<keldra_store::AccountedJournalPage<LocalChangePage>, Status> {
         require_source_page_limit(max_bytes)?;
         let limit = u32::try_from(limit.min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS))
             .expect("source journal limit fits u32");
@@ -405,6 +426,32 @@ impl DataPeerTransport {
         limit: usize,
         max_bytes: u64,
     ) -> Result<RoutedLocalChangePage, Status> {
+        self.read_routed_source_journal_accounted(
+            target,
+            address,
+            route,
+            expected_source,
+            after_offset,
+            target_offset,
+            limit,
+            max_bytes,
+        )
+        .await
+        .map(keldra_store::AccountedJournalPage::into_page)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn read_routed_source_journal_accounted(
+        &self,
+        target: NodeId,
+        address: &str,
+        route: JournalRoute,
+        expected_source: SourceId,
+        after_offset: u64,
+        target_offset: u64,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<keldra_store::AccountedJournalPage<RoutedLocalChangePage>, Status> {
         require_source_page_limit(max_bytes)?;
         let limit = u32::try_from(limit.min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS))
             .expect("source journal limit fits u32");
@@ -1201,7 +1248,8 @@ impl DataPeerTransport {
             None,
             after_offset,
             MAX_TYPED_MUTATION_BYTES as u64,
-        )?;
+        )?
+        .into_page();
         if let Some(oversize) = page.oversize {
             return Err(Status::resource_exhausted(format!(
                 "source journal record {} requires {} bytes",
@@ -1681,7 +1729,7 @@ fn decode_source_journal_page(
     expected_source: Option<SourceId>,
     after_offset: u64,
     max_bytes: u64,
-) -> Result<LocalChangePage, Status> {
+) -> Result<keldra_store::AccountedJournalPage<LocalChangePage>, Status> {
     require_response_schema(response.schema_version)?;
     require_source_page_limit(max_bytes)?;
     let source_id: SourceId = decode_typed(&response.source_id_json)?;
@@ -1727,6 +1775,11 @@ fn decode_source_journal_page(
             ));
         }
     };
+    let change_encoded_bytes = response
+        .changes_json
+        .iter()
+        .map(|encoded| encoded.len() as u64)
+        .collect::<Vec<_>>();
     let changes = response
         .changes_json
         .iter()
@@ -1742,12 +1795,15 @@ fn decode_source_journal_page(
             ));
         }
     }
-    Ok(LocalChangePage {
-        source_id,
-        changes,
-        encoded_bytes: response.encoded_bytes,
-        oversize,
-    })
+    Ok(keldra_store::AccountedJournalPage::new(
+        LocalChangePage {
+            source_id,
+            changes,
+            encoded_bytes: response.encoded_bytes,
+            oversize,
+        },
+        change_encoded_bytes,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1839,18 +1895,23 @@ mod tests {
     #[test]
     fn peer_page_preserves_the_advertised_byte_bound_and_source_epoch() {
         let encoded = encode_typed(&change(8)).unwrap();
+        let encoded_bytes = encoded.len() as u64;
         let response = wire::SourceJournalPage {
             schema_version: DATA_PEER_SCHEMA_VERSION,
-            encoded_bytes: encoded.len() as u64,
+            encoded_bytes,
             changes_json: vec![encoded],
             oversize_offset: 0,
             oversize_encoded_bytes: 0,
             source_id_json: encode_typed(&source()).unwrap(),
         };
 
-        let page = decode_source_journal_page(response, Some(source()), 7, 4096).unwrap();
+        let (page, change_encoded_bytes) =
+            decode_source_journal_page(response, Some(source()), 7, 4096)
+                .unwrap()
+                .into_parts();
         assert_eq!(page.source_id, source());
         assert_eq!(page.changes, vec![change(8)]);
+        assert_eq!(change_encoded_bytes, [encoded_bytes]);
         assert!(page.oversize.is_none());
     }
 
@@ -1865,7 +1926,9 @@ mod tests {
             source_id_json: encode_typed(&source()).unwrap(),
         };
 
-        let page = decode_source_journal_page(response, Some(source()), 7, 4096).unwrap();
+        let page = decode_source_journal_page(response, Some(source()), 7, 4096)
+            .unwrap()
+            .into_page();
         assert_eq!(
             page.oversize,
             Some(OversizeLocalChange {

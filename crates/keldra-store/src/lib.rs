@@ -86,6 +86,8 @@ pub use index_orphan_scrub_due::{
 pub use index_retention_due::{
     DeletedDefinitionCleanup, IndexCommitRetentionDue, IndexRetentionDueError,
 };
+#[doc(hidden)]
+pub use journal_route::AccountedJournalPage;
 pub use journal_route::{JournalRoute, RoutedJournalError, RoutedLocalChangePage};
 pub use key::ObjectKey;
 pub use logical_record::{

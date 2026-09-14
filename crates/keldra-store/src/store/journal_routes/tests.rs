@@ -142,8 +142,8 @@ async fn routed_pages_are_target_bounded_advance_empty_intervals_and_measure_pee
 
     // The matching route at offset three is immediately after this captured
     // target and must not leak into the page or its byte accounting.
-    let page = store
-        .scan_routed_local_changes(
+    let (page, page_change_bytes) = store
+        .scan_routed_local_changes_accounted(
             JournalRoute::Bucket {
                 tenant_id,
                 bucket_id,
@@ -154,7 +154,8 @@ async fn routed_pages_are_target_bounded_advance_empty_intervals_and_measure_pee
             10,
             u64::MAX,
         )
-        .unwrap();
+        .unwrap()
+        .into_parts();
     assert_eq!(
         page.changes
             .iter()
@@ -165,12 +166,13 @@ async fn routed_pages_are_target_bounded_advance_empty_intervals_and_measure_pee
     assert_eq!(page.through_offset, 2);
     let peer_bytes = serde_json::to_vec(&page.changes[0]).unwrap().len() as u64;
     assert_eq!(page.encoded_bytes, peer_bytes);
+    assert_eq!(page_change_bytes, [peer_bytes]);
 
     // The route iterator can already have observed every matching offset in
     // the target interval before the decoded peer-byte limit stops the page.
     // It must not advance through the unreturned second match.
-    let byte_limited = store
-        .scan_routed_local_changes(
+    let (byte_limited, byte_limited_change_bytes) = store
+        .scan_routed_local_changes_accounted(
             JournalRoute::Bucket {
                 tenant_id,
                 bucket_id,
@@ -181,7 +183,8 @@ async fn routed_pages_are_target_bounded_advance_empty_intervals_and_measure_pee
             10,
             peer_bytes,
         )
-        .unwrap();
+        .unwrap()
+        .into_parts();
     assert_eq!(
         byte_limited
             .changes
@@ -192,6 +195,7 @@ async fn routed_pages_are_target_bounded_advance_empty_intervals_and_measure_pee
     );
     assert_eq!(byte_limited.through_offset, 1);
     assert_eq!(byte_limited.encoded_bytes, peer_bytes);
+    assert_eq!(byte_limited_change_bytes, [peer_bytes]);
 
     let empty_between_matches = store
         .scan_routed_local_changes(

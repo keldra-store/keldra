@@ -641,6 +641,17 @@ impl Store {
         limit: usize,
         max_bytes: u64,
     ) -> Result<LocalChangePage, MutationError> {
+        self.scan_local_changes_bounded_accounted(after_offset, limit, max_bytes)
+            .map(crate::AccountedJournalPage::into_page)
+    }
+
+    #[doc(hidden)]
+    pub fn scan_local_changes_bounded_accounted(
+        &self,
+        after_offset: u64,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<crate::AccountedJournalPage<LocalChangePage>, MutationError> {
         if max_bytes == 0 {
             return Err(MutationError::Storage(
                 "local change scan byte limit must be positive".into(),
@@ -663,12 +674,15 @@ impl Store {
         }
         let limit = limit.min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS);
         if limit == 0 || after_offset == status.tail {
-            return Ok(LocalChangePage {
-                source_id: status.source_id,
-                changes: Vec::new(),
-                encoded_bytes: 0,
-                oversize: None,
-            });
+            return Ok(crate::AccountedJournalPage::new(
+                LocalChangePage {
+                    source_id: status.source_id,
+                    changes: Vec::new(),
+                    encoded_bytes: 0,
+                    oversize: None,
+                },
+                Vec::new(),
+            ));
         }
         let first_offset = after_offset + 1;
         let through = after_offset.saturating_add(limit as u64).min(status.tail);
@@ -680,6 +694,7 @@ impl Store {
             IteratorMode::From(&first_key, Direction::Forward),
         );
         let mut changes = Vec::with_capacity(expected_records);
+        let mut change_encoded_bytes = Vec::with_capacity(expected_records);
         let mut encoded_bytes = 0_u64;
         let mut stopped_at_byte_limit = false;
         for entry in iterator.take(expected_records) {
@@ -703,21 +718,25 @@ impl Store {
                 MutationError::Storage("local change page length overflow".into())
             })?;
             if projected > max_bytes && changes.is_empty() {
-                return Ok(LocalChangePage {
-                    source_id: status.source_id,
-                    changes,
-                    encoded_bytes: 0,
-                    oversize: Some(OversizeLocalChange {
-                        offset: stored_offset,
-                        encoded_bytes: change_bytes,
-                    }),
-                });
+                return Ok(crate::AccountedJournalPage::new(
+                    LocalChangePage {
+                        source_id: status.source_id,
+                        changes,
+                        encoded_bytes: 0,
+                        oversize: Some(OversizeLocalChange {
+                            offset: stored_offset,
+                            encoded_bytes: change_bytes,
+                        }),
+                    },
+                    change_encoded_bytes,
+                ));
             }
             if projected > max_bytes {
                 stopped_at_byte_limit = true;
                 break;
             }
             encoded_bytes = projected;
+            change_encoded_bytes.push(change_bytes);
             changes.push(decoded.change);
         }
         if !stopped_at_byte_limit && changes.len() != expected_records {
@@ -726,12 +745,15 @@ impl Store {
                 "local change offset {missing} is missing"
             )));
         }
-        Ok(LocalChangePage {
-            source_id: status.source_id,
-            changes,
-            encoded_bytes,
-            oversize: None,
-        })
+        Ok(crate::AccountedJournalPage::new(
+            LocalChangePage {
+                source_id: status.source_id,
+                changes,
+                encoded_bytes,
+                oversize: None,
+            },
+            change_encoded_bytes,
+        ))
     }
 }
 
@@ -991,13 +1013,21 @@ mod tests {
         let first = store.read_local_change(1).unwrap().unwrap();
         let first_bytes = crate::watch::encoded_change_len(&first).unwrap();
 
-        let page = store.scan_local_changes_bounded(0, 2, first_bytes).unwrap();
+        let (page, page_change_bytes) = store
+            .scan_local_changes_bounded_accounted(0, 2, first_bytes)
+            .unwrap()
+            .into_parts();
         assert_eq!(page.changes, vec![first]);
+        assert_eq!(page_change_bytes, [first_bytes]);
         assert_eq!(page.encoded_bytes, first_bytes);
         assert_eq!(page.oversize, None);
 
-        let second = store.scan_local_changes_bounded(1, 2, first_bytes).unwrap();
+        let (second, second_change_bytes) = store
+            .scan_local_changes_bounded_accounted(1, 2, first_bytes)
+            .unwrap()
+            .into_parts();
         assert_eq!(second.changes.len(), 1);
+        assert_eq!(second_change_bytes, [first_bytes]);
         assert_eq!(second.changes[0].offset(), 2);
     }
 

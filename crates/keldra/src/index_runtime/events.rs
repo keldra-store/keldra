@@ -5,7 +5,6 @@
 //! authoritative only when a manifest CAS publishes every prepared segment.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io;
 use std::sync::{Arc, Mutex, Weak};
 
 use keldra_consensus::{DecisionRaft, NodeId};
@@ -134,6 +133,7 @@ impl IndexEventAuthority for DecisionIndexEventAuthority {
 pub(crate) struct IndexSourcePage {
     pub source_id: SourceId,
     pub changes: Vec<LocalChange>,
+    pub change_encoded_bytes: Vec<u64>,
     pub encoded_bytes: u64,
     pub through_offset: u64,
     pub oversize: Option<OversizeLocalChange>,
@@ -315,10 +315,20 @@ fn trim_cached_page(
     max_bytes: u64,
 ) -> Result<IndexSourcePage, IndexEventError> {
     if let Some(oversize) = page.oversize {
+        if !page.changes.is_empty()
+            || !page.change_encoded_bytes.is_empty()
+            || page.encoded_bytes != 0
+        {
+            return Err(IndexEventError::PageLengthMismatch {
+                measured: 0,
+                reported: page.encoded_bytes,
+            });
+        }
         if oversize.offset > target_offset {
             return Ok(IndexSourcePage {
                 source_id: page.source_id,
                 changes: Vec::new(),
+                change_encoded_bytes: Vec::new(),
                 encoded_bytes: 0,
                 through_offset: target_offset,
                 oversize: None,
@@ -327,29 +337,42 @@ fn trim_cached_page(
         return Ok(IndexSourcePage {
             source_id: page.source_id,
             changes: Vec::new(),
+            change_encoded_bytes: Vec::new(),
             encoded_bytes: 0,
             through_offset: after_offset,
             oversize: Some(oversize),
         });
     }
+    let measured = page
+        .change_encoded_bytes
+        .iter()
+        .try_fold(0_u64, |total, bytes| total.checked_add(*bytes))
+        .ok_or(IndexEventError::PageLengthOverflow)?;
+    if page.change_encoded_bytes.len() != page.changes.len() || measured != page.encoded_bytes {
+        return Err(IndexEventError::PageLengthMismatch {
+            measured,
+            reported: page.encoded_bytes,
+        });
+    }
     let mut changes = Vec::new();
+    let mut change_encoded_bytes = Vec::new();
     let mut encoded_bytes = 0_u64;
     let mut through_offset = page.through_offset.min(target_offset);
-    for change in &page.changes {
+    for (change, encoded) in page.changes.iter().zip(&page.change_encoded_bytes) {
         if change.offset() > target_offset {
             break;
         }
-        let encoded = encoded_len(change)?;
-        if encoded_bytes.saturating_add(encoded) > max_bytes {
+        if encoded_bytes.saturating_add(*encoded) > max_bytes {
             if changes.is_empty() {
                 return Ok(IndexSourcePage {
                     source_id: page.source_id,
                     changes,
+                    change_encoded_bytes,
                     encoded_bytes: 0,
                     through_offset: after_offset,
                     oversize: Some(OversizeLocalChange {
                         offset: change.offset(),
-                        encoded_bytes: encoded,
+                        encoded_bytes: *encoded,
                     }),
                 });
             }
@@ -359,12 +382,14 @@ fn trim_cached_page(
                 .offset();
             break;
         }
-        encoded_bytes += encoded;
+        encoded_bytes += *encoded;
+        change_encoded_bytes.push(*encoded);
         changes.push(change.clone());
     }
     Ok(IndexSourcePage {
         source_id: page.source_id,
         changes,
+        change_encoded_bytes,
         encoded_bytes,
         through_offset,
         oversize: None,
@@ -396,17 +421,17 @@ impl IndexEventSources for ClusterIndexEventSources {
         limit: usize,
         max_bytes: u64,
     ) -> Result<IndexSourcePage, IndexEventError> {
-        let page = if source.node == self.local_node {
+        let accounted = if source.node == self.local_node {
             let store = self.store.clone();
             tokio::task::spawn_blocking(move || {
-                store.scan_local_changes_bounded(after_offset, limit, max_bytes)
+                store.scan_local_changes_bounded_accounted(after_offset, limit, max_bytes)
             })
             .await
             .map_err(|error| source_error(source.node, error))?
             .map_err(|error| source_error(source.node, error))?
         } else {
             self.peers
-                .read_source_journal(
+                .read_source_journal_accounted(
                     source.node,
                     &source.address,
                     expected_source,
@@ -417,6 +442,7 @@ impl IndexEventSources for ClusterIndexEventSources {
                 .await
                 .map_err(|error| source_error(source.node, error))?
         };
+        let (page, change_encoded_bytes) = accounted.into_parts();
         if page.source_id != expected_source {
             return Err(IndexEventError::SourceEpochChanged(source.node));
         }
@@ -428,6 +454,7 @@ impl IndexEventSources for ClusterIndexEventSources {
             &IndexSourcePage {
                 source_id: page.source_id,
                 changes: page.changes,
+                change_encoded_bytes,
                 encoded_bytes: page.encoded_bytes,
                 through_offset,
                 oversize: page.oversize,
@@ -474,10 +501,10 @@ impl IndexEventSources for ClusterIndexEventSources {
         {
             return Ok(page);
         }
-        let page = if source.node == self.local_node {
+        let accounted = if source.node == self.local_node {
             let store = self.store.clone();
             tokio::task::spawn_blocking(move || {
-                store.scan_routed_local_changes(
+                store.scan_routed_local_changes_accounted(
                     JournalRoute::Bucket {
                         tenant_id,
                         bucket_id,
@@ -494,7 +521,7 @@ impl IndexEventSources for ClusterIndexEventSources {
             .map_err(|error| local_routed_source_error(source.node, error))?
         } else {
             self.peers
-                .read_routed_source_journal(
+                .read_routed_source_journal_accounted(
                     source.node,
                     &source.address,
                     JournalRoute::Bucket {
@@ -510,9 +537,11 @@ impl IndexEventSources for ClusterIndexEventSources {
                 .await
                 .map_err(|error| remote_routed_source_error(source.node, error))?
         };
+        let (page, change_encoded_bytes) = accounted.into_parts();
         let page = IndexSourcePage {
             source_id: page.source_id,
             changes: page.changes,
+            change_encoded_bytes,
             encoded_bytes: page.encoded_bytes,
             through_offset: page.through_offset,
             oversize: page.oversize,
@@ -521,7 +550,11 @@ impl IndexEventSources for ClusterIndexEventSources {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, target_offset, max_bytes, page.clone());
-        trim_cached_page(&page, after_offset, target_offset, max_bytes)
+        // Both the local routed scan and the peer decoder already enforce this
+        // exact target and byte bound. Retain one clone in the shared cache and
+        // return the fetched page directly instead of allocating and cloning
+        // every change again through the cache-trimming path.
+        Ok(page)
     }
 
     async fn read_definition_page(
@@ -535,10 +568,10 @@ impl IndexEventSources for ClusterIndexEventSources {
         max_bytes: u64,
     ) -> Result<IndexSourcePage, IndexEventError> {
         let route = JournalRoute::Definition(kind);
-        let page = if source.node == self.local_node {
+        let accounted = if source.node == self.local_node {
             let store = self.store.clone();
             tokio::task::spawn_blocking(move || {
-                store.scan_routed_local_changes(
+                store.scan_routed_local_changes_accounted(
                     route,
                     expected_source,
                     after_offset,
@@ -552,7 +585,7 @@ impl IndexEventSources for ClusterIndexEventSources {
             .map_err(|error| local_routed_source_error(source.node, error))?
         } else {
             self.peers
-                .read_routed_source_journal(
+                .read_routed_source_journal_accounted(
                     source.node,
                     &source.address,
                     route,
@@ -565,9 +598,11 @@ impl IndexEventSources for ClusterIndexEventSources {
                 .await
                 .map_err(|error| remote_routed_source_error(source.node, error))?
         };
+        let (page, change_encoded_bytes) = accounted.into_parts();
         Ok(IndexSourcePage {
             source_id: page.source_id,
             changes: page.changes,
+            change_encoded_bytes,
             encoded_bytes: page.encoded_bytes,
             through_offset: page.through_offset,
             oversize: page.oversize,
@@ -1161,6 +1196,7 @@ impl IndexEventJournal {
         }
         if let Some(oversize) = page.oversize {
             if !page.changes.is_empty()
+                || !page.change_encoded_bytes.is_empty()
                 || page.encoded_bytes != 0
                 || oversize.offset < start.next_offset
                 || oversize.offset > target_offset
@@ -1179,10 +1215,16 @@ impl IndexEventJournal {
             return Err(IndexEventError::NonContiguousSource(source.node));
         }
 
+        if page.change_encoded_bytes.len() != page.changes.len() {
+            return Err(IndexEventError::PageLengthMismatch {
+                measured: 0,
+                reported: page.encoded_bytes,
+            });
+        }
         let mut expected_offset = after;
         let mut encoded_bytes = 0_u64;
         let mut changes = Vec::with_capacity(page.changes.len());
-        for change in page.changes {
+        for (change, change_bytes) in page.changes.into_iter().zip(page.change_encoded_bytes) {
             validate_index_change(&change)?;
             expected_offset = expected_offset
                 .checked_add(1)
@@ -1191,7 +1233,7 @@ impl IndexEventJournal {
                 return Err(IndexEventError::NonContiguousSource(source.node));
             }
             encoded_bytes = encoded_bytes
-                .checked_add(encoded_len(&change)?)
+                .checked_add(change_bytes)
                 .ok_or(IndexEventError::PageLengthOverflow)?;
             changes.push(IndexJournalChange {
                 node: source.node,
@@ -1317,6 +1359,7 @@ impl IndexEventJournal {
         }
         if let Some(oversize) = page.oversize {
             if !page.changes.is_empty()
+                || !page.change_encoded_bytes.is_empty()
                 || page.encoded_bytes != 0
                 || oversize.offset < start.next_offset
                 || oversize.offset > target_offset
@@ -1335,15 +1378,20 @@ impl IndexEventJournal {
             return Err(IndexEventError::NonContiguousSource(source.node));
         }
 
+        if page.change_encoded_bytes.len() != page.changes.len() {
+            return Err(IndexEventError::PageLengthMismatch {
+                measured: 0,
+                reported: page.encoded_bytes,
+            });
+        }
         let mut previous = after;
         let mut encoded_bytes = 0_u64;
         let mut changes = Vec::with_capacity(page.changes.len());
-        for change in page.changes {
+        for (change, bytes) in page.changes.into_iter().zip(page.change_encoded_bytes) {
             validate_index_change(&change)?;
             if change.offset() <= previous || change.offset() > page.through_offset {
                 return Err(IndexEventError::NonContiguousSource(source.node));
             }
-            let bytes = encoded_len(&change)?;
             let projected = encoded_bytes
                 .checked_add(bytes)
                 .ok_or(IndexEventError::PageLengthOverflow)?;
@@ -1483,33 +1531,11 @@ fn validate_index_change(change: &LocalChange) -> Result<(), IndexEventError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn encoded_len(change: &LocalChange) -> Result<u64, IndexEventError> {
-    let mut counter = ByteCounter(0);
-    serde_json::to_writer(&mut counter, change)
-        .map_err(|error| IndexEventError::Encode(error.to_string()))?;
-    Ok(counter.0)
-}
-
-pub(crate) fn index_journal_change_encoded_len(
-    change: &IndexJournalChange,
-) -> Result<u64, IndexEventError> {
-    encoded_len(&change.change)
-}
-
-struct ByteCounter(u64);
-
-impl io::Write for ByteCounter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| io::Error::other("index event byte count overflow"))?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    serde_json::to_vec(change)
+        .map(|encoded| encoded.len() as u64)
+        .map_err(|error| IndexEventError::Encode(error.to_string()))
 }
 
 fn require_compatible(

@@ -2,6 +2,38 @@ use thiserror::Error;
 
 use crate::{DefinitionKind, LocalChange, OversizeLocalChange, SourceId};
 
+/// Internal journal page plus the exact encoded charge of each change.
+///
+/// This is deliberately separate from the public watch page contract: index
+/// and peer internals need the sidecar to trim pages without re-encoding
+/// changes, while ordinary watch callers do not.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountedJournalPage<P> {
+    page: P,
+    change_encoded_bytes: Vec<u64>,
+}
+
+impl<P> AccountedJournalPage<P> {
+    #[doc(hidden)]
+    pub fn new(page: P, change_encoded_bytes: Vec<u64>) -> Self {
+        Self {
+            page,
+            change_encoded_bytes,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn into_parts(self) -> (P, Vec<u64>) {
+        (self.page, self.change_encoded_bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn into_page(self) -> P {
+        self.page
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalRoute {
     Definition(DefinitionKind),
