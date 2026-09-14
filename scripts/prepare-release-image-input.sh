@@ -49,7 +49,6 @@ build_inputs() {
   platform_values "$platform"
   [[ "${KELDRA_ZRUNNER_JOB_ID:-}" =~ ^[0-9A-HJKMNP-TV-Z]{26}$ ]] || fail "KELDRA_ZRUNNER_JOB_ID must bind this zrunner job"
   [[ "${RUSTUP_TOOLCHAIN:-}" == 1.96.0 ]] || fail "release build requires RUSTUP_TOOLCHAIN=1.96.0"
-  [[ "${CARGO_PROFILE_DEV_CODEGEN_BACKEND:-}" == llvm ]] || fail "release build requires zrunner's LLVM backend evidence"
   [[ "${CARGO_TARGET_DIR:-}" == /home/zcourts/projects/projects/build/debian1/keldra ]] || fail "unexpected CARGO_TARGET_DIR"
   [[ "$(git -C "$repo_root" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || fail "source checkout is not $commit"
   [[ -z "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=normal)" ]] || fail "release build requires a clean checkout"
@@ -98,7 +97,7 @@ seal_inputs() {
   ' "$manifest" >/dev/null || fail "build manifest command, target, or toolchain is invalid"
   jq -e --arg id "$job_id" --arg cwd "$repo_root" --arg version "$version" --arg platform "$platform" --arg commit "$commit" --arg build_dir "$build_dir" '
     .schema == "zrunner.job.v1" and .id == $id and .runner == "debian1" and .profile == "rust" and .cwd == $cwd and
-    .env.RUSTUP_TOOLCHAIN == "1.96.0" and .env.CARGO_PROFILE_DEV_CODEGEN_BACKEND == "llvm" and .env.KELDRA_ZRUNNER_JOB_ID == $id and .env.CARGO_TARGET_DIR == "/home/zcourts/projects/projects/build/debian1/keldra" and
+    .env.RUSTUP_TOOLCHAIN == "1.96.0" and .rust_codegen_backend == "llvm" and .env.KELDRA_ZRUNNER_JOB_ID == $id and .env.CARGO_TARGET_DIR == "/home/zcourts/projects/projects/build/debian1/keldra" and
     (.locks | index("cargo-target:debian1:keldra") != null) and
     (.argv == ["./scripts/prepare-release-image-input.sh","build",$version,$platform,$commit,$build_dir])
   ' "$job_json" >/dev/null || fail "zrunner job does not authorize this exact release build"
@@ -121,7 +120,6 @@ qualify_image() {
   local version="$1" commit="$2" image_record="$3" archive="$4" output="$5" platform expected_archive image
   [[ "${KELDRA_ZRUNNER_JOB_ID:-}" =~ ^[0-9A-HJKMNP-TV-Z]{26}$ ]] || fail "KELDRA_ZRUNNER_JOB_ID must bind this zrunner job"
   [[ "${RUSTUP_TOOLCHAIN:-}" == 1.96.0 ]] || fail "qualification requires RUSTUP_TOOLCHAIN=1.96.0"
-  [[ "${CARGO_PROFILE_DEV_CODEGEN_BACKEND:-}" == llvm ]] || fail "qualification requires zrunner's LLVM backend evidence"
   [[ "${CARGO_TARGET_DIR:-}" == /home/zcourts/projects/projects/build/*/keldra ]] || fail "qualification Cargo target changed"
   platform="$(jq -er '.platform' "$image_record")"; platform_values "$platform"
   case "$platform:$(uname -m)" in linux/amd64:x86_64|linux/arm64:aarch64|linux/arm64:arm64) ;; *) fail "$platform release qualification requires a matching native host" ;; esac

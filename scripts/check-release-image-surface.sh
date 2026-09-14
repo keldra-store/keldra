@@ -318,6 +318,7 @@ grep -Fq 'KELDRA_INPUT_MANIFEST_SHA256' docs/release-process.md
 grep -Fq 'readelf --version-info' scripts/prepare-release-image-input.sh
 grep -Fq 'keldra.zrunner-release-build.v1' scripts/prepare-release-image-input.sh
 grep -Fq 'zrunner.job.v1' scripts/prepare-release-image-input.sh
+grep -Fq '.rust_codegen_backend == "llvm"' scripts/prepare-release-image-input.sh
 grep -Fq 'https://spdx.dev/Document' scripts/record-release-image-archive.sh
 grep -Fq 'https://slsa.dev/provenance/' scripts/record-release-image-archive.sh
 grep -Fq 'commands.add_parser("three-node")' scripts/release-record.py
