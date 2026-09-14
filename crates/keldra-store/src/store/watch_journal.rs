@@ -1027,7 +1027,9 @@ mod tests {
             .unwrap()
             .into_parts();
         assert_eq!(second.changes.len(), 1);
-        assert_eq!(second_change_bytes, [first_bytes]);
+        let second_bytes = crate::watch::encoded_change_len(&second.changes[0]).unwrap();
+        assert_eq!(second_change_bytes, [second_bytes]);
+        assert_eq!(second.encoded_bytes, second_bytes);
         assert_eq!(second.changes[0].offset(), 2);
     }
 
