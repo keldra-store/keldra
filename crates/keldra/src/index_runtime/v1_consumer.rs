@@ -1388,7 +1388,7 @@ async fn select_mutation(
                     &recipe.bucket,
                     mutation.tenant_id,
                     mutation.bucket_id,
-                    &current.generation,
+                    &current,
                     scope,
                     &mutation.path,
                 )
@@ -1580,6 +1580,7 @@ async fn flush(
             .cloned()
             .collect::<Vec<_>>();
         mutations.sort_by_key(|mutation| (mutation.offset, mutation.ordinal));
+        let _preparation = super::v1_telemetry::global().begin_in_flight_preparation(STALL_AFTER);
         prepare_lane(
             writer,
             physical_catalog_identity,
