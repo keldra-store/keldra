@@ -186,6 +186,43 @@ async fn get_version_rejects_a_descriptor_id_that_disagrees_with_its_key() {
 }
 
 #[tokio::test]
+async fn version_metadata_rejects_a_descriptor_id_that_disagrees_with_its_key() {
+    let (_temporary, store) = store().await;
+    let created = store
+        .put(put(
+            "corrupt-version-metadata-id",
+            b"value",
+            Precondition::Absent,
+            "corrupt-version-metadata-id-create",
+        ))
+        .await
+        .unwrap();
+    let object_key = key("corrupt-version-metadata-id");
+    let identity = store
+        .resolve_bucket_identity(object_key.tenant(), object_key.bucket())
+        .unwrap();
+    let descriptor_key = version_key(identity, &object_key, created.version);
+    let mut stored = store
+        .stored_version_by_key(&descriptor_key)
+        .unwrap()
+        .unwrap();
+    stored.version.id = VersionId(u64::MAX);
+    store
+        .db
+        .put_cf(
+            store.cf(CF_VERSIONS).unwrap(),
+            descriptor_key,
+            stored.encode().unwrap(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.version_metadata(&object_key, created.version),
+        Err(MutationError::Storage(message)) if message.contains("disagrees with its key")
+    ));
+}
+
+#[tokio::test]
 async fn batch_get_rejects_a_descriptor_that_disagrees_with_its_current_head() {
     let (_temporary, store) = store().await;
     let created = store

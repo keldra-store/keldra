@@ -286,9 +286,12 @@ impl Store {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Option<Version>, MutationError> {
-        Ok(self
-            .stored_version_by_key(&version_key(identity, key, version_id))?
-            .map(|stored| stored.version))
+        let Some(stored) = self.stored_version_by_key(&version_key(identity, key, version_id))?
+        else {
+            return Ok(None);
+        };
+        validate_selected_version_id(version_id, &stored.version)?;
+        Ok(Some(stored.version))
     }
 
     pub(super) fn user_retained_version(
