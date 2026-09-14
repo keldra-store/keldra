@@ -812,13 +812,45 @@ async fn cursor_reads_are_validated_against_a_fresh_source_tail() {
     let final_status = source.local_watch_status().unwrap();
     assert_eq!(final_status.tail, initial_status.tail + 1);
     assert_eq!(progress.tail, final_status.tail);
-    assert_eq!(progress.reference_safe_through, final_status.tail);
-    for store in stores.stores.values() {
-        assert_eq!(
+    assert_eq!(progress.reference_safe_through, initial_status.tail);
+    let first_pass_cursors = stores
+        .stores
+        .values()
+        .map(|store| {
             store
                 .reference_delta_cursor(final_status.source_id)
-                .unwrap(),
-            final_status.tail
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        first_pass_cursors
+            .iter()
+            .all(|cursor| *cursor >= initial_status.tail && *cursor <= final_status.tail)
+    );
+    assert_eq!(
+        first_pass_cursors.iter().copied().min(),
+        Some(progress.reference_safe_through)
+    );
+    let mut progress = progress;
+    for attempt in 0..8 {
+        let status = source.local_watch_status().unwrap();
+        if progress.reference_safe_through == status.tail && progress.settled_through == status.tail
+        {
+            break;
+        }
+        assert!(
+            attempt < 7,
+            "reference delivery did not catch the moving tail"
+        );
+        progress = runner.deliver_once().await.unwrap();
+    }
+    let caught_up = source.local_watch_status().unwrap();
+    assert_eq!(progress.reference_safe_through, caught_up.tail);
+    assert_eq!(progress.settled_through, caught_up.tail);
+    for store in stores.stores.values() {
+        assert_eq!(
+            store.reference_delta_cursor(caught_up.source_id).unwrap(),
+            caught_up.tail
         );
     }
     assert_eq!(
@@ -1264,11 +1296,28 @@ async fn missing_lineage_never_advances_past_the_unproven_event() {
         blocked_offset,
         Ok(ReferenceCommitDisposition::CommittedOrAncestor),
     );
-    let completed = runner.deliver_once().await.unwrap();
-    assert_eq!(completed.settled_through, completed.tail);
-    let status = source.local_watch_status().unwrap();
-    assert_eq!(status.settled_through, completed.settled_through);
-    assert!(status.settled_through >= blocked_offset);
+    let mut completed = runner.deliver_once().await.unwrap();
+    let first_status = source.local_watch_status().unwrap();
+    assert_eq!(first_status.settled_through, completed.settled_through);
+    assert!(completed.settled_through >= blocked_offset);
+    assert!(completed.settled_through <= completed.reference_safe_through);
+    assert!(completed.reference_safe_through <= completed.tail);
+    for attempt in 0..8 {
+        let status = source.local_watch_status().unwrap();
+        if completed.reference_safe_through == status.tail
+            && completed.settled_through == status.tail
+        {
+            break;
+        }
+        assert!(
+            attempt < 7,
+            "reference delivery did not catch the moving tail"
+        );
+        completed = runner.deliver_once().await.unwrap();
+    }
+    let caught_up = source.local_watch_status().unwrap();
+    assert_eq!(completed.reference_safe_through, caught_up.tail);
+    assert_eq!(completed.settled_through, caught_up.tail);
 }
 
 #[tokio::test]
