@@ -695,6 +695,8 @@ message IndexSourceFreshness {
   uint64 indexed_next_offset = 3;
   // Latest tail observed by the query replica's background source monitor.
   optional uint64 observed_tail = 4;
+  // Observed indexable source positions not represented by this committed
+  // view. This is meaningful only when observed_tail is present.
   uint64 lag_hint = 5;
 }
 
@@ -702,6 +704,9 @@ message IndexSourceFreshness {
 // opts into waiting for a covering committed view and can reach its deadline
 // solely because indexing still lags that explicit checkpoint.
 message IndexFreshness {
+  // Common finalized atomic-program position represented by every selected
+  // partition root. Zero is a valid genesis cut for ordinary, non-atomic
+  // writes; use sources for source-generation and lag evidence.
   uint64 commit_revision = 1;
   google.protobuf.Timestamp published_at = 2;
   repeated IndexSourceFreshness sources = 3;

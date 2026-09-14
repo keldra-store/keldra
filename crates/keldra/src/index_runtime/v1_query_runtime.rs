@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use keldra_api::v1::{
     IndexAggregateOperation, IndexAggregateResult, IndexFacetBucket, IndexFacetResult,
-    IndexFreshness, IndexQueryHit, IndexSourceFreshness, ObjectAddress,
+    IndexQueryHit, ObjectAddress,
 };
 use keldra_atomic_program::MAX_OBJECT_PATH_BYTES;
 use keldra_consensus::DecisionRaft;
@@ -47,12 +47,15 @@ use super::v1_query_compile::compile_v1_query;
 
 #[path = "v1_query_cursor.rs"]
 mod cursor;
+#[path = "v1_query_freshness.rs"]
+mod query_freshness;
 #[path = "v1_query_snapshot_cache.rs"]
 mod snapshot_cache;
 use cursor::{
     QueryContinuation, QueryPosition, QueryPositionRoot, decode_query_position,
     encode_query_position, normalized_query_binding,
 };
+use query_freshness::freshness;
 use snapshot_cache::V1QuerySnapshotCache;
 
 const _: [(); MAX_OBJECT_PATH_BYTES] = [(); keldra_index::v1::MAX_QUERY_DOCUMENT_PATH_BYTES];
@@ -394,6 +397,7 @@ impl V1LocalIndexQueryExecutor {
                 &pinned,
                 start_fence,
                 result.through_atomic_position,
+                |partition| self.projections.observed_source_next(*partition),
             )?,
             next_position,
         })
@@ -1255,43 +1259,6 @@ fn page_candidates(
         .then(|| page.last().map(|candidate| candidate.candidate.document))
         .flatten();
     (page, next)
-}
-
-fn freshness(
-    request: &LocalIndexQueryRequest,
-    pinned: &PinnedRootVector,
-    fence: PlacementLogId,
-    atomic: u64,
-) -> Result<IndexFreshness, Status> {
-    let mut sources = Vec::<IndexSourceFreshness>::with_capacity(pinned.roots.len());
-    for root in &pinned.roots {
-        if let Some(last) = sources.last_mut()
-            && last.node_id == root.partition.source_node
-            && last.source_epoch.as_slice() == root.partition.source_epoch
-        {
-            last.indexed_next_offset = last.indexed_next_offset.max(root.root.next_offset);
-            continue;
-        }
-        sources.push(IndexSourceFreshness {
-            node_id: root.partition.source_node,
-            source_epoch: root.partition.source_epoch.to_vec(),
-            indexed_next_offset: root.root.next_offset,
-            observed_tail: None,
-            lag_hint: 0,
-        });
-    }
-    Ok(IndexFreshness {
-        commit_revision: atomic,
-        published_at: None,
-        sources,
-        initial_build_complete: true,
-        rebuilding: false,
-        authorization_revision: request.authorization_revision,
-        placement_term: fence.term,
-        placement_index: fence.index,
-        index_id: request.definition.index_id,
-        definition_version: request.definition.version,
-    })
 }
 
 fn facet_to_api(
