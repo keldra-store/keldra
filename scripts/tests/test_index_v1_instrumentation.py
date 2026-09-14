@@ -42,6 +42,13 @@ class InstrumentationTests(unittest.TestCase):
             self.assertIn(f'\\"{metric}\\"', source)
             self.assertIn(metric, MODULE.GAUGES)
 
+    def test_scale_evidence_handles_styled_logs_and_terminal_failure_reports(self):
+        source = HARNESS_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('gsub(/\\033\\[[0-9;]*[mK]/, "", $0)', source)
+        self.assertIn(".mutations // .partial_evidence.mutations", source)
+        self.assertIn("$r.mutations // $r.partial_evidence.mutations", source)
+        self.assertIn("$r.concurrent // $r.partial_evidence.concurrent", source)
+
     def test_profiler_encloses_concurrent_work_through_terminal_progress(self):
         source = HARNESS_SCRIPT.read_text(encoding="utf-8")
         start = source.index('start_concurrent_through_complete_profile "${active_cell}"')
