@@ -1,7 +1,9 @@
 use keldra_index::v1::{
-    IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage, PreparedQueryMembershipDelta,
-    PreparedQueryMutationBatch, ProjectionPackCredits, QueryBlockCredits, QueryBlockLimits,
-    QueryDocumentGate, RecipeIdentity, StableDocumentKey, prepare_atomic_projection_generation,
+    CanonicalRecipeState, DocumentHead, IndexingMemoryCredits, IndexingMemoryLimits,
+    IndexingMemoryStage, PreparedQueryMembershipDelta, PreparedQueryMutationBatch,
+    ProjectedDocumentState, ProjectionMutationBuffer, ProjectionPackCredits, QueryBlockCredits,
+    QueryBlockLimits, QueryDocumentGate, RecipeIdentity, StableDocumentKey, pack_component_deltas,
+    prepare_atomic_projection_generation,
 };
 
 use super::*;
@@ -95,6 +97,49 @@ fn artifact_fingerprints(plan: &AtomicPublicationPlan) -> Vec<(String, [u8; 32],
         .iter()
         .map(|artifact| (artifact.path.clone(), artifact.hash, artifact.bytes.clone()))
         .collect()
+}
+
+#[test]
+fn prepared_component_deltas_become_exact_keyed_cache_updates() {
+    let scope = [11; 32];
+    let recipe = RecipeIdentity::new([12; 32]).unwrap();
+    let state = ProjectedDocumentState::new(
+        scope,
+        DocumentHead::new(scope, "objects/one".into(), 0, 7, None, true).unwrap(),
+        vec![CanonicalRecipeState::new(recipe, vec![1]).unwrap()],
+        Vec::new(),
+    )
+    .unwrap();
+    let stable_key = state.head.stable_key;
+    let mut buffer = ProjectionMutationBuffer::new(1024 * 1024).unwrap();
+    buffer
+        .apply_source_states(scope, "objects/one", 7, vec![state], Vec::new())
+        .unwrap();
+    let (packs, _) = pack_component_deltas(buffer.seal().unwrap(), pack_credits())
+        .unwrap()
+        .into_parts();
+    let updates = projection_state_updates(&packs).unwrap();
+
+    assert!(updates.iter().any(|(key, value)| {
+        *key == projection_state_record_key(ComponentIdentity::DocumentHead, stable_key)
+            && value.is_some()
+    }));
+    assert!(updates.iter().any(|(key, value)| {
+        *key == projection_state_record_key(ComponentIdentity::SourceRecords, stable_key)
+            && value.is_some()
+    }));
+    assert_ne!(
+        projection_state_partition_key(1, 2, partition()),
+        projection_state_partition_key(
+            1,
+            2,
+            ProjectionPartitionIdentity::new([7; 32], 1, [8; 32], 3, 3, 4).unwrap()
+        )
+    );
+    assert_ne!(
+        projection_state_partition_key(1, 2, partition()),
+        projection_state_partition_key(1, 3, partition())
+    );
 }
 
 #[test]

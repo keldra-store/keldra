@@ -418,6 +418,7 @@ pub struct Store {
         Arc<std::sync::Mutex<crate::authz::CompiledAuthorizationCache>>,
     pub(crate) bucket_options_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) definition_state_lock: Arc<std::sync::Mutex<()>>,
+    index_projection_state_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) node_id: u16,
     pub(crate) sync_writes: bool,
     pub(crate) watch_retention: WatchRetention,
@@ -1054,6 +1055,7 @@ impl Store {
             )),
             bucket_options_lock: Arc::new(std::sync::Mutex::new(())),
             definition_state_lock: Arc::new(std::sync::Mutex::new(())),
+            index_projection_state_lock: Arc::new(std::sync::Mutex::new(())),
             node_id: options.node_id,
             sync_writes: options.sync_writes,
             watch_retention: options.watch_retention,
@@ -1486,6 +1488,7 @@ mod derived_consumers;
 mod distributed_publish_batch;
 mod evaluation_telemetry;
 mod index_orphan_scrub_due;
+mod index_projection_state;
 mod index_retention_due;
 mod journal_capacity;
 mod journal_routes;

@@ -14,8 +14,9 @@ use keldra_index::v1::{
     ProjectionCurrent, ProjectionFamilyPartitionDirectory, ProjectionGeneration,
     ProjectionPackCredits, ProjectionPartitionIdentity, ProjectionQueryRunDescriptor,
     QueryBlockCredits, QueryBlockLimits, QueryRunPage, StableDocumentKey,
-    component_stream_child_hashes, decode_document_head, decode_projection_catalog_activation,
-    decode_projection_current, decode_projection_family_directory, decode_projection_generation,
+    component_stream_child_hashes, decode_component_delta_segment, decode_document_head,
+    decode_projection_catalog_activation, decode_projection_current,
+    decode_projection_family_directory, decode_projection_generation,
     decode_projection_generation_header, decode_query_run_page, decode_source_records,
     encode_projection_catalog_activation, encode_projection_family_directory,
     lookup_component_record_in_verified_pack, prepare_atomic_projection_generation,
@@ -99,6 +100,7 @@ struct AtomicPublicationPlan {
     generation: ProjectionGeneration,
     sealed_bytes: u64,
     source_positions: u64,
+    state_updates: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
 impl V1ProjectionPublisher {
@@ -538,6 +540,7 @@ impl V1ProjectionPublisher {
         let sealed_bytes = plan.sealed_bytes;
         let next_offset = plan.current.next_offset;
         let generation_hash = plan.current.generation_hash;
+        let state_updates = plan.state_updates;
         let mut publications = Vec::with_capacity(plan.immutable.len());
         for artifact in self.stage_immutable_artifacts(plan.immutable).await? {
             let routing_id =
@@ -595,6 +598,17 @@ impl V1ProjectionPublisher {
             return Err(Status::data_loss(
                 "published v1 generation differs from the prepared generation",
             ));
+        }
+        if let Err(error) = self.store.advance_index_projection_state(
+            &projection_state_partition_key(tenant_id, bucket_id, partition),
+            previous.map(|previous| previous.current.generation_hash),
+            generation_hash,
+            &state_updates,
+        ) {
+            // Current is already authoritative and durable. A cache failure
+            // must not turn its successful CAS into a replaying false failure;
+            // the generation marker makes the next lookup reset and refill.
+            tracing::warn!(%error, "v1 local projected-state cache update failed");
         }
         let _ = self.changes.send(());
         // Publication and progress telemetry become true only after the
@@ -842,8 +856,9 @@ impl V1ProjectionPublisher {
         }
     }
 
-    /// Reconstruct one source object's exact predecessor from its compact
-    /// locator, head, and recipe components without a second durable cache.
+    /// Load one source object's exact predecessor from the generation-gated
+    /// local keyed projection, reconstructing and refilling from immutable
+    /// components only on the first miss after a cache reset.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn load_source_states(
         &self,
@@ -851,19 +866,20 @@ impl V1ProjectionPublisher {
         bucket: &str,
         tenant_id: u64,
         bucket_id: u64,
-        generation: &ProjectionGeneration,
+        current: &LoadedV1ProjectionGeneration,
         source_scope: [u8; 32],
         source_path: &str,
     ) -> Result<Vec<ProjectedDocumentState>, Status> {
+        let generation = &current.generation;
         let locator =
             StableDocumentKey::derive(source_scope, source_path, 0).map_err(index_status)?;
         let Some(encoded_records) = self
-            .load_component_record(
+            .load_cached_component_record(
                 storage_tenant,
                 bucket,
                 tenant_id,
                 bucket_id,
-                generation,
+                current,
                 ComponentIdentity::SourceRecords,
                 locator,
             )
@@ -887,12 +903,12 @@ impl V1ProjectionPublisher {
         let mut states = Vec::with_capacity(records.len());
         for key in records {
             let encoded_head = self
-                .load_component_record(
+                .load_cached_component_record(
                     storage_tenant,
                     bucket,
                     tenant_id,
                     bucket_id,
-                    generation,
+                    current,
                     ComponentIdentity::DocumentHead,
                     key,
                 )
@@ -916,12 +932,12 @@ impl V1ProjectionPublisher {
                     ComponentIdentity::Field(*recipe)
                 };
                 let Some(value) = self
-                    .load_component_record(
+                    .load_cached_component_record(
                         storage_tenant,
                         bucket,
                         tenant_id,
                         bucket_id,
-                        generation,
+                        current,
                         component,
                         key,
                     )
@@ -945,6 +961,48 @@ impl V1ProjectionPublisher {
         }
         states.sort_by_key(|state| state.head.source_record);
         Ok(states)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn load_cached_component_record(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        current: &LoadedV1ProjectionGeneration,
+        component: ComponentIdentity,
+        key: StableDocumentKey,
+    ) -> Result<Option<Vec<u8>>, Status> {
+        let partition_key =
+            projection_state_partition_key(tenant_id, bucket_id, current.generation.partition);
+        let record_key = projection_state_record_key(component, key);
+        match self.store.index_projection_state(
+            &partition_key,
+            current.current.generation_hash,
+            &record_key,
+        ) {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) | Err(_) => {}
+        }
+        let value = self
+            .load_component_record(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                &current.generation,
+                component,
+                key,
+            )
+            .await?;
+        let _ = self.store.cache_index_projection_state(
+            &partition_key,
+            current.current.generation_hash,
+            &record_key,
+            value.as_deref(),
+        );
+        Ok(value)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1414,6 +1472,7 @@ fn plan_atomic_publication(
     previous: Option<&LoadedV1ProjectionGeneration>,
     prepared: PreparedAtomicProjectionGeneration,
 ) -> Result<AtomicPublicationPlan, Status> {
+    let state_updates = projection_state_updates(&prepared.packs)?;
     let sealed_bytes = prepared
         .packs
         .iter()
@@ -1600,7 +1659,88 @@ fn plan_atomic_publication(
             .next_offset
             .checked_sub(query_run.source_start_offset)
             .ok_or_else(|| Status::data_loss("v1 query run source cut moves backwards"))?,
+        state_updates,
     })
+}
+
+fn projection_state_updates(
+    packs: &[keldra_index::v1::SealedProjectionDeltaPack],
+) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, Status> {
+    let mut updates = BTreeMap::new();
+    for pack in packs {
+        for delta in &pack.deltas {
+            let start = usize::try_from(delta.offset)
+                .map_err(|_| Status::data_loss("v1 cached delta offset is unbounded"))?;
+            let length = usize::try_from(delta.encoded_bytes)
+                .map_err(|_| Status::data_loss("v1 cached delta length is unbounded"))?;
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| Status::data_loss("v1 cached delta range overflows"))?;
+            let encoded = pack
+                .bytes
+                .get(start..end)
+                .ok_or_else(|| Status::data_loss("v1 cached delta range is outside its pack"))?;
+            let decoded = decode_component_delta_segment(encoded).map_err(index_status)?;
+            if decoded.component != delta.component || decoded.records.len() as u64 != delta.records
+            {
+                return Err(Status::data_loss(
+                    "v1 cached delta identity differs from its pack descriptor",
+                ));
+            }
+            for record in decoded.records {
+                let key = projection_state_record_key(delta.component, record.stable_key);
+                if updates.insert(key, record.replacement).is_some() {
+                    return Err(Status::data_loss(
+                        "v1 publication repeats one cached component record",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(updates.into_iter().collect())
+}
+
+fn projection_state_partition_key(
+    tenant_id: u64,
+    bucket_id: u64,
+    partition: ProjectionPartitionIdentity,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(113);
+    key.push(1);
+    key.extend_from_slice(&tenant_id.to_be_bytes());
+    key.extend_from_slice(&bucket_id.to_be_bytes());
+    key.extend_from_slice(&partition.family_id);
+    key.extend_from_slice(&partition.source_node.to_be_bytes());
+    key.extend_from_slice(&partition.source_epoch);
+    key.extend_from_slice(&partition.producer_node.to_be_bytes());
+    key.extend_from_slice(&partition.placement_term.to_be_bytes());
+    key.extend_from_slice(&partition.placement_index.to_be_bytes());
+    key
+}
+
+fn projection_state_record_key(
+    component: ComponentIdentity,
+    stable_key: StableDocumentKey,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(65);
+    match component {
+        ComponentIdentity::DocumentHead => key.push(1),
+        ComponentIdentity::Membership(recipe) => {
+            key.push(2);
+            key.extend_from_slice(&recipe.bytes());
+        }
+        ComponentIdentity::Field(recipe) => {
+            key.push(3);
+            key.extend_from_slice(&recipe.bytes());
+        }
+        ComponentIdentity::Order(recipe) => {
+            key.push(4);
+            key.extend_from_slice(&recipe.bytes());
+        }
+        ComponentIdentity::SourceRecords => key.push(6),
+    }
+    key.extend_from_slice(&stable_key.bytes());
+    key
 }
 
 fn require_all_immutable_publications(
