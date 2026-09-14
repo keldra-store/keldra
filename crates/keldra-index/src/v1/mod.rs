@@ -67,7 +67,8 @@ pub use projected_state::{
     inherit_projection_preserving_versions,
 };
 pub use publication::{
-    PreparedAtomicProjectionGeneration, PreparedProjectionGeneration,
+    AtomicProjectionPublicationCredits, PreparedAtomicProjectionGeneration,
+    PreparedAtomicProjectionPayload, PreparedProjectionGeneration,
     prepare_atomic_projection_catalog_transition, prepare_atomic_projection_generation,
     prepare_projection_generation,
 };

@@ -49,7 +49,57 @@ pub struct PreparedAtomicProjectionGeneration {
     _pack_credits: ProjectionPackCredits,
 }
 
+/// Opaque admission which must remain live until every prepared immutable
+/// artifact has left the publisher's in-memory staging path.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct AtomicProjectionPublicationCredits {
+    _query: QueryBlockCredits,
+    _packs: ProjectionPackCredits,
+}
+
+/// Prepared atomic bytes after their opaque memory admission is split out for
+/// explicit lifetime management by the runtime publisher.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct PreparedAtomicProjectionPayload {
+    pub packs: Vec<SealedProjectionDeltaPack>,
+    pub stream_pages: Vec<EncodedComponentStreamPage>,
+    pub query_blocks: Vec<EncodedQueryBlock>,
+    pub query_run: super::EncodedProjectionQueryRun,
+    pub query_stream_pages: Vec<EncodedQueryRunPage>,
+    pub generation: EncodedProjectionGeneration,
+    pub current: Vec<u8>,
+}
+
 impl PreparedAtomicProjectionGeneration {
+    /// Separate the publication payload from the admission that accounts for
+    /// it. Keeping this explicit prevents destructuring the public payload
+    /// fields from silently releasing their credits before durable staging.
+    #[doc(hidden)]
+    pub fn into_publication_parts(
+        self,
+    ) -> (
+        PreparedAtomicProjectionPayload,
+        AtomicProjectionPublicationCredits,
+    ) {
+        (
+            PreparedAtomicProjectionPayload {
+                packs: self.packs,
+                stream_pages: self.stream_pages,
+                query_blocks: self.query_blocks,
+                query_run: self.query_run,
+                query_stream_pages: self.query_stream_pages,
+                generation: self.generation,
+                current: self.current,
+            },
+            AtomicProjectionPublicationCredits {
+                _query: self._query_credits,
+                _packs: self._pack_credits,
+            },
+        )
+    }
+
     pub fn payload_bytes(&self) -> Result<usize, IndexError> {
         self.packs
             .iter()
