@@ -3,7 +3,10 @@
 use std::collections::VecDeque;
 use std::future::Future;
 
+use keldra_index::IndexError;
 use tonic::Status;
+
+use super::cpu::IndexQueryScheduler;
 
 pub(super) fn partition_lane_parallelism(
     total_parallelism: usize,
@@ -68,6 +71,60 @@ where
     Ok(output)
 }
 
+/// Run bounded independent query-partition I/O/async jobs and preserve their
+/// stable key order. The scheduler's configured lane count is already capped
+/// by the shared index CPU pool.
+pub(super) async fn run_query_partitions_ordered<K, I, O, F, Fut>(
+    scheduler: &IndexQueryScheduler,
+    work: Vec<(K, I)>,
+    operation: F,
+) -> Result<Vec<(K, O)>, Status>
+where
+    K: Copy + Ord + Send + 'static,
+    I: Send + 'static,
+    O: Send + 'static,
+    F: Fn(I) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = O> + Send + 'static,
+{
+    let maximum_parallelism = scheduler.maximum_parallelism();
+    let scheduler = scheduler.clone();
+    run_bounded_ordered(work, maximum_parallelism, move |input| {
+        let scheduler = scheduler.clone();
+        let operation = operation.clone();
+        async move { scheduler.run_partition(move || operation(input)).await }
+    })
+    .await
+}
+
+/// Run bounded independent query-partition CPU jobs on the one shared index
+/// Rayon pool. Application errors remain ordered outcomes, so all admitted
+/// siblings drain before the caller chooses a recovery action.
+pub(super) async fn run_query_partition_cpu_ordered<K, I, O, F>(
+    scheduler: &IndexQueryScheduler,
+    work: Vec<(K, I)>,
+    operation: F,
+) -> Result<Vec<(K, Result<O, IndexError>)>, Status>
+where
+    K: Copy + Ord + Send + 'static,
+    I: Send + 'static,
+    O: Send + 'static,
+    F: Fn(I) -> Result<O, IndexError> + Clone + Send + 'static,
+{
+    let maximum_parallelism = scheduler.maximum_parallelism();
+    let scheduler = scheduler.clone();
+    run_bounded_ordered(work, maximum_parallelism, move |input| {
+        let scheduler = scheduler.clone();
+        let operation = operation.clone();
+        async move {
+            let cpu = scheduler.clone();
+            scheduler
+                .run_partition(move || async move { cpu.run_cpu(move || operation(input)).await })
+                .await
+        }
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -78,6 +135,7 @@ mod tests {
     use keldra_index::v1::{IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage};
 
     use super::*;
+    use crate::index_runtime::cpu::IndexCpuPool;
 
     fn memory(bytes: usize) -> IndexingMemoryCredits {
         IndexingMemoryCredits::new(
@@ -199,6 +257,87 @@ mod tests {
 
         assert_eq!(peak.load(Ordering::Acquire), 2);
         assert_eq!(credits.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_scheduler_caps_lanes_and_drains_ordered_cpu_failures() {
+        let scheduler = IndexCpuPool::new(2).unwrap().query_scheduler(8);
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let output = run_query_partition_cpu_ordered(
+            &scheduler,
+            (0..6).rev().map(|key| (key, key)).collect(),
+            {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let completed = Arc::clone(&completed);
+                move |value| {
+                    let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(now, Ordering::AcqRel);
+                    std::thread::sleep(Duration::from_millis(2));
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    completed.fetch_add(1, Ordering::AcqRel);
+                    if value == 3 {
+                        Err(IndexError::Integrity)
+                    } else {
+                        Ok(value)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(scheduler.maximum_parallelism(), 2);
+        assert_eq!(peak.load(Ordering::Acquire), 2);
+        assert_eq!(completed.load(Ordering::Acquire), 6);
+        assert_eq!(
+            output.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            (0..6).collect::<Vec<_>>()
+        );
+        assert!(matches!(&output[3].1, Err(IndexError::Integrity)));
+    }
+
+    #[tokio::test]
+    async fn query_scheduler_bounds_clones_and_orders_async_partition_work() {
+        let pool = IndexCpuPool::new(2).unwrap();
+        let first_scheduler = pool.query_scheduler(2);
+        let second_scheduler = first_scheduler.clone();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let operation = {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            move |value| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                async move {
+                    let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(now, Ordering::AcqRel);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    value
+                }
+            }
+        };
+        let first = run_query_partitions_ordered(
+            &first_scheduler,
+            (0..4).rev().map(|key| (key, key)).collect(),
+            operation.clone(),
+        );
+        let second = run_query_partitions_ordered(
+            &second_scheduler,
+            (4..8).rev().map(|key| (key, key)).collect(),
+            operation,
+        );
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(peak.load(Ordering::Acquire), 2);
+        assert_eq!(first, (0..4).map(|key| (key, key)).collect::<Vec<_>>());
+        assert_eq!(second, (4..8).map(|key| (key, key)).collect::<Vec<_>>());
     }
 
     #[test]

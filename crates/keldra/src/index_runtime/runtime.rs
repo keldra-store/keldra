@@ -98,6 +98,7 @@ pub(crate) async fn start(
 
     let cpu = IndexCpuPool::new(config.indexing_cores())
         .context("initialize the fixed index Rayon pool")?;
+    let query_scheduler = cpu.query_scheduler(cpu.workers());
     let coordinator = IndexArtifactCoordinator::new(
         store.clone(),
         objects.clone(),
@@ -155,6 +156,7 @@ pub(crate) async fn start(
         catalog.clone(),
         v1_publisher.clone(),
         query_budget,
+        query_scheduler,
     ));
     let queries: Arc<dyn IndexQueryExecutor> = Arc::new(DistributedIndexQueryExecutor::new(
         local_node,

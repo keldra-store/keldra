@@ -1,6 +1,7 @@
 //! Format-v1 local query execution over one verified family root vector.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use keldra_api::v1::{
@@ -13,14 +14,16 @@ use keldra_index::IndexError;
 use keldra_index::typed_json::{AggregateOperation, FieldSchema, FieldType, ScalarValue};
 use keldra_index::v1::{
     AuthorizedQueryCandidate, LogicalFieldBinding, LogicalProjectionBinding,
-    MAX_QUERY_CANDIDATE_ADMISSION_BATCH, PinnedPartitionQueryRoot, ProjectionCatalogActivation,
-    ProjectionFamilyPartitionDirectory, ProjectionGenerationHeader, ProjectionPartitionIdentity,
-    ProjectionQueryRunDescriptor, QueryAdmissionContext, QueryArtifactLoad, QueryArtifactLoader,
-    QueryBlockCredits, QueryBlockLimits, QueryCandidateAdmission, QueryCommonCut,
-    QueryExecutionLimits, QueryFieldBinding, QueryMemoryPermit, QueryRootCutProof,
-    QuerySnapshotIdentity, RecipeIdentity, StableDocumentKey, TypedJsonQueryRequest,
-    ValidatedQuerySnapshot, decode_projection_generation_header, execute_typed_json_query,
-    projection_generation_path, query_snapshot_identity,
+    MAX_QUERY_CANDIDATE_ADMISSION_BATCH, MAX_QUERY_PARTITIONS, PinnedPartitionQueryRoot,
+    ProjectionCatalogActivation, ProjectionFamilyPartitionDirectory, ProjectionGenerationHeader,
+    ProjectionPartitionIdentity, ProjectionQueryRunDescriptor, QueryAdmissionContext,
+    QueryArtifactLoad, QueryArtifactLoader, QueryBlockCredits, QueryBlockLimits,
+    QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits, QueryFieldBinding,
+    QueryMemoryPermit, QueryPartitionExecutor, QueryPartitionJob, QueryPublicValueEncoder,
+    QueryRootCutProof, QuerySnapshotIdentity, RecipeIdentity, StableDocumentKey,
+    TypedJsonQueryRequest, ValidatedQuerySnapshot, decode_projection_generation_header,
+    execute_typed_json_query_with_cursor_and_executor, projection_generation_path,
+    query_snapshot_identity, resolve_query_partition_results,
 };
 use keldra_store::{BlobRef, PlacementLogId};
 use tonic::Status;
@@ -34,10 +37,21 @@ use crate::index_service::{
 };
 
 use super::catalog::{CatalogIdentity, IndexCatalog, PhysicalCatalogRecipe};
+use super::cpu::IndexQueryScheduler;
 use super::date::format_millis;
 use super::query_budget::{IndexQueryMemoryBudget, IndexQueryMemoryPermit};
+use super::v1_parallel::run_query_partitions_ordered;
 use super::v1_publication::V1ProjectionPublisher;
 use super::v1_query_compile::compile_v1_query;
+
+#[path = "v1_query_cursor.rs"]
+mod cursor;
+#[cfg(test)]
+use cursor::QueryPositionRoot;
+use cursor::{
+    QueryContinuation, QueryPosition, decode_query_position, encode_query_position,
+    normalized_query_binding,
+};
 
 const _: [(); MAX_OBJECT_PATH_BYTES] = [(); keldra_index::v1::MAX_QUERY_DOCUMENT_PATH_BYTES];
 
@@ -50,16 +64,7 @@ const MIN_QUERY_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_QUERY_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 // This is a logical-work limit, not a conversion of the memory lease.
 const MAX_QUERY_CANDIDATES: usize = 1_000_000;
-const QUERY_POSITION_MAGIC: &[u8; 8] = b"K1QPOS01";
-const QUERY_POSITION_FORMAT: u16 = 1;
-const QUERY_POSITION_FIXED_BYTES: usize = 8 + 2 + 32 + 32 + 4;
-const QUERY_POSITION_ROOT_FIXED_BYTES: usize = 32 + 1;
-const QUERY_POSITION_ROOT_PROOF_BYTES: usize = 8;
-// The physical directory admits a much larger future topology, but an opaque
-// public continuation must remain a bounded request value. This already
-// exceeds the executor's normal 1,024-partition default and is far above any
-// supported cluster topology.
-const MAX_QUERY_CONTINUATION_PARTITIONS: usize = 1_024;
+const MAX_PREDECESSOR_GENERATION_LOADS: usize = 4_096;
 const QUERY_SNAPSHOT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 impl QueryMemoryPermit for IndexQueryMemoryPermit {
@@ -75,6 +80,7 @@ pub(crate) struct V1LocalIndexQueryExecutor {
     catalog: IndexCatalog,
     projections: V1ProjectionPublisher,
     memory: IndexQueryMemoryBudget,
+    query_scheduler: IndexQueryScheduler,
     snapshots: V1QuerySnapshotCache,
 }
 
@@ -85,6 +91,7 @@ impl V1LocalIndexQueryExecutor {
         catalog: IndexCatalog,
         projections: V1ProjectionPublisher,
         memory: IndexQueryMemoryBudget,
+        query_scheduler: IndexQueryScheduler,
     ) -> Self {
         Self {
             decisions,
@@ -92,6 +99,7 @@ impl V1LocalIndexQueryExecutor {
             catalog,
             projections,
             memory,
+            query_scheduler,
             snapshots: V1QuerySnapshotCache::default(),
         }
     }
@@ -103,11 +111,7 @@ impl V1LocalIndexQueryExecutor {
         let (logical, recipe, schema, activation) = self.resolve_catalog(&request).await?;
         tracing::debug!("v1 query resolved its active catalog");
         let compiled = compile_v1_query(&schema, &request.query).map_err(index_status)?;
-        let facet_limits = compiled
-            .facets
-            .iter()
-            .map(|facet| facet.limit)
-            .collect::<Vec<_>>();
+        let query_binding = normalized_query_binding(&logical, &compiled).map_err(index_status)?;
         let natural_page = compiled.order.is_empty()
             && compiled.facets.is_empty()
             && compiled.aggregates.is_empty();
@@ -116,9 +120,32 @@ impl V1LocalIndexQueryExecutor {
             .as_ref()
             .map(|cursor| decode_query_position(&cursor.last_position))
             .transpose()?;
-        let resume_after_document = natural_page
-            .then(|| continuation.as_ref().map(|position| position.document))
-            .flatten();
+        if continuation
+            .as_ref()
+            .is_some_and(|position| position.query_binding != query_binding)
+        {
+            return Err(Status::invalid_argument(
+                "v1 query cursor belongs to a different normalized query",
+            ));
+        }
+        let resume_after_document =
+            match continuation.as_ref().map(|position| &position.continuation) {
+                Some(QueryContinuation::Natural(document)) if natural_page => Some(*document),
+                Some(QueryContinuation::Explicit(_)) if !natural_page => None,
+                Some(_) => {
+                    return Err(Status::invalid_argument(
+                        "v1 query cursor continuation kind differs from the query order",
+                    ));
+                }
+                None => None,
+            };
+        let explicit_search_after = continuation.as_ref().and_then(|position| {
+            if let QueryContinuation::Explicit(cursor) = &position.continuation {
+                Some(cursor)
+            } else {
+                None
+            }
+        });
         // Subscribe before the first pin so a Current publication between the
         // read and the wait cannot be lost. The publisher is the authority for
         // root-vector progress; no catalogue/directory polling interval is
@@ -184,7 +211,7 @@ impl V1LocalIndexQueryExecutor {
             "v1 query pinned its common-cut root vector"
         );
 
-        let limits = execution_limits(pinned.roots.len(), request.limit)?;
+        let limits = execution_limits(request.limit)?;
         let query = TypedJsonQueryRequest {
             logical,
             fields: schema
@@ -203,27 +230,15 @@ impl V1LocalIndexQueryExecutor {
             recipe_catalog_proofs: activation.recipe_catalog_proofs.clone(),
             predicate: compiled.predicate,
             order: compiled.order,
-            // Core scalar ordering is an implementation order, while the
-            // public contract breaks equal-count facet buckets by their
-            // canonical JSON bytes (including formatted Date strings). Keep
-            // the bounded complete bucket set until that public conversion.
-            facets: compiled
-                .facets
-                .into_iter()
-                .map(|facet| keldra_index::typed_json::FacetRequest {
-                    limit: u32::MAX,
-                    ..facet
-                })
-                .collect(),
+            facets: compiled.facets,
             aggregates: compiled.aggregates,
-            // Natural-order pages push their stable cursor into core execution
-            // and retain one lookahead candidate. Explicit ordering, facets,
-            // and aggregates still require the complete bounded candidate set.
+            // Natural order retains one lookahead. Explicit order uses the
+            // bounded collector's qualifying-count evidence and exact tuple.
             resume_after_document,
             result_limit: if natural_page {
                 request.limit.saturating_add(1)
             } else {
-                limits.maximum_results
+                request.limit
             },
         };
         let maximum_memory = self.memory.maximum_bounded_lease(MAX_QUERY_MEMORY_BYTES);
@@ -253,16 +268,19 @@ impl V1LocalIndexQueryExecutor {
                 bucket: request.definition.bucket.clone(),
                 authorization_revision: request.authorization_revision,
             };
-            let attempt = execute_typed_json_query(
+            let attempt = execute_typed_json_query_with_cursor_and_executor(
                 &mut loader,
                 &mut admission,
                 pinned.cut,
                 &pinned.roots,
                 validated_snapshot.clone(),
                 &query,
+                explicit_search_after,
+                &RuntimePublicValueEncoder,
                 limits,
                 QueryBlockLimits::default_for_memory(),
                 &mut credits,
+                &self.query_scheduler,
             )
             .await;
             let required_memory = credits.required_query_lease_bytes();
@@ -292,7 +310,7 @@ impl V1LocalIndexQueryExecutor {
                 }
             }
         };
-        let (result, snapshot) = result;
+        let (result, snapshot, explicit_next) = result;
         tracing::debug!("v1 query completed artifact execution and candidate admission");
 
         self.verify_pin(&request, &recipe, &activation, &pinned)
@@ -302,16 +320,23 @@ impl V1LocalIndexQueryExecutor {
                 "index query placement changed during v1 execution",
             ));
         }
-        let (page, next_position) = page_candidates(
-            result.candidates,
-            (!natural_page).then_some(request.resume.as_ref()).flatten(),
-            request.limit,
-        )?;
+        let (page, next_position) = if natural_page {
+            let (page, next) = page_candidates(result.candidates, request.limit);
+            (page, next.map(QueryContinuation::Natural))
+        } else {
+            (
+                result.candidates,
+                explicit_next.map(QueryContinuation::Explicit),
+            )
+        };
         if next_position.is_some() {
             self.snapshots.insert(pinned.clone(), snapshot.clone());
         }
         let next_position = next_position
-            .map(|document| encode_query_position(snapshot.identity(), document, &pinned))
+            .as_ref()
+            .map(|cursor| {
+                encode_query_position(snapshot.identity(), query_binding, cursor, &pinned)
+            })
             .transpose()?;
         let hits = page
             .into_iter()
@@ -328,8 +353,7 @@ impl V1LocalIndexQueryExecutor {
         let facet_results = result
             .facets
             .into_iter()
-            .zip(facet_limits)
-            .map(|(result, limit)| facet_to_api(&schema.fields, result, limit))
+            .map(|result| facet_to_api(&schema.fields, result))
             .collect::<Result<Vec<_>, _>>()?;
         let aggregate_results = result
             .aggregates
@@ -476,32 +500,9 @@ impl V1LocalIndexQueryExecutor {
         if directory.entries.is_empty() {
             return Err(Status::unavailable("v1 family directory has no partitions"));
         }
-        let mut newest = Vec::with_capacity(directory.entries.len());
-        for entry in &directory.entries {
-            let loaded = self
-                .projections
-                .load_current(
-                    &request.storage_tenant,
-                    &request.definition.bucket,
-                    request.tenant_id,
-                    request.bucket_id,
-                    entry.partition,
-                )
-                .await?
-                .ok_or_else(|| Status::unavailable("v1 partition current is absent"))?;
-            if loaded.generation.partition != entry.partition
-                || loaded.generation.physical_catalog_generation != recipe.physical_generation
-            {
-                return Err(Status::unavailable(
-                    "v1 partition current does not match the active catalog generation",
-                ));
-            }
-            newest.push((
-                entry.partition,
-                loaded.current.generation_hash,
-                loaded.generation,
-            ));
-        }
+        let newest = self
+            .load_newest_partition_roots(request, recipe, &directory)
+            .await?;
         let requested_cut = request.resume.as_ref().map(|cursor| cursor.commit_revision);
         let cut = requested_cut.unwrap_or_else(|| {
             newest
@@ -513,52 +514,101 @@ impl V1LocalIndexQueryExecutor {
         let common_cut = QueryCommonCut {
             through_atomic_position: cut,
         };
-        let mut roots = Vec::with_capacity(newest.len());
-        let mut generation_hashes = Vec::with_capacity(newest.len());
-        if let Some(continuation) = continuation {
+        let exact = if let Some(continuation) = continuation {
             if continuation.roots.len() != newest.len() {
                 return Err(Status::failed_precondition(
                     "v1 query continuation root vector no longer matches the family directory",
                 ));
             }
-            for ((partition, _, _), exact) in newest.into_iter().zip(&continuation.roots) {
-                let header = self
-                    .load_generation_header(request, recipe, partition, exact.generation_hash)
-                    .await?;
-                if header.physical_catalog_generation != recipe.physical_generation
-                    || header.through_atomic_position > common_cut.through_atomic_position
-                {
-                    return Err(Status::failed_precondition(
-                        "v1 query continuation generation no longer matches its pinned cut",
-                    ));
-                }
-                roots.push(pinned_query_root(
-                    recipe,
-                    partition,
-                    header,
-                    common_cut,
-                    exact.next_newer_through_atomic_position,
-                ));
-                generation_hashes.push(exact.generation_hash);
-            }
+            let work = newest
+                .into_iter()
+                .zip(&continuation.roots)
+                .map(|((partition, _, _), exact)| (partition, (partition, exact.clone())))
+                .collect();
+            let runtime = self.clone();
+            let request = request.clone();
+            let recipe = recipe.clone();
+            let outcomes = run_query_partitions_ordered(
+                &self.query_scheduler,
+                work,
+                move |(partition, exact)| {
+                    let runtime = runtime.clone();
+                    let request = request.clone();
+                    let recipe = recipe.clone();
+                    async move {
+                        let header = runtime
+                            .load_generation_header(
+                                &request,
+                                &recipe,
+                                partition,
+                                exact.generation_hash,
+                            )
+                            .await?;
+                        if header.physical_catalog_generation != recipe.physical_generation
+                            || header.through_atomic_position > common_cut.through_atomic_position
+                        {
+                            return Err(Status::failed_precondition(
+                                "v1 query continuation generation no longer matches its pinned cut",
+                            ));
+                        }
+                        Ok((
+                            pinned_query_root(
+                                &recipe,
+                                partition,
+                                header,
+                                common_cut,
+                                exact.next_newer_through_atomic_position,
+                            ),
+                            exact.generation_hash,
+                        ))
+                    }
+                },
+            )
+            .await?;
+            outcomes
+                .into_iter()
+                .map(|(_, outcome)| outcome)
+                .collect::<Result<Vec<_>, Status>>()?
         } else {
-            for (partition, generation_hash, generation) in newest {
-                let (root, generation_hash) = self
-                    .select_root_at_cut(
-                        request,
-                        recipe,
-                        partition,
-                        generation_hash,
-                        generation,
-                        common_cut,
-                    )
-                    .await?;
-                roots.push(root);
-                generation_hashes.push(generation_hash);
-            }
-        }
-        let mut exact = roots.into_iter().zip(generation_hashes).collect::<Vec<_>>();
-        exact.sort_by_key(|(root, _)| root.partition);
+            let predecessor_loads = PredecessorLoadBudget::new(MAX_PREDECESSOR_GENERATION_LOADS);
+            let work = newest
+                .into_iter()
+                .map(|(partition, generation_hash, generation)| {
+                    (partition, (partition, generation_hash, generation))
+                })
+                .collect();
+            let runtime = self.clone();
+            let request = request.clone();
+            let recipe = recipe.clone();
+            let outcomes = run_query_partitions_ordered(
+                &self.query_scheduler,
+                work,
+                move |(partition, generation_hash, generation)| {
+                    let runtime = runtime.clone();
+                    let request = request.clone();
+                    let recipe = recipe.clone();
+                    let predecessor_loads = predecessor_loads.clone();
+                    async move {
+                        runtime
+                            .select_root_at_cut(
+                                &request,
+                                &recipe,
+                                partition,
+                                generation_hash,
+                                generation,
+                                common_cut,
+                                &predecessor_loads,
+                            )
+                            .await
+                    }
+                },
+            )
+            .await?;
+            outcomes
+                .into_iter()
+                .map(|(_, outcome)| outcome)
+                .collect::<Result<Vec<_>, Status>>()?
+        };
         let (roots, generation_hashes) = exact.into_iter().unzip();
         Ok(PinnedRootVector {
             cut: common_cut,
@@ -569,6 +619,57 @@ impl V1LocalIndexQueryExecutor {
         })
     }
 
+    async fn load_newest_partition_roots(
+        &self,
+        request: &LocalIndexQueryRequest,
+        recipe: &PhysicalCatalogRecipe,
+        directory: &ProjectionFamilyPartitionDirectory,
+    ) -> Result<
+        Vec<(
+            ProjectionPartitionIdentity,
+            [u8; 32],
+            keldra_index::v1::ProjectionGeneration,
+        )>,
+        Status,
+    > {
+        let work =
+            bounded_query_partition_work(directory, |entry| (entry.partition, entry.partition))?;
+        let projections = self.projections.clone();
+        let storage_tenant = request.storage_tenant.clone();
+        let bucket = request.definition.bucket.clone();
+        let tenant_id = request.tenant_id;
+        let bucket_id = request.bucket_id;
+        let physical_generation = recipe.physical_generation;
+        let outcomes =
+            run_query_partitions_ordered(&self.query_scheduler, work, move |partition| {
+                let projections = projections.clone();
+                let storage_tenant = storage_tenant.clone();
+                let bucket = bucket.clone();
+                async move {
+                    let loaded = projections
+                        .load_current(&storage_tenant, &bucket, tenant_id, bucket_id, partition)
+                        .await?
+                        .ok_or_else(|| Status::unavailable("v1 partition current is absent"))?;
+                    if loaded.generation.partition != partition
+                        || loaded.generation.physical_catalog_generation != physical_generation
+                    {
+                        return Err(Status::unavailable(
+                            "v1 partition current does not match the active catalog generation",
+                        ));
+                    }
+                    Ok((loaded.current.generation_hash, loaded.generation))
+                }
+            })
+            .await?;
+        outcomes
+            .into_iter()
+            .map(|(partition, outcome)| {
+                outcome
+                    .map(|(generation_hash, generation)| (partition, generation_hash, generation))
+            })
+            .collect()
+    }
+
     async fn select_root_at_cut(
         &self,
         request: &LocalIndexQueryRequest,
@@ -577,6 +678,7 @@ impl V1LocalIndexQueryExecutor {
         mut generation_hash: [u8; 32],
         generation: keldra_index::v1::ProjectionGeneration,
         cut: QueryCommonCut,
+        predecessor_loads: &PredecessorLoadBudget,
     ) -> Result<(PinnedPartitionQueryRoot, [u8; 32]), Status> {
         let mut header = ProjectionGenerationHeader {
             partition: generation.partition,
@@ -601,6 +703,7 @@ impl V1LocalIndexQueryExecutor {
             let hash = header.previous_generation_hash.ok_or_else(|| {
                 Status::failed_precondition("requested v1 query cut is no longer retained")
             })?;
+            predecessor_loads.try_admit()?;
             generation_hash = hash;
             let previous = self
                 .load_generation_header(request, recipe, partition, hash)
@@ -710,6 +813,40 @@ impl V1LocalIndexQueryExecutor {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct PredecessorLoadBudget {
+    admitted: Arc<AtomicUsize>,
+    maximum: usize,
+}
+
+impl PredecessorLoadBudget {
+    fn new(maximum: usize) -> Self {
+        Self {
+            admitted: Arc::new(AtomicUsize::new(0)),
+            maximum,
+        }
+    }
+
+    fn try_admit(&self) -> Result<(), Status> {
+        self.admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.maximum).then_some(current + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| {
+                Status::resource_exhausted(format!(
+                    "v1 predecessor generation load budget exhausted (maximum {} per root-vector pin)",
+                    self.maximum
+                ))
+            })
+    }
+
+    #[cfg(test)]
+    fn admitted(&self) -> usize {
+        self.admitted.load(Ordering::Acquire)
     }
 }
 
@@ -934,6 +1071,30 @@ impl QueryArtifactLoader for RuntimeArtifactLoader {
             );
         }
     }
+
+    fn try_fork_query_loader(&self) -> Result<Option<Self>, IndexError> {
+        Ok(Some(Self::new(self.projections.clone())))
+    }
+}
+
+impl QueryPartitionExecutor for IndexQueryScheduler {
+    fn maximum_parallelism(&self) -> usize {
+        IndexQueryScheduler::maximum_parallelism(self)
+    }
+
+    async fn execute_ordered<K, O>(
+        &self,
+        jobs: Vec<(K, QueryPartitionJob<O>)>,
+    ) -> Result<Vec<(K, O)>, IndexError>
+    where
+        K: Copy + Ord + Send + 'static,
+        O: Send + 'static,
+    {
+        let outcomes = run_query_partitions_ordered(self, jobs, |job| job)
+            .await
+            .map_err(|error| IndexError::Io(error.to_string()))?;
+        resolve_query_partition_results(outcomes)
+    }
 }
 
 struct RuntimeCandidateAdmission {
@@ -1056,7 +1217,7 @@ fn next_query_memory_lease(current: u64, required: usize, maximum: u64) -> Resul
     Ok(next)
 }
 
-fn execution_limits(partitions: usize, requested: usize) -> Result<QueryExecutionLimits, Status> {
+fn execution_limits(requested: usize) -> Result<QueryExecutionLimits, Status> {
     if requested > MAX_QUERY_CANDIDATES {
         return Err(Status::resource_exhausted(
             "v1 query result page exceeds the bounded candidate limit",
@@ -1065,13 +1226,25 @@ fn execution_limits(partitions: usize, requested: usize) -> Result<QueryExecutio
     let maximum_memory = usize::try_from(MAX_QUERY_MEMORY_BYTES)
         .map_err(|_| Status::resource_exhausted("v1 query memory maximum exceeds this platform"))?;
     Ok(QueryExecutionLimits {
-        maximum_partitions: partitions.max(1),
+        maximum_partitions: MAX_QUERY_PARTITIONS,
         maximum_loaded_bytes: maximum_memory,
         maximum_heap_bytes: maximum_memory,
         maximum_candidates: MAX_QUERY_CANDIDATES,
         maximum_results: MAX_QUERY_CANDIDATES,
         ..QueryExecutionLimits::default_for_memory()
     })
+}
+
+fn bounded_query_partition_work<T>(
+    directory: &ProjectionFamilyPartitionDirectory,
+    mut map: impl FnMut(&keldra_index::v1::ProjectionPartitionDirectoryEntry) -> T,
+) -> Result<Vec<T>, Status> {
+    if directory.entries.len() > MAX_QUERY_PARTITIONS {
+        return Err(Status::resource_exhausted(
+            "v1 query partition count exceeds the bounded query limit",
+        ));
+    }
+    Ok(directory.entries.iter().map(&mut map).collect())
 }
 
 fn handoff_lineage(partition: ProjectionPartitionIdentity) -> [u8; 32] {
@@ -1124,205 +1297,14 @@ fn requirement_is_covered(
 
 fn page_candidates(
     candidates: Vec<AuthorizedQueryCandidate>,
-    resume: Option<&crate::index_service::IndexPageCursor>,
     limit: usize,
-) -> Result<(Vec<AuthorizedQueryCandidate>, Option<StableDocumentKey>), Status> {
-    let start = if let Some(resume) = resume {
-        let resume_document = decode_query_position(&resume.last_position)?.document;
-        candidates
-            .iter()
-            .position(|candidate| candidate.candidate.document == resume_document)
-            .map(|position| position + 1)
-            .ok_or_else(|| {
-                Status::failed_precondition("v1 query cursor position is no longer visible")
-            })?
-    } else {
-        0
-    };
-    let end = start.saturating_add(limit).min(candidates.len());
-    let has_more = end < candidates.len();
-    let page = candidates
-        .into_iter()
-        .skip(start)
-        .take(limit)
-        .collect::<Vec<_>>();
+) -> (Vec<AuthorizedQueryCandidate>, Option<StableDocumentKey>) {
+    let has_more = candidates.len() > limit;
+    let page = candidates.into_iter().take(limit).collect::<Vec<_>>();
     let next = has_more
         .then(|| page.last().map(|candidate| candidate.candidate.document))
         .flatten();
-    Ok((page, next))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct QueryPositionRoot {
-    generation_hash: [u8; 32],
-    next_newer_through_atomic_position: Option<u64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct QueryPosition {
-    snapshot: QuerySnapshotIdentity,
-    document: StableDocumentKey,
-    roots: Vec<QueryPositionRoot>,
-}
-
-fn decode_query_position(position: &[u8]) -> Result<QueryPosition, Status> {
-    if position.len() < QUERY_POSITION_FIXED_BYTES
-        || &position[..8] != QUERY_POSITION_MAGIC
-        || u16::from_be_bytes(position[8..10].try_into().expect("fixed format width"))
-            != QUERY_POSITION_FORMAT
-    {
-        return Err(Status::invalid_argument("v1 query cursor is invalid"));
-    }
-    let snapshot = QuerySnapshotIdentity::from_bytes(
-        position[10..42]
-            .try_into()
-            .expect("fixed query position snapshot width"),
-    )
-    .map_err(index_status)?;
-    let document = StableDocumentKey::from_bytes(
-        position[42..74]
-            .try_into()
-            .expect("fixed query position document width"),
-    )
-    .map_err(index_status)?;
-    let count = usize::try_from(u32::from_be_bytes(
-        position[74..78]
-            .try_into()
-            .expect("fixed query position count width"),
-    ))
-    .map_err(|_| Status::invalid_argument("v1 query cursor root count is invalid"))?;
-    if count == 0 || count > MAX_QUERY_CONTINUATION_PARTITIONS {
-        return Err(Status::invalid_argument(
-            "v1 query cursor root count is invalid",
-        ));
-    }
-    let minimum = QUERY_POSITION_FIXED_BYTES
-        .checked_add(
-            count
-                .checked_mul(QUERY_POSITION_ROOT_FIXED_BYTES)
-                .ok_or_else(|| Status::invalid_argument("v1 query cursor is too large"))?,
-        )
-        .ok_or_else(|| Status::invalid_argument("v1 query cursor is too large"))?;
-    let maximum = minimum
-        .checked_add(
-            count
-                .checked_mul(QUERY_POSITION_ROOT_PROOF_BYTES)
-                .ok_or_else(|| Status::invalid_argument("v1 query cursor is too large"))?,
-        )
-        .ok_or_else(|| Status::invalid_argument("v1 query cursor is too large"))?;
-    if !(minimum..=maximum).contains(&position.len()) {
-        return Err(Status::invalid_argument(
-            "v1 query cursor length is invalid",
-        ));
-    }
-    let mut offset = QUERY_POSITION_FIXED_BYTES;
-    let mut roots = Vec::with_capacity(count);
-    for _ in 0..count {
-        let generation_hash = position
-            .get(offset..offset + 32)
-            .ok_or_else(|| Status::invalid_argument("v1 query cursor is truncated"))?
-            .try_into()
-            .expect("checked generation hash width");
-        offset += 32;
-        if generation_hash == [0; 32] {
-            return Err(Status::invalid_argument(
-                "v1 query cursor generation is invalid",
-            ));
-        }
-        let proof = *position
-            .get(offset)
-            .ok_or_else(|| Status::invalid_argument("v1 query cursor is truncated"))?;
-        offset += 1;
-        let next_newer_through_atomic_position = match proof {
-            0 => None,
-            1 => {
-                let value = u64::from_be_bytes(
-                    position
-                        .get(offset..offset + 8)
-                        .ok_or_else(|| Status::invalid_argument("v1 query cursor is truncated"))?
-                        .try_into()
-                        .expect("checked proof width"),
-                );
-                offset += 8;
-                Some(value)
-            }
-            _ => {
-                return Err(Status::invalid_argument(
-                    "v1 query cursor root proof is invalid",
-                ));
-            }
-        };
-        roots.push(QueryPositionRoot {
-            generation_hash,
-            next_newer_through_atomic_position,
-        });
-    }
-    if offset != position.len() {
-        return Err(Status::invalid_argument(
-            "v1 query cursor contains trailing bytes",
-        ));
-    }
-    Ok(QueryPosition {
-        snapshot,
-        document,
-        roots,
-    })
-}
-
-fn encode_query_position(
-    snapshot: QuerySnapshotIdentity,
-    document: StableDocumentKey,
-    pinned: &PinnedRootVector,
-) -> Result<Vec<u8>, Status> {
-    if pinned.roots.is_empty()
-        || pinned.roots.len() != pinned.generation_hashes.len()
-        || pinned.roots.len() > MAX_QUERY_CONTINUATION_PARTITIONS
-    {
-        return Err(Status::resource_exhausted(
-            "v1 query root vector is too large for a bounded continuation",
-        ));
-    }
-    let count = u32::try_from(pinned.roots.len())
-        .map_err(|_| Status::resource_exhausted("v1 query root count exceeds u32"))?;
-    let proof_bytes = pinned
-        .roots
-        .iter()
-        .filter(|root| root.cut_proof.next_newer_through_atomic_position.is_some())
-        .count()
-        .checked_mul(QUERY_POSITION_ROOT_PROOF_BYTES)
-        .ok_or_else(|| Status::resource_exhausted("v1 query continuation size overflow"))?;
-    let capacity = QUERY_POSITION_FIXED_BYTES
-        .checked_add(
-            pinned
-                .roots
-                .len()
-                .checked_mul(QUERY_POSITION_ROOT_FIXED_BYTES)
-                .ok_or_else(|| Status::resource_exhausted("v1 query continuation size overflow"))?,
-        )
-        .and_then(|bytes| bytes.checked_add(proof_bytes))
-        .ok_or_else(|| Status::resource_exhausted("v1 query continuation size overflow"))?;
-    let mut position = Vec::with_capacity(capacity);
-    position.extend_from_slice(QUERY_POSITION_MAGIC);
-    position.extend_from_slice(&QUERY_POSITION_FORMAT.to_be_bytes());
-    position.extend_from_slice(&snapshot.bytes());
-    position.extend_from_slice(&document.bytes());
-    position.extend_from_slice(&count.to_be_bytes());
-    for (root, generation_hash) in pinned.roots.iter().zip(&pinned.generation_hashes) {
-        if *generation_hash == [0; 32] {
-            return Err(Status::data_loss(
-                "v1 query pinned an invalid generation identity",
-            ));
-        }
-        position.extend_from_slice(generation_hash);
-        match root.cut_proof.next_newer_through_atomic_position {
-            Some(next) => {
-                position.push(1);
-                position.extend_from_slice(&next.to_be_bytes());
-            }
-            None => position.push(0),
-        }
-    }
-    Ok(position)
+    (page, next)
 }
 
 fn freshness(
@@ -1365,12 +1347,11 @@ fn freshness(
 fn facet_to_api(
     fields: &[FieldSchema],
     result: keldra_index::typed_json::FacetResult,
-    limit: u32,
 ) -> Result<IndexFacetResult, Status> {
     let field = fields
         .get(result.field_id.get() as usize)
         .ok_or_else(|| Status::data_loss("v1 facet names an unknown field"))?;
-    let mut buckets = result
+    let buckets = result
         .buckets
         .into_iter()
         .map(|bucket| {
@@ -1380,17 +1361,22 @@ fn facet_to_api(
             })
         })
         .collect::<Result<Vec<_>, Status>>()?;
-    buckets.sort_by(|left, right| {
-        right
-            .count
-            .cmp(&left.count)
-            .then_with(|| left.value_json.cmp(&right.value_json))
-    });
-    buckets.truncate(limit as usize);
     Ok(IndexFacetResult {
         field: field.name.clone(),
         buckets,
     })
+}
+
+struct RuntimePublicValueEncoder;
+
+impl QueryPublicValueEncoder for RuntimePublicValueEncoder {
+    fn encode_public_value(
+        &self,
+        field: &FieldSchema,
+        value: &ScalarValue,
+    ) -> Result<Vec<u8>, IndexError> {
+        scalar_json(field, value).map_err(|_| IndexError::Integrity)
+    }
 }
 
 fn aggregate_to_api(
@@ -1483,18 +1469,62 @@ mod tests {
 
     #[test]
     fn execution_limits_are_fixed_independently_of_adaptive_leases() {
-        let limits = execution_limits(3, 100).unwrap();
+        let limits = execution_limits(100).unwrap();
 
+        assert_eq!(limits.maximum_partitions, MAX_QUERY_PARTITIONS);
         assert_eq!(limits.maximum_candidates, MAX_QUERY_CANDIDATES);
         assert_eq!(limits.maximum_results, MAX_QUERY_CANDIDATES);
         assert_eq!(limits.maximum_loaded_bytes, MAX_QUERY_MEMORY_BYTES as usize);
         assert_eq!(limits.maximum_heap_bytes, MAX_QUERY_MEMORY_BYTES as usize);
+
+        let mut expanded = limits;
+        expanded.maximum_partitions = MAX_QUERY_PARTITIONS + 1;
+        assert!(expanded.validate().is_err());
     }
 
     #[test]
     fn requested_page_cannot_expand_bounded_logical_work() {
-        assert!(execution_limits(1, MAX_QUERY_CANDIDATES).is_ok());
-        assert!(execution_limits(1, MAX_QUERY_CANDIDATES + 1).is_err());
+        assert!(execution_limits(MAX_QUERY_CANDIDATES).is_ok());
+        assert!(execution_limits(MAX_QUERY_CANDIDATES + 1).is_err());
+    }
+
+    #[test]
+    fn oversized_partition_directory_is_rejected_before_work_is_created() {
+        let mut directory = ProjectionFamilyPartitionDirectory {
+            family_id: [1; 32],
+            revision: 1,
+            entries: Vec::with_capacity(MAX_QUERY_PARTITIONS + 1),
+        };
+        directory.entries.resize_with(MAX_QUERY_PARTITIONS + 1, || {
+            keldra_index::v1::ProjectionPartitionDirectoryEntry {
+                partition: partition(4, 5),
+                lifecycle: keldra_index::v1::ProjectionPartitionLifecycle::Active,
+                covered_predecessors: Vec::new(),
+            }
+        });
+        let created = AtomicUsize::new(0);
+
+        let result = bounded_query_partition_work(&directory, |_| {
+            created.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert!(result.is_err());
+        assert_eq!(created.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn predecessor_load_budget_is_shared_and_does_not_overrun() {
+        let budget = PredecessorLoadBudget::new(3);
+        let peer = budget.clone();
+
+        budget.try_admit().unwrap();
+        peer.try_admit().unwrap();
+        budget.try_admit().unwrap();
+        let error = peer.try_admit().unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(budget.admitted(), 3);
+        assert_eq!(peer.admitted(), 3);
     }
 
     #[test]
@@ -1625,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn result_cursor_resumes_after_the_exact_stable_document() {
+    fn natural_page_cursor_uses_the_exact_last_returned_document() {
         let values = vec![authorized(1, "a"), authorized(2, "b"), authorized(3, "c")];
         let snapshot = QuerySnapshotIdentity::from_bytes([9; 32]).unwrap();
         let pinned = PinnedRootVector {
@@ -1641,25 +1671,17 @@ mod tests {
             },
             directory_version: keldra_store::VersionId(1),
         };
-        let resume = crate::index_service::IndexPageCursor {
-            commit_revision: 9,
-            last_position: encode_query_position(
-                snapshot,
-                StableDocumentKey::from_bytes([1; 32]).unwrap(),
-                &pinned,
-            )
-            .unwrap(),
-            authorization_revision: 4,
-        };
-        let (page, next) = page_candidates(values, Some(&resume), 1).unwrap();
-        assert_eq!(page[0].candidate.document.bytes(), [2; 32]);
-        assert_eq!(next, Some(StableDocumentKey::from_bytes([2; 32]).unwrap()));
-        let encoded = encode_query_position(snapshot, next.unwrap(), &pinned).unwrap();
+        let (page, next) = page_candidates(values, 1);
+        assert_eq!(page[0].candidate.document.bytes(), [1; 32]);
+        assert_eq!(next, Some(StableDocumentKey::from_bytes([1; 32]).unwrap()));
+        let continuation = QueryContinuation::Natural(next.unwrap());
+        let encoded = encode_query_position(snapshot, [6; 32], &continuation, &pinned).unwrap();
         assert_eq!(
             decode_query_position(&encoded).unwrap(),
             QueryPosition {
                 snapshot,
-                document: StableDocumentKey::from_bytes([2; 32]).unwrap(),
+                query_binding: [6; 32],
+                continuation,
                 roots: vec![QueryPositionRoot {
                     generation_hash: [7; 32],
                     next_newer_through_atomic_position: None,
@@ -1687,14 +1709,20 @@ mod tests {
             },
             directory_version: keldra_store::VersionId(1),
         };
-        let document = StableDocumentKey::from_bytes([3; 32]).unwrap();
+        let continuation =
+            QueryContinuation::Explicit(keldra_index::v1::ExplicitQuerySearchAfter {
+                values: vec![None, Some(ScalarValue::Signed(42))],
+                document: StableDocumentKey::from_bytes([3; 32]).unwrap(),
+            });
 
-        let decoded =
-            decode_query_position(&encode_query_position(snapshot, document, &pinned).unwrap())
-                .unwrap();
+        let decoded = decode_query_position(
+            &encode_query_position(snapshot, [6; 32], &continuation, &pinned).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(decoded.snapshot, snapshot);
-        assert_eq!(decoded.document, document);
+        assert_eq!(decoded.query_binding, [6; 32]);
+        assert_eq!(decoded.continuation, continuation);
         assert_eq!(
             decoded.roots,
             vec![
@@ -1726,8 +1754,9 @@ mod tests {
             },
             directory_version: keldra_store::VersionId(1),
         };
-        let document = StableDocumentKey::from_bytes([3; 32]).unwrap();
-        let mut encoded = encode_query_position(snapshot, document, &pinned).unwrap();
+        let continuation =
+            QueryContinuation::Natural(StableDocumentKey::from_bytes([3; 32]).unwrap());
+        let mut encoded = encode_query_position(snapshot, [6; 32], &continuation, &pinned).unwrap();
         assert!(decode_query_position(&encoded[..encoded.len() - 1]).is_err());
         encoded.push(0);
         assert!(decode_query_position(&encoded).is_err());
@@ -1901,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn facet_limit_is_applied_after_public_canonical_byte_ordering() {
+    fn facet_conversion_preserves_the_core_canonical_order() {
         let field = FieldSchema {
             id: keldra_index::typed_json::FieldId::new(0),
             name: "number".into(),
@@ -1928,8 +1957,9 @@ mod tests {
                 },
             ],
         };
-        let public = facet_to_api(&[field], result, 1).unwrap();
-        assert_eq!(public.buckets.len(), 1);
-        assert_eq!(public.buckets[0].value_json, b"10");
+        let public = facet_to_api(&[field], result).unwrap();
+        assert_eq!(public.buckets.len(), 2);
+        assert_eq!(public.buckets[0].value_json, b"2");
+        assert_eq!(public.buckets[1].value_json, b"10");
     }
 }
