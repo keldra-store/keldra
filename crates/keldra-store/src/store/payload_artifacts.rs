@@ -498,6 +498,45 @@ impl Store {
         }
     }
 
+    pub(super) fn read_complete_artifact_owned_for_reference(
+        &self,
+        reference: &BlobRef,
+    ) -> Result<Option<Vec<u8>>, MutationError> {
+        let derived = ArtifactManifest::complete(reference)?;
+        if derived.layout != ArtifactLayout::Inline {
+            return self
+                .read_complete_manifest(reference)?
+                .map(|manifest| self.read_complete_artifact_owned(&manifest))
+                .transpose();
+        }
+
+        let length = usize::try_from(derived.encoded_length)
+            .map_err(|_| artifact_storage("payload artifact length does not fit in memory"))?;
+        let bytes = self
+            .db
+            .get_cf_opt(
+                self.cf(CF_PAYLOAD_ARTIFACTS)?,
+                tagged_identity(COMPLETE_INLINE_TAG, &derived.storage_id),
+                &trusted_local_payload_read_options(),
+            )
+            .map_err(storage_error)?;
+        let Some(bytes) = bytes else {
+            // A streamed upload can be sealed at an inline logical length while
+            // retaining its chunked upload storage identity for zero-copy
+            // promotion. Only canonical inline artifacts can skip the manifest.
+            return self
+                .read_complete_manifest(reference)?
+                .map(|manifest| self.read_complete_artifact_owned(&manifest))
+                .transpose();
+        };
+        if bytes.len() != length {
+            return Err(artifact_storage(
+                "payload artifact value has the wrong encoded length",
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
     pub(super) fn read_shard_manifest(
         &self,
         identity: &ShardIdentity,

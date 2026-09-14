@@ -44,9 +44,8 @@ impl MetadataMemoryResources {
         // Payloads and immutable index artifacts are already bounded and
         // content-addressed by Keldra. Blob compression would add CPU work,
         // while even an uncompressed BlobDB miss materializes an owned value.
-        // Reuse the bounded shared cache so the manifest existence probe and
-        // immediately following value read pin the same blob instead of doing
-        // a second pread and copy.
+        // Reuse the bounded shared cache so independently repeated local reads
+        // can reuse the same blob instead of repeating its pread and copy.
         options.set_blob_compression_type(rocksdb::DBCompressionType::None);
         options.set_blob_cache(&self.block_cache);
         options.set_enable_blob_gc(true);

@@ -390,16 +390,25 @@ impl Store {
 
     /// Reads one live blob into a single owned allocation.
     pub async fn read_blob_bytes(&self, reference: &BlobRef) -> Result<Vec<u8>, MutationError> {
-        let manifest = self.live_blob_manifest(reference)?;
-        self.read_complete_artifact_owned(&manifest)
+        let state = self
+            .blob_reference_state(reference)?
+            .filter(|state| state.ref_count != 0)
+            .ok_or(MutationError::BlobNotFound)?;
+        validate_blob_reference_state(state)?;
+        self.read_complete_artifact_owned_for_reference(reference)?
+            .ok_or(MutationError::BlobNotFound)
     }
 
     pub(crate) async fn read_retained_blob_bytes(
         &self,
         reference: &BlobRef,
     ) -> Result<Vec<u8>, MutationError> {
-        let manifest = self.retained_blob_manifest(reference)?;
-        self.read_complete_artifact_owned(&manifest)
+        let state = self
+            .blob_reference_state(reference)?
+            .ok_or(MutationError::BlobNotFound)?;
+        validate_blob_reference_state(state)?;
+        self.read_complete_artifact_owned_for_reference(reference)?
+            .ok_or(MutationError::BlobNotFound)
     }
 
     pub(super) async fn contains_blob(&self, reference: &BlobRef) -> Result<bool, MutationError> {
