@@ -4,7 +4,7 @@
 //! makes every local-cache read fail closed when this node's materialization is
 //! not aligned with the caller's loaded Current.
 
-use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
+use rocksdb::{WriteBatch, WriteOptions};
 
 use super::{CF_METADATA, Store};
 use crate::MutationError;
@@ -12,14 +12,12 @@ use crate::key::STORAGE_KEY_FORMAT_VERSION;
 
 const MARKER_DOMAIN: u8 = b'M';
 const STATE_DOMAIN: u8 = b'S';
-const GARBAGE_DOMAIN: u8 = b'G';
 const KEY_PREFIX: [u8; 3] = [STORAGE_KEY_FORMAT_VERSION, b'I', b'P'];
 const MARKER_FORMAT: u8 = 1;
 const MARKER_BYTES: usize = 1 + 32 + 32;
 const MAX_PARTITION_IDENTITY_BYTES: usize = 256;
 const MAX_RECORD_KEY_BYTES: usize = 256;
 const MAX_CACHE_VALUE_BYTES: usize = 64 * 1024 * 1024;
-const CLEANUP_KEYS_PER_WRITE: usize = 128;
 
 #[derive(Clone, Copy)]
 struct Marker {
@@ -28,9 +26,17 @@ struct Marker {
 }
 
 impl Store {
+    /// Remove every process-local projection cache record on startup. Immutable
+    /// generations remain the authority and lazily repopulate this namespace.
+    pub(super) fn clear_index_projection_state_cache(&self) -> Result<(), MutationError> {
+        let mut batch = WriteBatch::default();
+        stage_prefix_delete(&mut batch, self.cf(CF_METADATA)?, &KEY_PREFIX)?;
+        self.write_cache_batch(batch)
+    }
+
     /// Returns one exact keyed state only when the partition marker names the
     /// supplied authoritative Current generation. A mismatch rotates to an
-    /// empty epoch in O(1); old epochs are reclaimed in bounded later steps.
+    /// empty epoch in O(1); the retired epoch is deleted in the same batch.
     #[doc(hidden)]
     pub fn index_projection_state(
         &self,
@@ -123,11 +129,11 @@ impl Store {
         };
         let mut batch = WriteBatch::default();
         if !preserve && let Some(previous) = previous {
-            batch.put_cf(
+            stage_prefix_delete(
+                &mut batch,
                 self.cf(CF_METADATA)?,
-                garbage_key(partition, previous.cache_epoch),
-                [],
-            );
+                &state_epoch_prefix(partition, previous.cache_epoch),
+            )?;
         }
         for (record_key, value) in updates {
             batch.put_cf(
@@ -144,7 +150,6 @@ impl Store {
                 cache_epoch: epoch,
             }),
         );
-        self.stage_bounded_garbage_cleanup(&mut batch, partition, epoch)?;
         self.write_cache_batch(batch)
     }
 
@@ -165,18 +170,17 @@ impl Store {
         };
         let mut batch = WriteBatch::default();
         if let Some(previous) = previous {
-            batch.put_cf(
+            stage_prefix_delete(
+                &mut batch,
                 self.cf(CF_METADATA)?,
-                garbage_key(partition, previous.cache_epoch),
-                [],
-            );
+                &state_epoch_prefix(partition, previous.cache_epoch),
+            )?;
         }
         batch.put_cf(
             self.cf(CF_METADATA)?,
             marker_key(partition),
             encode_marker(marker),
         );
-        self.stage_bounded_garbage_cleanup(&mut batch, partition, marker.cache_epoch)?;
         self.write_cache_batch(batch)?;
         Ok(marker)
     }
@@ -187,57 +191,6 @@ impl Store {
             .map_err(storage_error)?
             .map(|value| decode_marker(&value))
             .transpose()
-    }
-
-    fn stage_bounded_garbage_cleanup(
-        &self,
-        batch: &mut WriteBatch,
-        partition: &[u8],
-        active_epoch: [u8; 32],
-    ) -> Result<(), MutationError> {
-        let metadata = self.cf(CF_METADATA)?;
-        let garbage_prefix = domain_prefix(partition, GARBAGE_DOMAIN);
-        let Some(item) = self
-            .db
-            .iterator_cf(
-                metadata,
-                IteratorMode::From(&garbage_prefix, Direction::Forward),
-            )
-            .next()
-        else {
-            return Ok(());
-        };
-        let (garbage_key_bytes, _) = item.map_err(storage_error)?;
-        if !garbage_key_bytes.starts_with(&garbage_prefix) {
-            return Ok(());
-        }
-        let retired_epoch = decode_garbage_epoch(&garbage_key_bytes, &garbage_prefix)?;
-        if retired_epoch == active_epoch {
-            batch.delete_cf(metadata, garbage_key_bytes);
-            return Ok(());
-        }
-        let retired_prefix = state_epoch_prefix(partition, retired_epoch);
-        let mut deleted = 0usize;
-        let mut exhausted = true;
-        for item in self.db.iterator_cf(
-            metadata,
-            IteratorMode::From(&retired_prefix, Direction::Forward),
-        ) {
-            let (key, _) = item.map_err(storage_error)?;
-            if !key.starts_with(&retired_prefix) {
-                break;
-            }
-            if deleted == CLEANUP_KEYS_PER_WRITE {
-                exhausted = false;
-                break;
-            }
-            batch.delete_cf(metadata, key);
-            deleted += 1;
-        }
-        if exhausted {
-            batch.delete_cf(metadata, garbage_key_bytes);
-        }
-        Ok(())
     }
 
     fn write_cache_batch(&self, batch: WriteBatch) -> Result<(), MutationError> {
@@ -346,16 +299,21 @@ fn decode_cache_value(encoded: &[u8]) -> Result<Option<Vec<u8>>, MutationError> 
     }
 }
 
-fn garbage_key(partition: &[u8], epoch: [u8; 32]) -> Vec<u8> {
-    let mut key = domain_prefix(partition, GARBAGE_DOMAIN);
-    key.extend_from_slice(&epoch);
-    key
-}
-
-fn decode_garbage_epoch(key: &[u8], prefix: &[u8]) -> Result<[u8; 32], MutationError> {
-    key.strip_prefix(prefix)
-        .and_then(|value| value.try_into().ok())
-        .ok_or_else(|| storage("index projection garbage key is malformed"))
+fn stage_prefix_delete(
+    batch: &mut WriteBatch,
+    cf: &rocksdb::ColumnFamily,
+    prefix: &[u8],
+) -> Result<(), MutationError> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != u8::MAX {
+            end[index] += 1;
+            end.truncate(index + 1);
+            batch.delete_range_cf(cf, prefix, &end);
+            return Ok(());
+        }
+    }
+    Err(storage("index projection cache prefix has no successor"))
 }
 
 fn encode_marker(marker: Marker) -> [u8; MARKER_BYTES] {
@@ -512,5 +470,68 @@ mod tests {
                 .unwrap(),
             Some(Some(b"new".to_vec()))
         );
+    }
+
+    #[tokio::test]
+    async fn rotating_generation_range_deletes_the_complete_retired_epoch() {
+        let (_dir, store) = store().await;
+        let partition = b"partition-a";
+        store
+            .index_projection_state(partition, [1; 32], b"seed")
+            .unwrap();
+        for ordinal in 0_u16..300 {
+            store
+                .cache_index_projection_state(
+                    partition,
+                    [1; 32],
+                    &ordinal.to_be_bytes(),
+                    Some(b"value"),
+                )
+                .unwrap();
+        }
+
+        store
+            .index_projection_state(partition, [2; 32], b"seed")
+            .unwrap();
+
+        let retired = state_epoch_prefix(partition, [1; 32]);
+        let remaining = store
+            .db
+            .iterator_cf(
+                store.cf(CF_METADATA).unwrap(),
+                rocksdb::IteratorMode::From(&retired, rocksdb::Direction::Forward),
+            )
+            .take_while(|item| {
+                item.as_ref()
+                    .is_ok_and(|(key, _)| key.starts_with(&retired))
+            })
+            .count();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn reopen_clears_the_disposable_projection_cache_namespace() {
+        let directory = TempDir::new().unwrap();
+        let options = StoreOptions::new(directory.path(), 1);
+        let store = Store::open(options.clone()).await.unwrap();
+        store
+            .index_projection_state(b"partition-a", [1; 32], b"a")
+            .unwrap();
+        store
+            .cache_index_projection_state(b"partition-a", [1; 32], b"a", Some(b"one"))
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(options).await.unwrap();
+        let first = reopened
+            .db
+            .iterator_cf(
+                reopened.cf(CF_METADATA).unwrap(),
+                rocksdb::IteratorMode::From(&KEY_PREFIX, rocksdb::Direction::Forward),
+            )
+            .next()
+            .transpose()
+            .unwrap();
+        assert!(first.is_none_or(|(key, _)| !key.starts_with(&KEY_PREFIX)));
     }
 }

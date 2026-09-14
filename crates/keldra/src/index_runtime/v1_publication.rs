@@ -1705,16 +1705,12 @@ fn projection_state_partition_key(
     bucket_id: u64,
     partition: ProjectionPartitionIdentity,
 ) -> Vec<u8> {
-    let mut key = Vec::with_capacity(113);
+    let mut key = Vec::with_capacity(51);
     key.push(1);
     key.extend_from_slice(&tenant_id.to_be_bytes());
     key.extend_from_slice(&bucket_id.to_be_bytes());
     key.extend_from_slice(&partition.family_id);
     key.extend_from_slice(&partition.source_node.to_be_bytes());
-    key.extend_from_slice(&partition.source_epoch);
-    key.extend_from_slice(&partition.producer_node.to_be_bytes());
-    key.extend_from_slice(&partition.placement_term.to_be_bytes());
-    key.extend_from_slice(&partition.placement_index.to_be_bytes());
     key
 }
 

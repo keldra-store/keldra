@@ -128,13 +128,37 @@ fn prepared_component_deltas_become_exact_keyed_cache_updates() {
         *key == projection_state_record_key(ComponentIdentity::SourceRecords, stable_key)
             && value.is_some()
     }));
+}
+
+#[test]
+fn projection_cache_partition_key_uses_only_stable_logical_identity() {
+    assert_eq!(
+        projection_state_partition_key(1, 2, partition()),
+        projection_state_partition_key(
+            1,
+            2,
+            ProjectionPartitionIdentity::new([7; 32], 1, [9; 32], 3, 30, 40).unwrap()
+        )
+    );
     assert_ne!(
         projection_state_partition_key(1, 2, partition()),
         projection_state_partition_key(
             1,
             2,
-            ProjectionPartitionIdentity::new([7; 32], 1, [8; 32], 3, 3, 4).unwrap()
+            ProjectionPartitionIdentity::new([6; 32], 1, [8; 32], 2, 3, 4).unwrap()
         )
+    );
+    assert_ne!(
+        projection_state_partition_key(1, 2, partition()),
+        projection_state_partition_key(
+            1,
+            2,
+            ProjectionPartitionIdentity::new([7; 32], 2, [8; 32], 2, 3, 4).unwrap()
+        )
+    );
+    assert_ne!(
+        projection_state_partition_key(1, 2, partition()),
+        projection_state_partition_key(2, 2, partition())
     );
     assert_ne!(
         projection_state_partition_key(1, 2, partition()),

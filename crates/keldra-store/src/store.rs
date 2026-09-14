@@ -1081,6 +1081,7 @@ impl Store {
             #[cfg(test)]
             test_identity_lock: Arc::new(std::sync::Mutex::new(())),
         };
+        store.clear_index_projection_state_cache()?;
         store
             .initialize_mutation_lane_runtime(existing_database)
             .await?;
