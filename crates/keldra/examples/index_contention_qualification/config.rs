@@ -30,6 +30,58 @@ impl MutationWorkload {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct MixedWorkload {
+    pub phase_seconds: u64,
+    pub total_scheduled_operations_per_second: u64,
+    pub first_write_operations_per_second: u64,
+    pub first_read_operations_per_second: u64,
+    pub second_write_operations_per_second: u64,
+    pub second_read_operations_per_second: u64,
+}
+
+impl MixedWorkload {
+    fn new(total: u64, phase_seconds: u64) -> Result<Self> {
+        ensure!(
+            total > 0 && total <= 1_000_000 && total % 10 == 0,
+            "mixed total operation rate must be a positive multiple of 10 no greater than 1000000"
+        );
+        ensure!(phase_seconds > 0, "mixed phase duration must be non-zero");
+        Ok(Self {
+            phase_seconds,
+            total_scheduled_operations_per_second: total,
+            first_write_operations_per_second: total * 7 / 10,
+            first_read_operations_per_second: total * 3 / 10,
+            second_write_operations_per_second: total * 3 / 10,
+            second_read_operations_per_second: total * 7 / 10,
+        })
+    }
+
+    fn from_env() -> Result<Option<Self>> {
+        let key = name("MIXED_TOTAL_OPERATIONS_PER_SECOND");
+        let Some(value) = env::var_os(&key) else {
+            return Ok(None);
+        };
+        let total: u64 = value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("{key} must be valid UTF-8"))?
+            .parse()
+            .with_context(|| format!("invalid {key}"))?;
+        ensure!(
+            env::var_os(name("CONCURRENT_SECONDS")).is_none(),
+            "CONCURRENT_SECONDS is derived from MIXED_PHASE_SECONDS in mixed mode"
+        );
+        let phase_seconds = seconds("MIXED_PHASE_SECONDS", 7_200)?.as_secs();
+        Self::new(total, phase_seconds)
+            .with_context(|| format!("invalid {key}"))
+            .map(Some)
+    }
+
+    pub fn total_duration(self) -> Duration {
+        Duration::from_secs(self.phase_seconds.saturating_mul(2))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub endpoints: Vec<String>,
@@ -53,6 +105,7 @@ pub struct Config {
     pub mutation_record_bytes: usize,
     pub mutation_queue_depth: usize,
     pub target_data_operations_per_second: Option<f64>,
+    pub mixed_workload: Option<MixedWorkload>,
     pub query_rate: u64,
     pub query_max_in_flight: usize,
     pub baseline: Duration,
@@ -91,6 +144,7 @@ pub struct PublicConfig {
     pub mutation_record_bytes: usize,
     pub mutation_queue_depth: usize,
     pub target_data_operations_per_second: Option<f64>,
+    pub mixed_workload: Option<MixedWorkload>,
     pub query_rate_per_second: u64,
     pub query_max_in_flight: usize,
     pub baseline_seconds: u64,
@@ -125,6 +179,11 @@ impl Config {
         let mutation_queue_depth = number("MUTATION_QUEUE_DEPTH", 32)?;
         let target_data_operations_per_second =
             optional_positive("TARGET_DATA_OPERATIONS_PER_SECOND")?;
+        let mixed_workload = MixedWorkload::from_env()?;
+        ensure!(
+            mixed_workload.is_none() || target_data_operations_per_second.is_none(),
+            "mixed workload mode cannot also set TARGET_DATA_OPERATIONS_PER_SECOND"
+        );
         let query_rate = number("QUERY_RATE", 20)?;
         let visibility_query_rate = number("VISIBILITY_QUERY_RATE", query_rate)?;
         let query_max_in_flight = number("QUERY_MAX_IN_FLIGHT", 64)?;
@@ -173,6 +232,12 @@ impl Config {
             "single-node requires LOCAL durability and three-node requires REPLICATED durability"
         );
         super::metrics::validate_open_loop(query_rate, query_max_in_flight)?;
+        if let Some(mixed) = mixed_workload {
+            super::metrics::validate_open_loop(
+                mixed.second_read_operations_per_second,
+                query_max_in_flight,
+            )?;
+        }
         ensure!(
             (1..=1_000_000).contains(&visibility_query_rate),
             "visibility query rate must be in 1..=1000000"
@@ -206,10 +271,14 @@ impl Config {
             mutation_record_bytes,
             mutation_queue_depth,
             target_data_operations_per_second,
+            mixed_workload,
             query_rate,
             query_max_in_flight,
             baseline: seconds("BASELINE_SECONDS", 30)?,
-            concurrent: seconds("CONCURRENT_SECONDS", 300)?,
+            concurrent: mixed_workload.map_or_else(
+                || seconds("CONCURRENT_SECONDS", 300),
+                |mixed| Ok(mixed.total_duration()),
+            )?,
             post: seconds("POST_SECONDS", 30)?,
             request_timeout: millis("REQUEST_TIMEOUT_MILLISECONDS", 30_000)?,
             drain_timeout,
@@ -248,6 +317,7 @@ impl Config {
             mutation_record_bytes: self.mutation_record_bytes,
             mutation_queue_depth: self.mutation_queue_depth,
             target_data_operations_per_second: self.target_data_operations_per_second,
+            mixed_workload: self.mixed_workload,
             query_rate_per_second: self.query_rate,
             query_max_in_flight: self.query_max_in_flight,
             baseline_seconds: self.baseline.as_secs(),
@@ -377,5 +447,16 @@ mod tests {
         assert!(validate_record_counts(1_001, 1).is_err());
         assert!(validate_record_counts(1, 0).is_err());
         assert!(validate_record_counts(1, MAX_QUALIFICATION_MUTABLE_RECORDS + 1).is_err());
+    }
+
+    #[test]
+    fn mixed_workload_defines_exact_scheduled_operation_ratios() {
+        let mixed = MixedWorkload::new(4_000, 7_200).unwrap();
+        assert_eq!(mixed.first_write_operations_per_second, 2_800);
+        assert_eq!(mixed.first_read_operations_per_second, 1_200);
+        assert_eq!(mixed.second_write_operations_per_second, 1_200);
+        assert_eq!(mixed.second_read_operations_per_second, 2_800);
+        assert_eq!(mixed.total_duration(), Duration::from_secs(14_400));
+        assert!(MixedWorkload::new(4_001, 7_200).is_err());
     }
 }

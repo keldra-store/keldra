@@ -421,6 +421,7 @@ async fn run_qualification(
         &phase_token,
         config.baseline,
         Instant::now(),
+        false,
         counters.clone(),
     )
     .await?;
@@ -446,6 +447,7 @@ async fn run_qualification(
         &phase_token,
         config.concurrent,
         concurrent_started,
+        true,
         counters.clone(),
     )
     .await?;
@@ -521,6 +523,7 @@ async fn run_qualification(
         &verification_token,
         config.post,
         Instant::now(),
+        false,
         counters.clone(),
     )
     .await?;
@@ -580,7 +583,9 @@ async fn run_qualification(
     let sustained_nonempty_mutation_queue = mutation_report.queue_depth_samples > 0
         && mutation_report.minimum_sampled_client_queue_depth > 0
         && mutation_report.sampled_client_queue_empty_count == 0;
-    let mutation_load_shape_valid = if config.target_data_operations_per_second.is_some() {
+    let mutation_load_shape_valid = if config.target_data_operations_per_second.is_some()
+        || config.mixed_workload.is_some()
+    {
         mutation_report.client_queue_dropped_batches == 0
             && mutation_report.undispatched_at_measurement_deadline_batches == 0
             && mutation_report.scheduled_batches == mutation_report.client_queue_enqueued_batches
@@ -841,6 +846,7 @@ async fn run_query_phase(
     token: &str,
     duration: Duration,
     phase_start: Instant,
+    use_mixed_schedule: bool,
     counters: Arc<Counters>,
 ) -> Result<QueryPhaseReport> {
     let mut report = QueryPhaseReport::default();
@@ -849,96 +855,131 @@ async fn run_query_phase(
     let mut lateness = Latencies::new()?;
     let permits = Arc::new(Semaphore::new(config.query_max_in_flight));
     let phase_end = phase_start + duration;
-    let period_nanos = 1_000_000_000u64 / config.query_rate;
-    ensure!(period_nanos > 0, "query rate exceeds scheduler resolution");
-    let period = Duration::from_nanos(period_nanos);
+    let schedule = if use_mixed_schedule {
+        config.mixed_workload.map_or_else(
+            || vec![(duration, config.query_rate)],
+            |mixed| {
+                vec![
+                    (
+                        Duration::from_secs(mixed.phase_seconds),
+                        mixed.first_read_operations_per_second,
+                    ),
+                    (
+                        Duration::from_secs(mixed.phase_seconds),
+                        mixed.second_read_operations_per_second,
+                    ),
+                ]
+            },
+        )
+    } else {
+        vec![(duration, config.query_rate)]
+    };
     let mut tasks = JoinSet::new();
     let mut offered_definitions = BTreeSet::new();
     let mut queried_definitions = BTreeSet::new();
-    let mut sequence = 0u32;
-    loop {
-        let intended = phase_start + period.saturating_mul(sequence);
-        if intended >= phase_end {
-            break;
-        }
-        while let Some(joined) = tasks.try_join_next() {
-            record_query_completion(
-                joined,
-                phase_end,
-                &mut report,
-                &mut queried_definitions,
-                &mut end_to_end,
-                &mut service,
-                &counters,
-            )
-            .await?;
-        }
-        while !tasks.is_empty() && Instant::now() < intended {
-            tokio::select! {
-                () = tokio::time::sleep_until(intended) => break,
-                joined = tasks.join_next() => {
-                    record_query_completion(
-                        joined.expect("non-empty query task set has one completion"),
-                        phase_end,
-                        &mut report,
-                        &mut queried_definitions,
-                        &mut end_to_end,
-                        &mut service,
-                        &counters,
-                    ).await?;
+    let mut sequence = 0u64;
+    let mut segment_start = phase_start;
+    for (segment_duration, rate) in schedule {
+        let segment_end = segment_start + segment_duration;
+        let period_nanos = 1_000_000_000u64 / rate;
+        ensure!(period_nanos > 0, "query rate exceeds scheduler resolution");
+        let period = Duration::from_nanos(period_nanos);
+        let mut segment_sequence = 0_u64;
+        loop {
+            let intended =
+                segment_start + Duration::from_nanos(period_nanos.saturating_mul(segment_sequence));
+            if intended >= segment_end {
+                break;
+            }
+            while let Some(joined) = tasks.try_join_next() {
+                record_query_completion(
+                    joined,
+                    phase_end,
+                    &mut report,
+                    &mut queried_definitions,
+                    &mut end_to_end,
+                    &mut service,
+                    &counters,
+                )
+                .await?;
+            }
+            while !tasks.is_empty() && Instant::now() < intended {
+                tokio::select! {
+                    () = tokio::time::sleep_until(intended) => break,
+                    joined = tasks.join_next() => {
+                        record_query_completion(
+                            joined.expect("non-empty query task set has one completion"),
+                            phase_end,
+                            &mut report,
+                            &mut queried_definitions,
+                            &mut end_to_end,
+                            &mut service,
+                            &counters,
+                        ).await?;
+                    }
                 }
             }
-        }
-        tokio::time::sleep_until(intended).await;
-        let dispatched = Instant::now();
-        report.scheduled_queries += 1;
-        offered_definitions.insert(sequence as usize % names.len());
-        counters.scheduled.fetch_add(1, Ordering::Relaxed);
-        lateness.record(dispatched.saturating_duration_since(intended))?;
-        if dispatched.saturating_duration_since(intended) >= period {
-            report.scheduler_deadline_misses += 1;
-            counters.dropped.fetch_add(1, Ordering::Relaxed);
-            sequence = sequence.checked_add(1).context("query schedule overflow")?;
-            continue;
-        }
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            report.client_concurrency_rejections += 1;
-            counters.dropped.fetch_add(1, Ordering::Relaxed);
-            sequence = sequence.checked_add(1).context("query schedule overflow")?;
-            continue;
-        };
-        let definition_position = sequence as usize % names.len();
-        let channel = channels[sequence as usize % channels.len()].clone();
-        let name = names[definition_position].clone();
-        let bucket = config.bucket.clone();
-        let token = token.to_owned();
-        let expected = expected.clone();
-        let timeout = config.request_timeout;
-        tasks.spawn(async move {
-            let _permit = permit;
-            let service_started = Instant::now();
-            let result = tokio::time::timeout(timeout, async {
-                let mut client = index_client(channel, &token)?;
-                let response = stable_query(&mut client, &bucket, &name).await?;
-                let correctness_error = validate_stable(&response, &expected).is_err();
-                let freshness = response.freshness.context("query omitted freshness")?;
-                Ok::<_, anyhow::Error>(QueryOutcome {
-                    definition_position,
-                    revision: freshness.commit_revision,
-                    max_lag: freshness
-                        .sources
-                        .iter()
-                        .map(|source| source.lag_hint)
-                        .max()
-                        .unwrap_or(0),
-                    service: service_started.elapsed(),
-                    correctness_error,
+            tokio::time::sleep_until(intended).await;
+            let dispatched = Instant::now();
+            report.scheduled_queries += 1;
+            offered_definitions.insert(sequence as usize % names.len());
+            counters.scheduled.fetch_add(1, Ordering::Relaxed);
+            lateness.record(dispatched.saturating_duration_since(intended))?;
+            if dispatched.saturating_duration_since(intended) >= period {
+                report.scheduler_deadline_misses += 1;
+                counters.dropped.fetch_add(1, Ordering::Relaxed);
+                sequence = sequence.checked_add(1).context("query schedule overflow")?;
+                segment_sequence = segment_sequence
+                    .checked_add(1)
+                    .context("query segment schedule overflow")?;
+                continue;
+            }
+            let Ok(permit) = permits.clone().try_acquire_owned() else {
+                report.client_concurrency_rejections += 1;
+                counters.dropped.fetch_add(1, Ordering::Relaxed);
+                sequence = sequence.checked_add(1).context("query schedule overflow")?;
+                segment_sequence = segment_sequence
+                    .checked_add(1)
+                    .context("query segment schedule overflow")?;
+                continue;
+            };
+            let definition_position = sequence as usize % names.len();
+            let channel = channels[sequence as usize % channels.len()].clone();
+            let name = names[definition_position].clone();
+            let bucket = config.bucket.clone();
+            let token = token.to_owned();
+            let expected = expected.clone();
+            let timeout = config.request_timeout;
+            tasks.spawn(async move {
+                let _permit = permit;
+                let service_started = Instant::now();
+                let result = tokio::time::timeout(timeout, async {
+                    let mut client = index_client(channel, &token)?;
+                    let response = stable_query(&mut client, &bucket, &name).await?;
+                    let correctness_error = validate_stable(&response, &expected).is_err();
+                    let freshness = response.freshness.context("query omitted freshness")?;
+                    Ok::<_, anyhow::Error>(QueryOutcome {
+                        definition_position,
+                        revision: freshness.commit_revision,
+                        max_lag: freshness
+                            .sources
+                            .iter()
+                            .map(|source| source.lag_hint)
+                            .max()
+                            .unwrap_or(0),
+                        service: service_started.elapsed(),
+                        correctness_error,
+                    })
                 })
-            })
-            .await;
-            (intended, Instant::now(), result)
-        });
-        sequence = sequence.checked_add(1).context("query schedule overflow")?;
+                .await;
+                (intended, Instant::now(), result)
+            });
+            sequence = sequence.checked_add(1).context("query schedule overflow")?;
+            segment_sequence = segment_sequence
+                .checked_add(1)
+                .context("query segment schedule overflow")?;
+        }
+        segment_start = segment_end;
     }
     while let Some(joined) = tasks.join_next().await {
         record_query_completion(
@@ -1112,7 +1153,9 @@ async fn run_mutations(
     }
     drop(result_tx);
     let mut report = MutationReport {
-        load_mode: if config.target_data_operations_per_second.is_some() {
+        load_mode: if config.mixed_workload.is_some() {
+            "mixed-fixed-rate"
+        } else if config.target_data_operations_per_second.is_some() {
             "fixed-rate"
         } else {
             "saturated-queue"
@@ -1345,12 +1388,34 @@ async fn produce_mutation_jobs(
         client_queue_dropped_batches: 0,
     };
     let mut sequence = prefilled_batches;
-    if let Some(operation_rate) = config.target_data_operations_per_second {
+    if let Some(mixed) = config.mixed_workload {
+        let boundary = started + Duration::from_secs(mixed.phase_seconds);
+        let first = produce_fixed_rate_jobs(
+            started,
+            boundary,
+            config.mutation_batch_size,
+            mixed.first_write_operations_per_second as f64,
+            0,
+            job_tx.clone(),
+        )
+        .await?;
+        let second = produce_fixed_rate_jobs(
+            boundary,
+            deadline,
+            config.mutation_batch_size,
+            mixed.second_write_operations_per_second as f64,
+            first.scheduled_batches,
+            job_tx,
+        )
+        .await?;
+        return Ok(merge_producer_reports(first, second));
+    } else if let Some(operation_rate) = config.target_data_operations_per_second {
         return produce_fixed_rate_jobs(
             started,
             deadline,
             config.mutation_batch_size,
             operation_rate,
+            0,
             job_tx,
         )
         .await;
@@ -1378,6 +1443,7 @@ async fn produce_fixed_rate_jobs(
     deadline: Instant,
     mutation_batch_size: usize,
     operation_rate: f64,
+    sequence_base: u64,
     job_tx: mpsc::Sender<MutationJob>,
 ) -> Result<MutationProducerReport> {
     // The configured rate is the user data rate. The one marker operation per
@@ -1416,7 +1482,9 @@ async fn produce_fixed_rate_jobs(
             }
             report.scheduled_batches = report.scheduled_batches.saturating_add(1);
             match job_tx.try_send(MutationJob {
-                sequence: schedule_ordinal - 1,
+                sequence: sequence_base
+                    .checked_add(schedule_ordinal - 1)
+                    .context("mutation sequence overflow")?,
             }) {
                 Ok(()) => {
                     report.client_queue_enqueued_batches =
@@ -1436,6 +1504,26 @@ async fn produce_fixed_rate_jobs(
         }
     }
     Ok(report)
+}
+
+fn merge_producer_reports(
+    first: MutationProducerReport,
+    second: MutationProducerReport,
+) -> MutationProducerReport {
+    MutationProducerReport {
+        scheduled_batches: first
+            .scheduled_batches
+            .saturating_add(second.scheduled_batches),
+        undispatched_at_measurement_deadline_batches: first
+            .undispatched_at_measurement_deadline_batches
+            .saturating_add(second.undispatched_at_measurement_deadline_batches),
+        client_queue_enqueued_batches: first
+            .client_queue_enqueued_batches
+            .saturating_add(second.client_queue_enqueued_batches),
+        client_queue_dropped_batches: first
+            .client_queue_dropped_batches
+            .saturating_add(second.client_queue_dropped_batches),
+    }
 }
 
 async fn execute_mutation(

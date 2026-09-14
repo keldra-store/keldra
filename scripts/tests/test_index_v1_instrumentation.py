@@ -28,6 +28,20 @@ PROGRESS_SOURCE = (
 
 
 class InstrumentationTests(unittest.TestCase):
+    def test_scale_evidence_retains_producer_stall_state(self):
+        source = HARNESS_SCRIPT.read_text(encoding="utf-8")
+        for metric in (
+            "oldest_no_progress_age_milliseconds",
+            "stalled_partitions",
+            "retrying_partitions",
+            "halted_partitions",
+            "in_flight_preparing_partitions",
+            "oldest_in_flight_preparation_age_milliseconds",
+            "in_flight_preparation_stalled_partitions",
+        ):
+            self.assertIn(f'\\"{metric}\\"', source)
+            self.assertIn(metric, MODULE.GAUGES)
+
     def test_profiler_encloses_concurrent_work_through_terminal_progress(self):
         source = HARNESS_SCRIPT.read_text(encoding="utf-8")
         start = source.index('start_concurrent_through_complete_profile "${active_cell}"')
@@ -47,6 +61,14 @@ class InstrumentationTests(unittest.TestCase):
         final_flush = progress.index("file.flush().await?", final_snapshot)
         self.assertLess(stop_branch, final_snapshot)
         self.assertLess(final_snapshot, final_flush)
+
+    def test_mixed_mode_uses_one_driver_and_one_durable_cell(self):
+        source = HARNESS_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("KELDRA_V1_SCALE_MIXED_TOTAL_OPERATIONS_PER_SECOND", source)
+        self.assertIn("KELDRA_INDEX_CONTENTION_MIXED_PHASE_SECONDS", source)
+        self.assertIn("mixed_ratio_sequence=70-write-30-read,30-write-70-read", source)
+        self.assertNotIn("mixed-first-driver", source)
+        self.assertNotIn("mixed-second-driver", source)
 
     def test_driver_reports_live_queries_and_separate_visibility_observation(self):
         driver = PROGRESS_SOURCE.parent.parent / "index_contention_qualification.rs"
@@ -282,6 +304,8 @@ class InstrumentationTests(unittest.TestCase):
             sample = {"timestamp_unix_milliseconds": timestamp}
             for key in MODULE.COUNTERS:
                 sample[key] = multiplier
+            for key in MODULE.GAUGES:
+                sample[key] = 0
             sample.update(
                 local_next_offset=multiplier,
                 local_tail=multiplier + 1,
@@ -308,6 +332,8 @@ class InstrumentationTests(unittest.TestCase):
             sample = {"timestamp_unix_milliseconds": timestamp}
             for key in MODULE.COUNTERS:
                 sample[key] = base + increment
+            for key in MODULE.GAUGES:
+                sample[key] = 0
             sample.update(
                 local_next_offset=base + increment,
                 local_tail=base + increment + 1,
@@ -328,6 +354,8 @@ class InstrumentationTests(unittest.TestCase):
             sample = {"timestamp_unix_milliseconds": timestamp}
             for key in MODULE.COUNTERS:
                 sample[key] = value
+            for key in MODULE.GAUGES:
+                sample[key] = 0
             sample.update(
                 local_next_offset=value,
                 local_tail=value + 1,

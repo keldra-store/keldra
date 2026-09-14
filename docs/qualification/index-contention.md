@@ -184,6 +184,17 @@ malformed boundary evidence fails the cell. Raw driver
 progress, process samples, VM samples, server logs, and the complete public
 report remain beside the summary and are packaged as a SHA-256 sidecar archive.
 
+`KELDRA_V1_SCALE_MODE=mixed` runs one uninterrupted durable-store workload.
+`KELDRA_V1_SCALE_MIXED_TOTAL_OPERATIONS_PER_SECOND` is required and defines
+the combined scheduled public operations per second: the first phase schedules
+70% data writes and 30% ordinary index queries, then the second schedules 30%
+writes and 70% queries. Each phase defaults to 7,200 seconds and can be set with
+`KELDRA_V1_SCALE_MIXED_PHASE_SECONDS`. Percentages describe scheduled operation
+counts, not successful throughput or relative CPU cost. The report retains the
+four derived rates, the shared phase duration, strict query correctness,
+receipt-relative visibility, and final public-API authority convergence. The
+server and durable store are not restarted at the phase boundary.
+
 Catalog cardinality D250K is qualified separately with
 `scripts/qualify-index-catalog.sh`; the contention matrix does not conflate
 catalog admission/restart cost with sustained projection pipeline activity.

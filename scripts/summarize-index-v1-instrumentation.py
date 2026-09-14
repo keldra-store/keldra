@@ -28,6 +28,13 @@ GAUGES = (
     "local_tail",
     "lag_entries",
     "lag_oldest_age_milliseconds",
+    "oldest_no_progress_age_milliseconds",
+    "stalled_partitions",
+    "retrying_partitions",
+    "halted_partitions",
+    "in_flight_preparing_partitions",
+    "oldest_in_flight_preparation_age_milliseconds",
+    "in_flight_preparation_stalled_partitions",
 )
 PROCESS_REQUIRED_FIELDS = (
     "interval_end_epoch_milliseconds",
@@ -231,6 +238,29 @@ def pipeline_metrics(start: int, end: int, path: str) -> dict[str, Any]:
             "maximum_lag_entries": max(sample["lag_entries"] for sample in gauge_samples),
             "maximum_lag_oldest_age_milliseconds": max(
                 sample["lag_oldest_age_milliseconds"] for sample in gauge_samples
+            ),
+            "maximum_oldest_no_progress_age_milliseconds": max(
+                sample["oldest_no_progress_age_milliseconds"] for sample in gauge_samples
+            ),
+            "maximum_stalled_partitions": max(
+                sample["stalled_partitions"] for sample in gauge_samples
+            ),
+            "maximum_retrying_partitions": max(
+                sample["retrying_partitions"] for sample in gauge_samples
+            ),
+            "maximum_halted_partitions": max(
+                sample["halted_partitions"] for sample in gauge_samples
+            ),
+            "maximum_in_flight_preparing_partitions": max(
+                sample["in_flight_preparing_partitions"] for sample in gauge_samples
+            ),
+            "maximum_oldest_in_flight_preparation_age_milliseconds": max(
+                sample["oldest_in_flight_preparation_age_milliseconds"]
+                for sample in gauge_samples
+            ),
+            "maximum_in_flight_preparation_stalled_partitions": max(
+                sample["in_flight_preparation_stalled_partitions"]
+                for sample in gauge_samples
             ),
         },
     }

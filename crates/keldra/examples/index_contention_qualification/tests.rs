@@ -10,6 +10,26 @@ fn marker_ids_do_not_overlap_small_corpus_ids() {
 }
 
 #[test]
+fn mixed_mutation_phases_reconcile_into_one_uninterrupted_report() {
+    let report = merge_producer_reports(
+        MutationProducerReport {
+            scheduled_batches: 7,
+            client_queue_enqueued_batches: 6,
+            client_queue_dropped_batches: 1,
+            ..MutationProducerReport::default()
+        },
+        MutationProducerReport {
+            scheduled_batches: 3,
+            client_queue_enqueued_batches: 3,
+            ..MutationProducerReport::default()
+        },
+    );
+    assert_eq!(report.scheduled_batches, 10);
+    assert_eq!(report.client_queue_enqueued_batches, 9);
+    assert_eq!(report.client_queue_dropped_batches, 1);
+}
+
+#[test]
 fn recipes_use_one_public_multivalue_field_and_distinct_source_pointers() {
     assert_eq!(recipe_probe_pointer(0), "/probes/00");
     assert_eq!(recipe_probe_pointer(1), "/probes/01");
@@ -457,6 +477,7 @@ async fn fixed_rate_records_every_schedule_and_queue_drop() {
         started + Duration::from_millis(70),
         32,
         3_300.0,
+        0,
         job_tx,
     )
     .await
@@ -474,7 +495,7 @@ async fn fixed_rate_does_not_dispatch_schedules_after_deadline() {
     let (job_tx, mut job_rx) = mpsc::channel(16);
     let deadline = Instant::now() - Duration::from_millis(1);
     let started = deadline - Duration::from_millis(70);
-    let report = produce_fixed_rate_jobs(started, deadline, 32, 3_300.0, job_tx)
+    let report = produce_fixed_rate_jobs(started, deadline, 32, 3_300.0, 0, job_tx)
         .await
         .unwrap();
     assert_eq!(report.scheduled_batches, 7);
