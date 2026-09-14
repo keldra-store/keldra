@@ -1,14 +1,14 @@
 # keldra
 
 The official Rust client for Keldra. It provides authenticated object upload
-helpers and the complete generated Keldra 0.17 protocol, including object,
+helpers and the complete generated Keldra 0.18 v1 protocol, including object,
 authorization, administration, cluster-wide index, accounting, and PersonalDB
 clients.
 
 ## Install
 
 ```sh
-cargo add keldra@0.17.1
+cargo add keldra@0.18.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -111,7 +111,7 @@ client.unlink_object(UnlinkObjectRequest {
 ```
 
 Clone and link require cluster protocol/storage capability `1/1`. Operators must
-start 0.17 on fresh authoritative and derived-index volumes and confirm that the
+start 0.18 on fresh authoritative and derived-index volumes and confirm that the
 fresh cluster reports active capability `1/1` before applications invoke them.
 
 ## Define a typed index safely

@@ -22,9 +22,9 @@ zrunner-assigned jobs and writes its manifest only after both binaries exist
 and pass ELF, interpreter, glibc-version, and NEEDED-library validation.
 
 ```bash
-./scripts/prepare-release-image-input.sh build 0.17.1 linux/amd64 \
+./scripts/prepare-release-image-input.sh build 0.18.0 linux/amd64 \
   <SOURCE_COMMIT> \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/build-amd64
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/build-amd64
 ```
 
 After zrunner reports the successful `completed` state, export the exact
@@ -34,10 +34,10 @@ clean current checkout are not accepted as provenance:
 
 ```bash
 ./scripts/prepare-release-image-input.sh seal \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/build-amd64 \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/zrunner-job-amd64.json \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/zrunner-completed-amd64.json \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/image-input-amd64
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/build-amd64 \
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/zrunner-job-amd64.json \
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/zrunner-completed-amd64.json \
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/image-input-amd64
 ```
 
 Submit each Docker invocation itself to zrunner's `docker-build` profile; do
@@ -46,7 +46,7 @@ three values printed by the preparation command:
 
 ```bash
 docker buildx build --platform linux/amd64 \
-  --build-context "keldra-binaries=/home/zcourts/projects/projects/releases/keldra/0.17.1/image-input-amd64" \
+  --build-context "keldra-binaries=/home/zcourts/projects/projects/releases/keldra/0.18.0/image-input-amd64" \
   --build-arg "KELDRA_SOURCE_REVISION=<SOURCE_COMMIT>" \
   --build-arg "KELDRA_SERVER_SHA256=<SERVER_SHA256>" \
   --build-arg "KELDRA_CLI_SHA256=<CLI_SHA256>" \
@@ -54,7 +54,7 @@ docker buildx build --platform linux/amd64 \
   --build-arg "KELDRA_PACKAGE_IMAGE=debian:trixie-slim@sha256:<digest>" \
   --build-arg "KELDRA_RUNTIME_IMAGE=debian:trixie-slim@sha256:<digest>" \
   --provenance=mode=max --sbom=true \
-  --output "type=oci,dest=/home/zcourts/projects/projects/releases/keldra/0.17.1/keldra-image-amd64.oci.tar" \
+  --output "type=oci,dest=/home/zcourts/projects/projects/releases/keldra/0.18.0/keldra-image-amd64.oci.tar" \
   --file crates/keldra/Dockerfile.prebuilt .
 ```
 
@@ -66,11 +66,11 @@ stage. Record each archive without loading or executing it:
 
 ```bash
 ./scripts/record-release-image-archive.sh \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/image-input-amd64 \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/keldra-image-amd64.oci.tar \
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/image-input-amd64 \
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/keldra-image-amd64.oci.tar \
   debian:trixie-slim@sha256:<digest> \
   debian:trixie-slim@sha256:<digest> \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/keldra-release-image-amd64.json
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/keldra-release-image-amd64.json
 ```
 
 Record both archives before qualification. The recorder parses the in-toto
@@ -81,7 +81,7 @@ sealed-input hash, package image, and runtime image.
 Run three-node qualification on the Debian ARM64 zrunner against the exact
 ARM64 release image with explicit LLVM policy. The same contract can select
 the amd64 image only on a native x86_64 runner. Its argv is
-`./scripts/prepare-release-image-input.sh qualify 0.17.1
+`./scripts/prepare-release-image-input.sh qualify 0.18.0
 <SOURCE_COMMIT> <IMAGE_RECORD> <OCI_ARCHIVE>
 <QUALIFICATION_MANIFEST>`, with `KELDRA_ZRUNNER_JOB_ID` bound to the job ULID.
 The wrapper requires `RUSTUP_TOOLCHAIN=1.96.0`, the runner's
@@ -93,7 +93,7 @@ Convert that manifest, submitted job, and successful terminal event into
 truthful local release evidence:
 
 ```bash
-./scripts/release-record.py three-node --version 0.17.1 \
+./scripts/release-record.py three-node --version 0.18.0 \
   --commit <SOURCE_COMMIT> --image <IMAGE_RECORD> \
   --oci-archive <OCI_ARCHIVE> \
   --qualification-manifest <QUALIFICATION_MANIFEST> \
@@ -111,10 +111,10 @@ After qualification and release-record assembly, publish that one tag with:
 
 ```bash
 ./scripts/publish-release-image-archives.sh \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/keldra-release-record-0.17.1.json \
-  0.17.1 <SOURCE_COMMIT> ghcr.io/keldra-store/keldra \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/keldra-image-amd64.oci.tar \
-  /home/zcourts/projects/projects/releases/keldra/0.17.1/keldra-image-arm64.oci.tar
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/keldra-release-record-0.18.0.json \
+  0.18.0 <SOURCE_COMMIT> ghcr.io/keldra-store/keldra \
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/keldra-image-amd64.oci.tar \
+  /home/zcourts/projects/projects/releases/keldra/0.18.0/keldra-image-arm64.oci.tar
 ```
 
 The publisher completes verification and metadata collection for both outer
@@ -159,4 +159,4 @@ legacy migration, mixed-version cluster, or predecessor format guarantees.
 `Keldra v1 Index Acceptance` remains a standalone performance-qualification
 workflow for the later Performance tranche. It builds a candidate-bound kit and
 runs the sustained and Catalog-250K matrices on attested SSD and rotational
-hosts, but its evidence is not a prerequisite for publishing 0.17.1.
+hosts, but its evidence is not a prerequisite for publishing 0.18.0.

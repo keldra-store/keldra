@@ -10,14 +10,14 @@
 
 ## Workspace
 
-All workspace packages currently share version `0.17.1`:
+All workspace packages currently share version `0.18.0`:
 
 - server, CLI, and Rust client: `keldra-server`, `keldra-cli`, and `keldra`;
 - core crates: `keldra-api`, `keldra-authz`, `keldra-atomic-program`,
   `keldra-consensus`, `keldra-index`, and `keldra-store`;
 - qualification tooling: `keldra-osv-qualification`.
 
-Keldra 0.17.1 runs as one flat cluster of capacity-weighted nodes with native
+Keldra 0.18.0 runs as one flat cluster of capacity-weighted nodes with native
 on-disk state, cluster-managed mTLS between peers, cluster-wide derived
 streaming indices, and no external metadata database, external PKI, or second
 storage system. It includes PersonalDB, accounting, S3 and Git gateways, and
@@ -66,14 +66,13 @@ cargo package --locked -p keldra
 
 ## Release
 
-### Initialize 0.17 at capability 1/1
+### Initialize 0.18 at capability 1/1
 
-Keldra 0.17 changes the cluster/data-peer protocols and introduces a clean-break
-storage format and index architecture. Every 0.17 node must use fresh
-authoritative and derived-index volumes; mixed 0.16/0.17 operation and in-place
-upgrades from any earlier Keldra release are unsupported.
+Keldra 0.18 introduces a clean-break persistence format. Every 0.18 node must
+use fresh authoritative and derived-index volumes; mixed 0.17/0.18 operation
+and in-place upgrades from any earlier Keldra release are unsupported.
 
-1. Initialize a fresh 0.17 cluster. Fresh clusters start with protocol/storage
+1. Initialize a fresh 0.18 cluster. Fresh clusters start with protocol/storage
    capability `1/1`, regardless of node count. If application data must move
    from an older cluster, import it through the public API as new writes.
 2. Inspect cluster capabilities and require active protocol/storage capability
@@ -88,18 +87,18 @@ keldra --endpoint "$KELDRA_ENDPOINT" get-cluster-capabilities
 ```
 
 Never start an earlier Keldra binary against storage initialized or touched by
-0.17.
+0.18.
 
 The release tag must be the exact, unprefixed workspace version. After the
-validated commit is pushed, maintainers publish `0.17.1` with:
+validated commit is pushed, maintainers publish `0.18.0` with:
 
 ```sh
 validated_commit="$(git rev-parse HEAD)"
-git tag 0.17.1 "$validated_commit"
-git push origin refs/tags/0.17.1
+git tag 0.18.0 "$validated_commit"
+git push origin refs/tags/0.18.0
 ```
 
-Run the `Keldra Release` workflow manually with tag `0.17.1` and digest-pinned
+Run the `Keldra Release` workflow manually with tag `0.18.0` and digest-pinned
 `rust:1.96-trixie` and `debian:trixie-slim` image references. The workflow
 reruns the static and Rust gates, builds both image architectures, qualifies the
 exact amd64 candidate across three nodes, and creates an immutable release

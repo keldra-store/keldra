@@ -11,15 +11,17 @@ python3 "$(dirname "$0")/release-record.py" verify \
   --commit "$(jq -r '.source_commit' "${record}")"
 
 cat <<EOF
-Keldra ${version} introduces the v1 memory-first Typed JSON index architecture.
-Equivalent logical definitions share physical extraction, immutable segment
-artifacts, and publication work. Partition-owned hot ingress, bounded admission,
-journal-backed recovery, and atomic published root vectors keep ingestion and
-queries on one explicit consistency boundary.
+Keldra ${version} makes v1 indexing and queries bounded, recoverable, and easier
+to operate under sustained mixed workloads. Query continuations now preserve
+their exact retained root vector independently of disposable caches, partition
+work uses bounded concurrency, and compaction integrity failures are contained
+and reported without silently freezing every index. Internal object head and
+stored-version metadata now use Keldra's compact binary persistence format.
 
-This is a clean persistence and protocol break. Start ${version} on fresh
-authoritative and derived-index volumes. In-place upgrades, mixed-version
-clusters, and predecessor format identities are unsupported.
+This is a clean persistence-format break. Keldra ${version} cannot open, migrate,
+or reuse a Keldra 0.17 or earlier volume. Start it on fresh authoritative and
+derived-index volumes; in-place upgrades, mixed 0.17/${version} clusters, and
+predecessor format identities are unsupported.
 
 Known limitation: one operator secret still controls JWT signing, durable
 credential decryption, and PersonalDB identities, so those lifecycles rotate

@@ -9,11 +9,11 @@ or rotation of that one root affects all three authorities together. Keldra has
 no online rotation flow for this root: replacing it would require coordinated
 JWT rollover, durable credential re-encryption, and PersonalDB trust migration.
 This coupled lifecycle is an explicitly accepted pre-1.0 limitation; the
-authorities are not split in 0.17.1.
+authorities are not split in 0.18.0.
 
 ## Current v1 index boundary
 
-Keldra 0.17 starts on fresh authoritative and derived-index volumes. The
+Keldra 0.18 starts on fresh authoritative and derived-index volumes. The
 partition-owned Typed JSON pipeline, logical catalog, recovery, root-vector
 query cut, retention, and materialization contracts are specified by
 [KELDRA-0020](rfcs/keldra_0020_logical_index_catalog_and_shared_physical_projections.md).

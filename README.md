@@ -46,7 +46,7 @@ repository are required.
 ### 1. Start a development node
 
 ```sh
-export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.17.1
+export KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.18.0
 export KELDRA_TOKEN_SIGNING_KEY_FILE="$PWD/keldra-data/token-signing-key"
 
 mkdir -p keldra-data
@@ -163,7 +163,7 @@ Zanzibar-authorized object addressed by `(tenant, bucket, path)`.
 ## Use the Rust client
 
 ```sh
-cargo add keldra@0.17.1
+cargo add keldra@0.18.0
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -239,7 +239,7 @@ it, and the target cannot be deleted until every inbound link is removed.
 The complete Rust example is in
 [clients/rust/README.md](clients/rust/README.md#clone-bytes-or-link-a-mutable-name).
 Clone and link require the current cluster protocol/storage capability `1/1`; complete the
-fresh 0.17 bootstrap checks below before using them.
+fresh 0.18 bootstrap checks below before using them.
 
 ## Create a PersonalDB group
 
@@ -251,7 +251,7 @@ Zanzibar-authorized independently of ordinary object traffic.
 Add the public client and canonical protocol types:
 
 ```sh
-cargo add keldra@0.17.1 personaldb-protocol@0.2.2 serde_json
+cargo add keldra@0.18.0 personaldb-protocol@0.2.2 serde_json
 ```
 
 Use the same application credential created above to create a source group and
@@ -741,7 +741,7 @@ and performs a rolling restart. Index qualification is a separate SSD-kit
 phase:
 
 ```sh
-KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.17.1 \
+KELDRA_IMAGE=ghcr.io/keldra-store/keldra:0.18.0 \
   ./scripts/qualify-three-node.sh
 ```
 
@@ -760,16 +760,15 @@ Production formation uses the same sequence:
 The public gRPC endpoint may sit behind an ordinary TLS terminator. Peer traffic
 uses mandatory certificates created and rotated by the cluster.
 
-### Start 0.17 on fresh volumes
+### Start 0.18 on fresh volumes
 
-Keldra 0.17 is a clean storage-format and index-architecture break. Start every
-0.17 node with fresh authoritative and derived-index volumes; it does not open,
-migrate, or reuse a volume from an earlier Keldra release. Mixed 0.16/0.17
-clusters are unsupported. If application data must move from an older cluster,
-keep that cluster separate and import the data through the public API as new
-writes.
+Keldra 0.18 is a clean persistence-format break. Start every 0.18 node with
+fresh authoritative and derived-index volumes; it does not open, migrate, or
+reuse a 0.17 or earlier volume. Mixed 0.17/0.18 clusters are unsupported. If
+application data must move from an older cluster, keep that cluster separate
+and import the data through the public API as new writes.
 
-Fresh 0.17 clusters select protocol/storage capability `1/1` during bootstrap,
+Fresh 0.18 clusters select protocol/storage capability `1/1` during bootstrap,
 including single-node clusters. Confirm that status reports active `1/1` before
 admitting production traffic. There is no predecessor capability mode or
 activation ceremony in the clean-break release.
@@ -783,7 +782,7 @@ administration commands.
 
 Before admitting production traffic, smoke clone independence, link
 write-through, target-delete fencing, unlink, and date queries. Never start an
-earlier Keldra binary against a volume initialized or touched by 0.17.
+earlier Keldra binary against a volume initialized or touched by 0.18.
 
 ### Place storage by workload
 
@@ -853,7 +852,7 @@ The architecture contracts live in
 clean-break native-segment index architecture is specified by
 [KELDRA-0014](docs/rfcs/keldra_0014_native_segment_indexes.md). The approved
 integrated payload layout, lifecycle, GC, replication boundary, and WAL
-contract within 0.17's fresh-volume requirement is specified by
+contract within 0.18's fresh-volume requirement is specified by
 [KELDRA-0018](docs/rfcs/keldra_0018_integrated_payload_storage.md).
 
 ## Build and qualify
@@ -882,7 +881,7 @@ CPU, RSS, WAL/store-write evidence under `~/keldra_experiments`. The
 single-node and three-node wrappers qualify non-index storage, authorization,
 and cluster behavior only.
 
-Keldra 0.17 deployments start on fresh authoritative and derived-index volumes.
+Keldra 0.18 deployments start on fresh authoritative and derived-index volumes.
 Current operational boundaries are collected in the [known
 limitations](docs/known-limitations.md).
 
