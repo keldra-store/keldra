@@ -20,6 +20,7 @@ disk_budget_bytes="${KELDRA_V1_SCALE_DISK_BUDGET_BYTES:-214748364800}"
 base_port="${KELDRA_V1_SCALE_PORT:-51051}"
 server_rust_log="${KELDRA_V1_SCALE_RUST_LOG:-warn,keldra::index_runtime::v1_summary=info,keldra::observability::runtime=debug,keldra::single_node_group_commit_config=info,keldra_store::single_node_group_commit_phases=info}"
 query_rate="${KELDRA_V1_SCALE_QUERY_RATE:-20}"
+visibility_query_rate="${KELDRA_V1_SCALE_VISIBILITY_QUERY_RATE:-${query_rate}}"
 query_max_in_flight="${KELDRA_V1_SCALE_QUERY_MAX_IN_FLIGHT:-32}"
 query_memory_bytes="${KELDRA_V1_SCALE_QUERY_MEMORY_BYTES:-536870912}"
 # Load generation is deliberately independent of the server indexing-core
@@ -191,7 +192,8 @@ positive_integer "${preseeded_mutable_records}" && ((preseeded_mutable_records <
   echo "KELDRA_V1_SCALE_PRESEEDED_MUTABLE_RECORDS must be positive and no greater than KELDRA_V1_SCALE_MUTABLE_RECORDS" >&2
   exit 2
 }
-for value in "${base_port}" "${query_rate}" "${query_max_in_flight}" "${source_journal_entries}" \
+for value in "${base_port}" "${query_rate}" "${visibility_query_rate}" \
+  "${query_max_in_flight}" "${source_journal_entries}" \
   "${baseline_seconds}" "${concurrent_seconds}" "${post_seconds}" "${catalog_only_at_or_above}"
 do
   positive_integer "${value}" || { echo "server, query, journal, and duration settings must be positive integers" >&2; exit 2; }
@@ -295,6 +297,7 @@ block_device_sampler_pid=""
   echo "target_data_operations_rate_ladder=${rate_ladder}"
   echo "mutation_object_size_matrix=${object_size_matrix}"
   echo "query_rate=${query_rate}"
+  echo "visibility_query_rate=${visibility_query_rate}"
   echo "query_max_in_flight=${query_max_in_flight}"
   echo "query_memory_bytes=${query_memory_bytes}"
   echo "group_max_requests=${group_max_requests:-server-default}"
@@ -874,6 +877,7 @@ for definitions in "${definitions_values[@]}"; do
             "KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=32"
             "KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=$((mutation_workers * 8))"
             "KELDRA_INDEX_CONTENTION_QUERY_RATE=${query_rate}"
+            "KELDRA_INDEX_CONTENTION_VISIBILITY_QUERY_RATE=${visibility_query_rate}"
             "KELDRA_INDEX_CONTENTION_QUERY_MAX_IN_FLIGHT=${query_max_in_flight}"
             "KELDRA_INDEX_CONTENTION_REQUEST_TIMEOUT_MILLISECONDS=30000"
             "KELDRA_INDEX_CONTENTION_DRAIN_TIMEOUT_SECONDS=600"

@@ -404,6 +404,51 @@ async fn visibility_completion_is_separate_from_mutation_responses() {
 }
 
 #[tokio::test]
+async fn visibility_failures_preserve_transport_vs_lag_classification() {
+    let counters = Counters::new().await.unwrap();
+    let mut visibility_tasks = JoinSet::new();
+    for (id, kind) in [
+        (1, VisibilityFailureKind::ObservationDeadline),
+        (2, VisibilityFailureKind::RequestTimeout),
+        (3, VisibilityFailureKind::RequestError),
+    ] {
+        visibility_tasks.spawn(async move {
+            VisibilitySampleOutcome {
+                canary: Canary {
+                    id,
+                    version: id,
+                    completed_at: Instant::now(),
+                    sample_eligible: true,
+                },
+                definition_position: 0,
+                definition_name: "index".into(),
+                started: true,
+                successful_receipt_to_probe_start: Duration::ZERO,
+                result: Err(VisibilityProbeFailure {
+                    kind,
+                    error: anyhow::anyhow!("classified failure"),
+                }),
+            }
+        });
+    }
+    let responses = MutationResponses {
+        report: MutationReport::default(),
+        visibility_tasks,
+        successful_receipt_to_probe_start: Latencies::new().unwrap(),
+        probe_start_to_visibility: Latencies::new().unwrap(),
+        successful_receipt_to_visibility: Latencies::new().unwrap(),
+        counters,
+    };
+
+    let report = responses.finish_visibility().await.unwrap();
+    assert_eq!(report.visibility_probes_failed, 3);
+    assert_eq!(report.visibility_probe_observation_deadlines, 1);
+    assert_eq!(report.visibility_probe_request_timeouts, 1);
+    assert_eq!(report.visibility_probe_request_errors, 1);
+    assert_eq!(report.visibility_probe_failures.len(), 3);
+}
+
+#[tokio::test]
 async fn fixed_rate_records_every_schedule_and_queue_drop() {
     let (job_tx, mut job_rx) = mpsc::channel(2);
     let started = Instant::now();

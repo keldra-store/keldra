@@ -61,6 +61,7 @@ pub struct Config {
     pub request_timeout: Duration,
     pub drain_timeout: Duration,
     pub visibility_poll: Duration,
+    pub visibility_query_rate: u64,
     pub visibility_observation_timeout: Duration,
     pub visibility_sample_every_batches: u64,
     pub max_concurrent_query_p99_ms: Option<f64>,
@@ -98,6 +99,7 @@ pub struct PublicConfig {
     pub request_timeout_milliseconds: u64,
     pub drain_timeout_seconds: u64,
     pub visibility_poll_milliseconds: u64,
+    pub visibility_query_rate_per_second: u64,
     pub visibility_observation_timeout_seconds: u64,
     pub visibility_sample_every_batches: u64,
     pub max_concurrent_query_p99_ms: Option<f64>,
@@ -124,6 +126,7 @@ impl Config {
         let target_data_operations_per_second =
             optional_positive("TARGET_DATA_OPERATIONS_PER_SECOND")?;
         let query_rate = number("QUERY_RATE", 20)?;
+        let visibility_query_rate = number("VISIBILITY_QUERY_RATE", query_rate)?;
         let query_max_in_flight = number("QUERY_MAX_IN_FLIGHT", 64)?;
         ensure!(!endpoints.is_empty(), "at least one endpoint is required");
         validate_scale(definition_count, physical_recipe_count)?;
@@ -170,6 +173,10 @@ impl Config {
             "single-node requires LOCAL durability and three-node requires REPLICATED durability"
         );
         super::metrics::validate_open_loop(query_rate, query_max_in_flight)?;
+        ensure!(
+            (1..=1_000_000).contains(&visibility_query_rate),
+            "visibility query rate must be in 1..=1000000"
+        );
         let server_source_commit = required("SERVER_SOURCE_COMMIT")?;
         ensure!(
             server_source_commit.len() == 40
@@ -207,6 +214,7 @@ impl Config {
             request_timeout: millis("REQUEST_TIMEOUT_MILLISECONDS", 30_000)?,
             drain_timeout,
             visibility_poll: millis("VISIBILITY_POLL_MILLISECONDS", 100)?,
+            visibility_query_rate,
             visibility_observation_timeout: seconds(
                 "VISIBILITY_OBSERVATION_TIMEOUT_SECONDS",
                 drain_timeout.as_secs(),
@@ -248,6 +256,7 @@ impl Config {
             request_timeout_milliseconds: self.request_timeout.as_millis() as u64,
             drain_timeout_seconds: self.drain_timeout.as_secs(),
             visibility_poll_milliseconds: self.visibility_poll.as_millis() as u64,
+            visibility_query_rate_per_second: self.visibility_query_rate,
             visibility_observation_timeout_seconds: self.visibility_observation_timeout.as_secs(),
             visibility_sample_every_batches: self.visibility_sample_every_batches,
             max_concurrent_query_p99_ms: self.max_concurrent_query_p99_ms,

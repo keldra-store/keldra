@@ -14,11 +14,15 @@ mod data;
 mod metrics;
 #[path = "index_contention_qualification/progress.rs"]
 mod progress;
+#[path = "index_contention_qualification/terminal.rs"]
+mod terminal;
 #[cfg(test)]
 #[path = "index_contention_qualification/tests.rs"]
 mod tests;
 #[path = "index_contention_qualification/verification.rs"]
 mod verification;
+#[path = "index_contention_qualification/visibility.rs"]
+mod visibility;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use config::{Config, MutationWorkload};
@@ -54,6 +58,9 @@ use tonic::transport::Channel;
 #[cfg(test)]
 use verification::{PaginatedQueryResult, insert_authoritative_entry, source_has_no_observed_lag};
 use verification::{load_authoritative_mutable_state, verify_final_mutable_state};
+use visibility::{MutationResponses, VisibilitySampleOutcome, wait_canary};
+#[cfg(test)]
+use visibility::{VisibilityFailureKind, VisibilityProbeFailure};
 
 type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
 const MAX_ACTIVE_QUERY_DEFINITIONS: usize = 1_024;
@@ -85,23 +92,7 @@ struct Report {
     responsiveness: ResponsivenessReport,
 }
 
-#[derive(Debug, Serialize)]
-struct TerminalFailureReport {
-    schema: &'static str,
-    started_unix_milliseconds: u128,
-    completed_unix_milliseconds: u128,
-    result: &'static str,
-    configuration: config::PublicConfig,
-    failure: TerminalFailure,
-}
-
-#[derive(Debug, Serialize)]
-struct TerminalFailure {
-    stage: &'static str,
-    error: String,
-}
-
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct QueryPhaseReport {
     measurement_window_seconds: f64,
     total_until_all_terminal_seconds: f64,
@@ -127,7 +118,7 @@ struct QueryPhaseReport {
     queried_definition_count: usize,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct MutationReport {
     load_mode: &'static str,
     target_data_operations_per_second: Option<f64>,
@@ -176,6 +167,9 @@ struct MutationReport {
     visibility_probes_started: u64,
     visibility_probes_succeeded: u64,
     visibility_probes_failed: u64,
+    visibility_probe_observation_deadlines: u64,
+    visibility_probe_request_timeouts: u64,
+    visibility_probe_request_errors: u64,
     visibility_probe_failures: Vec<VisibilitySampleFailure>,
     visibility_probe_failures_omitted: u64,
     successful_receipt_to_probe_start_delay: LatencyReport,
@@ -229,16 +223,17 @@ struct ResponsivenessReport {
     successful_receipt_to_query_visibility_p99_within_configured_limit: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct VisibilitySampleFailure {
     canary_id: u64,
     object_version: u64,
     definition_position: usize,
     definition_name: String,
+    failure_kind: &'static str,
     error: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct MutationFailureClass {
     source: &'static str,
     code: i32,
@@ -263,76 +258,6 @@ impl MutationRequestFailure {
                 count: 1,
             }],
         }
-    }
-}
-
-struct VisibilitySampleOutcome {
-    canary: Canary,
-    definition_position: usize,
-    definition_name: String,
-    started: bool,
-    successful_receipt_to_probe_start: Duration,
-    result: Result<Duration>,
-}
-
-struct MutationResponses {
-    report: MutationReport,
-    visibility_tasks: JoinSet<VisibilitySampleOutcome>,
-    successful_receipt_to_probe_start: Latencies,
-    probe_start_to_visibility: Latencies,
-    successful_receipt_to_visibility: Latencies,
-    counters: Arc<Counters>,
-}
-
-impl MutationResponses {
-    async fn finish_visibility(mut self) -> Result<MutationReport> {
-        while let Some(sample) = self.visibility_tasks.join_next().await {
-            let sample = sample.context("visibility task panicked")?;
-            self.counters.visibility_probe_completed();
-            if sample.started {
-                self.report.visibility_probes_started += 1;
-            }
-            self.successful_receipt_to_probe_start
-                .record(sample.successful_receipt_to_probe_start)?;
-            match sample.result {
-                Ok(elapsed) => {
-                    self.report.visibility_probes_succeeded += 1;
-                    self.counters.visibility_probe_succeeded();
-                    self.successful_receipt_to_visibility.record(elapsed)?;
-                    self.probe_start_to_visibility
-                        .record(elapsed.saturating_sub(sample.successful_receipt_to_probe_start))?;
-                }
-                Err(error) => {
-                    self.report.visibility_probes_failed += 1;
-                    self.counters.visibility_probe_failed();
-                    if self.report.visibility_probe_failures.len()
-                        < MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS
-                    {
-                        self.report
-                            .visibility_probe_failures
-                            .push(VisibilitySampleFailure {
-                                canary_id: sample.canary.id,
-                                object_version: sample.canary.version,
-                                definition_position: sample.definition_position,
-                                definition_name: sample.definition_name,
-                                error: bounded_error(&format!("{error:#}")),
-                            });
-                    } else {
-                        self.report.visibility_probe_failures_omitted = self
-                            .report
-                            .visibility_probe_failures_omitted
-                            .saturating_add(1);
-                    }
-                }
-            }
-        }
-        self.report.successful_receipt_to_probe_start_delay =
-            self.successful_receipt_to_probe_start.report();
-        self.report.probe_start_to_query_visibility_latency =
-            self.probe_start_to_visibility.report();
-        self.report.successful_receipt_to_query_visibility_latency =
-            self.successful_receipt_to_visibility.report();
-        Ok(self.report)
     }
 }
 
@@ -394,12 +319,13 @@ type QueryTaskResult = (
 async fn main() -> Result<()> {
     let config = Arc::new(Config::from_env()?);
     let started_unix_milliseconds = unix_millis()?;
+    let terminal = terminal::TerminalEvidence::new();
     if std::env::var_os("KELDRA_INDEX_CONTENTION_CAPABILITY_ONLY").is_some() {
         let report = capabilities::run(&config, started_unix_milliseconds).await?;
         write_report(config.output.as_deref(), &report)?;
         return Ok(());
     }
-    match run_qualification(config.clone(), started_unix_milliseconds).await {
+    match run_qualification(config.clone(), started_unix_milliseconds, &terminal).await {
         Ok(report) => {
             write_report(config.output.as_deref(), &report)?;
             ensure!(
@@ -409,24 +335,24 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Err(error) => {
-            let report = TerminalFailureReport {
-                schema: "keldra.index-contention-terminal-failure.v2",
+            let report = terminal.report(
                 started_unix_milliseconds,
-                completed_unix_milliseconds: unix_millis()?,
-                result: "fail",
-                configuration: config.public(),
-                failure: TerminalFailure {
-                    stage: "qualification_execution",
-                    error: bounded_error(&format!("{error:#}")),
-                },
-            };
+                unix_millis()?,
+                config.public(),
+                bounded_error(&format!("{error:#}")),
+            );
             write_report(config.output.as_deref(), &report)?;
             Err(error)
         }
     }
 }
 
-async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128) -> Result<Report> {
+async fn run_qualification(
+    config: Arc<Config>,
+    started_unix_milliseconds: u128,
+    terminal: &terminal::TerminalEvidence,
+) -> Result<Report> {
+    terminal.stage("setup");
     let corpus_sha256 = data::corpus_digest(
         config.seed,
         config.stable_records,
@@ -481,6 +407,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     let progress_task = progress::start(config.progress_jsonl.clone(), counters.clone(), stop_rx);
 
     counters.phase("baseline").await;
+    terminal.stage("baseline");
     let baseline = run_query_phase(
         &config,
         &names,
@@ -492,7 +419,9 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         counters.clone(),
     )
     .await?;
+    terminal.baseline(&baseline);
     counters.phase("concurrent").await;
+    terminal.stage("concurrent");
     let concurrent_started = Instant::now();
     let concurrent_started_unix_milliseconds = unix_millis()?;
     let mutation_task = tokio::spawn(run_mutations(
@@ -515,7 +444,9 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         counters.clone(),
     )
     .await?;
+    terminal.concurrent(&concurrent);
     counters.phase("mutation_response_drain").await;
+    terminal.stage("mutation_response_drain");
     let post_load_started = Instant::now();
     let outstanding_started = Instant::now();
     let mutation_responses = tokio::time::timeout(config.drain_timeout, mutation_task)
@@ -523,23 +454,33 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         .context("mutation response drain exceeded timeout")???;
     let mutation_response_drain_seconds = outstanding_started.elapsed().as_secs_f64();
     counters.phase("visibility_observation").await;
+    terminal.stage("visibility_observation");
     let visibility_started = Instant::now();
     let mutation_report = mutation_responses.finish_visibility().await?;
+    terminal.mutations(&mutation_report);
     let visibility_observation_seconds = visibility_started.elapsed().as_secs_f64();
+    terminal.stage("credential_refresh");
     let credential_refresh_started = Instant::now();
-    let verification_token = fresh_token(&config, &setup_channels[0]).await?;
+    // All workload transports can be idle for the full visibility timeout.
+    // Establish the terminal pool before refreshing credentials so neither
+    // authentication nor authority reads race an idle HTTP/2 connection close.
+    let verification_channels = Arc::new(connect_all(&config.endpoints).await?);
+    let verification_token = fresh_token(&config, &verification_channels[0]).await?;
     let credential_refresh_seconds = credential_refresh_started.elapsed().as_secs_f64();
     counters.phase("authority_snapshot_load").await;
+    terminal.stage("authority_snapshot_load");
     let authority_started = Instant::now();
     let authority =
-        load_authoritative_mutable_state(&config, &query_channels, &verification_token).await?;
+        load_authoritative_mutable_state(&config, &verification_channels, &verification_token)
+            .await?;
     let authoritative_state_read_seconds = authority_started.elapsed().as_secs_f64();
     counters.phase("final_pagination").await;
+    terminal.stage("final_pagination");
     let convergence_started = Instant::now();
     let (final_state_verified, advisory_zero_lag, final_sources) = verify_final_mutable_state(
         &config,
         &names,
-        &query_channels,
+        &verification_channels,
         &verification_token,
         authority,
         counters.clone(),
@@ -556,6 +497,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
         final_index_convergence_seconds,
     };
     counters.phase("post").await;
+    terminal.stage("post");
     let post = run_query_phase(
         &config,
         &names,
@@ -568,6 +510,7 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     )
     .await?;
     counters.phase("complete").await;
+    terminal.stage("complete");
     let _ = stop_tx.send(true);
     progress_task.await.context("progress task panicked")??;
 
@@ -1172,9 +1115,13 @@ async fn run_mutations(
     let successful_receipt_to_visibility = Latencies::new()?;
     let mut visibility_tasks = JoinSet::new();
     // Bound observer traffic independently from workload queries. Every
-    // predetermined sample waits for a permit and reports that wait separately,
-    // so neither favorable censoring nor observer queueing is hidden.
+    // predetermined sample participates in one global query-start schedule and
+    // acquires concurrency per RPC; pacing and permit waits remain inside the
+    // reported end-to-end visibility latency.
     let visibility_permits = Arc::new(Semaphore::new(config.query_max_in_flight));
+    let visibility_pacer = Arc::new(visibility::VisibilityQueryPacer::new(
+        config.visibility_query_rate,
+    )?);
     let mut visibility_sample_ordinal = 0_u64;
     let mut last_terminal_response_at = mutation_started;
     while let Some((terminal_at, job, event)) = result_rx.recv().await {
@@ -1262,40 +1209,31 @@ async fn run_mutations(
                         let request_timeout = config.request_timeout;
                         let observation_timeout = config.visibility_observation_timeout;
                         let permits = visibility_permits.clone();
+                        let pacer = visibility_pacer.clone();
                         let probe_counters = counters.clone();
                         visibility_tasks.spawn(async move {
-                            let permit_result = permits.acquire_owned().await;
                             let probe_started = Instant::now();
                             let successful_receipt_to_probe_start =
                                 probe_started.saturating_duration_since(canary.completed_at);
-                            let (started, result) = match permit_result {
-                                Ok(permit) => {
-                                    let _permit = permit;
-                                    probe_counters.visibility_probe_started();
-                                    (
-                                        true,
-                                        wait_canary(
-                                            &channel,
-                                            &token,
-                                            &bucket,
-                                            &name,
-                                            canary,
-                                            poll,
-                                            request_timeout,
-                                            observation_timeout,
-                                        )
-                                        .await,
-                                    )
-                                }
-                                Err(error) => {
-                                    (false, Err(anyhow!("visibility semaphore closed: {error}")))
-                                }
-                            };
+                            probe_counters.visibility_probe_started();
+                            let result = wait_canary(
+                                &channel,
+                                &token,
+                                &bucket,
+                                &name,
+                                canary,
+                                poll,
+                                request_timeout,
+                                observation_timeout,
+                                pacer,
+                                permits,
+                            )
+                            .await;
                             VisibilitySampleOutcome {
                                 canary,
                                 definition_position,
                                 definition_name: name,
-                                started,
+                                started: true,
                                 successful_receipt_to_probe_start,
                                 result,
                             }
@@ -1350,7 +1288,7 @@ async fn run_mutations(
     report.successful_data_ingest_throughput_payload_bytes_per_second =
         report.successful_data_payload_bytes_in_window as f64 / report.load_window_seconds;
     report.failure_diagnostics_definition = "fully_successful_batches, structurally_valid_batches_with_operation_failures, and indeterminate_batches are disjoint terminal outcomes; indeterminate_batches had no structurally valid per-operation response, so their operation outcomes are indeterminate rather than falsely classified as failed; successful and failed operations come from structurally valid responses; successful sibling outcomes in a partial response remain counted; failure_classes retains bounded diagnostics; at most eight distinct classes are retained and failure_occurrences_omitted counts occurrences from additional classes";
-    report.visibility_definition = "successful_receipt_to_probe_start_delay measures local observer queueing; probe_start_to_query_visibility_latency measures active polling to the first ordinary-query hit with the exact object_version; successful_receipt_to_query_visibility_latency is their end-to-end sum from successful receipt; sampled probes use non-overwritten object paths, every predetermined successful probe receipt is retained, probes rotate across definitions, observer concurrency is bounded, and polling-resolution delay is included";
+    report.visibility_definition = "successful_receipt_to_probe_start_delay measures local observer queueing; probe_start_to_query_visibility_latency measures globally rate-bounded active polling to the first ordinary-query hit with the exact object_version; successful_receipt_to_query_visibility_latency is their end-to-end sum from successful receipt; sampled probes use non-overwritten object paths, every predetermined successful probe receipt is retained, probes rotate across definitions, observer concurrency and aggregate query start rate are bounded, and polling-resolution delay is included";
     Ok(MutationResponses {
         report,
         visibility_tasks,
@@ -1665,49 +1603,6 @@ fn mutable_record_id(sequence: u64, offset: usize, batch_size: usize, mutable_re
         .saturating_mul(batch_size as u64)
         .saturating_add(offset as u64)
         % mutable_records
-}
-
-async fn wait_canary(
-    channel: &Channel,
-    token: &str,
-    bucket: &str,
-    index_name: &str,
-    canary: Canary,
-    poll: Duration,
-    request_timeout: Duration,
-    observation_timeout: Duration,
-) -> Result<Duration> {
-    let deadline = canary.completed_at + observation_timeout;
-    let mut client = index_client(channel.clone(), token)?;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        ensure!(
-            !remaining.is_zero(),
-            "canary {} was not visible on {index_name}",
-            canary.id
-        );
-        let response = tokio::time::timeout(
-            remaining.min(request_timeout),
-            marker_query(&mut client, bucket, index_name, canary.id),
-        )
-        .await
-        .context("canary query exceeded per-request timeout")??;
-        if response.hits.iter().any(|hit| {
-            hit.object_version == canary.version
-                && hit
-                    .address
-                    .as_ref()
-                    .is_some_and(|a| a.path == data::marker_path(canary.id))
-        }) {
-            return Ok(Instant::now().saturating_duration_since(canary.completed_at));
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "canary {} was not visible on {index_name}",
-            canary.id
-        );
-        tokio::time::sleep(poll).await;
-    }
 }
 
 fn visibility_definition_position(sample_ordinal: u64, definition_count: usize) -> usize {
