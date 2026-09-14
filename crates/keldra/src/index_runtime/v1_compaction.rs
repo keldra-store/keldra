@@ -421,7 +421,7 @@ fn blocking_artifact(
     .map_err(|error| keldra_index::IndexError::Io(error.to_string()))
 }
 
-fn index_status(error: keldra_index::IndexError) -> Status {
+pub(super) fn index_status(error: keldra_index::IndexError) -> Status {
     match error {
         keldra_index::IndexError::ResourceLimit { .. } => {
             Status::resource_exhausted(error.to_string())

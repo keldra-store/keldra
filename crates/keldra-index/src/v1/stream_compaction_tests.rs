@@ -174,6 +174,15 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
     assert!(second_plan.covers_oldest_history);
     assert_eq!(second_plan.minimum_key, key(1));
     assert_eq!(second_plan.maximum_key, key(250));
+    let mut released_plan = second_plan.clone();
+    released_plan.minimum_key = key(100);
+    released_plan.maximum_key = key(101);
+    let released_error = splice_compacted_component_runs(fourth.root, &released_plan, &[], |_| {
+        Err::<Vec<u8>, _>(IndexError::Integrity)
+    })
+    .unwrap_err();
+    assert!(matches!(released_error, IndexError::IntegrityViolation(_)));
+    assert!(released_error.to_string().contains("minimum_key"));
     let second_output = compact_component_runs(
         &second_plan,
         limits,

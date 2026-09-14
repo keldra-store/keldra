@@ -9,6 +9,64 @@ fn integrity_failure_halts_only_the_affected_partition() {
 }
 
 #[test]
+fn overlapping_compaction_integrity_halts_once_and_exposes_durable_lag() {
+    // The index regression constructs the released wide-L1 plus narrow-L0
+    // self-built plan. This is its first server boundary: splice reports the
+    // named integrity invariant and producer compaction maps it to DataLoss.
+    let error =
+        super::super::v1_compaction::index_status(keldra_index::IndexError::IntegrityViolation(
+            "component compaction plan minimum_key; component=DocumentHead, stream_root=0102"
+                .into(),
+        ));
+    assert_eq!(error.code(), tonic::Code::DataLoss);
+    assert!(halts_partition(&error));
+
+    let source = SourceId {
+        node_id: 1,
+        source_epoch: [4; 32],
+    };
+    let mut affected = PartitionEvidence::opened(source, [3; 32], [5; 32], 12);
+    let mut peer = PartitionEvidence::opened(source, [6; 32], [7; 32], 20);
+    let now = Instant::now();
+    let caught_up = affected.observe_lag(12, false, false, STALL_AFTER, now);
+    assert_eq!(caught_up.entries, 0);
+    assert!(!caught_up.stalled);
+
+    let mut affected_halted = false;
+    let peer_halted = false;
+    let mut affected_stage = ProducerStage::Compacting;
+    let first = contain_integrity_failure(
+        &mut affected_halted,
+        &mut affected_stage,
+        Some(&mut affected),
+        &error,
+    );
+    assert!(first.newly_halted);
+    assert_eq!(first.failed_stage, ProducerStage::Compacting);
+    assert!(!writer_state_is_runnable(affected_halted));
+
+    let second = contain_integrity_failure(
+        &mut affected_halted,
+        &mut affected_stage,
+        Some(&mut affected),
+        &error,
+    );
+    assert!(!second.newly_halted, "the same halt must not log twice");
+
+    let source_advanced =
+        affected.observe_lag(20, true, false, STALL_AFTER, now + Duration::from_millis(1));
+    assert_eq!(affected.published_next, 12, "lag uses durable Current");
+    assert_eq!(source_advanced.entries, 8);
+    assert!(source_advanced.stalled);
+
+    let peer_progress = peer.observe_lag(20, false, false, STALL_AFTER, now);
+    assert!(writer_state_is_runnable(peer_halted));
+    assert_eq!(peer_progress.entries, 0);
+    assert!(!peer_progress.stalled);
+    assert!(!peer.halted);
+}
+
+#[test]
 fn an_assigned_partition_without_an_open_writer_is_not_runnable() {
     let writers = BTreeMap::<ProjectionPartitionIdentity, Writer>::new();
 

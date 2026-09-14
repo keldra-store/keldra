@@ -27,7 +27,9 @@ use super::v1_extractor::{SelectedV1Source, V1ProjectionExtractor, matching_reci
 use super::v1_journal_dispatch::{V1OrderedSourceDispatcher, V1SourceDispatch};
 use super::v1_mutation_window::coalesce_latest_by_source_path;
 use super::v1_parallel::{partition_lane_parallelism, run_bounded_ordered};
-use super::v1_producer_state::{PartitionEvidence, PartitionEvidenceMap, ProducerStage};
+use super::v1_producer_state::{
+    PartitionEvidence, PartitionEvidenceMap, ProducerStage, contain_integrity_failure,
+};
 use super::v1_publication::{
     LoadedV1ProjectionGeneration, V1ProjectionPublisher, V1PublicationPredecessor,
 };
@@ -422,19 +424,21 @@ async fn reconcile(
             }
             Err(error) if halts_partition(&error) => {
                 let mut writer = writer;
-                let failed_stage = writer.stage;
-                writer.halted_on_integrity_failure = true;
-                writer.stage = ProducerStage::Halted;
-                if let Some(state) = evidence.get_mut(&partition) {
-                    state.halt(&error);
-                }
-                tracing::error!(
-                    %error,
-                    ?partition,
-                    family_id = ?writer.recipe.family.family_id,
-                    failed_stage = failed_stage.label(),
-                    "v1 projection partition halted after integrity failure; unrelated partitions continue"
+                let transition = contain_integrity_failure(
+                    &mut writer.halted_on_integrity_failure,
+                    &mut writer.stage,
+                    evidence.get_mut(&partition),
+                    &error,
                 );
+                if transition.newly_halted {
+                    tracing::error!(
+                        %error,
+                        ?partition,
+                        family_id = ?writer.recipe.family.family_id,
+                        failed_stage = transition.failed_stage.label(),
+                        "v1 projection partition halted after integrity failure; unrelated partitions continue"
+                    );
+                }
                 writers.insert(partition, writer);
             }
             Err(error) => {
@@ -469,7 +473,11 @@ fn runnable_partition(
 ) -> bool {
     writers
         .get(partition)
-        .is_some_and(|writer| !writer.halted_on_integrity_failure)
+        .is_some_and(|writer| writer_state_is_runnable(writer.halted_on_integrity_failure))
+}
+
+fn writer_state_is_runnable(halted_on_integrity_failure: bool) -> bool {
+    !halted_on_integrity_failure
 }
 
 fn halts_partition(error: &Status) -> bool {
@@ -529,19 +537,17 @@ fn record_lag_telemetry(
         let published_next = state.published_next;
         let stage = state.stage;
         state.observe_progress(published_next, processed_next, stage);
-        let partition_lag = cursor.next_offset.saturating_sub(state.published_next);
-        if partition_lag == 0 {
-            state.lag_started_at = None;
-            state.last_progress_at = now;
-        } else if state.lag_started_at.is_none() {
-            // Newly observed lag is not yet a stall.
-            state.lag_started_at = Some(now);
-            state.last_progress_at = now;
-        }
-        let no_progress_age = now
-            .saturating_duration_since(state.last_progress_at)
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
+        let has_unpublished_projection_work = writer.is_some_and(|writer| {
+            writer.pending_prepared_rows > 0 || !writer.pending_mutations.is_empty()
+        });
+        let processing_is_behind = state.processed_next < cursor.next_offset;
+        let lag = state.observe_lag(
+            cursor.next_offset,
+            processing_is_behind,
+            has_unpublished_projection_work,
+            STALL_AFTER,
+            now,
+        );
         tracing::debug!(
             target: "keldra::index_runtime::v1_consumer_state",
             ?partition,
@@ -560,7 +566,7 @@ fn record_lag_telemetry(
             pending_age_milliseconds = writer
                 .and_then(|writer| writer.since)
                 .map_or(0_u64, |since| since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
-            last_progress_age_milliseconds = no_progress_age,
+            last_progress_age_milliseconds = lag.no_progress_milliseconds,
             identical_retries = state.identical_retries,
             last_error = state.last_error_message.as_deref().unwrap_or(""),
             halted = state.halted,
@@ -568,8 +574,8 @@ fn record_lag_telemetry(
         );
         local_next = local_next.min(state.published_next);
         local_tail = local_tail.max(cursor.next_offset.saturating_sub(1));
-        lag_entries = lag_entries.saturating_add(partition_lag);
-        if partition_lag > 0 {
+        lag_entries = lag_entries.saturating_add(lag.entries);
+        if lag.entries > 0 {
             let lag_started = state
                 .lag_started_at
                 .expect("lagging v1 partition has a start instant");
@@ -578,17 +584,10 @@ fn record_lag_telemetry(
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64,
             );
-            let has_unpublished_projection_work = writer.is_some_and(|writer| {
-                writer.pending_prepared_rows > 0 || !writer.pending_mutations.is_empty()
-            });
-            let processing_is_behind = state.processed_next < cursor.next_offset;
             if state.halted || processing_is_behind || has_unpublished_projection_work {
-                oldest_no_progress_age = oldest_no_progress_age.max(no_progress_age);
+                oldest_no_progress_age = oldest_no_progress_age.max(lag.no_progress_milliseconds);
             }
-            if state.halted
-                || ((processing_is_behind || has_unpublished_projection_work)
-                    && now.saturating_duration_since(state.last_progress_at) >= STALL_AFTER)
-            {
+            if lag.stalled {
                 stalled_partitions = stalled_partitions.saturating_add(1);
             }
         }

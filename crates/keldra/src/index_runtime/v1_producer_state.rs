@@ -1,6 +1,6 @@
 //! Retained in-process evidence for format-v1 partition progress and retries.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use keldra_index::v1::ProjectionPartitionIdentity;
 use keldra_store::SourceId;
@@ -50,6 +50,19 @@ pub(super) struct PartitionEvidence {
     pub(super) last_error: Option<(tonic::Code, String)>,
     pub(super) last_error_message: Option<String>,
     pub(super) halted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct IntegrityHaltTransition {
+    pub(super) failed_stage: ProducerStage,
+    pub(super) newly_halted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PartitionLagObservation {
+    pub(super) entries: u64,
+    pub(super) no_progress_milliseconds: u64,
+    pub(super) stalled: bool,
 }
 
 impl PartitionEvidence {
@@ -156,6 +169,55 @@ impl PartitionEvidence {
         self.halted = true;
         self.stage = ProducerStage::Halted;
     }
+
+    pub(super) fn observe_lag(
+        &mut self,
+        source_next: u64,
+        processing_is_behind: bool,
+        has_unpublished_projection_work: bool,
+        stall_after: Duration,
+        now: Instant,
+    ) -> PartitionLagObservation {
+        let entries = source_next.saturating_sub(self.published_next);
+        if entries == 0 {
+            self.lag_started_at = None;
+            self.last_progress_at = now;
+        } else if self.lag_started_at.is_none() {
+            self.lag_started_at = Some(now);
+            self.last_progress_at = now;
+        }
+        let no_progress_milliseconds = now
+            .saturating_duration_since(self.last_progress_at)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let stalled = entries > 0
+            && (self.halted
+                || ((processing_is_behind || has_unpublished_projection_work)
+                    && now.saturating_duration_since(self.last_progress_at) >= stall_after));
+        PartitionLagObservation {
+            entries,
+            no_progress_milliseconds,
+            stalled,
+        }
+    }
+}
+
+pub(super) fn contain_integrity_failure(
+    writer_halted: &mut bool,
+    writer_stage: &mut ProducerStage,
+    evidence: Option<&mut PartitionEvidence>,
+    error: &Status,
+) -> IntegrityHaltTransition {
+    let transition = IntegrityHaltTransition {
+        failed_stage: *writer_stage,
+        newly_halted: !*writer_halted,
+    };
+    *writer_halted = true;
+    *writer_stage = ProducerStage::Halted;
+    if let Some(evidence) = evidence {
+        evidence.halt(error);
+    }
+    transition
 }
 
 pub(super) type PartitionEvidenceMap =
