@@ -5,17 +5,18 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use keldra_index::v1::{
-    CanonicalRecipeState, ComponentIdentity, ComponentRecordLookup, ComponentStreamReverseCursor,
-    ComponentStreamReverseStep, ComponentStreamRoot, PreparedAtomicProjectionGeneration,
-    PreparedQueryMutationBatch, ProjectedDocumentState, ProjectionCatalogActivation,
-    ProjectionCurrent, ProjectionFamilyPartitionDirectory, ProjectionGeneration,
-    ProjectionPackCredits, ProjectionPartitionIdentity, ProjectionQueryRunDescriptor,
-    QueryBlockCredits, QueryBlockLimits, QueryRunPage, StableDocumentKey,
-    component_stream_child_hashes, decode_component_delta_segment, decode_document_head,
-    decode_projection_catalog_activation, decode_projection_current,
+    AtomicProjectionPublicationCredits, CanonicalRecipeState, ComponentIdentity,
+    ComponentRecordLookup, ComponentStreamReverseCursor, ComponentStreamReverseStep,
+    ComponentStreamRoot, PreparedAtomicProjectionGeneration, PreparedQueryMutationBatch,
+    ProjectedDocumentState, ProjectionCatalogActivation, ProjectionCurrent,
+    ProjectionFamilyPartitionDirectory, ProjectionGeneration, ProjectionPackCredits,
+    ProjectionPartitionIdentity, ProjectionQueryRunDescriptor, QueryBlockCredits, QueryBlockLimits,
+    QueryRunPage, StableDocumentKey, component_stream_child_hashes, decode_component_delta_segment,
+    decode_document_head, decode_projection_catalog_activation, decode_projection_current,
     decode_projection_family_directory, decode_projection_generation,
     decode_projection_generation_header, decode_query_run_page, decode_source_records,
     encode_projection_catalog_activation, encode_projection_family_directory,
@@ -37,11 +38,20 @@ use crate::cluster_object_read::ClusterObjectReader;
 use super::publication::{DerivedArtifactAdmission, IndexArtifactPublish, IndexArtifactRouter};
 use super::v1_artifact_cache::ImmutableArtifactCache;
 use super::v1_compaction::{V1CompactionArtifacts, V1CompactionBase};
+use super::v1_parallel::run_bounded_ordered;
+
+mod immutable_staging;
+mod projection_cache_updates;
+#[cfg(test)]
+use immutable_staging::{immutable_stage_windows, immutable_stage_work, inline_window_fits};
+use projection_cache_updates::ProjectionCacheAdvancer;
 
 const MAX_STREAM_PAGE_BYTES: usize = 32 * 1024;
 const MAX_GENERATION_BYTES: usize = 256 * 1024;
 const MAX_FAMILY_DIRECTORY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CATALOG_ACTIVATION_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PARALLEL_IMMUTABLE_STAGE_WINDOWS: usize = 4;
+const MAX_PARALLEL_DIRECTORY_READS: usize = 4;
 #[derive(Clone)]
 pub(crate) struct V1ProjectionPublisher {
     store: Store,
@@ -50,6 +60,7 @@ pub(crate) struct V1ProjectionPublisher {
     changes: tokio::sync::broadcast::Sender<()>,
     immutable_cache: ImmutableArtifactCache,
     observed_source_next: ObservedSourceProgress,
+    projection_cache_updates: ProjectionCacheAdvancer,
 }
 
 #[derive(Clone, Default)]
@@ -128,6 +139,7 @@ struct AtomicPublicationPlan {
     sealed_bytes: u64,
     source_positions: u64,
     state_updates: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    publication_credits: AtomicProjectionPublicationCredits,
 }
 
 impl V1ProjectionPublisher {
@@ -135,8 +147,11 @@ impl V1ProjectionPublisher {
         store: Store,
         reader: ClusterObjectReader,
         artifacts: IndexArtifactRouter,
+        projection_cache_bytes: usize,
     ) -> Self {
         let (changes, _) = tokio::sync::broadcast::channel(1_024);
+        let projection_cache_updates =
+            ProjectionCacheAdvancer::start(store.clone(), projection_cache_bytes);
         Self {
             store,
             reader,
@@ -144,6 +159,7 @@ impl V1ProjectionPublisher {
             changes,
             immutable_cache: ImmutableArtifactCache::default(),
             observed_source_next: ObservedSourceProgress::default(),
+            projection_cache_updates,
         }
     }
 
@@ -584,9 +600,19 @@ impl V1ProjectionPublisher {
         let sealed_bytes = plan.sealed_bytes;
         let next_offset = plan.current.next_offset;
         let generation_hash = plan.current.generation_hash;
-        let state_updates = plan.state_updates;
-        let mut publications = Vec::with_capacity(plan.immutable.len());
-        for artifact in self.stage_immutable_artifacts(plan.immutable).await? {
+        let publication_credits = plan.publication_credits;
+        let cache_update = self.projection_cache_updates.admit(
+            projection_state_partition_key(tenant_id, bucket_id, partition),
+            previous.map(|previous| previous.current.generation_hash),
+            generation_hash,
+            plan.state_updates,
+        );
+        let immutable_artifact_count = plan.immutable.len();
+        let staging_started = Instant::now();
+        let staged_artifacts = self.stage_immutable_artifacts(plan.immutable).await?;
+        let staging_duration = staging_started.elapsed();
+        let mut publications = Vec::with_capacity(staged_artifacts.len());
+        for artifact in staged_artifacts {
             let routing_id =
                 projection_artifact_routing_id(partition.family_id, artifact.kind, artifact.hash)
                     .map_err(index_status)?;
@@ -601,9 +627,11 @@ impl V1ProjectionPublisher {
                 None,
             ));
         }
+        let immutable_publication_started = Instant::now();
         require_all_immutable_publications(
             self.artifacts.publish_immutable_many(publications).await?,
         )?;
+        let immutable_publication_duration = immutable_publication_started.elapsed();
         let current_blob = self.stage(&plan.current_bytes).await?;
         if current_blob.hash != *keldra_index::profiled_blake3_hash!(&plan.current_bytes).as_bytes()
             || current_blob.length != plan.current_bytes.len() as u64
@@ -612,6 +640,7 @@ impl V1ProjectionPublisher {
                 "staged v1 current changed its exact bytes",
             ));
         }
+        let current_cas_started = Instant::now();
         let outcome = self
             .artifacts
             .publish(request(
@@ -625,6 +654,11 @@ impl V1ProjectionPublisher {
                 expected_current_version,
             ))
             .await?;
+        // Retain prepared-byte admission through immutable publication and the
+        // final Current CAS which makes those artifacts reachable.
+        drop(publication_credits);
+        let current_cas_duration = current_cas_started.elapsed();
+        let verification_started = Instant::now();
         let loaded_generation = self
             .load_generation_by_hash(
                 storage_tenant,
@@ -643,17 +677,28 @@ impl V1ProjectionPublisher {
                 "published v1 generation differs from the prepared generation",
             ));
         }
-        if let Err(error) = self.store.advance_index_projection_state(
-            &projection_state_partition_key(tenant_id, bucket_id, partition),
-            previous.map(|previous| previous.current.generation_hash),
-            generation_hash,
-            &state_updates,
-        ) {
-            // Current is already authoritative and durable. A cache failure
-            // must not turn its successful CAS into a replaying false failure;
-            // the generation marker makes the next lookup reset and refill.
-            tracing::warn!(%error, "v1 local projected-state cache update failed");
+        let verification_duration = verification_started.elapsed();
+        let cache_scheduled = cache_update
+            .is_some_and(|cache_update| self.projection_cache_updates.schedule(cache_update));
+        if !cache_scheduled {
+            tracing::info!(
+                counter.keldra_index_v1_projection_cache_updates_skipped = 1_u64,
+                "v1 disposable projection cache update skipped at its byte bound or shutdown"
+            );
         }
+        tracing::info!(
+            histogram.keldra_index_v1_artifact_staging_duration_seconds =
+                staging_duration.as_secs_f64(),
+            histogram.keldra_index_v1_immutable_publication_duration_seconds =
+                immutable_publication_duration.as_secs_f64(),
+            histogram.keldra_index_v1_current_cas_duration_seconds =
+                current_cas_duration.as_secs_f64(),
+            histogram.keldra_index_v1_post_cas_verification_duration_seconds =
+                verification_duration.as_secs_f64(),
+            immutable_artifacts = immutable_artifact_count,
+            cache_scheduled,
+            "keldra_index_v1_publication_phases"
+        );
         let _ = self.changes.send(());
         // Publication and progress telemetry become true only after the
         // partition-current CAS committed. Failures above may leave safe,
@@ -1217,148 +1262,58 @@ impl V1ProjectionPublisher {
         let mut pending = VecDeque::from([root_hash]);
         let mut visited = BTreeSet::new();
         let mut pages = Vec::new();
-        while let Some(hash) = pending.pop_front() {
-            if !visited.insert(hash) || visited.len() > root_count as usize * 2 {
-                return Err(Status::data_loss(
-                    "v1 component directory contains a cycle or exceeds its bound",
-                ));
+        while !pending.is_empty() {
+            let mut work = Vec::new();
+            while work.len() < MAX_PARALLEL_DIRECTORY_READS {
+                let Some(hash) = pending.pop_front() else {
+                    break;
+                };
+                if !visited.insert(hash) || visited.len() > root_count as usize * 2 {
+                    return Err(Status::data_loss(
+                        "v1 component directory contains a cycle or exceeds its bound",
+                    ));
+                }
+                work.push((work.len(), hash));
             }
-            let path = projection_component_page_path(partition, hash);
-            let (bytes, _) = self
-                .read_object(
-                    storage_tenant,
-                    bucket,
-                    tenant_id,
-                    bucket_id,
-                    &path,
-                    Some(hash),
-                    MAX_STREAM_PAGE_BYTES,
-                )
-                .await?
-                .ok_or_else(|| Status::data_loss("v1 component page is absent"))?;
-            pending.extend(
-                keldra_index::v1::component_directory_child_hashes(&bytes).map_err(index_status)?,
-            );
-            pages.push(keldra_index::v1::EncodedComponentDirectoryPage { hash, bytes });
+            let publisher = self.clone();
+            let storage_tenant = storage_tenant.to_owned();
+            let bucket = bucket.to_owned();
+            let loaded = run_bounded_ordered(work, MAX_PARALLEL_DIRECTORY_READS, move |hash| {
+                let publisher = publisher.clone();
+                let storage_tenant = storage_tenant.clone();
+                let bucket = bucket.clone();
+                async move {
+                    let path = projection_component_page_path(partition, hash);
+                    let (bytes, _) = publisher
+                        .read_object(
+                            &storage_tenant,
+                            &bucket,
+                            tenant_id,
+                            bucket_id,
+                            &path,
+                            Some(hash),
+                            MAX_STREAM_PAGE_BYTES,
+                        )
+                        .await?
+                        .ok_or_else(|| Status::data_loss("v1 component page is absent"))?;
+                    Ok::<_, Status>((hash, bytes))
+                }
+            })
+            .await?;
+            for (_, loaded) in loaded {
+                let (hash, bytes) = loaded?;
+                pending.extend(
+                    keldra_index::v1::component_directory_child_hashes(&bytes)
+                        .map_err(index_status)?,
+                );
+                pages.push(keldra_index::v1::EncodedComponentDirectoryPage { hash, bytes });
+            }
         }
         Ok(keldra_index::v1::ComponentDirectory {
             root_hash,
             root_count,
             pages,
         })
-    }
-
-    async fn stage_immutable_artifacts(
-        &self,
-        artifacts: Vec<ArtifactBytes>,
-    ) -> Result<Vec<StagedArtifact>, Status> {
-        let mut staged = Vec::with_capacity(artifacts.len());
-        let windows =
-            immutable_stage_windows(artifacts.iter().map(|artifact| artifact.bytes.len()))?;
-        let mut artifacts = VecDeque::from(artifacts);
-        for window in windows {
-            match window {
-                ImmutableStageWindow::Unary { bytes } => {
-                    let artifact = artifacts.pop_front().ok_or_else(|| {
-                        Status::internal("v1 immutable staging plan omitted its unary artifact")
-                    })?;
-                    if artifact.bytes.len() != bytes {
-                        return Err(Status::internal(
-                            "v1 immutable unary staging plan changed its byte association",
-                        ));
-                    }
-                    let blob = self.stage(&artifact.bytes).await?;
-                    staged.push(staged_artifact(artifact, blob)?);
-                }
-                ImmutableStageWindow::Inline { items, bytes } => {
-                    let mut inline_identities = Vec::with_capacity(items);
-                    let mut inline_blobs = Vec::with_capacity(items);
-                    let mut observed_bytes = 0_usize;
-                    for _ in 0..items {
-                        let artifact = artifacts.pop_front().ok_or_else(|| {
-                            Status::internal("v1 immutable staging plan omitted an inline artifact")
-                        })?;
-                        let ArtifactBytes {
-                            path,
-                            kind,
-                            hash,
-                            bytes,
-                        } = artifact;
-                        observed_bytes =
-                            observed_bytes.checked_add(bytes.len()).ok_or_else(|| {
-                                Status::resource_exhausted("v1 inline artifact byte count overflow")
-                            })?;
-                        inline_identities.push(InlineArtifactIdentity {
-                            path,
-                            kind,
-                            hash,
-                            length: bytes.len(),
-                        });
-                        inline_blobs.push(bytes);
-                    }
-                    if observed_bytes != bytes {
-                        return Err(Status::internal(
-                            "v1 immutable inline staging plan changed its byte association",
-                        ));
-                    }
-                    self.flush_inline_artifacts(
-                        &mut inline_identities,
-                        &mut inline_blobs,
-                        &mut staged,
-                    )
-                    .await?;
-                }
-            }
-        }
-        if !artifacts.is_empty() {
-            return Err(Status::internal(
-                "v1 immutable staging plan left artifacts unassociated",
-            ));
-        }
-        Ok(staged)
-    }
-
-    async fn flush_inline_artifacts(
-        &self,
-        identities: &mut Vec<InlineArtifactIdentity>,
-        bytes: &mut Vec<Vec<u8>>,
-        staged: &mut Vec<StagedArtifact>,
-    ) -> Result<(), Status> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let blobs = self
-            .store
-            .stage_derived_progress_inline_blobs(bytes)
-            .await
-            .map_err(|error| Status::unavailable(error.to_string()))?;
-        if blobs.len() != identities.len() || blobs.len() != bytes.len() {
-            return Err(Status::data_loss(
-                "staged v1 inline artifact result count differs from its input",
-            ));
-        }
-        for (identity, blob) in std::mem::take(identities).into_iter().zip(blobs) {
-            if blob.hash != identity.hash || blob.length != identity.length as u64 {
-                return Err(Status::data_loss(
-                    "staged v1 immutable artifact changed its exact bytes",
-                ));
-            }
-            staged.push(StagedArtifact {
-                path: identity.path,
-                kind: identity.kind,
-                hash: identity.hash,
-                blob,
-            });
-        }
-        bytes.clear();
-        Ok(())
-    }
-
-    async fn stage(&self, bytes: &[u8]) -> Result<BlobRef, Status> {
-        self.store
-            .stage_derived_progress_blob(bytes)
-            .await
-            .map_err(|error| Status::unavailable(error.to_string()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1553,73 +1508,12 @@ impl V1ProjectionPublisher {
     }
 }
 
-fn immutable_stage_windows(
-    lengths: impl IntoIterator<Item = usize>,
-) -> Result<Vec<ImmutableStageWindow>, Status> {
-    let mut windows = Vec::new();
-    let mut inline_items = 0_usize;
-    let mut inline_bytes = 0_usize;
-    for bytes in lengths {
-        if bytes > PAYLOAD_ARTIFACT_CHUNK_BYTES {
-            push_inline_stage_window(&mut windows, &mut inline_items, &mut inline_bytes);
-            windows.push(ImmutableStageWindow::Unary { bytes });
-            continue;
-        }
-        if !inline_window_fits(inline_items, inline_bytes, bytes) {
-            push_inline_stage_window(&mut windows, &mut inline_items, &mut inline_bytes);
-        }
-        inline_items += 1;
-        inline_bytes = inline_bytes.checked_add(bytes).ok_or_else(|| {
-            Status::resource_exhausted("v1 inline staging window byte count overflow")
-        })?;
-    }
-    push_inline_stage_window(&mut windows, &mut inline_items, &mut inline_bytes);
-    Ok(windows)
-}
-
-fn push_inline_stage_window(
-    windows: &mut Vec<ImmutableStageWindow>,
-    items: &mut usize,
-    bytes: &mut usize,
-) {
-    if *items != 0 {
-        windows.push(ImmutableStageWindow::Inline {
-            items: *items,
-            bytes: *bytes,
-        });
-        *items = 0;
-        *bytes = 0;
-    }
-}
-
-fn inline_window_fits(item_count: usize, byte_count: usize, next_bytes: usize) -> bool {
-    next_bytes <= PAYLOAD_ARTIFACT_CHUNK_BYTES
-        && item_count < MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS
-        && byte_count
-            .checked_add(next_bytes)
-            .and_then(|total| u64::try_from(total).ok())
-            .is_some_and(|total| total <= MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES)
-}
-
-fn staged_artifact(artifact: ArtifactBytes, blob: BlobRef) -> Result<StagedArtifact, Status> {
-    if blob.hash != artifact.hash || blob.length != artifact.bytes.len() as u64 {
-        return Err(Status::data_loss(
-            "staged v1 immutable artifact changed its exact bytes",
-        ));
-    }
-    Ok(StagedArtifact {
-        path: artifact.path,
-        kind: artifact.kind,
-        hash: artifact.hash,
-        blob,
-    })
-}
-
 fn plan_atomic_publication(
     partition: ProjectionPartitionIdentity,
     previous: Option<&LoadedV1ProjectionGeneration>,
     prepared: PreparedAtomicProjectionGeneration,
 ) -> Result<AtomicPublicationPlan, Status> {
+    let (prepared, publication_credits) = prepared.into_publication_parts();
     let state_updates = projection_state_updates(&prepared.packs)?;
     let sealed_bytes = prepared
         .packs
@@ -1808,6 +1702,7 @@ fn plan_atomic_publication(
             .checked_sub(query_run.source_start_offset)
             .ok_or_else(|| Status::data_loss("v1 query run source cut moves backwards"))?,
         state_updates,
+        publication_credits,
     })
 }
 

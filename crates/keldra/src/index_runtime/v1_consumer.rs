@@ -1,7 +1,9 @@
 //! Sole ordered producer for format-v1 physical projection partitions.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use keldra_consensus::{DecisionRaft, NodeId};
@@ -35,11 +37,22 @@ use super::v1_publication::{
 };
 use super::v1_source_batch::{ExactMutationRequest, load_exact_mutations};
 
+#[path = "v1_consumer_compaction.rs"]
+mod compaction;
+#[path = "v1_consumer_prepare.rs"]
+mod prepare;
+use compaction::{
+    BackgroundCompaction, compaction_in_flight, compaction_matches_current,
+    ensure_background_compaction,
+};
+use prepare::{apply_rows, prepare_lane};
+#[cfg(test)]
+use prepare::{preparation_refill_size, selected_mutation_resident_bytes};
+
 const RETRY: Duration = Duration::from_millis(250);
 const SAFETY_RECONCILE: Duration = Duration::from_secs(30);
 const STALL_AFTER: Duration = Duration::from_secs(30);
 const JOURNAL_PAGE_RESIDENT_MULTIPLIER: usize = 4;
-const MAX_PUBLICATION_MUTATIONS: u64 = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReconcileOutcome {
@@ -97,6 +110,7 @@ struct Writer {
     pending_next: u64,
     pending_mutation_capacity: usize,
     pending_mutation_permit: IndexingMemoryPermit,
+    background_compaction: Option<BackgroundCompaction>,
     halted_on_integrity_failure: bool,
     stage: ProducerStage,
 }
@@ -154,7 +168,11 @@ impl V1IndexProducerTask {
         let mut catalog_changes = catalog.subscribe();
         let mut publication_changes = publisher.subscribe();
         let mut journal_changes = hot.subscribe();
+        let compaction_cpu = cpu.clone();
         let extractor = V1ProjectionExtractor::new(reader.clone(), cpu, hot, limits.worker_bytes);
+        let lag_observation_epoch = Arc::new(AtomicU64::new(0));
+        let lag_observation_active = Arc::new(AtomicBool::new(false));
+        let compaction_ready = Arc::new(tokio::sync::Notify::new());
         let task = tokio::spawn(async move {
             let mut writers = BTreeMap::new();
             let mut evidence = PartitionEvidenceMap::new();
@@ -168,8 +186,12 @@ impl V1IndexProducerTask {
                     &reader,
                     &extractor,
                     &publisher,
+                    &compaction_cpu,
                     &credits,
                     limits,
+                    &lag_observation_epoch,
+                    &lag_observation_active,
+                    &compaction_ready,
                     &mut writers,
                     &mut evidence,
                 )
@@ -190,6 +212,7 @@ impl V1IndexProducerTask {
                             _ = wait_for_physical_catalog_change(&mut catalog_changes) => {}
                             _ = journal_changes.recv() => {}
                             _ = publication_changes.recv() => {}
+                            () = compaction_ready.notified() => {}
                             () = tokio::time::sleep(deadline) => {}
                         }
                     }
@@ -219,6 +242,7 @@ fn next_reconcile_delay(
     writers
         .values()
         .filter(|writer| !writer.halted_on_integrity_failure)
+        .filter(|writer| !compaction_in_flight(writer))
         .filter_map(|writer| writer.since)
         .map(|since| limits.flush_age.saturating_sub(since.elapsed()))
         .min()
@@ -249,7 +273,10 @@ fn limits(config: IndexRuntimeConfig) -> Result<Limits, Status> {
         flush_bytes,
         projection_batch_bytes,
         flush_age: config.flush_max_age(),
-        flush_operations: config.flush_max_operations().min(MAX_PUBLICATION_MUTATIONS),
+        // The charged mutation window is the authoritative memory bound. Keep
+        // the configured operation bound instead of imposing an unrelated
+        // fixed ceiling that forces extra publications on larger budgets.
+        flush_operations: config.flush_max_operations(),
         lsm_runs: u64::from(config.lsm_max_runs_per_level()),
         lsm_bytes: config.lsm_max_unmerged_bytes_per_level(),
         parallelism,
@@ -267,8 +294,12 @@ async fn reconcile(
     reader: &ClusterObjectReader,
     extractor: &V1ProjectionExtractor,
     publisher: &V1ProjectionPublisher,
+    compaction_cpu: &super::cpu::IndexCpuPool,
     credits: &IndexingMemoryCredits,
     limits: Limits,
+    lag_observation_epoch: &Arc<AtomicU64>,
+    lag_observation_active: &Arc<AtomicBool>,
+    compaction_ready: &Arc<tokio::sync::Notify>,
     writers: &mut BTreeMap<ProjectionPartitionIdentity, Writer>,
     evidence: &mut PartitionEvidenceMap,
 ) -> Result<ReconcileOutcome, Status> {
@@ -354,25 +385,45 @@ async fn reconcile(
     }
     writers.retain(|partition, _| assigned.contains(partition));
     evidence.retain(|partition, _| assigned.contains(partition));
-    let mut lag_targets = BTreeMap::new();
-    for (partition, writer) in writers.iter() {
-        let published_next = writer
-            .current
-            .as_ref()
-            .map_or(0, |current| current.current.next_offset);
-        let indexable_next = journal
-            .routed_index_source_next(
+    let lag_requests = writers
+        .iter()
+        .map(|(partition, writer)| {
+            (
+                *partition,
                 writer.recipe.family.tenant_id,
                 writer.recipe.family.bucket_id,
                 writer.source,
-                routed_lag_start(published_next),
-                &target,
+                writer
+                    .current
+                    .as_ref()
+                    .map_or(0, |current| current.current.next_offset),
             )
-            .await
-            .map_err(event_status)?;
-        lag_targets.insert(*partition, indexable_next);
-    }
-    publisher.replace_observed_source_next(&lag_targets);
+        })
+        .collect::<Vec<_>>();
+    spawn_lag_observation(
+        Arc::clone(journal),
+        publisher.clone(),
+        target.clone(),
+        lag_requests,
+        limits.parallelism,
+        Arc::clone(lag_observation_epoch),
+        Arc::clone(lag_observation_active),
+    );
+    let lag_targets = writers
+        .iter()
+        .map(|(partition, writer)| {
+            let published_next = writer
+                .current
+                .as_ref()
+                .map_or(0, |current| current.current.next_offset);
+            (
+                *partition,
+                publisher
+                    .observed_source_next(*partition)
+                    .unwrap_or(published_next),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     record_lag_telemetry(&lag_targets, writers, evidence);
     let physical_catalog_identity = catalog_snapshot.identity;
     let runnable = assigned
@@ -394,14 +445,16 @@ async fn reconcile(
             (partition, (writer, writer_limits))
         })
         .collect();
-    let outcomes = run_bounded_ordered(work, active_writers, {
+    let outcomes = run_partition_advances(work, active_writers, {
         let target = target.clone();
         let journal = Arc::clone(journal);
         let scanner = scanner.clone();
         let reader = reader.clone();
         let extractor = extractor.clone();
         let publisher = publisher.clone();
+        let compaction_cpu = compaction_cpu.clone();
         let credits = credits.clone();
+        let compaction_ready = Arc::clone(compaction_ready);
         move |(mut writer, writer_limits)| {
             let target = target.clone();
             let journal = Arc::clone(&journal);
@@ -409,9 +462,12 @@ async fn reconcile(
             let reader = reader.clone();
             let extractor = extractor.clone();
             let publisher = publisher.clone();
+            let compaction_cpu = compaction_cpu.clone();
             let credits = credits.clone();
+            let compaction_ready = Arc::clone(&compaction_ready);
             async move {
                 let _advance = super::v1_telemetry::global().begin_in_flight_advance(STALL_AFTER);
+                let before = writer_processed_next(&writer);
                 let result = advance(
                     &mut writer,
                     &target,
@@ -421,11 +477,13 @@ async fn reconcile(
                     &reader,
                     &extractor,
                     &publisher,
+                    &compaction_cpu,
                     &credits,
+                    &compaction_ready,
                     writer_limits,
                 )
                 .await;
-                (writer, result)
+                (writer, writer_limits, before, result)
             }
         }
     })
@@ -484,13 +542,168 @@ async fn reconcile(
             }
         }
     }
-    publisher.replace_observed_source_next(&lag_targets);
     record_lag_telemetry(&lag_targets, writers, evidence);
     Ok(if partition_failed {
         ReconcileOutcome::RetryPartition
     } else {
         ReconcileOutcome::Stable
     })
+}
+
+type PartitionAdvanceOutcome = (Writer, Limits, u64, Result<(), Status>);
+
+async fn run_partition_advances<F, Fut>(
+    work: Vec<(ProjectionPartitionIdentity, (Writer, Limits))>,
+    maximum_parallelism: usize,
+    operation: F,
+) -> Result<Vec<(ProjectionPartitionIdentity, (Writer, Result<(), Status>))>, Status>
+where
+    F: Fn((Writer, Limits)) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = PartitionAdvanceOutcome> + Send + 'static,
+{
+    let started = Instant::now();
+    let mut pending = VecDeque::from(work);
+    let mut active = tokio::task::JoinSet::new();
+    let mut output = Vec::new();
+    let maximum_parallelism = maximum_parallelism.max(1);
+    let mut rescheduled = 0_u64;
+    let mut completed_advances = 0_u64;
+    let mut peak_in_flight = 0_usize;
+
+    loop {
+        while active.len() < maximum_parallelism {
+            let Some((partition, input)) = pending.pop_front() else {
+                break;
+            };
+            let operation = operation.clone();
+            active.spawn(async move { (partition, operation(input).await) });
+            peak_in_flight = peak_in_flight.max(active.len());
+        }
+        let Some(completed) = active.join_next().await else {
+            break;
+        };
+        let (partition, (writer, limits, before, result)) = completed.map_err(|error| {
+            Status::internal(format!("v1 partition advance task failed: {error}"))
+        })?;
+        completed_advances = completed_advances.saturating_add(1);
+        if result.is_ok()
+            && should_reschedule_after_advance(writer.stage, before, writer_processed_next(&writer))
+        {
+            // Requeue at the back so a partition never monopolizes a bounded
+            // worker slot while peers are waiting for their first page.
+            rescheduled = rescheduled.saturating_add(1);
+            pending.push_back((partition, (writer, limits)));
+        } else {
+            output.push((partition, (writer, result)));
+        }
+    }
+    output.sort_unstable_by_key(|(partition, _)| *partition);
+    tracing::debug!(
+        histogram.keldra_index_v1_scheduler_duration_seconds = started.elapsed().as_secs_f64(),
+        counter.keldra_index_v1_partition_advances = completed_advances,
+        counter.keldra_index_v1_partition_reschedules = rescheduled,
+        gauge.keldra_index_v1_partition_advances_peak_in_flight = peak_in_flight,
+        "v1 producer scheduler completed a bounded target"
+    );
+    Ok(output)
+}
+
+fn should_reschedule_after_advance(stage: ProducerStage, before: u64, after: u64) -> bool {
+    after > before && matches!(stage, ProducerStage::Backfill | ProducerStage::JournalScan)
+}
+
+type LagObservationRequest = (ProjectionPartitionIdentity, u64, u64, SourceId, u64);
+
+fn spawn_lag_observation(
+    journal: Arc<IndexEventJournal>,
+    publisher: V1ProjectionPublisher,
+    target: IndexBarrier,
+    requests: Vec<LagObservationRequest>,
+    maximum_parallelism: usize,
+    epoch: Arc<AtomicU64>,
+    active: Arc<AtomicBool>,
+) {
+    if active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let observation_epoch = epoch.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let requested_partitions = requests.len();
+        struct ActiveGuard(Arc<AtomicBool>);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _active = ActiveGuard(active);
+        let work = requests
+            .into_iter()
+            .map(
+                |(partition, tenant_id, bucket_id, source, published_next)| {
+                    (partition, (tenant_id, bucket_id, source, published_next))
+                },
+            )
+            .collect();
+        let observed = run_bounded_ordered(work, maximum_parallelism, {
+            let journal = Arc::clone(&journal);
+            move |(tenant_id, bucket_id, source, published_next)| {
+                let journal = Arc::clone(&journal);
+                let target = target.clone();
+                async move {
+                    journal
+                        .routed_index_source_next(
+                            tenant_id,
+                            bucket_id,
+                            source,
+                            routed_lag_start(published_next),
+                            &target,
+                        )
+                        .await
+                        .map_err(event_status)
+                }
+            }
+        })
+        .await;
+        match observed {
+            Ok(observed) if lag_observation_is_current(&epoch, observation_epoch) => {
+                let successful_partitions =
+                    observed.iter().filter(|(_, result)| result.is_ok()).count();
+                let observations = observed
+                    .into_iter()
+                    .filter_map(|(partition, result)| result.ok().map(|next| (partition, next)))
+                    .collect();
+                publisher.replace_observed_source_next(&observations);
+                tracing::debug!(
+                    histogram.keldra_index_v1_lag_scan_duration_seconds =
+                        started.elapsed().as_secs_f64(),
+                    counter.keldra_index_v1_lag_scan_partitions = requested_partitions,
+                    counter.keldra_index_v1_lag_scan_successes = successful_partitions,
+                    counter.keldra_index_v1_lag_scan_failures =
+                        requested_partitions.saturating_sub(successful_partitions),
+                    "v1 routed lag observation completed off the producer critical path"
+                );
+            }
+            Ok(_) => {
+                tracing::debug!(
+                    histogram.keldra_index_v1_lag_scan_duration_seconds =
+                        started.elapsed().as_secs_f64(),
+                    counter.keldra_index_v1_lag_scan_stale_results = requested_partitions,
+                    "v1 routed lag observation discarded a stale result"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(%error, "v1 routed lag observation task failed");
+            }
+        }
+    });
+}
+
+fn lag_observation_is_current(epoch: &AtomicU64, observation_epoch: u64) -> bool {
+    epoch.load(Ordering::Acquire) == observation_epoch
 }
 
 fn runnable_partition(
@@ -761,6 +974,7 @@ async fn open_writer(
         pending_next: accumulator_start,
         pending_mutation_capacity,
         pending_mutation_permit,
+        background_compaction: None,
         halted_on_integrity_failure: false,
         stage: ProducerStage::Opening,
     })
@@ -913,7 +1127,9 @@ async fn advance(
     reader: &ClusterObjectReader,
     extractor: &V1ProjectionExtractor,
     publisher: &V1ProjectionPublisher,
+    compaction_cpu: &super::cpu::IndexCpuPool,
     credits: &IndexingMemoryCredits,
+    compaction_ready: &Arc<tokio::sync::Notify>,
     limits: Limits,
 ) -> Result<(), Status> {
     // Finish the captured baseline before entering journal replay.
@@ -932,6 +1148,14 @@ async fn advance(
         .await?;
         return Ok(());
     }
+    ensure_background_compaction(
+        writer,
+        publisher,
+        compaction_cpu,
+        credits,
+        compaction_ready,
+        limits,
+    )?;
     writer.stage = ProducerStage::JournalScan;
     // Leave charged mutation-window room for the decoded journal page.
     let max_page = u64::try_from(limits.flush_bytes.saturating_div(4).max(1))
@@ -949,7 +1173,8 @@ async fn advance(
         let _page_memory = credits
             .acquire(IndexingMemoryStage::ReplayInput, page_memory_bytes)
             .map_err(|_| Status::resource_exhausted("v1 journal-page memory unavailable"))?;
-        if let Some(page) = journal
+        let page_started = Instant::now();
+        let page = journal
             .next_page(
                 writer.recipe.family.tenant_id,
                 writer.recipe.family.bucket_id,
@@ -958,8 +1183,16 @@ async fn advance(
                 max_page,
             )
             .await
-            .map_err(event_status)?
-        {
+            .map_err(event_status)?;
+        tracing::debug!(
+            histogram.keldra_index_v1_journal_page_duration_seconds =
+                page_started.elapsed().as_secs_f64(),
+            counter.keldra_index_v1_journal_page_changes =
+                page.as_ref().map_or(0, |page| page.changes.len()),
+            gauge.keldra_index_v1_journal_page_memory_bytes = page_memory_bytes,
+            "v1 producer read one bounded journal page"
+        );
+        if let Some(page) = page {
             let mut dispatches = Vec::new();
             for change in &page.changes {
                 let event_source = page.through.sources[&change.node].source;
@@ -1029,9 +1262,10 @@ async fn advance(
             }
         }
     }
-    if writer
-        .since
-        .is_some_and(|since| since.elapsed() >= limits.flush_age)
+    if !compaction_in_flight(writer)
+        && writer
+            .since
+            .is_some_and(|since| since.elapsed() >= limits.flush_age)
     {
         flush(
             writer,
@@ -1249,380 +1483,14 @@ fn mutation_window_bytes(mutation: &Mutation) -> usize {
         .saturating_add(std::mem::size_of::<usize>().saturating_mul(4))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn prepare_lane(
-    writer: &mut Writer,
-    physical_catalog_identity: [u8; 32],
-    mutations: Vec<Mutation>,
-    safe_next: u64,
-    reader: &ClusterObjectReader,
-    extractor: &V1ProjectionExtractor,
-    publisher: &V1ProjectionPublisher,
-    credits: &IndexingMemoryCredits,
-    limits: Limits,
-) -> Result<(), Status> {
-    let current = writer.current.clone();
-    let recipe = writer.recipe.clone();
-    let scope = source_scope(writer.source);
-    let input_bytes = limits.worker_bytes;
-    let mut prepared_values = Vec::new();
-    let exact_requests = mutations
-        .iter()
-        .map(|mutation| ExactMutationRequest {
-            path: &mutation.path,
-            canonical_path: mutation.canonical_path.as_deref(),
-            version: mutation.version,
-            deleted: mutation.deleted,
-        })
-        .collect::<Vec<_>>();
-    let sources = load_exact_mutations(reader, &recipe, &exact_requests).await?;
-    let selected_inputs = mutations.into_iter().zip(sources).collect::<Vec<_>>();
-    for chunk in selected_inputs.chunks(limits.parallelism) {
-        let inputs = (0..chunk.len())
-            .map(|_| {
-                credits
-                    .acquire(IndexingMemoryStage::ReplayInput, input_bytes)
-                    .map_err(|_| Status::resource_exhausted("v1 replay input memory unavailable"))
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-        let previous = match &current {
-            Some(current) => {
-                let matched_indices = chunk
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, (mutation, source))| {
-                        let content_type = match source {
-                            IndexSourceMutation::Upsert(object) => object.content_type.as_deref(),
-                            IndexSourceMutation::Remove { .. } => None,
-                        };
-                        (!mutation.predecessor_absent_at_window_start
-                            && !matching_recipes(
-                                std::slice::from_ref(&recipe),
-                                mutation.tenant_id,
-                                mutation.bucket_id,
-                                &mutation.path,
-                                content_type,
-                            )
-                            .is_empty())
-                        .then_some(index)
-                    })
-                    .collect::<Vec<_>>();
-                let source_paths = matched_indices
-                    .iter()
-                    .map(|index| chunk[*index].0.path.as_str())
-                    .collect::<Vec<_>>();
-                let matched_previous = publisher
-                    .load_source_states_batch(
-                        &recipe.storage_tenant,
-                        &recipe.bucket,
-                        recipe.family.tenant_id,
-                        recipe.family.bucket_id,
-                        current,
-                        scope,
-                        &source_paths,
-                        limits.parallelism,
-                    )
-                    .await?;
-                let mut previous = std::iter::repeat_with(Vec::new)
-                    .take(chunk.len())
-                    .collect::<Vec<_>>();
-                for (index, states) in matched_indices.into_iter().zip(matched_previous) {
-                    previous[index] = states;
-                }
-                previous
-            }
-            None => std::iter::repeat_with(Vec::new).take(chunk.len()).collect(),
-        };
-        let mut jobs = tokio::task::JoinSet::new();
-        for (((mutation, source), previous), input) in
-            chunk.iter().cloned().zip(previous).zip(inputs)
-        {
-            let extractor = extractor.clone();
-            let prepare_extractor = extractor.clone();
-            let recipe = recipe.clone();
-            let credits = credits.clone();
-            jobs.spawn(async move {
-                let Some(value) = select_mutation(
-                    extractor,
-                    recipe.clone(),
-                    physical_catalog_identity,
-                    mutation,
-                    source,
-                    previous,
-                    input,
-                )
-                .await?
-                else {
-                    return Ok(None);
-                };
-                let SelectedMutation {
-                    mutation,
-                    selected,
-                    previous,
-                    source_bytes,
-                    _input,
-                } = value;
-                let query_credits = empty_query_credits(&credits, limits)?;
-                let (selected, previous, prepared, query_credits) = prepare_extractor
-                    .prepare_owned(scope, selected, recipe, previous, query_credits)
-                    .await?;
-                Ok::<_, Status>(Some((
-                    SelectedMutation {
-                        mutation,
-                        selected,
-                        previous,
-                        source_bytes,
-                        _input,
-                    },
-                    prepared,
-                    query_credits,
-                )))
-            });
-        }
-        let mut first_failure = None;
-        while let Some(joined) = jobs.join_next().await {
-            match joined {
-                Ok(Ok(Some(value))) => prepared_values.push(value),
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => {
-                    first_failure.get_or_insert(error);
-                }
-                Err(error) => {
-                    first_failure.get_or_insert_with(|| {
-                        Status::internal(format!("v1 selection task failed: {error}"))
-                    });
-                }
-            }
-        }
-        if let Some(error) = first_failure {
-            return Err(error);
-        }
-    }
-    prepared_values.sort_by_key(|(value, _, _)| (value.mutation.offset, value.mutation.ordinal));
-    let mut rows = Vec::with_capacity(prepared_values.len());
-    let mut previous = BTreeMap::new();
-    for (value, prepared, query_credits) in prepared_values {
-        let mutation = value.mutation;
-        merge_query(&mut writer.query, prepared.query)?;
-        writer.query_input_credits.push(query_credits);
-        previous.insert(mutation.path.clone(), value.previous);
-        writer.source_bytes = writer.source_bytes.saturating_add(value.source_bytes);
-        rows.push(PreparedProjectionRow {
-            source_offset: mutation.offset,
-            mutation_ordinal: mutation.ordinal,
-            source_path: mutation.path,
-            source_version: mutation.version,
-            projected_states: prepared.current,
-        });
-    }
-    apply_rows(writer, safe_next, rows, previous, credits, limits)
-}
-
-async fn select_mutation(
-    extractor: V1ProjectionExtractor,
-    recipe: PhysicalCatalogRecipe,
-    physical_catalog_identity: [u8; 32],
-    mutation: Mutation,
-    source: IndexSourceMutation,
-    previous: Vec<keldra_index::v1::ProjectedDocumentState>,
-    mut input: keldra_index::v1::IndexingMemoryPermit,
-) -> Result<Option<SelectedMutation>, Status> {
-    let source_bytes = match &source {
-        IndexSourceMutation::Upsert(object) => object.content_length,
-        IndexSourceMutation::Remove { .. } => 0,
-    };
-    let content_type = match &source {
-        IndexSourceMutation::Upsert(object) => object.content_type.as_deref(),
-        IndexSourceMutation::Remove { .. } => None,
-    };
-    let matched = matching_recipes(
-        std::slice::from_ref(&recipe),
-        mutation.tenant_id,
-        mutation.bucket_id,
-        &mutation.path,
-        content_type,
-    );
-    if matched.is_empty() {
-        // A delete or content-type transition can stop matching this recipe
-        // before extraction. Retire any exact-or-older hot state so a cached
-        // projection cannot outlive the journal mutation that made it obsolete.
-        extractor.discard_hot_through(
-            mutation.tenant_id,
-            mutation.bucket_id,
-            &mutation.path,
-            mutation.version,
-        );
-        return Ok(None);
-    }
-    let selected = extractor
-        .select(
-            mutation.tenant_id,
-            mutation.bucket_id,
-            source,
-            &matched,
-            physical_catalog_identity,
-        )
-        .await?;
-    let retained_bytes = selected_mutation_resident_bytes(&mutation, &selected, &previous)?;
-    if retained_bytes > input.bytes() {
-        return Err(Status::resource_exhausted(format!(
-            "v1 replay selection requires {retained_bytes} bytes but its construction bound is {}",
-            input.bytes()
-        )));
-    }
-    input
-        .shrink_to(retained_bytes.max(1))
-        .map_err(index_status)?;
-    Ok(Some(SelectedMutation {
-        mutation,
-        selected,
-        previous,
-        source_bytes,
-        _input: input,
-    }))
-}
-
-fn selected_mutation_resident_bytes(
-    mutation: &Mutation,
-    selected: &SelectedV1Source,
-    previous: &[keldra_index::v1::ProjectedDocumentState],
-) -> Result<usize, Status> {
-    let mut bytes = std::mem::size_of::<SelectedMutation>()
-        .checked_add(mutation.path.capacity())
-        .and_then(|bytes| {
-            bytes.checked_add(
-                mutation
-                    .canonical_path
-                    .as_ref()
-                    .map_or(0, |path| path.capacity()),
-            )
-        })
-        .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?;
-    bytes = bytes
-        .checked_add(
-            match &selected.source {
-                IndexSourceMutation::Upsert(object) => std::mem::size_of::<IndexBuildObject>()
-                    .checked_add(object.path.capacity())
-                    .and_then(|value| {
-                        value.checked_add(
-                            object
-                                .canonical_path
-                                .as_ref()
-                                .map_or(0, |path| path.capacity()),
-                        )
-                    })
-                    .and_then(|value| {
-                        value.checked_add(
-                            object
-                                .content_type
-                                .as_ref()
-                                .map_or(0, |content_type| content_type.capacity()),
-                        )
-                    }),
-                IndexSourceMutation::Remove {
-                    identity,
-                    canonical_path,
-                } => std::mem::size_of_val(identity)
-                    .checked_add(identity.path.capacity())
-                    .and_then(|value| {
-                        value.checked_add(canonical_path.as_ref().map_or(0, |path| path.capacity()))
-                    }),
-            }
-            .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?,
-        )
-        .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?;
-    if let Some(projection) = &selected.selected {
-        bytes = bytes
-            .checked_add(projection.resident_bytes().map_err(index_status)?)
-            .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?;
-    }
-    bytes = bytes
-        .checked_add(
-            previous
-                .len()
-                .checked_mul(std::mem::size_of::<keldra_index::v1::ProjectedDocumentState>())
-                .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?,
-        )
-        .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?;
-    for state in previous {
-        bytes = bytes
-            .checked_add(state.resident_bytes().map_err(index_status)?)
-            .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?;
-    }
-    Ok(bytes)
-}
-
-fn apply_rows(
-    writer: &mut Writer,
-    next: u64,
-    mut rows: Vec<PreparedProjectionRow>,
-    previous: BTreeMap<String, Vec<keldra_index::v1::ProjectedDocumentState>>,
-    credits: &IndexingMemoryCredits,
-    limits: Limits,
-) -> Result<(), Status> {
-    let first = writer.accumulator.next_offset();
-    if next <= first {
-        return Ok(());
-    }
-    rows.sort_by_key(|row| (row.source_offset, row.mutation_ordinal));
-    let reservation =
-        PreparedProjectionBatchReservation::reserve(credits, limits.projection_batch_bytes)
-            .map_err(|_| Status::resource_exhausted("v1 prepared-row memory unavailable"))?;
-    let batch = reservation
-        .finish(source_scope(writer.source), first, next, rows)
-        .map_err(index_status)?;
-    let prepared_bytes = u64::try_from(batch.resident_bytes())
-        .map_err(|_| Status::resource_exhausted("v1 prepared-row bytes exceed telemetry"))?;
-    match writer
-        .accumulator
-        .apply_batch(batch, previous)
-        .map_err(index_status)?
-    {
-        ProjectionBatchAdmission::Applied {
-            source_rows,
-            coalesced_rows,
-            ..
-        } => {
-            let source_rows = u64::try_from(source_rows)
-                .map_err(|_| Status::resource_exhausted("v1 prepared rows exceed telemetry"))?;
-            writer.pending_prepared_rows = writer.pending_prepared_rows.saturating_add(source_rows);
-            writer.pending_prepared_bytes = writer.pending_prepared_bytes.saturating_add(
-                super::v1_telemetry::V1PipelineTelemetry::indexed_prepared_bytes(
-                    source_rows,
-                    prepared_bytes,
-                ),
-            );
-            writer.pending_projected_rows = writer.pending_projected_rows.saturating_add(
-                u64::try_from(coalesced_rows).map_err(|_| {
-                    Status::resource_exhausted("v1 projected rows exceed telemetry")
-                })?,
-            );
-            // Cursor-only batches are expected for reserved projection and
-            // catalog objects. They advance the in-memory contiguous cut, but
-            // must not arm publication: an empty Current creates another
-            // reserved source event and otherwise feeds itself forever. The
-            // preceding Current remains the conservative durable retention
-            // proof. A later matching mutation publishes one range spanning
-            // every skipped control event; restart safely replays the retained
-            // gap from that preceding Current.
-            if source_rows != 0 {
-                writer.since.get_or_insert_with(Instant::now);
-            }
-            Ok(())
-        }
-        ProjectionBatchAdmission::ReplayRequired { .. } => {
-            Err(Status::resource_exhausted("v1 accumulator requires replay"))
-        }
-    }
-}
-
 fn should_flush(writer: &Writer, limits: Limits) -> bool {
     !writer.pending_mutations.is_empty()
         && (writer.pending_mutation_bytes >= limits.flush_bytes
             || writer.pending_operations >= limits.flush_operations
-            || writer
-                .since
-                .is_some_and(|since| since.elapsed() >= limits.flush_age))
+            || (!compaction_in_flight(writer)
+                && writer
+                    .since
+                    .is_some_and(|since| since.elapsed() >= limits.flush_age)))
 }
 
 fn has_publication_work(has_current: bool, prepared_source_rows: u64) -> bool {
@@ -1672,12 +1540,6 @@ async fn flush(
     }
     let projected_bytes = u64::try_from(writer.accumulator.buffered_bytes())
         .map_err(|_| Status::resource_exhausted("v1 projected bytes exceed telemetry"))?;
-    let needs_compaction = writer.current.as_ref().is_some_and(|current| {
-        current.generation.query_stream_root.run_count >= limits.lsm_runs
-            || current.generation.roots.iter().any(|root| {
-                root.segment_count >= limits.lsm_runs || root.encoded_bytes >= limits.lsm_bytes
-            })
-    });
     writer.stage = ProducerStage::Sealing;
     let sealed = writer.accumulator.seal_and_reset().map_err(index_status)?;
     let (sealed, source_permit) = sealed.into_parts();
@@ -1692,46 +1554,33 @@ async fn flush(
     let _preload = credits
         .acquire(IndexingMemoryStage::ReplayInput, preload_bytes)
         .map_err(|_| Status::resource_exhausted("v1 spine preload memory unavailable"))?;
-    let compaction = if needs_compaction {
+    let compaction = if let Some(background) = writer.background_compaction.take() {
         writer.stage = ProducerStage::Compacting;
-        let component_permit = credits
-            .acquire(
-                IndexingMemoryStage::SealScratch,
-                limits.bytes.saturating_div(8).max(1),
-            )
-            .map_err(|_| {
-                Status::resource_exhausted("v1 component compaction memory unavailable")
-            })?;
-        let query_permit = credits
-            .acquire(
-                IndexingMemoryStage::OrderingCatalog,
-                limits.bytes.saturating_div(8).max(1),
-            )
-            .map_err(|_| Status::resource_exhausted("v1 query compaction memory unavailable"))?;
-        Some(
-            publisher
-                .prepare_compaction(
-                    &writer.recipe.storage_tenant,
-                    &writer.recipe.bucket,
-                    writer.recipe.family.tenant_id,
-                    writer.recipe.family.bucket_id,
-                    writer
-                        .current
-                        .as_ref()
-                        .expect("compaction requires Current"),
-                    usize::try_from(limits.lsm_runs).map_err(|_| {
-                        Status::invalid_argument("v1 LSM run bound exceeds this platform")
-                    })?,
-                    usize::try_from(limits.lsm_bytes).map_err(|_| {
-                        Status::invalid_argument("v1 LSM byte bound exceeds this platform")
-                    })?,
-                    preload_bytes,
-                    ProjectionPackCredits::from_pipeline_permit(component_permit),
-                    QueryBlockCredits::from_pipeline_permit(query_permit),
-                )
-                .await?
-                .into_parts(),
-        )
+        let predecessor_generation = background.predecessor_generation;
+        let wait_started = Instant::now();
+        let prepared = background.finish().await?;
+        let matched_current = compaction_matches_current(
+            predecessor_generation,
+            writer
+                .current
+                .as_ref()
+                .map(|current| current.current.generation_hash),
+        );
+        tracing::debug!(
+            histogram.keldra_index_v1_compaction_foreground_wait_duration_seconds =
+                wait_started.elapsed().as_secs_f64(),
+            compaction_matched_current = matched_current,
+            "v1 producer joined background compaction at a publication boundary"
+        );
+        if matched_current {
+            Some(prepared.into_parts())
+        } else {
+            tracing::debug!(
+                predecessor_generation = ?predecessor_generation,
+                "v1 background compaction discarded after Current advanced"
+            );
+            None
+        }
     } else {
         None
     };

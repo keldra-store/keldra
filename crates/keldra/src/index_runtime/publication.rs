@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Instant;
 
 use keldra_consensus::NodeId;
 use keldra_store::{
@@ -17,6 +18,7 @@ use crate::cluster_placement::ClusterPlacement;
 use crate::object_distribution::ObjectDistribution;
 
 use super::placement::{IndexIdentity, IndexPlacement};
+use super::v1_parallel::run_bounded_ordered;
 
 mod paths;
 mod v1_batch;
@@ -26,6 +28,7 @@ const INDEX_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.index-artifact
 const ACCOUNTING_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.accounting+json";
 pub(crate) const MAX_INDEX_ARTIFACT_BATCH_ITEMS: usize = 1_000;
 pub(crate) const MAX_INDEX_ARTIFACT_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PARALLEL_IMMUTABLE_PUBLICATIONS: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DefinitionVersionGuard {
@@ -871,6 +874,7 @@ impl IndexArtifactRouter {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        let started = Instant::now();
         let placement = self.objects.current_program_placement()?;
         let fence = placement.fence();
         let mut groups =
@@ -905,44 +909,79 @@ impl IndexArtifactRouter {
         let mut outcomes = std::iter::repeat_with(|| None)
             .take(count)
             .collect::<Vec<_>>();
+        let mut work = Vec::new();
         for ((coordinator, address), group) in groups {
             for batch in bounded_artifact_batches(group)? {
-                let (indices, publications): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
-                self.require_fence(fence)?;
-                let published = match address.as_deref() {
-                    Some(address) => {
-                        self.peers
-                            .publish_index_artifacts(coordinator, address, fence, &publications)
-                            .await
-                    }
-                    None => {
-                        self.coordinator
-                            .publish_many(self.local_node, placement.clone(), publications)
-                            .await
-                    }
-                };
-                self.require_fence(fence)?;
-                match published {
-                    Ok(published) => {
-                        record_grouped_artifact_outcomes(&mut outcomes, indices, published)?
-                    }
-                    Err(error) => {
-                        for index in indices {
-                            let slot = outcomes.get_mut(index).ok_or_else(|| {
-                                Status::data_loss(
-                                    "grouped immutable outcome index is out of bounds",
-                                )
-                            })?;
-                            if slot.replace(Err(error.clone())).is_some() {
-                                return Err(Status::data_loss(
-                                    "grouped immutable outcome was recorded twice",
-                                ));
+                work.push((work.len(), (coordinator, address.clone(), batch)));
+            }
+        }
+        let batch_count = work.len();
+        let router = self.clone();
+        let published = run_bounded_ordered(
+            work,
+            MAX_PARALLEL_IMMUTABLE_PUBLICATIONS,
+            move |(coordinator, address, batch)| {
+                let router = router.clone();
+                let placement = placement.clone();
+                async move {
+                    let (indices, publications): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+                    let published = async {
+                        router.require_fence(fence)?;
+                        let published = match address.as_deref() {
+                            Some(address) => {
+                                router
+                                    .peers
+                                    .publish_index_artifacts(
+                                        coordinator,
+                                        address,
+                                        fence,
+                                        &publications,
+                                    )
+                                    .await
                             }
+                            None => {
+                                router
+                                    .coordinator
+                                    .publish_many(router.local_node, placement, publications)
+                                    .await
+                            }
+                        };
+                        router.require_fence(fence)?;
+                        published
+                    }
+                    .await;
+                    (indices, published)
+                }
+            },
+        )
+        .await?;
+        for (_, (indices, published)) in published {
+            match published {
+                Ok(published) => {
+                    record_grouped_artifact_outcomes(&mut outcomes, indices, published)?
+                }
+                Err(error) => {
+                    for index in indices {
+                        let slot = outcomes.get_mut(index).ok_or_else(|| {
+                            Status::data_loss("grouped immutable outcome index is out of bounds")
+                        })?;
+                        if slot.replace(Err(error.clone())).is_some() {
+                            return Err(Status::data_loss(
+                                "grouped immutable outcome was recorded twice",
+                            ));
                         }
                     }
                 }
             }
         }
+        tracing::info!(
+            histogram.keldra_index_v1_immutable_router_publication_duration_seconds =
+                started.elapsed().as_secs_f64(),
+            immutable_artifacts = count,
+            publication_batches = batch_count,
+            maximum_parallelism = MAX_PARALLEL_IMMUTABLE_PUBLICATIONS,
+            "keldra_index_v1_immutable_router_publication"
+        );
         ordered_grouped_artifact_outcomes(outcomes)
     }
 
@@ -1612,5 +1651,23 @@ mod tests {
             ordered[1].as_ref().unwrap_err().code(),
             tonic::Code::Aborted
         );
+    }
+
+    #[test]
+    fn immutable_publication_batches_preserve_request_order_and_bounds() {
+        let group = (0..=MAX_INDEX_ARTIFACT_BATCH_ITEMS)
+            .map(|index| {
+                let mut request = artifact_publish(format!("index/v1/immutable/{index}"), None);
+                request.blob.length = 1;
+                (index, request)
+            })
+            .collect();
+        let batches = bounded_artifact_batches(group).unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), MAX_INDEX_ARTIFACT_BATCH_ITEMS);
+        assert_eq!(batches[1].len(), 1);
+        assert_eq!(batches[0][0].0, 0);
+        assert_eq!(batches[1][0].0, MAX_INDEX_ARTIFACT_BATCH_ITEMS);
     }
 }

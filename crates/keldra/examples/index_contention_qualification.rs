@@ -1492,9 +1492,8 @@ async fn produce_fixed_rate_jobs(
                         report.client_queue_enqueued_batches.saturating_add(1)
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    report.unoffered_client_queue_full_batches = report
-                        .unoffered_client_queue_full_batches
-                        .saturating_add(1)
+                    report.unoffered_client_queue_full_batches =
+                        report.unoffered_client_queue_full_batches.saturating_add(1)
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     bail!("mutation worker queue closed during fixed-rate production")

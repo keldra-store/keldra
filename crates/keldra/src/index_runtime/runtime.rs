@@ -111,8 +111,14 @@ pub(crate) async fn start(
         objects.clone(),
         cluster_peers.clone(),
     );
-    let v1_publisher =
-        V1ProjectionPublisher::new(store.clone(), reader.clone(), artifact_router.clone());
+    let projection_cache_bytes = usize::try_from((pipeline_memory / 8).max(1))
+        .context("bound disposable v1 projection-cache work")?;
+    let v1_publisher = V1ProjectionPublisher::new(
+        store.clone(),
+        reader.clone(),
+        artifact_router.clone(),
+        projection_cache_bytes,
+    );
     let v1_catalog_lifecycle = V1CatalogLifecycleTask::start(
         catalog.clone(),
         journal.clone(),

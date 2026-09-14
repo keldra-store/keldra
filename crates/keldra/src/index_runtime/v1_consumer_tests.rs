@@ -311,9 +311,9 @@ fn newest_wins_keeps_the_first_post_current_absence_evidence() {
     let (_, coalesced) = coalesce_units(
         0,
         vec![
-            (0, vec![recreated]),
-            (0, vec![mutation("objects/a", 2)]),
             (0, vec![created]),
+            (0, vec![mutation("objects/a", 2)]),
+            (0, vec![recreated]),
         ],
     )
     .unwrap();
@@ -325,7 +325,8 @@ fn newest_wins_keeps_the_first_post_current_absence_evidence() {
     existing.predecessor_absent_at_window_start = false;
     let mut later_recreate = mutation("objects/b", 5);
     later_recreate.predecessor_absent_at_window_start = true;
-    let (_, coalesced) = coalesce_units(0, vec![(0, vec![existing, later_recreate])]).unwrap();
+    let (_, coalesced) =
+        coalesce_units(0, vec![(0, vec![existing]), (0, vec![later_recreate])]).unwrap();
     assert!(!coalesced[0].predecessor_absent_at_window_start);
 }
 
@@ -435,7 +436,80 @@ fn projection_batch_headroom_scales_with_pipeline_memory() {
     assert_eq!(limits.bytes, 2 * 1024 * 1024 * 1024);
     assert_eq!(limits.flush_bytes, 16 * 1024 * 1024);
     assert_eq!(limits.projection_batch_bytes, 512 * 1024 * 1024);
-    assert_eq!(limits.flush_operations, MAX_PUBLICATION_MUTATIONS);
+    assert_eq!(
+        limits.flush_operations,
+        IndexRuntimeConfig::DEFAULT_FLUSH_MAX_OPERATIONS
+    );
+}
+
+#[test]
+fn configured_flush_operation_bound_is_not_replaced_by_a_fixed_small_batch() {
+    let config = IndexRuntimeConfig::new(4)
+        .unwrap()
+        .with_flush_boundaries(16 * 1024 * 1024, 1_000, 131_072)
+        .unwrap();
+
+    assert_eq!(limits(config).unwrap().flush_operations, 131_072);
+}
+
+#[test]
+fn successful_progress_reschedules_only_an_unfinished_writer() {
+    assert!(should_reschedule_after_advance(
+        ProducerStage::JournalScan,
+        10,
+        11
+    ));
+    assert!(should_reschedule_after_advance(
+        ProducerStage::Backfill,
+        10,
+        11
+    ));
+    assert!(!should_reschedule_after_advance(
+        ProducerStage::CaughtUp,
+        10,
+        11
+    ));
+}
+
+#[test]
+fn no_progress_does_not_busy_reschedule_a_partition() {
+    assert!(!should_reschedule_after_advance(
+        ProducerStage::JournalScan,
+        10,
+        10
+    ));
+    assert!(!should_reschedule_after_advance(
+        ProducerStage::Backfill,
+        10,
+        9
+    ));
+}
+
+#[test]
+fn rolling_preparation_refills_only_available_bounded_lanes() {
+    assert_eq!(preparation_refill_size(10, 0, 4), 4);
+    assert_eq!(preparation_refill_size(10, 2, 4), 2);
+    assert_eq!(preparation_refill_size(10, 3, 4), 0);
+    assert_eq!(preparation_refill_size(1, 0, 4), 1);
+    assert_eq!(preparation_refill_size(0, 0, 4), 0);
+    assert_eq!(preparation_refill_size(3, 0, 0), 1);
+}
+
+#[test]
+fn only_the_latest_background_lag_observation_can_publish() {
+    let epoch = AtomicU64::new(7);
+    assert!(lag_observation_is_current(&epoch, 7));
+    assert!(!lag_observation_is_current(&epoch, 6));
+    epoch.store(8, Ordering::Release);
+    assert!(!lag_observation_is_current(&epoch, 7));
+    assert!(lag_observation_is_current(&epoch, 8));
+}
+
+#[test]
+fn background_compaction_installs_only_on_its_exact_predecessor() {
+    assert!(compaction_matches_current([7; 32], Some([7; 32])));
+    assert!(!compaction_matches_current([7; 32], Some([8; 32])));
+    assert!(!compaction_matches_current([7; 32], None));
 }
 
 #[test]

@@ -247,6 +247,33 @@ fn mixed_inline_and_chunked_artifacts_keep_stage_order() {
 }
 
 #[test]
+fn parallel_stage_work_preserves_window_and_artifact_order() {
+    let lengths = [1, 2, PAYLOAD_ARTIFACT_CHUNK_BYTES + 1, 3];
+    let artifacts = lengths
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, length)| ArtifactBytes {
+            path: format!("artifact-{ordinal}"),
+            kind: keldra_index::v1::ProjectionArtifactKind::Pack,
+            hash: [u8::try_from(ordinal).unwrap(); 32],
+            bytes: vec![0; length],
+        })
+        .collect();
+    let work = immutable_stage_work(artifacts).unwrap();
+
+    assert_eq!(
+        work.iter().map(|(ordinal, _)| *ordinal).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        work.into_iter()
+            .flat_map(|(_, (_, artifacts))| artifacts.into_iter().map(|artifact| artifact.path))
+            .collect::<Vec<_>>(),
+        vec!["artifact-0", "artifact-1", "artifact-2", "artifact-3"]
+    );
+}
+
+#[test]
 fn inline_artifacts_partition_at_byte_and_item_limits() {
     let maximum_batch_bytes = usize::try_from(MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES).unwrap();
     assert_eq!(
