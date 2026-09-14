@@ -1,5 +1,6 @@
 use super::*;
 use crate::typed_json::{AggregateOperation, Cardinality, FieldCapabilities, FieldType};
+use crate::v1::CatalogOrdinalRange;
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -368,6 +369,108 @@ fn query_snapshot_binding_distinguishes_logical_definitions_on_the_same_roots() 
         &second.catalog_lineage,
         &second.recipe_catalog_proofs,
     ));
+}
+
+#[test]
+fn repeated_one_page_queries_reuse_the_validated_snapshot_without_artifact_loads() {
+    let cut = QueryCommonCut {
+        through_atomic_position: 20,
+    };
+    let membership = RecipeIdentity::new([3; 32]).unwrap();
+    let root = ProjectionQueryStreamRoot {
+        stream_root_hash: [7; 32],
+        stream_root_encoded_bytes: 1,
+        run_count: 1,
+        first_sequence: 1,
+        last_sequence: 1,
+        source_start_offset: 1,
+        next_offset: 2,
+        through_atomic_position: 20,
+    };
+    let pin = PinnedPartitionQueryRoot {
+        partition: partition(1),
+        physical_catalog_generation: [4; 32],
+        root,
+        cut_proof: QueryRootCutProof {
+            common_cut: cut,
+            selected_stream_root_hash: root.stream_root_hash,
+            next_newer_through_atomic_position: None,
+        },
+        handoff_lineage_id: [5; 32],
+    };
+    let logical = LogicalProjectionBinding {
+        logical_index_id: 1,
+        logical_definition_version: 1,
+        family_id: [1; 32],
+        physical_catalog_generation: [4; 32],
+        membership,
+        fields: Vec::new(),
+    };
+    let proof = QueryRecipeCatalogProof {
+        recipe: membership,
+        accepted_ordinal_ranges: vec![CatalogOrdinalRange { first: 0, last: 0 }],
+    };
+    let request = TypedJsonQueryRequest {
+        logical: logical.clone(),
+        fields: Vec::new(),
+        catalog_lineage: vec![[4; 32]],
+        recipe_catalog_proofs: vec![proof.clone()],
+        predicate: None,
+        order: Vec::new(),
+        facets: Vec::new(),
+        aggregates: Vec::new(),
+        resume_after_document: None,
+        result_limit: 10,
+    };
+    let descriptor = Arc::new(ProjectionQueryRunDescriptor {
+        partition: pin.partition,
+        physical_catalog_generation: [4; 32],
+        sequence: 1,
+        source_start_offset: 1,
+        next_offset: 2,
+        through_atomic_position: 20,
+        blocks: Vec::new(),
+    });
+    let snapshot = Arc::new(ValidatedQuerySnapshot {
+        identity: query_snapshot_identity(cut, &[pin]).unwrap(),
+        common_cut: cut,
+        pins: vec![pin],
+        logical,
+        catalog_lineage: vec![[4; 32]],
+        recipe_catalog_proofs: vec![proof],
+        manifests: vec![PartitionManifest {
+            view: PartitionView { pin },
+            runs: vec![descriptor],
+        }],
+    });
+    let mut loader = Loader {
+        artifacts: BTreeMap::new(),
+        payload_loads: 0,
+    };
+    let mut admission = BatchAdmission {
+        calls: 0,
+        reorder: false,
+    };
+
+    for _ in 0..2 {
+        let mut query_credits = credits(1024 * 1024);
+        let (_, returned) = ready(execute_typed_json_query(
+            &mut loader,
+            &mut admission,
+            cut,
+            &[pin],
+            Some(snapshot.clone()),
+            &request,
+            QueryExecutionLimits::default_for_memory(),
+            QueryBlockLimits::default_for_memory(),
+            &mut query_credits,
+        ))
+        .unwrap();
+        assert!(Arc::ptr_eq(&returned, &snapshot));
+    }
+
+    assert_eq!(loader.payload_loads, 0);
+    assert_eq!(admission.calls, 0);
 }
 
 #[test]

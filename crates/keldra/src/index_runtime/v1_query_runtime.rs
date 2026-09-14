@@ -1,8 +1,7 @@
 //! Format-v1 local query execution over one verified family root vector.
 
-use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use keldra_api::v1::{
     IndexAggregateOperation, IndexAggregateResult, IndexFacetBucket, IndexFacetResult,
@@ -12,6 +11,8 @@ use keldra_atomic_program::MAX_OBJECT_PATH_BYTES;
 use keldra_consensus::DecisionRaft;
 use keldra_index::IndexError;
 use keldra_index::typed_json::{AggregateOperation, FieldSchema, FieldType, ScalarValue};
+#[cfg(test)]
+use keldra_index::v1::QuerySnapshotIdentity;
 use keldra_index::v1::{
     AuthorizedQueryCandidate, LogicalFieldBinding, LogicalProjectionBinding,
     MAX_QUERY_CANDIDATE_ADMISSION_BATCH, MAX_QUERY_PARTITIONS, PinnedPartitionQueryRoot,
@@ -20,8 +21,8 @@ use keldra_index::v1::{
     QueryArtifactLoad, QueryArtifactLoader, QueryBlockCredits, QueryBlockLimits,
     QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits, QueryFieldBinding,
     QueryMemoryPermit, QueryPartitionExecutor, QueryPartitionJob, QueryPublicValueEncoder,
-    QueryRootCutProof, QuerySnapshotIdentity, RecipeIdentity, StableDocumentKey,
-    TypedJsonQueryRequest, ValidatedQuerySnapshot, decode_projection_generation_header,
+    QueryRootCutProof, RecipeIdentity, StableDocumentKey, TypedJsonQueryRequest,
+    ValidatedQuerySnapshot, decode_projection_generation_header,
     execute_typed_json_query_with_cursor_and_executor, projection_generation_path,
     query_snapshot_identity, resolve_query_partition_results,
 };
@@ -46,12 +47,13 @@ use super::v1_query_compile::compile_v1_query;
 
 #[path = "v1_query_cursor.rs"]
 mod cursor;
-#[cfg(test)]
-use cursor::QueryPositionRoot;
+#[path = "v1_query_snapshot_cache.rs"]
+mod snapshot_cache;
 use cursor::{
-    QueryContinuation, QueryPosition, decode_query_position, encode_query_position,
-    normalized_query_binding,
+    QueryContinuation, QueryPosition, QueryPositionRoot, decode_query_position,
+    encode_query_position, normalized_query_binding,
 };
+use snapshot_cache::V1QuerySnapshotCache;
 
 const _: [(); MAX_OBJECT_PATH_BYTES] = [(); keldra_index::v1::MAX_QUERY_DOCUMENT_PATH_BYTES];
 
@@ -152,14 +154,15 @@ impl V1LocalIndexQueryExecutor {
         // needed.
         let mut publication_changes = self.projections.subscribe();
         let cached = continuation.as_ref().and_then(|position| {
-            self.snapshots.get(
+            self.snapshots.get_for_continuation(
                 position.snapshot,
                 &logical,
                 &activation.catalog_lineage,
                 &activation.recipe_catalog_proofs,
+                &position.roots,
             )
         });
-        let (pinned, validated_snapshot) = if let Some(cached) = cached {
+        let (pinned, mut validated_snapshot) = if let Some(cached) = cached {
             if cached.pinned.cut.through_atomic_position
                 != request
                     .resume
@@ -206,6 +209,18 @@ impl V1LocalIndexQueryExecutor {
             }
             (pinned, None)
         };
+        if validated_snapshot.is_none() {
+            validated_snapshot = self
+                .snapshots
+                .get_for_pinned(
+                    &pinned,
+                    &logical,
+                    &activation.catalog_lineage,
+                    &activation.recipe_catalog_proofs,
+                )
+                .map_err(index_status)?
+                .map(|cached| cached.snapshot.clone());
+        }
         tracing::debug!(
             query.partition_count = pinned.roots.len(),
             "v1 query pinned its common-cut root vector"
@@ -329,9 +344,19 @@ impl V1LocalIndexQueryExecutor {
                 explicit_next.map(QueryContinuation::Explicit),
             )
         };
-        if next_position.is_some() {
-            self.snapshots.insert(pinned.clone(), snapshot.clone());
-        }
+        // A validated root-vector snapshot is useful independently of whether
+        // this response needs a continuation. Ordinary one-page queries over
+        // the same immutable generation must not reconstruct and revalidate
+        // every descriptor. Fresh requests still pin the current root vector
+        // above, so a newer generation must match both its root identity and
+        // exact generation hashes before it can reuse this entry.
+        cache_completed_snapshot(
+            &self.snapshots,
+            pinned.clone(),
+            snapshot.clone(),
+            request.resume.is_some(),
+            next_position.is_some(),
+        );
         let next_position = next_position
             .as_ref()
             .map(|cursor| {
@@ -869,111 +894,37 @@ struct PinnedRootVector {
     directory_version: keldra_store::VersionId,
 }
 
-struct CachedRuntimeQuerySnapshot {
-    pinned: Arc<PinnedRootVector>,
-    snapshot: Arc<ValidatedQuerySnapshot>,
-    resident_bytes: usize,
-}
+impl PinnedRootVector {
+    fn matches_generation(&self, other: &Self) -> bool {
+        self.cut == other.cut
+            && self.roots == other.roots
+            && self.generation_hashes == other.generation_hashes
+    }
 
-#[derive(Default)]
-struct QuerySnapshotCacheState {
-    resident_bytes: usize,
-    entries: HashMap<QuerySnapshotIdentity, Vec<Arc<CachedRuntimeQuerySnapshot>>>,
-    recency: VecDeque<Arc<CachedRuntimeQuerySnapshot>>,
-}
-
-#[derive(Clone, Default)]
-struct V1QuerySnapshotCache(Arc<Mutex<QuerySnapshotCacheState>>);
-
-impl V1QuerySnapshotCache {
-    fn get(
-        &self,
-        identity: QuerySnapshotIdentity,
-        logical: &LogicalProjectionBinding,
-        catalog_lineage: &[[u8; 32]],
-        recipe_catalog_proofs: &[keldra_index::v1::QueryRecipeCatalogProof],
-    ) -> Option<Arc<CachedRuntimeQuerySnapshot>> {
-        let mut state = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let found = state.entries.get(&identity).and_then(|entries| {
-            entries
+    fn matches_position_roots(&self, roots: &[QueryPositionRoot]) -> bool {
+        self.roots.len() == roots.len()
+            && self.generation_hashes.len() == roots.len()
+            && self
+                .roots
                 .iter()
-                .find(|entry| {
-                    entry
-                        .snapshot
-                        .matches_binding(logical, catalog_lineage, recipe_catalog_proofs)
+                .zip(&self.generation_hashes)
+                .zip(roots)
+                .all(|((pinned, generation_hash), position)| {
+                    generation_hash == &position.generation_hash
+                        && pinned.cut_proof.next_newer_through_atomic_position
+                            == position.next_newer_through_atomic_position
                 })
-                .cloned()
-        })?;
-        state.recency.retain(|entry| !Arc::ptr_eq(entry, &found));
-        state.recency.push_back(found.clone());
-        Some(found)
     }
+}
 
-    fn insert(&self, pinned: PinnedRootVector, snapshot: Arc<ValidatedQuerySnapshot>) {
-        let identity = snapshot.identity();
-        let resident_bytes = snapshot
-            .resident_bytes()
-            .saturating_add(std::mem::size_of::<PinnedRootVector>())
-            .saturating_add(
-                pinned
-                    .roots
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<PinnedPartitionQueryRoot>()),
-            )
-            .saturating_add(
-                pinned
-                    .generation_hashes
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<[u8; 32]>()),
-            )
-            .saturating_add(pinned.directory.entries.capacity().saturating_mul(
-                std::mem::size_of::<keldra_index::v1::ProjectionPartitionDirectoryEntry>(),
-            ));
-        if resident_bytes > QUERY_SNAPSHOT_CACHE_BYTES {
-            return;
-        }
-        let mut state = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.entries.get(&identity).is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry.snapshot.has_same_binding(&snapshot))
-        }) {
-            return;
-        }
-        let cached = Arc::new(CachedRuntimeQuerySnapshot {
-            pinned: Arc::new(pinned),
-            snapshot,
-            resident_bytes,
-        });
-        state.resident_bytes = state.resident_bytes.saturating_add(resident_bytes);
-        state
-            .entries
-            .entry(identity)
-            .or_default()
-            .push(cached.clone());
-        state.recency.push_back(cached);
-        while state.resident_bytes > QUERY_SNAPSHOT_CACHE_BYTES {
-            let Some(oldest) = state.recency.pop_front() else {
-                break;
-            };
-            let oldest_identity = oldest.snapshot.identity();
-            let mut remove_bucket = false;
-            if let Some(entries) = state.entries.get_mut(&oldest_identity) {
-                entries.retain(|entry| !Arc::ptr_eq(entry, &oldest));
-                remove_bucket = entries.is_empty();
-            }
-            if remove_bucket {
-                state.entries.remove(&oldest_identity);
-            }
-            state.resident_bytes = state.resident_bytes.saturating_sub(oldest.resident_bytes);
-        }
-    }
+fn cache_completed_snapshot(
+    cache: &V1QuerySnapshotCache,
+    pinned: PinnedRootVector,
+    snapshot: Arc<ValidatedQuerySnapshot>,
+    resumed: bool,
+    has_next: bool,
+) {
+    cache.insert(pinned, snapshot, resumed || has_next);
 }
 
 struct RuntimeArtifactLoader {
@@ -1736,6 +1687,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn snapshot_reuse_rejects_a_different_generation_with_the_same_query_root() {
+        let pinned = PinnedRootVector {
+            cut: QueryCommonCut {
+                through_atomic_position: 9,
+            },
+            roots: vec![root(partition(4, 5), 8)],
+            generation_hashes: vec![[7; 32]],
+            directory: ProjectionFamilyPartitionDirectory {
+                family_id: [1; 32],
+                revision: 1,
+                entries: Vec::new(),
+            },
+            directory_version: keldra_store::VersionId(1),
+        };
+        let mut republished = pinned.clone();
+        republished.generation_hashes[0] = [8; 32];
+        let original_position = vec![QueryPositionRoot {
+            generation_hash: [7; 32],
+            next_newer_through_atomic_position: None,
+        }];
+
+        assert!(pinned.matches_generation(&pinned));
+        assert!(pinned.matches_position_roots(&original_position));
+        assert!(!pinned.matches_generation(&republished));
+        assert!(!republished.matches_position_roots(&original_position));
     }
 
     #[test]
