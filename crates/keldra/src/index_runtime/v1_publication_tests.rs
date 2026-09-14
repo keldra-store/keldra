@@ -13,6 +13,22 @@ fn partition() -> ProjectionPartitionIdentity {
     ProjectionPartitionIdentity::new([7; 32], 1, [8; 32], 2, 3, 4).unwrap()
 }
 
+#[test]
+fn observed_source_progress_is_shared_between_clones_and_replaced() {
+    let observations = ObservedSourceProgress::default();
+    let clone = observations.clone();
+    let first = partition();
+    let second = ProjectionPartitionIdentity::new([17; 32], 11, [18; 32], 12, 13, 14).unwrap();
+
+    observations.replace(&BTreeMap::from([(first, 21), (second, 34)]));
+    assert_eq!(clone.get(first), Some(21));
+    assert_eq!(clone.get(second), Some(34));
+
+    clone.replace(&BTreeMap::from([(second, 55)]));
+    assert_eq!(observations.get(first), None);
+    assert_eq!(observations.get(second), Some(55));
+}
+
 fn query_credits() -> QueryBlockCredits {
     let bytes = 4 * 1024 * 1024;
     let memory = IndexingMemoryCredits::new(

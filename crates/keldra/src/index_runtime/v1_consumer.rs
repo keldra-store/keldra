@@ -111,6 +111,10 @@ struct Mutation {
     canonical_path: Option<String>,
     version: u64,
     deleted: bool,
+    /// The first journal transition for this path after durable Current proves
+    /// that no live predecessor existed. This evidence survives newest-wins
+    /// coalescing across the complete unpublished window.
+    predecessor_absent_at_window_start: bool,
 }
 
 struct SelectedMutation {
@@ -368,6 +372,7 @@ async fn reconcile(
             .map_err(event_status)?;
         lag_targets.insert(*partition, indexable_next);
     }
+    publisher.replace_observed_source_next(&lag_targets);
     record_lag_telemetry(&lag_targets, writers, evidence);
     let physical_catalog_identity = catalog_snapshot.identity;
     let runnable = assigned
@@ -479,6 +484,7 @@ async fn reconcile(
             }
         }
     }
+    publisher.replace_observed_source_next(&lag_targets);
     record_lag_telemetry(&lag_targets, writers, evidence);
     Ok(if partition_failed {
         ReconcileOutcome::RetryPartition
@@ -1197,6 +1203,11 @@ fn apply_mutation_window(
             (mutation.offset, mutation.ordinal) > (previous.offset, previous.ordinal)
         });
         if replace {
+            let mut mutation = mutation;
+            if let Some(previous) = latest.get(&mutation.path) {
+                mutation.predecessor_absent_at_window_start =
+                    previous.predecessor_absent_at_window_start;
+            }
             latest.insert(mutation.path.clone(), mutation);
         }
     }
@@ -1284,14 +1295,15 @@ async fn prepare_lane(
                             IndexSourceMutation::Upsert(object) => object.content_type.as_deref(),
                             IndexSourceMutation::Remove { .. } => None,
                         };
-                        (!matching_recipes(
-                            std::slice::from_ref(&recipe),
-                            mutation.tenant_id,
-                            mutation.bucket_id,
-                            &mutation.path,
-                            content_type,
-                        )
-                        .is_empty())
+                        (!mutation.predecessor_absent_at_window_start
+                            && !matching_recipes(
+                                std::slice::from_ref(&recipe),
+                                mutation.tenant_id,
+                                mutation.bucket_id,
+                                &mutation.path,
+                                content_type,
+                            )
+                            .is_empty())
                         .then_some(index)
                     })
                     .collect::<Vec<_>>();
@@ -1871,6 +1883,8 @@ fn dispatch_mutations(dispatch: V1SourceDispatch) -> Result<(u64, Vec<Mutation>)
                         canonical_path: mutation.canonical_path,
                         version: mutation.path_version.0,
                         deleted: mutation.deleted,
+                        // Atomic summaries carry no predecessor accounting evidence.
+                        predecessor_absent_at_window_start: false,
                     })
                 })
                 .collect::<Result<Vec<_>, Status>>()?;
@@ -1880,6 +1894,10 @@ fn dispatch_mutations(dispatch: V1SourceDispatch) -> Result<(u64, Vec<Mutation>)
 }
 
 fn head_mutation(head: ObjectHeadChange, ordinal: u32) -> Mutation {
+    let predecessor_absent_at_window_start = head.canonical_path.is_none()
+        && head
+            .accounting_transition
+            .is_some_and(|transition| transition.previous_live_length.is_none());
     Mutation {
         offset: head.offset,
         ordinal,
@@ -1889,6 +1907,7 @@ fn head_mutation(head: ObjectHeadChange, ordinal: u32) -> Mutation {
         canonical_path: head.canonical_path,
         version: head.path_version.0,
         deleted: matches!(head.kind, ObjectHeadChangeKind::Delete),
+        predecessor_absent_at_window_start,
     }
 }
 
@@ -1968,6 +1987,7 @@ fn coalesce_units(
     units: Vec<(u64, Vec<Mutation>)>,
 ) -> Result<(u64, Vec<Mutation>), Status> {
     let mut mutations = Vec::new();
+    let mut first_transitions = BTreeMap::new();
     for (atomic, unit) in units {
         let unique = unit
             .iter()
@@ -1978,12 +1998,27 @@ fn coalesce_units(
                 "one atomic mutation unit repeats an exact source path",
             ));
         }
+        for mutation in &unit {
+            let position = (mutation.offset, mutation.ordinal);
+            first_transitions
+                .entry(mutation.path.clone())
+                .and_modify(|(first_position, predecessor_absent)| {
+                    if position < *first_position {
+                        *first_position = position;
+                        *predecessor_absent = mutation.predecessor_absent_at_window_start;
+                    }
+                })
+                .or_insert((position, mutation.predecessor_absent_at_window_start));
+        }
         through_atomic = through_atomic.max(atomic);
         mutations.extend(unit);
     }
-    let mutations = coalesce_latest_by_source_path(mutations, |mutation| {
+    let mut mutations = coalesce_latest_by_source_path(mutations, |mutation| {
         (mutation.path.clone(), mutation.offset, mutation.ordinal)
     })?;
+    for mutation in &mut mutations {
+        mutation.predecessor_absent_at_window_start = first_transitions[&mutation.path].1;
+    }
     Ok((through_atomic, mutations))
 }
 

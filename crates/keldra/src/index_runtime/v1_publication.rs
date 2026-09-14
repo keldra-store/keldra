@@ -49,6 +49,27 @@ pub(crate) struct V1ProjectionPublisher {
     artifacts: IndexArtifactRouter,
     changes: tokio::sync::broadcast::Sender<()>,
     immutable_cache: ImmutableArtifactCache,
+    observed_source_next: ObservedSourceProgress,
+}
+
+#[derive(Clone, Default)]
+struct ObservedSourceProgress(Arc<std::sync::Mutex<BTreeMap<ProjectionPartitionIdentity, u64>>>);
+
+impl ObservedSourceProgress {
+    fn replace(&self, observations: &BTreeMap<ProjectionPartitionIdentity, u64>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = observations.clone();
+    }
+
+    fn get(&self, partition: ProjectionPartitionIdentity) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&partition)
+            .copied()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -122,7 +143,24 @@ impl V1ProjectionPublisher {
             artifacts,
             changes,
             immutable_cache: ImmutableArtifactCache::default(),
+            observed_source_next: ObservedSourceProgress::default(),
         }
+    }
+
+    /// Replaces the disposable producer observation used to reject freshness
+    /// against relevant source progress without scanning a journal on queries.
+    pub(crate) fn replace_observed_source_next(
+        &self,
+        observations: &BTreeMap<ProjectionPartitionIdentity, u64>,
+    ) {
+        self.observed_source_next.replace(observations);
+    }
+
+    pub(crate) fn observed_source_next(
+        &self,
+        partition: ProjectionPartitionIdentity,
+    ) -> Option<u64> {
+        self.observed_source_next.get(partition)
     }
 
     pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()> {

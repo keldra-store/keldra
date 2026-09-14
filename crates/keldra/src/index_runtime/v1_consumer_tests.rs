@@ -104,6 +104,111 @@ fn alias_head_mutation_preserves_exact_and_canonical_paths() {
         Some("objects/target.json")
     );
     assert!(mutation.deleted);
+    assert!(!mutation.predecessor_absent_at_window_start);
+}
+
+#[test]
+fn only_direct_head_accounting_proves_predecessor_absence() {
+    let direct = head_mutation(
+        ObjectHeadChange {
+            offset: 1,
+            tenant_id: 1,
+            bucket_id: 2,
+            exact_path: "objects/new.json".into(),
+            canonical_path: None,
+            path_version: VersionId(1),
+            kind: ObjectHeadChangeKind::Put,
+            program_commit_cursor: None,
+            reference_deltas: Vec::new(),
+            accounting_transition: Some(keldra_store::AccountingHeadTransition::new(
+                None,
+                Some(10),
+                0,
+            )),
+            definition_transition: None,
+        },
+        0,
+    );
+    assert!(direct.predecessor_absent_at_window_start);
+
+    let replacement = head_mutation(
+        ObjectHeadChange {
+            offset: 2,
+            path_version: VersionId(2),
+            accounting_transition: Some(keldra_store::AccountingHeadTransition::new(
+                Some(10),
+                Some(11),
+                10,
+            )),
+            ..ObjectHeadChange {
+                offset: 1,
+                tenant_id: 1,
+                bucket_id: 2,
+                exact_path: "objects/existing.json".into(),
+                canonical_path: None,
+                path_version: VersionId(1),
+                kind: ObjectHeadChangeKind::Put,
+                program_commit_cursor: None,
+                reference_deltas: Vec::new(),
+                accounting_transition: None,
+                definition_transition: None,
+            }
+        },
+        0,
+    );
+    assert!(!replacement.predecessor_absent_at_window_start);
+
+    let alias = head_mutation(
+        ObjectHeadChange {
+            offset: 3,
+            tenant_id: 1,
+            bucket_id: 2,
+            exact_path: "aliases/new.json".into(),
+            canonical_path: Some("objects/new.json".into()),
+            path_version: VersionId(3),
+            kind: ObjectHeadChangeKind::Put,
+            program_commit_cursor: None,
+            reference_deltas: Vec::new(),
+            accounting_transition: Some(keldra_store::AccountingHeadTransition::new(
+                None,
+                Some(10),
+                0,
+            )),
+            definition_transition: None,
+        },
+        0,
+    );
+    assert!(!alias.predecessor_absent_at_window_start);
+}
+
+#[test]
+fn finalized_atomic_mutations_keep_predecessor_fallback() {
+    let source = SourceId {
+        node_id: 1,
+        source_epoch: [3; 32],
+    };
+    let (_, mutations) = dispatch_mutations(V1SourceDispatch::FinalizedAtomic(
+        super::super::v1_journal_dispatch::V1FinalizedAtomicGroup {
+            source,
+            cursor: 7,
+            mutations: vec![super::super::v1_atomic_dispatch::FinalizedAtomicMutation {
+                cursor: 7,
+                mutation: keldra_store::AtomicBatchMutation {
+                    tenant_id: 1,
+                    bucket_id: 2,
+                    exact_path: "objects/atomic.json".into(),
+                    canonical_path: None,
+                    path_version: VersionId(4),
+                    deleted: false,
+                    source_id: source,
+                    source_journal_position: 4,
+                },
+            }],
+        },
+    ))
+    .unwrap();
+    assert_eq!(mutations.len(), 1);
+    assert!(!mutations[0].predecessor_absent_at_window_start);
 }
 
 fn partition() -> ProjectionPartitionIdentity {
@@ -194,7 +299,65 @@ fn mutation(path: &str, offset: u64) -> Mutation {
         canonical_path: None,
         version: offset,
         deleted: false,
+        predecessor_absent_at_window_start: false,
     }
+}
+
+#[test]
+fn newest_wins_keeps_the_first_post_current_absence_evidence() {
+    let mut created = mutation("objects/a", 1);
+    created.predecessor_absent_at_window_start = true;
+    let recreated = mutation("objects/a", 3);
+    let (_, coalesced) = coalesce_units(
+        0,
+        vec![
+            (0, vec![recreated]),
+            (0, vec![mutation("objects/a", 2)]),
+            (0, vec![created]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(coalesced.len(), 1);
+    assert_eq!(coalesced[0].offset, 3);
+    assert!(coalesced[0].predecessor_absent_at_window_start);
+
+    let mut existing = mutation("objects/b", 4);
+    existing.predecessor_absent_at_window_start = false;
+    let mut later_recreate = mutation("objects/b", 5);
+    later_recreate.predecessor_absent_at_window_start = true;
+    let (_, coalesced) = coalesce_units(0, vec![(0, vec![existing, later_recreate])]).unwrap();
+    assert!(!coalesced[0].predecessor_absent_at_window_start);
+}
+
+#[test]
+fn queued_pages_keep_the_first_post_current_absence_evidence() {
+    let mut latest = BTreeMap::new();
+    let mut resident_bytes = 0;
+    let mut operations = 0;
+    let mut next = 0;
+    let mut created = mutation("objects/a", 1);
+    created.predecessor_absent_at_window_start = true;
+    queue_mutation_window(
+        &mut latest,
+        &mut resident_bytes,
+        &mut operations,
+        &mut next,
+        1024 * 1024,
+        vec![created],
+        2,
+    )
+    .unwrap();
+    queue_mutation_window(
+        &mut latest,
+        &mut resident_bytes,
+        &mut operations,
+        &mut next,
+        1024 * 1024,
+        vec![mutation("objects/a", 2)],
+        3,
+    )
+    .unwrap();
+    assert!(latest["objects/a"].predecessor_absent_at_window_start);
 }
 
 #[test]
