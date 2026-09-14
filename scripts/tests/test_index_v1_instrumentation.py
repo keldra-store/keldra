@@ -21,9 +21,33 @@ SAMPLER = importlib.util.module_from_spec(SAMPLER_SPEC)
 assert SAMPLER_SPEC.loader is not None
 SAMPLER_SPEC.loader.exec_module(SAMPLER)
 HARNESS_SCRIPT = Path(__file__).parents[1] / "qualify-index-v1-ssd-scale.sh"
+PROGRESS_SOURCE = (
+    Path(__file__).parents[2]
+    / "crates/keldra/examples/index_contention_qualification/progress.rs"
+)
 
 
 class InstrumentationTests(unittest.TestCase):
+    def test_profiler_encloses_concurrent_work_through_terminal_progress(self):
+        source = HARNESS_SCRIPT.read_text(encoding="utf-8")
+        start = source.index('start_concurrent_through_complete_profile "${active_cell}"')
+        launch = source.index('driver_launched_ms="$(date +%s%3N)"', start)
+        finish = source.index("finish_concurrent_through_complete_profile", launch)
+        self.assertLess(start, launch)
+        self.assertLess(launch, finish)
+        self.assertIn('select(.phase == "concurrent")', source)
+        self.assertIn('select(.phase == "complete")', source)
+        self.assertNotIn("profile_phase()", source)
+        self.assertNotIn("perf-drain", source)
+        self.assertIn("perf-concurrent-through-complete.data", source)
+
+        progress = PROGRESS_SOURCE.read_text(encoding="utf-8")
+        stop_branch = progress.index("changed = stop.changed()")
+        final_snapshot = progress.index("counters.snapshot", stop_branch)
+        final_flush = progress.index("file.flush().await?", final_snapshot)
+        self.assertLess(stop_branch, final_snapshot)
+        self.assertLess(final_snapshot, final_flush)
+
     def test_disk_sampler_emits_tsv_delimiters_instead_of_literal_escapes(self):
         source = HARNESS_SCRIPT.read_text(encoding="utf-8")
         self.assertIn('printf "\\t%s", $field', source)

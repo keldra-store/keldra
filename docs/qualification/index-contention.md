@@ -97,22 +97,23 @@ KELDRA_V1_SCALE_PROFILE_CELL=d64-p1-w4-m1073741824-b1024-r5000-cw64 \
   ./qualify-index-v1-ssd-scale.sh
 ```
 
-The selected cell retains separate `perf-ingest-concurrent.data` and
-`perf-drain.data` recordings, flat demangled reports, and DWARF caller graphs.
-The two raw recordings are captured back-to-back; report rendering is deferred
-until the workload driver, server, and resource samplers stop so it cannot
-contend with a measured phase or extend whole-run resource sampling.
+The selected cell retains one `perf-concurrent-through-complete.data` recording,
+a flat demangled report, and a DWARF caller graph. Recording starts before the
+driver is launched so it cannot miss the beginning of concurrent ingest, and
+continues through mutation-response drain, authoritative-state loading, final
+pagination, and the post-load query phase until the driver publishes its
+terminal `complete` progress record. This deliberately includes setup and
+baseline samples before concurrent ingest; the broader prefix is preferable to
+silently omitting the start of the workload under test. Report rendering is
+deferred until the workload driver, server, and resource samplers stop so it
+cannot contend with the measured workload or extend whole-run resource sampling.
 Before starting the workload, the runner proves access to the CPU cycles event.
 If the host policy rejects the invoking user but permits passwordless
 `sudo perf`, only recording is elevated and ownership of the raw data is
 returned before user-level checksumming and report rendering. If neither route
-works, or either requested recording fails, qualification fails rather than
-silently publishing an empty profile.
-The harness publishes progress once per second and samples its timestamp
-separately from its phase value. Metadata therefore retains adjacent progress
-samples as observation context, not as exact transition timestamps or strict
-bounds. A driver exit before the next phase is explicitly marked as a partial
-capture. The runner also emits allocator-leaf CPU stacks. Those samples show
+works, the recording fails, or the progress evidence does not contain both
+`concurrent` and terminal `complete` observations, qualification fails rather
+than accepting a partial profile. The runner also emits allocator-leaf CPU stacks. Those samples show
 CPU time observed inside `malloc`, `realloc`, and `free`; they are not an
 allocation count or byte census. A status file records when no portable heap
 profiler is available, and no allocation totals should be inferred in that

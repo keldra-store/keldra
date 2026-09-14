@@ -241,7 +241,15 @@ pub fn start(
                     let mut encoded = serde_json::to_vec(&counters.snapshot(started, phase_started.elapsed()).await)?;
                     encoded.push(b'\n'); file.write_all(&encoded).await?; file.flush().await?;
                 }
-                changed = stop.changed() => { if changed.is_err() || *stop.borrow() { break; } }
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        let current_generation = counters.phase_generation.load(Ordering::Relaxed);
+                        if current_generation != phase_generation { phase_started = Instant::now(); }
+                        let mut encoded = serde_json::to_vec(&counters.snapshot(started, phase_started.elapsed()).await)?;
+                        encoded.push(b'\n'); file.write_all(&encoded).await?; file.flush().await?;
+                        break;
+                    }
+                }
             }
         }
         Ok(())

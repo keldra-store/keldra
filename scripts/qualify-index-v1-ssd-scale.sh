@@ -358,7 +358,8 @@ stop_profiler() {
   wait "${profiler_pid}" || status=$?
   # `perf record` reports the SIGINT used to finalize a requested capture as
   # the conventional shell status 128 + SIGINT.  The non-empty data-file check
-  # in profile_phase still proves that the recording was actually finalized.
+  # in finish_concurrent_through_complete_profile still proves that the
+  # recording was actually finalized.
   if [[ "${signal_child}" == 1 && "${status}" == 130 ]]; then
     status=0
   fi
@@ -500,92 +501,70 @@ latest_progress_phase() {
   tail -n 1 "${progress}" | jq -er '.phase'
 }
 
-profile_phase() {
-  local phase="$1" next_phase="$2" progress="$3" driver_pid="$4" output_root="$5"
-  local evidence_phase="${phase}" observed_record observed_phase previous_record profiler_ms
-  local stop_record perf_status capture_status
-  [[ "${phase}" == "concurrent" ]] && evidence_phase="ingest-concurrent"
-  local data="${output_root}/perf-${evidence_phase}.data"
-  local metadata="${output_root}/perf-${evidence_phase}-metadata.txt"
-
-  while kill -0 "${driver_pid}" 2>/dev/null; do
-    observed_phase="$(latest_progress_phase "${progress}" 2>/dev/null || true)"
-    [[ "${observed_phase}" == "${phase}" ]] && break
-    # A later phase means the requested phase was never sampled.
-    if [[ "${observed_phase}" == "${next_phase}" || "${observed_phase}" == "post" || "${observed_phase}" == "complete" ]]; then
-      printf 'status=phase-not-observed\nrequested_phase=%s\nfirst_later_phase=%s\n' \
-        "${phase}" "${observed_phase}" >"${metadata}"
-      return 1
-    fi
-    sleep 0.1
-  done
-  if [[ "$(latest_progress_phase "${progress}" 2>/dev/null || true)" != "${phase}" ]]; then
-    printf 'status=driver-ended-before-phase\nrequested_phase=%s\n' "${phase}" >"${metadata}"
-    return 1
-  fi
-
-  # The progress writer samples once per second and captures its timestamp
-  # separately from its phase mutex. Preserve the adjacent samples as timing
-  # context, but do not claim that they strictly bound the transition.
-  observed_record="$(jq -c --arg phase "${phase}" 'select(.phase == $phase)' "${progress}" | head -n 1)"
-  previous_record="$(jq -cs --arg phase "${phase}" 'map(select(.phase != $phase)) | last // empty' "${progress}")"
+start_concurrent_through_complete_profile() {
+  local output_root="$1" profiler_ms data metadata
+  data="${output_root}/perf-concurrent-through-complete.data"
+  metadata="${output_root}/perf-concurrent-through-complete-metadata.txt"
   profiler_ms="$(date +%s%3N)"
   {
-    echo "schema=keldra.perf-phase-profile.v1"
+    echo "schema=keldra.perf-workload-profile.v1"
     echo "record_started=true"
-    echo "evidence_phase=${evidence_phase}"
-    echo "harness_phase=${phase}"
-    echo "end_phase=${next_phase}"
+    echo "evidence_phase=concurrent-through-complete"
+    echo "capture_scope=server-process-from-before-driver-launch-through-observed-terminal-phase"
+    echo "pre_concurrent_prefix=included-to-guarantee-the-complete-concurrent-phase"
     echo "event=cycles"
     echo "frequency_hz=${profile_frequency}"
     echo "call_graph=dwarf,8192"
-    echo "phase_timing=sampled-observation-not-exact-boundary"
-    echo "first_phase_record=${observed_record}"
-    echo "previous_phase_record=${previous_record:-none}"
     echo "profiler_started_unix_milliseconds=${profiler_ms}"
     echo "server_pid=${server_pid}"
   } >"${metadata}"
 
   "${perf_prefix[@]}" perf record --event cycles --freq "${profile_frequency}" --call-graph dwarf,8192 \
     --pid "${server_pid}" --output "${data}" \
-    >"${output_root}/perf-${evidence_phase}-record.stdout" \
-    2>"${output_root}/perf-${evidence_phase}-record.stderr" &
+    >"${output_root}/perf-concurrent-through-complete-record.stdout" \
+    2>"${output_root}/perf-concurrent-through-complete-record.stderr" &
   profiler_pid=$!
   profiler_data="${data}"
-  while kill -0 "${driver_pid}" 2>/dev/null; do
+}
+
+finish_concurrent_through_complete_profile() {
+  local progress="$1" driver_pid="$2" output_root="$3"
+  local data metadata observed_phase driver_state concurrent_record terminal_record profiler_ms perf_status
+  data="${output_root}/perf-concurrent-through-complete.data"
+  metadata="${output_root}/perf-concurrent-through-complete-metadata.txt"
+  while true; do
     if ! kill -0 "${profiler_pid}" 2>/dev/null; then
       if stop_profiler 0; then perf_status=0; else perf_status=$?; fi
-      printf 'perf_record_exit=%s\nstatus=record-ended-before-phase\n' "${perf_status}" >>"${metadata}"
+      printf 'perf_record_exit=%s\nstatus=record-ended-before-terminal-phase\n' "${perf_status}" >>"${metadata}"
       return 1
     fi
     observed_phase="$(latest_progress_phase "${progress}" 2>/dev/null || true)"
-    [[ "${observed_phase}" == "${phase}" || -z "${observed_phase}" ]] || break
+    [[ "${observed_phase}" == "complete" ]] && break
+    driver_state="$(ps -o stat= -p "${driver_pid}" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+    if [[ -z "${driver_state}" || "${driver_state}" == Z* ]]; then
+      stop_profiler || true
+      printf 'last_observed_phase=%s\nstatus=driver-ended-before-terminal-phase\n' \
+        "${observed_phase:-none}" >>"${metadata}"
+      return 1
+    fi
     sleep 0.1
   done
+  concurrent_record="$(jq -c 'select(.phase == "concurrent")' "${progress}" | head -n 1)"
+  terminal_record="$(jq -c 'select(.phase == "complete")' "${progress}" | tail -n 1)"
   profiler_ms="$(date +%s%3N)"
-  if [[ -n "${observed_phase:-}" && "${observed_phase}" != "${phase}" ]]; then
-    stop_record="$(jq -c --arg phase "${observed_phase}" 'select(.phase == $phase)' "${progress}" 2>/dev/null | head -n 1)"
-  else
-    stop_record=""
-  fi
-  observed_record="$(jq -c --arg phase "${phase}" 'select(.phase == $phase)' "${progress}" 2>/dev/null | tail -n 1)"
-  if [[ "${observed_phase:-}" == "${next_phase}" ]]; then
-    capture_status="recorded"
-  elif [[ -n "${stop_record}" ]]; then
-    capture_status="recorded-after-next-phase-was-not-observed"
-  else
-    capture_status="partial-driver-ended"
-  fi
-  printf 'profiler_stop_observed_phase=%s\nlast_profiled_phase_record=%s\nfirst_later_phase_record=%s\nprofiler_stopped_unix_milliseconds=%s\n' \
-    "${observed_phase:-driver-ended}" "${observed_record:-none}" "${stop_record:-none}" \
-    "${profiler_ms}" >>"${metadata}"
+  printf 'concurrent_phase_observed=%s\nterminal_phase_observed=%s\nfirst_concurrent_record=%s\nterminal_record=%s\nprofiler_stopped_unix_milliseconds=%s\n' \
+    "$([[ -n "${concurrent_record}" ]] && echo true || echo false)" \
+    "$([[ -n "${terminal_record}" ]] && echo true || echo false)" \
+    "${concurrent_record:-none}" "${terminal_record:-none}" "${profiler_ms}" >>"${metadata}"
   if stop_profiler; then perf_status=0; else perf_status=$?; fi
   printf 'perf_record_exit=%s\n' "${perf_status}" >>"${metadata}"
-  if ((perf_status != 0)) || [[ ! -s "${data}" ]]; then
-    printf 'status=record-failed\n' >>"${metadata}"
+  if ((perf_status != 0)) || [[ ! -s "${data}" ]] \
+    || [[ -z "${concurrent_record}" || -z "${terminal_record}" ]]
+  then
+    printf 'status=record-incomplete\n' >>"${metadata}"
     return 1
   fi
-  printf 'status=%s\n' "${capture_status}" >>"${metadata}"
+  printf 'status=recorded\n' >>"${metadata}"
 }
 
 render_perf_reports() {
@@ -907,17 +886,21 @@ for definitions in "${definitions_values[@]}"; do
           set +e
           if [[ "${profile}" == 1 && "${cell}" == "${profile_cell}" ]]; then
             profiled_cell=1
-            env "${driver_env[@]}" "${kit_root}/bin/index-contention-qualification" \
-              >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log" &
-            driver_pid=$!
-            "${kit_root}/sample-index-v1-resources.py" process --pid "${driver_pid}" --output "${active_cell}/driver-resources.tsv" & driver_sampler_pid=$!
             profile_status=0
-            profile_phase concurrent drain "${progress}" "${driver_pid}" "${active_cell}" || profile_status=$?
+            start_concurrent_through_complete_profile "${active_cell}" || profile_status=$?
             if ((profile_status == 0)); then
-              profile_phase drain post "${progress}" "${driver_pid}" "${active_cell}" || profile_status=$?
+              driver_launched_ms="$(date +%s%3N)"
+              printf 'driver_launched_unix_milliseconds=%s\n' "${driver_launched_ms}" \
+                >>"${active_cell}/perf-concurrent-through-complete-metadata.txt"
+              env "${driver_env[@]}" "${kit_root}/bin/index-contention-qualification" \
+                >"${active_cell}/driver.stdout.log" 2>"${active_cell}/driver.stderr.log" &
+              driver_pid=$!
+              "${kit_root}/sample-index-v1-resources.py" process --pid "${driver_pid}" --output "${active_cell}/driver-resources.tsv" & driver_sampler_pid=$!
+              finish_concurrent_through_complete_profile \
+                "${progress}" "${driver_pid}" "${active_cell}" || profile_status=$?
             fi
             if ((profile_status != 0)); then
-              if kill -0 "${driver_pid}" 2>/dev/null; then
+              if [[ -n "${driver_pid}" ]] && kill -0 "${driver_pid}" 2>/dev/null; then
                 stop_driver 1
               else
                 stop_driver 0
@@ -952,8 +935,7 @@ for definitions in "${definitions_values[@]}"; do
             # Symbolization starts only after the driver, server, and resource
             # samplers stop, so it cannot alter measured or whole-run evidence.
             profile_report_status=0
-            render_perf_reports ingest-concurrent "${active_cell}" || profile_report_status=$?
-            render_perf_reports drain "${active_cell}" || profile_report_status=$?
+            render_perf_reports concurrent-through-complete "${active_cell}" || profile_report_status=$?
             if ((profile_report_status != 0)); then driver_status="${profile_report_status}"; fi
           fi
           telemetry_samples="${active_cell}/v1-summary.jsonl"
