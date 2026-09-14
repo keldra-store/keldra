@@ -481,8 +481,8 @@ impl StateReader for Store {
                     .transpose()
                     .map_err(|error| error.to_string())?;
                 let version = match head {
-                    Some(head) => Some(
-                        snapshot
+                    Some(head) => {
+                        let version = snapshot
                             .get_cf(
                                 self.cf(CF_VERSIONS).map_err(|error| error.to_string())?,
                                 version_key(identity, &key, head.version),
@@ -493,8 +493,12 @@ impl StateReader for Store {
                                 StoredVersion::decode(&encoded)
                                     .map(|stored| stored.version)
                                     .map_err(|error| error.to_string())
-                            })?,
-                    ),
+                            })?;
+                        if version.id != head.version || version.deleted != head.deleted {
+                            return Err("head and current version descriptor disagree".to_owned());
+                        }
+                        Some(version)
+                    }
                     None => None,
                 };
                 selected.push((path.clone(), version));

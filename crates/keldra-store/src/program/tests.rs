@@ -211,6 +211,54 @@ async fn snapshot(store: &Store) -> ProgramSnapshot {
         .unwrap()
 }
 
+#[tokio::test]
+async fn program_snapshot_rejects_a_descriptor_that_disagrees_with_its_head() {
+    let (_temporary, store, _) = configured_store().await;
+    let key = object_key(&counter_path()).unwrap();
+    let identity = store
+        .resolve_bucket_identity(key.tenant(), key.bucket())
+        .unwrap();
+    let selected = store.clock.next().unwrap();
+    let different = store.clock.next().unwrap();
+
+    for (head_deleted, descriptor_id) in [(true, different), (false, selected)] {
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            store.program_cf(CF_VERSIONS).unwrap(),
+            version_key(identity, &key, selected),
+            StoredVersion::new(
+                Version {
+                    id: descriptor_id,
+                    blob: None,
+                    content_type: None,
+                    deleted: true,
+                    committed_at_unix_millis: 1,
+                    protected_link_descriptor: false,
+                },
+                StoredVersionRetention::JournalPending,
+            )
+            .encode()
+            .unwrap(),
+        );
+        batch.put_cf(
+            store.program_cf(CF_HEADS).unwrap(),
+            identity.head_key(key.path()),
+            encode_head(&Head {
+                version: selected,
+                deleted: head_deleted,
+                mutation_stamp: None,
+            })
+            .unwrap(),
+        );
+        store.write_program_batch(batch).unwrap();
+
+        let error = StateReader::read_snapshot(&store, &[counter_path()])
+            .await
+            .unwrap_err();
+        assert_eq!(error, "head and current version descriptor disagree");
+    }
+}
+
 fn commit(
     prepared: &PreparedProgramBundle,
     previous_commit_cursor: Option<u64>,
