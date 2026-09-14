@@ -1169,30 +1169,29 @@ impl V1ProjectionPublisher {
         // Keep reuse inside the same authoritative object path. A content hash
         // alone must not allow another tenant, bucket, family, or artifact kind
         // to satisfy this read.
-        if let Some(bytes) =
-            self.immutable_cache
-                .get(tenant_id, bucket_id, path, expected_hash, maximum_bytes)?
-        {
-            return Ok(Some(bytes));
-        }
-        let Some((bytes, _)) = self
-            .read_object(
-                storage_tenant,
-                bucket,
+        self.immutable_cache
+            .get_or_load(
                 tenant_id,
                 bucket_id,
                 path,
-                Some(expected_hash),
+                expected_hash,
                 maximum_bytes,
+                || async {
+                    Ok(self
+                        .read_object(
+                            storage_tenant,
+                            bucket,
+                            tenant_id,
+                            bucket_id,
+                            path,
+                            Some(expected_hash),
+                            maximum_bytes,
+                        )
+                        .await?
+                        .map(|(bytes, _)| Bytes::from(bytes)))
+                },
             )
-            .await?
-        else {
-            return Ok(None);
-        };
-        let bytes = Bytes::from(bytes);
-        self.immutable_cache
-            .insert(tenant_id, bucket_id, path, expected_hash, bytes.clone());
-        Ok(Some(bytes))
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]

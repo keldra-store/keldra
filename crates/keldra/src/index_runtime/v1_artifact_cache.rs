@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -14,7 +15,7 @@ struct Authority {
     bucket_id: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Key {
     authority: Authority,
     path: Arc<str>,
@@ -49,6 +50,7 @@ struct State {
     // path without allocating another owned copy.
     entries: HashMap<Authority, HashMap<Arc<str>, HashMap<[u8; 32], Bytes>>>,
     blobs: HashMap<BlobKey, CachedBlob>,
+    loading: HashMap<Key, tokio::sync::watch::Sender<bool>>,
     fifo: VecDeque<CacheKey>,
 }
 
@@ -71,6 +73,7 @@ impl Default for State {
             bytes: 0,
             entries: HashMap::new(),
             blobs: HashMap::new(),
+            loading: HashMap::new(),
             fifo: VecDeque::new(),
         }
     }
@@ -79,7 +82,132 @@ impl Default for State {
 #[derive(Clone, Default)]
 pub(super) struct ImmutableArtifactCache(Arc<Mutex<State>>);
 
+struct PathLoadGuard {
+    cache: ImmutableArtifactCache,
+    key: Option<Key>,
+}
+
+impl Drop for PathLoadGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let completed = self
+            .cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .loading
+            .remove(&key);
+        if let Some(completed) = completed {
+            completed.send_replace(true);
+        }
+    }
+}
+
+enum PathLoad {
+    Hit(Bytes),
+    Wait(tokio::sync::watch::Receiver<bool>),
+    Lead(PathLoadGuard),
+}
+
 impl ImmutableArtifactCache {
+    /// Coalesce simultaneous misses for one exact immutable object identity.
+    ///
+    /// Projection lanes commonly seek different records through the same
+    /// stream page or pack. The first lane performs the authoritative read;
+    /// peers retain their own loader and retry only if that read failed before
+    /// populating the cache.
+    pub(super) async fn get_or_load<F, Fut>(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        path: &str,
+        hash: [u8; 32],
+        maximum_bytes: usize,
+        load: F,
+    ) -> Result<Option<Bytes>, Status>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Option<Bytes>, Status>>,
+    {
+        let mut load = Some(load);
+        loop {
+            match self.begin_path_load(tenant_id, bucket_id, path, hash, maximum_bytes)? {
+                PathLoad::Hit(bytes) => return Ok(Some(bytes)),
+                PathLoad::Wait(mut completed) => {
+                    if !*completed.borrow() {
+                        completed.changed().await.map_err(|_| {
+                            Status::internal("v1 immutable artifact load coordinator closed")
+                        })?;
+                    }
+                }
+                PathLoad::Lead(guard) => {
+                    let load = load
+                        .take()
+                        .expect("one artifact caller can lead at most once");
+                    let result = load().await;
+                    if let Ok(Some(bytes)) = &result {
+                        if bytes.len() > maximum_bytes {
+                            return Err(Status::data_loss(
+                                "v1 projection artifact violates its exact byte bound",
+                            ));
+                        }
+                        self.insert(tenant_id, bucket_id, path, hash, bytes.clone());
+                    }
+                    drop(guard);
+                    return result;
+                }
+            }
+        }
+    }
+
+    fn begin_path_load(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        path: &str,
+        hash: [u8; 32],
+        maximum_bytes: usize,
+    ) -> Result<PathLoad, Status> {
+        let authority = Authority {
+            tenant_id,
+            bucket_id,
+        };
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(bytes) = state
+            .entries
+            .get(&authority)
+            .and_then(|paths| paths.get(path))
+            .and_then(|hashes| hashes.get(&hash))
+        {
+            if bytes.len() > maximum_bytes {
+                return Err(Status::data_loss(
+                    "v1 projection artifact violates its exact byte bound",
+                ));
+            }
+            return Ok(PathLoad::Hit(bytes.clone()));
+        }
+        let key = Key {
+            authority,
+            path: Arc::from(path),
+            hash,
+        };
+        if let Some(completed) = state.loading.get(&key) {
+            return Ok(PathLoad::Wait(completed.subscribe()));
+        }
+        let (completed, _) = tokio::sync::watch::channel(false);
+        state.loading.insert(key.clone(), completed);
+        Ok(PathLoad::Lead(PathLoadGuard {
+            cache: self.clone(),
+            key: Some(key),
+        }))
+    }
+
+    #[cfg(test)]
     pub(super) fn get(
         &self,
         tenant_id: u64,
@@ -377,6 +505,9 @@ fn resident_query_run_bytes(descriptor: &ProjectionQueryRunDescriptor) -> usize 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::Notify;
     use tonic::Code;
 
     use super::*;
@@ -394,6 +525,119 @@ mod tests {
 
         assert_eq!(cached, bytes);
         assert_eq!(cached.as_ptr(), bytes.as_ptr());
+    }
+
+    #[tokio::test]
+    async fn simultaneous_path_misses_perform_one_authoritative_load() {
+        let cache = ImmutableArtifactCache::default();
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let leader_entered = Arc::new(Notify::new());
+        let release_leader = Arc::new(Notify::new());
+        let entered = leader_entered.notified();
+
+        let leader = {
+            let cache = cache.clone();
+            let load_count = load_count.clone();
+            let leader_entered = leader_entered.clone();
+            let release_leader = release_leader.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_load(1, 2, "/family/pages/hash", [3; 32], 8, || async move {
+                        load_count.fetch_add(1, Ordering::SeqCst);
+                        leader_entered.notify_one();
+                        release_leader.notified().await;
+                        Ok(Some(Bytes::from(vec![1; 8])))
+                    })
+                    .await
+            })
+        };
+        entered.await;
+        let follower = {
+            let cache = cache.clone();
+            let load_count = load_count.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_load(1, 2, "/family/pages/hash", [3; 32], 8, || async move {
+                        load_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(Some(Bytes::from(vec![2; 8])))
+                    })
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        release_leader.notify_one();
+        let leader_bytes = leader.await.unwrap().unwrap().unwrap();
+        let follower_bytes = follower.await.unwrap().unwrap().unwrap();
+
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+        assert_eq!(leader_bytes.as_ptr(), follower_bytes.as_ptr());
+    }
+
+    #[tokio::test]
+    async fn failed_path_load_releases_a_waiter_to_retry() {
+        let cache = ImmutableArtifactCache::default();
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let leader_entered = Arc::new(Notify::new());
+        let release_leader = Arc::new(Notify::new());
+        let entered = leader_entered.notified();
+
+        let leader = {
+            let cache = cache.clone();
+            let load_count = load_count.clone();
+            let leader_entered = leader_entered.clone();
+            let release_leader = release_leader.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_load(1, 2, "/family/pages/hash", [3; 32], 8, || async move {
+                        load_count.fetch_add(1, Ordering::SeqCst);
+                        leader_entered.notify_one();
+                        release_leader.notified().await;
+                        Err(Status::unavailable("authoritative read failed"))
+                    })
+                    .await
+            })
+        };
+        entered.await;
+        let follower = {
+            let cache = cache.clone();
+            let load_count = load_count.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_load(1, 2, "/family/pages/hash", [3; 32], 8, || async move {
+                        load_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(Some(Bytes::from(vec![4; 8])))
+                    })
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        release_leader.notify_one();
+
+        assert_eq!(leader.await.unwrap().unwrap_err().code(), Code::Unavailable);
+        assert_eq!(follower.await.unwrap().unwrap().unwrap().as_ref(), &[4; 8]);
+        assert_eq!(load_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn loaded_path_bytes_must_fit_the_callers_exact_bound() {
+        let cache = ImmutableArtifactCache::default();
+
+        let error = cache
+            .get_or_load(1, 2, "/family/pages/hash", [3; 32], 7, || async {
+                Ok(Some(Bytes::from_static(b"artifact")))
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), Code::DataLoss);
+        assert!(
+            cache
+                .get(1, 2, "/family/pages/hash", [3; 32], 8)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
