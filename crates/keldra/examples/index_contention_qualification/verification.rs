@@ -1,4 +1,6 @@
-use super::{IndexClient, config::Config, data, index_client, progress::Counters, query_page};
+use super::{
+    IndexClient, bounded_error, config::Config, data, index_client, progress::Counters, query_page,
+};
 use anyhow::{Context, Result, bail, ensure};
 use keldra_storage::object_client;
 use keldra_storage::v1::object_head::State as ObjectHeadState;
@@ -181,6 +183,7 @@ async fn verify_one_final_definition(
     let mut client = index_client(channel, &token)?;
     let mut last_observation = "no query attempt completed".to_owned();
     let mut last_successful_observation = None::<String>;
+    let mut pagination_failures = PaginationFailureEvidence::default();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(
@@ -227,15 +230,79 @@ async fn verify_one_final_definition(
                 }
             }
             Err(error) => {
+                pagination_failures.observe(error);
+                let failures = pagination_failures.summary();
                 last_observation = match &last_successful_observation {
                     Some(successful) => format!(
-                        "query failed: {error:#}; last successful observation: {successful}"
+                        "query failed: {failures}; last successful observation: {successful}"
                     ),
-                    None => format!("query failed: {error:#}"),
+                    None => format!("query failed: {failures}"),
                 };
             }
         }
         tokio::time::sleep(visibility_poll).await;
+    }
+}
+
+#[derive(Debug)]
+struct PaginationAttemptFailure {
+    detail: String,
+    deadline_edge: bool,
+}
+
+impl PaginationAttemptFailure {
+    fn causal(detail: impl Into<String>) -> Self {
+        Self {
+            detail: bounded_error(&detail.into()),
+            deadline_edge: false,
+        }
+    }
+
+    fn deadline_edge(detail: impl Into<String>) -> Self {
+        Self {
+            detail: bounded_error(&detail.into()),
+            deadline_edge: true,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PaginationFailureEvidence {
+    total: u64,
+    first_causal: Option<String>,
+    latest_causal: Option<String>,
+    terminal_deadline_edge: Option<String>,
+}
+
+impl PaginationFailureEvidence {
+    fn observe(&mut self, failure: PaginationAttemptFailure) {
+        self.total = self.total.saturating_add(1);
+        if failure.deadline_edge {
+            self.terminal_deadline_edge = Some(failure.detail);
+            return;
+        }
+        self.first_causal
+            .get_or_insert_with(|| failure.detail.clone());
+        self.latest_causal = Some(failure.detail);
+    }
+
+    fn summary(&self) -> String {
+        let mut evidence = format!("{} pagination attempt(s) failed", self.total);
+        if let Some(first) = self.first_causal.as_deref() {
+            evidence.push_str("; first causal failure: ");
+            evidence.push_str(first);
+        }
+        if let Some(latest) = self.latest_causal.as_deref()
+            && self.first_causal.as_deref() != Some(latest)
+        {
+            evidence.push_str("; latest causal failure: ");
+            evidence.push_str(latest);
+        }
+        if let Some(terminal) = self.terminal_deadline_edge.as_deref() {
+            evidence.push_str("; terminal deadline-edge failure: ");
+            evidence.push_str(terminal);
+        }
+        evidence
     }
 }
 
@@ -337,17 +404,21 @@ async fn paginated_class_query(
     deadline: Instant,
     request_timeout: Duration,
     counters: Arc<Counters>,
-) -> Result<PaginatedQueryResult> {
+) -> std::result::Result<PaginatedQueryResult, PaginationAttemptFailure> {
     counters.pagination_attempt_started();
     let traversal_started = Instant::now();
-    let value = serde_json::to_vec(class)?;
+    let value = serde_json::to_vec(class).map_err(|error| {
+        PaginationAttemptFailure::causal(format!("mutable query value encoding failed: {error}"))
+    })?;
     let mut page_token = Vec::new();
     let mut result = PaginatedQueryResult::default();
     for page_ordinal in 1usize.. {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             counters.pagination_attempt_failed(traversal_started.elapsed());
-            bail!("paginated mutable query exceeded its verification deadline");
+            return Err(PaginationAttemptFailure::deadline_edge(
+                "paginated mutable query exceeded its verification deadline",
+            ));
         }
         let page_timeout = remaining.min(request_timeout);
         let page_started = Instant::now();
@@ -369,24 +440,29 @@ async fn paginated_class_query(
             Ok(Err(error)) => {
                 counters.pagination_page_failed(page_started.elapsed());
                 counters.pagination_attempt_failed(traversal_started.elapsed());
-                return Err(anyhow::anyhow!(
+                return Err(PaginationAttemptFailure::causal(format!(
                     "page {page_ordinal} RPC failed after {:?}; completed_pages={}, accumulated_hits={}, traversal_elapsed={:?}: {error:#}",
                     page_started.elapsed(),
                     page_ordinal - 1,
                     result.hits.len(),
                     traversal_started.elapsed(),
-                ));
+                )));
             }
             Err(_) => {
                 counters.pagination_page_failed(page_started.elapsed());
                 counters.pagination_attempt_failed(traversal_started.elapsed());
-                return Err(anyhow::anyhow!(
+                let detail = format!(
                     "page {page_ordinal} exceeded its {:?} request timeout; completed_pages={}, accumulated_hits={}, traversal_elapsed={:?}",
                     page_timeout,
                     page_ordinal - 1,
                     result.hits.len(),
                     traversal_started.elapsed(),
-                ));
+                );
+                return Err(if page_timeout < request_timeout {
+                    PaginationAttemptFailure::deadline_edge(detail)
+                } else {
+                    PaginationAttemptFailure::causal(detail)
+                });
             }
         };
         let next_page_token = match result.absorb(response) {
@@ -394,8 +470,8 @@ async fn paginated_class_query(
             Err(error) => {
                 counters.pagination_page_failed(page_started.elapsed());
                 counters.pagination_attempt_failed(traversal_started.elapsed());
-                return Err(error.context(format!(
-                    "page {page_ordinal} response validation failed after {:?}; completed_pages={}, accumulated_hits={}, traversal_elapsed={:?}",
+                return Err(PaginationAttemptFailure::causal(format!(
+                    "page {page_ordinal} response validation failed after {:?}; completed_pages={}, accumulated_hits={}, traversal_elapsed={:?}: {error:#}",
                     page_started.elapsed(),
                     page_ordinal - 1,
                     result.hits.len(),
@@ -423,4 +499,55 @@ pub(super) fn source_has_no_observed_lag(source: &IndexSourceFreshness) -> bool 
         && source
             .observed_tail
             .is_none_or(|tail| tail.checked_add(1) == Some(source.indexed_next_offset))
+}
+
+#[cfg(test)]
+mod pagination_failure_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_deadline_edge_does_not_replace_causal_failure() {
+        let mut evidence = PaginationFailureEvidence::default();
+        evidence.observe(PaginationAttemptFailure::causal(
+            "page 1 RPC failed: resource exhausted",
+        ));
+        evidence.observe(PaginationAttemptFailure::deadline_edge(
+            "page 1 exceeded its 191ms request timeout",
+        ));
+
+        let summary = evidence.summary();
+        assert!(summary.contains("2 pagination attempt(s) failed"));
+        assert!(summary.contains("first causal failure: page 1 RPC failed: resource exhausted"));
+        assert!(
+            summary.contains(
+                "terminal deadline-edge failure: page 1 exceeded its 191ms request timeout"
+            )
+        );
+    }
+
+    #[test]
+    fn first_and_latest_distinct_causal_failures_are_retained() {
+        let mut evidence = PaginationFailureEvidence::default();
+        evidence.observe(PaginationAttemptFailure::causal("first RPC failure"));
+        evidence.observe(PaginationAttemptFailure::causal(
+            "representative response validation failure",
+        ));
+
+        let summary = evidence.summary();
+        assert!(summary.contains("first causal failure: first RPC failure"));
+        assert!(
+            summary.contains("latest causal failure: representative response validation failure")
+        );
+    }
+
+    #[test]
+    fn retained_failure_details_are_bounded() {
+        let mut evidence = PaginationFailureEvidence::default();
+        evidence.observe(PaginationAttemptFailure::causal("x".repeat(4_096)));
+
+        assert_eq!(
+            evidence.first_causal.as_ref().unwrap().chars().count(),
+            super::super::MAX_VISIBILITY_SAMPLE_ERROR_CHARS
+        );
+    }
 }
