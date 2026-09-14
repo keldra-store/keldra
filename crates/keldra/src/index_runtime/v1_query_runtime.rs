@@ -50,7 +50,16 @@ const MIN_QUERY_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_QUERY_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 // This is a logical-work limit, not a conversion of the memory lease.
 const MAX_QUERY_CANDIDATES: usize = 1_000_000;
-const QUERY_POSITION_BYTES: usize = 64;
+const QUERY_POSITION_MAGIC: &[u8; 8] = b"K1QPOS01";
+const QUERY_POSITION_FORMAT: u16 = 1;
+const QUERY_POSITION_FIXED_BYTES: usize = 8 + 2 + 32 + 32 + 4;
+const QUERY_POSITION_ROOT_FIXED_BYTES: usize = 32 + 1;
+const QUERY_POSITION_ROOT_PROOF_BYTES: usize = 8;
+// The physical directory admits a much larger future topology, but an opaque
+// public continuation must remain a bounded request value. This already
+// exceeds the executor's normal 1,024-partition default and is far above any
+// supported cluster topology.
+const MAX_QUERY_CONTINUATION_PARTITIONS: usize = 1_024;
 const QUERY_SNAPSHOT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 impl QueryMemoryPermit for IndexQueryMemoryPermit {
@@ -108,16 +117,16 @@ impl V1LocalIndexQueryExecutor {
             .map(|cursor| decode_query_position(&cursor.last_position))
             .transpose()?;
         let resume_after_document = natural_page
-            .then(|| continuation.map(|(_, document)| document))
+            .then(|| continuation.as_ref().map(|position| position.document))
             .flatten();
         // Subscribe before the first pin so a Current publication between the
         // read and the wait cannot be lost. The publisher is the authority for
         // root-vector progress; no catalogue/directory polling interval is
         // needed.
         let mut publication_changes = self.projections.subscribe();
-        let cached = continuation.and_then(|(identity, _)| {
+        let cached = continuation.as_ref().and_then(|position| {
             self.snapshots.get(
-                identity,
+                position.snapshot,
                 &logical,
                 &activation.catalog_lineage,
                 &activation.recipe_catalog_proofs,
@@ -138,7 +147,9 @@ impl V1LocalIndexQueryExecutor {
             ((*cached.pinned).clone(), Some(cached.snapshot.clone()))
         } else {
             let pinned = loop {
-                let pinned = self.pin_root_vector(&request, &recipe).await?;
+                let pinned = self
+                    .pin_root_vector(&request, &recipe, continuation.as_ref())
+                    .await?;
                 if request.resume.is_some()
                     || requirement_is_covered(&pinned, request.required_freshness.as_ref())
                 {
@@ -158,7 +169,7 @@ impl V1LocalIndexQueryExecutor {
                     }
                 }
             };
-            if let Some((expected, _)) = continuation
+            if let Some(expected) = continuation.as_ref().map(|position| position.snapshot)
                 && query_snapshot_identity(pinned.cut, &pinned.roots).map_err(index_status)?
                     != expected
             {
@@ -299,8 +310,9 @@ impl V1LocalIndexQueryExecutor {
         if next_position.is_some() {
             self.snapshots.insert(pinned.clone(), snapshot.clone());
         }
-        let next_position =
-            next_position.map(|document| encode_query_position(snapshot.identity(), document));
+        let next_position = next_position
+            .map(|document| encode_query_position(snapshot.identity(), document, &pinned))
+            .transpose()?;
         let hits = page
             .into_iter()
             .map(|candidate| IndexQueryHit {
@@ -442,6 +454,7 @@ impl V1LocalIndexQueryExecutor {
         &self,
         request: &LocalIndexQueryRequest,
         recipe: &PhysicalCatalogRecipe,
+        continuation: Option<&QueryPosition>,
     ) -> Result<PinnedRootVector, Status> {
         let (directory, directory_version) = self
             .projections
@@ -483,13 +496,17 @@ impl V1LocalIndexQueryExecutor {
                     "v1 partition current does not match the active catalog generation",
                 ));
             }
-            newest.push((entry.partition, loaded.generation));
+            newest.push((
+                entry.partition,
+                loaded.current.generation_hash,
+                loaded.generation,
+            ));
         }
         let requested_cut = request.resume.as_ref().map(|cursor| cursor.commit_revision);
         let cut = requested_cut.unwrap_or_else(|| {
             newest
                 .iter()
-                .map(|(_, generation)| generation.through_atomic_position)
+                .map(|(_, _, generation)| generation.through_atomic_position)
                 .min()
                 .unwrap_or(0)
         });
@@ -497,16 +514,56 @@ impl V1LocalIndexQueryExecutor {
             through_atomic_position: cut,
         };
         let mut roots = Vec::with_capacity(newest.len());
-        for (partition, generation) in newest {
-            roots.push(
-                self.select_root_at_cut(request, recipe, partition, generation, common_cut)
-                    .await?,
-            );
+        let mut generation_hashes = Vec::with_capacity(newest.len());
+        if let Some(continuation) = continuation {
+            if continuation.roots.len() != newest.len() {
+                return Err(Status::failed_precondition(
+                    "v1 query continuation root vector no longer matches the family directory",
+                ));
+            }
+            for ((partition, _, _), exact) in newest.into_iter().zip(&continuation.roots) {
+                let header = self
+                    .load_generation_header(request, recipe, partition, exact.generation_hash)
+                    .await?;
+                if header.physical_catalog_generation != recipe.physical_generation
+                    || header.through_atomic_position > common_cut.through_atomic_position
+                {
+                    return Err(Status::failed_precondition(
+                        "v1 query continuation generation no longer matches its pinned cut",
+                    ));
+                }
+                roots.push(pinned_query_root(
+                    recipe,
+                    partition,
+                    header,
+                    common_cut,
+                    exact.next_newer_through_atomic_position,
+                ));
+                generation_hashes.push(exact.generation_hash);
+            }
+        } else {
+            for (partition, generation_hash, generation) in newest {
+                let (root, generation_hash) = self
+                    .select_root_at_cut(
+                        request,
+                        recipe,
+                        partition,
+                        generation_hash,
+                        generation,
+                        common_cut,
+                    )
+                    .await?;
+                roots.push(root);
+                generation_hashes.push(generation_hash);
+            }
         }
-        roots.sort_by_key(|root| root.partition);
+        let mut exact = roots.into_iter().zip(generation_hashes).collect::<Vec<_>>();
+        exact.sort_by_key(|(root, _)| root.partition);
+        let (roots, generation_hashes) = exact.into_iter().unzip();
         Ok(PinnedRootVector {
             cut: common_cut,
             roots,
+            generation_hashes,
             directory,
             directory_version,
         })
@@ -517,9 +574,10 @@ impl V1LocalIndexQueryExecutor {
         request: &LocalIndexQueryRequest,
         recipe: &PhysicalCatalogRecipe,
         partition: ProjectionPartitionIdentity,
+        mut generation_hash: [u8; 32],
         generation: keldra_index::v1::ProjectionGeneration,
         cut: QueryCommonCut,
-    ) -> Result<PinnedPartitionQueryRoot, Status> {
+    ) -> Result<(PinnedPartitionQueryRoot, [u8; 32]), Status> {
         let mut header = ProjectionGenerationHeader {
             partition: generation.partition,
             physical_catalog_generation: generation.physical_catalog_generation,
@@ -543,6 +601,7 @@ impl V1LocalIndexQueryExecutor {
             let hash = header.previous_generation_hash.ok_or_else(|| {
                 Status::failed_precondition("requested v1 query cut is no longer retained")
             })?;
+            generation_hash = hash;
             let previous = self
                 .load_generation_header(request, recipe, partition, hash)
                 .await?;
@@ -555,17 +614,10 @@ impl V1LocalIndexQueryExecutor {
             }
             header = previous;
         }
-        Ok(PinnedPartitionQueryRoot {
-            partition,
-            physical_catalog_generation: recipe.physical_generation,
-            root: header.query_stream_root,
-            cut_proof: QueryRootCutProof {
-                common_cut: cut,
-                selected_stream_root_hash: header.query_stream_root.stream_root_hash,
-                next_newer_through_atomic_position: next_newer,
-            },
-            handoff_lineage_id: handoff_lineage(partition),
-        })
+        Ok((
+            pinned_query_root(recipe, partition, header, cut, next_newer),
+            generation_hash,
+        ))
     }
 
     async fn load_generation_header(
@@ -588,7 +640,9 @@ impl V1LocalIndexQueryExecutor {
                 CONTROL_OBJECT_MAX_BYTES,
             )
             .await?
-            .ok_or_else(|| Status::data_loss("pinned v1 generation is absent"))?
+            .ok_or_else(|| {
+                Status::failed_precondition("requested v1 query generation is no longer retained")
+            })?
             .0;
         let header = decode_projection_generation_header(&bytes).map_err(index_status)?;
         if header.partition != partition {
@@ -673,6 +727,7 @@ impl LocalIndexQueryExecutor for V1LocalIndexQueryExecutor {
 struct PinnedRootVector {
     cut: QueryCommonCut,
     roots: Vec<PinnedPartitionQueryRoot>,
+    generation_hashes: Vec<[u8; 32]>,
     directory: ProjectionFamilyPartitionDirectory,
     directory_version: keldra_store::VersionId,
 }
@@ -730,6 +785,12 @@ impl V1QuerySnapshotCache {
                     .roots
                     .capacity()
                     .saturating_mul(std::mem::size_of::<PinnedPartitionQueryRoot>()),
+            )
+            .saturating_add(
+                pinned
+                    .generation_hashes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<[u8; 32]>()),
             )
             .saturating_add(pinned.directory.entries.capacity().saturating_mul(
                 std::mem::size_of::<keldra_index::v1::ProjectionPartitionDirectoryEntry>(),
@@ -963,14 +1024,15 @@ fn require_request(request: &LocalIndexQueryRequest) -> Result<(), Status> {
             "local v1 query identity is invalid",
         ));
     }
-    if request.resume.as_ref().is_some_and(|cursor| {
-        cursor.commit_revision == 0
+    if let Some(cursor) = request.resume.as_ref() {
+        if cursor.commit_revision == 0
             || cursor.authorization_revision != request.authorization_revision
-            || cursor.last_position.len() != QUERY_POSITION_BYTES
-    }) {
-        return Err(Status::invalid_argument(
-            "local v1 query cursor identity is invalid",
-        ));
+            || decode_query_position(&cursor.last_position).is_err()
+        {
+            return Err(Status::invalid_argument(
+                "local v1 query cursor identity is invalid",
+            ));
+        }
     }
     Ok(())
 }
@@ -1021,6 +1083,26 @@ fn handoff_lineage(partition: ProjectionPartitionIdentity) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
+fn pinned_query_root(
+    recipe: &PhysicalCatalogRecipe,
+    partition: ProjectionPartitionIdentity,
+    header: ProjectionGenerationHeader,
+    cut: QueryCommonCut,
+    next_newer_through_atomic_position: Option<u64>,
+) -> PinnedPartitionQueryRoot {
+    PinnedPartitionQueryRoot {
+        partition,
+        physical_catalog_generation: recipe.physical_generation,
+        root: header.query_stream_root,
+        cut_proof: QueryRootCutProof {
+            common_cut: cut,
+            selected_stream_root_hash: header.query_stream_root.stream_root_hash,
+            next_newer_through_atomic_position,
+        },
+        handoff_lineage_id: handoff_lineage(partition),
+    }
+}
+
 fn requirement_is_covered(
     pinned: &PinnedRootVector,
     requirement: Option<&crate::index_service::IndexFreshnessRequirement>,
@@ -1046,7 +1128,7 @@ fn page_candidates(
     limit: usize,
 ) -> Result<(Vec<AuthorizedQueryCandidate>, Option<StableDocumentKey>), Status> {
     let start = if let Some(resume) = resume {
-        let (_, resume_document) = decode_query_position(&resume.last_position)?;
+        let resume_document = decode_query_position(&resume.last_position)?.document;
         candidates
             .iter()
             .position(|candidate| candidate.candidate.document == resume_document)
@@ -1070,32 +1152,177 @@ fn page_candidates(
     Ok((page, next))
 }
 
-fn decode_query_position(
-    position: &[u8],
-) -> Result<(QuerySnapshotIdentity, StableDocumentKey), Status> {
-    let position: [u8; QUERY_POSITION_BYTES] = position
-        .try_into()
-        .map_err(|_| Status::invalid_argument("v1 query cursor is invalid"))?;
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QueryPositionRoot {
+    generation_hash: [u8; 32],
+    next_newer_through_atomic_position: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QueryPosition {
+    snapshot: QuerySnapshotIdentity,
+    document: StableDocumentKey,
+    roots: Vec<QueryPositionRoot>,
+}
+
+fn decode_query_position(position: &[u8]) -> Result<QueryPosition, Status> {
+    if position.len() < QUERY_POSITION_FIXED_BYTES
+        || &position[..8] != QUERY_POSITION_MAGIC
+        || u16::from_be_bytes(position[8..10].try_into().expect("fixed format width"))
+            != QUERY_POSITION_FORMAT
+    {
+        return Err(Status::invalid_argument("v1 query cursor is invalid"));
+    }
     let snapshot = QuerySnapshotIdentity::from_bytes(
-        position[..32]
+        position[10..42]
             .try_into()
             .expect("fixed query position snapshot width"),
     )
     .map_err(index_status)?;
     let document = StableDocumentKey::from_bytes(
-        position[32..]
+        position[42..74]
             .try_into()
             .expect("fixed query position document width"),
     )
     .map_err(index_status)?;
-    Ok((snapshot, document))
+    let count = usize::try_from(u32::from_be_bytes(
+        position[74..78]
+            .try_into()
+            .expect("fixed query position count width"),
+    ))
+    .map_err(|_| Status::invalid_argument("v1 query cursor root count is invalid"))?;
+    if count == 0 || count > MAX_QUERY_CONTINUATION_PARTITIONS {
+        return Err(Status::invalid_argument(
+            "v1 query cursor root count is invalid",
+        ));
+    }
+    let minimum = QUERY_POSITION_FIXED_BYTES
+        .checked_add(
+            count
+                .checked_mul(QUERY_POSITION_ROOT_FIXED_BYTES)
+                .ok_or_else(|| Status::invalid_argument("v1 query cursor is too large"))?,
+        )
+        .ok_or_else(|| Status::invalid_argument("v1 query cursor is too large"))?;
+    let maximum = minimum
+        .checked_add(
+            count
+                .checked_mul(QUERY_POSITION_ROOT_PROOF_BYTES)
+                .ok_or_else(|| Status::invalid_argument("v1 query cursor is too large"))?,
+        )
+        .ok_or_else(|| Status::invalid_argument("v1 query cursor is too large"))?;
+    if !(minimum..=maximum).contains(&position.len()) {
+        return Err(Status::invalid_argument(
+            "v1 query cursor length is invalid",
+        ));
+    }
+    let mut offset = QUERY_POSITION_FIXED_BYTES;
+    let mut roots = Vec::with_capacity(count);
+    for _ in 0..count {
+        let generation_hash = position
+            .get(offset..offset + 32)
+            .ok_or_else(|| Status::invalid_argument("v1 query cursor is truncated"))?
+            .try_into()
+            .expect("checked generation hash width");
+        offset += 32;
+        if generation_hash == [0; 32] {
+            return Err(Status::invalid_argument(
+                "v1 query cursor generation is invalid",
+            ));
+        }
+        let proof = *position
+            .get(offset)
+            .ok_or_else(|| Status::invalid_argument("v1 query cursor is truncated"))?;
+        offset += 1;
+        let next_newer_through_atomic_position = match proof {
+            0 => None,
+            1 => {
+                let value = u64::from_be_bytes(
+                    position
+                        .get(offset..offset + 8)
+                        .ok_or_else(|| Status::invalid_argument("v1 query cursor is truncated"))?
+                        .try_into()
+                        .expect("checked proof width"),
+                );
+                offset += 8;
+                Some(value)
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "v1 query cursor root proof is invalid",
+                ));
+            }
+        };
+        roots.push(QueryPositionRoot {
+            generation_hash,
+            next_newer_through_atomic_position,
+        });
+    }
+    if offset != position.len() {
+        return Err(Status::invalid_argument(
+            "v1 query cursor contains trailing bytes",
+        ));
+    }
+    Ok(QueryPosition {
+        snapshot,
+        document,
+        roots,
+    })
 }
 
-fn encode_query_position(snapshot: QuerySnapshotIdentity, document: StableDocumentKey) -> Vec<u8> {
-    let mut position = Vec::with_capacity(QUERY_POSITION_BYTES);
+fn encode_query_position(
+    snapshot: QuerySnapshotIdentity,
+    document: StableDocumentKey,
+    pinned: &PinnedRootVector,
+) -> Result<Vec<u8>, Status> {
+    if pinned.roots.is_empty()
+        || pinned.roots.len() != pinned.generation_hashes.len()
+        || pinned.roots.len() > MAX_QUERY_CONTINUATION_PARTITIONS
+    {
+        return Err(Status::resource_exhausted(
+            "v1 query root vector is too large for a bounded continuation",
+        ));
+    }
+    let count = u32::try_from(pinned.roots.len())
+        .map_err(|_| Status::resource_exhausted("v1 query root count exceeds u32"))?;
+    let proof_bytes = pinned
+        .roots
+        .iter()
+        .filter(|root| root.cut_proof.next_newer_through_atomic_position.is_some())
+        .count()
+        .checked_mul(QUERY_POSITION_ROOT_PROOF_BYTES)
+        .ok_or_else(|| Status::resource_exhausted("v1 query continuation size overflow"))?;
+    let capacity = QUERY_POSITION_FIXED_BYTES
+        .checked_add(
+            pinned
+                .roots
+                .len()
+                .checked_mul(QUERY_POSITION_ROOT_FIXED_BYTES)
+                .ok_or_else(|| Status::resource_exhausted("v1 query continuation size overflow"))?,
+        )
+        .and_then(|bytes| bytes.checked_add(proof_bytes))
+        .ok_or_else(|| Status::resource_exhausted("v1 query continuation size overflow"))?;
+    let mut position = Vec::with_capacity(capacity);
+    position.extend_from_slice(QUERY_POSITION_MAGIC);
+    position.extend_from_slice(&QUERY_POSITION_FORMAT.to_be_bytes());
     position.extend_from_slice(&snapshot.bytes());
     position.extend_from_slice(&document.bytes());
-    position
+    position.extend_from_slice(&count.to_be_bytes());
+    for (root, generation_hash) in pinned.roots.iter().zip(&pinned.generation_hashes) {
+        if *generation_hash == [0; 32] {
+            return Err(Status::data_loss(
+                "v1 query pinned an invalid generation identity",
+            ));
+        }
+        position.extend_from_slice(generation_hash);
+        match root.cut_proof.next_newer_through_atomic_position {
+            Some(next) => {
+                position.push(1);
+                position.extend_from_slice(&next.to_be_bytes());
+            }
+            None => position.push(0),
+        }
+    }
+    Ok(position)
 }
 
 fn freshness(
@@ -1376,6 +1603,7 @@ mod tests {
                 through_atomic_position: 9,
             },
             roots: vec![predecessor, successor],
+            generation_hashes: vec![[7; 32], [8; 32]],
             directory: ProjectionFamilyPartitionDirectory {
                 family_id: [1; 32],
                 revision: 1,
@@ -1400,21 +1628,109 @@ mod tests {
     fn result_cursor_resumes_after_the_exact_stable_document() {
         let values = vec![authorized(1, "a"), authorized(2, "b"), authorized(3, "c")];
         let snapshot = QuerySnapshotIdentity::from_bytes([9; 32]).unwrap();
+        let pinned = PinnedRootVector {
+            cut: QueryCommonCut {
+                through_atomic_position: 9,
+            },
+            roots: vec![root(partition(4, 5), 8)],
+            generation_hashes: vec![[7; 32]],
+            directory: ProjectionFamilyPartitionDirectory {
+                family_id: [1; 32],
+                revision: 1,
+                entries: Vec::new(),
+            },
+            directory_version: keldra_store::VersionId(1),
+        };
         let resume = crate::index_service::IndexPageCursor {
             commit_revision: 9,
             last_position: encode_query_position(
                 snapshot,
                 StableDocumentKey::from_bytes([1; 32]).unwrap(),
-            ),
+                &pinned,
+            )
+            .unwrap(),
             authorization_revision: 4,
         };
         let (page, next) = page_candidates(values, Some(&resume), 1).unwrap();
         assert_eq!(page[0].candidate.document.bytes(), [2; 32]);
         assert_eq!(next, Some(StableDocumentKey::from_bytes([2; 32]).unwrap()));
+        let encoded = encode_query_position(snapshot, next.unwrap(), &pinned).unwrap();
         assert_eq!(
-            decode_query_position(&encode_query_position(snapshot, next.unwrap())).unwrap(),
-            (snapshot, StableDocumentKey::from_bytes([2; 32]).unwrap())
+            decode_query_position(&encoded).unwrap(),
+            QueryPosition {
+                snapshot,
+                document: StableDocumentKey::from_bytes([2; 32]).unwrap(),
+                roots: vec![QueryPositionRoot {
+                    generation_hash: [7; 32],
+                    next_newer_through_atomic_position: None,
+                }],
+            }
         );
+    }
+
+    #[test]
+    fn query_position_preserves_exact_generations_and_equal_cut_proofs() {
+        let snapshot = QuerySnapshotIdentity::from_bytes([9; 32]).unwrap();
+        let mut first = root(partition(4, 5), 8);
+        first.cut_proof.next_newer_through_atomic_position = Some(10);
+        let second = root(partition(6, 7), 12);
+        let pinned = PinnedRootVector {
+            cut: QueryCommonCut {
+                through_atomic_position: 9,
+            },
+            roots: vec![first, second],
+            generation_hashes: vec![[7; 32], [8; 32]],
+            directory: ProjectionFamilyPartitionDirectory {
+                family_id: [1; 32],
+                revision: 1,
+                entries: Vec::new(),
+            },
+            directory_version: keldra_store::VersionId(1),
+        };
+        let document = StableDocumentKey::from_bytes([3; 32]).unwrap();
+
+        let decoded =
+            decode_query_position(&encode_query_position(snapshot, document, &pinned).unwrap())
+                .unwrap();
+
+        assert_eq!(decoded.snapshot, snapshot);
+        assert_eq!(decoded.document, document);
+        assert_eq!(
+            decoded.roots,
+            vec![
+                QueryPositionRoot {
+                    generation_hash: [7; 32],
+                    next_newer_through_atomic_position: Some(10),
+                },
+                QueryPositionRoot {
+                    generation_hash: [8; 32],
+                    next_newer_through_atomic_position: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn query_position_rejects_truncation_and_trailing_bytes() {
+        let snapshot = QuerySnapshotIdentity::from_bytes([9; 32]).unwrap();
+        let pinned = PinnedRootVector {
+            cut: QueryCommonCut {
+                through_atomic_position: 9,
+            },
+            roots: vec![root(partition(4, 5), 8)],
+            generation_hashes: vec![[7; 32]],
+            directory: ProjectionFamilyPartitionDirectory {
+                family_id: [1; 32],
+                revision: 1,
+                entries: Vec::new(),
+            },
+            directory_version: keldra_store::VersionId(1),
+        };
+        let document = StableDocumentKey::from_bytes([3; 32]).unwrap();
+        let mut encoded = encode_query_position(snapshot, document, &pinned).unwrap();
+        assert!(decode_query_position(&encoded[..encoded.len() - 1]).is_err());
+        encoded.push(0);
+        assert!(decode_query_position(&encoded).is_err());
     }
 
     struct Visibility;

@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -29,8 +29,7 @@ pub struct Counters {
     pub pagination_attempt_failures: AtomicU64,
     pub pagination_pages_completed: AtomicU64,
     pub pagination_page_failures: AtomicU64,
-    pub pagination_furthest_page: AtomicU64,
-    pub pagination_furthest_hits: AtomicU64,
+    pagination_furthest: StdMutex<(u64, u64)>,
     pub pagination_last_page_microseconds: AtomicU64,
     pub pagination_maximum_page_microseconds: AtomicU64,
     pub pagination_last_attempt_microseconds: AtomicU64,
@@ -124,10 +123,15 @@ impl Counters {
     ) {
         self.pagination_pages_completed
             .fetch_add(1, Ordering::Relaxed);
-        self.pagination_furthest_page
-            .fetch_max(page as u64, Ordering::Relaxed);
-        self.pagination_furthest_hits
-            .fetch_max(accumulated_hits as u64, Ordering::Relaxed);
+        let observation = (page as u64, accumulated_hits as u64);
+        let mut furthest = self
+            .pagination_furthest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if observation > *furthest {
+            *furthest = observation;
+        }
+        drop(furthest);
         self.record_pagination_page_elapsed(elapsed);
     }
 
@@ -158,6 +162,10 @@ impl Counters {
             .as_ref()
             .map(Latencies::report)
             .unwrap_or_default();
+        let pagination_furthest = *self
+            .pagination_furthest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Snapshot {
             schema: "keldra.index-contention.progress.v1",
             timestamp_unix_milliseconds: SystemTime::now()
@@ -182,8 +190,8 @@ impl Counters {
             pagination_attempt_failures: self.pagination_attempt_failures.load(Ordering::Relaxed),
             pagination_pages_completed: self.pagination_pages_completed.load(Ordering::Relaxed),
             pagination_page_failures: self.pagination_page_failures.load(Ordering::Relaxed),
-            pagination_furthest_page: self.pagination_furthest_page.load(Ordering::Relaxed),
-            pagination_furthest_hits: self.pagination_furthest_hits.load(Ordering::Relaxed),
+            pagination_furthest_page: pagination_furthest.0,
+            pagination_furthest_hits: pagination_furthest.1,
             pagination_last_page_milliseconds: self
                 .pagination_last_page_microseconds
                 .load(Ordering::Relaxed) as f64
@@ -272,10 +280,12 @@ mod tests {
             3
         );
         assert_eq!(counters.pagination_page_failures.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.pagination_furthest_page.load(Ordering::Relaxed), 2);
         assert_eq!(
-            counters.pagination_furthest_hits.load(Ordering::Relaxed),
-            1_750
+            *counters
+                .pagination_furthest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            (2, 1_750)
         );
         assert_eq!(
             counters
@@ -294,6 +304,30 @@ mod tests {
                 .pagination_last_attempt_microseconds
                 .load(Ordering::Relaxed),
             34_000
+        );
+    }
+
+    #[test]
+    fn pagination_furthest_page_and_hits_remain_one_observation() {
+        let counters = Counters::default();
+
+        counters.pagination_page_completed(5, 10, Duration::ZERO);
+        counters.pagination_page_completed(4, 10_000, Duration::ZERO);
+        assert_eq!(
+            *counters
+                .pagination_furthest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            (5, 10)
+        );
+
+        counters.pagination_page_completed(5, 20, Duration::ZERO);
+        assert_eq!(
+            *counters
+                .pagination_furthest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            (5, 20)
         );
     }
 }

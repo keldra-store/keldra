@@ -442,7 +442,8 @@ A query:
 6. maps public field names to physical recipes;
 7. opens or reuses verified immutable segment readers;
 8. executes predicates, ordering, facets, aggregates, text, and vectors;
-9. applies newest head/liveness state and exact-current validation; and
+9. applies the liveness and exact-result identity recorded by the pinned
+   immutable gate cut; and
 10. returns authorized exact result identities.
 
 For each pinned root, the reader seeks only the matching recipe directories in
@@ -450,8 +451,12 @@ its `ProjectionQueryRun`s. It intersects advanceable postings and membership /
 stable-key live gates, uses points for ranges, and reads declared doc values only
 for order, facets, and aggregates. It may merge a bounded number of run-local
 iterators, but it never broad-scans document-key field-state output. Candidate
-stable keys then undergo the mandatory bounded exact-current object/head
-validation before a result is returned.
+The immutable gate is part of the same published generation as its postings and
+doc values, so it is the exact liveness/version authority for that pinned cut.
+Query admission must not reload mutable object heads or version descriptors to
+reinterpret an immutable snapshot: doing so both repeats storage work and mixes
+two different points in time. Rebuilding a gate from authoritative objects is a
+producer/recovery operation, not a query operation.
 
 The root vector, logical definition version, query shape, order, and
 search-after state are bound into continuation evidence. A later partition root
@@ -470,6 +475,9 @@ condition of the write architecture.
 
 Authorization is never inherited merely because physical bytes are shared.
 Both definition admission and returned objects retain their existing checks.
+Every page rechecks current Zanzibar authority. The authorization revision is
+bound into continuation evidence; a revision change fails the continuation
+closed rather than evaluating a historical page under newer or stale policy.
 
 ## 11. Backfill and catalog changes
 
