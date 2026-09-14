@@ -6,8 +6,6 @@ use keldra_index::v1::ProjectionPartitionIdentity;
 use keldra_store::SourceId;
 use tonic::Status;
 
-pub(super) const MAX_IDENTICAL_RETRIES: u32 = 120;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ProducerStage {
     Opening,
@@ -42,7 +40,9 @@ impl ProducerStage {
 pub(super) struct PartitionEvidence {
     pub(super) source: SourceId,
     pub(super) family_id: [u8; 32],
+    pub(super) physical_generation: [u8; 32],
     pub(super) published_next: u64,
+    pub(super) processed_next: u64,
     pub(super) last_progress_at: Instant,
     pub(super) lag_started_at: Option<Instant>,
     pub(super) stage: ProducerStage,
@@ -53,11 +53,18 @@ pub(super) struct PartitionEvidence {
 }
 
 impl PartitionEvidence {
-    pub(super) fn opened(source: SourceId, family_id: [u8; 32], published_next: u64) -> Self {
+    pub(super) fn opened(
+        source: SourceId,
+        family_id: [u8; 32],
+        physical_generation: [u8; 32],
+        published_next: u64,
+    ) -> Self {
         Self {
             source,
             family_id,
+            physical_generation,
             published_next,
+            processed_next: published_next,
             last_progress_at: Instant::now(),
             lag_started_at: None,
             stage: ProducerStage::Opening,
@@ -68,32 +75,65 @@ impl PartitionEvidence {
         }
     }
 
-    pub(super) fn observe_progress(&mut self, published_next: u64, stage: ProducerStage) {
+    pub(super) fn observe_progress(
+        &mut self,
+        published_next: u64,
+        processed_next: u64,
+        stage: ProducerStage,
+    ) {
+        let advanced = published_next > self.published_next || processed_next > self.processed_next;
         if published_next > self.published_next {
             self.published_next = published_next;
+        }
+        if processed_next > self.processed_next {
+            self.processed_next = processed_next;
+        }
+        if advanced {
             self.last_progress_at = Instant::now();
-            self.identical_retries = 0;
-            self.last_error = None;
-            self.last_error_message = None;
         }
         self.stage = stage;
     }
 
-    pub(super) fn reopened(&mut self, source: SourceId, family_id: [u8; 32], published_next: u64) {
+    pub(super) fn observe_success(
+        &mut self,
+        published_next: u64,
+        processed_next: u64,
+        stage: ProducerStage,
+    ) {
+        self.observe_progress(published_next, processed_next, stage);
+        self.identical_retries = 0;
+        self.last_error = None;
+        self.last_error_message = None;
+    }
+
+    pub(super) fn reopened(
+        &mut self,
+        source: SourceId,
+        family_id: [u8; 32],
+        physical_generation: [u8; 32],
+        published_next: u64,
+    ) {
         if self.source != source
             || self.family_id != family_id
+            || self.physical_generation != physical_generation
             || self.published_next != published_next
         {
             self.source = source;
             self.family_id = family_id;
+            self.physical_generation = physical_generation;
             self.published_next = published_next;
+            self.processed_next = published_next;
             self.last_progress_at = Instant::now();
             self.lag_started_at = None;
+            self.identical_retries = 0;
+            self.last_error = None;
+            self.last_error_message = None;
+            self.halted = false;
         }
         self.stage = ProducerStage::Opening;
     }
 
-    pub(super) fn record_retry(&mut self, failed_stage: ProducerStage, error: &Status) -> bool {
+    pub(super) fn record_retry(&mut self, failed_stage: ProducerStage, error: &Status) {
         let reason = if error.code() == tonic::Code::ResourceExhausted {
             format!("{}:resource_exhausted", failed_stage.label())
         } else {
@@ -107,13 +147,7 @@ impl PartitionEvidence {
         };
         self.last_error = Some(signature);
         self.last_error_message = Some(error.message().to_owned());
-        self.halted = self.identical_retries >= MAX_IDENTICAL_RETRIES;
-        self.stage = if self.halted {
-            ProducerStage::Halted
-        } else {
-            ProducerStage::Backoff
-        };
-        self.halted
+        self.stage = ProducerStage::Backoff;
     }
 
     pub(super) fn halt(&mut self, error: &Status) {
@@ -138,24 +172,23 @@ mod tests {
                 source_epoch: [2; 32],
             },
             [3; 32],
+            [4; 32],
             7,
         )
     }
 
     #[test]
-    fn only_identical_retries_accumulate_toward_halt() {
+    fn retryable_failures_accumulate_evidence_without_halting() {
         let mut evidence = new_evidence();
-        for retry in 1..MAX_IDENTICAL_RETRIES {
-            assert!(!evidence.record_retry(
+        for retry in 1..=240 {
+            evidence.record_retry(
                 ProducerStage::Preparing,
-                &Status::resource_exhausted(format!("needs {} bytes", 128 + retry))
-            ));
+                &Status::resource_exhausted(format!("needs {} bytes", 128 + retry)),
+            );
         }
-        assert!(evidence.record_retry(
-            ProducerStage::Preparing,
-            &Status::resource_exhausted("needs 249 bytes")
-        ));
-        assert_eq!(evidence.stage, ProducerStage::Halted);
+        assert_eq!(evidence.identical_retries, 240);
+        assert_eq!(evidence.stage, ProducerStage::Backoff);
+        assert!(!evidence.halted);
 
         let mut evidence = new_evidence();
         evidence.record_retry(ProducerStage::JournalScan, &Status::unavailable("first"));
@@ -168,7 +201,7 @@ mod tests {
     fn durable_progress_resets_retry_evidence() {
         let mut evidence = new_evidence();
         evidence.record_retry(ProducerStage::JournalScan, &Status::unavailable("retry"));
-        evidence.observe_progress(8, ProducerStage::CaughtUp);
+        evidence.observe_success(8, 8, ProducerStage::CaughtUp);
 
         assert_eq!(evidence.published_next, 8);
         assert_eq!(evidence.identical_retries, 0);
@@ -180,9 +213,25 @@ mod tests {
         let mut evidence = new_evidence();
         let source = evidence.source;
         let family_id = evidence.family_id;
-        evidence.reopened(source, family_id, 0);
+        evidence.halt(&Status::data_loss("old generation failed"));
+        evidence.reopened(source, family_id, [5; 32], 0);
 
         assert_eq!(evidence.published_next, 0);
+        assert_eq!(evidence.processed_next, 0);
         assert_eq!(evidence.stage, ProducerStage::Opening);
+        assert!(!evidence.halted);
+        assert_eq!(evidence.identical_retries, 0);
+    }
+
+    #[test]
+    fn filtered_scan_progress_does_not_claim_publication_progress() {
+        let mut evidence = new_evidence();
+        evidence.record_retry(ProducerStage::JournalScan, &Status::unavailable("retry"));
+        evidence.observe_success(7, 12, ProducerStage::CaughtUp);
+
+        assert_eq!(evidence.published_next, 7);
+        assert_eq!(evidence.processed_next, 12);
+        assert_eq!(evidence.identical_retries, 0);
+        assert!(evidence.last_error.is_none());
     }
 }

@@ -174,9 +174,7 @@ impl V1IndexProducerTask {
                         tokio::time::sleep(RETRY).await;
                     }
                     Ok(ReconcileOutcome::RetryPartition) => {
-                        // A failed partition was removed without disturbing the
-                        // successful writers. Retry that partition promptly from
-                        // its durable Current while the others retain progress.
+                        // Retry only the failed partition from durable Current.
                         tokio::time::sleep(RETRY).await;
                     }
                     Ok(ReconcileOutcome::Stable) => {
@@ -222,19 +220,15 @@ fn next_reconcile_delay(
 }
 
 fn limits(config: IndexRuntimeConfig) -> Result<Limits, Status> {
-    // Catalog and hot ingress own one quarter each. The producer is limited to
-    // the remaining half, so their independent allocators cannot exceed the
-    // one configured pipeline ceiling.
+    // Catalog and hot ingress own the other half of the pipeline ceiling.
     let configured = usize::try_from(config.pipeline_memory_bytes())
         .map_err(|_| Status::invalid_argument("v1 pipeline memory exceeds this platform"))?;
     let bytes = configured.saturating_div(2).max(1);
     let flush_bytes = usize::try_from(config.flush_bytes())
         .map_err(|_| Status::invalid_argument("v1 flush bytes exceed this platform"))?
         .min(bytes.saturating_div(4).max(1));
-    // `flush_bytes` bounds source-journal input, but prepared rows and their
-    // transient projection overlay can legitimately be larger than that input.
-    // Give one publication cycle a bounded share of the configured producer
-    // memory instead of turning the flush threshold into a hard output cap.
+    // Projection output may legitimately exceed its bounded journal input.
+    // Reserve a bounded producer share rather than treating flush as an output cap.
     let projection_batch_bytes = bytes.saturating_div(4).max(flush_bytes);
     let parallelism = usize::try_from(config.indexing_cores())
         .map_err(|_| Status::invalid_argument("v1 indexing cores exceed this platform"))?;
@@ -303,10 +297,15 @@ async fn reconcile(
                 continue;
             }
             assigned.insert(partition);
-            if writers.get(&partition).is_some_and(|writer| {
+            let generation_changed = writers.get(&partition).is_some_and(|writer| {
                 writer.recipe.physical_generation != recipe.physical_generation
-            }) {
-                return Err(Status::unavailable("v1 physical catalog changed"));
+            }) || evidence
+                .get(&partition)
+                .is_some_and(|state| state.physical_generation != recipe.physical_generation);
+            if generation_changed {
+                // A physical generation is a clean rebuild boundary.
+                writers.remove(&partition);
+                evidence.remove(&partition);
             }
             if !writers.contains_key(&partition)
                 && !evidence.get(&partition).is_some_and(|state| state.halted)
@@ -329,6 +328,7 @@ async fn reconcile(
                         entry.insert(PartitionEvidence::opened(
                             writer.source,
                             writer.recipe.family.family_id,
+                            writer.recipe.physical_generation,
                             published_next,
                         ));
                     }
@@ -336,6 +336,7 @@ async fn reconcile(
                         entry.get_mut().reopened(
                             writer.source,
                             writer.recipe.family.family_id,
+                            writer.recipe.physical_generation,
                             published_next,
                         );
                     }
@@ -350,16 +351,10 @@ async fn reconcile(
     let physical_catalog_identity = catalog_snapshot.identity;
     let runnable = assigned
         .into_iter()
-        .filter(|partition| {
-            !writers
-                .get(partition)
-                .is_some_and(|writer| writer.halted_on_integrity_failure)
-        })
+        .filter(|partition| runnable_partition(writers, partition))
         .collect::<Vec<_>>();
     let active_writers = runnable.len().min(limits.parallelism.max(1));
-    // Moving each Writer into one task makes the partition's generation chain
-    // unshareable: preparation, immutable publication, and the Current CAS stay
-    // ordered even while unrelated partitions overlap.
+    // Each task owns one Writer, preserving its generation/CAS order.
     let work = runnable
         .into_iter()
         .enumerate()
@@ -417,7 +412,11 @@ async fn reconcile(
                         .current
                         .as_ref()
                         .map_or(0, |current| current.current.next_offset);
-                    state.observe_progress(published_next, writer.stage);
+                    state.observe_success(
+                        published_next,
+                        writer_processed_next(&writer),
+                        writer.stage,
+                    );
                 }
                 writers.insert(partition, writer);
             }
@@ -443,26 +442,16 @@ async fn reconcile(
                     .get_mut(&partition)
                     .expect("opened v1 partition has runtime evidence");
                 state.stage = writer.stage;
-                if state.record_retry(writer.stage, &error) {
-                    tracing::error!(
-                        %error,
-                        ?partition,
-                        family_id = ?writer.recipe.family.family_id,
-                        failed_stage = writer.stage.label(),
-                        identical_retries = state.identical_retries,
-                        "v1 projection partition halted after bounded identical retries; unrelated partitions continue"
-                    );
-                } else {
-                    partition_failed = true;
-                    tracing::warn!(
-                        %error,
-                        ?partition,
-                        family_id = ?writer.recipe.family.family_id,
-                        failed_stage = writer.stage.label(),
-                        identical_retries = state.identical_retries,
-                        "v1 projection partition will replay from Current; unrelated partitions continue"
-                    );
-                }
+                state.record_retry(writer.stage, &error);
+                partition_failed = true;
+                tracing::warn!(
+                    %error,
+                    ?partition,
+                    family_id = ?writer.recipe.family.family_id,
+                    failed_stage = writer.stage.label(),
+                    identical_retries = state.identical_retries,
+                    "v1 projection partition will replay from Current; unrelated partitions continue"
+                );
             }
         }
     }
@@ -472,6 +461,15 @@ async fn reconcile(
     } else {
         ReconcileOutcome::Stable
     })
+}
+
+fn runnable_partition(
+    writers: &BTreeMap<ProjectionPartitionIdentity, Writer>,
+    partition: &ProjectionPartitionIdentity,
+) -> bool {
+    writers
+        .get(partition)
+        .is_some_and(|writer| !writer.halted_on_integrity_failure)
 }
 
 fn halts_partition(error: &Status) -> bool {
@@ -498,10 +496,11 @@ fn record_lag_telemetry(
                 PartitionEvidence::opened(
                     writer.source,
                     writer.recipe.family.family_id,
+                    writer.recipe.physical_generation,
                     published_next,
                 )
             })
-            .observe_progress(published_next, writer.stage);
+            .observe_progress(published_next, writer_processed_next(writer), writer.stage);
     }
     let mut oldest_age = 0_u64;
     let mut oldest_no_progress_age = 0_u64;
@@ -526,13 +525,16 @@ fn record_lag_telemetry(
                     .map(|cursor| cursor.next_offset)
             })
             .unwrap_or(state.published_next);
+        let processed_next = writer.map_or(state.processed_next, writer_processed_next);
+        let published_next = state.published_next;
+        let stage = state.stage;
+        state.observe_progress(published_next, processed_next, stage);
         let partition_lag = cursor.next_offset.saturating_sub(state.published_next);
         if partition_lag == 0 {
             state.lag_started_at = None;
             state.last_progress_at = now;
         } else if state.lag_started_at.is_none() {
-            // A caught-up partition becoming newly eligible for work is not a
-            // stall. Start both lag and no-progress clocks at observation.
+            // Newly observed lag is not yet a stall.
             state.lag_started_at = Some(now);
             state.last_progress_at = now;
         }
@@ -546,6 +548,7 @@ fn record_lag_telemetry(
             family_id = ?state.family_id,
             producer_stage = state.stage.label(),
             published_next_offset = state.published_next,
+            processed_next_offset = state.processed_next,
             scanned_next_offset = scanned_next,
             pending_next_offset = writer.map_or(state.published_next, |writer| writer.pending_next),
             accumulator_next_offset = writer.map_or(state.published_next, |writer| writer.accumulator.next_offset()),
@@ -575,8 +578,17 @@ fn record_lag_telemetry(
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64,
             );
-            oldest_no_progress_age = oldest_no_progress_age.max(no_progress_age);
-            if now.saturating_duration_since(state.last_progress_at) >= STALL_AFTER {
+            let has_unpublished_projection_work = writer.is_some_and(|writer| {
+                writer.pending_prepared_rows > 0 || !writer.pending_mutations.is_empty()
+            });
+            let processing_is_behind = state.processed_next < cursor.next_offset;
+            if state.halted || processing_is_behind || has_unpublished_projection_work {
+                oldest_no_progress_age = oldest_no_progress_age.max(no_progress_age);
+            }
+            if state.halted
+                || ((processing_is_behind || has_unpublished_projection_work)
+                    && now.saturating_duration_since(state.last_progress_at) >= STALL_AFTER)
+            {
                 stalled_partitions = stalled_partitions.saturating_add(1);
             }
         }
@@ -609,6 +621,18 @@ fn record_lag_telemetry(
         retrying_partitions,
     );
     super::v1_telemetry::V1PipelineTelemetry::set(&telemetry.halted_partitions, halted_partitions);
+}
+
+fn writer_processed_next(writer: &Writer) -> u64 {
+    let scanned_next = writer
+        .scanned
+        .sources
+        .get(&NodeId(u64::from(writer.source.node_id)))
+        .filter(|cursor| cursor.source == writer.source)
+        .map_or(0, |cursor| cursor.next_offset);
+    scanned_next
+        .max(writer.pending_next)
+        .max(writer.accumulator.next_offset())
 }
 
 async fn open_writer(
@@ -862,10 +886,7 @@ async fn advance(
     credits: &IndexingMemoryCredits,
     limits: Limits,
 ) -> Result<(), Status> {
-    // Dense baseline offsets describe snapshot rows, not completion. Keep
-    // pulling the captured snapshot until its terminal flush installs Current;
-    // entering journal replay after the first non-empty batch would prepare the
-    // same source versions twice in one unpublished query run.
+    // Finish the captured baseline before entering journal replay.
     if writer.current.is_none() {
         writer.stage = ProducerStage::Backfill;
         backfill(
@@ -882,9 +903,7 @@ async fn advance(
         return Ok(());
     }
     writer.stage = ProducerStage::JournalScan;
-    // A mutation-window entry owns two path strings plus its map node. Keep
-    // journal pages below one quarter of the charged window so one fresh page
-    // can always be represented conservatively before the threshold flush.
+    // Leave charged mutation-window room for the decoded journal page.
     let max_page = u64::try_from(limits.flush_bytes.saturating_div(4).max(1))
         .unwrap_or(u64::MAX)
         .min(MAX_INDEX_EVENT_PAGE_BYTES)
@@ -1000,11 +1019,7 @@ async fn advance(
         .get(&NodeId(u64::from(writer.source.node_id)))
         .filter(|cursor| cursor.source == writer.source)
         .map_or(0, |cursor| cursor.next_offset);
-    let published_next = writer
-        .current
-        .as_ref()
-        .map_or(0, |current| current.current.next_offset);
-    writer.stage = if published_next >= target_next {
+    writer.stage = if writer_processed_next(writer) >= target_next {
         ProducerStage::CaughtUp
     } else {
         ProducerStage::JournalScan

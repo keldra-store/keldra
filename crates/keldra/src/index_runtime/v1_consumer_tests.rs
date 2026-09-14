@@ -9,6 +9,13 @@ fn integrity_failure_halts_only_the_affected_partition() {
 }
 
 #[test]
+fn an_assigned_partition_without_an_open_writer_is_not_runnable() {
+    let writers = BTreeMap::<ProjectionPartitionIdentity, Writer>::new();
+
+    assert!(!runnable_partition(&writers, &partition()));
+}
+
+#[test]
 fn alias_head_mutation_preserves_exact_and_canonical_paths() {
     let mutation = head_mutation(
         ObjectHeadChange {
