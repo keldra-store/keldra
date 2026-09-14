@@ -19,10 +19,12 @@ platform_values() {
 }
 
 elf_metadata() {
-  local binary="$1" output="$2" actual_machine actual_interpreter glibc_max needed elf_type
+  local binary="$1" output="$2" actual_abi actual_machine actual_interpreter glibc_max needed elf_type
   [[ "$(readelf -h "$binary" | sed -n 's/^  Class:[[:space:]]*//p')" == ELF64 ]] || fail "$binary is not ELF64"
   [[ "$(readelf -h "$binary" | sed -n 's/^  Data:[[:space:]]*//p')" == "2's complement, little endian" ]] || fail "$binary is not little-endian ELF"
-  [[ "$(readelf -h "$binary" | sed -n 's,^  OS/ABI:[[:space:]]*,,p')" == "UNIX - System V" ]] || fail "$binary does not use the GNU/System-V ABI"
+  actual_abi="$(readelf -h "$binary" | sed -n 's,^  OS/ABI:[[:space:]]*,,p')"
+  [[ "$actual_abi" == "UNIX - System V" || "$actual_abi" == "UNIX - GNU" ]] \
+    || fail "$binary uses unsupported ELF OS/ABI $actual_abi"
   elf_type="$(readelf -h "$binary" | sed -n 's/^  Type:[[:space:]]*\([^ ]*\).*/\1/p')"
   [[ "$elf_type" == DYN || "$elf_type" == EXEC ]] || fail "$binary is not an executable ELF"
   actual_machine="$(readelf -h "$binary" | sed -n 's/^  Machine:[[:space:]]*//p')"
