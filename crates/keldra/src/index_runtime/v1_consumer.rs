@@ -349,7 +349,25 @@ async fn reconcile(
     }
     writers.retain(|partition, _| assigned.contains(partition));
     evidence.retain(|partition, _| assigned.contains(partition));
-    record_lag_telemetry(&target, writers, evidence);
+    let mut lag_targets = BTreeMap::new();
+    for (partition, writer) in writers.iter() {
+        let published_next = writer
+            .current
+            .as_ref()
+            .map_or(0, |current| current.current.next_offset);
+        let indexable_next = journal
+            .routed_index_source_next(
+                writer.recipe.family.tenant_id,
+                writer.recipe.family.bucket_id,
+                writer.source,
+                routed_lag_start(published_next),
+                &target,
+            )
+            .await
+            .map_err(event_status)?;
+        lag_targets.insert(*partition, indexable_next);
+    }
+    record_lag_telemetry(&lag_targets, writers, evidence);
     let physical_catalog_identity = catalog_snapshot.identity;
     let runnable = assigned
         .into_iter()
@@ -460,7 +478,7 @@ async fn reconcile(
             }
         }
     }
-    record_lag_telemetry(&target, writers, evidence);
+    record_lag_telemetry(&lag_targets, writers, evidence);
     Ok(if partition_failed {
         ReconcileOutcome::RetryPartition
     } else {
@@ -486,7 +504,7 @@ fn halts_partition(error: &Status) -> bool {
 }
 
 fn record_lag_telemetry(
-    target: &IndexBarrier,
+    lag_targets: &BTreeMap<ProjectionPartitionIdentity, u64>,
     writers: &BTreeMap<ProjectionPartitionIdentity, Writer>,
     evidence: &mut PartitionEvidenceMap,
 ) {
@@ -517,12 +535,9 @@ fn record_lag_telemetry(
     let mut halted_partitions = 0_u64;
     let mut retrying_partitions = 0_u64;
     for (partition, state) in evidence.iter_mut() {
-        let Some(cursor) = target.sources.get(&NodeId(u64::from(state.source.node_id))) else {
+        let Some(&indexable_next) = lag_targets.get(partition) else {
             continue;
         };
-        if cursor.source != state.source {
-            continue;
-        }
         let writer = writers.get(partition);
         let scanned_next = writer
             .and_then(|writer| {
@@ -541,9 +556,9 @@ fn record_lag_telemetry(
         let has_unpublished_projection_work = writer.is_some_and(|writer| {
             writer.pending_prepared_rows > 0 || !writer.pending_mutations.is_empty()
         });
-        let processing_is_behind = state.processed_next < cursor.next_offset;
+        let processing_is_behind = state.processed_next < indexable_next;
         let lag = state.observe_lag(
-            cursor.next_offset,
+            indexable_next,
             processing_is_behind,
             has_unpublished_projection_work,
             STALL_AFTER,
@@ -559,7 +574,7 @@ fn record_lag_telemetry(
             scanned_next_offset = scanned_next,
             pending_next_offset = writer.map_or(state.published_next, |writer| writer.pending_next),
             accumulator_next_offset = writer.map_or(state.published_next, |writer| writer.accumulator.next_offset()),
-            observed_next_offset = cursor.next_offset,
+            observed_next_offset = indexable_next,
             pending_mutations = writer.map_or(0, |writer| writer.pending_mutations.len()),
             pending_mutation_bytes = writer.map_or(0, |writer| writer.pending_mutation_bytes),
             pending_operations = writer.map_or(0, |writer| writer.pending_operations),
@@ -574,7 +589,7 @@ fn record_lag_telemetry(
             "v1 projection partition state"
         );
         local_next = local_next.min(state.published_next);
-        local_tail = local_tail.max(cursor.next_offset.saturating_sub(1));
+        local_tail = local_tail.max(indexable_next.saturating_sub(1));
         lag_entries = lag_entries.saturating_add(lag.entries);
         if lag.entries > 0 {
             let lag_started = state
@@ -633,6 +648,14 @@ fn writer_processed_next(writer: &Writer) -> u64 {
     scanned_next
         .max(writer.pending_next)
         .max(writer.accumulator.next_offset())
+}
+
+fn routed_lag_start(published_next: u64) -> u64 {
+    // Journal offset zero is the fresh-partition sentinel. The first real
+    // source record is offset one, represented by next-offset one before it is
+    // consumed. Keep the sentinel as one unit of initial-build work while
+    // still routing every real source position.
+    published_next.max(1)
 }
 
 async fn open_writer(

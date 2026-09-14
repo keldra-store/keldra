@@ -108,12 +108,24 @@ async fn advance_once(
             next_offset: catalog_next,
             ..cursor
         };
+        let mut catalog_barrier = barrier.clone();
+        catalog_barrier
+            .sources
+            .get_mut(&NodeId(u64::from(cursor.source.node_id)))
+            .expect("captured v1 source remains in its barrier")
+            .next_offset = catalog_next;
         let next_offset = if recipes.is_empty() {
             // The durable catalog checkpoint proves the all-source baseline
             // inventory and replay cut even when that inventory is empty.
             catalog_next
-        } else if let Some(next_offset) =
-            family_coverage(catalog_cursor, recipes, projections).await?
+        } else if let Some(next_offset) = family_coverage(
+            catalog_cursor,
+            &catalog_barrier,
+            recipes,
+            journal,
+            projections,
+        )
+        .await?
         {
             next_offset
         } else {
@@ -175,7 +187,9 @@ async fn catalog_checkpoint_limit(
 /// `None` means a family is not query-visible yet, so retention must stay put.
 async fn family_coverage(
     cursor: IndexSourceCursor,
+    target: &super::events::IndexBarrier,
     recipes: &[PhysicalCatalogRecipe],
+    journal: &IndexEventJournal,
     projections: &V1ProjectionPublisher,
 ) -> Result<Option<u64>, Status> {
     let mut covered_through = cursor.next_offset;
@@ -216,9 +230,43 @@ async fn family_coverage(
         else {
             return Ok(None);
         };
+        let family_next =
+            advance_over_irrelevant_suffix(cursor, target, family_next, recipe, journal).await?;
         covered_through = covered_through.min(family_next);
     }
     Ok(Some(covered_through))
+}
+
+/// A durable Current need not be rewritten merely to acknowledge source
+/// positions which cannot affect its bucket. The routed journal scan is the
+/// proof: an empty result covers the complete bounded interval, so retention
+/// may safely advance through that suffix while the immutable Current remains
+/// unchanged.
+async fn advance_over_irrelevant_suffix(
+    cursor: IndexSourceCursor,
+    target: &super::events::IndexBarrier,
+    family_next: u64,
+    recipe: &PhysicalCatalogRecipe,
+    journal: &IndexEventJournal,
+) -> Result<u64, Status> {
+    if family_next >= cursor.next_offset {
+        return Ok(family_next);
+    }
+    let latest_indexable = journal
+        .routed_index_source_next(
+            recipe.family.tenant_id,
+            recipe.family.bucket_id,
+            cursor.source,
+            family_next,
+            target,
+        )
+        .await
+        .map_err(|error| Status::unavailable(error.to_string()))?;
+    Ok(if latest_indexable == family_next {
+        cursor.next_offset
+    } else {
+        family_next
+    })
 }
 
 async fn live_directory_coverage_for_source(

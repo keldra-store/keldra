@@ -74,6 +74,12 @@ fn an_assigned_partition_without_an_open_writer_is_not_runnable() {
 }
 
 #[test]
+fn fresh_partition_lag_starts_at_the_journal_sentinel() {
+    assert_eq!(routed_lag_start(0), 1);
+    assert_eq!(routed_lag_start(17), 17);
+}
+
+#[test]
 fn alias_head_mutation_preserves_exact_and_canonical_paths() {
     let mutation = head_mutation(
         ObjectHeadChange {

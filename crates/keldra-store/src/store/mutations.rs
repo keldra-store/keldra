@@ -1038,7 +1038,12 @@ impl Store {
                     maximum: self.watch_retention.max_bytes,
                 });
             }
-            self.stage_journal_routes(batch, status.source_id.source_epoch, &change)?;
+            self.stage_journal_routes_with_admission(
+                batch,
+                status.source_id.source_epoch,
+                admission,
+                &change,
+            )?;
             status.retained_entries = status.retained_entries.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation entry count is exhausted".into())
             })?;

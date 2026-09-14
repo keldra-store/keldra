@@ -1,5 +1,6 @@
 use rocksdb::{Direction, IteratorMode, WriteBatch};
 
+use super::journal_capacity::SourceJournalAdmission;
 use super::{CF_JOURNAL_ROUTES, CF_LOCAL_INVALIDATIONS, Store};
 #[cfg(test)]
 use crate::definition_state::DefinitionKind;
@@ -206,8 +207,32 @@ impl Store {
         source_epoch: [u8; 32],
         change: &LocalChange,
     ) -> Result<(), crate::MutationError> {
+        self.stage_journal_routes_with_admission(
+            batch,
+            source_epoch,
+            SourceJournalAdmission::Bounded,
+            change,
+        )
+    }
+
+    pub(super) fn stage_journal_routes_with_admission(
+        &self,
+        batch: &mut WriteBatch,
+        source_epoch: [u8; 32],
+        admission: SourceJournalAdmission,
+        change: &LocalChange,
+    ) -> Result<(), crate::MutationError> {
         let cf = self.cf(CF_JOURNAL_ROUTES)?;
         try_visit_routes_for_change(change, |route| {
+            // Derived artifacts remain ordinary, durable objects in the
+            // authoritative source journal. They are not source data for a
+            // bucket projection, so omitting only this disposable sparse key
+            // prevents a projection from waking on its own publication.
+            if admission == SourceJournalAdmission::DerivedProgress
+                && matches!(route, JournalRoute::Bucket { .. })
+            {
+                return Ok(());
+            }
             batch.put_cf(
                 cf,
                 route_key(route, source_epoch, change.offset()).map_err(route_mutation_error)?,

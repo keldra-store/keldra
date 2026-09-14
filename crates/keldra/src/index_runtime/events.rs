@@ -942,6 +942,42 @@ impl IndexEventJournal {
             .await
     }
 
+    /// Return the newest indexable position for one source in a fixed
+    /// captured interval. The caller may use an unchanged `from_next` as proof
+    /// that the whole suffix was irrelevant to this bucket.
+    pub(crate) async fn routed_index_source_next(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        source: SourceId,
+        from_next: u64,
+        target: &IndexBarrier,
+    ) -> Result<u64, IndexEventError> {
+        let node = NodeId(u64::from(source.node_id));
+        let target_cursor = target
+            .sources
+            .get(&node)
+            .ok_or(IndexEventError::IncompleteSources)?;
+        if target_cursor.source != source || from_next > target_cursor.next_offset {
+            return Err(IndexEventError::NonContiguousSource(node));
+        }
+        let mut from = target.clone();
+        from.sources
+            .get_mut(&node)
+            .expect("validated routed source remains present")
+            .next_offset = from_next;
+        let effects = self
+            .routed_index_effects(tenant_id, bucket_id, &from, target)
+            .await?;
+        if effects.is_empty() {
+            return Ok(from_next);
+        }
+        effects
+            .get(&source)
+            .map(|effect| effect.next_offset)
+            .ok_or(IndexEventError::NonContiguousSource(node))
+    }
+
     /// Return only bucket effects which can alter an accounting rollup.
     /// Accounting artifacts are ordinary objects for durability, but they are
     /// excluded from accounting projection input and must not self-trigger.

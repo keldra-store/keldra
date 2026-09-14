@@ -373,8 +373,8 @@ mod tests {
     use super::*;
     use crate::model::ObjectMutationGovernance;
     use crate::{
-        DerivedConsumerCheckpoint, DerivedConsumerKind, Durability, ObjectKey, PlacementLogId,
-        PutMode, PutRequest, StoreOptions, WatchRetention,
+        DerivedConsumerCheckpoint, DerivedConsumerKind, Durability, JournalRoute, ObjectKey,
+        PlacementLogId, PutMode, PutRequest, StoreOptions, WatchRetention,
     };
 
     fn fence() -> PlacementLogId {
@@ -438,6 +438,37 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn derived_progress_keeps_primary_records_but_omits_bucket_routes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+
+        publish_progress(&store, "trusted-progress").await;
+
+        let status = store.local_watch_status().unwrap();
+        let primary = store.scan_local_changes(0, 16).unwrap();
+        assert!(!primary.is_empty());
+        assert_eq!(primary.last().unwrap().offset(), status.tail);
+        let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();
+        let routed = store
+            .scan_routed_local_changes(
+                JournalRoute::Bucket {
+                    tenant_id: identity.tenant_id.0,
+                    bucket_id: identity.bucket_id.0,
+                },
+                status.source_id,
+                0,
+                status.tail,
+                16,
+                u64::MAX,
+            )
+            .unwrap();
+        assert!(routed.changes.is_empty());
+        assert_eq!(routed.through_offset, status.tail);
     }
 
     #[tokio::test]

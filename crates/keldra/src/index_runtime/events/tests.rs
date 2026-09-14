@@ -721,6 +721,53 @@ async fn routed_index_effects_report_only_the_relevant_sources_newest_offset() {
 }
 
 #[tokio::test]
+async fn routed_index_source_next_distinguishes_irrelevant_and_relevant_suffixes() {
+    let clear = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (
+            status(1, 3),
+            vec![
+                change_in_bucket(1, 1, 7, 8),
+                change_in_bucket(1, 2, 1, 2),
+                change_in_bucket(1, 3, 9, 9),
+            ],
+        ),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let events = journal(vec![placement(clear)], &sources);
+    let target = events.capture_barrier().await.unwrap();
+
+    assert_eq!(
+        events
+            .routed_index_source_next(1, 2, source_id(1), 1, &target)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        events
+            .routed_index_source_next(5, 6, source_id(1), 1, &target)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        events
+            .routed_index_source_next(7, 8, source_id(1), 1, &target)
+            .await
+            .unwrap(),
+        2,
+        "the first real journal offset must participate in routed lag"
+    );
+}
+
+#[tokio::test]
 async fn routed_accounting_effects_ignore_rollup_publication() {
     let clear = AtomicProgramWatermark::new(None, None, 0);
     let sources = MemorySources::default();
