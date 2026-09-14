@@ -15,9 +15,9 @@ use super::{
 };
 use crate::key::{BucketId, BucketIdentity, TenantId};
 use crate::{
-    DefinitionKind, DefinitionLocator, Head, MAX_CONTENT_TYPE_BYTES, MUTATION_STAMP_FORMAT,
-    MutationError, ObjectAliasRegistry, ObjectAliasRegistryTransition, ObjectKey, ObjectMutation,
-    Store, Version, VersionId,
+    DefinitionKind, DefinitionLocator, Head, MAX_CONTENT_TYPE_BYTES, MutationError,
+    ObjectAliasRegistry, ObjectAliasRegistryTransition, ObjectKey, ObjectMutation, Store, Version,
+    VersionId,
 };
 
 pub const MAX_OBJECT_RECORD_EXPORT_RECORDS: u32 = 1_000;
@@ -177,21 +177,8 @@ impl ObjectPathSnapshot {
                 "head version and retained descriptor set must be non-empty",
             ));
         }
-        if let Some(stamp) = self.head.mutation_stamp {
-            if stamp.format != MUTATION_STAMP_FORMAT
-                || stamp.predecessor_version == Some(self.head.version)
-                || stamp
-                    .predecessor_version
-                    .is_some_and(|predecessor| predecessor >= self.head.version)
-                || stamp.program_commit_cursor == Some(0)
-                || stamp.serving_fence_term == 0
-                || stamp.source_id.node_id == 0
-                || stamp.source_id.source_epoch == [0; 32]
-                || stamp.source_journal_position == 0
-            {
-                return Err(invalid_snapshot("head mutation stamp is malformed"));
-            }
-        }
+        super::object_metadata_codec::validate_head(&self.head)
+            .map_err(|error| invalid_snapshot(error.to_string()))?;
         let mut previous = None;
         let mut current = None;
         for version in &self.versions {

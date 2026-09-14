@@ -736,6 +736,29 @@ impl Store {
     }
 }
 
+fn validate_selected_head(head: &Head, version: &Version) -> Result<(), MutationError> {
+    validate_selected_version_id(head.version, version)?;
+    if version.deleted != head.deleted {
+        return Err(MutationError::Storage(
+            "selected version descriptor disagrees with its head".into(),
+        ));
+    }
+    version_blob_reference(version).map(|_| ())
+}
+
+fn validate_selected_version_id(
+    selected_version: VersionId,
+    version: &Version,
+) -> Result<(), MutationError> {
+    if version.id != selected_version {
+        Err(MutationError::Storage(
+            "selected version descriptor disagrees with its key".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 const PERSONALDB_MANIFEST_PREFIX: &str = "_keldra/personaldb/v1/";
 
 #[derive(Clone, Copy)]

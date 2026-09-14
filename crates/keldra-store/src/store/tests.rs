@@ -11,6 +11,51 @@ async fn store() -> (TempDir, Store) {
     (temporary, store)
 }
 
+#[tokio::test]
+async fn existing_volume_without_object_metadata_format_marker_is_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let options = StoreOptions::new(temporary.path(), 1);
+    let store = Store::open(options.clone()).await.unwrap();
+    store
+        .db
+        .delete_cf(
+            store.cf(CF_METADATA).unwrap(),
+            object_metadata_codec::OBJECT_METADATA_FORMAT_KEY,
+        )
+        .unwrap();
+    drop(store);
+
+    let error = Store::open(options).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("no object metadata persistence format marker")
+    );
+}
+
+#[tokio::test]
+async fn existing_volume_with_unknown_object_metadata_format_is_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let options = StoreOptions::new(temporary.path(), 1);
+    let store = Store::open(options.clone()).await.unwrap();
+    store
+        .db
+        .put_cf(
+            store.cf(CF_METADATA).unwrap(),
+            object_metadata_codec::OBJECT_METADATA_FORMAT_KEY,
+            [2],
+        )
+        .unwrap();
+    drop(store);
+
+    let error = Store::open(options).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("object metadata persistence format marker is unsupported")
+    );
+}
+
 fn key(path: &str) -> ObjectKey {
     ObjectKey::new("tenant", "bucket", path).unwrap()
 }

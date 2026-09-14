@@ -19,8 +19,8 @@ use crate::key::{
     contains_reserved_keldra_segment,
 };
 use crate::{
-    Head, MAX_CONTENT_TYPE_BYTES, MUTATION_STAMP_FORMAT, ObjectAliasRegistry, ObjectKey, SourceId,
-    Store, Version, VersionId,
+    Head, MAX_CONTENT_TYPE_BYTES, ObjectAliasRegistry, ObjectKey, SourceId, Store, Version,
+    VersionId,
 };
 
 use super::object_snapshot::ObjectSnapshotError;
@@ -82,21 +82,8 @@ impl CurrentObjectSnapshot {
                 "current head and exact version descriptor disagree or are malformed",
             ));
         }
-        if let Some(stamp) = self.head.mutation_stamp {
-            if stamp.format != MUTATION_STAMP_FORMAT
-                || stamp.predecessor_version == Some(self.head.version)
-                || stamp
-                    .predecessor_version
-                    .is_some_and(|predecessor| predecessor >= self.head.version)
-                || stamp.program_commit_cursor == Some(0)
-                || stamp.serving_fence_term == 0
-                || stamp.source_id.node_id == 0
-                || stamp.source_id.source_epoch == [0; 32]
-                || stamp.source_journal_position == 0
-            {
-                return Err(invalid_snapshot("head mutation stamp is malformed"));
-            }
-        }
+        super::object_metadata_codec::validate_head(&self.head)
+            .map_err(|error| invalid_snapshot(error.to_string()))?;
         super::version_blob_reference(&self.version)
             .map_err(|error| invalid_snapshot(error.to_string()))?;
         crate::model::validate_version_descriptor(&self.version)

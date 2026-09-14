@@ -977,6 +977,12 @@ impl Store {
         let metadata_cf = db
             .cf_handle(CF_METADATA)
             .context("missing metadata column family")?;
+        object_metadata_codec::initialize_object_metadata_format(
+            &db,
+            &metadata_cf,
+            existing_database,
+            options.sync_writes,
+        )?;
         match db.get_cf(metadata_cf, INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY)? {
             Some(encoded) if encoded.as_ref() == [INTEGRATED_PAYLOAD_STORAGE_FORMAT] => {}
             Some(_) => anyhow::bail!("integrated payload storage format marker is unsupported"),
@@ -1960,29 +1966,6 @@ pub(crate) fn version_blob_reference(version: &Version) -> Result<Option<BlobRef
         _ => Err(MutationError::Storage(
             "version has an invalid payload shape".into(),
         )),
-    }
-}
-
-fn validate_selected_head(head: &Head, version: &Version) -> Result<(), MutationError> {
-    validate_selected_version_id(head.version, version)?;
-    if version.deleted != head.deleted {
-        return Err(MutationError::Storage(
-            "selected version descriptor disagrees with its head".into(),
-        ));
-    }
-    version_blob_reference(version).map(|_| ())
-}
-
-fn validate_selected_version_id(
-    selected_version: VersionId,
-    version: &Version,
-) -> Result<(), MutationError> {
-    if version.id != selected_version {
-        Err(MutationError::Storage(
-            "selected version descriptor disagrees with its key".into(),
-        ))
-    } else {
-        Ok(())
     }
 }
 

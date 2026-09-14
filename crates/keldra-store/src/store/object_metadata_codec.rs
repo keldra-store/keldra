@@ -11,6 +11,8 @@ use crate::{
     PlacementLogId, SourceId, Version, VersionId,
 };
 
+pub(crate) const OBJECT_METADATA_FORMAT_KEY: &[u8] = b"object_metadata_format_current_v1";
+const OBJECT_METADATA_FORMAT: u8 = 1;
 const HEAD_MAGIC: &[u8; 4] = b"KHED";
 const VERSION_MAGIC: &[u8; 4] = b"KVER";
 const FORMAT: u8 = 1;
@@ -34,17 +36,7 @@ const VERSION_FLAGS: u8 = VERSION_RETENTION_MASK
     | VERSION_PROTECTED_LINK_DESCRIPTOR;
 
 pub(crate) fn encode_head(head: &Head) -> Result<Vec<u8>, MutationError> {
-    if head.version.0 == 0 {
-        return Err(malformed("object head version is zero"));
-    }
-    if head
-        .mutation_stamp
-        .is_some_and(|stamp| stamp.format != MUTATION_STAMP_FORMAT)
-    {
-        return Err(malformed(
-            "object head mutation stamp format is unsupported",
-        ));
-    }
+    validate_head(head)?;
     let mut flags = u8::from(head.deleted) * HEAD_DELETED;
     if let Some(stamp) = head.mutation_stamp {
         flags |= HEAD_HAS_STAMP;
@@ -99,9 +91,6 @@ pub(crate) fn decode_head(encoded: &[u8]) -> Result<Head, MutationError> {
         ));
     }
     let version = VersionId(input.u64()?);
-    if version.0 == 0 {
-        return Err(malformed("object head version is zero"));
-    }
     let mutation_stamp = if has_stamp {
         let stamp_format = input.u16()?;
         if stamp_format != MUTATION_STAMP_FORMAT {
@@ -137,11 +126,77 @@ pub(crate) fn decode_head(encoded: &[u8]) -> Result<Head, MutationError> {
         None
     };
     input.finish()?;
-    Ok(Head {
+    let head = Head {
         version,
         deleted: flags & HEAD_DELETED != 0,
         mutation_stamp,
-    })
+    };
+    validate_head(&head)?;
+    Ok(head)
+}
+
+pub(crate) fn validate_head(head: &Head) -> Result<(), MutationError> {
+    if head.version.0 == 0 {
+        return Err(malformed("object head version is zero"));
+    }
+    let Some(stamp) = head.mutation_stamp else {
+        return Ok(());
+    };
+    if stamp.format != MUTATION_STAMP_FORMAT {
+        return Err(malformed(
+            "object head mutation stamp format is unsupported",
+        ));
+    }
+    if stamp
+        .predecessor_version
+        .is_some_and(|predecessor| predecessor.0 == 0 || predecessor >= head.version)
+    {
+        return Err(malformed(
+            "object head predecessor does not precede the head version",
+        ));
+    }
+    if stamp.program_commit_cursor == Some(0) {
+        return Err(malformed("object head program commit cursor is zero"));
+    }
+    if stamp.active_placement_log_id.term == 0 || stamp.active_placement_log_id.index == 0 {
+        return Err(malformed("object head placement log identity is zero"));
+    }
+    if stamp.serving_fence_term == 0 {
+        return Err(malformed("object head serving fence term is zero"));
+    }
+    if stamp.source_id.node_id == 0 || stamp.source_id.source_epoch == [0; 32] {
+        return Err(malformed("object head source identity is zero"));
+    }
+    if stamp.source_journal_position == 0 {
+        return Err(malformed("object head source journal position is zero"));
+    }
+    Ok(())
+}
+
+pub(crate) fn initialize_object_metadata_format(
+    db: &rocksdb::DB,
+    metadata: &impl rocksdb::AsColumnFamilyRef,
+    existing_database: bool,
+    sync_writes: bool,
+) -> anyhow::Result<()> {
+    match db.get_cf(metadata, OBJECT_METADATA_FORMAT_KEY)? {
+        Some(encoded) if encoded.as_ref() == [OBJECT_METADATA_FORMAT] => Ok(()),
+        Some(_) => anyhow::bail!("object metadata persistence format marker is unsupported"),
+        None if existing_database => {
+            anyhow::bail!("existing Keldra volume has no object metadata persistence format marker")
+        }
+        None => {
+            let mut write = rocksdb::WriteOptions::default();
+            write.set_sync(sync_writes);
+            db.put_cf_opt(
+                metadata,
+                OBJECT_METADATA_FORMAT_KEY,
+                [OBJECT_METADATA_FORMAT],
+                &write,
+            )?;
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn encode_stored_version(stored: &StoredVersion) -> Result<Vec<u8>, MutationError> {
@@ -465,8 +520,10 @@ mod tests {
 
     #[test]
     fn legacy_json_and_malformed_binary_are_rejected() {
-        assert!(decode_head(br#"{\"version\":7}"#).is_err());
-        assert!(decode_stored_version(br#"{\"format\":1}"#).is_err());
+        let legacy_head = br#"{"version":7,"deleted":false,"mutation_stamp":null}"#;
+        let legacy_stored_version = br#"{"format":1,"retention":"journal_pending","version":{"id":1,"blob":null,"content_type":null,"deleted":true,"committed_at_unix_millis":1,"protected_link_descriptor":false}}"#;
+        assert!(decode_head(legacy_head).is_err());
+        assert!(decode_stored_version(legacy_stored_version).is_err());
 
         let mut head = encode_head(&Head {
             version: VersionId(1),
@@ -491,6 +548,42 @@ mod tests {
         .unwrap();
         version.push(0);
         assert!(decode_stored_version(&version).is_err());
+    }
+
+    #[test]
+    fn malformed_head_lineage_is_rejected_on_encode_and_decode() {
+        let mut head = Head {
+            version: VersionId(17),
+            deleted: false,
+            mutation_stamp: Some(MutationStamp {
+                format: MUTATION_STAMP_FORMAT,
+                predecessor_version: Some(VersionId(16)),
+                program_commit_cursor: None,
+                mutation_fingerprint: [14; 32],
+                active_placement_log_id: PlacementLogId {
+                    term: 13,
+                    index: 12,
+                },
+                serving_fence_term: 11,
+                source_id: SourceId {
+                    node_id: 10,
+                    source_epoch: [9; 32],
+                },
+                source_journal_position: 8,
+            }),
+        };
+        let encoded = encode_head(&head).unwrap();
+
+        head.mutation_stamp
+            .as_mut()
+            .unwrap()
+            .source_journal_position = 0;
+        assert!(encode_head(&head).is_err());
+
+        let mut malformed = encoded;
+        let journal_position = malformed.len() - 8;
+        malformed[journal_position..].fill(0);
+        assert!(decode_head(&malformed).is_err());
     }
 
     #[test]
