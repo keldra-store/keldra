@@ -15,7 +15,7 @@ fn mixed_mutation_phases_reconcile_into_one_uninterrupted_report() {
         MutationProducerReport {
             scheduled_batches: 7,
             client_queue_enqueued_batches: 6,
-            client_queue_dropped_batches: 1,
+            unoffered_client_queue_full_batches: 1,
             ..MutationProducerReport::default()
         },
         MutationProducerReport {
@@ -26,7 +26,7 @@ fn mixed_mutation_phases_reconcile_into_one_uninterrupted_report() {
     );
     assert_eq!(report.scheduled_batches, 10);
     assert_eq!(report.client_queue_enqueued_batches, 9);
-    assert_eq!(report.client_queue_dropped_batches, 1);
+    assert_eq!(report.unoffered_client_queue_full_batches, 1);
 }
 
 #[test]
@@ -469,7 +469,7 @@ async fn visibility_failures_preserve_transport_vs_lag_classification() {
 }
 
 #[tokio::test]
-async fn fixed_rate_records_every_schedule_and_queue_drop() {
+async fn fixed_rate_records_every_schedule_and_queue_admission_miss() {
     let (job_tx, mut job_rx) = mpsc::channel(2);
     let started = Instant::now();
     let report = produce_fixed_rate_jobs(
@@ -485,7 +485,7 @@ async fn fixed_rate_records_every_schedule_and_queue_drop() {
     assert_eq!(report.scheduled_batches, 7);
     assert_eq!(report.undispatched_at_measurement_deadline_batches, 0);
     assert_eq!(report.client_queue_enqueued_batches, 2);
-    assert_eq!(report.client_queue_dropped_batches, 5);
+    assert_eq!(report.unoffered_client_queue_full_batches, 5);
     assert_eq!(job_rx.recv().await.unwrap().sequence, 0);
     assert_eq!(job_rx.recv().await.unwrap().sequence, 1);
 }

@@ -130,7 +130,7 @@ struct MutationReport {
     scheduled_batches: u64,
     undispatched_at_measurement_deadline_batches: u64,
     client_queue_enqueued_batches: u64,
-    client_queue_dropped_batches: u64,
+    unoffered_client_queue_full_batches: u64,
     scheduled_data_operations: u64,
     undispatched_at_measurement_deadline_data_operations: u64,
     client_queue_enqueued_data_operations: u64,
@@ -294,7 +294,7 @@ struct MutationProducerReport {
     scheduled_batches: u64,
     undispatched_at_measurement_deadline_batches: u64,
     client_queue_enqueued_batches: u64,
-    client_queue_dropped_batches: u64,
+    unoffered_client_queue_full_batches: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -586,7 +586,7 @@ async fn run_qualification(
     let mutation_load_shape_valid = if config.target_data_operations_per_second.is_some()
         || config.mixed_workload.is_some()
     {
-        mutation_report.client_queue_dropped_batches == 0
+        mutation_report.unoffered_client_queue_full_batches == 0
             && mutation_report.undispatched_at_measurement_deadline_batches == 0
             && mutation_report.scheduled_batches == mutation_report.client_queue_enqueued_batches
     } else {
@@ -1321,7 +1321,8 @@ async fn run_mutations(
     report.undispatched_at_measurement_deadline_batches =
         producer_report.undispatched_at_measurement_deadline_batches;
     report.client_queue_enqueued_batches = producer_report.client_queue_enqueued_batches;
-    report.client_queue_dropped_batches = producer_report.client_queue_dropped_batches;
+    report.unoffered_client_queue_full_batches =
+        producer_report.unoffered_client_queue_full_batches;
     report.scheduled_data_operations = producer_report
         .scheduled_batches
         .saturating_mul(config.mutation_batch_size as u64);
@@ -1385,7 +1386,7 @@ async fn produce_mutation_jobs(
         scheduled_batches: prefilled_batches,
         undispatched_at_measurement_deadline_batches: 0,
         client_queue_enqueued_batches: prefilled_batches,
-        client_queue_dropped_batches: 0,
+        unoffered_client_queue_full_batches: 0,
     };
     let mut sequence = prefilled_batches;
     if let Some(mixed) = config.mixed_workload {
@@ -1491,8 +1492,9 @@ async fn produce_fixed_rate_jobs(
                         report.client_queue_enqueued_batches.saturating_add(1)
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    report.client_queue_dropped_batches =
-                        report.client_queue_dropped_batches.saturating_add(1)
+                    report.unoffered_client_queue_full_batches = report
+                        .unoffered_client_queue_full_batches
+                        .saturating_add(1)
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     bail!("mutation worker queue closed during fixed-rate production")
@@ -1520,9 +1522,9 @@ fn merge_producer_reports(
         client_queue_enqueued_batches: first
             .client_queue_enqueued_batches
             .saturating_add(second.client_queue_enqueued_batches),
-        client_queue_dropped_batches: first
-            .client_queue_dropped_batches
-            .saturating_add(second.client_queue_dropped_batches),
+        unoffered_client_queue_full_batches: first
+            .unoffered_client_queue_full_batches
+            .saturating_add(second.unoffered_client_queue_full_batches),
     }
 }
 
