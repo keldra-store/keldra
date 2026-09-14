@@ -44,19 +44,55 @@ impl Store {
         current_generation: [u8; 32],
         record_key: &[u8],
     ) -> Result<Option<Option<Vec<u8>>>, MutationError> {
-        validate_identity(partition, current_generation, record_key)?;
+        self.index_projection_states(partition, current_generation, &[record_key])?
+            .pop()
+            .ok_or_else(|| storage("index projection state batch omitted a request"))
+    }
+
+    /// Returns exact keyed states after validating the partition generation
+    /// once for the complete ordered batch.
+    #[doc(hidden)]
+    pub fn index_projection_states(
+        &self,
+        partition: &[u8],
+        current_generation: [u8; 32],
+        record_keys: &[&[u8]],
+    ) -> Result<Vec<Option<Option<Vec<u8>>>>, MutationError> {
+        validate_partition(partition)?;
+        validate_generation(current_generation)?;
+        for record_key in record_keys {
+            validate_record_key(record_key)?;
+        }
+        if record_keys.is_empty() {
+            return Ok(Vec::new());
+        }
         let _guard = self
             .index_projection_state_lock
             .lock()
             .map_err(|_| storage("index projection state lock is poisoned"))?;
         let marker = self.read_or_rotate_marker(partition, current_generation)?;
-        self.db
-            .get_cf(
-                self.cf(CF_METADATA)?,
-                state_key(partition, marker.cache_epoch, record_key)?,
-            )
-            .map_err(storage_error)
-            .and_then(|value| value.map(|value| decode_cache_value(&value)).transpose())
+        let keys = record_keys
+            .iter()
+            .map(|record_key| state_key(partition, marker.cache_epoch, record_key))
+            .collect::<Result<Vec<_>, MutationError>>()?;
+        let cf = self.cf(CF_METADATA)?;
+        let selected = self
+            .db
+            .multi_get_cf(keys.iter().map(|key| (cf, key.as_slice())));
+        if selected.len() != record_keys.len() {
+            return Err(storage(
+                "index projection state multi-get returned the wrong result count",
+            ));
+        }
+        selected
+            .into_iter()
+            .map(|value| {
+                value
+                    .map_err(storage_error)?
+                    .map(|value| decode_cache_value(&value))
+                    .transpose()
+            })
+            .collect()
     }
 
     /// Populates one authoritative fallback result if the cache epoch still
@@ -69,9 +105,28 @@ impl Store {
         record_key: &[u8],
         state: Option<&[u8]>,
     ) -> Result<bool, MutationError> {
-        validate_identity(partition, current_generation, record_key)?;
-        if let Some(state) = state {
-            validate_value(state)?;
+        self.cache_index_projection_states(partition, current_generation, &[(record_key, state)])
+    }
+
+    /// Populates authoritative fallback results with one marker validation and
+    /// one disposable RocksDB batch.
+    #[doc(hidden)]
+    pub fn cache_index_projection_states(
+        &self,
+        partition: &[u8],
+        current_generation: [u8; 32],
+        states: &[(&[u8], Option<&[u8]>)],
+    ) -> Result<bool, MutationError> {
+        validate_partition(partition)?;
+        validate_generation(current_generation)?;
+        for (record_key, state) in states {
+            validate_record_key(record_key)?;
+            if let Some(state) = state {
+                validate_value(state)?;
+            }
+        }
+        if states.is_empty() {
+            return Ok(true);
         }
         let _guard = self
             .index_projection_state_lock
@@ -83,16 +138,15 @@ impl Store {
         if marker.current_generation != current_generation {
             return Ok(false);
         }
-        let mut options = WriteOptions::default();
-        options.set_sync(false);
-        self.db
-            .put_cf_opt(
+        let mut batch = WriteBatch::default();
+        for (record_key, state) in states {
+            batch.put_cf(
                 self.cf(CF_METADATA)?,
                 state_key(partition, marker.cache_epoch, record_key)?,
-                encode_cache_value(state),
-                &options,
-            )
-            .map_err(storage_error)?;
+                encode_cache_value(*state),
+            );
+        }
+        self.write_cache_batch(batch)?;
         Ok(true)
     }
 
@@ -200,16 +254,6 @@ impl Store {
         options.set_sync(false);
         self.db.write_opt(batch, &options).map_err(storage_error)
     }
-}
-
-fn validate_identity(
-    partition: &[u8],
-    generation: [u8; 32],
-    record_key: &[u8],
-) -> Result<(), MutationError> {
-    validate_partition(partition)?;
-    validate_generation(generation)?;
-    validate_record_key(record_key)
 }
 
 fn validate_partition(partition: &[u8]) -> Result<(), MutationError> {
@@ -405,6 +449,44 @@ mod tests {
             !store
                 .cache_index_projection_state(partition, [1; 32], b"a", Some(b"stale"))
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_state_reads_and_fills_preserve_request_order_and_negative_entries() {
+        let (_dir, store) = store().await;
+        let partition = b"partition-a";
+        assert_eq!(
+            store
+                .index_projection_states(
+                    partition,
+                    [1; 32],
+                    &[b"b".as_slice(), b"a".as_slice(), b"missing".as_slice()],
+                )
+                .unwrap(),
+            vec![None, None, None]
+        );
+        assert!(
+            store
+                .cache_index_projection_states(
+                    partition,
+                    [1; 32],
+                    &[
+                        (b"a".as_slice(), Some(b"one".as_slice())),
+                        (b"b".as_slice(), None),
+                    ],
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .index_projection_states(
+                    partition,
+                    [1; 32],
+                    &[b"b".as_slice(), b"missing".as_slice(), b"a".as_slice()],
+                )
+                .unwrap(),
+            vec![Some(None), None, Some(Some(b"one".to_vec()))]
         );
     }
 

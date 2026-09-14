@@ -86,6 +86,12 @@ struct InlineArtifactIdentity {
     length: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ComponentRecordRequest {
+    component: ComponentIdentity,
+    key: StableDocumentKey,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum ImmutableStageWindow {
     Inline { items: usize, bytes: usize },
@@ -856,11 +862,10 @@ impl V1ProjectionPublisher {
         }
     }
 
-    /// Load one source object's exact predecessor from the generation-gated
-    /// local keyed projection, reconstructing and refilling from immutable
-    /// components only on the first miss after a cache reset.
+    /// Loads an ordered source-path phase through two generation-gated cache
+    /// batches: source locators first, then all derived heads and components.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn load_source_states(
+    pub(crate) async fn load_source_states_batch(
         &self,
         storage_tenant: &str,
         bucket: &str,
@@ -868,27 +873,44 @@ impl V1ProjectionPublisher {
         bucket_id: u64,
         current: &LoadedV1ProjectionGeneration,
         source_scope: [u8; 32],
-        source_path: &str,
-    ) -> Result<Vec<ProjectedDocumentState>, Status> {
+        source_paths: &[&str],
+        fallback_parallelism: usize,
+    ) -> Result<Vec<Vec<ProjectedDocumentState>>, Status> {
+        if source_paths.is_empty() {
+            return Ok(Vec::new());
+        }
         let generation = &current.generation;
-        let locator =
-            StableDocumentKey::derive(source_scope, source_path, 0).map_err(index_status)?;
-        let Some(encoded_records) = self
-            .load_cached_component_record(
+        let locator_requests = source_paths
+            .iter()
+            .map(|source_path| {
+                Ok(ComponentRecordRequest {
+                    component: ComponentIdentity::SourceRecords,
+                    key: StableDocumentKey::derive(source_scope, source_path, 0)
+                        .map_err(index_status)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let encoded_locators = self
+            .load_cached_component_records(
                 storage_tenant,
                 bucket,
                 tenant_id,
                 bucket_id,
                 current,
-                ComponentIdentity::SourceRecords,
-                locator,
+                &locator_requests,
+                fallback_parallelism,
             )
-            .await?
-        else {
-            return Ok(Vec::new());
-        };
-        let records = decode_source_records(source_scope, source_path, &encoded_records)
-            .map_err(index_status)?;
+            .await?;
+        let records = source_paths
+            .iter()
+            .zip(encoded_locators)
+            .map(|(source_path, encoded)| match encoded {
+                Some(encoded) => {
+                    decode_source_records(source_scope, source_path, &encoded).map_err(index_status)
+                }
+                None => Ok(Vec::new()),
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
         let component_recipes = generation
             .roots
             .iter()
@@ -900,25 +922,55 @@ impl V1ProjectionPublisher {
                 | ComponentIdentity::Order(_) => None,
             })
             .collect::<Vec<_>>();
-        let mut states = Vec::with_capacity(records.len());
-        for key in records {
-            let encoded_head = self
-                .load_cached_component_record(
-                    storage_tenant,
-                    bucket,
-                    tenant_id,
-                    bucket_id,
-                    current,
-                    ComponentIdentity::DocumentHead,
-                    key,
-                )
-                .await?
-                .ok_or_else(|| {
-                    Status::data_loss("v1 source locator names a missing document head")
-                })?;
+        let documents = records
+            .iter()
+            .enumerate()
+            .flat_map(|(source_index, records)| {
+                records.iter().copied().map(move |key| (source_index, key))
+            })
+            .collect::<Vec<_>>();
+        let detail_requests = documents
+            .iter()
+            .flat_map(|(_, key)| {
+                std::iter::once(ComponentRecordRequest {
+                    component: ComponentIdentity::DocumentHead,
+                    key: *key,
+                })
+                .chain(component_recipes.iter().map(|(membership, recipe)| {
+                    ComponentRecordRequest {
+                        component: if *membership {
+                            ComponentIdentity::Membership(*recipe)
+                        } else {
+                            ComponentIdentity::Field(*recipe)
+                        },
+                        key: *key,
+                    }
+                }))
+            })
+            .collect::<Vec<_>>();
+        let details = self
+            .load_cached_component_records(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                current,
+                &detail_requests,
+                fallback_parallelism,
+            )
+            .await?;
+        let mut details = details.into_iter();
+        let mut states = source_paths
+            .iter()
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<ProjectedDocumentState>>>();
+        for (source_index, key) in documents {
+            let encoded_head = details.next().flatten().ok_or_else(|| {
+                Status::data_loss("v1 source locator names a missing document head")
+            })?;
             let head =
                 decode_document_head(source_scope, key, &encoded_head).map_err(index_status)?;
-            if head.stable_key != key || head.source_path != source_path {
+            if head.stable_key != key || head.source_path != source_paths[source_index] {
                 return Err(Status::data_loss(
                     "v1 source locator, document head, and source scope disagree",
                 ));
@@ -926,23 +978,10 @@ impl V1ProjectionPublisher {
             let mut memberships = Vec::new();
             let mut fields = Vec::new();
             for (membership, recipe) in &component_recipes {
-                let component = if *membership {
-                    ComponentIdentity::Membership(*recipe)
-                } else {
-                    ComponentIdentity::Field(*recipe)
-                };
-                let Some(value) = self
-                    .load_cached_component_record(
-                        storage_tenant,
-                        bucket,
-                        tenant_id,
-                        bucket_id,
-                        current,
-                        component,
-                        key,
-                    )
-                    .await?
-                else {
+                let value = details.next().ok_or_else(|| {
+                    Status::data_loss("v1 predecessor detail batch omitted a request")
+                })?;
+                let Some(value) = value else {
                     continue;
                 };
                 let state = CanonicalRecipeState::new(*recipe, value).map_err(index_status)?;
@@ -954,55 +993,126 @@ impl V1ProjectionPublisher {
             }
             memberships.sort_by_key(|state| state.recipe);
             fields.sort_by_key(|state| state.recipe);
-            states.push(
+            states[source_index].push(
                 ProjectedDocumentState::new(source_scope, head, memberships, fields)
                     .map_err(index_status)?,
             );
         }
-        states.sort_by_key(|state| state.head.source_record);
+        if details.next().is_some() {
+            return Err(Status::data_loss(
+                "v1 predecessor detail batch returned the wrong result count",
+            ));
+        }
+        for states in &mut states {
+            states.sort_by_key(|state| state.head.source_record);
+        }
         Ok(states)
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn load_cached_component_record(
+    async fn load_cached_component_records(
         &self,
         storage_tenant: &str,
         bucket: &str,
         tenant_id: u64,
         bucket_id: u64,
         current: &LoadedV1ProjectionGeneration,
-        component: ComponentIdentity,
-        key: StableDocumentKey,
-    ) -> Result<Option<Vec<u8>>, Status> {
+        requests: &[ComponentRecordRequest],
+        fallback_parallelism: usize,
+    ) -> Result<Vec<Option<Vec<u8>>>, Status> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
         let partition_key =
             projection_state_partition_key(tenant_id, bucket_id, current.generation.partition);
-        let record_key = projection_state_record_key(component, key);
-        match self.store.index_projection_state(
-            &partition_key,
-            current.current.generation_hash,
-            &record_key,
-        ) {
-            Ok(Some(value)) => return Ok(value),
-            Ok(None) | Err(_) => {}
-        }
-        let value = self
-            .load_component_record(
-                storage_tenant,
-                bucket,
-                tenant_id,
-                bucket_id,
-                &current.generation,
-                component,
-                key,
+        let record_keys = requests
+            .iter()
+            .map(|request| projection_state_record_key(request.component, request.key))
+            .collect::<Vec<_>>();
+        let record_key_refs = record_keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let cached = self
+            .store
+            .index_projection_states(
+                &partition_key,
+                current.current.generation_hash,
+                &record_key_refs,
             )
-            .await?;
-        let _ = self.store.cache_index_projection_state(
+            .unwrap_or_else(|_| {
+                std::iter::repeat_with(|| None)
+                    .take(requests.len())
+                    .collect()
+            });
+        let mut values = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect::<Vec<_>>();
+        let mut missed = Vec::new();
+        for (index, (request, cached)) in requests.iter().copied().zip(cached).enumerate() {
+            if let Some(value) = cached {
+                values[index] = Some(value);
+                continue;
+            }
+            missed.push((index, request));
+        }
+        let mut fills = Vec::new();
+        let mut first_failure = None;
+        for missed in missed.chunks(fallback_parallelism.max(1)) {
+            let mut jobs = tokio::task::JoinSet::new();
+            for (index, request) in missed.iter().copied() {
+                let publisher = self.clone();
+                let storage_tenant = storage_tenant.to_owned();
+                let bucket = bucket.to_owned();
+                let generation = current.generation.clone();
+                jobs.spawn(async move {
+                    let value = publisher
+                        .load_component_record(
+                            &storage_tenant,
+                            &bucket,
+                            tenant_id,
+                            bucket_id,
+                            &generation,
+                            request.component,
+                            request.key,
+                        )
+                        .await?;
+                    Ok::<_, Status>((index, value))
+                });
+            }
+            while let Some(result) = jobs.join_next().await {
+                match result {
+                    Ok(Ok((index, value))) => {
+                        fills.push((index, value.clone()));
+                        values[index] = Some(value);
+                    }
+                    Ok(Err(error)) => {
+                        first_failure.get_or_insert(error);
+                    }
+                    Err(error) => {
+                        first_failure.get_or_insert_with(|| {
+                            Status::internal(format!("v1 component load task failed: {error}"))
+                        });
+                    }
+                }
+            }
+        }
+        fills.sort_by_key(|(index, _)| *index);
+        let fill_values = fills
+            .iter()
+            .map(|(index, value)| (record_keys[*index].as_slice(), value.as_deref()))
+            .collect::<Vec<_>>();
+        let _ = self.store.cache_index_projection_states(
             &partition_key,
             current.current.generation_hash,
-            &record_key,
-            value.as_deref(),
+            &fill_values,
         );
-        Ok(value)
+        if let Some(error) = first_failure {
+            return Err(error);
+        }
+        values
+            .into_iter()
+            .map(|value| {
+                value.ok_or_else(|| Status::data_loss("v1 component batch omitted a request"))
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]

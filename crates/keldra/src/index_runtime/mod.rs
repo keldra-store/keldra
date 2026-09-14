@@ -35,5 +35,6 @@ pub(crate) mod v1_query_compile;
 pub(crate) mod v1_query_runtime;
 pub(crate) mod v1_removal_quiescence;
 pub(crate) mod v1_retention;
+mod v1_source_batch;
 pub(crate) mod v1_telemetry;
 pub(crate) mod working_memory;

@@ -11,7 +11,7 @@ use keldra_index::v1::{
     PreparedProjectionRow, PreparedQueryMutationBatch, ProjectionBatchAdmission,
     ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits,
 };
-use keldra_store::{ObjectHeadChange, ObjectHeadChangeKind, ObjectKey, SourceId, VersionId};
+use keldra_store::{ObjectHeadChange, ObjectHeadChangeKind, SourceId, VersionId};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
@@ -33,6 +33,7 @@ use super::v1_producer_state::{
 use super::v1_publication::{
     LoadedV1ProjectionGeneration, V1ProjectionPublisher, V1PublicationPredecessor,
 };
+use super::v1_source_batch::{ExactMutationRequest, load_exact_mutations};
 
 const RETRY: Duration = Duration::from_millis(250);
 const SAFETY_RECONCILE: Duration = Duration::from_secs(30);
@@ -1254,31 +1255,88 @@ async fn prepare_lane(
     let scope = source_scope(writer.source);
     let input_bytes = limits.worker_bytes;
     let mut prepared_values = Vec::new();
-    for chunk in mutations.chunks(limits.parallelism) {
+    let exact_requests = mutations
+        .iter()
+        .map(|mutation| ExactMutationRequest {
+            path: &mutation.path,
+            canonical_path: mutation.canonical_path.as_deref(),
+            version: mutation.version,
+            deleted: mutation.deleted,
+        })
+        .collect::<Vec<_>>();
+    let sources = load_exact_mutations(reader, &recipe, &exact_requests).await?;
+    let selected_inputs = mutations.into_iter().zip(sources).collect::<Vec<_>>();
+    for chunk in selected_inputs.chunks(limits.parallelism) {
+        let inputs = (0..chunk.len())
+            .map(|_| {
+                credits
+                    .acquire(IndexingMemoryStage::ReplayInput, input_bytes)
+                    .map_err(|_| Status::resource_exhausted("v1 replay input memory unavailable"))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let previous = match &current {
+            Some(current) => {
+                let matched_indices = chunk
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, (mutation, source))| {
+                        let content_type = match source {
+                            IndexSourceMutation::Upsert(object) => object.content_type.as_deref(),
+                            IndexSourceMutation::Remove { .. } => None,
+                        };
+                        (!matching_recipes(
+                            std::slice::from_ref(&recipe),
+                            mutation.tenant_id,
+                            mutation.bucket_id,
+                            &mutation.path,
+                            content_type,
+                        )
+                        .is_empty())
+                        .then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                let source_paths = matched_indices
+                    .iter()
+                    .map(|index| chunk[*index].0.path.as_str())
+                    .collect::<Vec<_>>();
+                let matched_previous = publisher
+                    .load_source_states_batch(
+                        &recipe.storage_tenant,
+                        &recipe.bucket,
+                        recipe.family.tenant_id,
+                        recipe.family.bucket_id,
+                        current,
+                        scope,
+                        &source_paths,
+                        limits.parallelism,
+                    )
+                    .await?;
+                let mut previous = std::iter::repeat_with(Vec::new)
+                    .take(chunk.len())
+                    .collect::<Vec<_>>();
+                for (index, states) in matched_indices.into_iter().zip(matched_previous) {
+                    previous[index] = states;
+                }
+                previous
+            }
+            None => std::iter::repeat_with(Vec::new).take(chunk.len()).collect(),
+        };
         let mut jobs = tokio::task::JoinSet::new();
-        for mutation in chunk.iter().cloned() {
-            let reader = reader.clone();
+        for (((mutation, source), previous), input) in
+            chunk.iter().cloned().zip(previous).zip(inputs)
+        {
             let extractor = extractor.clone();
             let prepare_extractor = extractor.clone();
-            let publisher = publisher.clone();
             let recipe = recipe.clone();
-            let current = current.clone();
             let credits = credits.clone();
             jobs.spawn(async move {
-                let input = credits
-                    .acquire(IndexingMemoryStage::ReplayInput, input_bytes)
-                    .map_err(|_| {
-                        Status::resource_exhausted("v1 replay input memory unavailable")
-                    })?;
                 let Some(value) = select_mutation(
-                    reader,
                     extractor,
-                    publisher,
                     recipe.clone(),
-                    current,
                     physical_catalog_identity,
-                    scope,
                     mutation,
+                    source,
+                    previous,
                     input,
                 )
                 .await?
@@ -1349,25 +1407,14 @@ async fn prepare_lane(
 }
 
 async fn select_mutation(
-    reader: ClusterObjectReader,
     extractor: V1ProjectionExtractor,
-    publisher: V1ProjectionPublisher,
     recipe: PhysicalCatalogRecipe,
-    current: Option<LoadedV1ProjectionGeneration>,
     physical_catalog_identity: [u8; 32],
-    scope: [u8; 32],
     mutation: Mutation,
+    source: IndexSourceMutation,
+    previous: Vec<keldra_index::v1::ProjectedDocumentState>,
     mut input: keldra_index::v1::IndexingMemoryPermit,
 ) -> Result<Option<SelectedMutation>, Status> {
-    let source = load_exact_mutation(
-        &reader,
-        &recipe,
-        &mutation.path,
-        mutation.canonical_path.clone(),
-        mutation.version,
-        mutation.deleted,
-    )
-    .await?;
     let source_bytes = match &source {
         IndexSourceMutation::Upsert(object) => object.content_length,
         IndexSourceMutation::Remove { .. } => 0,
@@ -1404,22 +1451,6 @@ async fn select_mutation(
             physical_catalog_identity,
         )
         .await?;
-    let previous = match current {
-        Some(current) => {
-            publisher
-                .load_source_states(
-                    &recipe.storage_tenant,
-                    &recipe.bucket,
-                    mutation.tenant_id,
-                    mutation.bucket_id,
-                    &current,
-                    scope,
-                    &mutation.path,
-                )
-                .await?
-        }
-        None => Vec::new(),
-    };
     let retained_bytes = selected_mutation_resident_bytes(&mutation, &selected, &previous)?;
     if retained_bytes > input.bytes() {
         return Err(Status::resource_exhausted(format!(
@@ -1859,54 +1890,6 @@ fn head_mutation(head: ObjectHeadChange, ordinal: u32) -> Mutation {
         version: head.path_version.0,
         deleted: matches!(head.kind, ObjectHeadChangeKind::Delete),
     }
-}
-
-async fn load_exact_mutation(
-    reader: &ClusterObjectReader,
-    recipe: &PhysicalCatalogRecipe,
-    path: &str,
-    canonical_path: Option<String>,
-    version: u64,
-    deleted: bool,
-) -> Result<IndexSourceMutation, Status> {
-    let identity = keldra_index::v1::ObjectIdentity {
-        path: path.into(),
-        version,
-    };
-    if deleted {
-        return Ok(IndexSourceMutation::Remove {
-            identity,
-            canonical_path,
-        });
-    }
-    let key = ObjectKey::new(&recipe.storage_tenant, &recipe.bucket, path)
-        .map_err(|error| Status::data_loss(error.to_string()))?;
-    let selected = reader
-        .exact_versions_stable(
-            &[key],
-            &[VersionId(version)],
-            recipe.family.tenant_id,
-            recipe.family.bucket_id,
-        )
-        .await?
-        .pop()
-        .flatten()
-        .ok_or_else(|| Status::failed_precondition("v1 exact source version is absent"))?;
-    if selected.deleted || selected.id.0 != version {
-        return Err(Status::data_loss("v1 exact source version mismatch"));
-    }
-    let blob = selected
-        .blob
-        .ok_or_else(|| Status::data_loss("v1 source blob is absent"))?;
-    Ok(IndexSourceMutation::Upsert(IndexBuildObject {
-        path: path.into(),
-        canonical_path,
-        version,
-        content_type: selected.content_type,
-        content_hash: blob.hash,
-        content_length: blob.length,
-        committed_at_unix_millis: selected.committed_at_unix_millis,
-    }))
 }
 
 fn merge_query(
