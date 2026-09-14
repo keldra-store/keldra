@@ -612,6 +612,7 @@ async fn local_atomic_finalization_waits_for_deferred_reference_delivery() {
     let (_temporary, store, verified) = configured_store().await;
     let deferred_blob = store.stage_blob(b"deferred predecessor").await.unwrap();
     let before = store.local_watch_status().unwrap();
+    let deferred_guard = store.lock_commit("deferred_reference_test").await;
     let mut deferred_batch = WriteBatch::default();
     store
         .stage_local_changes(
@@ -634,6 +635,7 @@ async fn local_atomic_finalization_waits_for_deferred_reference_delivery() {
         .unwrap();
     store.write_program_batch(deferred_batch).unwrap();
     store.notify_local_invalidations();
+    drop(deferred_guard);
     let deferred = store.local_watch_status().unwrap();
     assert_eq!(deferred.tail, before.tail + 1);
     assert_eq!(
@@ -650,6 +652,11 @@ async fn local_atomic_finalization_waits_for_deferred_reference_delivery() {
         .await
         .unwrap();
     let prepared = store.prepare_program_bundle(&lease).await.unwrap();
+    assert_eq!(
+        store.reference_delta_cursor(deferred.source_id).unwrap(),
+        before.tail,
+        "preparing a program must not skip deferred reference delivery"
+    );
     let local_commit = commit(&prepared, None, 1);
     let _reservations = commit_prepared_reservations(&store, &prepared, &local_commit).await;
     let backlog = store.local_watch_status().unwrap();

@@ -170,7 +170,7 @@ async fn sealing_creates_one_reservation_and_reuse_only_refreshes_it() {
 }
 
 #[tokio::test]
-async fn streamed_seal_retains_memory_without_a_filesystem_spool_while_waiting_for_commit() {
+async fn streamed_seal_bypasses_the_legacy_commit_mutex_without_a_filesystem_spool() {
     let (temporary, store) = store().await;
     let bytes = vec![0x5a; SMALL_BLOB_MAX_BYTES + 1];
     let expected = blob_reference_for_bytes(&bytes);
@@ -180,18 +180,47 @@ async fn streamed_seal_retains_memory_without_a_filesystem_spool_while_waiting_f
     let commit_guard = store.commit_lock.lock().await;
     let sealing_store = store.clone();
     let sealing = tokio::spawn(async move { sealing_store.seal_blob_upload(upload).await });
-    tokio::task::yield_now().await;
-    assert!(!store.contains_blob(&expected).await.unwrap());
-    assert!(!sealing.is_finished());
+    let sealed = tokio::time::timeout(std::time::Duration::from_secs(2), sealing)
+        .await
+        .expect("streamed seal bypasses the legacy commit mutex")
+        .unwrap()
+        .unwrap();
     assert!(!temporary.path().join("blobs/.upload-spool").exists());
 
     drop(commit_guard);
-    assert_eq!(sealing.await.unwrap().unwrap(), expected);
+    assert_eq!(sealed, expected);
     assert!(!temporary.path().join("blobs/.upload-spool").exists());
     let state = store.blob_reference_state(&expected).unwrap().unwrap();
     assert_eq!(state.ref_count, 1);
     assert_eq!(state.flags, AWAITING_PUBLISH);
     assert!(state.created_at <= state.updated_at);
+}
+
+#[tokio::test]
+async fn chunked_upload_finalization_uses_the_exact_blob_conflict() {
+    let (_temporary, store) = store().await;
+    let bytes = vec![0x6b; PAYLOAD_ARTIFACT_CHUNK_BYTES + 1];
+    let expected = blob_reference_for_bytes(&bytes);
+    let held_lane = store
+        .mutation_commit_lanes
+        .acquire(
+            [super::super::mutation_commit_lanes::blob_conflict_resource(
+                &expected,
+            )],
+        )
+        .await;
+    let writer = store.clone();
+    let sealing = tokio::spawn(async move { writer.stage_blob(&bytes).await });
+
+    tokio::task::yield_now().await;
+    assert!(!sealing.is_finished());
+    drop(held_lane);
+
+    assert_eq!(sealing.await.unwrap().unwrap(), expected);
+    assert_eq!(
+        store.read_blob_bytes(&expected).await.unwrap().len(),
+        PAYLOAD_ARTIFACT_CHUNK_BYTES + 1
+    );
 }
 
 #[tokio::test]
@@ -713,6 +742,146 @@ async fn derived_progress_inline_batch_uses_one_write_and_preserves_input_order(
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn derived_progress_inline_batch_does_not_take_the_legacy_commit_mutex() {
+    let (_temporary, store) = store().await;
+    let legacy_mutex = store.commit_lock.lock().await;
+    let writer = store.clone();
+    let completed = tokio::spawn(async move {
+        writer
+            .stage_derived_progress_inline_blobs(&[b"independent derived artifact".to_vec()])
+            .await
+    });
+
+    let references = tokio::time::timeout(std::time::Duration::from_secs(2), completed)
+        .await
+        .expect("derived staging bypasses the legacy commit mutex")
+        .unwrap()
+        .unwrap();
+    drop(legacy_mutex);
+
+    assert_eq!(references.len(), 1);
+    assert_eq!(
+        store.complete_copy_state(&references[0]).await.unwrap(),
+        PayloadArtifactState::Valid
+    );
+}
+
+#[tokio::test]
+async fn derived_progress_inline_batch_uses_exact_blob_conflicts() {
+    let (_temporary, store) = store().await;
+    let blocked_bytes = b"conflicting derived artifact".to_vec();
+    let blocked_reference = blob_reference_for_bytes(&blocked_bytes);
+    let held_lane = store
+        .mutation_commit_lanes
+        .acquire(
+            [super::super::mutation_commit_lanes::blob_conflict_resource(
+                &blocked_reference,
+            )],
+        )
+        .await;
+
+    let independent_blobs = [b"independent derived artifact".to_vec()];
+    let independent = store.stage_derived_progress_inline_blobs(&independent_blobs);
+    tokio::time::timeout(std::time::Duration::from_secs(2), independent)
+        .await
+        .expect("an unrelated blob lane remains available")
+        .unwrap();
+
+    let blocked_store = store.clone();
+    let blocked = tokio::spawn(async move {
+        blocked_store
+            .stage_derived_progress_inline_blobs(&[blocked_bytes])
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(!blocked.is_finished());
+    drop(held_lane);
+    tokio::time::timeout(std::time::Duration::from_secs(2), blocked)
+        .await
+        .expect("matching blob resumes after its exact conflict is released")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_derived_inline_writer_does_not_leave_a_lane_ticket_hole() {
+    let (_temporary, store) = store().await;
+    let before = store.local_watch_status().unwrap();
+    store
+        .mutation_commit_lanes
+        .pause_next_projection
+        .store(true, std::sync::atomic::Ordering::Release);
+    let writer = store.clone();
+    let writing = tokio::spawn(async move {
+        writer
+            .stage_derived_progress_inline_blobs(&[b"detached derived artifact".to_vec()])
+            .await
+    });
+    store
+        .mutation_commit_lanes
+        .projection_write_completed
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+
+    writing.abort();
+    assert!(writing.await.unwrap_err().is_cancelled());
+    store
+        .mutation_commit_lanes
+        .projection_publish_continue
+        .add_permits(1);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if store.local_watch_status().unwrap().tail == before.tail + 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached derived settlement advances the lane frontier");
+}
+
+#[tokio::test]
+async fn cancelling_generic_artifact_writer_does_not_leave_a_lane_ticket_hole() {
+    let (_temporary, store) = store().await;
+    let before = store.local_watch_status().unwrap();
+    store
+        .mutation_commit_lanes
+        .pause_next_projection
+        .store(true, std::sync::atomic::Ordering::Release);
+    let writer = store.clone();
+    let writing = tokio::spawn(async move { writer.stage_blob(b"detached inline artifact").await });
+    store
+        .mutation_commit_lanes
+        .projection_write_completed
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+
+    writing.abort();
+    assert!(writing.await.unwrap_err().is_cancelled());
+    store
+        .mutation_commit_lanes
+        .projection_publish_continue
+        .add_permits(1);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if store.local_watch_status().unwrap().tail == before.tail + 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached artifact settlement advances the lane frontier");
 }
 
 #[tokio::test]

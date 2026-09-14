@@ -89,6 +89,54 @@ async fn bounded_metadata_options_reopen_an_existing_store() {
 }
 
 #[tokio::test]
+async fn explicit_rocksdb_resource_budget_controls_native_memory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let resources = RocksDbResourceBudget {
+        block_cache_bytes: 8 * 1024 * 1024,
+        write_buffer_manager_bytes: 24 * 1024 * 1024,
+        column_family_write_buffer_bytes: 4 * 1024 * 1024,
+        background_jobs: 3,
+        subcompactions: 2,
+    };
+    let store =
+        Store::open(StoreOptions::new(temporary.path(), 1).with_rocksdb_resources(resources))
+            .await
+            .unwrap();
+
+    let runtime = store.metadata_runtime_metrics();
+    assert_eq!(
+        runtime.block_cache_capacity_bytes,
+        resources.block_cache_bytes
+    );
+    assert_eq!(
+        runtime.write_buffer_capacity_bytes,
+        resources.write_buffer_manager_bytes
+    );
+}
+
+#[tokio::test]
+async fn invalid_rocksdb_resource_budget_is_rejected_before_open() {
+    let temporary = tempfile::tempdir().unwrap();
+    let error = Store::open(
+        StoreOptions::new(temporary.path(), 1).with_rocksdb_resources(RocksDbResourceBudget {
+            block_cache_bytes: 1,
+            write_buffer_manager_bytes: 1024,
+            column_family_write_buffer_bytes: 2048,
+            background_jobs: 1,
+            subcompactions: 2,
+        }),
+    )
+    .await
+    .err()
+    .expect("invalid budget is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("RocksDB resource budget is invalid")
+    );
+}
+
+#[tokio::test]
 async fn configured_wal_target_and_payload_engine_properties_are_observable() {
     let temporary = tempfile::tempdir().unwrap();
     let target = 96 * 1024 * 1024;

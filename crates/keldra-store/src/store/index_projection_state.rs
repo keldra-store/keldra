@@ -26,6 +26,47 @@ struct Marker {
 }
 
 impl Store {
+    fn with_index_projection_partition_lock<T>(
+        &self,
+        partition: &[u8],
+        operation: impl FnOnce() -> Result<T, MutationError>,
+    ) -> Result<T, MutationError> {
+        let partition_key = partition.to_vec();
+        let lock = {
+            let mut registry = self
+                .index_projection_state_locks
+                .lock()
+                .map_err(|_| storage("index projection state lock registry is poisoned"))?;
+            if let Some(lock) = registry
+                .get(&partition_key)
+                .and_then(std::sync::Weak::upgrade)
+            {
+                lock
+            } else {
+                let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+                registry.insert(partition_key.clone(), std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let guard = lock
+            .lock()
+            .map_err(|_| storage("index projection partition lock is poisoned"))?;
+        let result = operation();
+        drop(guard);
+        drop(lock);
+        let mut registry = self
+            .index_projection_state_locks
+            .lock()
+            .map_err(|_| storage("index projection state lock registry is poisoned"))?;
+        if registry
+            .get(&partition_key)
+            .is_some_and(|entry| entry.strong_count() == 0)
+        {
+            registry.remove(&partition_key);
+        }
+        result
+    }
+
     /// Remove every process-local projection cache record on startup. Immutable
     /// generations remain the authority and lazily repopulate this namespace.
     pub(super) fn clear_index_projection_state_cache(&self) -> Result<(), MutationError> {
@@ -66,33 +107,31 @@ impl Store {
         if record_keys.is_empty() {
             return Ok(Vec::new());
         }
-        let _guard = self
-            .index_projection_state_lock
-            .lock()
-            .map_err(|_| storage("index projection state lock is poisoned"))?;
-        let marker = self.read_or_rotate_marker(partition, current_generation)?;
-        let keys = record_keys
-            .iter()
-            .map(|record_key| state_key(partition, marker.cache_epoch, record_key))
-            .collect::<Result<Vec<_>, MutationError>>()?;
-        let cf = self.cf(CF_METADATA)?;
-        let selected = self
-            .db
-            .multi_get_cf(keys.iter().map(|key| (cf, key.as_slice())));
-        if selected.len() != record_keys.len() {
-            return Err(storage(
-                "index projection state multi-get returned the wrong result count",
-            ));
-        }
-        selected
-            .into_iter()
-            .map(|value| {
-                value
-                    .map_err(storage_error)?
-                    .map(|value| decode_cache_value(&value))
-                    .transpose()
-            })
-            .collect()
+        self.with_index_projection_partition_lock(partition, || {
+            let marker = self.read_or_rotate_marker(partition, current_generation)?;
+            let keys = record_keys
+                .iter()
+                .map(|record_key| state_key(partition, marker.cache_epoch, record_key))
+                .collect::<Result<Vec<_>, MutationError>>()?;
+            let cf = self.cf(CF_METADATA)?;
+            let selected = self
+                .db
+                .multi_get_cf(keys.iter().map(|key| (cf, key.as_slice())));
+            if selected.len() != record_keys.len() {
+                return Err(storage(
+                    "index projection state multi-get returned the wrong result count",
+                ));
+            }
+            selected
+                .into_iter()
+                .map(|value| {
+                    value
+                        .map_err(storage_error)?
+                        .map(|value| decode_cache_value(&value))
+                        .transpose()
+                })
+                .collect()
+        })
     }
 
     /// Populates one authoritative fallback result if the cache epoch still
@@ -128,31 +167,30 @@ impl Store {
         if states.is_empty() {
             return Ok(true);
         }
-        let _guard = self
-            .index_projection_state_lock
-            .lock()
-            .map_err(|_| storage("index projection state lock is poisoned"))?;
-        let Some(marker) = self.read_marker(partition)? else {
-            return Ok(false);
-        };
-        if marker.current_generation != current_generation {
-            return Ok(false);
-        }
-        let mut batch = WriteBatch::default();
-        for (record_key, state) in states {
-            batch.put_cf(
-                self.cf(CF_METADATA)?,
-                state_key(partition, marker.cache_epoch, record_key)?,
-                encode_cache_value(*state),
-            );
-        }
-        self.write_cache_batch(batch)?;
-        Ok(true)
+        self.with_index_projection_partition_lock(partition, || {
+            let Some(marker) = self.read_marker(partition)? else {
+                return Ok(false);
+            };
+            if marker.current_generation != current_generation {
+                return Ok(false);
+            }
+            let mut batch = WriteBatch::default();
+            for (record_key, state) in states {
+                batch.put_cf(
+                    self.cf(CF_METADATA)?,
+                    state_key(partition, marker.cache_epoch, record_key)?,
+                    encode_cache_value(*state),
+                );
+            }
+            self.write_cache_batch(batch)?;
+            Ok(true)
+        })
     }
 
-    /// Advances the disposable cache after the authoritative Current CAS. If
-    /// the predecessor marker is unavailable, the new updates seed a fresh
-    /// partial epoch; an absent key continues to fall back to immutable state.
+    /// Advances the disposable cache after the authoritative Current CAS. An
+    /// empty cache may be seeded as a partial epoch; an existing epoch advances
+    /// only from its exact predecessor (or idempotently at the same Current).
+    /// A stale completion is ignored rather than rolling its marker backwards.
     #[doc(hidden)]
     pub fn advance_index_projection_state(
         &self,
@@ -160,7 +198,7 @@ impl Store {
         predecessor_generation: Option<[u8; 32]>,
         current_generation: [u8; 32],
         updates: &[(Vec<u8>, Option<Vec<u8>>)],
-    ) -> Result<(), MutationError> {
+    ) -> Result<bool, MutationError> {
         validate_partition(partition)?;
         validate_generation(current_generation)?;
         for (record_key, value) in updates {
@@ -169,42 +207,44 @@ impl Store {
                 validate_value(value)?;
             }
         }
-        let _guard = self
-            .index_projection_state_lock
-            .lock()
-            .map_err(|_| storage("index projection state lock is poisoned"))?;
-        let previous = self.read_marker(partition)?;
-        let preserve = previous
-            .is_some_and(|marker| predecessor_generation == Some(marker.current_generation));
-        let epoch = if preserve {
-            previous.expect("preserved marker exists").cache_epoch
-        } else {
-            current_generation
-        };
-        let mut batch = WriteBatch::default();
-        if !preserve && let Some(previous) = previous {
-            stage_prefix_delete(
-                &mut batch,
-                self.cf(CF_METADATA)?,
-                &state_epoch_prefix(partition, previous.cache_epoch),
-            )?;
-        }
-        for (record_key, value) in updates {
+        self.with_index_projection_partition_lock(partition, || {
+            let previous = self.read_marker(partition)?;
+            let already_current =
+                previous.is_some_and(|marker| marker.current_generation == current_generation);
+            let preserve = already_current
+                || previous.is_some_and(|marker| {
+                    predecessor_generation == Some(marker.current_generation)
+                });
+            if previous.is_some() && !preserve {
+                // This is an old or discontinuous disposable update. It must
+                // never replace a marker installed for a different (possibly
+                // newer) authoritative Current generation.
+                return Ok(false);
+            }
+            let epoch = if preserve {
+                previous.expect("preserved marker exists").cache_epoch
+            } else {
+                current_generation
+            };
+            let mut batch = WriteBatch::default();
+            for (record_key, value) in updates {
+                batch.put_cf(
+                    self.cf(CF_METADATA)?,
+                    state_key(partition, epoch, record_key)?,
+                    encode_cache_value(value.as_deref()),
+                );
+            }
             batch.put_cf(
                 self.cf(CF_METADATA)?,
-                state_key(partition, epoch, record_key)?,
-                encode_cache_value(value.as_deref()),
+                marker_key(partition),
+                encode_marker(Marker {
+                    current_generation,
+                    cache_epoch: epoch,
+                }),
             );
-        }
-        batch.put_cf(
-            self.cf(CF_METADATA)?,
-            marker_key(partition),
-            encode_marker(Marker {
-                current_generation,
-                cache_epoch: epoch,
-            }),
-        );
-        self.write_cache_batch(batch)
+            self.write_cache_batch(batch)?;
+            Ok(true)
+        })
     }
 
     fn read_or_rotate_marker(
@@ -396,6 +436,9 @@ fn storage_error(error: rocksdb::Error) -> MutationError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -523,7 +566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advancing_without_exact_predecessor_starts_safe_partial_epoch() {
+    async fn advancing_without_exact_predecessor_cannot_replace_another_marker() {
         let (_dir, store) = store().await;
         let partition = b"partition-a";
         store
@@ -532,25 +575,75 @@ mod tests {
         store
             .cache_index_projection_state(partition, [1; 32], b"a", Some(b"old"))
             .unwrap();
-        store
-            .advance_index_projection_state(
-                partition,
-                Some([9; 32]),
-                [2; 32],
-                &[(b"b".to_vec(), Some(b"new".to_vec()))],
-            )
-            .unwrap();
+        assert!(
+            !store
+                .advance_index_projection_state(
+                    partition,
+                    Some([9; 32]),
+                    [2; 32],
+                    &[(b"b".to_vec(), Some(b"new".to_vec()))],
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .index_projection_state(partition, [1; 32], b"a")
+                .unwrap(),
+            Some(Some(b"old".to_vec()))
+        );
+        assert_eq!(
+            store
+                .index_projection_state(partition, [1; 32], b"b")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_completion_cannot_roll_back_a_newer_cache_epoch() {
+        let (_dir, store) = store().await;
+        let partition = b"partition-a";
+        assert!(
+            store
+                .advance_index_projection_state(
+                    partition,
+                    None,
+                    [1; 32],
+                    &[(b"a".to_vec(), Some(b"one".to_vec()))],
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .advance_index_projection_state(
+                    partition,
+                    Some([1; 32]),
+                    [2; 32],
+                    &[(b"b".to_vec(), Some(b"two".to_vec()))],
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .advance_index_projection_state(
+                    partition,
+                    None,
+                    [1; 32],
+                    &[(b"a".to_vec(), Some(b"late".to_vec()))],
+                )
+                .unwrap()
+        );
         assert_eq!(
             store
                 .index_projection_state(partition, [2; 32], b"a")
                 .unwrap(),
-            None
+            Some(Some(b"one".to_vec()))
         );
         assert_eq!(
             store
                 .index_projection_state(partition, [2; 32], b"b")
                 .unwrap(),
-            Some(Some(b"new".to_vec()))
+            Some(Some(b"two".to_vec()))
         );
     }
 
@@ -615,5 +708,53 @@ mod tests {
             .transpose()
             .unwrap();
         assert!(first.is_none_or(|(key, _)| !key.starts_with(&KEY_PREFIX)));
+    }
+
+    #[tokio::test]
+    async fn independent_partitions_do_not_share_projection_state_lock() {
+        let (_dir, store) = store().await;
+        let held = Arc::new(Mutex::new(()));
+        store
+            .index_projection_state_locks
+            .lock()
+            .unwrap()
+            .insert(b"partition-a".to_vec(), Arc::downgrade(&held));
+        let held_guard = held.lock().unwrap();
+
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let blocked_store = store.clone();
+        let blocked = std::thread::spawn(move || {
+            blocked_tx
+                .send(blocked_store.index_projection_state(b"partition-a", [1; 32], b"record"))
+                .unwrap();
+        });
+
+        let (independent_tx, independent_rx) = mpsc::channel();
+        let independent_store = store.clone();
+        let independent = std::thread::spawn(move || {
+            independent_tx
+                .send(independent_store.index_projection_state(b"partition-b", [1; 32], b"record"))
+                .unwrap();
+        });
+
+        assert_eq!(
+            independent_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("independent partition is not blocked")
+                .unwrap(),
+            None
+        );
+        assert!(blocked_rx.try_recv().is_err());
+        drop(held_guard);
+        drop(held);
+        assert_eq!(
+            blocked_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("matching partition resumes")
+                .unwrap(),
+            None
+        );
+        blocked.join().unwrap();
+        independent.join().unwrap();
     }
 }

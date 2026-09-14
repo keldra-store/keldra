@@ -311,6 +311,14 @@ impl Store {
         &self,
         status: WatchJournalStatus,
     ) -> Result<(), MutationError> {
+        self.settle_inline_source_changes_through_from_status(status, status.tail)
+    }
+
+    pub(super) fn settle_inline_source_changes_through_from_status(
+        &self,
+        status: WatchJournalStatus,
+        reference_safe_through: u64,
+    ) -> Result<(), MutationError> {
         let local_source = SourceId {
             node_id: self.node_id,
             source_epoch: self.watch_source_epoch,
@@ -321,17 +329,26 @@ impl Store {
                 status.source_id,
             )));
         }
-        let reference_safe = self
+        let current_reference_safe = self
             .source_journal_reference_safe_through
             .load(std::sync::atomic::Ordering::Acquire);
-        if reference_safe > status.tail {
+        if current_reference_safe > status.tail {
             return Err(MutationError::Storage(format!(
-                "source journal reference-safe cursor {reference_safe} is beyond tail {}",
+                "source journal reference-safe cursor {current_reference_safe} is beyond tail {}",
+                status.tail,
+            )));
+        }
+        if reference_safe_through < current_reference_safe {
+            return Ok(());
+        }
+        if reference_safe_through > status.tail {
+            return Err(MutationError::Storage(format!(
+                "source journal reference-safe transition from {current_reference_safe} to {reference_safe_through} is outside tail {}",
                 status.tail,
             )));
         }
         self.source_journal_reference_safe_through
-            .store(status.tail, std::sync::atomic::Ordering::Release);
+            .store(reference_safe_through, std::sync::atomic::Ordering::Release);
         self.mutation_capacity_notify.notify_waiters();
         Ok(())
     }

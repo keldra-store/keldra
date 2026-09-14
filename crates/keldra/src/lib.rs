@@ -125,6 +125,7 @@ pub struct ServerConfig {
     pub plugin_gateway: PluginGatewayConfig,
     pub max_blob_bytes: u64,
     pub max_total_wal_bytes: u64,
+    pub rocksdb_resources: keldra_store::RocksDbResourceBudget,
     pub erasure_profile: ErasureProfile,
     pub awaiting_publish_ttl_seconds: u64,
     pub mutation_receipt_retention_seconds: u64,
@@ -204,6 +205,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             .with_payload_directory(&config.storage.payload)
             .with_pending_upload_max_bytes(config.storage.pending_upload_max_bytes)
             .with_max_total_wal_bytes(config.max_total_wal_bytes)
+            .with_rocksdb_resources(config.rocksdb_resources)
             .with_watch_retention(watch_retention)
             .with_mutation_receipt_retention(mutation_receipt_retention)
             .with_single_node_group_commit(config.single_node_group_commit.clone())

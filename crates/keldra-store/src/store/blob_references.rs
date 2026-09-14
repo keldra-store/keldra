@@ -93,17 +93,76 @@ impl Store {
         }
 
         let now = now_unix_millis()?;
-        let _guard = self.lock_commit("blob_reference").await;
-        self.persist_derived_progress_inline_blob_batch(blobs, &references, now)?;
+        let resources = references
+            .iter()
+            .map(super::mutation_commit_lanes::blob_conflict_resource);
+        let mut lane = self.mutation_commit_lanes.acquire(resources).await;
+        if self.mutation_commit_lanes.projection_retry_needed() {
+            self.project_lane_completions().await?;
+        }
+
+        let (batch, completion) = loop {
+            // Snapshot shared source authority briefly, then perform artifact
+            // reads and batch construction under exact blob guards only. If an
+            // independent lane reserved first, rebuild with its new frontier.
+            let (source, receipts, cursor) = {
+                let mut runtime = self.mutation_commit_lanes.sequence().await;
+                let runtime = runtime.as_mut().ok_or_else(|| {
+                    MutationError::Storage("mutation lane runtime is not initialized".into())
+                })?;
+                self.refresh_stale_lane_runtime(runtime)?;
+                let cursor = self
+                    .reference_delta_cursor(runtime.projected_watch.source_id)
+                    .map_err(|error| MutationError::Storage(error.to_string()))?;
+                (runtime.reserved_watch, runtime.reserved_receipts, cursor)
+            };
+            let (mut batch, staged) = self.build_derived_progress_inline_blob_batch(
+                blobs,
+                &references,
+                now,
+                source,
+                cursor,
+            )?;
+            let mut sequence = self.mutation_commit_lanes.sequence().await;
+            let runtime = sequence.as_mut().ok_or_else(|| {
+                MutationError::Storage("mutation lane runtime is not initialized".into())
+            })?;
+            self.refresh_stale_lane_runtime(runtime)?;
+            if runtime.reserved_watch != source || runtime.reserved_receipts != receipts {
+                drop(sequence);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let completion = runtime.reserve_with_reference_settlement(
+                staged.status,
+                receipts,
+                None,
+                cursor == source.tail,
+                false,
+                staged.visibility_settlement_staged,
+            )?;
+            self.stage_lane_completion(&mut batch, completion)?;
+            break (batch, completion);
+        };
+
+        let mut options = WriteOptions::default();
+        options.set_sync(self.sync_writes);
+        let persistence = self.db.write_opt(batch, &options).map_err(storage_error);
+        lane.release_physical_slot();
+        self.finish_lane_commit_cancellation_safe(completion, persistence.is_ok())
+            .await?;
+        persistence?;
         Ok(references)
     }
 
-    fn persist_derived_progress_inline_blob_batch(
+    fn build_derived_progress_inline_blob_batch(
         &self,
         blobs: &[Vec<u8>],
         references: &[BlobRef],
         now_unix_millis: u64,
-    ) -> Result<(), MutationError> {
+        source_status: WatchJournalStatus,
+        reference_cursor: u64,
+    ) -> Result<(WriteBatch, super::mutations::StagedLocalChanges), MutationError> {
         let mut batch = WriteBatch::default();
         let mut pending_inline_payloads = BTreeSet::new();
         let mut pending_blob_references = PendingBlobReferences::new();
@@ -135,17 +194,138 @@ impl Store {
                 accounting_transition: None,
             });
         }
-        self.stage_local_changes_with_admission(
+        let staged = self.stage_local_changes_from_status(
             &mut batch,
             &changes,
             LocalReferenceEffects::NoReferenceEffects,
             SourceJournalAdmission::DerivedProgress,
+            source_status,
+            reference_cursor,
+            true,
+            false,
         )?;
-        let mut options = WriteOptions::default();
-        options.set_sync(self.sync_writes);
-        self.db.write_opt(batch, &options).map_err(storage_error)?;
-        self.notify_local_invalidations();
-        Ok(())
+        Ok((batch, staged))
+    }
+
+    async fn commit_artifact_lifecycle_lane<T>(
+        &self,
+        resources: Vec<Vec<u8>>,
+        admission: SourceJournalAdmission,
+        mut build: impl FnMut(
+            WatchJournalStatus,
+            u64,
+        ) -> Result<
+            (WriteBatch, Option<super::mutations::StagedLocalChanges>, T),
+            MutationError,
+        >,
+    ) -> Result<T, MutationError> {
+        loop {
+            let mut lane = self.mutation_commit_lanes.acquire(resources.clone()).await;
+            if self.mutation_commit_lanes.projection_retry_needed() {
+                self.project_lane_completions().await?;
+            }
+            let prepared = loop {
+                let (source, receipts, cursor) = {
+                    let mut runtime = self.mutation_commit_lanes.sequence().await;
+                    let runtime = runtime.as_mut().ok_or_else(|| {
+                        MutationError::Storage("mutation lane runtime is not initialized".into())
+                    })?;
+                    self.refresh_stale_lane_runtime(runtime)?;
+                    let cursor = self
+                        .reference_delta_cursor(runtime.projected_watch.source_id)
+                        .map_err(|error| MutationError::Storage(error.to_string()))?;
+                    (runtime.reserved_watch, runtime.reserved_receipts, cursor)
+                };
+                let (mut batch, staged, output) = match build(source, cursor) {
+                    Ok(prepared) => prepared,
+                    Err(MutationError::SourceJournalCapacity)
+                        if admission == SourceJournalAdmission::Bounded =>
+                    {
+                        break None;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let mut sequence = self.mutation_commit_lanes.sequence().await;
+                let runtime = sequence.as_mut().ok_or_else(|| {
+                    MutationError::Storage("mutation lane runtime is not initialized".into())
+                })?;
+                self.refresh_stale_lane_runtime(runtime)?;
+                if runtime.reserved_watch != source || runtime.reserved_receipts != receipts {
+                    drop(sequence);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                let completion = staged
+                    .map(|staged| {
+                        runtime.reserve_with_reference_settlement(
+                            staged.status,
+                            receipts,
+                            None,
+                            cursor == source.tail,
+                            false,
+                            staged.visibility_settlement_staged,
+                        )
+                    })
+                    .transpose()?;
+                if let Some(completion) = completion {
+                    self.stage_lane_completion(&mut batch, completion)?;
+                }
+                break Some((batch, completion, output));
+            };
+            let Some((batch, completion, output)) = prepared else {
+                drop(lane);
+                self.wait_for_mutation_capacity().await;
+                continue;
+            };
+            if batch.is_empty() && completion.is_none() {
+                return Ok(output);
+            }
+
+            let mut options = WriteOptions::default();
+            options.set_sync(self.sync_writes);
+            let persistence = self.db.write_opt(batch, &options).map_err(storage_error);
+            lane.release_physical_slot();
+            if let Some(completion) = completion {
+                self.finish_lane_commit_cancellation_safe(completion, persistence.is_ok())
+                    .await?;
+            }
+            persistence?;
+            return Ok(output);
+        }
+    }
+
+    fn stage_artifact_lifecycle_change_for_lane(
+        &self,
+        batch: &mut WriteBatch,
+        identity: Vec<u8>,
+        revision: u64,
+        admission: SourceJournalAdmission,
+        source: WatchJournalStatus,
+        reference_cursor: u64,
+    ) -> Result<Option<super::mutations::StagedLocalChanges>, MutationError> {
+        let changes = [PendingLocalChange::ContentLifecycleChanged {
+            blob_identity: identity,
+            revision,
+            reference_deltas: Vec::new(),
+            accounting_transition: None,
+        }];
+        if admission.suppresses_physical_replica_changes(
+            &changes,
+            LocalReferenceEffects::NoReferenceEffects,
+        )? {
+            return Ok(None);
+        }
+        self.stage_local_changes_from_status(
+            batch,
+            &changes,
+            LocalReferenceEffects::NoReferenceEffects,
+            admission,
+            source,
+            reference_cursor,
+            true,
+            false,
+        )
+        .map(Some)
     }
 
     pub fn lock_manager(&self) -> LocalLockManager {
@@ -217,7 +397,12 @@ impl Store {
             ));
         }
         let now = now_unix_millis()?;
-        let _guard = self.lock_commit("payload_upload").await;
+        let mut lane = self
+            .mutation_commit_lanes
+            .acquire([super::mutation_commit_lanes::artifact_conflict_resource(
+                &upload_id,
+            )])
+            .await;
         let manifest = ArtifactManifest::upload(upload_id);
         let (start, previous_updated_at) = if let Some((current, next, updated_at)) =
             self.read_artifact_install_state(&upload_id)?
@@ -249,14 +434,16 @@ impl Store {
         }
         let previous_due = upload_gc_due_key(&upload_id, previous_updated_at);
         let replacement_due = upload_gc_due_key(&upload_id, now);
-        self.advance_artifact_install(
+        let result = self.advance_artifact_install(
             &upload_id,
             &manifest,
             ordinal,
             &bytes,
             now,
             Some((&previous_due, &replacement_due)),
-        )
+        );
+        lane.release_physical_slot();
+        result
     }
 
     async fn finish_pending_upload(
@@ -295,86 +482,87 @@ impl Store {
                     }
                 }
             }
-            let guard = self.lock_commit("payload_upload").await;
-            let result = (|| {
-                let Some((upload_manifest, _, upload_updated_at)) =
-                    self.read_artifact_install_state(&staged.upload_id())?
-                else {
-                    return Err(MutationError::Storage(
-                        "pending upload disappeared before finalization".into(),
-                    ));
-                };
-                let current_existing = self.read_complete_manifest(reference)?;
-                if current_existing != observed_existing {
-                    return Ok(None);
-                }
-                let current_lifecycle =
-                    self.read_blob_reference_state(&blob_reference_key(reference))?;
-                match (current_existing.is_some(), current_lifecycle.is_some()) {
-                    (true, false) => {
+            let resources = vec![
+                super::mutation_commit_lanes::artifact_conflict_resource(&staged.upload_id()),
+                super::mutation_commit_lanes::blob_conflict_resource(reference),
+            ];
+            let result = self
+                .commit_artifact_lifecycle_lane(resources, admission, |source, cursor| {
+                    let Some((upload_manifest, _, upload_updated_at)) =
+                        self.read_artifact_install_state(&staged.upload_id())?
+                    else {
                         return Err(MutationError::Storage(
-                            "sealed payload manifest has no lifecycle authority".into(),
+                            "pending upload disappeared before finalization".into(),
                         ));
+                    };
+                    let current_existing = self.read_complete_manifest(reference)?;
+                    if current_existing != observed_existing {
+                        return Ok((WriteBatch::default(), None, None));
                     }
-                    (false, true) => {
-                        return Err(MutationError::Storage(
-                            "sealed payload lifecycle has no published manifest".into(),
-                        ));
+                    let current_lifecycle =
+                        self.read_blob_reference_state(&blob_reference_key(reference))?;
+                    match (current_existing.is_some(), current_lifecycle.is_some()) {
+                        (true, false) => {
+                            return Err(MutationError::Storage(
+                                "sealed payload manifest has no lifecycle authority".into(),
+                            ));
+                        }
+                        (false, true) => {
+                            return Err(MutationError::Storage(
+                                "sealed payload lifecycle has no published manifest".into(),
+                            ));
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-                let state = self
-                    .prepare_sealed_blob_reservation(reference, now)?
-                    .ok_or_else(|| {
-                        MutationError::Storage("sealed upload lifecycle is missing".into())
-                    })?;
-                let mut batch = WriteBatch::default();
-                if let Some(existing) = current_existing {
-                    if existing.storage_id == manifest.storage_id {
-                        return Err(MutationError::Storage(
-                            "pending upload storage identity collides with a sealed artifact"
-                                .into(),
-                        ));
+                    let state = self
+                        .prepare_sealed_blob_reservation(reference, now)?
+                        .ok_or_else(|| {
+                            MutationError::Storage("sealed upload lifecycle is missing".into())
+                        })?;
+                    let mut batch = WriteBatch::default();
+                    if let Some(existing) = current_existing {
+                        if existing.storage_id == manifest.storage_id {
+                            return Err(MutationError::Storage(
+                                "pending upload storage identity collides with a sealed artifact"
+                                    .into(),
+                            ));
+                        }
+                        self.stage_artifact_delete(
+                            &mut batch,
+                            &staged.upload_id(),
+                            &upload_manifest,
+                        )?;
+                    } else {
+                        self.stage_uploaded_complete_manifest(
+                            &mut batch,
+                            &staged.upload_id(),
+                            reference,
+                            &manifest,
+                        )?;
                     }
-                    self.stage_artifact_delete(&mut batch, &staged.upload_id(), &upload_manifest)?;
-                } else {
-                    self.stage_uploaded_complete_manifest(
+                    batch.delete_cf(
+                        self.cf(CF_BLOB_GC_DUE)?,
+                        upload_gc_due_key(&staged.upload_id(), upload_updated_at),
+                    );
+                    let mut pending = PendingBlobReferences::new();
+                    let identity = blob_reference_key(reference);
+                    self.stage_blob_reference_update(
                         &mut batch,
-                        &staged.upload_id(),
-                        reference,
-                        &manifest,
+                        &mut pending,
+                        identity.clone(),
+                        state,
                     )?;
-                }
-                batch.delete_cf(
-                    self.cf(CF_BLOB_GC_DUE)?,
-                    upload_gc_due_key(&staged.upload_id(), upload_updated_at),
-                );
-                let mut pending = PendingBlobReferences::new();
-                let identity = blob_reference_key(reference);
-                self.stage_blob_reference_update(
-                    &mut batch,
-                    &mut pending,
-                    identity.clone(),
-                    state,
-                )?;
-                self.stage_local_changes_with_admission(
-                    &mut batch,
-                    &[PendingLocalChange::ContentLifecycleChanged {
-                        blob_identity: identity,
-                        revision: state.updated_at,
-                        reference_deltas: Vec::new(),
-                        accounting_transition: None,
-                    }],
-                    LocalReferenceEffects::NoReferenceEffects,
-                    admission,
-                )?;
-                let mut options = WriteOptions::default();
-                options.set_sync(self.sync_writes);
-                self.db.write_opt(batch, &options).map_err(storage_error)?;
-                self.notify_local_invalidations();
-                Ok(Some(()))
-            })();
-            drop(guard);
+                    let staged_change = self.stage_artifact_lifecycle_change_for_lane(
+                        &mut batch,
+                        identity,
+                        state.updated_at,
+                        admission,
+                        source,
+                        cursor,
+                    )?;
+                    Ok((batch, staged_change, Some(())))
+                })
+                .await;
             match result {
                 Ok(None) => continue,
                 Err(MutationError::SourceJournalCapacity)
@@ -538,70 +726,81 @@ impl Store {
         due: &BlobGcDueRecord,
         now_unix_millis: u64,
     ) -> Result<bool, MutationError> {
+        let _install_session = self.lock_artifact_install_session(&due.identity).await;
         if due.identity.len() == UPLOAD_IDENTITY_BYTES {
             return self.collect_pending_upload_due(due).await;
         }
-        {
-            let _commit_guard = self.lock_commit("blob_reference").await;
-            let Some(current) = self.read_blob_reference_state(&due.identity)? else {
-                self.delete_stale_blob_gc_due(&due.due_key)?;
-                return Ok(false);
-            };
-            if current.updated_at != due.updated_at || !blob_reference_needs_due(current) {
-                self.delete_stale_blob_gc_due(&due.due_key)?;
-                return Ok(false);
-            }
-            if !blob_reference_is_garbage(
-                current,
-                now_unix_millis,
-                self.awaiting_publish_ttl_millis,
-            ) {
-                return Ok(false);
-            }
+        let resource = if due.identity.len() == BLOB_REFERENCE_IDENTITY_BYTES {
+            let reference = blob_reference_from_key(&due.identity)?;
+            super::mutation_commit_lanes::blob_conflict_resource(&reference)
+        } else {
+            super::mutation_commit_lanes::artifact_conflict_resource(&due.identity)
+        };
+        self.commit_artifact_lifecycle_lane(
+            vec![resource],
+            SourceJournalAdmission::Bounded,
+            |source, cursor| {
+                let mut batch = WriteBatch::default();
+                let Some(current) = self.read_blob_reference_state(&due.identity)? else {
+                    batch.delete_cf(self.cf(CF_BLOB_GC_DUE)?, &due.due_key);
+                    return Ok((batch, None, false));
+                };
+                if current.updated_at != due.updated_at || !blob_reference_needs_due(current) {
+                    batch.delete_cf(self.cf(CF_BLOB_GC_DUE)?, &due.due_key);
+                    return Ok((batch, None, false));
+                }
+                if !blob_reference_is_garbage(
+                    current,
+                    now_unix_millis,
+                    self.awaiting_publish_ttl_millis,
+                ) {
+                    return Ok((batch, None, false));
+                }
 
-            let manifest = if due.identity.len() == BLOB_REFERENCE_IDENTITY_BYTES {
-                let reference = blob_reference_from_key(&due.identity)?;
-                self.read_complete_manifest(&reference)?
-            } else {
-                let identity = ShardIdentity::decode(&due.identity).map_err(storage_error)?;
-                self.read_shard_manifest(&identity)?
-            }
-            .or(self.read_artifact_install_manifest(&due.identity)?)
-            .ok_or_else(|| {
-                MutationError::Storage(
+                let manifest = if due.identity.len() == BLOB_REFERENCE_IDENTITY_BYTES {
+                    let reference = blob_reference_from_key(&due.identity)?;
+                    self.read_complete_manifest(&reference)?
+                } else {
+                    let identity = ShardIdentity::decode(&due.identity).map_err(storage_error)?;
+                    self.read_shard_manifest(&identity)?
+                }
+                .or(self.read_artifact_install_manifest(&due.identity)?)
+                .ok_or_else(|| {
+                    MutationError::Storage(
                     "payload lifecycle has neither a sealed manifest nor an installation record"
                         .into(),
                 )
-            })?;
-            let mut batch = WriteBatch::default();
-            self.stage_artifact_delete(&mut batch, &due.identity, &manifest)?;
-            self.stage_blob_reference_delete(&mut batch, &due.identity, current)?;
-            self.stage_local_changes(
-                &mut batch,
-                &[PendingLocalChange::ContentLifecycleChanged {
-                    blob_identity: due.identity.clone(),
-                    revision: now_unix_millis,
-                    reference_deltas: Vec::new(),
-                    accounting_transition: None,
-                }],
-                LocalReferenceEffects::NoReferenceEffects,
-            )?;
-            let mut options = WriteOptions::default();
-            options.set_sync(self.sync_writes);
-            self.db.write_opt(batch, &options).map_err(storage_error)?;
-            self.notify_local_invalidations();
-        }
-        Ok(true)
+                })?;
+                self.stage_artifact_delete(&mut batch, &due.identity, &manifest)?;
+                self.stage_blob_reference_delete(&mut batch, &due.identity, current)?;
+                let staged = self.stage_artifact_lifecycle_change_for_lane(
+                    &mut batch,
+                    due.identity.clone(),
+                    now_unix_millis,
+                    SourceJournalAdmission::Bounded,
+                    source,
+                    cursor,
+                )?;
+                Ok((batch, staged, true))
+            },
+        )
+        .await
     }
 
     async fn collect_pending_upload_due(
         &self,
         due: &BlobGcDueRecord,
     ) -> Result<bool, MutationError> {
-        let _commit_guard = self.lock_commit("payload_upload_gc").await;
+        let mut lane = self
+            .mutation_commit_lanes
+            .acquire([super::mutation_commit_lanes::artifact_conflict_resource(
+                &due.identity,
+            )])
+            .await;
         let Some((manifest, _, updated_at)) = self.read_artifact_install_state(&due.identity)?
         else {
             self.delete_stale_blob_gc_due(&due.due_key)?;
+            lane.release_physical_slot();
             return Ok(false);
         };
         if manifest.kind != ArtifactKind::Upload
@@ -622,6 +821,7 @@ impl Store {
             let mut options = WriteOptions::default();
             options.set_sync(self.sync_writes);
             self.db.write_opt(batch, &options).map_err(storage_error)?;
+            lane.release_physical_slot();
             return Ok(false);
         }
         let mut batch = WriteBatch::default();
@@ -630,6 +830,7 @@ impl Store {
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db.write_opt(batch, &options).map_err(storage_error)?;
+        lane.release_physical_slot();
         Ok(true)
     }
 
@@ -720,57 +921,39 @@ impl Store {
         now_unix_millis: u64,
         admission: SourceJournalAdmission,
     ) -> Result<u32, MutationError> {
-        loop {
-            let guard = self.lock_commit("payload_install").await;
-            let result = (|| {
-                let state = self
-                    .prepare_sealed_artifact_reservation(identity, now_unix_millis)?
-                    .ok_or_else(|| {
-                        MutationError::Storage("sealed lifecycle state is missing".into())
-                    })?;
-                let mut batch = WriteBatch::default();
-                let start = self.begin_artifact_install(
-                    &mut batch,
-                    identity,
-                    manifest.clone(),
-                    now_unix_millis,
-                )?;
-                let mut pending = PendingBlobReferences::new();
-                self.stage_blob_reference_update(
-                    &mut batch,
-                    &mut pending,
-                    identity.to_vec(),
-                    state,
-                )?;
-                self.stage_local_changes_with_admission(
-                    &mut batch,
-                    &[PendingLocalChange::ContentLifecycleChanged {
-                        blob_identity: identity.to_vec(),
-                        revision: state.updated_at,
-                        reference_deltas: Vec::new(),
-                        accounting_transition: None,
-                    }],
-                    LocalReferenceEffects::NoReferenceEffects,
-                    admission,
-                )?;
-                let mut options = WriteOptions::default();
-                options.set_sync(self.sync_writes);
-                self.db.write_opt(batch, &options).map_err(storage_error)?;
-                self.notify_local_invalidations();
-                Ok(start)
-            })();
-            drop(guard);
-            match result {
-                Err(MutationError::SourceJournalCapacity)
-                    if admission == SourceJournalAdmission::Bounded =>
-                {
-                    self.wait_for_mutation_capacity().await;
-                }
-                result => return result,
-            }
-        }
+        let identity = identity.to_vec();
+        let resources = vec![super::mutation_commit_lanes::artifact_conflict_resource(
+            &identity,
+        )];
+        self.commit_artifact_lifecycle_lane(resources, admission, |source, cursor| {
+            let state = self
+                .prepare_sealed_artifact_reservation(&identity, now_unix_millis)?
+                .ok_or_else(|| {
+                    MutationError::Storage("sealed lifecycle state is missing".into())
+                })?;
+            let mut batch = WriteBatch::default();
+            let start = self.begin_artifact_install(
+                &mut batch,
+                &identity,
+                manifest.clone(),
+                now_unix_millis,
+            )?;
+            let mut pending = PendingBlobReferences::new();
+            self.stage_blob_reference_update(&mut batch, &mut pending, identity.clone(), state)?;
+            let staged = self.stage_artifact_lifecycle_change_for_lane(
+                &mut batch,
+                identity.clone(),
+                state.updated_at,
+                admission,
+                source,
+                cursor,
+            )?;
+            Ok((batch, staged, start))
+        })
+        .await
     }
 
+    #[cfg(test)]
     fn reserve_sealed_artifact_with_admission(
         &self,
         key: &[u8],
@@ -832,21 +1015,30 @@ impl Store {
         now_unix_millis: u64,
         admission: SourceJournalAdmission,
     ) -> Result<(), MutationError> {
-        loop {
-            let guard = self.lock_commit("blob_reference").await;
-            let result = self
-                .reserve_sealed_artifact_with_admission(identity, now_unix_millis, admission)
-                .map(|_| ());
-            drop(guard);
-            match result {
-                Err(MutationError::SourceJournalCapacity)
-                    if admission == SourceJournalAdmission::Bounded =>
-                {
-                    self.wait_for_mutation_capacity().await;
-                }
-                result => return result,
-            }
-        }
+        let identity = identity.to_vec();
+        let resources = vec![super::mutation_commit_lanes::artifact_conflict_resource(
+            &identity,
+        )];
+        self.commit_artifact_lifecycle_lane(resources, admission, |source, cursor| {
+            let next = self
+                .prepare_sealed_artifact_reservation(&identity, now_unix_millis)?
+                .ok_or_else(|| {
+                    MutationError::Storage("sealed lifecycle state is missing".into())
+                })?;
+            let mut batch = WriteBatch::default();
+            let mut pending = PendingBlobReferences::new();
+            self.stage_blob_reference_update(&mut batch, &mut pending, identity.clone(), next)?;
+            let staged = self.stage_artifact_lifecycle_change_for_lane(
+                &mut batch,
+                identity.clone(),
+                next.updated_at,
+                admission,
+                source,
+                cursor,
+            )?;
+            Ok((batch, staged, ()))
+        })
+        .await
     }
 
     async fn persist_inline_payload_seal_with_admission(
@@ -856,60 +1048,36 @@ impl Store {
         now_unix_millis: u64,
         admission: SourceJournalAdmission,
     ) -> Result<(), MutationError> {
-        loop {
-            let guard = self.lock_commit("blob_reference").await;
-            let result =
-                self.persist_inline_payload_seal(reference, bytes, now_unix_millis, admission);
-            drop(guard);
-            match result {
-                Err(MutationError::SourceJournalCapacity)
-                    if admission == SourceJournalAdmission::Bounded =>
-                {
-                    self.wait_for_mutation_capacity().await;
-                }
-                result => return result,
-            }
-        }
-    }
-
-    fn persist_inline_payload_seal(
-        &self,
-        reference: &BlobRef,
-        bytes: &[u8],
-        now_unix_millis: u64,
-        admission: SourceJournalAdmission,
-    ) -> Result<(), MutationError> {
         validate_complete_artifact(reference, bytes)?;
-        let pending = BTreeSet::new();
-        let artifact_key = self.prepare_inline_payload_value(reference, bytes, &pending)?;
-        let state = self
-            .prepare_sealed_blob_reservation(reference, now_unix_millis)?
-            .ok_or_else(|| {
-                MutationError::Storage("inline payload reservation is missing".into())
-            })?;
         let key = blob_reference_key(reference);
-        let mut batch = WriteBatch::default();
-        if artifact_key.is_some() {
-            self.stage_inline_complete_artifact(&mut batch, reference, bytes)?;
-        }
-        let mut references = PendingBlobReferences::new();
-        self.stage_blob_reference_update(&mut batch, &mut references, key.clone(), state)?;
-        self.stage_local_changes_with_admission(
-            &mut batch,
-            &[PendingLocalChange::ContentLifecycleChanged {
-                blob_identity: key,
-                revision: state.updated_at,
-                reference_deltas: Vec::new(),
-                accounting_transition: None,
-            }],
-            LocalReferenceEffects::NoReferenceEffects,
-            admission,
-        )?;
-        let mut options = WriteOptions::default();
-        options.set_sync(self.sync_writes);
-        self.db.write_opt(batch, &options).map_err(storage_error)?;
-        self.notify_local_invalidations();
-        Ok(())
+        let resources = vec![super::mutation_commit_lanes::blob_conflict_resource(
+            reference,
+        )];
+        self.commit_artifact_lifecycle_lane(resources, admission, |source, cursor| {
+            let pending = BTreeSet::new();
+            let artifact_key = self.prepare_inline_payload_value(reference, bytes, &pending)?;
+            let state = self
+                .prepare_sealed_blob_reservation(reference, now_unix_millis)?
+                .ok_or_else(|| {
+                    MutationError::Storage("inline payload reservation is missing".into())
+                })?;
+            let mut batch = WriteBatch::default();
+            if artifact_key.is_some() {
+                self.stage_inline_complete_artifact(&mut batch, reference, bytes)?;
+            }
+            let mut references = PendingBlobReferences::new();
+            self.stage_blob_reference_update(&mut batch, &mut references, key.clone(), state)?;
+            let staged = self.stage_artifact_lifecycle_change_for_lane(
+                &mut batch,
+                key.clone(),
+                state.updated_at,
+                admission,
+                source,
+                cursor,
+            )?;
+            Ok((batch, staged, ()))
+        })
+        .await
     }
 
     pub(crate) fn prepare_blob_reference_publication(

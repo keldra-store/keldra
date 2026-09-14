@@ -34,9 +34,12 @@ use crate::{
     PutRequest, ReferenceDelta, SMALL_BLOB_MAX_BYTES, StorageTenantId, Version, VersionClock,
     VersionId,
 };
-use memory::METADATA_BLOCK_CACHE_BYTES;
 #[cfg(test)]
-use memory::{METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES, METADATA_WRITE_BUFFER_MANAGER_BYTES};
+use memory::{
+    METADATA_BLOCK_CACHE_BYTES, METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES,
+    METADATA_WRITE_BUFFER_MANAGER_BYTES,
+};
+pub use options::{RocksDbResourceBudget, StoreOptions};
 use options::{validate_authoritative_roots, wal_directory_bytes};
 use payload_artifacts::{
     complete_identity as blob_reference_key, complete_inline_key as complete_artifact_key,
@@ -135,6 +138,11 @@ pub const DEFAULT_MUTATION_RECEIPT_MAX_ENTRIES: u64 = 2_000_000;
 pub const DEFAULT_MUTATION_RECEIPT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_AWAITING_PUBLISH_TTL_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_MAX_TOTAL_WAL_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+pub const DEFAULT_ROCKSDB_BLOCK_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES: u64 = 128 * 1024 * 1024;
+pub const DEFAULT_ROCKSDB_COLUMN_FAMILY_WRITE_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_ROCKSDB_BACKGROUND_JOBS: u32 = 4;
+pub const DEFAULT_ROCKSDB_SUBCOMPACTIONS: u32 = 2;
 pub const PAYLOAD_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum item count in one trusted derived-progress inline staging commit.
 #[doc(hidden)]
@@ -173,6 +181,8 @@ pub(crate) const COLUMN_FAMILIES: &[&str] = &[
 struct MetadataMemoryResources {
     block_cache: Cache,
     write_buffer_manager: WriteBufferManager,
+    block_cache_capacity_bytes: u64,
+    column_family_write_buffer_bytes: usize,
 }
 
 /// Point-in-time resource and backpressure signals from the metadata database.
@@ -368,31 +378,6 @@ impl PendingLocalChange {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct StoreOptions {
-    /// Root from which default authoritative paths are derived.
-    pub root: PathBuf,
-    /// RocksDB directory containing the metadata column families and SSTs.
-    pub metadata_directory: PathBuf,
-    /// RocksDB directory containing the metadata write-ahead log.
-    pub metadata_wal_directory: PathBuf,
-    /// RocksDB column-family path containing integrated payload SST/blob files.
-    pub payload_directory: PathBuf,
-    /// Aggregate hard capacity admitted across active unfinished uploads.
-    pub pending_upload_max_bytes: u64,
-    /// Shared RocksDB WAL flush/admission high-water target.
-    pub max_total_wal_bytes: u64,
-    pub node_id: u16,
-    pub sync_writes: bool,
-    pub watch_retention: WatchRetention,
-    pub mutation_receipt_retention: MutationReceiptRetention,
-    pub single_node_group_commit: SingleNodeGroupCommitConfig,
-    /// Blob inactivity grace. The production server requires this to cover
-    /// its fixed 24-hour atomic-replay window; short values are only useful to
-    /// embedded callers such as focused garbage-collection tests.
-    pub awaiting_publish_ttl_seconds: u64,
-}
-
 #[derive(Clone)]
 pub struct Store {
     pub(crate) db: Arc<DB>,
@@ -418,7 +403,12 @@ pub struct Store {
         Arc<std::sync::Mutex<crate::authz::CompiledAuthorizationCache>>,
     pub(crate) bucket_options_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) definition_state_lock: Arc<std::sync::Mutex<()>>,
-    index_projection_state_lock: Arc<std::sync::Mutex<()>>,
+    index_projection_state_locks:
+        Arc<std::sync::Mutex<BTreeMap<Vec<u8>, std::sync::Weak<std::sync::Mutex<()>>>>>,
+    // Coordinates one resumable multi-write install per immutable identity.
+    // RocksDB install records remain authoritative across restart.
+    artifact_install_session_locks:
+        Arc<std::sync::Mutex<BTreeMap<Vec<u8>, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     pub(crate) node_id: u16,
     pub(crate) sync_writes: bool,
     pub(crate) watch_retention: WatchRetention,
@@ -651,7 +641,7 @@ impl Store {
     /// memory resources.
     pub fn metadata_runtime_metrics(&self) -> MetadataRuntimeMetrics {
         let mut metrics = MetadataRuntimeMetrics {
-            block_cache_capacity_bytes: METADATA_BLOCK_CACHE_BYTES as u64,
+            block_cache_capacity_bytes: self._metadata_memory.block_cache_capacity_bytes,
             block_cache_usage_bytes: self._metadata_memory.block_cache.get_usage() as u64,
             block_cache_pinned_bytes: self._metadata_memory.block_cache.get_pinned_usage() as u64,
             write_buffer_capacity_bytes: self
@@ -939,11 +929,20 @@ impl Store {
                     options.payload_directory.display()
                 )
             })?;
+        let rocksdb_resources = options
+            .rocksdb_resources
+            .validate()
+            .map_err(anyhow::Error::new)?;
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
         db_options.set_wal_dir(&options.metadata_wal_directory);
         db_options.set_max_total_wal_size(options.max_total_wal_bytes);
+        db_options.set_max_background_jobs(
+            i32::try_from(rocksdb_resources.background_jobs)
+                .expect("validated RocksDB background jobs fit i32"),
+        );
+        db_options.set_max_subcompactions(rocksdb_resources.subcompactions);
         if existing_database {
             let actual = DB::list_cf(&db_options, &options.metadata_directory)
                 .context("list existing Keldra column families")?
@@ -956,7 +955,7 @@ impl Store {
                 anyhow::bail!("existing Keldra volume does not use the current storage layout");
             }
         }
-        let metadata_memory = Arc::new(MetadataMemoryResources::new());
+        let metadata_memory = Arc::new(MetadataMemoryResources::new(rocksdb_resources));
         let descriptors = std::iter::once(DEFAULT_COLUMN_FAMILY_NAME)
             .chain(COLUMN_FAMILIES.iter().copied())
             .map(|name| {
@@ -1055,7 +1054,8 @@ impl Store {
             )),
             bucket_options_lock: Arc::new(std::sync::Mutex::new(())),
             definition_state_lock: Arc::new(std::sync::Mutex::new(())),
-            index_projection_state_lock: Arc::new(std::sync::Mutex::new(())),
+            index_projection_state_locks: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            artifact_install_session_locks: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             node_id: options.node_id,
             sync_writes: options.sync_writes,
             watch_retention: options.watch_retention,
@@ -1095,6 +1095,11 @@ impl Store {
             storage.wal_root = %options.metadata_wal_directory.display(),
             storage.payload_root = %options.payload_directory.display(),
             storage.max_total_wal_bytes = options.max_total_wal_bytes,
+            storage.rocksdb_block_cache_bytes = rocksdb_resources.block_cache_bytes,
+            storage.rocksdb_write_buffer_manager_bytes = rocksdb_resources.write_buffer_manager_bytes,
+            storage.rocksdb_column_family_write_buffer_bytes = rocksdb_resources.column_family_write_buffer_bytes,
+            storage.rocksdb_background_jobs = rocksdb_resources.background_jobs,
+            storage.rocksdb_subcompactions = rocksdb_resources.subcompactions,
             storage.pending_upload_max_bytes = options.pending_upload_max_bytes,
             storage.payload_chunk_bytes = PAYLOAD_ARTIFACT_CHUNK_BYTES,
             storage.payload_blob_min_bytes = PAYLOAD_BLOB_MIN_BYTES,

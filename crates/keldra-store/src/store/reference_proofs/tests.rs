@@ -5,8 +5,8 @@ use crate::watch::{REFERENCE_PROOF_KEY_BYTES, offset_from_key};
 use crate::{
     BatchOperation, DestinationReferenceArtifact, DestinationReferenceDelta, Durability,
     OBJECT_ALIAS_REGISTRY_FORMAT, OBJECT_MUTATION_FORMAT, ObjectAliasRegistry, ObjectAliasSnapshot,
-    ObjectMutationContext, PlacementLogId, PutMode, PutRequest, ReferenceDeltaBatch,
-    ReplicaObjectMutationApplied, StoreOptions, VersionId,
+    ObjectMutationContext, PlacementLogId, PublishRequest, PutMode, PutRequest,
+    ReferenceDeltaBatch, ReplicaObjectMutationApplied, StoreOptions, VersionId,
 };
 
 use super::*;
@@ -236,10 +236,18 @@ fn wal_put_batches_since(store: &Store, sequence: u64) -> Vec<WalPuts> {
 async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
     let (_temporary, source, replica) = stores().await;
     source.resolve_bucket_identity("tenant", "bucket").unwrap();
+    let payload = source.stage_blob(b"proof payload").await.unwrap();
     let source_sequence = source.db.latest_sequence_number();
     let coordinated = source
         .coordinate_object_mutation(
-            BatchOperation::Put(put("atomic", "atomic-source")),
+            BatchOperation::Publish(PublishRequest {
+                key: key("atomic"),
+                blob: payload,
+                content_type: Some("application/octet-stream".into()),
+                mode: PutMode::PutIfAbsent,
+                command_id: Some("atomic-source".into()),
+                durability: Durability::Local,
+            }),
             context(),
         )
         .await
@@ -284,7 +292,20 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
         .find(|puts| {
             puts.contains(&head_key) && puts.contains(&proof_key) && puts.contains(&journal_key)
         })
-        .expect("source metadata and proof share one batch");
+        .unwrap_or_else(|| {
+            panic!(
+                "source metadata, proof, and journal record do not share one batch: {:?}",
+                source_batches
+                    .iter()
+                    .map(|puts| (
+                        puts.contains(&head_key),
+                        puts.contains(&proof_key),
+                        puts.contains(&journal_key),
+                        puts.contains(LOCAL_INVALIDATION_STATUS_KEY),
+                    ))
+                    .collect::<Vec<_>>()
+            )
+        });
     let mutation_status = decode_watch_journal_status(
         mutation.stamp.source_id,
         mutation_batch
@@ -293,10 +314,7 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
     )
     .unwrap();
     assert_eq!(mutation_status.tail, mutation.stamp.source_journal_position);
-    assert_eq!(
-        mutation_status.settled_through.checked_add(1),
-        Some(mutation.stamp.source_journal_position)
-    );
+    assert!(mutation_status.settled_through < mutation.stamp.source_journal_position);
     let final_source_status = source.local_watch_status().unwrap();
     assert_eq!(final_source_status, mutation_status);
 

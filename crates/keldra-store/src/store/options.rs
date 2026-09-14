@@ -1,6 +1,77 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::*;
+
+/// Bounded RocksDB-native resources owned by one [`Store`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RocksDbResourceBudget {
+    pub block_cache_bytes: u64,
+    pub write_buffer_manager_bytes: u64,
+    pub column_family_write_buffer_bytes: u64,
+    pub background_jobs: u32,
+    pub subcompactions: u32,
+}
+
+impl RocksDbResourceBudget {
+    pub fn validate(self) -> Result<Self, MutationError> {
+        if self.block_cache_bytes == 0
+            || self.write_buffer_manager_bytes == 0
+            || self.column_family_write_buffer_bytes == 0
+            || self.background_jobs == 0
+            || self.subcompactions == 0
+            || self.column_family_write_buffer_bytes > self.write_buffer_manager_bytes
+            || self.subcompactions > self.background_jobs
+            || usize::try_from(self.block_cache_bytes).is_err()
+            || usize::try_from(self.write_buffer_manager_bytes).is_err()
+            || usize::try_from(self.column_family_write_buffer_bytes).is_err()
+            || i32::try_from(self.background_jobs).is_err()
+        {
+            return Err(MutationError::Storage(
+                "RocksDB resource budget is invalid".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+impl Default for RocksDbResourceBudget {
+    fn default() -> Self {
+        Self {
+            block_cache_bytes: DEFAULT_ROCKSDB_BLOCK_CACHE_BYTES,
+            write_buffer_manager_bytes: DEFAULT_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES,
+            column_family_write_buffer_bytes: DEFAULT_ROCKSDB_COLUMN_FAMILY_WRITE_BUFFER_BYTES,
+            background_jobs: DEFAULT_ROCKSDB_BACKGROUND_JOBS,
+            subcompactions: DEFAULT_ROCKSDB_SUBCOMPACTIONS,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StoreOptions {
+    /// Root from which default authoritative paths are derived.
+    pub root: PathBuf,
+    /// RocksDB directory containing the metadata column families and SSTs.
+    pub metadata_directory: PathBuf,
+    /// RocksDB directory containing the metadata write-ahead log.
+    pub metadata_wal_directory: PathBuf,
+    /// RocksDB column-family path containing integrated payload SST/blob files.
+    pub payload_directory: PathBuf,
+    /// Aggregate hard capacity admitted across active unfinished uploads.
+    pub pending_upload_max_bytes: u64,
+    /// Shared RocksDB WAL flush/admission high-water target.
+    pub max_total_wal_bytes: u64,
+    /// Explicit native cache, memtable, and background-work allocation.
+    pub rocksdb_resources: RocksDbResourceBudget,
+    pub node_id: u16,
+    pub sync_writes: bool,
+    pub watch_retention: WatchRetention,
+    pub mutation_receipt_retention: MutationReceiptRetention,
+    pub single_node_group_commit: SingleNodeGroupCommitConfig,
+    /// Blob inactivity grace. The production server requires this to cover
+    /// its fixed 24-hour atomic-replay window; short values are only useful to
+    /// embedded callers such as focused garbage-collection tests.
+    pub awaiting_publish_ttl_seconds: u64,
+}
 
 pub(super) fn wal_directory_bytes(directory: &Path) -> std::io::Result<u64> {
     let mut total = 0_u64;
@@ -36,6 +107,7 @@ impl StoreOptions {
             payload_directory: root.join("blobs"),
             pending_upload_max_bytes: crate::blob::DEFAULT_PENDING_UPLOAD_MAX_BYTES,
             max_total_wal_bytes: DEFAULT_MAX_TOTAL_WAL_BYTES,
+            rocksdb_resources: RocksDbResourceBudget::default(),
             root,
             node_id,
             sync_writes: true,
@@ -68,6 +140,11 @@ impl StoreOptions {
 
     pub fn with_max_total_wal_bytes(mut self, max_total_wal_bytes: u64) -> Self {
         self.max_total_wal_bytes = max_total_wal_bytes;
+        self
+    }
+
+    pub fn with_rocksdb_resources(mut self, resources: RocksDbResourceBudget) -> Self {
+        self.rocksdb_resources = resources;
         self
     }
 

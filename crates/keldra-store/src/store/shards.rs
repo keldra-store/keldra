@@ -180,6 +180,8 @@ impl Store {
         admission: SourceJournalAdmission,
     ) -> Result<ShardSealOutcome, ShardStoreError> {
         identity.validate_for(codec)?;
+        let install_identity = identity.encode();
+        let _install_session = self.lock_artifact_install_session(&install_identity).await;
         let Some((manifest, start)) = self
             .prepare_shard_install(codec, identity, admission)
             .await?
@@ -259,6 +261,8 @@ impl Store {
         admission: SourceJournalAdmission,
     ) -> Result<ShardSealOutcome, ShardStoreError> {
         identity.validate_for(codec)?;
+        let install_identity = identity.encode();
+        let _install_session = self.lock_artifact_install_session(&install_identity).await;
         let Some((manifest, start)) = self
             .prepare_shard_install(codec, identity, admission)
             .await?
@@ -300,6 +304,27 @@ impl Store {
         self.finish_shard_install(codec, identity, &manifest)
             .await?;
         Ok(ShardSealOutcome::Created)
+    }
+
+    pub(super) async fn lock_artifact_install_session(
+        &self,
+        identity: &[u8],
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .artifact_install_session_locks
+                .lock()
+                .expect("artifact install session lock registry is not poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(identity).and_then(std::sync::Weak::upgrade) {
+                lock
+            } else {
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(identity.to_vec(), std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
     }
 
     async fn prepare_shard_install(
@@ -348,16 +373,25 @@ impl Store {
         ordinal: u32,
         bytes: &[u8],
     ) -> Result<(), ShardStoreError> {
-        let _guard = self.lock_commit("shard_install").await;
-        self.advance_artifact_install(
-            &identity.encode(),
-            manifest,
-            ordinal,
-            bytes,
-            now_unix_millis().map_err(shard_error)?,
-            None,
-        )
-        .map_err(shard_error)
+        let encoded_identity = identity.encode();
+        let mut lane = self
+            .mutation_commit_lanes
+            .acquire([super::mutation_commit_lanes::artifact_conflict_resource(
+                &encoded_identity,
+            )])
+            .await;
+        let result = self
+            .advance_artifact_install(
+                &encoded_identity,
+                manifest,
+                ordinal,
+                bytes,
+                now_unix_millis().map_err(shard_error)?,
+                None,
+            )
+            .map_err(shard_error);
+        lane.release_physical_slot();
+        result
     }
 
     async fn finish_shard_install(
@@ -370,11 +404,17 @@ impl Store {
         if let Err(error) =
             codec.validate_shard(identity.blob(), identity.ordinal(), &mut validation)
         {
-            let _guard = self.lock_commit("shard_install").await;
+            let encoded_identity = identity.encode();
+            let mut lane = self
+                .mutation_commit_lanes
+                .acquire([super::mutation_commit_lanes::artifact_conflict_resource(
+                    &encoded_identity,
+                )])
+                .await;
             let mut batch = WriteBatch::default();
             self.reset_artifact_install(
                 &mut batch,
-                &identity.encode(),
+                &encoded_identity,
                 manifest,
                 now_unix_millis().map_err(shard_error)?,
             )
@@ -384,17 +424,27 @@ impl Store {
             self.db
                 .write_opt(batch, &options)
                 .map_err(shard_storage_error)?;
+            lane.release_physical_slot();
             return Err(error.into());
         }
-        let _guard = self.lock_commit("shard_install").await;
+        let encoded_identity = identity.encode();
+        let mut lane = self
+            .mutation_commit_lanes
+            .acquire([super::mutation_commit_lanes::artifact_conflict_resource(
+                &encoded_identity,
+            )])
+            .await;
         let mut batch = WriteBatch::default();
-        self.finish_artifact_install(&mut batch, &identity.encode(), manifest)
+        self.finish_artifact_install(&mut batch, &encoded_identity, manifest)
             .map_err(shard_error)?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
-        self.db
+        let result = self
+            .db
             .write_opt(batch, &options)
-            .map_err(shard_storage_error)
+            .map_err(shard_storage_error);
+        lane.release_physical_slot();
+        result
     }
 
     /// Validates the complete persisted shard identity and every inline CRC.
@@ -463,29 +513,35 @@ impl Store {
     /// Placement and reference-delta callers decide when removal is safe; this
     /// byte-plane primitive deliberately has no cluster policy.
     pub async fn remove_shard(&self, identity: &ShardIdentity) -> Result<bool, ShardStoreError> {
-        let had_state = {
-            let _commit_guard = self.lock_commit("shard_state").await;
-            let key = identity.encode();
-            let state = self.read_blob_reference_state(&key).map_err(shard_error)?;
-            let had_state = state.is_some();
-            let manifest = self.read_shard_manifest(identity).map_err(shard_error)?;
+        let key = identity.encode();
+        let _install_session = self.lock_artifact_install_session(&key).await;
+        let mut lane = self
+            .mutation_commit_lanes
+            .acquire([super::mutation_commit_lanes::artifact_conflict_resource(
+                &key,
+            )])
+            .await;
+        let state = self.read_blob_reference_state(&key).map_err(shard_error)?;
+        let had_state = state.is_some();
+        let manifest = self.read_shard_manifest(identity).map_err(shard_error)?;
+        if state.is_some() || manifest.is_some() {
+            let mut batch = WriteBatch::default();
+            if let Some(manifest) = manifest.as_ref() {
+                self.stage_artifact_delete(&mut batch, &key, manifest)
+                    .map_err(shard_error)?;
+            }
             if let Some(state) = state {
-                let mut batch = WriteBatch::default();
-                if let Some(manifest) = manifest.as_ref() {
-                    self.stage_artifact_delete(&mut batch, &key, manifest)
-                        .map_err(shard_error)?;
-                }
                 self.stage_blob_reference_delete(&mut batch, &key, state)
                     .map_err(shard_error)?;
-                let mut options = WriteOptions::default();
-                options.set_sync(self.sync_writes);
-                self.db
-                    .write_opt(batch, &options)
-                    .map_err(shard_storage_error)?;
             }
-            had_state || manifest.is_some()
-        };
-        Ok(had_state)
+            let mut options = WriteOptions::default();
+            options.set_sync(self.sync_writes);
+            self.db
+                .write_opt(batch, &options)
+                .map_err(shard_storage_error)?;
+        }
+        lane.release_physical_slot();
+        Ok(had_state || manifest.is_some())
     }
 }
 
@@ -617,6 +673,76 @@ mod tests {
                 .unwrap(),
             ShardSealOutcome::AlreadyPresent
         );
+        assert_eq!(
+            store
+                .shard_reference_state(&identity)
+                .unwrap()
+                .unwrap()
+                .ref_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_install_bypasses_the_legacy_commit_mutex() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = open_store(temporary.path()).await;
+        let source = vec![0x6f; SMALL_BLOB_MAX_BYTES + 17];
+        let (codec, reference, shards) = encoded_shards(&source);
+        let identity = ShardIdentity::new(reference, 0);
+        let legacy_mutex = store.commit_lock.lock().await;
+        let writer = store.clone();
+        let sealing_identity = identity.clone();
+        let shard = shards[0].clone();
+        let sealing = tokio::spawn(async move {
+            writer
+                .seal_shard(&codec, &sealing_identity, Cursor::new(shard))
+                .await
+        });
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), sealing)
+            .await
+            .expect("shard install bypasses the legacy commit mutex")
+            .unwrap()
+            .unwrap();
+        drop(legacy_mutex);
+
+        assert_eq!(outcome, ShardSealOutcome::Created);
+        assert!(store.contains_shard_artifact(&identity).unwrap());
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_shard_install_has_one_creator_and_one_idempotent_replay() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = open_store(temporary.path()).await;
+        let source = vec![0x70; SMALL_BLOB_MAX_BYTES + 17];
+        let (codec, reference, shards) = encoded_shards(&source);
+        let identity = ShardIdentity::new(reference, 0);
+        let first_store = store.clone();
+        let first_codec = ErasureCodec::new(codec.profile()).unwrap();
+        let first_identity = identity.clone();
+        let first_shard = shards[0].clone();
+        let first = tokio::spawn(async move {
+            first_store
+                .seal_shard(&first_codec, &first_identity, Cursor::new(first_shard))
+                .await
+        });
+        let second_store = store.clone();
+        let second_identity = identity.clone();
+        let second_shard = shards[0].clone();
+        let second = tokio::spawn(async move {
+            second_store
+                .seal_shard(&codec, &second_identity, Cursor::new(second_shard))
+                .await
+        });
+
+        let outcomes = [
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
+        ];
+        assert!(outcomes.contains(&ShardSealOutcome::Created));
+        assert!(outcomes.contains(&ShardSealOutcome::AlreadyPresent));
+        assert!(store.contains_shard_artifact(&identity).unwrap());
         assert_eq!(
             store
                 .shard_reference_state(&identity)
@@ -824,6 +950,33 @@ mod tests {
             store.get_shard(&codec, &identity),
             Err(ShardStoreError::NotFound)
         ));
+        assert!(!store.remove_shard(&identity).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn removal_clears_an_orphan_manifest_instead_of_only_reporting_success() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = open_store(temporary.path()).await;
+        let source = vec![0x2d; SMALL_BLOB_MAX_BYTES + 9];
+        let (codec, reference, shards) = encoded_shards(&source);
+        let identity = ShardIdentity::new(reference, 2);
+        store
+            .seal_shard(&codec, &identity, Cursor::new(&shards[2]))
+            .await
+            .unwrap();
+
+        let key = identity.encode();
+        let state = store.shard_reference_state(&identity).unwrap().unwrap();
+        let mut batch = WriteBatch::default();
+        store
+            .stage_blob_reference_delete(&mut batch, &key, state)
+            .unwrap();
+        store.db.write(batch).unwrap();
+        assert!(store.shard_reference_state(&identity).unwrap().is_none());
+        assert!(store.contains_shard_artifact(&identity).unwrap());
+
+        assert!(store.remove_shard(&identity).await.unwrap());
+        assert!(!store.contains_shard_artifact(&identity).unwrap());
         assert!(!store.remove_shard(&identity).await.unwrap());
     }
 

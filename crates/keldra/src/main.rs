@@ -266,6 +266,46 @@ struct Arguments {
     )]
     max_total_wal_bytes: u64,
 
+    /// RocksDB shared block/blob-cache budget across every column family.
+    #[arg(
+        long,
+        env = "KELDRA_ROCKSDB_BLOCK_CACHE_BYTES",
+        default_value_t = keldra_store::DEFAULT_ROCKSDB_BLOCK_CACHE_BYTES
+    )]
+    rocksdb_block_cache_bytes: u64,
+
+    /// RocksDB aggregate write-buffer budget across every column family.
+    #[arg(
+        long,
+        env = "KELDRA_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES",
+        default_value_t = keldra_store::DEFAULT_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES
+    )]
+    rocksdb_write_buffer_manager_bytes: u64,
+
+    /// Target RocksDB memtable size per active column family.
+    #[arg(
+        long,
+        env = "KELDRA_ROCKSDB_COLUMN_FAMILY_WRITE_BUFFER_BYTES",
+        default_value_t = keldra_store::DEFAULT_ROCKSDB_COLUMN_FAMILY_WRITE_BUFFER_BYTES
+    )]
+    rocksdb_column_family_write_buffer_bytes: u64,
+
+    /// Maximum RocksDB background flush and compaction jobs.
+    #[arg(
+        long,
+        env = "KELDRA_ROCKSDB_BACKGROUND_JOBS",
+        default_value_t = keldra_store::DEFAULT_ROCKSDB_BACKGROUND_JOBS
+    )]
+    rocksdb_background_jobs: u32,
+
+    /// Maximum RocksDB subcompactions within one compaction job.
+    #[arg(
+        long,
+        env = "KELDRA_ROCKSDB_SUBCOMPACTIONS",
+        default_value_t = keldra_store::DEFAULT_ROCKSDB_SUBCOMPACTIONS
+    )]
+    rocksdb_subcompactions: u32,
+
     #[arg(
         long,
         env = "KELDRA_ERASURE_DATA_SHARDS",
@@ -571,6 +611,13 @@ async fn main() -> Result<()> {
         plugin_gateway,
         max_blob_bytes: arguments.max_blob_bytes,
         max_total_wal_bytes: arguments.max_total_wal_bytes,
+        rocksdb_resources: keldra_store::RocksDbResourceBudget {
+            block_cache_bytes: arguments.rocksdb_block_cache_bytes,
+            write_buffer_manager_bytes: arguments.rocksdb_write_buffer_manager_bytes,
+            column_family_write_buffer_bytes: arguments.rocksdb_column_family_write_buffer_bytes,
+            background_jobs: arguments.rocksdb_background_jobs,
+            subcompactions: arguments.rocksdb_subcompactions,
+        },
         erasure_profile,
         awaiting_publish_ttl_seconds: arguments.awaiting_publish_ttl_seconds,
         mutation_receipt_retention_seconds: arguments.mutation_receipt_retention_seconds,

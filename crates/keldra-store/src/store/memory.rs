@@ -3,19 +3,33 @@ use std::path::Path;
 use super::*;
 
 // One cache and write-buffer manager are shared across every column family.
-pub(super) const METADATA_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
-pub(super) const METADATA_WRITE_BUFFER_MANAGER_BYTES: usize = 128 * 1024 * 1024;
-pub(super) const METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(test)]
+pub(super) const METADATA_BLOCK_CACHE_BYTES: usize = DEFAULT_ROCKSDB_BLOCK_CACHE_BYTES as usize;
+#[cfg(test)]
+pub(super) const METADATA_WRITE_BUFFER_MANAGER_BYTES: usize =
+    DEFAULT_ROCKSDB_WRITE_BUFFER_MANAGER_BYTES as usize;
+#[cfg(test)]
+pub(super) const METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES: usize =
+    DEFAULT_ROCKSDB_COLUMN_FAMILY_WRITE_BUFFER_BYTES as usize;
 const PAYLOAD_BLOB_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 impl MetadataMemoryResources {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(resources: RocksDbResourceBudget) -> Self {
+        let block_cache_bytes = usize::try_from(resources.block_cache_bytes)
+            .expect("validated RocksDB block cache fits usize");
+        let write_buffer_manager_bytes = usize::try_from(resources.write_buffer_manager_bytes)
+            .expect("validated RocksDB write buffer manager fits usize");
+        let column_family_write_buffer_bytes =
+            usize::try_from(resources.column_family_write_buffer_bytes)
+                .expect("validated RocksDB column-family write buffer fits usize");
         Self {
-            block_cache: Cache::new_lru_cache(METADATA_BLOCK_CACHE_BYTES),
+            block_cache: Cache::new_lru_cache(block_cache_bytes),
             write_buffer_manager: WriteBufferManager::new_write_buffer_manager(
-                METADATA_WRITE_BUFFER_MANAGER_BYTES,
+                write_buffer_manager_bytes,
                 true,
             ),
+            block_cache_capacity_bytes: resources.block_cache_bytes,
+            column_family_write_buffer_bytes,
         }
     }
 
@@ -26,7 +40,7 @@ impl MetadataMemoryResources {
         let mut options = Options::default();
         options.set_block_based_table_factory(&table);
         options.set_write_buffer_manager(&self.write_buffer_manager);
-        options.set_write_buffer_size(METADATA_COLUMN_FAMILY_WRITE_BUFFER_BYTES);
+        options.set_write_buffer_size(self.column_family_write_buffer_bytes);
         options
     }
 

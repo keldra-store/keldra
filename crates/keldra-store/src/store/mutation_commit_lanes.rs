@@ -26,7 +26,7 @@ use crate::{LocalChange, MutationError, VersionId, WatchJournalStatus};
 pub(super) const LANE_FRONTIER_KEY: &[u8] = b"mutation_lane_frontier_current_v1";
 pub(super) const LANE_COMPLETION_PREFIX: &[u8] = b"mutation_lane_completion_v1/";
 const LANE_COMPLETION_FORMAT: u8 = 1;
-const LANE_COMPLETION_BYTES: usize = 1 + 8 * 7 + 1 + 8;
+const LANE_COMPLETION_BYTES: usize = 1 + 8 * 7 + 1 + 8 + 3;
 
 #[derive(Clone)]
 pub(super) struct MutationCommitLanes {
@@ -44,11 +44,13 @@ pub(super) struct MutationCommitLanes {
     #[cfg(test)]
     fail_next_projection: Arc<AtomicBool>,
     #[cfg(test)]
-    pause_next_projection: Arc<AtomicBool>,
+    fail_next_completion_disambiguation: Arc<AtomicBool>,
     #[cfg(test)]
-    projection_write_completed: Arc<Semaphore>,
+    pub(super) pause_next_projection: Arc<AtomicBool>,
     #[cfg(test)]
-    projection_publish_continue: Arc<Semaphore>,
+    pub(super) projection_write_completed: Arc<Semaphore>,
+    #[cfg(test)]
+    pub(super) projection_publish_continue: Arc<Semaphore>,
     #[cfg(test)]
     pause_next_evaluation: Arc<AtomicBool>,
     #[cfg(test)]
@@ -158,6 +160,7 @@ struct LaneProjectionPlan {
     completions: Vec<(u64, LaneCompletionState)>,
     batch: WriteBatch,
     requires_sync: bool,
+    inline_reference_safe_through: Option<u64>,
 }
 
 enum ExclusiveFence<'a> {
@@ -186,6 +189,9 @@ pub(super) struct LaneCompletion {
     pub(super) receipt_entries: u64,
     pub(super) receipt_bytes: u64,
     pub(super) high_version: Option<VersionId>,
+    pub(super) reference_cursor_advanced: bool,
+    pub(super) inline_reference_safe: bool,
+    pub(super) visibility_settled: bool,
 }
 
 #[derive(Clone)]
@@ -222,6 +228,8 @@ impl MutationCommitLanes {
             authorities_stale: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_projection: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_completion_disambiguation: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             pause_next_projection: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -412,6 +420,18 @@ impl LaneRuntime {
         receipts: MutationReceiptStatus,
         high_version: Option<VersionId>,
     ) -> Result<LaneCompletion, MutationError> {
+        self.reserve_with_reference_settlement(watch, receipts, high_version, true, true, true)
+    }
+
+    pub(super) fn reserve_with_reference_settlement(
+        &mut self,
+        watch: WatchJournalStatus,
+        receipts: MutationReceiptStatus,
+        high_version: Option<VersionId>,
+        reference_cursor_advanced: bool,
+        inline_reference_safe: bool,
+        visibility_settled: bool,
+    ) -> Result<LaneCompletion, MutationError> {
         let ticket = self
             .next_ticket
             .checked_add(1)
@@ -449,6 +469,9 @@ impl LaneRuntime {
             receipt_entries,
             receipt_bytes,
             high_version,
+            reference_cursor_advanced,
+            inline_reference_safe,
+            visibility_settled,
         };
         completion.validate().map_err(MutationError::Storage)?;
         self.next_ticket = ticket;
@@ -682,6 +705,70 @@ impl Store {
         }
     }
 
+    /// Settles a reserved ticket in an independently owned task.
+    ///
+    /// Once the primary batch has run, dropping the request future must not
+    /// cancel settlement and leave a permanent hole in the ordered frontier.
+    /// A failed ambiguity read is retried because only the atomically persisted
+    /// completion record can distinguish a committed batch from an abandoned
+    /// reservation without weakening mutation correctness.
+    pub(super) async fn finish_lane_commit_cancellation_safe(
+        &self,
+        completion: LaneCompletion,
+        primary_write_succeeded: bool,
+    ) -> Result<LaneSettlementMetrics, MutationError> {
+        let store = self.clone();
+        tokio::spawn(async move {
+            let committed = if primary_write_succeeded {
+                true
+            } else {
+                let mut read_failures = 0_u64;
+                loop {
+                    match store.persisted_lane_completion_exists(completion) {
+                        Ok(committed) => break committed,
+                        Err(error) => {
+                            read_failures = read_failures.saturating_add(1);
+                            if read_failures == 1 || read_failures % 100 == 0 {
+                                tracing::warn!(
+                                    error = %error,
+                                    lane_completion_ticket = completion.ticket,
+                                    read_failures,
+                                    "retrying mutation lane completion disambiguation"
+                                );
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+            };
+            store.finish_lane_commit(completion, committed).await
+        })
+        .await
+        .map_err(|error| {
+            MutationError::Storage(format!("mutation lane settlement task failed: {error}"))
+        })?
+    }
+
+    fn persisted_lane_completion_exists(
+        &self,
+        completion: LaneCompletion,
+    ) -> Result<bool, MutationError> {
+        #[cfg(test)]
+        if self
+            .mutation_commit_lanes
+            .fail_next_completion_disambiguation
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(MutationError::Storage(
+                "injected mutation lane completion disambiguation failure".into(),
+            ));
+        }
+        self.db
+            .get_cf(self.cf(CF_METADATA)?, completion.key())
+            .map(|value| value.is_some())
+            .map_err(storage_error)
+    }
+
     pub(super) async fn project_lane_completions(
         &self,
     ) -> Result<LaneProjectionMetrics, MutationError> {
@@ -751,7 +838,12 @@ impl Store {
             })?;
             self.publish_lane_projection(runtime, &plan)?;
         }
-        self.settle_inline_source_changes_from_status(projected_watch)?;
+        if let Some(reference_safe_through) = plan.inline_reference_safe_through {
+            self.settle_inline_source_changes_through_from_status(
+                projected_watch,
+                reference_safe_through,
+            )?;
+        }
         self.mutation_commit_lanes.frontier_notify.notify_waiters();
         self.notify_local_invalidations_from_status(projected_watch);
         Ok(LaneProjectionMetrics {
@@ -768,6 +860,7 @@ impl Store {
         let mut batch = WriteBatch::default();
         let mut requires_sync = false;
         let mut completions = Vec::new();
+        let mut inline_reference_safe_through = None;
         loop {
             let next = prospective.projected_ticket.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("mutation lane frontier is exhausted".into())
@@ -785,6 +878,9 @@ impl Store {
                         &mut prospective.projected_high_version,
                         completion,
                     )?;
+                    if completion.inline_reference_safe && completion.first_offset != 0 {
+                        inline_reference_safe_through = Some(completion.last_offset);
+                    }
                     batch.delete_cf(self.cf(CF_METADATA)?, completion.key());
                 }
                 LaneCompletionState::Abandoned(completion) => {
@@ -794,6 +890,9 @@ impl Store {
                         &mut prospective.projected_watch,
                         completion,
                     )?;
+                    if completion.inline_reference_safe && completion.first_offset != 0 {
+                        inline_reference_safe_through = Some(completion.last_offset);
+                    }
                 }
             }
             prospective.projected_ticket = next;
@@ -809,6 +908,7 @@ impl Store {
             completions,
             batch,
             requires_sync,
+            inline_reference_safe_through,
         }))
     }
 
@@ -868,8 +968,12 @@ impl Store {
                 .retained_bytes
                 .checked_add(completion.journal_bytes)
                 .ok_or_else(|| MutationError::Storage("lane journal bytes are exhausted".into()))?;
-            self.stage_reference_delta_cursor(batch, watch.source_id, watch.tail)?;
-            watch.settled_through = watch.tail;
+            if completion.reference_cursor_advanced {
+                self.stage_reference_delta_cursor(batch, watch.source_id, watch.tail)?;
+            }
+            if completion.visibility_settled {
+                watch.settled_through = watch.tail;
+            }
         }
         receipts.entries = receipts
             .entries
@@ -906,8 +1010,12 @@ impl Store {
                 completion.first_offset,
                 completion.last_offset,
             )?;
-            self.stage_reference_delta_cursor(batch, watch.source_id, watch.tail)?;
-            watch.settled_through = watch.tail;
+            if completion.reference_cursor_advanced {
+                self.stage_reference_delta_cursor(batch, watch.source_id, watch.tail)?;
+            }
+            if completion.visibility_settled {
+                watch.settled_through = watch.tail;
+            }
         }
         Ok(())
     }
@@ -1026,6 +1134,9 @@ impl LaneCompletion {
             encoded[option] = 1;
             encoded[option + 1..option + 9].copy_from_slice(&version.0.to_be_bytes());
         }
+        encoded[option + 9] = u8::from(self.reference_cursor_advanced);
+        encoded[option + 10] = u8::from(self.inline_reference_safe);
+        encoded[option + 11] = u8::from(self.visibility_settled);
         encoded
     }
 
@@ -1045,6 +1156,21 @@ impl LaneCompletion {
             1 => Some(VersionId(read(option + 1))),
             _ => return Err("lane completion version marker is invalid".into()),
         };
+        let reference_cursor_advanced = match encoded[option + 9] {
+            0 => false,
+            1 => true,
+            _ => return Err("lane completion reference-settlement marker is invalid".into()),
+        };
+        let inline_reference_safe = match encoded[option + 10] {
+            0 => false,
+            1 => true,
+            _ => return Err("lane completion inline-reference marker is invalid".into()),
+        };
+        let visibility_settled = match encoded[option + 11] {
+            0 => false,
+            1 => true,
+            _ => return Err("lane completion visibility marker is invalid".into()),
+        };
         let completion = Self {
             ticket: read(1),
             first_offset: read(9),
@@ -1054,6 +1180,9 @@ impl LaneCompletion {
             receipt_entries: read(41),
             receipt_bytes: read(49),
             high_version,
+            reference_cursor_advanced,
+            inline_reference_safe,
+            visibility_settled,
         };
         completion.validate()?;
         Ok(completion)
@@ -1127,6 +1256,10 @@ pub(super) fn blob_conflict_resource(reference: &crate::BlobRef) -> Vec<u8> {
     )
 }
 
+pub(super) fn artifact_conflict_resource(identity: &[u8]) -> Vec<u8> {
+    tagged_resource(5, [identity])
+}
+
 fn tagged_resource<'a>(tag: u8, parts: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
     let mut resource = vec![tag];
     for part in parts {
@@ -1174,6 +1307,9 @@ mod tests {
             receipt_entries: 2,
             receipt_bytes: 808,
             high_version: Some(VersionId(91)),
+            reference_cursor_advanced: true,
+            inline_reference_safe: true,
+            visibility_settled: true,
         };
         assert_eq!(
             LaneCompletion::decode(&completion.encode()).unwrap(),
@@ -1326,6 +1462,9 @@ mod tests {
                 receipt_entries: 0,
                 receipt_bytes: 0,
                 high_version: Some(VersionId(offset)),
+                reference_cursor_advanced: true,
+                inline_reference_safe: true,
+                visibility_settled: true,
             };
             let mut batch = WriteBatch::default();
             batch.put_cf(
@@ -1435,6 +1574,45 @@ mod tests {
         );
         assert!(store.prune_source_journal_for_capacity().await.unwrap());
         assert_eq!(store.local_watch_status().unwrap().retention_floor, 1);
+    }
+
+    #[tokio::test]
+    async fn completion_disambiguation_read_failure_retries_without_losing_the_ticket() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let completion = {
+            let mut runtime = store.mutation_commit_lanes.sequence().await;
+            let runtime = runtime.as_mut().unwrap();
+            let watch = runtime.reserved_watch;
+            let receipts = runtime.reserved_receipts;
+            runtime.reserve(watch, receipts, None).unwrap()
+        };
+        let mut batch = WriteBatch::default();
+        store.stage_lane_completion(&mut batch, completion).unwrap();
+        store.db.write(batch).unwrap();
+        store
+            .mutation_commit_lanes
+            .fail_next_completion_disambiguation
+            .store(true, Ordering::Release);
+
+        store
+            .finish_lane_commit_cancellation_safe(completion, false)
+            .await
+            .unwrap();
+
+        let runtime = store.mutation_commit_lanes.sequence().await;
+        let runtime = runtime.as_ref().unwrap();
+        assert_eq!(runtime.projected_ticket, completion.ticket);
+        assert!(!runtime.completions.contains_key(&completion.ticket));
+        assert!(
+            store
+                .db
+                .get_cf(store.cf(CF_METADATA).unwrap(), completion.key())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1677,6 +1855,9 @@ mod tests {
             receipt_entries: 0,
             receipt_bytes: 0,
             high_version: None,
+            reference_cursor_advanced: true,
+            inline_reference_safe: true,
+            visibility_settled: true,
         };
         let mut batch = WriteBatch::default();
         batch.put_cf(
