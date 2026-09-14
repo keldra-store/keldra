@@ -21,6 +21,7 @@ pub(super) async fn load_authoritative_mutable_state(
     config: &Config,
     channels: &[Channel],
     token: &str,
+    expected_mutable_ids: Arc<[bool]>,
 ) -> Result<Arc<BTreeMap<String, u64>>> {
     let mut authority = BTreeMap::new();
     let mutable_records = usize::try_from(config.mutable_records)
@@ -33,6 +34,7 @@ pub(super) async fn load_authoritative_mutable_state(
         let tenant = config.tenant.clone();
         let bucket = config.bucket.clone();
         let mutable_records = config.mutable_records;
+        let expected_mutable_ids = expected_mutable_ids.clone();
         workers.spawn(async move {
             let mut objects = object_client(channel, &token)?;
             let mut entries = Vec::new();
@@ -49,11 +51,13 @@ pub(super) async fn load_authoritative_mutable_state(
                     })
                     .await?
                     .into_inner();
-                let version = match head.state.context("mutable head omitted state")? {
-                    ObjectHeadState::Present(present) => present.version,
-                    _ => bail!("mutable authority path {path} is not present"),
-                };
-                entries.push((path, version));
+                match head.state.context("mutable head omitted state")? {
+                    ObjectHeadState::Present(present) => entries.push((path, present.version)),
+                    _ if expected_mutable_ids[id as usize] => {
+                        bail!("acknowledged mutable authority path {path} is not present")
+                    }
+                    _ => {}
+                }
                 id = id
                     .checked_add(worker_count as u64)
                     .context("mutable authority worker index overflow")?;
@@ -66,26 +70,31 @@ pub(super) async fn load_authoritative_mutable_state(
             insert_authoritative_entry(&mut authority, path, version)?;
         }
     }
-    ensure_complete_authority(&authority, config.mutable_records)?;
+    ensure_authority_covers_expected(&authority, &expected_mutable_ids)?;
     Ok(Arc::new(authority))
 }
 
-pub(super) fn ensure_complete_authority(
+pub(super) fn ensure_authority_covers_expected(
     authority: &BTreeMap<String, u64>,
-    mutable_records: u64,
+    expected_mutable_ids: &[bool],
 ) -> Result<()> {
-    let expected_len = usize::try_from(mutable_records)
-        .context("configured mutable key count does not fit in memory")?;
+    let expected_len = expected_mutable_ids
+        .iter()
+        .filter(|expected| **expected)
+        .count();
     ensure!(
-        authority.len() == expected_len,
-        "mutable authority returned {} of {mutable_records} configured paths",
+        authority.len() >= expected_len,
+        "mutable authority returned {} paths but {expected_len} acknowledged or preseeded paths are required",
         authority.len()
     );
-    for (id, actual_path) in (0..mutable_records).zip(authority.keys()) {
-        let expected_path = data::mutable_path(id);
+    for (id, expected) in expected_mutable_ids.iter().enumerate() {
+        if !expected {
+            continue;
+        }
+        let expected_path = data::mutable_path(id as u64);
         ensure!(
-            actual_path == &expected_path,
-            "mutable authority returned `{actual_path}` where configured path `{expected_path}` was expected"
+            authority.contains_key(&expected_path),
+            "acknowledged or preseeded mutable authority path {expected_path} is not present"
         );
     }
     Ok(())

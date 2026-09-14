@@ -81,23 +81,23 @@ fn authoritative_state_rejects_duplicate_paths() {
 }
 
 #[test]
-fn authoritative_state_requires_every_configured_path() {
+fn authoritative_state_requires_every_acknowledged_or_preseeded_path() {
     let authority = (0..3)
         .map(|id| (data::mutable_path(id), id + 1))
         .collect::<BTreeMap<_, _>>();
-    verification::ensure_complete_authority(&authority, 3).unwrap();
+    verification::ensure_authority_covers_expected(&authority, &[true, true, true, false]).unwrap();
 
     let missing = authority
         .iter()
         .filter(|(path, _)| *path != &data::mutable_path(1))
         .map(|(path, version)| (path.clone(), *version))
         .collect::<BTreeMap<_, _>>();
-    assert!(verification::ensure_complete_authority(&missing, 3).is_err());
+    assert!(verification::ensure_authority_covers_expected(&missing, &[true, true, true]).is_err());
 
-    let mut substituted = authority;
-    substituted.remove(&data::mutable_path(1));
-    substituted.insert("contention/mutable/unconfigured.json".into(), 99);
-    assert!(verification::ensure_complete_authority(&substituted, 3).is_err());
+    let sparse = [(data::mutable_path(0), 1), (data::mutable_path(2), 3)]
+        .into_iter()
+        .collect();
+    verification::ensure_authority_covers_expected(&sparse, &[true, false, true, false]).unwrap();
 }
 
 fn paginated_response(

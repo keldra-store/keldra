@@ -140,6 +140,9 @@ struct MutationReport {
     successful_data_operations_in_window: u64,
     successful_data_operations_after_window: u64,
     successful_probe_operations: u64,
+    expected_authoritative_mutable_records: u64,
+    #[serde(skip)]
+    expected_authoritative_mutable_ids: Vec<bool>,
     failed_data_operations: u64,
     failed_probe_operations: u64,
     successful_data_payload_bytes: u64,
@@ -187,6 +190,7 @@ struct PostLoadReport {
     visibility_observation_seconds: f64,
     credential_refresh_seconds: f64,
     authoritative_state_read_seconds: f64,
+    authoritative_mutable_records: usize,
     final_index_convergence_seconds: f64,
 }
 
@@ -278,6 +282,7 @@ struct MutationResult {
     failed_probe_operations: u64,
     successful_data_payload_bytes: u64,
     successful_probe_payload_bytes: u64,
+    successful_data_ids: Vec<u64>,
     failures: Vec<MutationFailureClass>,
     elapsed: Duration,
     completed_at: Instant,
@@ -470,10 +475,19 @@ async fn run_qualification(
     counters.phase("authority_snapshot_load").await;
     terminal.stage("authority_snapshot_load");
     let authority_started = Instant::now();
-    let authority =
-        load_authoritative_mutable_state(&config, &verification_channels, &verification_token)
-            .await?;
+    let expected_mutable_ids: Arc<[bool]> = mutation_report
+        .expected_authoritative_mutable_ids
+        .clone()
+        .into();
+    let authority = load_authoritative_mutable_state(
+        &config,
+        &verification_channels,
+        &verification_token,
+        expected_mutable_ids,
+    )
+    .await?;
     let authoritative_state_read_seconds = authority_started.elapsed().as_secs_f64();
+    let authoritative_mutable_records = authority.len();
     counters.phase("final_pagination").await;
     terminal.stage("final_pagination");
     let convergence_started = Instant::now();
@@ -494,6 +508,7 @@ async fn run_qualification(
         visibility_observation_seconds,
         credential_refresh_seconds,
         authoritative_state_read_seconds,
+        authoritative_mutable_records,
         final_index_convergence_seconds,
     };
     counters.phase("post").await;
@@ -1107,6 +1122,9 @@ async fn run_mutations(
         measurement_window_ended_unix_milliseconds,
         load_window_seconds: config.concurrent.as_secs_f64(),
         queue_capacity: config.mutation_queue_depth,
+        expected_authoritative_mutable_ids: (0..config.mutable_records)
+            .map(|id| id < config.preseeded_mutable_records)
+            .collect(),
         ..MutationReport::default()
     };
     let mut request_latency = Latencies::new()?;
@@ -1142,6 +1160,15 @@ async fn run_mutations(
                 record_mutation_failure(&mut report, failure);
             }
             Ok(result) => {
+                for id in &result.successful_data_ids {
+                    let position = usize::try_from(*id)
+                        .context("successful mutable record id does not fit in memory")?;
+                    let expected = report
+                        .expected_authoritative_mutable_ids
+                        .get_mut(position)
+                        .context("successful mutable record id exceeds configured keyspace")?;
+                    *expected = true;
+                }
                 if result.failures.is_empty() {
                     report.fully_successful_batches += 1;
                 } else {
@@ -1287,6 +1314,11 @@ async fn run_mutations(
         report.successful_data_operations_in_window as f64 / report.load_window_seconds;
     report.successful_data_ingest_throughput_payload_bytes_per_second =
         report.successful_data_payload_bytes_in_window as f64 / report.load_window_seconds;
+    report.expected_authoritative_mutable_records = report
+        .expected_authoritative_mutable_ids
+        .iter()
+        .filter(|expected| **expected)
+        .count() as u64;
     report.failure_diagnostics_definition = "fully_successful_batches, structurally_valid_batches_with_operation_failures, and indeterminate_batches are disjoint terminal outcomes; indeterminate_batches had no structurally valid per-operation response, so their operation outcomes are indeterminate rather than falsely classified as failed; successful and failed operations come from structurally valid responses; successful sibling outcomes in a partial response remain counted; failure_classes retains bounded diagnostics; at most eight distinct classes are retained and failure_occurrences_omitted counts occurrences from additional classes";
     report.visibility_definition = "successful_receipt_to_probe_start_delay measures local observer queueing; probe_start_to_query_visibility_latency measures globally rate-bounded active polling to the first ordinary-query hit with the exact object_version; successful_receipt_to_query_visibility_latency is their end-to-end sum from successful receipt; sampled probes use non-overwritten object paths, every predetermined successful probe receipt is retained, probes rotate across definitions, observer concurrency and aggregate query start rate are bounded, and polling-resolution delay is included";
     Ok(MutationResponses {
@@ -1506,6 +1538,7 @@ async fn execute_mutation(
     let mut failed_probe_operations = 0_u64;
     let mut successful_data_payload_bytes = 0_u64;
     let mut successful_probe_payload_bytes = 0_u64;
+    let mut successful_data_ids = Vec::with_capacity(config.mutation_batch_size);
     for outcome in response.outcomes {
         let index = match usize::try_from(outcome.index) {
             Ok(index) => index,
@@ -1552,6 +1585,12 @@ async fn execute_mutation(
                         .saturating_add(operation_payload_bytes[index]);
                 } else {
                     successful_data_operations += 1;
+                    successful_data_ids.push(mutable_record_id(
+                        job.sequence,
+                        index,
+                        config.mutation_batch_size,
+                        config.mutable_records,
+                    ));
                     successful_data_payload_bytes = successful_data_payload_bytes
                         .saturating_add(operation_payload_bytes[index]);
                 }
@@ -1586,6 +1625,7 @@ async fn execute_mutation(
         failed_probe_operations,
         successful_data_payload_bytes: successful_data_payload_bytes,
         successful_probe_payload_bytes: successful_probe_payload_bytes,
+        successful_data_ids,
         failures,
         elapsed: completed_at.saturating_duration_since(started),
         completed_at,
