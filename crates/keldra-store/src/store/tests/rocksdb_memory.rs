@@ -126,3 +126,34 @@ async fn configured_wal_target_and_payload_engine_properties_are_observable() {
     assert!(metrics.payload_sst_bytes.is_some_and(|bytes| bytes > 0));
     assert!(metrics.non_payload_metadata_index_sst_bytes.is_some());
 }
+
+#[tokio::test]
+async fn payload_blob_reads_reuse_the_bounded_shared_cache() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let bytes = vec![0x72; PAYLOAD_BLOB_MIN_BYTES as usize + 1];
+    let reference = store.stage_blob(&bytes).await.unwrap();
+    store
+        .db
+        .flush_cf(store.cf(CF_PAYLOAD_ARTIFACTS).unwrap())
+        .unwrap();
+
+    rocksdb::perf::set_perf_stats(rocksdb::perf::PerfStatsLevel::EnableCount);
+    let mut perf = rocksdb::perf::PerfContext::default();
+    perf.reset();
+    assert_eq!(store.read_blob_bytes(&reference).await.unwrap(), bytes);
+    let report = perf.report(true);
+    rocksdb::perf::set_perf_stats(rocksdb::perf::PerfStatsLevel::Disable);
+
+    let blob_cache_hits = report
+        .split(", ")
+        .find_map(|counter| counter.strip_prefix("blob_cache_hit_count = "))
+        .and_then(|count| count.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(
+        blob_cache_hits >= 1,
+        "the manifest probe and value read did not reuse BlobDB content: {report}"
+    );
+}
