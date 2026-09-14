@@ -387,6 +387,7 @@ async fn reconcile(
             let publisher = publisher.clone();
             let credits = credits.clone();
             async move {
+                let _advance = super::v1_telemetry::global().begin_in_flight_advance(STALL_AFTER);
                 let result = advance(
                     &mut writer,
                     &target,
@@ -1580,7 +1581,6 @@ async fn flush(
             .cloned()
             .collect::<Vec<_>>();
         mutations.sort_by_key(|mutation| (mutation.offset, mutation.ordinal));
-        let _preparation = super::v1_telemetry::global().begin_in_flight_preparation(STALL_AFTER);
         prepare_lane(
             writer,
             physical_catalog_identity,

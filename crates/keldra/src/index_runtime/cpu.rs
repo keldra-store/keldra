@@ -154,6 +154,13 @@ impl IndexCpuPool {
         }
     }
 
+    /// Bound query partitions while retaining one worker for projection and
+    /// compaction progress. A single-worker deployment necessarily shares its
+    /// only worker, so it retains one query lane rather than disabling queries.
+    pub(crate) fn query_scheduler_reserving_producer(&self) -> IndexQueryScheduler {
+        self.query_scheduler(self.workers.saturating_sub(1).max(1))
+    }
+
     /// Run CPU work inside Keldra's pool, never Rayon's global registry.
     pub(crate) async fn install<F, T>(&self, work: F) -> Result<T, IndexCpuPoolError>
     where
@@ -565,5 +572,81 @@ mod tests {
         assert_eq!(pool.workers(), 3);
         assert_eq!(scheduler.maximum_parallelism(), 3);
         assert!(query_name.starts_with("keldra-index-worker-"));
+    }
+
+    #[test]
+    fn query_scheduler_reserves_a_producer_worker_when_possible() {
+        assert_eq!(
+            IndexCpuPool::new(4)
+                .unwrap()
+                .query_scheduler_reserving_producer()
+                .maximum_parallelism(),
+            3
+        );
+        assert_eq!(
+            IndexCpuPool::new(1)
+                .unwrap()
+                .query_scheduler_reserving_producer()
+                .maximum_parallelism(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_cpu_work_progresses_while_query_lanes_remain_busy() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct ReleaseOnDrop(Arc<AtomicBool>);
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let pool = IndexCpuPool::new(4).unwrap();
+        let scheduler = pool.query_scheduler_reserving_producer();
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
+        let mut queries = Vec::new();
+        for _ in 0..scheduler.maximum_parallelism() {
+            let scheduler = scheduler.clone();
+            let cpu_scheduler = scheduler.clone();
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            queries.push(tokio::spawn(async move {
+                scheduler
+                    .run_partition(move || async move {
+                        cpu_scheduler
+                            .run_cpu(move || {
+                                started.fetch_add(1, Ordering::Release);
+                                while !release.load(Ordering::Acquire) {
+                                    std::thread::yield_now();
+                                }
+                                Ok(())
+                            })
+                            .await
+                    })
+                    .await
+            }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while started.load(Ordering::Acquire) != scheduler.maximum_parallelism() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every admitted query lane should occupy one worker");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), pool.submit(|| ()))
+            .await
+            .expect("the reserved producer worker should remain runnable")
+            .unwrap();
+
+        drop(release_on_drop);
+        for query in queries {
+            query.await.unwrap().unwrap();
+        }
     }
 }

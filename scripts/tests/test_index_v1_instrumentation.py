@@ -35,9 +35,9 @@ class InstrumentationTests(unittest.TestCase):
             "stalled_partitions",
             "retrying_partitions",
             "halted_partitions",
-            "in_flight_preparing_partitions",
-            "oldest_in_flight_preparation_age_milliseconds",
-            "in_flight_preparation_stalled_partitions",
+            "in_flight_advancing_partitions",
+            "oldest_in_flight_advance_age_milliseconds",
+            "in_flight_advance_stalled_partitions",
         ):
             self.assertIn(f'\\"{metric}\\"', source)
             self.assertIn(metric, MODULE.GAUGES)

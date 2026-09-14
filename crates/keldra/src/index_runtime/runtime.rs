@@ -98,7 +98,7 @@ pub(crate) async fn start(
 
     let cpu = IndexCpuPool::new(config.indexing_cores())
         .context("initialize the fixed index Rayon pool")?;
-    let query_scheduler = cpu.query_scheduler(cpu.workers());
+    let query_scheduler = cpu.query_scheduler_reserving_producer();
     let coordinator = IndexArtifactCoordinator::new(
         store.clone(),
         objects.clone(),

@@ -9,8 +9,8 @@ macro_rules! counters {
     ($($name:ident),+ $(,)?) => {
         pub(crate) struct V1PipelineTelemetry {
             started: Instant,
-            next_preparation_id: AtomicU64,
-            in_flight_preparations: Mutex<BTreeMap<u64, InFlightPreparation>>,
+            next_advance_id: AtomicU64,
+            in_flight_advances: Mutex<BTreeMap<u64, InFlightAdvance>>,
             $(pub(crate) $name: AtomicU64,)+
         }
 
@@ -18,8 +18,8 @@ macro_rules! counters {
             fn default() -> Self {
                 Self {
                     started: Instant::now(),
-                    next_preparation_id: AtomicU64::new(1),
-                    in_flight_preparations: Mutex::new(BTreeMap::new()),
+                    next_advance_id: AtomicU64::new(1),
+                    in_flight_advances: Mutex::new(BTreeMap::new()),
                     $($name: AtomicU64::new(0),)+
                 }
             }
@@ -66,27 +66,27 @@ counters!(
 static TELEMETRY: OnceLock<Arc<V1PipelineTelemetry>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
-struct InFlightPreparation {
+struct InFlightAdvance {
     started_at: Instant,
     stall_after: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct InFlightPreparationSnapshot {
+struct InFlightAdvanceSnapshot {
     count: u64,
     oldest_age_milliseconds: u64,
     stalled: u64,
 }
 
-pub(crate) struct InFlightPreparationGuard {
+pub(crate) struct InFlightAdvanceGuard {
     telemetry: Arc<V1PipelineTelemetry>,
     id: u64,
 }
 
-impl Drop for InFlightPreparationGuard {
+impl Drop for InFlightAdvanceGuard {
     fn drop(&mut self) {
         self.telemetry
-            .in_flight_preparations
+            .in_flight_advances
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.id);
@@ -122,66 +122,66 @@ impl V1PipelineTelemetry {
         counter.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn begin_in_flight_preparation(
+    pub(crate) fn begin_in_flight_advance(
         self: &Arc<Self>,
         stall_after: Duration,
-    ) -> InFlightPreparationGuard {
-        self.begin_in_flight_preparation_at(Instant::now(), stall_after)
+    ) -> InFlightAdvanceGuard {
+        self.begin_in_flight_advance_at(Instant::now(), stall_after)
     }
 
-    fn begin_in_flight_preparation_at(
+    fn begin_in_flight_advance_at(
         self: &Arc<Self>,
         started_at: Instant,
         stall_after: Duration,
-    ) -> InFlightPreparationGuard {
-        let id = self.next_preparation_id.fetch_add(1, Ordering::Relaxed);
-        self.in_flight_preparations
+    ) -> InFlightAdvanceGuard {
+        let id = self.next_advance_id.fetch_add(1, Ordering::Relaxed);
+        self.in_flight_advances
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(
                 id,
-                InFlightPreparation {
+                InFlightAdvance {
                     started_at,
                     stall_after,
                 },
             );
-        InFlightPreparationGuard {
+        InFlightAdvanceGuard {
             telemetry: self.clone(),
             id,
         }
     }
 
-    fn in_flight_preparation_snapshot(&self, now: Instant) -> InFlightPreparationSnapshot {
-        let preparations = self
-            .in_flight_preparations
+    fn in_flight_advance_snapshot(&self, now: Instant) -> InFlightAdvanceSnapshot {
+        let advances = self
+            .in_flight_advances
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        preparations.values().fold(
-            InFlightPreparationSnapshot::default(),
-            |mut snapshot, preparation| {
-                let age = now.saturating_duration_since(preparation.started_at);
+        advances.values().fold(
+            InFlightAdvanceSnapshot::default(),
+            |mut snapshot, advance| {
+                let age = now.saturating_duration_since(advance.started_at);
                 snapshot.count = snapshot.count.saturating_add(1);
                 snapshot.oldest_age_milliseconds = snapshot
                     .oldest_age_milliseconds
                     .max(age.as_millis().min(u128::from(u64::MAX)) as u64);
                 snapshot.stalled = snapshot
                     .stalled
-                    .saturating_add(u64::from(age >= preparation.stall_after));
+                    .saturating_add(u64::from(age >= advance.stall_after));
                 snapshot
             },
         )
     }
 
-    fn no_progress_summary(&self, now: Instant) -> (InFlightPreparationSnapshot, u64, u64) {
-        let preparation = self.in_flight_preparation_snapshot(now);
-        let oldest_no_progress = Self::load(&self.oldest_no_progress_age_millis)
-            .max(preparation.oldest_age_milliseconds);
-        let stalled_partitions = Self::load(&self.stalled_partitions).max(preparation.stalled);
-        (preparation, oldest_no_progress, stalled_partitions)
+    fn no_progress_summary(&self, now: Instant) -> (InFlightAdvanceSnapshot, u64, u64) {
+        let advance = self.in_flight_advance_snapshot(now);
+        let oldest_no_progress =
+            Self::load(&self.oldest_no_progress_age_millis).max(advance.oldest_age_milliseconds);
+        let stalled_partitions = Self::load(&self.stalled_partitions).max(advance.stalled);
+        (advance, oldest_no_progress, stalled_partitions)
     }
 
     fn emit_summary(&self) {
-        let (preparation, oldest_no_progress, stalled_partitions) =
+        let (advance, oldest_no_progress, stalled_partitions) =
             self.no_progress_summary(Instant::now());
         tracing::info!(
             target: "keldra::index_runtime::v1_summary",
@@ -219,9 +219,9 @@ impl V1PipelineTelemetry {
             keldra_index_v1_stalled_partitions = stalled_partitions,
             keldra_index_v1_retrying_partitions = Self::load(&self.retrying_partitions),
             keldra_index_v1_halted_partitions = Self::load(&self.halted_partitions),
-            keldra_index_v1_in_flight_preparing_partitions = preparation.count,
-            keldra_index_v1_oldest_in_flight_preparation_age_milliseconds = preparation.oldest_age_milliseconds,
-            keldra_index_v1_in_flight_preparation_stalled_partitions = preparation.stalled,
+            keldra_index_v1_in_flight_advancing_partitions = advance.count,
+            keldra_index_v1_oldest_in_flight_advance_age_milliseconds = advance.oldest_age_milliseconds,
+            keldra_index_v1_in_flight_advance_stalled_partitions = advance.stalled,
             "keldra_index_v1_summary"
         );
         for snapshot in keldra_index::hash_profile_snapshots() {
@@ -285,35 +285,35 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_preparation_reports_live_age_and_is_removed_on_drop() {
+    fn in_flight_advance_reports_live_age_and_is_removed_on_drop() {
         let telemetry = Arc::new(V1PipelineTelemetry::default());
         let now = Instant::now();
-        let guard = telemetry.begin_in_flight_preparation_at(
+        let guard = telemetry.begin_in_flight_advance_at(
             now.checked_sub(Duration::from_secs(31)).unwrap(),
             Duration::from_secs(30),
         );
 
-        let (preparation, oldest_no_progress, stalled) = telemetry.no_progress_summary(now);
-        assert_eq!(preparation.count, 1);
-        assert_eq!(preparation.oldest_age_milliseconds, 31_000);
-        assert_eq!(preparation.stalled, 1);
+        let (advance, oldest_no_progress, stalled) = telemetry.no_progress_summary(now);
+        assert_eq!(advance.count, 1);
+        assert_eq!(advance.oldest_age_milliseconds, 31_000);
+        assert_eq!(advance.stalled, 1);
         assert_eq!(oldest_no_progress, 31_000);
         assert_eq!(stalled, 1);
 
         drop(guard);
         assert_eq!(
-            telemetry.in_flight_preparation_snapshot(now),
-            InFlightPreparationSnapshot::default()
+            telemetry.in_flight_advance_snapshot(now),
+            InFlightAdvanceSnapshot::default()
         );
     }
 
     #[test]
-    fn live_preparation_is_combined_conservatively_with_reconciled_gauges() {
+    fn live_advance_is_combined_conservatively_with_reconciled_gauges() {
         let telemetry = Arc::new(V1PipelineTelemetry::default());
         V1PipelineTelemetry::set(&telemetry.oldest_no_progress_age_millis, 45_000);
         V1PipelineTelemetry::set(&telemetry.stalled_partitions, 3);
         let now = Instant::now();
-        let _guard = telemetry.begin_in_flight_preparation_at(
+        let _guard = telemetry.begin_in_flight_advance_at(
             now.checked_sub(Duration::from_secs(31)).unwrap(),
             Duration::from_secs(30),
         );
