@@ -48,6 +48,24 @@ class InstrumentationTests(unittest.TestCase):
         self.assertLess(stop_branch, final_snapshot)
         self.assertLess(final_snapshot, final_flush)
 
+    def test_driver_reports_live_queries_and_separate_visibility_observation(self):
+        driver = PROGRESS_SOURCE.parent.parent / "index_contention_qualification.rs"
+        source = driver.read_text(encoding="utf-8")
+        query_phase = source.index("async fn run_query_phase")
+        self.assertIn("tasks.try_join_next()", source[query_phase:])
+        live_reap = source.index("record_query_completion", query_phase)
+        query_spawn = source.index("tasks.spawn", live_reap)
+        self.assertLess(live_reap, query_spawn)
+
+        response_phase = source.index('counters.phase("mutation_response_drain")')
+        response_timeout = source.index("config.drain_timeout", response_phase)
+        visibility_phase = source.index('counters.phase("visibility_observation")')
+        visibility_finish = source.index("finish_visibility().await", visibility_phase)
+        self.assertLess(response_phase, response_timeout)
+        self.assertLess(response_timeout, visibility_phase)
+        self.assertLess(visibility_phase, visibility_finish)
+        self.assertNotIn("outstanding_requests_and_sampled_visibility_seconds", source)
+
     def test_disk_sampler_emits_tsv_delimiters_instead_of_literal_escapes(self):
         source = HARNESS_SCRIPT.read_text(encoding="utf-8")
         self.assertIn('printf "\\t%s", $field', source)

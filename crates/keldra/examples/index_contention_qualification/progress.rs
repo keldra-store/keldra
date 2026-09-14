@@ -22,8 +22,14 @@ pub struct Counters {
     pub dropped: AtomicU64,
     pub errors: AtomicU64,
     pub timeouts: AtomicU64,
+    pub correctness_errors: AtomicU64,
     pub mutations: AtomicU64,
     pub mutation_errors: AtomicU64,
+    visibility_probes_planned: AtomicU64,
+    visibility_probes_started: AtomicU64,
+    pub visibility_probes_completed: AtomicU64,
+    visibility_probes_succeeded: AtomicU64,
+    visibility_probes_failed: AtomicU64,
     pub pagination_attempts: AtomicU64,
     pub pagination_attempts_completed: AtomicU64,
     pub pagination_attempt_failures: AtomicU64,
@@ -53,9 +59,15 @@ struct Snapshot {
     dropped_queries: u64,
     query_errors: u64,
     query_timeouts: u64,
+    query_correctness_errors: u64,
     query_latency: LatencyReport,
     accepted_mutations: u64,
     mutation_errors: u64,
+    visibility_probes_planned: u64,
+    visibility_probes_started: u64,
+    visibility_probes_completed: u64,
+    visibility_probes_succeeded: u64,
+    visibility_probes_failed: u64,
     pagination_attempts: u64,
     pagination_attempts_completed: u64,
     pagination_attempt_failures: u64,
@@ -97,6 +109,31 @@ impl Counters {
         if let Some(histogram) = self.query_latencies.lock().await.as_mut() {
             let _ = histogram.record(elapsed);
         }
+    }
+
+    pub fn visibility_probe_planned(&self) {
+        self.visibility_probes_planned
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn visibility_probe_started(&self) {
+        self.visibility_probes_started
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn visibility_probe_completed(&self) {
+        self.visibility_probes_completed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn visibility_probe_succeeded(&self) {
+        self.visibility_probes_succeeded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn visibility_probe_failed(&self) {
+        self.visibility_probes_failed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn pagination_attempt_started(&self) {
@@ -180,9 +217,15 @@ impl Counters {
             dropped_queries: self.dropped.load(Ordering::Relaxed),
             query_errors: self.errors.load(Ordering::Relaxed),
             query_timeouts: self.timeouts.load(Ordering::Relaxed),
+            query_correctness_errors: self.correctness_errors.load(Ordering::Relaxed),
             query_latency: latency,
             accepted_mutations: self.mutations.load(Ordering::Relaxed),
             mutation_errors: self.mutation_errors.load(Ordering::Relaxed),
+            visibility_probes_planned: self.visibility_probes_planned.load(Ordering::Relaxed),
+            visibility_probes_started: self.visibility_probes_started.load(Ordering::Relaxed),
+            visibility_probes_completed: self.visibility_probes_completed.load(Ordering::Relaxed),
+            visibility_probes_succeeded: self.visibility_probes_succeeded.load(Ordering::Relaxed),
+            visibility_probes_failed: self.visibility_probes_failed.load(Ordering::Relaxed),
             pagination_attempts: self.pagination_attempts.load(Ordering::Relaxed),
             pagination_attempts_completed: self
                 .pagination_attempts_completed

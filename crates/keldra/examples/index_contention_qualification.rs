@@ -189,7 +189,8 @@ struct PostLoadReport {
     /// Non-overlapping wall time after the concurrent query phase has reached
     /// terminal responses, until correctness and convergence checks complete.
     elapsed_seconds: f64,
-    outstanding_requests_and_sampled_visibility_seconds: f64,
+    mutation_response_drain_seconds: f64,
+    visibility_observation_seconds: f64,
     credential_refresh_seconds: f64,
     authoritative_state_read_seconds: f64,
     final_index_convergence_seconds: f64,
@@ -269,8 +270,70 @@ struct VisibilitySampleOutcome {
     canary: Canary,
     definition_position: usize,
     definition_name: String,
+    started: bool,
     successful_receipt_to_probe_start: Duration,
     result: Result<Duration>,
+}
+
+struct MutationResponses {
+    report: MutationReport,
+    visibility_tasks: JoinSet<VisibilitySampleOutcome>,
+    successful_receipt_to_probe_start: Latencies,
+    probe_start_to_visibility: Latencies,
+    successful_receipt_to_visibility: Latencies,
+    counters: Arc<Counters>,
+}
+
+impl MutationResponses {
+    async fn finish_visibility(mut self) -> Result<MutationReport> {
+        while let Some(sample) = self.visibility_tasks.join_next().await {
+            let sample = sample.context("visibility task panicked")?;
+            self.counters.visibility_probe_completed();
+            if sample.started {
+                self.report.visibility_probes_started += 1;
+            }
+            self.successful_receipt_to_probe_start
+                .record(sample.successful_receipt_to_probe_start)?;
+            match sample.result {
+                Ok(elapsed) => {
+                    self.report.visibility_probes_succeeded += 1;
+                    self.counters.visibility_probe_succeeded();
+                    self.successful_receipt_to_visibility.record(elapsed)?;
+                    self.probe_start_to_visibility
+                        .record(elapsed.saturating_sub(sample.successful_receipt_to_probe_start))?;
+                }
+                Err(error) => {
+                    self.report.visibility_probes_failed += 1;
+                    self.counters.visibility_probe_failed();
+                    if self.report.visibility_probe_failures.len()
+                        < MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS
+                    {
+                        self.report
+                            .visibility_probe_failures
+                            .push(VisibilitySampleFailure {
+                                canary_id: sample.canary.id,
+                                object_version: sample.canary.version,
+                                definition_position: sample.definition_position,
+                                definition_name: sample.definition_name,
+                                error: bounded_error(&format!("{error:#}")),
+                            });
+                    } else {
+                        self.report.visibility_probe_failures_omitted = self
+                            .report
+                            .visibility_probe_failures_omitted
+                            .saturating_add(1);
+                    }
+                }
+            }
+        }
+        self.report.successful_receipt_to_probe_start_delay =
+            self.successful_receipt_to_probe_start.report();
+        self.report.probe_start_to_query_visibility_latency =
+            self.probe_start_to_visibility.report();
+        self.report.successful_receipt_to_query_visibility_latency =
+            self.successful_receipt_to_visibility.report();
+        Ok(self.report)
+    }
 }
 
 const MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS: usize = 16;
@@ -320,6 +383,12 @@ struct QueryOutcome {
     service: Duration,
     correctness_error: bool,
 }
+
+type QueryTaskResult = (
+    Instant,
+    Instant,
+    std::result::Result<Result<QueryOutcome>, tokio::time::error::Elapsed>,
+);
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -449,11 +518,14 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     counters.phase("mutation_response_drain").await;
     let post_load_started = Instant::now();
     let outstanding_started = Instant::now();
-    let mutation_report = tokio::time::timeout(config.drain_timeout, mutation_task)
+    let mutation_responses = tokio::time::timeout(config.drain_timeout, mutation_task)
         .await
-        .context("mutation drain exceeded timeout")???;
-    let outstanding_requests_and_sampled_visibility_seconds =
-        outstanding_started.elapsed().as_secs_f64();
+        .context("mutation response drain exceeded timeout")???;
+    let mutation_response_drain_seconds = outstanding_started.elapsed().as_secs_f64();
+    counters.phase("visibility_observation").await;
+    let visibility_started = Instant::now();
+    let mutation_report = mutation_responses.finish_visibility().await?;
+    let visibility_observation_seconds = visibility_started.elapsed().as_secs_f64();
     let credential_refresh_started = Instant::now();
     let verification_token = fresh_token(&config, &setup_channels[0]).await?;
     let credential_refresh_seconds = credential_refresh_started.elapsed().as_secs_f64();
@@ -477,7 +549,8 @@ async fn run_qualification(config: Arc<Config>, started_unix_milliseconds: u128)
     let observed = final_sources;
     let post_load = PostLoadReport {
         elapsed_seconds: post_load_started.elapsed().as_secs_f64(),
-        outstanding_requests_and_sampled_visibility_seconds,
+        mutation_response_drain_seconds,
+        visibility_observation_seconds,
         credential_refresh_seconds,
         authoritative_state_read_seconds,
         final_index_convergence_seconds,
@@ -830,6 +903,34 @@ async fn run_query_phase(
         if intended >= phase_end {
             break;
         }
+        while let Some(joined) = tasks.try_join_next() {
+            record_query_completion(
+                joined,
+                phase_end,
+                &mut report,
+                &mut queried_definitions,
+                &mut end_to_end,
+                &mut service,
+                &counters,
+            )
+            .await?;
+        }
+        while !tasks.is_empty() && Instant::now() < intended {
+            tokio::select! {
+                () = tokio::time::sleep_until(intended) => break,
+                joined = tasks.join_next() => {
+                    record_query_completion(
+                        joined.expect("non-empty query task set has one completion"),
+                        phase_end,
+                        &mut report,
+                        &mut queried_definitions,
+                        &mut end_to_end,
+                        &mut service,
+                        &counters,
+                    ).await?;
+                }
+            }
+        }
         tokio::time::sleep_until(intended).await;
         let dispatched = Instant::now();
         report.scheduled_queries += 1;
@@ -882,51 +983,16 @@ async fn run_query_phase(
         sequence = sequence.checked_add(1).context("query schedule overflow")?;
     }
     while let Some(joined) = tasks.join_next().await {
-        let (intended, completed, result) = joined.context("query task panicked")?;
-        match result {
-            Err(_) => {
-                report.timeouts += 1;
-                counters.timeouts.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(Err(_)) => {
-                report.request_errors += 1;
-                counters.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(Ok(outcome)) => {
-                queried_definitions.insert(outcome.definition_position);
-                if outcome.correctness_error {
-                    report.correctness_errors += 1;
-                } else {
-                    report.successful_queries += 1;
-                    if completed < phase_end {
-                        report.successful_queries_in_window += 1;
-                    } else {
-                        report.successful_queries_after_window += 1;
-                    }
-                    report.minimum_commit_revision = Some(
-                        report
-                            .minimum_commit_revision
-                            .map_or(outcome.revision, |v| v.min(outcome.revision)),
-                    );
-                    report.maximum_commit_revision = Some(
-                        report
-                            .maximum_commit_revision
-                            .map_or(outcome.revision, |v| v.max(outcome.revision)),
-                    );
-                    report.maximum_source_lag_hint =
-                        report.maximum_source_lag_hint.max(outcome.max_lag);
-                    end_to_end.record(completed.saturating_duration_since(intended))?;
-                    service.record(outcome.service)?;
-                    counters
-                        .query_completed(
-                            completed.saturating_duration_since(intended),
-                            outcome.revision,
-                            outcome.max_lag,
-                        )
-                        .await;
-                }
-            }
-        }
+        record_query_completion(
+            joined,
+            phase_end,
+            &mut report,
+            &mut queried_definitions,
+            &mut end_to_end,
+            &mut service,
+            &counters,
+        )
+        .await?;
     }
     report.measurement_window_seconds = duration.as_secs_f64();
     report.total_until_all_terminal_seconds = phase_start.elapsed().as_secs_f64();
@@ -944,6 +1010,65 @@ async fn run_query_phase(
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn record_query_completion(
+    joined: std::result::Result<QueryTaskResult, tokio::task::JoinError>,
+    phase_end: Instant,
+    report: &mut QueryPhaseReport,
+    queried_definitions: &mut BTreeSet<usize>,
+    end_to_end: &mut Latencies,
+    service: &mut Latencies,
+    counters: &Counters,
+) -> Result<()> {
+    let (intended, completed, result) = joined.context("query task panicked")?;
+    match result {
+        Err(_) => {
+            report.timeouts += 1;
+            counters.timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Err(_)) => {
+            report.request_errors += 1;
+            counters.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Ok(outcome)) => {
+            queried_definitions.insert(outcome.definition_position);
+            if outcome.correctness_error {
+                report.correctness_errors += 1;
+                counters.correctness_errors.fetch_add(1, Ordering::Relaxed);
+            } else {
+                report.successful_queries += 1;
+                if completed < phase_end {
+                    report.successful_queries_in_window += 1;
+                } else {
+                    report.successful_queries_after_window += 1;
+                }
+                report.minimum_commit_revision = Some(
+                    report
+                        .minimum_commit_revision
+                        .map_or(outcome.revision, |value| value.min(outcome.revision)),
+                );
+                report.maximum_commit_revision = Some(
+                    report
+                        .maximum_commit_revision
+                        .map_or(outcome.revision, |value| value.max(outcome.revision)),
+                );
+                report.maximum_source_lag_hint =
+                    report.maximum_source_lag_hint.max(outcome.max_lag);
+                end_to_end.record(completed.saturating_duration_since(intended))?;
+                service.record(outcome.service)?;
+                counters
+                    .query_completed(
+                        completed.saturating_duration_since(intended),
+                        outcome.revision,
+                        outcome.max_lag,
+                    )
+                    .await;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_mutations(
     config: Arc<Config>,
     channels: Arc<Vec<Channel>>,
@@ -952,7 +1077,7 @@ async fn run_mutations(
     counters: Arc<Counters>,
     mutation_started: Instant,
     measurement_window_started_unix_milliseconds: u128,
-) -> Result<MutationReport> {
+) -> Result<MutationResponses> {
     let mutation_window_ends = mutation_started + config.concurrent;
     let measurement_window_ended_unix_milliseconds =
         measurement_window_started_unix_milliseconds.saturating_add(config.concurrent.as_millis());
@@ -1042,9 +1167,9 @@ async fn run_mutations(
         ..MutationReport::default()
     };
     let mut request_latency = Latencies::new()?;
-    let mut successful_receipt_to_probe_start = Latencies::new()?;
-    let mut probe_start_to_visibility = Latencies::new()?;
-    let mut successful_receipt_to_visibility = Latencies::new()?;
+    let successful_receipt_to_probe_start = Latencies::new()?;
+    let probe_start_to_visibility = Latencies::new()?;
+    let successful_receipt_to_visibility = Latencies::new()?;
     let mut visibility_tasks = JoinSet::new();
     // Bound observer traffic independently from workload queries. Every
     // predetermined sample waits for a permit and reports that wait separately,
@@ -1056,6 +1181,7 @@ async fn run_mutations(
         last_terminal_response_at = last_terminal_response_at.max(terminal_at);
         if job.sequence % config.visibility_sample_every_batches == 0 {
             report.visibility_probes_planned += 1;
+            counters.visibility_probe_planned();
         }
         match event {
             Err(failure) => {
@@ -1136,32 +1262,40 @@ async fn run_mutations(
                         let request_timeout = config.request_timeout;
                         let observation_timeout = config.visibility_observation_timeout;
                         let permits = visibility_permits.clone();
+                        let probe_counters = counters.clone();
                         visibility_tasks.spawn(async move {
                             let permit_result = permits.acquire_owned().await;
                             let probe_started = Instant::now();
                             let successful_receipt_to_probe_start =
                                 probe_started.saturating_duration_since(canary.completed_at);
-                            let result = match permit_result {
+                            let (started, result) = match permit_result {
                                 Ok(permit) => {
                                     let _permit = permit;
-                                    wait_canary(
-                                        &channel,
-                                        &token,
-                                        &bucket,
-                                        &name,
-                                        canary,
-                                        poll,
-                                        request_timeout,
-                                        observation_timeout,
+                                    probe_counters.visibility_probe_started();
+                                    (
+                                        true,
+                                        wait_canary(
+                                            &channel,
+                                            &token,
+                                            &bucket,
+                                            &name,
+                                            canary,
+                                            poll,
+                                            request_timeout,
+                                            observation_timeout,
+                                        )
+                                        .await,
                                     )
-                                    .await
                                 }
-                                Err(error) => Err(anyhow!("visibility semaphore closed: {error}")),
+                                Err(error) => {
+                                    (false, Err(anyhow!("visibility semaphore closed: {error}")))
+                                }
                             };
                             VisibilitySampleOutcome {
                                 canary,
                                 definition_position,
                                 definition_name: name,
+                                started,
                                 successful_receipt_to_probe_start,
                                 result,
                             }
@@ -1193,38 +1327,6 @@ async fn run_mutations(
         worker.context("mutation worker panicked")??;
     }
     sampler.await.context("queue sampler panicked")?;
-    while let Some(sample) = visibility_tasks.join_next().await {
-        let sample = sample.context("visibility task panicked")?;
-        report.visibility_probes_started += 1;
-        successful_receipt_to_probe_start.record(sample.successful_receipt_to_probe_start)?;
-        match sample.result {
-            Ok(successful_receipt_to_visible_duration) => {
-                report.visibility_probes_succeeded += 1;
-                successful_receipt_to_visibility.record(successful_receipt_to_visible_duration)?;
-                probe_start_to_visibility.record(
-                    successful_receipt_to_visible_duration
-                        .saturating_sub(sample.successful_receipt_to_probe_start),
-                )?;
-            }
-            Err(error) => {
-                report.visibility_probes_failed += 1;
-                if report.visibility_probe_failures.len() < MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS {
-                    report
-                        .visibility_probe_failures
-                        .push(VisibilitySampleFailure {
-                            canary_id: sample.canary.id,
-                            object_version: sample.canary.version,
-                            definition_position: sample.definition_position,
-                            definition_name: sample.definition_name,
-                            error: bounded_error(&format!("{error:#}")),
-                        });
-                } else {
-                    report.visibility_probe_failures_omitted =
-                        report.visibility_probe_failures_omitted.saturating_add(1);
-                }
-            }
-        }
-    }
     report.minimum_sampled_client_queue_depth = minimum_depth.load(Ordering::Relaxed);
     report.sampled_client_queue_empty_count = starvation.load(Ordering::Relaxed);
     report.queue_depth_samples = queue_samples.load(Ordering::Relaxed);
@@ -1248,12 +1350,15 @@ async fn run_mutations(
     report.successful_data_ingest_throughput_payload_bytes_per_second =
         report.successful_data_payload_bytes_in_window as f64 / report.load_window_seconds;
     report.failure_diagnostics_definition = "fully_successful_batches, structurally_valid_batches_with_operation_failures, and indeterminate_batches are disjoint terminal outcomes; indeterminate_batches had no structurally valid per-operation response, so their operation outcomes are indeterminate rather than falsely classified as failed; successful and failed operations come from structurally valid responses; successful sibling outcomes in a partial response remain counted; failure_classes retains bounded diagnostics; at most eight distinct classes are retained and failure_occurrences_omitted counts occurrences from additional classes";
-    report.successful_receipt_to_probe_start_delay = successful_receipt_to_probe_start.report();
-    report.probe_start_to_query_visibility_latency = probe_start_to_visibility.report();
-    report.successful_receipt_to_query_visibility_latency =
-        successful_receipt_to_visibility.report();
     report.visibility_definition = "successful_receipt_to_probe_start_delay measures local observer queueing; probe_start_to_query_visibility_latency measures active polling to the first ordinary-query hit with the exact object_version; successful_receipt_to_query_visibility_latency is their end-to-end sum from successful receipt; sampled probes use non-overwritten object paths, every predetermined successful probe receipt is retained, probes rotate across definitions, observer concurrency is bounded, and polling-resolution delay is included";
-    Ok(report)
+    Ok(MutationResponses {
+        report,
+        visibility_tasks,
+        successful_receipt_to_probe_start,
+        probe_start_to_visibility,
+        successful_receipt_to_visibility,
+        counters,
+    })
 }
 
 async fn produce_mutation_jobs(

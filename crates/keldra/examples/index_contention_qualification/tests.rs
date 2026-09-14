@@ -1,6 +1,7 @@
 use super::*;
 use keldra_storage::v1::IndexSourceFreshness;
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 
 #[test]
 fn marker_ids_do_not_overlap_small_corpus_ids() {
@@ -77,6 +78,26 @@ fn authoritative_state_rejects_duplicate_paths() {
         insert_authoritative_entry(&mut authority, "contention/mutable/00000001.json".into(), 2,)
             .is_err()
     );
+}
+
+#[test]
+fn authoritative_state_requires_every_configured_path() {
+    let authority = (0..3)
+        .map(|id| (data::mutable_path(id), id + 1))
+        .collect::<BTreeMap<_, _>>();
+    verification::ensure_complete_authority(&authority, 3).unwrap();
+
+    let missing = authority
+        .iter()
+        .filter(|(path, _)| *path != &data::mutable_path(1))
+        .map(|(path, version)| (path.clone(), *version))
+        .collect::<BTreeMap<_, _>>();
+    assert!(verification::ensure_complete_authority(&missing, 3).is_err());
+
+    let mut substituted = authority;
+    substituted.remove(&data::mutable_path(1));
+    substituted.insert("contention/mutable/unconfigured.json".into(), 99);
+    assert!(verification::ensure_complete_authority(&substituted, 3).is_err());
 }
 
 fn paginated_response(
@@ -246,6 +267,140 @@ fn mutation_failure_classes_are_counted_and_bounded() {
     assert_eq!(report.failure_classes.len(), MAX_MUTATION_FAILURE_CLASSES);
     assert_eq!(report.failure_classes[0].count, 2);
     assert_eq!(report.failure_occurrences_omitted, 1);
+}
+
+#[tokio::test]
+async fn query_completion_updates_live_outcome_counters() {
+    let counters = Counters::new().await.unwrap();
+    let mut report = QueryPhaseReport::default();
+    let mut queried = BTreeSet::new();
+    let mut end_to_end = Latencies::new().unwrap();
+    let mut service = Latencies::new().unwrap();
+    let intended = Instant::now();
+    let phase_end = intended + Duration::from_secs(1);
+
+    record_query_completion(
+        Ok((
+            intended,
+            intended + Duration::from_millis(5),
+            Ok(Ok(QueryOutcome {
+                definition_position: 3,
+                revision: 7,
+                max_lag: 11,
+                service: Duration::from_millis(4),
+                correctness_error: false,
+            })),
+        )),
+        phase_end,
+        &mut report,
+        &mut queried,
+        &mut end_to_end,
+        &mut service,
+        &counters,
+    )
+    .await
+    .unwrap();
+    record_query_completion(
+        Ok((
+            intended,
+            intended + Duration::from_millis(6),
+            Ok(Ok(QueryOutcome {
+                correctness_error: true,
+                ..QueryOutcome::default()
+            })),
+        )),
+        phase_end,
+        &mut report,
+        &mut queried,
+        &mut end_to_end,
+        &mut service,
+        &counters,
+    )
+    .await
+    .unwrap();
+    let timeout = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+        .await
+        .unwrap_err();
+    record_query_completion(
+        Ok((intended, intended + Duration::from_millis(7), Err(timeout))),
+        phase_end,
+        &mut report,
+        &mut queried,
+        &mut end_to_end,
+        &mut service,
+        &counters,
+    )
+    .await
+    .unwrap();
+    record_query_completion(
+        Ok((
+            intended,
+            intended + Duration::from_millis(8),
+            Ok(Err(anyhow::anyhow!("request failed"))),
+        )),
+        phase_end,
+        &mut report,
+        &mut queried,
+        &mut end_to_end,
+        &mut service,
+        &counters,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.successful_queries, 1);
+    assert_eq!(report.correctness_errors, 1);
+    assert_eq!(report.timeouts, 1);
+    assert_eq!(report.request_errors, 1);
+    assert_eq!(counters.completed.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.correctness_errors.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.timeouts.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.errors.load(Ordering::Relaxed), 1);
+    assert!(queried.contains(&3));
+}
+
+#[tokio::test]
+async fn visibility_completion_is_separate_from_mutation_responses() {
+    let counters = Counters::new().await.unwrap();
+    counters.visibility_probe_planned();
+    counters.visibility_probe_started();
+    let mut visibility_tasks = JoinSet::new();
+    visibility_tasks.spawn(async {
+        VisibilitySampleOutcome {
+            canary: Canary {
+                id: 1,
+                version: 2,
+                completed_at: Instant::now(),
+                sample_eligible: true,
+            },
+            definition_position: 0,
+            definition_name: "index".into(),
+            started: true,
+            successful_receipt_to_probe_start: Duration::from_millis(3),
+            result: Ok(Duration::from_millis(7)),
+        }
+    });
+    let responses = MutationResponses {
+        report: MutationReport {
+            visibility_probes_planned: 1,
+            visibility_probes_with_successful_receipts: 1,
+            ..MutationReport::default()
+        },
+        visibility_tasks,
+        successful_receipt_to_probe_start: Latencies::new().unwrap(),
+        probe_start_to_visibility: Latencies::new().unwrap(),
+        successful_receipt_to_visibility: Latencies::new().unwrap(),
+        counters: counters.clone(),
+    };
+
+    let report = responses.finish_visibility().await.unwrap();
+    assert_eq!(report.visibility_probes_started, 1);
+    assert_eq!(report.visibility_probes_succeeded, 1);
+    assert_eq!(report.visibility_probes_failed, 0);
+    assert_eq!(
+        counters.visibility_probes_completed.load(Ordering::Relaxed),
+        1
+    );
 }
 
 #[tokio::test]

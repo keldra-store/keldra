@@ -88,21 +88,22 @@ KELDRA_V1_SCALE_MODE=sustained ./qualify-index-v1-ssd-scale.sh
 
 To retain symbolized CPU evidence for one exact matrix cell, opt in with the
 cell name emitted by the runner (for example,
-`d64-p1-w4-m1073741824-b1024-r5000-cw64`):
+`d64-p1-w4-m268435456-b1024-n256-r5000-cw64`):
 
 ```bash
 KELDRA_V1_SCALE_MODE=sustained \
 KELDRA_V1_SCALE_PROFILE=1 \
-KELDRA_V1_SCALE_PROFILE_CELL=d64-p1-w4-m1073741824-b1024-r5000-cw64 \
+KELDRA_V1_SCALE_PROFILE_CELL=d64-p1-w4-m268435456-b1024-n256-r5000-cw64 \
   ./qualify-index-v1-ssd-scale.sh
 ```
 
 The selected cell retains one `perf-concurrent-through-complete.data` recording,
 a flat demangled report, and a DWARF caller graph. Recording starts before the
 driver is launched so it cannot miss the beginning of concurrent ingest, and
-continues through mutation-response drain, authoritative-state loading, final
-pagination, and the post-load query phase until the driver publishes its
-terminal `complete` progress record. This deliberately includes setup and
+continues through mutation-response drain, the separately reported visibility
+observation phase, authoritative-state loading, final pagination, and the
+post-load query phase until the driver publishes its terminal `complete`
+progress record. This deliberately includes setup and
 baseline samples before concurrent ingest; the broader prefix is preferable to
 silently omitting the start of the workload under test. Report rendering is
 deferred until the workload driver, server, and resource samplers stop so it
@@ -363,7 +364,9 @@ network, block-I/O, and process counters; native cells use
 `progress.jsonl` is the append-only orchestration lifecycle;
 `active-driver-progress.jsonl` points to the current cell's flushed, one-second
 cumulative snapshots; latency histograms are reset at phase transitions, while
-operation counters remain cumulative. `status.json` is replaced atomically
+operation counters remain cumulative. Query completions, errors, timeouts,
+correctness failures, and visibility-probe progress are updated as their tasks
+finish rather than being retained until a phase boundary. `status.json` is replaced atomically
 after every lifecycle event. None of these files contains client credentials.
 
 The public API exposes definition IDs and freshness placement terms/indexes, but
@@ -416,7 +419,9 @@ ordinary query RPC, but may continue polling for the separate total observation
 timeout. The latter defaults to the 600-second drain timeout and is configured
 with `KELDRA_INDEX_CONTENTION_VISIBILITY_OBSERVATION_TIMEOUT_SECONDS`; a slow
 visibility observation is therefore measured rather than incorrectly classified as one
-slow RPC after 30 seconds. Samples rotate across definitions by sample ordinal,
+slow RPC after 30 seconds. The mutation-response drain timeout governs only
+outstanding mutation responses; visibility probes run in a separately named
+phase and each retains its own visibility-observation timeout. Samples rotate across definitions by sample ordinal,
 independently of canary IDs and the sampling interval. Observer concurrency is
 bounded and its queue delay is reported separately rather than silently folded
 into active observation time. Sampled probes use unique, non-overwritten object
