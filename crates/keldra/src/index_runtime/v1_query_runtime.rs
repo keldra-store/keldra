@@ -1137,8 +1137,7 @@ fn require_request(request: &LocalIndexQueryRequest) -> Result<(), Status> {
         ));
     }
     if let Some(cursor) = request.resume.as_ref() {
-        if cursor.commit_revision == 0
-            || cursor.authorization_revision != request.authorization_revision
+        if cursor.authorization_revision != request.authorization_revision
             || decode_query_position(&cursor.last_position).is_err()
         {
             return Err(Status::invalid_argument(
@@ -1639,6 +1638,53 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn local_request_accepts_a_genesis_cut_with_an_exact_position() {
+        let snapshot = QuerySnapshotIdentity::from_bytes([9; 32]).unwrap();
+        let mut genesis_root = root(partition(4, 5), 8);
+        genesis_root.root.through_atomic_position = 0;
+        genesis_root.cut_proof.common_cut.through_atomic_position = 0;
+        let pinned = PinnedRootVector {
+            cut: QueryCommonCut {
+                through_atomic_position: 0,
+            },
+            roots: vec![genesis_root],
+            generation_hashes: vec![[7; 32]],
+            directory: ProjectionFamilyPartitionDirectory {
+                family_id: [1; 32],
+                revision: 1,
+                entries: Vec::new(),
+            },
+            directory_version: keldra_store::VersionId(1),
+        };
+        let continuation =
+            QueryContinuation::Natural(StableDocumentKey::from_bytes([3; 32]).unwrap());
+        let request = LocalIndexQueryRequest {
+            storage_tenant: "tenant".into(),
+            tenant_id: 7,
+            bucket_id: 9,
+            definition: keldra_api::v1::IndexDefinition {
+                index_id: 11,
+                version: 13,
+                ..Default::default()
+            },
+            query: Default::default(),
+            limit: 100,
+            resume: Some(crate::index_service::IndexPageCursor {
+                commit_revision: 0,
+                last_position: encode_query_position(snapshot, [6; 32], &continuation, &pinned)
+                    .unwrap(),
+                authorization_revision: 19,
+            }),
+            candidate_visibility: Arc::new(Visibility),
+            authorization_revision: 19,
+            required_freshness: None,
+            deadline: tokio::time::Instant::now(),
+        };
+
+        assert!(require_request(&request).is_ok());
     }
 
     #[test]

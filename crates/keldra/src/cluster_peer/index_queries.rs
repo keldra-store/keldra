@@ -438,10 +438,7 @@ fn validate_request(request: &RoutedIndexQueryRequest) -> Result<(), Status> {
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     validate_query_kind(&request.definition, &request.query)?;
     if let Some(resume) = request.resume.as_ref() {
-        if resume.commit_revision == 0
-            || resume.authorization_revision == 0
-            || resume.last_position.is_empty()
-        {
+        if resume.authorization_revision == 0 || resume.last_position.is_empty() {
             return Err(Status::invalid_argument(
                 "routed index continuation is invalid",
             ));
@@ -578,14 +575,10 @@ fn validate_result(
             .sources
             .windows(2)
             .any(|pair| pair[0].node_id >= pair[1].node_id)
-        || (result.freshness.commit_revision == 0
-            && (result.freshness.published_at.is_some()
-                || result.freshness.placement_term != 0
-                || result.freshness.placement_index != 0))
+        || (result.freshness.commit_revision == 0 && result.freshness.published_at.is_some())
         || (result.freshness.commit_revision != 0
             && (result.freshness.placement_term == 0 || result.freshness.placement_index == 0))
         || result.next_position.as_ref().is_some_and(Vec::is_empty)
-        || (result.next_position.is_some() && result.freshness.commit_revision == 0)
     {
         return Err(Status::data_loss("routed index result is invalid"));
     }
@@ -887,6 +880,14 @@ mod tests {
     }
 
     #[test]
+    fn routed_continuation_accepts_the_genesis_atomic_cut() {
+        let mut request = request();
+        request.resume.as_mut().unwrap().commit_revision = 0;
+
+        assert!(validate_request(&request).is_ok());
+    }
+
+    #[test]
     fn routed_anonymous_marker_reconstructs_only_the_named_tenant() {
         let tokens = JwtManager::new(b"anonymous-index-route-secret-0123456789").unwrap();
         let (anonymous, plugin_scope) =
@@ -948,6 +949,33 @@ mod tests {
         let freshness = response.freshness.unwrap();
         assert_eq!(freshness.placement_term, 31);
         assert_eq!(freshness.placement_index, 32);
+    }
+
+    #[test]
+    fn routed_result_accepts_a_genesis_cut_pinned_by_position_and_fence() {
+        let result = ExecutedIndexQuery {
+            hits: Vec::new(),
+            facet_results: Vec::new(),
+            aggregate_results: Vec::new(),
+            freshness: keldra_api::v1::IndexFreshness {
+                commit_revision: 0,
+                published_at: None,
+                authorization_revision: 19,
+                placement_term: 1,
+                placement_index: 1,
+                index_id: 11,
+                definition_version: 13,
+                ..Default::default()
+            },
+            next_position: Some(b"engine-position".to_vec()),
+        };
+        let resume = IndexPageCursor {
+            commit_revision: 0,
+            last_position: b"engine-position".to_vec(),
+            authorization_revision: 19,
+        };
+
+        assert!(validate_result(&result, Some(&resume), 100).is_ok());
     }
 
     #[test]

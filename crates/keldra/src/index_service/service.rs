@@ -1123,10 +1123,7 @@ fn canonical_query_hash(query: &IndexQuery) -> [u8; 32] {
 }
 
 fn validate_page_cursor(cursor: &IndexPageCursor) -> Result<(), Status> {
-    if cursor.commit_revision == 0
-        || cursor.last_position.is_empty()
-        || cursor.authorization_revision == 0
-    {
+    if cursor.last_position.is_empty() || cursor.authorization_revision == 0 {
         Err(Status::invalid_argument(
             "index page token contains an invalid continuation",
         ))
@@ -1182,11 +1179,6 @@ fn validate_execution(
     if execution.next_position.as_ref().is_some_and(Vec::is_empty) {
         return Err(Status::data_loss(
             "index executor returned an empty continuation position",
-        ));
-    }
-    if execution.next_position.is_some() && execution.freshness.commit_revision == 0 {
-        return Err(Status::data_loss(
-            "index executor returned a continuation without a commit revision",
         ));
     }
     if execution.freshness.authorization_revision == 0 {
@@ -1530,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn continuations_require_commit_position_and_authorization_revision() {
+    fn continuations_require_position_and_authorization_revision() {
         assert!(
             validate_page_cursor(&IndexPageCursor {
                 commit_revision: 4,
@@ -1539,12 +1531,15 @@ mod tests {
             })
             .is_ok()
         );
-        for cursor in [
-            IndexPageCursor {
+        assert!(
+            validate_page_cursor(&IndexPageCursor {
                 commit_revision: 0,
-                last_position: b"after".to_vec(),
+                last_position: b"after-genesis".to_vec(),
                 authorization_revision: 8,
-            },
+            })
+            .is_ok()
+        );
+        for cursor in [
             IndexPageCursor {
                 commit_revision: 4,
                 last_position: Vec::new(),
@@ -1581,6 +1576,23 @@ mod tests {
                 ..Default::default()
             },
             next_position: None,
+        };
+
+        assert!(validate_execution(&execution, None, 100).is_ok());
+    }
+
+    #[test]
+    fn genesis_commit_cut_can_issue_a_continuation() {
+        let execution = super::super::boundary::ExecutedIndexQuery {
+            hits: Vec::new(),
+            facet_results: Vec::new(),
+            aggregate_results: Vec::new(),
+            freshness: IndexFreshness {
+                commit_revision: 0,
+                authorization_revision: 9,
+                ..Default::default()
+            },
+            next_position: Some(b"after-genesis".to_vec()),
         };
 
         assert!(validate_execution(&execution, None, 100).is_ok());

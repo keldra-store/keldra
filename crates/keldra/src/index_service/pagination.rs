@@ -54,6 +54,9 @@ impl IndexPageTokenClaims {
     }
 
     pub(crate) fn has_valid_envelope(&self) -> bool {
+        // Zero is the valid genesis atomic cut for an ordinary-write-only
+        // projection. The opaque engine position and its root proofs pin the
+        // exact immutable snapshot independently of this numeric cut.
         self.format == INDEX_PAGE_TOKEN_FORMAT
             && self.aud == INDEX_PAGE_TOKEN_AUDIENCE
             && self.purpose == INDEX_PAGE_TOKEN_PURPOSE
@@ -62,7 +65,6 @@ impl IndexPageTokenClaims {
             && self.bucket_id != 0
             && self.index_id != 0
             && self.definition_version != 0
-            && self.commit_revision != 0
             && self.authorization_revision != 0
             && !self.last_position.is_empty()
     }
@@ -131,10 +133,9 @@ fn require_binding(binding: IndexPageTokenBinding) -> Result<(), Status> {
 }
 
 fn require_cursor(cursor: &IndexPageCursor) -> Result<(), Status> {
-    if cursor.commit_revision == 0
-        || cursor.authorization_revision == 0
-        || cursor.last_position.is_empty()
-    {
+    // `commit_revision == 0` is a valid genesis atomic cut. Position and
+    // authorization evidence distinguish a real continuation from absence.
+    if cursor.authorization_revision == 0 || cursor.last_position.is_empty() {
         Err(Status::internal("index page cursor is invalid"))
     } else {
         Ok(())
@@ -187,6 +188,18 @@ mod tests {
             manager.decode(&caller, &token, binding()).unwrap(),
             cursor()
         );
+    }
+
+    #[test]
+    fn page_token_preserves_a_genesis_commit_cut() {
+        let manager = JwtManager::new(KEY).unwrap();
+        let caller = caller("tenant-a", "app-a");
+        let mut genesis = cursor();
+        genesis.commit_revision = 0;
+
+        let token = manager.encode(&caller, binding(), &genesis).unwrap();
+
+        assert_eq!(manager.decode(&caller, &token, binding()).unwrap(), genesis);
     }
 
     #[test]
