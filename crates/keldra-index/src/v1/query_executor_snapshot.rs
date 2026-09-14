@@ -181,8 +181,8 @@ impl QueryRunStream {
             };
             let encoded_bytes =
                 usize::try_from(expected.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-            if encoded_bytes > budget.limits.maximum_page_bytes {
-                return resource(encoded_bytes, budget.limits.maximum_page_bytes);
+            if encoded_bytes > budget.limits().maximum_page_bytes {
+                return resource(encoded_bytes, budget.limits().maximum_page_bytes);
             }
             let bytes = load_exact_pre_admitted(
                 loader,

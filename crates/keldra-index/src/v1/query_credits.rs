@@ -1,15 +1,32 @@
 //! Opaque memory admission retained for the complete query-block operation.
 
+use std::sync::{Arc, Mutex, MutexGuard};
+
 use crate::IndexError;
 
 use super::IndexingMemoryPermit;
 
 pub struct QueryBlockCredits {
+    ledger: Arc<Mutex<QueryCreditLedger>>,
+}
+
+struct QueryCreditLedger {
     admitted: usize,
     remaining: usize,
     loaded_blocks: usize,
     required_query_lease_bytes: Option<usize>,
     _permit: QueryCreditPermit,
+}
+
+/// An exact byte reservation which is returned to its originating ledger when
+/// it leaves scope. The reservation retains the root query permit even if the
+/// originating credit handle is dropped first.
+#[must_use = "dropping the reservation immediately returns its admitted bytes"]
+pub(crate) struct QueryCreditReservation {
+    ledger: Arc<Mutex<QueryCreditLedger>>,
+    bytes: usize,
+    loaded_block: bool,
+    active: bool,
 }
 
 pub trait QueryMemoryPermit: Send {
@@ -29,32 +46,54 @@ enum QueryCreditPermit {
 
 impl std::fmt::Debug for QueryBlockCredits {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ledger = lock_ledger(&self.ledger);
         formatter
             .debug_struct("QueryBlockCredits")
-            .field("admitted", &self.admitted)
-            .field("remaining", &self.remaining)
-            .field("loaded_blocks", &self.loaded_blocks)
+            .field("admitted", &ledger.admitted)
+            .field("remaining", &ledger.remaining)
+            .field("loaded_blocks", &ledger.loaded_blocks)
             .field(
                 "required_query_lease_bytes",
-                &self.required_query_lease_bytes,
+                &ledger.required_query_lease_bytes,
             )
             .finish_non_exhaustive()
     }
+}
+
+impl std::fmt::Debug for QueryCreditReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueryCreditReservation")
+            .field("bytes", &self.bytes)
+            .field("loaded_block", &self.loaded_block)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
+
+fn lock_ledger(ledger: &Mutex<QueryCreditLedger>) -> MutexGuard<'_, QueryCreditLedger> {
+    // No user code, allocation, or await runs while this lock is held. Recover
+    // the state after a panic so a poisoned mutex cannot strand the root permit.
+    ledger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl QueryBlockCredits {
     pub fn from_pipeline_permit(permit: IndexingMemoryPermit) -> Self {
         let admitted = permit.bytes();
         Self {
-            admitted,
-            remaining: admitted,
-            loaded_blocks: 0,
-            required_query_lease_bytes: None,
-            _permit: QueryCreditPermit::Pipeline {
-                permit,
-                maximum: admitted,
-                growable: false,
-            },
+            ledger: Arc::new(Mutex::new(QueryCreditLedger {
+                admitted,
+                remaining: admitted,
+                loaded_blocks: 0,
+                required_query_lease_bytes: None,
+                _permit: QueryCreditPermit::Pipeline {
+                    permit,
+                    maximum: admitted,
+                    growable: false,
+                },
+            })),
         }
     }
 
@@ -73,15 +112,17 @@ impl QueryBlockCredits {
             ));
         }
         Ok(Self {
-            admitted,
-            remaining: admitted,
-            loaded_blocks: 0,
-            required_query_lease_bytes: None,
-            _permit: QueryCreditPermit::Pipeline {
-                permit,
-                maximum,
-                growable: true,
-            },
+            ledger: Arc::new(Mutex::new(QueryCreditLedger {
+                admitted,
+                remaining: admitted,
+                loaded_blocks: 0,
+                required_query_lease_bytes: None,
+                _permit: QueryCreditPermit::Pipeline {
+                    permit,
+                    maximum,
+                    growable: true,
+                },
+            })),
         })
     }
 
@@ -93,99 +134,65 @@ impl QueryBlockCredits {
             ));
         }
         Ok(Self {
-            admitted: remaining,
-            remaining,
-            loaded_blocks: 0,
-            required_query_lease_bytes: None,
-            _permit: QueryCreditPermit::Query { _permit: permit },
+            ledger: Arc::new(Mutex::new(QueryCreditLedger {
+                admitted: remaining,
+                remaining,
+                loaded_blocks: 0,
+                required_query_lease_bytes: None,
+                _permit: QueryCreditPermit::Query { _permit: permit },
+            })),
         })
     }
 
-    pub const fn remaining(&self) -> usize {
-        self.remaining
+    /// Fork an independently mutable handle to the same exact query lease.
+    /// Pipeline credits remain exclusive because their growable permit is tied
+    /// to one ordered producer operation.
+    pub fn try_fork_query(&self) -> Result<Self, IndexError> {
+        if !matches!(
+            &lock_ledger(&self.ledger)._permit,
+            QueryCreditPermit::Query { .. }
+        ) {
+            return Err(IndexError::InvalidDefinition(
+                "only query-bound credits can be forked".into(),
+            ));
+        }
+        Ok(Self {
+            ledger: Arc::clone(&self.ledger),
+        })
+    }
+
+    pub fn remaining(&self) -> usize {
+        lock_ledger(&self.ledger).remaining
     }
 
     /// Total query lease needed by the reservation which exhausted these
     /// credits. Logical execution limits do not populate this retry signal.
     #[doc(hidden)]
-    pub const fn required_query_lease_bytes(&self) -> Option<usize> {
-        self.required_query_lease_bytes
+    pub fn required_query_lease_bytes(&self) -> Option<usize> {
+        lock_ledger(&self.ledger).required_query_lease_bytes
     }
 
     pub fn reserve(&mut self, bytes: usize) -> Result<(), IndexError> {
-        if bytes > self.remaining {
-            let additional = bytes - self.remaining;
-            let required = self
-                .admitted
-                .checked_sub(self.remaining)
-                .ok_or(IndexError::Integrity)?
-                .checked_add(bytes)
-                .ok_or(IndexError::OffsetOverflow)?;
-            match &mut self._permit {
-                QueryCreditPermit::Pipeline {
-                    permit,
-                    maximum,
-                    growable: true,
-                } => {
-                    let next = self
-                        .admitted
-                        .checked_add(additional)
-                        .ok_or(IndexError::OffsetOverflow)?;
-                    if next > *maximum {
-                        return Err(IndexError::ResourceLimit {
-                            needed: next,
-                            limit: *maximum,
-                        });
-                    }
-                    permit.grow_to(next).map_err(|admission| match admission {
-                        super::MemoryAdmission::ReplayRequired {
-                            available_bytes, ..
-                        } => IndexError::ResourceLimit {
-                            needed: next,
-                            limit: self.admitted.saturating_add(available_bytes),
-                        },
-                        super::MemoryAdmission::Admitted => unreachable!(),
-                    })?;
-                    self.admitted = next;
-                    self.remaining = self
-                        .remaining
-                        .checked_add(additional)
-                        .ok_or(IndexError::OffsetOverflow)?;
-                }
-                QueryCreditPermit::Query { .. } => {
-                    self.required_query_lease_bytes = Some(
-                        self.required_query_lease_bytes
-                            .map_or(required, |recorded| recorded.max(required)),
-                    );
-                    return Err(IndexError::ResourceLimit {
-                        needed: required,
-                        limit: self.admitted,
-                    });
-                }
-                QueryCreditPermit::Pipeline { .. } => {
-                    return Err(IndexError::ResourceLimit {
-                        needed: bytes,
-                        limit: self.remaining,
-                    });
-                }
-            }
-        }
-        self.remaining -= bytes;
-        Ok(())
+        reserve(&mut lock_ledger(&self.ledger), bytes)
+    }
+
+    pub(crate) fn reserve_scoped(
+        &mut self,
+        bytes: usize,
+    ) -> Result<QueryCreditReservation, IndexError> {
+        self.reserve(bytes)?;
+        Ok(QueryCreditReservation {
+            ledger: Arc::clone(&self.ledger),
+            bytes,
+            loaded_block: false,
+            active: true,
+        })
     }
 
     /// Return a general reservation after the associated bytes are no longer
     /// resident. Loaded-block lane accounting is handled separately.
     pub fn release(&mut self, bytes: usize) -> Result<(), IndexError> {
-        if self
-            .remaining
-            .checked_add(bytes)
-            .is_none_or(|remaining| remaining > self.admitted)
-        {
-            return Err(IndexError::Integrity);
-        }
-        self.remaining += bytes;
-        Ok(())
+        release(&mut lock_ledger(&self.ledger), bytes, false)
     }
 
     pub fn reserve_loaded_block(
@@ -193,33 +200,152 @@ impl QueryBlockCredits {
         bytes: usize,
         maximum_loaded_blocks: usize,
     ) -> Result<(), IndexError> {
-        if self.loaded_blocks >= maximum_loaded_blocks {
+        let mut ledger = lock_ledger(&self.ledger);
+        if ledger.loaded_blocks >= maximum_loaded_blocks {
             return Err(IndexError::ResourceLimit {
-                needed: self.loaded_blocks.saturating_add(1),
+                needed: ledger.loaded_blocks.saturating_add(1),
                 limit: maximum_loaded_blocks,
             });
         }
-        self.reserve(bytes)
-            .map(|()| self.loaded_blocks = self.loaded_blocks.saturating_add(1))
+        reserve(&mut ledger, bytes)?;
+        ledger.loaded_blocks = ledger.loaded_blocks.saturating_add(1);
+        Ok(())
+    }
+
+    pub(crate) fn reserve_loaded_block_scoped(
+        &mut self,
+        bytes: usize,
+        maximum_loaded_blocks: usize,
+    ) -> Result<QueryCreditReservation, IndexError> {
+        self.reserve_loaded_block(bytes, maximum_loaded_blocks)?;
+        Ok(QueryCreditReservation {
+            ledger: Arc::clone(&self.ledger),
+            bytes,
+            loaded_block: true,
+            active: true,
+        })
     }
 
     pub fn release_loaded_block(&mut self, bytes: usize) -> Result<(), IndexError> {
-        if self.loaded_blocks == 0
-            || self
-                .remaining
-                .checked_add(bytes)
-                .is_none_or(|remaining| remaining > self.admitted)
-        {
-            return Err(IndexError::Integrity);
+        release(&mut lock_ledger(&self.ledger), bytes, true)
+    }
+}
+
+fn reserve(ledger: &mut QueryCreditLedger, bytes: usize) -> Result<(), IndexError> {
+    if bytes > ledger.remaining {
+        let additional = bytes - ledger.remaining;
+        let admitted = ledger.admitted;
+        let remaining = ledger.remaining;
+        let required = admitted
+            .checked_sub(remaining)
+            .ok_or(IndexError::Integrity)?
+            .checked_add(bytes)
+            .ok_or(IndexError::OffsetOverflow)?;
+        if matches!(&ledger._permit, QueryCreditPermit::Query { .. }) {
+            ledger.required_query_lease_bytes = Some(
+                ledger
+                    .required_query_lease_bytes
+                    .map_or(required, |recorded| recorded.max(required)),
+            );
+            return Err(IndexError::ResourceLimit {
+                needed: required,
+                limit: admitted,
+            });
         }
-        self.remaining += bytes;
-        self.loaded_blocks -= 1;
-        Ok(())
+        let QueryCreditPermit::Pipeline {
+            permit,
+            maximum,
+            growable,
+        } = &mut ledger._permit
+        else {
+            unreachable!("query permits returned above")
+        };
+        if !*growable {
+            return Err(IndexError::ResourceLimit {
+                needed: bytes,
+                limit: remaining,
+            });
+        }
+        let next = admitted
+            .checked_add(additional)
+            .ok_or(IndexError::OffsetOverflow)?;
+        if next > *maximum {
+            return Err(IndexError::ResourceLimit {
+                needed: next,
+                limit: *maximum,
+            });
+        }
+        permit.grow_to(next).map_err(|admission| match admission {
+            super::MemoryAdmission::ReplayRequired {
+                available_bytes, ..
+            } => IndexError::ResourceLimit {
+                needed: next,
+                limit: admitted.saturating_add(available_bytes),
+            },
+            super::MemoryAdmission::Admitted => unreachable!(),
+        })?;
+        ledger.admitted = next;
+        ledger.remaining = remaining
+            .checked_add(additional)
+            .ok_or(IndexError::OffsetOverflow)?;
+    }
+    ledger.remaining -= bytes;
+    Ok(())
+}
+
+fn release(
+    ledger: &mut QueryCreditLedger,
+    bytes: usize,
+    loaded_block: bool,
+) -> Result<(), IndexError> {
+    if loaded_block && ledger.loaded_blocks == 0 {
+        return Err(IndexError::Integrity);
+    }
+    if ledger
+        .remaining
+        .checked_add(bytes)
+        .is_none_or(|remaining| remaining > ledger.admitted)
+    {
+        return Err(IndexError::Integrity);
+    }
+    ledger.remaining += bytes;
+    if loaded_block {
+        ledger.loaded_blocks -= 1;
+    }
+    Ok(())
+}
+
+impl QueryCreditReservation {
+    pub(crate) fn release_in_place(&mut self) -> Result<(), IndexError> {
+        let outcome = release(
+            &mut lock_ledger(&self.ledger),
+            self.bytes,
+            self.loaded_block,
+        );
+        if outcome.is_ok() {
+            self.active = false;
+        }
+        outcome
+    }
+}
+
+impl Drop for QueryCreditReservation {
+    fn drop(&mut self) {
+        if self.active {
+            let outcome = release(
+                &mut lock_ledger(&self.ledger),
+                self.bytes,
+                self.loaded_block,
+            );
+            debug_assert!(outcome.is_ok(), "scoped query-credit release must balance");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier, mpsc};
+
     use super::*;
     use crate::v1::{IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage};
 
@@ -310,6 +436,115 @@ mod tests {
             Err(IndexError::ResourceLimit { .. })
         ));
         assert_eq!(credits.required_query_lease_bytes(), None);
+        assert_eq!(credits.remaining(), 16);
+    }
+
+    #[test]
+    fn forked_query_handles_share_bytes_and_retry_high_water() {
+        let mut credits = QueryBlockCredits::from_query_permit(Box::new(QueryPermit(16))).unwrap();
+        let mut fork = credits.try_fork_query().unwrap();
+
+        credits.reserve(10).unwrap();
+        assert_eq!(fork.remaining(), 6);
+        assert_eq!(
+            fork.reserve(8),
+            Err(IndexError::ResourceLimit {
+                needed: 18,
+                limit: 16,
+            })
+        );
+        assert_eq!(credits.required_query_lease_bytes(), Some(18));
+        credits.release(10).unwrap();
+        fork.reserve(12).unwrap();
+        assert_eq!(
+            credits.reserve(8),
+            Err(IndexError::ResourceLimit {
+                needed: 20,
+                limit: 16,
+            })
+        );
+        assert_eq!(fork.required_query_lease_bytes(), Some(20));
+    }
+
+    #[test]
+    fn loaded_block_limit_is_global_across_query_forks() {
+        let mut credits = QueryBlockCredits::from_query_permit(Box::new(QueryPermit(16))).unwrap();
+        let mut fork = credits.try_fork_query().unwrap();
+
+        credits.reserve_loaded_block(4, 1).unwrap();
+        assert_eq!(
+            fork.reserve_loaded_block(4, 1),
+            Err(IndexError::ResourceLimit {
+                needed: 2,
+                limit: 1,
+            })
+        );
+        assert_eq!(credits.remaining(), 12);
+        fork.release_loaded_block(4).unwrap();
+        assert_eq!(credits.remaining(), 16);
+    }
+
+    #[test]
+    fn scoped_reservations_release_exact_bytes_and_block_lane() {
+        let mut credits = QueryBlockCredits::from_query_permit(Box::new(QueryPermit(16))).unwrap();
+        {
+            let _bytes = credits.reserve_scoped(6).unwrap();
+            assert_eq!(credits.remaining(), 10);
+        }
+        assert_eq!(credits.remaining(), 16);
+        {
+            let _block = credits.reserve_loaded_block_scoped(7, 1).unwrap();
+            assert_eq!(credits.remaining(), 9);
+        }
+        assert_eq!(credits.remaining(), 16);
+        credits.reserve_loaded_block(1, 1).unwrap();
+    }
+
+    #[test]
+    fn pipeline_credits_cannot_be_forked() {
+        let memory = memory(16);
+        let permit = memory
+            .acquire(IndexingMemoryStage::OrderingCatalog, 16)
+            .unwrap();
+        let credits = QueryBlockCredits::from_pipeline_permit(permit);
+
+        assert!(matches!(
+            credits.try_fork_query(),
+            Err(IndexError::InvalidDefinition(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_forks_cannot_over_admit_the_query_lease() {
+        let credits = QueryBlockCredits::from_query_permit(Box::new(QueryPermit(16))).unwrap();
+        let start = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let (sender, receiver) = mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let mut fork = credits.try_fork_query().unwrap();
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let sender = sender.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let reservation = fork.reserve_scoped(10).ok();
+                sender.send(reservation.is_some()).unwrap();
+                release.wait();
+                drop(reservation);
+            }));
+        }
+        drop(sender);
+
+        start.wait();
+        let outcomes = [receiver.recv().unwrap(), receiver.recv().unwrap()];
+        assert_eq!(outcomes.into_iter().filter(|admitted| *admitted).count(), 1);
+        assert_eq!(credits.remaining(), 6);
+        assert_eq!(credits.required_query_lease_bytes(), Some(20));
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
         assert_eq!(credits.remaining(), 16);
     }
 }

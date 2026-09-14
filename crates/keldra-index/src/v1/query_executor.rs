@@ -30,9 +30,18 @@ pub use admission::{
 #[path = "query_executor_authorization.rs"]
 mod authorization;
 use admission::{match_all_live_documents, resident_gate_bytes, resident_selected_candidate_bytes};
-use authorization::authorize_selected_candidates;
+use authorization::{authorize_selected_candidates, resident_authorized_candidate_bytes};
+#[path = "query_executor_budget.rs"]
+mod budget;
+use budget::Budget;
+#[path = "query_executor_general.rs"]
+mod general;
+use general::execute_general_query;
 #[path = "query_executor_natural.rs"]
 mod natural;
+use super::query_parallel::{
+    QueryPartitionExecutor, SerialQueryPartitionExecutor, execute_typed_json_query_with_executor,
+};
 use natural::execute_bounded_natural_equal;
 #[path = "query_executor_snapshot.rs"]
 mod snapshot;
@@ -46,10 +55,14 @@ use validate::validate_request;
 #[path = "query_executor_values.rs"]
 mod values;
 use values::{
-    aggregate_candidates, count_predicate_nodes, facet_candidates, leaf_field, order_candidates,
-    page_summary, predicate_requires_universe, requested_value_recipes, resident_scalar_bytes,
-    resource, validate_leaf_capability,
+    BoundedCandidateCollector, PartitionValueColumns, QueryCandidate, QueryValueReducers,
+    count_predicate_nodes, leaf_field, page_summary, predicate_requires_universe,
+    requested_value_recipes, resident_scalar_bytes, resource, validate_leaf_capability,
 };
+pub use values::{ExplicitQuerySearchAfter, QueryPublicValueEncoder, ScalarSortKeyValueEncoder};
+
+/// Maximum number of physical partition roots admitted by one logical query.
+pub const MAX_QUERY_PARTITIONS: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryExecutionLimits {
@@ -72,7 +85,7 @@ pub struct QueryExecutionLimits {
 impl QueryExecutionLimits {
     pub const fn default_for_memory() -> Self {
         Self {
-            maximum_partitions: 1_024,
+            maximum_partitions: MAX_QUERY_PARTITIONS,
             maximum_page_loads: 8_192,
             maximum_run_loads: 4_096,
             maximum_block_loads: 4_096,
@@ -91,6 +104,7 @@ impl QueryExecutionLimits {
 
     pub fn validate(self) -> Result<Self, IndexError> {
         if self.maximum_partitions == 0
+            || self.maximum_partitions > MAX_QUERY_PARTITIONS
             || self.maximum_page_loads == 0
             || self.maximum_run_loads == 0
             || self.maximum_block_loads == 0
@@ -135,13 +149,6 @@ pub struct TypedJsonQueryRequest {
     /// requested, because those operations require the complete candidate set.
     pub resume_after_document: Option<StableDocumentKey>,
     pub result_limit: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct QueryCandidate {
-    pub partition: ProjectionPartitionIdentity,
-    pub document: StableDocumentKey,
-    pub material_source_version: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -210,76 +217,18 @@ pub trait QueryArtifactLoader: Send {
         _block: Arc<DecodedQueryBlock>,
     ) {
     }
-}
 
-struct Budget {
-    limits: QueryExecutionLimits,
-    evidence: QueryLoadEvidence,
-    heap_bytes: usize,
-}
-
-impl Budget {
-    fn load(&mut self, kind: QueryArtifactKind, bytes: usize) -> Result<(), IndexError> {
-        let counter = match kind {
-            QueryArtifactKind::Page => &mut self.evidence.pages,
-            QueryArtifactKind::Run => &mut self.evidence.runs,
-            QueryArtifactKind::Block => &mut self.evidence.blocks,
-        };
-        let limit = match kind {
-            QueryArtifactKind::Page => self.limits.maximum_page_loads,
-            QueryArtifactKind::Run => self.limits.maximum_run_loads,
-            QueryArtifactKind::Block => self.limits.maximum_block_loads,
-        };
-        *counter = counter.checked_add(1).ok_or(IndexError::OffsetOverflow)?;
-        if *counter > limit {
-            return resource(*counter, limit);
-        }
-        self.evidence.bytes = self
-            .evidence
-            .bytes
-            .checked_add(bytes)
-            .ok_or(IndexError::OffsetOverflow)?;
-        if self.evidence.bytes > self.limits.maximum_loaded_bytes {
-            return resource(self.evidence.bytes, self.limits.maximum_loaded_bytes);
-        }
-        Ok(())
-    }
-
-    fn candidates(&self, count: usize) -> Result<(), IndexError> {
-        if count > self.limits.maximum_candidates {
-            resource(count, self.limits.maximum_candidates)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn reserve_heap(
-        &mut self,
-        credits: &mut QueryBlockCredits,
-        bytes: usize,
-    ) -> Result<(), IndexError> {
-        let next = self
-            .heap_bytes
-            .checked_add(bytes)
-            .ok_or(IndexError::OffsetOverflow)?;
-        if next > self.limits.maximum_heap_bytes {
-            return resource(next, self.limits.maximum_heap_bytes);
-        }
-        credits.reserve(bytes)?;
-        self.heap_bytes = next;
-        Ok(())
-    }
-
-    fn release_heap(
-        &mut self,
-        credits: &mut QueryBlockCredits,
-        bytes: usize,
-    ) -> Result<(), IndexError> {
-        self.heap_bytes = self
-            .heap_bytes
-            .checked_sub(bytes)
-            .ok_or(IndexError::Integrity)?;
-        credits.release(bytes)
+    /// Fork a query-local handle for independent partition work.
+    ///
+    /// A returned handle must address the same immutable artifact authority and
+    /// share any authoritative validation/admission state with this handle.
+    /// Disposable decoded caches may be shared as an optimization but cannot
+    /// change correctness. The default keeps existing loaders serial.
+    fn try_fork_query_loader(&self) -> Result<Option<Self>, IndexError>
+    where
+        Self: Sized,
+    {
+        Ok(None)
     }
 }
 
@@ -299,7 +248,10 @@ pub(super) fn matching_run_blocks(
     &run.blocks[start..end]
 }
 
-pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateAdmission>(
+pub async fn execute_typed_json_query<
+    L: QueryArtifactLoader + 'static,
+    A: QueryCandidateAdmission,
+>(
     loader: &mut L,
     admission: &mut A,
     common_cut: QueryCommonCut,
@@ -310,6 +262,90 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
     block_limits: QueryBlockLimits,
     block_credits: &mut QueryBlockCredits,
 ) -> Result<(TypedJsonQueryResult, Arc<ValidatedQuerySnapshot>), IndexError> {
+    execute_typed_json_query_with_executor(
+        loader,
+        admission,
+        common_cut,
+        pins,
+        validated_snapshot,
+        request,
+        execution_limits,
+        block_limits,
+        block_credits,
+        &SerialQueryPartitionExecutor,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_typed_json_query_with_cursor<
+    L: QueryArtifactLoader + 'static,
+    A: QueryCandidateAdmission,
+    E: QueryPublicValueEncoder,
+>(
+    loader: &mut L,
+    admission: &mut A,
+    common_cut: QueryCommonCut,
+    pins: &[PinnedPartitionQueryRoot],
+    validated_snapshot: Option<Arc<ValidatedQuerySnapshot>>,
+    request: &TypedJsonQueryRequest,
+    explicit_search_after: Option<&ExplicitQuerySearchAfter>,
+    public_value_encoder: &E,
+    execution_limits: QueryExecutionLimits,
+    block_limits: QueryBlockLimits,
+    block_credits: &mut QueryBlockCredits,
+) -> Result<
+    (
+        TypedJsonQueryResult,
+        Arc<ValidatedQuerySnapshot>,
+        Option<ExplicitQuerySearchAfter>,
+    ),
+    IndexError,
+> {
+    execute_typed_json_query_with_cursor_and_executor(
+        loader,
+        admission,
+        common_cut,
+        pins,
+        validated_snapshot,
+        request,
+        explicit_search_after,
+        public_value_encoder,
+        execution_limits,
+        block_limits,
+        block_credits,
+        &SerialQueryPartitionExecutor,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_typed_json_query_with_cursor_and_executor<
+    L: QueryArtifactLoader + 'static,
+    A: QueryCandidateAdmission,
+    E: QueryPublicValueEncoder,
+    X: QueryPartitionExecutor,
+>(
+    loader: &mut L,
+    admission: &mut A,
+    common_cut: QueryCommonCut,
+    pins: &[PinnedPartitionQueryRoot],
+    validated_snapshot: Option<Arc<ValidatedQuerySnapshot>>,
+    request: &TypedJsonQueryRequest,
+    explicit_search_after: Option<&ExplicitQuerySearchAfter>,
+    public_value_encoder: &E,
+    execution_limits: QueryExecutionLimits,
+    block_limits: QueryBlockLimits,
+    block_credits: &mut QueryBlockCredits,
+    partition_executor: &X,
+) -> Result<
+    (
+        TypedJsonQueryResult,
+        Arc<ValidatedQuerySnapshot>,
+        Option<ExplicitQuerySearchAfter>,
+    ),
+    IndexError,
+> {
     let execution_limits = execution_limits.validate()?;
     let block_limits = block_limits.validate()?;
     let snapshot_identity = validated_snapshot
@@ -329,11 +365,12 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
         execution_limits,
         validated_snapshot.is_none(),
     )?;
-    let mut budget = Budget {
-        limits: execution_limits,
-        evidence: QueryLoadEvidence::default(),
-        heap_bytes: 0,
-    };
+    if explicit_search_after.is_some() && request.resume_after_document.is_some() {
+        return Err(IndexError::InvalidQuery(
+            "natural and explicitly ordered continuations cannot be combined".into(),
+        ));
+    }
+    let mut budget = Budget::new(execution_limits);
     let mut snapshot_resident_bytes = 0usize;
     let mut snapshot_index_bytes = 0usize;
     let snapshot = if let Some(snapshot) = validated_snapshot {
@@ -374,6 +411,7 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
     if let Some(candidates) = execute_bounded_natural_equal(
         loader,
         admission,
+        partition_executor,
         common_cut,
         &manifests,
         request,
@@ -392,233 +430,32 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
                 candidates,
                 facets: Vec::new(),
                 aggregates: Vec::new(),
-                loads: budget.evidence,
+                loads: budget.evidence(),
             },
             snapshot,
+            None,
         ));
     }
 
-    let mut selected = BTreeMap::<StableDocumentKey, QueryAdmissionCandidate>::new();
-    for manifest in manifests {
-        let view = &manifest.view;
-        let needs_universe = request
-            .predicate
-            .as_ref()
-            .is_none_or(predicate_requires_universe);
-        let mut gates = if needs_universe {
-            load_latest_gates(
-                loader,
-                manifest,
-                request.logical.membership,
-                QueryBlockKind::Gate,
-                block_limits,
-                block_credits,
-                &mut budget,
-            )
-            .await?
-        } else {
-            BTreeMap::new()
-        };
-        let mut keys = if let Some(predicate) = request.predicate.as_ref() {
-            evaluate_predicate(
-                loader,
-                manifest,
-                &gates,
-                &contracts,
-                request.logical.membership,
-                predicate,
-                request.resume_after_document,
-                block_limits,
-                block_credits,
-                &mut budget,
-            )
-            .await?
-        } else {
-            match_all_live_documents(&gates)
-        };
-        let key_bytes = request
-            .predicate
-            .as_ref()
-            .map(|_| {
-                keys.len()
-                    .checked_mul(std::mem::size_of::<StableDocumentKey>())
-                    .ok_or(IndexError::OffsetOverflow)
-            })
-            .transpose()?;
-        if let Some(resume) = request.resume_after_document {
-            let mut resumed = keys.split_off(&resume);
-            resumed.remove(&resume);
-            keys = resumed;
-        }
-        if !needs_universe {
-            let aligned = load_latest_gates_for_keys(
-                loader,
-                manifest,
-                request.logical.membership,
-                QueryBlockKind::Gate,
-                &keys,
-                block_limits,
-                block_credits,
-                &mut budget,
-            )
-            .await?;
-            let (aligned_gates, aligned_bytes) = aligned.into_parts();
-            if aligned_gates.len() != keys.len() {
-                return Err(IndexError::Integrity);
-            }
-            for (document, gate) in keys.into_iter().zip(aligned_gates) {
-                let gate = gate.ok_or(IndexError::Integrity)?;
-                if gate.live {
-                    let candidate = QueryAdmissionCandidate {
-                        partition: view.pin.partition,
-                        handoff_lineage_id: view.pin.handoff_lineage_id,
-                        covered_through_source_position: view
-                            .pin
-                            .covered_through_source_position()?,
-                        document,
-                        material_source_version: gate.material_source_version,
-                        current_source_version: gate.current_source_version,
-                        source_path: gate.source_path.ok_or(IndexError::Integrity)?,
-                        canonical_source_path: gate.canonical_source_path,
-                        result_path: gate.result_path.ok_or(IndexError::Integrity)?,
-                        result_version: gate.result_version,
-                    };
-                    select_handoff_candidate(&mut selected, candidate, block_credits, &mut budget)?;
-                    budget.candidates(selected.len())?;
-                }
-            }
-            budget.release_heap(block_credits, aligned_bytes)?;
-            if let Some(bytes) = key_bytes {
-                budget.release_heap(block_credits, bytes)?;
-            }
-            continue;
-        }
-        for document in keys {
-            let gate = gates.remove(&document).ok_or(IndexError::Integrity)?;
-            let gate_bytes = resident_gate_bytes(&gate)?;
-            if gate.live {
-                let candidate = QueryAdmissionCandidate {
-                    partition: view.pin.partition,
-                    handoff_lineage_id: view.pin.handoff_lineage_id,
-                    covered_through_source_position: view.pin.covered_through_source_position()?,
-                    document,
-                    material_source_version: gate.material_source_version,
-                    current_source_version: gate.current_source_version,
-                    source_path: gate.source_path.ok_or(IndexError::Integrity)?,
-                    canonical_source_path: gate.canonical_source_path,
-                    result_path: gate.result_path.ok_or(IndexError::Integrity)?,
-                    result_version: gate.result_version,
-                };
-                select_handoff_candidate(&mut selected, candidate, block_credits, &mut budget)?;
-                budget.candidates(selected.len())?;
-            }
-            budget.release_heap(block_credits, gate_bytes)?;
-        }
-        if let Some(bytes) = key_bytes {
-            budget.release_heap(block_credits, bytes)?;
-        }
-        let remaining_gate_bytes = gates.values().try_fold(0usize, |total, gate| {
-            total
-                .checked_add(resident_gate_bytes(gate)?)
-                .ok_or(IndexError::OffsetOverflow)
-        })?;
-        drop(gates);
-        budget.release_heap(block_credits, remaining_gate_bytes)?;
-    }
-
-    let (mut authorized, mut candidates) = authorize_selected_candidates(
+    let general = execute_general_query(
+        loader,
         admission,
-        selected,
-        request.logical.logical_index_id,
-        request.logical.logical_definition_version,
+        partition_executor,
         common_cut,
+        manifests,
+        request,
+        &contracts,
+        explicit_search_after,
+        public_value_encoder,
+        block_limits,
         block_credits,
         &mut budget,
-        (request.order.is_empty() && request.facets.is_empty() && request.aggregates.is_empty())
-            .then_some(request.result_limit),
     )
     .await?;
-
-    let needed_values = requested_value_recipes(request, &contracts)?;
-    let mut values = BTreeMap::new();
-    for manifest in manifests {
-        let view = &manifest.view;
-        let partition_count = candidates
-            .iter()
-            .filter(|candidate| candidate.partition == view.pin.partition)
-            .count();
-        budget.reserve_heap(
-            block_credits,
-            partition_count
-                .checked_mul(std::mem::size_of::<StableDocumentKey>())
-                .ok_or(IndexError::OffsetOverflow)?,
-        )?;
-        let partition_candidates = candidates
-            .iter()
-            .filter_map(|candidate| {
-                (candidate.partition == view.pin.partition).then_some(candidate.document)
-            })
-            .collect::<BTreeSet<_>>();
-        for recipe in &needed_values {
-            let loaded = load_candidate_doc_values(
-                loader,
-                manifest,
-                *recipe,
-                &partition_candidates,
-                block_limits,
-                block_credits,
-                &mut budget,
-            )
-            .await?;
-            for (key, value) in loaded {
-                budget.reserve_heap(
-                    block_credits,
-                    std::mem::size_of::<(
-                        (
-                            ProjectionPartitionIdentity,
-                            StableDocumentKey,
-                            RecipeIdentity,
-                        ),
-                        Option<Vec<ScalarValue>>,
-                    )>(),
-                )?;
-                values.insert((view.pin.partition, key, *recipe), value);
-            }
-        }
-    }
-
-    let facets = facet_candidates(
-        &candidates,
-        &request.facets,
-        &contracts,
-        &values,
-        block_credits,
-        &mut budget,
-    )?;
-    let aggregates = aggregate_candidates(
-        &candidates,
-        &request.aggregates,
-        &contracts,
-        &values,
-        block_credits,
-        &mut budget,
-    )?;
-    order_candidates(
-        &mut candidates,
-        request.result_limit,
-        &request.order,
-        &contracts,
-        &values,
-    )?;
-    candidates.truncate(request.result_limit);
-    let candidates = candidates
-        .into_iter()
-        .map(|candidate| {
-            authorized
-                .remove(&(candidate.partition, candidate.document))
-                .ok_or(IndexError::Integrity)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let candidates = general.candidates;
+    let facets = general.facets;
+    let aggregates = general.aggregates;
+    let next_search_after = general.next;
     block_credits.release(snapshot_resident_bytes)?;
     budget.release_heap(block_credits, snapshot_index_bytes)?;
     Ok((
@@ -627,9 +464,10 @@ pub async fn execute_typed_json_query<L: QueryArtifactLoader, A: QueryCandidateA
             candidates,
             facets,
             aggregates,
-            loads: budget.evidence,
+            loads: budget.evidence(),
         },
         snapshot,
+        next_search_after,
     ))
 }
 
@@ -1518,8 +1356,8 @@ async fn seek_term_postings<L: QueryArtifactLoader>(
                 drop(cursor);
                 credits.release_loaded_block(bytes.len())?;
             }
-            if newest.len() > budget.limits.maximum_expanded_terms {
-                return resource(newest.len(), budget.limits.maximum_expanded_terms);
+            if newest.len() > budget.limits().maximum_expanded_terms {
+                return resource(newest.len(), budget.limits().maximum_expanded_terms);
             }
         }
         budget.release_heap(credits, entry_bytes)?;
@@ -1814,8 +1652,8 @@ async fn load_selected_terms<L: QueryArtifactLoader>(
                 ScalarValue::String(term) if term.starts_with(prefix) => output.push(entry),
                 _ => break,
             }
-            if output.len() > budget.limits.maximum_expanded_terms {
-                return resource(output.len(), budget.limits.maximum_expanded_terms);
+            if output.len() > budget.limits().maximum_expanded_terms {
+                return resource(output.len(), budget.limits().maximum_expanded_terms);
             }
             next = cursor.next()?;
         }
@@ -1832,12 +1670,18 @@ async fn load_candidate_doc_values<L: QueryArtifactLoader>(
     loader: &mut L,
     manifest: &PartitionManifest,
     recipe: RecipeIdentity,
-    candidates: &BTreeSet<StableDocumentKey>,
+    candidates: &[QueryCandidate],
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<BTreeMap<StableDocumentKey, Option<Vec<ScalarValue>>>, IndexError> {
-    let mut output = BTreeMap::new();
+) -> Result<(Vec<Option<Option<Vec<ScalarValue>>>>, usize), IndexError> {
+    let slot_bytes = candidates
+        .len()
+        .checked_mul(std::mem::size_of::<Option<Option<Vec<ScalarValue>>>>())
+        .ok_or(IndexError::OffsetOverflow)?;
+    budget.reserve_heap(credits, slot_bytes)?;
+    let mut resident_bytes = slot_bytes;
+    let mut output = vec![None; candidates.len()];
     for (_, descriptor) in manifest.matching_blocks(QueryBlockKind::DocValue, recipe) {
         let minimum = StableDocumentKey::from_bytes(
             descriptor
@@ -1853,7 +1697,10 @@ async fn load_candidate_doc_values<L: QueryArtifactLoader>(
                 .try_into()
                 .map_err(|_| IndexError::Integrity)?,
         )?;
-        if candidates.range(minimum..=maximum_key).next().is_none() {
+        let candidate_start = candidates.partition_point(|candidate| candidate.document < minimum);
+        let candidate_end =
+            candidates.partition_point(|candidate| candidate.document <= maximum_key);
+        if candidate_start == candidate_end {
             continue;
         }
         let maximum =
@@ -1874,13 +1721,17 @@ async fn load_candidate_doc_values<L: QueryArtifactLoader>(
         credits.release(bytes.len())?;
         let mut cursor =
             QueryBlockCursor::from_verified_content(descriptor, &bytes, block_limits, credits)?;
-        for candidate in candidates.range(minimum..=maximum_key) {
-            if output.contains_key(candidate) {
+        for (relative, candidate) in candidates[candidate_start..candidate_end]
+            .iter()
+            .enumerate()
+        {
+            let output_index = candidate_start + relative;
+            if output[output_index].is_some() {
                 continue;
             }
-            if let Some(record) = cursor.seek_to(&candidate.bytes())? {
+            if let Some(record) = cursor.seek_to(&candidate.document.bytes())? {
                 let value = decode_doc_value(record, block_limits)?;
-                if value.document == *candidate {
+                if value.document == candidate.document {
                     let resident = value
                         .value
                         .as_ref()
@@ -1894,14 +1745,17 @@ async fn load_candidate_doc_values<L: QueryArtifactLoader>(
                         .transpose()?
                         .unwrap_or(0);
                     budget.reserve_heap(credits, resident)?;
-                    output.insert(*candidate, value.value);
+                    resident_bytes = resident_bytes
+                        .checked_add(resident)
+                        .ok_or(IndexError::OffsetOverflow)?;
+                    output[output_index] = Some(value.value);
                 }
             }
         }
         drop(cursor);
         credits.release_loaded_block(bytes.len())?;
     }
-    Ok(output)
+    Ok((output, resident_bytes))
 }
 
 #[cfg(test)]

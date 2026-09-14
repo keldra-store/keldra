@@ -44,11 +44,7 @@ fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
     }
 }
 fn budget() -> Budget {
-    Budget {
-        limits: QueryExecutionLimits::default_for_memory(),
-        evidence: QueryLoadEvidence::default(),
-        heap_bytes: 0,
-    }
+    Budget::new(QueryExecutionLimits::default_for_memory())
 }
 
 #[test]
@@ -104,6 +100,23 @@ fn candidate(partition: ProjectionPartitionIdentity, covered: u64) -> QueryAdmis
         canonical_source_path: None,
         result_path: "results/candidate.json".into(),
         result_version: covered,
+    }
+}
+
+fn authorized(candidate: QueryCandidate) -> AuthorizedQueryCandidate {
+    AuthorizedQueryCandidate {
+        candidate: QueryAdmissionCandidate {
+            partition: candidate.partition,
+            handoff_lineage_id: [7; 32],
+            covered_through_source_position: 1,
+            document: candidate.document,
+            material_source_version: candidate.material_source_version,
+            current_source_version: candidate.material_source_version,
+            source_path: "objects/candidate.json".into(),
+            canonical_source_path: None,
+            result_path: "results/candidate.json".into(),
+            result_version: candidate.material_source_version,
+        },
     }
 }
 
@@ -163,11 +176,7 @@ fn preverified_artifact_loader_is_not_rehashed() {
 fn logical_heap_limit_does_not_report_query_credit_exhaustion() {
     let mut limits = QueryExecutionLimits::default_for_memory();
     limits.maximum_heap_bytes = 8;
-    let mut budget = Budget {
-        limits,
-        evidence: QueryLoadEvidence::default(),
-        heap_bytes: 0,
-    };
+    let mut budget = Budget::new(limits);
     let mut credits = credits(1024);
 
     assert!(matches!(
@@ -222,7 +231,7 @@ fn sequential_block_scans_reuse_transient_heap_credits() {
         drop(loaded);
         budget.release_heap(&mut credits, charged).unwrap();
         assert_eq!(credits.remaining(), initial);
-        assert_eq!(budget.heap_bytes, 0);
+        assert_eq!(budget.heap_bytes(), 0);
     }
 }
 
@@ -400,7 +409,7 @@ fn handoff_replacement_owns_exactly_one_candidate_charge() {
     first.result_path = "b".into();
     select_handoff_candidate(&mut selected, first.clone(), &mut credits, &mut budget).unwrap();
     assert_eq!(
-        budget.heap_bytes,
+        budget.heap_bytes(),
         resident_selected_candidate_bytes(&first).unwrap()
     );
 
@@ -415,14 +424,14 @@ fn handoff_replacement_owns_exactly_one_candidate_charge() {
     )
     .unwrap();
     assert_eq!(
-        budget.heap_bytes,
+        budget.heap_bytes(),
         resident_selected_candidate_bytes(&replacement).unwrap()
     );
 
     let ignored = candidate(partition(3), 8);
     select_handoff_candidate(&mut selected, ignored, &mut credits, &mut budget).unwrap();
     assert_eq!(
-        budget.heap_bytes,
+        budget.heap_bytes(),
         resident_selected_candidate_bytes(&replacement).unwrap()
     );
 }
@@ -591,7 +600,7 @@ fn absent_predicate_matches_the_live_membership_universe_only() {
 fn logical_order_tie_break_does_not_depend_on_handoff_partition() {
     let first = StableDocumentKey::from_bytes([1; 32]).unwrap();
     let second = StableDocumentKey::from_bytes([2; 32]).unwrap();
-    let mut candidates = vec![
+    let candidates = [
         QueryCandidate {
             partition: partition(1),
             document: second,
@@ -603,19 +612,42 @@ fn logical_order_tie_break_does_not_depend_on_handoff_partition() {
             material_source_version: 1,
         },
     ];
-    let result_limit = candidates.len();
-    order_candidates(
-        &mut candidates,
-        result_limit,
+    let mut credits = credits(64 * 1024);
+    let mut budget = budget();
+    let mut collector = BoundedCandidateCollector::new(
+        candidates.len(),
         &[],
         &BTreeMap::new(),
-        &BTreeMap::new(),
+        None,
+        &mut credits,
+        &mut budget,
     )
     .unwrap();
+    let columns = PartitionValueColumns::new(Vec::new(), 0);
+    for candidate in candidates {
+        let authorized = authorized(candidate);
+        budget
+            .reserve_heap(
+                &mut credits,
+                resident_authorized_candidate_bytes(&authorized).unwrap(),
+            )
+            .unwrap();
+        collector
+            .observe(
+                candidate,
+                authorized,
+                0,
+                &columns,
+                &mut credits,
+                &mut budget,
+            )
+            .unwrap();
+    }
+    let (candidates, _) = collector.finish(&mut credits, &mut budget).unwrap();
     assert_eq!(
         candidates
             .iter()
-            .map(|candidate| candidate.document)
+            .map(|candidate| candidate.candidate.document)
             .collect::<Vec<_>>(),
         vec![first, second]
     );
@@ -629,7 +661,6 @@ fn unauthorized_values_cannot_leak_into_facets_or_aggregates() {
         document: StableDocumentKey::from_bytes([10; 32]).unwrap(),
         material_source_version: 1,
     };
-    let denied = StableDocumentKey::from_bytes([11; 32]).unwrap();
     let field_id = FieldId::new(0);
     let recipe = RecipeIdentity::new([9; 32]).unwrap();
     let field = FieldSchema {
@@ -646,48 +677,46 @@ fn unauthorized_values_cannot_leak_into_facets_or_aggregates() {
         date_format: None,
     };
     let contracts = [(field_id, QueryFieldBinding { field, recipe })].into();
-    let values = [
-        (
-            (partition, admitted.document, recipe),
-            Some(vec![ScalarValue::String("visible".into())]),
-        ),
-        (
-            (partition, denied, recipe),
-            Some(vec![ScalarValue::String("secret".into())]),
-        ),
-    ]
-    .into();
     let mut credits = credits(64 * 1024);
     let mut budget = budget();
-    let facets = facet_candidates(
-        &[admitted],
+    let mut reducers = QueryValueReducers::new(
         &[FacetRequest {
             field_id,
             limit: 10,
         }],
-        &contracts,
-        &values,
-        &mut credits,
-        &mut budget,
-    )
-    .unwrap();
-    assert_eq!(
-        facets[0].buckets[0].value,
-        ScalarValue::String("visible".into())
-    );
-    let aggregates = aggregate_candidates(
-        &[admitted],
         &[AggregateRequest {
             field_id,
             operation: AggregateOperation::Count,
         }],
         &contracts,
-        &values,
         &mut credits,
         &mut budget,
     )
     .unwrap();
+    let mut columns = PartitionValueColumns::new(vec![recipe], 0);
+    columns
+        .push(
+            vec![Some(Some(vec![ScalarValue::String("visible".into())]))],
+            0,
+        )
+        .unwrap();
+    reducers
+        .observe(
+            0,
+            &columns,
+            &contracts,
+            &ScalarSortKeyValueEncoder,
+            &mut credits,
+            &mut budget,
+        )
+        .unwrap();
+    let (facets, aggregates) = reducers.finish(&mut credits, &mut budget).unwrap();
+    assert_eq!(
+        facets[0].buckets[0].value,
+        ScalarValue::String("visible".into())
+    );
     assert_eq!(aggregates[0].contributing_count, 1);
+    let _ = admitted;
 }
 
 #[test]
@@ -714,30 +743,13 @@ fn repeated_values_facet_once_but_aggregate_every_occurrence() {
         date_format: None,
     };
     let contracts = [(field_id, QueryFieldBinding { field, recipe })].into();
-    let values = [(
-        (partition, admitted.document, recipe),
-        Some(vec![ScalarValue::Signed(2), ScalarValue::Signed(2)]),
-    )]
-    .into();
     let mut credits = credits(64 * 1024);
     let mut budget = budget();
-    let facets = facet_candidates(
-        &[admitted],
+    let mut reducers = QueryValueReducers::new(
         &[FacetRequest {
             field_id,
             limit: 10,
         }],
-        &contracts,
-        &values,
-        &mut credits,
-        &mut budget,
-    )
-    .unwrap();
-    assert_eq!(facets[0].buckets.len(), 1);
-    assert_eq!(facets[0].buckets[0].count, 1);
-
-    let aggregates = aggregate_candidates(
-        &[admitted],
         &[
             AggregateRequest {
                 field_id,
@@ -749,12 +761,188 @@ fn repeated_values_facet_once_but_aggregate_every_occurrence() {
             },
         ],
         &contracts,
-        &values,
         &mut credits,
         &mut budget,
     )
     .unwrap();
+    let mut columns = PartitionValueColumns::new(vec![recipe], 0);
+    columns
+        .push(
+            vec![Some(Some(vec![
+                ScalarValue::Signed(2),
+                ScalarValue::Signed(2),
+            ]))],
+            0,
+        )
+        .unwrap();
+    reducers
+        .observe(
+            0,
+            &columns,
+            &contracts,
+            &ScalarSortKeyValueEncoder,
+            &mut credits,
+            &mut budget,
+        )
+        .unwrap();
+    let (facets, aggregates) = reducers.finish(&mut credits, &mut budget).unwrap();
+    assert_eq!(facets[0].buckets.len(), 1);
+    assert_eq!(facets[0].buckets[0].count, 1);
     assert_eq!(aggregates[0].contributing_count, 2);
     assert_eq!(aggregates[1].contributing_count, 2);
     assert_eq!(aggregates[1].value, Some(ScalarValue::Signed(4)));
+    let _ = admitted;
+}
+
+struct DecimalPublicEncoder;
+
+impl QueryPublicValueEncoder for DecimalPublicEncoder {
+    fn encode_public_value(
+        &self,
+        _field: &FieldSchema,
+        value: &ScalarValue,
+    ) -> Result<Vec<u8>, IndexError> {
+        match value {
+            ScalarValue::Signed(value) => Ok(value.to_string().into_bytes()),
+            _ => Err(IndexError::Integrity),
+        }
+    }
+}
+
+#[test]
+fn facet_limit_uses_public_value_order_for_equal_counts() {
+    let field_id = FieldId::new(0);
+    let recipe = RecipeIdentity::new([9; 32]).unwrap();
+    let field = FieldSchema {
+        id: field_id,
+        name: "value".into(),
+        source_selector: "/value".into(),
+        field_type: FieldType::SignedInteger,
+        cardinality: Cardinality::Multi,
+        allow_missing: true,
+        allow_null: false,
+        collation: crate::typed_json::Collation::BinaryUtf8,
+        capabilities: FieldCapabilities::FACET,
+        analyzer: None,
+        date_format: None,
+    };
+    let contracts = [(field_id, QueryFieldBinding { field, recipe })].into();
+    let mut credits = credits(64 * 1024);
+    let mut budget = budget();
+    let mut reducers = QueryValueReducers::new(
+        &[FacetRequest { field_id, limit: 1 }],
+        &[],
+        &contracts,
+        &mut credits,
+        &mut budget,
+    )
+    .unwrap();
+    let mut columns = PartitionValueColumns::new(vec![recipe], 0);
+    columns
+        .push(
+            vec![
+                Some(Some(vec![ScalarValue::Signed(2)])),
+                Some(Some(vec![ScalarValue::Signed(10)])),
+            ],
+            0,
+        )
+        .unwrap();
+    for row in 0..2 {
+        reducers
+            .observe(
+                row,
+                &columns,
+                &contracts,
+                &DecimalPublicEncoder,
+                &mut credits,
+                &mut budget,
+            )
+            .unwrap();
+    }
+    let (facets, _) = reducers.finish(&mut credits, &mut budget).unwrap();
+    assert_eq!(facets[0].buckets.len(), 1);
+    assert_eq!(facets[0].buckets[0].value, ScalarValue::Signed(10));
+}
+
+#[test]
+fn explicit_search_after_is_exclusive_and_uses_document_tie_break() {
+    let field_id = FieldId::new(0);
+    let recipe = RecipeIdentity::new([9; 32]).unwrap();
+    let field = FieldSchema {
+        id: field_id,
+        name: "value".into(),
+        source_selector: "/value".into(),
+        field_type: FieldType::SignedInteger,
+        cardinality: Cardinality::Single,
+        allow_missing: false,
+        allow_null: false,
+        collation: crate::typed_json::Collation::BinaryUtf8,
+        capabilities: FieldCapabilities::ORDER,
+        analyzer: None,
+        date_format: None,
+    };
+    let contracts = [(field_id, QueryFieldBinding { field, recipe })].into();
+    let first_document = StableDocumentKey::from_bytes([1; 32]).unwrap();
+    let second_document = StableDocumentKey::from_bytes([2; 32]).unwrap();
+    let third_document = StableDocumentKey::from_bytes([3; 32]).unwrap();
+    let cursor = ExplicitQuerySearchAfter {
+        values: vec![Some(ScalarValue::Signed(7))],
+        document: first_document,
+    };
+    let mut credits = credits(64 * 1024);
+    let mut budget = budget();
+    let mut collector = BoundedCandidateCollector::new(
+        1,
+        &[OrderField {
+            field_id,
+            direction: crate::typed_json::OrderDirection::Ascending,
+        }],
+        &contracts,
+        Some(&cursor),
+        &mut credits,
+        &mut budget,
+    )
+    .unwrap();
+    let mut columns = PartitionValueColumns::new(vec![recipe], 0);
+    columns
+        .push(
+            vec![
+                Some(Some(vec![ScalarValue::Signed(7)])),
+                Some(Some(vec![ScalarValue::Signed(7)])),
+                Some(Some(vec![ScalarValue::Signed(8)])),
+            ],
+            0,
+        )
+        .unwrap();
+    for (row, document) in [first_document, second_document, third_document]
+        .into_iter()
+        .enumerate()
+    {
+        let candidate = QueryCandidate {
+            partition: partition(1),
+            document,
+            material_source_version: 1,
+        };
+        let authorized = authorized(candidate);
+        budget
+            .reserve_heap(
+                &mut credits,
+                resident_authorized_candidate_bytes(&authorized).unwrap(),
+            )
+            .unwrap();
+        collector
+            .observe(
+                candidate,
+                authorized,
+                row,
+                &columns,
+                &mut credits,
+                &mut budget,
+            )
+            .unwrap();
+    }
+    let (candidates, next) = collector.finish(&mut credits, &mut budget).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].candidate.document, second_document);
+    assert_eq!(next.unwrap().document, second_document);
 }

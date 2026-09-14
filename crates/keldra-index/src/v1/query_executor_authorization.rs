@@ -121,7 +121,7 @@ pub(super) async fn authorize_selected_candidates<A: QueryCandidateAdmission>(
     Ok((authorized, candidates))
 }
 
-fn resident_authorized_candidate_bytes(
+pub(super) fn resident_authorized_candidate_bytes(
     admitted: &AuthorizedQueryCandidate,
 ) -> Result<usize, IndexError> {
     let candidate = &admitted.candidate;

@@ -19,6 +19,7 @@ mod query_credits;
 mod query_doc_values;
 mod query_executor;
 mod query_gate;
+mod query_parallel;
 mod query_prepare;
 #[cfg(test)]
 mod query_run;
@@ -85,15 +86,21 @@ pub use query_compaction::{ChargedQueryRunCompaction, compact_encoded_query_runs
 pub use query_credits::{QueryBlockCredits, QueryMemoryPermit};
 pub use query_doc_values::{decode_doc_value, encode_doc_value};
 pub use query_executor::{
-    AuthorizedQueryCandidate, MAX_QUERY_CANDIDATE_ADMISSION_BATCH, PinnedPartitionQueryRoot,
-    QueryAdmissionCandidate, QueryAdmissionContext, QueryArtifactKind, QueryArtifactLoad,
-    QueryArtifactLoader, QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits,
-    QueryFieldBinding, QueryLoadEvidence, QueryRootCutProof, QuerySnapshotIdentity,
+    AuthorizedQueryCandidate, ExplicitQuerySearchAfter, MAX_QUERY_CANDIDATE_ADMISSION_BATCH,
+    MAX_QUERY_PARTITIONS, PinnedPartitionQueryRoot, QueryAdmissionCandidate, QueryAdmissionContext,
+    QueryArtifactKind, QueryArtifactLoad, QueryArtifactLoader, QueryCandidateAdmission,
+    QueryCommonCut, QueryExecutionLimits, QueryFieldBinding, QueryLoadEvidence,
+    QueryPublicValueEncoder, QueryRootCutProof, QuerySnapshotIdentity, ScalarSortKeyValueEncoder,
     TypedJsonQueryRequest, TypedJsonQueryResult, ValidatedQuerySnapshot, execute_typed_json_query,
+    execute_typed_json_query_with_cursor, execute_typed_json_query_with_cursor_and_executor,
     query_snapshot_identity,
 };
 pub use query_gate::{
     MAX_QUERY_DOCUMENT_PATH_BYTES, QueryDocumentGate, decode_document_gate, encode_document_gate,
+};
+pub use query_parallel::{
+    QueryPartitionExecutor, QueryPartitionJob, SerialQueryPartitionExecutor,
+    execute_typed_json_query_with_executor, resolve_query_partition_results,
 };
 pub use query_prepare::{
     ChargedProjectionQueryRunArtifacts, PreparedQueryMembershipDelta, PreparedQueryMutationBatch,

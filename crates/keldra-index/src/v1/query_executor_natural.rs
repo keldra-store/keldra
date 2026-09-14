@@ -4,13 +4,14 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use crate::IndexError;
 use crate::typed_json::{Predicate, ScalarValue};
 
+use super::super::query_parallel::QueryPartitionJob;
 use super::admission::resident_selected_candidate_bytes;
 use super::{
     AuthorizedQueryCandidate, Budget, PartitionManifest, QueryAdmissionCandidate,
     QueryArtifactLoader, QueryBlockCredits, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits,
-    QueryCandidateAdmission, QueryCommonCut, QueryPosting, StableDocumentKey,
-    TypedJsonQueryRequest, authorize_selected_candidates, candidate_is_current, decode_posting,
-    load_latest_gates_for_keys, load_selected_terms, select_handoff_candidate,
+    QueryCandidateAdmission, QueryCommonCut, QueryPartitionExecutor, QueryPosting,
+    StableDocumentKey, TypedJsonQueryRequest, authorize_selected_candidates, candidate_is_current,
+    decode_posting, load_latest_gates_for_keys, load_selected_terms, select_handoff_candidate,
 };
 
 const POSTING_SOURCE_CHUNK: usize = 32;
@@ -20,11 +21,13 @@ const POSTING_SOURCE_CHUNK: usize = 32;
 /// suffix of the posting list for every continuation token.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_bounded_natural_equal<
-    L: QueryArtifactLoader,
+    L: QueryArtifactLoader + 'static,
     A: QueryCandidateAdmission,
+    X: QueryPartitionExecutor,
 >(
     loader: &mut L,
     admission: &mut A,
+    partition_executor: &X,
     common_cut: QueryCommonCut,
     manifests: &[PartitionManifest],
     request: &TypedJsonQueryRequest,
@@ -54,23 +57,23 @@ pub(super) async fn execute_bounded_natural_equal<
     let mut output = Vec::with_capacity(request.result_limit);
 
     while output.len() < request.result_limit {
-        let mut partition_pages = Vec::with_capacity(manifests.len());
+        let partition_pages = scan_equal_partition_pages(
+            loader,
+            partition_executor,
+            manifests,
+            request.logical.membership,
+            binding.recipe,
+            value,
+            resume,
+            scan_limit,
+            block_limits,
+            credits,
+            budget,
+        )
+        .await?;
         let mut safe_through = None;
         let mut more = false;
-        for manifest in manifests {
-            let page = scan_equal_partition_page(
-                loader,
-                manifest,
-                request.logical.membership,
-                binding.recipe,
-                value,
-                resume,
-                scan_limit,
-                block_limits,
-                credits,
-                budget,
-            )
-            .await?;
+        for page in &partition_pages {
             if page.truncated {
                 more = true;
                 let through = page.scan_through.ok_or(IndexError::Integrity)?;
@@ -78,7 +81,6 @@ pub(super) async fn execute_bounded_natural_equal<
                     safe_through.map_or(through, |current: StableDocumentKey| current.min(through)),
                 );
             }
-            partition_pages.push(page);
         }
 
         let mut selected = BTreeMap::new();
@@ -127,6 +129,113 @@ struct PartitionCandidatePage {
     candidates: Vec<QueryAdmissionCandidate>,
     scan_through: Option<StableDocumentKey>,
     truncated: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_equal_partition_pages<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
+    loader: &mut L,
+    partition_executor: &X,
+    manifests: &[PartitionManifest],
+    membership_recipe: super::RecipeIdentity,
+    field_recipe: super::RecipeIdentity,
+    value: &ScalarValue,
+    resume: Option<StableDocumentKey>,
+    limit: usize,
+    block_limits: QueryBlockLimits,
+    credits: &mut QueryBlockCredits,
+    budget: &mut Budget,
+) -> Result<Vec<PartitionCandidatePage>, IndexError> {
+    if manifests.len() <= 1 || partition_executor.maximum_parallelism() <= 1 {
+        let mut pages = Vec::with_capacity(manifests.len());
+        for manifest in manifests {
+            pages.push(
+                scan_equal_partition_page(
+                    loader,
+                    manifest,
+                    membership_recipe,
+                    field_recipe,
+                    value,
+                    resume,
+                    limit,
+                    block_limits,
+                    credits,
+                    budget,
+                )
+                .await?,
+            );
+        }
+        return Ok(pages);
+    }
+
+    // Fork every loader before starting work. A loader without a shared
+    // query-local authority falls back to the exact serial path rather than
+    // manufacturing a second cache or storage authority.
+    let mut loaders = Vec::with_capacity(manifests.len());
+    for _ in manifests {
+        let Some(fork) = loader.try_fork_query_loader()? else {
+            let mut pages = Vec::with_capacity(manifests.len());
+            for manifest in manifests {
+                pages.push(
+                    scan_equal_partition_page(
+                        loader,
+                        manifest,
+                        membership_recipe,
+                        field_recipe,
+                        value,
+                        resume,
+                        limit,
+                        block_limits,
+                        credits,
+                        budget,
+                    )
+                    .await?,
+                );
+            }
+            return Ok(pages);
+        };
+        loaders.push(fork);
+    }
+
+    let mut jobs =
+        Vec::<(usize, QueryPartitionJob<PartitionCandidatePage>)>::with_capacity(manifests.len());
+    for (ordinal, (mut loader, manifest)) in loaders.into_iter().zip(manifests).enumerate() {
+        let manifest = PartitionManifest {
+            view: manifest.view,
+            runs: manifest.runs.clone(),
+        };
+        let value = value.clone();
+        let (mut task_budget, mut task_credits) = budget.try_fork_query(credits)?;
+        jobs.push((
+            ordinal,
+            Box::pin(async move {
+                scan_equal_partition_page(
+                    &mut loader,
+                    &manifest,
+                    membership_recipe,
+                    field_recipe,
+                    &value,
+                    resume,
+                    limit,
+                    block_limits,
+                    &mut task_credits,
+                    &mut task_budget,
+                )
+                .await
+            }),
+        ));
+    }
+
+    let mut keyed_pages = partition_executor.execute_ordered(jobs).await?;
+    keyed_pages.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+    if keyed_pages.len() != manifests.len()
+        || keyed_pages
+            .iter()
+            .enumerate()
+            .any(|(expected, (actual, _))| expected != *actual)
+    {
+        return Err(IndexError::Integrity);
+    }
+    Ok(keyed_pages.into_iter().map(|(_, page)| page).collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -638,11 +747,7 @@ mod tests {
         ] {
             let mut credits =
                 QueryBlockCredits::from_query_permit(Box::new(Permit(1024 * 1024))).unwrap();
-            let mut budget = Budget {
-                limits: super::super::QueryExecutionLimits::default_for_memory(),
-                evidence: super::super::QueryLoadEvidence::default(),
-                heap_bytes: 0,
-            };
+            let mut budget = Budget::new(super::super::QueryExecutionLimits::default_for_memory());
             let (page, truncated) = ready(load_bounded_equal_postings(
                 &mut loader,
                 &manifest,
