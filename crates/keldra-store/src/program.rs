@@ -1081,11 +1081,24 @@ impl Store {
         let record = serde_json::from_slice::<StoredPreparedBundle>(&bundle_bytes)
             .map_err(program_storage_error)?;
         validate_prepared_record(&record)?;
+        let mut validated_blobs = BTreeSet::new();
+        let mut validation_buffer = vec![0_u8; 64 * 1024];
         for write in &record.writes {
-            if let Some(blob) = &write.version.blob {
-                // `open_blob` verifies the ordinary byte plane without
-                // copying output payloads into the bundle.
-                self.open_blob(blob).await.map_err(program_mutation_error)?;
+            if let Some(blob) = &write.version.blob
+                && validated_blobs.insert((blob.hash, blob.length))
+            {
+                // Traverse the complete bounded stream so every referenced
+                // local chunk must exist and agree with its manifest layout.
+                let mut reader = self.open_blob(blob).await.map_err(program_mutation_error)?;
+                loop {
+                    let read = reader
+                        .read(&mut validation_buffer)
+                        .await
+                        .map_err(program_storage_error)?;
+                    if read == 0 {
+                        break;
+                    }
+                }
             }
         }
 

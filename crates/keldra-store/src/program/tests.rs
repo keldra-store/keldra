@@ -571,6 +571,42 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
 }
 
 #[tokio::test]
+async fn prepared_bundle_loading_consumes_each_output_blob() {
+    let (_temporary, store, verified) = configured_store().await;
+    let engine = store.program_engine(&verified).unwrap();
+    let lease = engine
+        .prepare(
+            &InvocationContext::new("tenant").unwrap(),
+            &invocation("validate-output-bytes", ExpectedHead::Absent),
+        )
+        .await
+        .unwrap();
+    let prepared = store.prepare_program_bundle(&lease).await.unwrap();
+    let payload_cf = store
+        .db
+        .cf_handle(crate::store::CF_PAYLOAD_ARTIFACTS)
+        .unwrap();
+    let payload_key = store
+        .db
+        .iterator_cf(payload_cf, rocksdb::IteratorMode::Start)
+        .find_map(|entry| {
+            let (key, value) = entry.unwrap();
+            (value.as_ref() == br#"{"value":1}"#).then(|| key.into_vec())
+        })
+        .expect("prepared output payload is persisted");
+    store
+        .db
+        .put_cf(payload_cf, payload_key, b"truncated")
+        .unwrap();
+
+    let error = store
+        .prepared_program_bundle(prepared.bundle, prepared.durability_evidence_hash)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("wrong encoded length"));
+}
+
+#[tokio::test]
 async fn local_atomic_finalization_waits_for_deferred_reference_delivery() {
     let (_temporary, store, verified) = configured_store().await;
     let deferred_blob = store.stage_blob(b"deferred predecessor").await.unwrap();

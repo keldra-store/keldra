@@ -75,6 +75,10 @@ impl ArtifactManifest {
         reference: &BlobRef,
         storage_id: [u8; 32],
     ) -> Result<Self, MutationError> {
+        // Streaming chunks are persisted before their final content identity is
+        // known. Promotion deliberately retains that upload storage identity so
+        // sealing is zero-copy; unlike shard storage IDs, it is not derivable
+        // from the completed BlobRef.
         Ok(Self {
             kind: ArtifactKind::Complete,
             encoded_length: reference.length,
@@ -339,6 +343,16 @@ fn artifact_storage(message: impl Into<String>) -> MutationError {
     MutationError::Storage(message.into())
 }
 
+fn trusted_local_payload_read_options() -> rocksdb::ReadOptions {
+    let mut options = rocksdb::ReadOptions::default();
+    // Payload integrity is established when bytes cross an untrusted boundary.
+    // Local payload artifacts are immutable and their manifest/state identity is
+    // validated by Keldra, so repeating RocksDB's block/blob checksum here is
+    // duplicate work on every read.
+    options.set_verify_checksums(false);
+    options
+}
+
 impl Store {
     pub(super) fn stage_inline_complete_artifact(
         &self,
@@ -374,12 +388,14 @@ impl Store {
         reference: &BlobRef,
     ) -> Result<Option<ArtifactManifest>, MutationError> {
         let derived = ArtifactManifest::complete(reference)?;
+        let read_options = trusted_local_payload_read_options();
         if derived.layout == ArtifactLayout::Inline {
             if self
                 .db
-                .get_pinned_cf(
+                .get_pinned_cf_opt(
                     self.cf(CF_PAYLOAD_ARTIFACTS)?,
                     tagged_identity(COMPLETE_INLINE_TAG, &derived.storage_id),
+                    &read_options,
                 )
                 .map_err(storage_error)?
                 .is_some()
@@ -390,7 +406,11 @@ impl Store {
         let identity = complete_identity(reference);
         let Some(encoded) = self
             .db
-            .get_pinned_cf(self.cf(CF_PAYLOAD_MANIFESTS)?, manifest_key(&identity))
+            .get_pinned_cf_opt(
+                self.cf(CF_PAYLOAD_MANIFESTS)?,
+                manifest_key(&identity),
+                &read_options,
+            )
             .map_err(storage_error)?
         else {
             return Ok(None);
@@ -420,8 +440,7 @@ impl Store {
         let length = usize::try_from(manifest.encoded_length)
             .map_err(|_| artifact_storage("payload artifact length does not fit in memory"))?;
         let cf = self.cf(CF_PAYLOAD_ARTIFACTS)?;
-        let mut read_options = rocksdb::ReadOptions::default();
-        read_options.set_verify_checksums(false);
+        let read_options = trusted_local_payload_read_options();
 
         match manifest.layout {
             ArtifactLayout::Inline => {
@@ -484,19 +503,23 @@ impl Store {
         identity: &ShardIdentity,
     ) -> Result<Option<ArtifactManifest>, MutationError> {
         let encoded_identity = identity.encode();
+        let read_options = trusted_local_payload_read_options();
         let Some(encoded) = self
             .db
-            .get_cf(
+            .get_cf_opt(
                 self.cf(CF_PAYLOAD_MANIFESTS)?,
                 manifest_key(&encoded_identity),
+                &read_options,
             )
             .map_err(storage_error)?
         else {
             return Ok(None);
         };
         let manifest = ArtifactManifest::decode(&encoded)?;
+        let expected_storage_id = artifact_storage_id(&encoded_identity);
         if manifest.kind != ArtifactKind::Shard
             || manifest.integrity != *blake3::hash(&encoded_identity).as_bytes()
+            || manifest.storage_id != expected_storage_id
         {
             return Err(artifact_storage("shard manifest contradicts its identity"));
         }
@@ -897,11 +920,7 @@ impl RocksArtifactReader {
                     "payload artifact column family is missing",
                 )
             })?;
-            let mut read_options = rocksdb::ReadOptions::default();
-            // Payload integrity is checked when bytes cross an untrusted
-            // boundary. Rechecking RocksDB's internal checksum on every read
-            // of immutable local content duplicates that boundary check.
-            read_options.set_verify_checksums(false);
+            let read_options = trusted_local_payload_read_options();
             self.cached = self
                 .db
                 .get_cf_opt(cf, key, &read_options)
@@ -1001,6 +1020,78 @@ mod tests {
 
         let error = store.read_complete_manifest(&reference).unwrap_err();
         assert!(error.to_string().contains("manifest is malformed"));
+    }
+
+    #[tokio::test]
+    async fn trusted_local_manifest_read_still_rejects_identity_mismatch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let reference = BlobRef {
+            hash: [0x72; 32],
+            length: PAYLOAD_ARTIFACT_CHUNK_BYTES as u64 + 1,
+        };
+        let identity = complete_identity(&reference);
+        let mut manifest = ArtifactManifest::complete(&reference).unwrap();
+        manifest.integrity = [0x73; 32];
+        store
+            .db
+            .put_cf(
+                store.cf(CF_PAYLOAD_MANIFESTS).unwrap(),
+                manifest_key(&identity),
+                manifest.encode(),
+            )
+            .unwrap();
+
+        let error = store.read_complete_manifest(&reference).unwrap_err();
+        assert!(error.to_string().contains("contradicts its identity"));
+    }
+
+    #[tokio::test]
+    async fn shard_manifest_rejects_a_noncanonical_storage_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let identity = ShardIdentity::new(
+            BlobRef {
+                hash: [0x76; 32],
+                length: 1_024,
+            },
+            0,
+        );
+        let encoded_identity = identity.encode();
+        let mut manifest = ArtifactManifest::shard(&identity, 512).unwrap();
+        manifest.storage_id = [0x77; 32];
+        store
+            .db
+            .put_cf(
+                store.cf(CF_PAYLOAD_MANIFESTS).unwrap(),
+                manifest_key(&encoded_identity),
+                manifest.encode(),
+            )
+            .unwrap();
+
+        let error = store.read_shard_manifest(&identity).unwrap_err();
+        assert!(error.to_string().contains("contradicts its identity"));
+    }
+
+    #[test]
+    fn uploaded_complete_manifest_preserves_its_zero_copy_storage_identity() {
+        let reference = BlobRef {
+            hash: [0x78; 32],
+            length: PAYLOAD_ARTIFACT_CHUNK_BYTES as u64 + 1,
+        };
+        let upload_id = [0x79; 32];
+
+        let manifest = ArtifactManifest::uploaded_complete(&reference, upload_id).unwrap();
+
+        assert_eq!(manifest.storage_id, upload_id);
+        assert_ne!(
+            manifest.storage_id,
+            artifact_storage_id(&complete_identity(&reference))
+        );
     }
 
     #[tokio::test]
