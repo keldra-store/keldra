@@ -52,7 +52,7 @@ pub(super) async fn replay_object_paths(
                     )
                 }));
             }
-            LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => {
+            LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleBatchChanged(_) => {
                 // The paused final `transfer_all` installs current complete
                 // aggregates and payload lifecycle; there is no object path to replay.
             }

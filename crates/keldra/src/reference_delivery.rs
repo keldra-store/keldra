@@ -873,11 +873,7 @@ impl ReferenceDelivery {
                 routed.push((change.offset(), BTreeMap::new()));
                 continue;
             }
-            for delta in change
-                .reference_deltas()
-                .iter()
-                .filter(|delta| delta.change > 0)
-            {
+            for delta in change.reference_deltas().filter(|delta| delta.change > 0) {
                 if !prepared.contains(&delta.blob)
                     && let Err(message) = self.payloads.prepare(&placement, &delta.blob).await
                 {
@@ -1106,7 +1102,7 @@ fn locally_self_proving_visibility(change: &LocalChange) -> bool {
     matches!(
         change,
         LocalChange::AggregateChanged(_)
-            | LocalChange::ContentLifecycleChanged(_)
+            | LocalChange::ContentLifecycleBatchChanged(_)
             | LocalChange::AtomicBatchPublished(_)
             | LocalChange::SequenceGap(_)
     )
@@ -1155,10 +1151,10 @@ fn validate_cursor(
     Ok(())
 }
 
-fn route_effects(
+fn route_effects<'a>(
     placement: &ReferencePlacement,
     profile: ErasureProfile,
-    deltas: &[keldra_store::ReferenceDelta],
+    deltas: impl IntoIterator<Item = &'a keldra_store::ReferenceDelta>,
 ) -> BTreeMap<NodeId, Vec<DestinationReferenceDelta>> {
     let mut routed = BTreeMap::<NodeId, Vec<DestinationReferenceDelta>>::new();
     for delta in deltas {

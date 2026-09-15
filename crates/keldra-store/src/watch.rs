@@ -18,6 +18,8 @@ pub const DEFAULT_WATCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Maximum number of source-local invalidations returned by one storage scan.
 pub const MAX_LOCAL_INVALIDATION_SCAN_RECORDS: usize = 1_024;
+/// Maximum number of lifecycle effects carried by one journal position.
+pub const MAX_CONTENT_LIFECYCLE_BATCH_TRANSITIONS: usize = 4_096;
 /// One complete atomic delivery unit must fit an empty index journal page.
 pub const MAX_ATOMIC_BATCH_PUBLISHED_BYTES: u64 = 16 * 1024 * 1024;
 /// A separate count bound keeps descriptor construction and validation bounded
@@ -389,16 +391,23 @@ pub struct AggregateChanged {
     pub revision: u64,
 }
 
-/// Change to one content lifecycle record. Internal handoff consumers fetch
-/// the current typed state by `blob_identity`; public watches filter it out.
+/// One exact content-lifecycle transition inside a source-journal batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContentLifecycleChanged {
-    pub offset: u64,
+pub struct ContentLifecycleTransition {
     pub blob_identity: Vec<u8>,
     pub revision: u64,
     pub reference_deltas: Vec<ReferenceDelta>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub accounting_transition: Option<ContentAccountingTransition>,
+}
+
+/// One ordered, bounded batch of content-lifecycle transitions. Internal
+/// handoff consumers fetch current typed state by `blob_identity`; public
+/// watches filter the complete batch out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentLifecycleBatchChanged {
+    pub offset: u64,
+    pub transitions: Vec<ContentLifecycleTransition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,7 +511,7 @@ pub enum LocalChange {
     ObjectHead(ObjectHeadChange),
     RetainedVersionDeleted(RetainedVersionDeletedChange),
     AggregateChanged(AggregateChanged),
-    ContentLifecycleChanged(ContentLifecycleChanged),
+    ContentLifecycleBatchChanged(ContentLifecycleBatchChanged),
     AtomicBatchPublished(AtomicBatchPublished),
     /// A source position reserved by an interrupted parallel commit. It
     /// carries no derived effect but keeps the source cursor contiguous.
@@ -736,12 +745,24 @@ impl LocalChange {
         reference_deltas: Vec<ReferenceDelta>,
         accounting_transition: Option<ContentAccountingTransition>,
     ) -> Self {
-        Self::ContentLifecycleChanged(ContentLifecycleChanged {
+        Self::ContentLifecycleBatchChanged(ContentLifecycleBatchChanged {
             offset,
-            blob_identity,
-            revision,
-            reference_deltas,
-            accounting_transition,
+            transitions: vec![ContentLifecycleTransition {
+                blob_identity,
+                revision,
+                reference_deltas,
+                accounting_transition,
+            }],
+        })
+    }
+
+    pub(crate) fn content_lifecycle_batch_changed(
+        offset: u64,
+        transitions: Vec<ContentLifecycleTransition>,
+    ) -> Self {
+        Self::ContentLifecycleBatchChanged(ContentLifecycleBatchChanged {
+            offset,
+            transitions,
         })
     }
 
@@ -768,20 +789,26 @@ impl LocalChange {
             Self::ObjectHead(change) => change.offset,
             Self::RetainedVersionDeleted(change) => change.offset,
             Self::AggregateChanged(change) => change.offset,
-            Self::ContentLifecycleChanged(change) => change.offset,
+            Self::ContentLifecycleBatchChanged(change) => change.offset,
             Self::AtomicBatchPublished(change) => change.offset,
             Self::SequenceGap(change) => change.offset,
         }
     }
 
-    pub fn reference_deltas(&self) -> &[ReferenceDelta] {
+    pub fn reference_deltas(&self) -> LocalChangeReferenceDeltas<'_> {
         match self {
-            Self::ObjectHead(change) => &change.reference_deltas,
-            Self::RetainedVersionDeleted(change) => &change.reference_deltas,
-            Self::AggregateChanged(_) => &[],
-            Self::ContentLifecycleChanged(change) => &change.reference_deltas,
-            Self::AtomicBatchPublished(_) => &[],
-            Self::SequenceGap(_) => &[],
+            Self::ObjectHead(change) => {
+                LocalChangeReferenceDeltas::single(&change.reference_deltas)
+            }
+            Self::RetainedVersionDeleted(change) => {
+                LocalChangeReferenceDeltas::single(&change.reference_deltas)
+            }
+            Self::ContentLifecycleBatchChanged(change) => {
+                LocalChangeReferenceDeltas::batch(&change.transitions)
+            }
+            Self::AggregateChanged(_) | Self::AtomicBatchPublished(_) | Self::SequenceGap(_) => {
+                LocalChangeReferenceDeltas::single(&[])
+            }
         }
     }
 
@@ -795,10 +822,64 @@ impl LocalChange {
             Self::ObjectHead(change) => Some(change),
             Self::RetainedVersionDeleted(_) => None,
             Self::AggregateChanged(_) => None,
-            Self::ContentLifecycleChanged(_) => None,
+            Self::ContentLifecycleBatchChanged(_) => None,
             Self::AtomicBatchPublished(_) => None,
             Self::SequenceGap(_) => None,
             _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LocalChangeReferenceDeltas<'a> {
+    source: LocalChangeReferenceDeltaSource<'a>,
+}
+
+#[derive(Clone)]
+enum LocalChangeReferenceDeltaSource<'a> {
+    Single(std::slice::Iter<'a, ReferenceDelta>),
+    Batch {
+        transitions: std::slice::Iter<'a, ContentLifecycleTransition>,
+        current: std::slice::Iter<'a, ReferenceDelta>,
+    },
+}
+
+impl<'a> LocalChangeReferenceDeltas<'a> {
+    fn single(deltas: &'a [ReferenceDelta]) -> Self {
+        Self {
+            source: LocalChangeReferenceDeltaSource::Single(deltas.iter()),
+        }
+    }
+
+    fn batch(transitions: &'a [ContentLifecycleTransition]) -> Self {
+        Self {
+            source: LocalChangeReferenceDeltaSource::Batch {
+                transitions: transitions.iter(),
+                current: [].iter(),
+            },
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.clone().next().is_none()
+    }
+}
+
+impl<'a> Iterator for LocalChangeReferenceDeltas<'a> {
+    type Item = &'a ReferenceDelta;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.source {
+            LocalChangeReferenceDeltaSource::Single(deltas) => deltas.next(),
+            LocalChangeReferenceDeltaSource::Batch {
+                transitions,
+                current,
+            } => loop {
+                if let Some(delta) = current.next() {
+                    return Some(delta);
+                }
+                *current = transitions.next()?.reference_deltas.iter();
+            },
         }
     }
 }

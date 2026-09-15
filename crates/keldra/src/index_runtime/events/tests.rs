@@ -254,7 +254,7 @@ fn change_bucket(change: &LocalChange) -> Option<(u64, u64)> {
     match change {
         LocalChange::ObjectHead(change) => Some((change.tenant_id, change.bucket_id)),
         LocalChange::RetainedVersionDeleted(change) => Some((change.tenant_id, change.bucket_id)),
-        LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleChanged(_) => None,
+        LocalChange::AggregateChanged(_) | LocalChange::ContentLifecycleBatchChanged(_) => None,
         _ => None,
     }
 }

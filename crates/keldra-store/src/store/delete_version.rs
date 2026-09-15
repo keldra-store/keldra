@@ -466,7 +466,10 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(proof.change.reference_deltas(), mutation.reference_deltas);
+        assert_eq!(
+            proof.change.reference_deltas().cloned().collect::<Vec<_>>(),
+            mutation.reference_deltas
+        );
 
         let applied = replica
             .apply_retained_version_delete_replica(&mutation)

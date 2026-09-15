@@ -68,29 +68,26 @@ impl AccountingObjectSnapshot {
                     )?;
                     changed = true;
                 }
-                LocalChange::ContentLifecycleChanged(lifecycle)
-                    if lifecycle
-                        .accounting_transition
-                        .as_ref()
-                        .is_some_and(|transition| {
-                            transition.tenant_id == definition.tenant_id
-                                && transition.bucket_id == definition.bucket_id
-                                && includes_path(
-                                    &definition.stored.path_prefix,
-                                    &transition.exact_path,
-                                )
-                        }) =>
-                {
-                    let removed = lifecycle
-                        .accounting_transition
-                        .as_ref()
-                        .expect("matching transition was checked")
-                        .retained_bytes_removed;
-                    next.retained_non_billable_logical_bytes = next
-                        .retained_non_billable_logical_bytes
-                        .checked_sub(removed)
-                        .ok_or(AccountingAdvanceError::Underflow)?;
-                    changed = true;
+                LocalChange::ContentLifecycleBatchChanged(batch) => {
+                    for transition in &batch.transitions {
+                        let Some(accounting) = transition.accounting_transition.as_ref() else {
+                            continue;
+                        };
+                        if accounting.tenant_id != definition.tenant_id
+                            || accounting.bucket_id != definition.bucket_id
+                            || !includes_path(
+                                &definition.stored.path_prefix,
+                                &accounting.exact_path,
+                            )
+                        {
+                            continue;
+                        }
+                        next.retained_non_billable_logical_bytes = next
+                            .retained_non_billable_logical_bytes
+                            .checked_sub(accounting.retained_bytes_removed)
+                            .ok_or(AccountingAdvanceError::Underflow)?;
+                        changed = true;
+                    }
                 }
                 _ => {}
             }
@@ -268,9 +265,10 @@ pub(crate) enum AccountingAdvanceError {
 mod tests {
     use keldra_consensus::NodeId;
     use keldra_store::{
-        BlobRef, ContentAccountingTransition, ContentLifecycleChanged, OBJECT_LINK_CONTENT_TYPE,
-        ObjectHeadChange, ObjectHeadChangeKind, PlacementLogId, ReferenceDelta, RetainedHeadState,
-        SourceId, Version, VersionId,
+        BlobRef, ContentAccountingTransition, ContentLifecycleBatchChanged,
+        ContentLifecycleTransition, OBJECT_LINK_CONTENT_TYPE, ObjectHeadChange,
+        ObjectHeadChangeKind, PlacementLogId, ReferenceDelta, RetainedHeadState, SourceId, Version,
+        VersionId,
     };
 
     use super::*;
@@ -353,29 +351,55 @@ mod tests {
     fn delayed_content_lifecycle_retires_non_billable_logical_bytes_only() {
         let mut snapshot = AccountingObjectSnapshot {
             billable_logical_bytes: 8,
-            retained_non_billable_logical_bytes: 8,
+            retained_non_billable_logical_bytes: 13,
             visible_file_count: 1,
         };
         let page = IndexJournalPage {
             changes: vec![IndexJournalChange {
                 node: NodeId(1),
-                change: LocalChange::ContentLifecycleChanged(ContentLifecycleChanged {
+                change: LocalChange::ContentLifecycleBatchChanged(ContentLifecycleBatchChanged {
                     offset: 1,
-                    blob_identity: vec![1],
-                    revision: 1,
-                    reference_deltas: vec![ReferenceDelta {
-                        blob: BlobRef {
-                            hash: [1; 32],
-                            length: 8,
+                    transitions: vec![
+                        ContentLifecycleTransition {
+                            blob_identity: vec![1],
+                            revision: 1,
+                            reference_deltas: vec![ReferenceDelta {
+                                blob: BlobRef {
+                                    hash: [1; 32],
+                                    length: 8,
+                                },
+                                change: -1,
+                            }],
+                            accounting_transition: Some(ContentAccountingTransition {
+                                tenant_id: 11,
+                                bucket_id: 12,
+                                exact_path: "docs/a".into(),
+                                retained_bytes_removed: 8,
+                            }),
                         },
-                        change: -1,
-                    }],
-                    accounting_transition: Some(ContentAccountingTransition {
-                        tenant_id: 11,
-                        bucket_id: 12,
-                        exact_path: "docs/a".into(),
-                        retained_bytes_removed: 8,
-                    }),
+                        ContentLifecycleTransition {
+                            blob_identity: vec![2],
+                            revision: 2,
+                            reference_deltas: Vec::new(),
+                            accounting_transition: Some(ContentAccountingTransition {
+                                tenant_id: 11,
+                                bucket_id: 12,
+                                exact_path: "docs/b".into(),
+                                retained_bytes_removed: 5,
+                            }),
+                        },
+                        ContentLifecycleTransition {
+                            blob_identity: vec![3],
+                            revision: 3,
+                            reference_deltas: Vec::new(),
+                            accounting_transition: Some(ContentAccountingTransition {
+                                tenant_id: 11,
+                                bucket_id: 99,
+                                exact_path: "docs/unrelated".into(),
+                                retained_bytes_removed: 2,
+                            }),
+                        },
+                    ],
                 }),
             }],
             through: IndexBarrier {

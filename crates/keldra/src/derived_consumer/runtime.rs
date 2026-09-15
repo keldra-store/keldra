@@ -688,9 +688,14 @@ fn visit_change_buckets(
                 visit((route.tenant_id, route.bucket_id));
             }
         }
-        LocalChange::ContentLifecycleChanged(change) => {
-            if let Some(transition) = change.accounting_transition.as_ref() {
-                visit((transition.tenant_id, transition.bucket_id));
+        LocalChange::ContentLifecycleBatchChanged(change) => {
+            let mut visited = std::collections::BTreeSet::new();
+            for transition in &change.transitions {
+                if let Some(transition) = transition.accounting_transition.as_ref()
+                    && visited.insert((transition.tenant_id, transition.bucket_id))
+                {
+                    visit((transition.tenant_id, transition.bucket_id));
+                }
             }
         }
         LocalChange::AggregateChanged(_) => {}

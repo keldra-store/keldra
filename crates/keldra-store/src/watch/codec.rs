@@ -8,8 +8,8 @@ use thiserror::Error;
 
 use super::{
     AccountingHeadTransition, AggregateChanged, AggregateKind, ContentAccountingTransition,
-    ContentLifecycleChanged, LocalChange, ObjectHeadChange, ObjectHeadChangeKind,
-    RetainedVersionDeletedChange, SourceSequenceGap,
+    ContentLifecycleBatchChanged, ContentLifecycleTransition, LocalChange, ObjectHeadChange,
+    ObjectHeadChangeKind, RetainedVersionDeletedChange, SourceSequenceGap,
 };
 use crate::{
     BlobRef, DefinitionKind, DefinitionOperation, DefinitionTransition, ReferenceDelta, VersionId,
@@ -23,7 +23,7 @@ const HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 8 + 8;
 const OBJECT_HEAD: u8 = 1;
 const RETAINED_VERSION_DELETED: u8 = 2;
 const AGGREGATE_CHANGED: u8 = 3;
-const CONTENT_LIFECYCLE_CHANGED: u8 = 4;
+const CONTENT_LIFECYCLE_BATCH_CHANGED: u8 = 4;
 const ATOMIC_BATCH_PUBLISHED: u8 = 5;
 const SEQUENCE_GAP: u8 = 6;
 
@@ -159,22 +159,36 @@ fn encode_body(change: &LocalChange) -> Result<(u8, Vec<u8>), LocalChangeCodecEr
             put_u64(&mut body, change.revision);
             Ok((AGGREGATE_CHANGED, body))
         }
-        LocalChange::ContentLifecycleChanged(change) => {
-            put_u64(&mut body, change.offset);
-            put_bytes(&mut body, &change.blob_identity)?;
-            put_u64(&mut body, change.revision);
-            put_reference_deltas(&mut body, &change.reference_deltas)?;
-            match &change.accounting_transition {
-                Some(transition) => {
-                    put_u8(&mut body, 1);
-                    put_u64(&mut body, transition.tenant_id);
-                    put_u64(&mut body, transition.bucket_id);
-                    put_string(&mut body, &transition.exact_path)?;
-                    put_u64(&mut body, transition.retained_bytes_removed);
-                }
-                None => put_u8(&mut body, 0),
+        LocalChange::ContentLifecycleBatchChanged(change) => {
+            if change.transitions.is_empty()
+                || change.transitions.len() > super::MAX_CONTENT_LIFECYCLE_BATCH_TRANSITIONS
+            {
+                return Err(malformed(
+                    "content lifecycle batch count is outside its bound",
+                ));
             }
-            Ok((CONTENT_LIFECYCLE_CHANGED, body))
+            put_u64(&mut body, change.offset);
+            put_u64(
+                &mut body,
+                u64::try_from(change.transitions.len())
+                    .map_err(|_| malformed("content lifecycle batch count is exhausted"))?,
+            );
+            for transition in &change.transitions {
+                put_bytes(&mut body, &transition.blob_identity)?;
+                put_u64(&mut body, transition.revision);
+                put_reference_deltas(&mut body, &transition.reference_deltas)?;
+                match &transition.accounting_transition {
+                    Some(accounting) => {
+                        put_u8(&mut body, 1);
+                        put_u64(&mut body, accounting.tenant_id);
+                        put_u64(&mut body, accounting.bucket_id);
+                        put_string(&mut body, &accounting.exact_path)?;
+                        put_u64(&mut body, accounting.retained_bytes_removed);
+                    }
+                    None => put_u8(&mut body, 0),
+                }
+            }
+            Ok((CONTENT_LIFECYCLE_BATCH_CHANGED, body))
         }
         LocalChange::AtomicBatchPublished(change) => {
             change.validate().map_err(malformed)?;
@@ -248,24 +262,42 @@ fn decode_body(kind: u8, input: &mut Input<'_>) -> Result<LocalChange, LocalChan
             aggregate_key: input.bytes()?.to_vec(),
             revision: input.u64()?,
         })),
-        CONTENT_LIFECYCLE_CHANGED => Ok(LocalChange::ContentLifecycleChanged(
-            ContentLifecycleChanged {
-                offset: input.u64()?,
-                blob_identity: input.bytes()?.to_vec(),
-                revision: input.u64()?,
-                reference_deltas: input.reference_deltas()?,
-                accounting_transition: match input.u8()? {
-                    0 => None,
-                    1 => Some(ContentAccountingTransition {
-                        tenant_id: input.u64()?,
-                        bucket_id: input.u64()?,
-                        exact_path: input.string()?.to_owned(),
-                        retained_bytes_removed: input.u64()?,
-                    }),
-                    _ => return Err(malformed("content accounting marker is invalid")),
+        CONTENT_LIFECYCLE_BATCH_CHANGED => {
+            let offset = input.u64()?;
+            let count = input.length_count("content lifecycle transition", 25)?;
+            if count == 0 || count > super::MAX_CONTENT_LIFECYCLE_BATCH_TRANSITIONS {
+                return Err(malformed(
+                    "content lifecycle batch count is outside its bound",
+                ));
+            }
+            let mut transitions = Vec::new();
+            transitions
+                .try_reserve_exact(count)
+                .map_err(|_| malformed("content lifecycle batch allocation failed"))?;
+            for _ in 0..count {
+                transitions.push(ContentLifecycleTransition {
+                    blob_identity: input.bytes()?.to_vec(),
+                    revision: input.u64()?,
+                    reference_deltas: input.reference_deltas()?,
+                    accounting_transition: match input.u8()? {
+                        0 => None,
+                        1 => Some(ContentAccountingTransition {
+                            tenant_id: input.u64()?,
+                            bucket_id: input.u64()?,
+                            exact_path: input.string()?.to_owned(),
+                            retained_bytes_removed: input.u64()?,
+                        }),
+                        _ => return Err(malformed("content accounting marker is invalid")),
+                    },
+                });
+            }
+            Ok(LocalChange::ContentLifecycleBatchChanged(
+                ContentLifecycleBatchChanged {
+                    offset,
+                    transitions,
                 },
-            },
-        )),
+            ))
+        }
         ATOMIC_BATCH_PUBLISHED => {
             let offset = input.u64()?;
             let cursor = input.u64()?;
@@ -706,6 +738,85 @@ mod tests {
                 serde_json::to_vec(&change).unwrap().len() as u64
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_batch_round_trips_ordered_effects_at_one_offset() {
+        let first = ReferenceDelta {
+            blob: BlobRef {
+                hash: [3; 32],
+                length: 31,
+            },
+            change: -1,
+        };
+        let second = ReferenceDelta {
+            blob: BlobRef {
+                hash: [4; 32],
+                length: 47,
+            },
+            change: -1,
+        };
+        let change = LocalChange::content_lifecycle_batch_changed(
+            19,
+            vec![
+                ContentLifecycleTransition {
+                    blob_identity: b"first".to_vec(),
+                    revision: 7,
+                    reference_deltas: vec![first.clone()],
+                    accounting_transition: Some(ContentAccountingTransition {
+                        tenant_id: 11,
+                        bucket_id: 12,
+                        exact_path: "documents/first".into(),
+                        retained_bytes_removed: 31,
+                    }),
+                },
+                ContentLifecycleTransition {
+                    blob_identity: b"second".to_vec(),
+                    revision: 8,
+                    reference_deltas: vec![second.clone()],
+                    accounting_transition: Some(ContentAccountingTransition {
+                        tenant_id: 11,
+                        bucket_id: 13,
+                        exact_path: "documents/second".into(),
+                        retained_bytes_removed: 47,
+                    }),
+                },
+            ],
+        );
+
+        let encoded = encode_local_change(&change).unwrap();
+        let decoded = decode_local_change_with_length(&encoded).unwrap();
+        assert_eq!(decoded.change, change);
+        assert_eq!(decoded.change.offset(), 19);
+        assert_eq!(
+            decoded
+                .change
+                .reference_deltas()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            decoded.peer_encoded_bytes,
+            serde_json::to_vec(&change).unwrap().len() as u64
+        );
+    }
+
+    #[test]
+    fn lifecycle_batch_rejects_empty_and_unbounded_transition_counts() {
+        let empty = LocalChange::content_lifecycle_batch_changed(1, Vec::new());
+        assert!(encode_local_change(&empty).is_err());
+        let transition = ContentLifecycleTransition {
+            blob_identity: Vec::new(),
+            revision: 1,
+            reference_deltas: Vec::new(),
+            accounting_transition: None,
+        };
+        let unbounded = LocalChange::content_lifecycle_batch_changed(
+            1,
+            vec![transition; super::super::MAX_CONTENT_LIFECYCLE_BATCH_TRANSITIONS + 1],
+        );
+        assert!(encode_local_change(&unbounded).is_err());
     }
 
     #[test]

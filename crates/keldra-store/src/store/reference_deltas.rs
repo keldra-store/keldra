@@ -304,8 +304,12 @@ mod tests {
         assert_eq!(state.ref_count, 1);
         assert_eq!(state.flags, 0);
         let changes = store.scan_local_changes(0, 10).unwrap();
-        let Some(LocalChange::ContentLifecycleChanged(lifecycle)) = changes.last() else {
+        let Some(LocalChange::ContentLifecycleBatchChanged(lifecycle_batch)) = changes.last()
+        else {
             panic!("reference application must append a lifecycle invalidation")
+        };
+        let [lifecycle] = lifecycle_batch.transitions.as_slice() else {
+            panic!("reference application must append one lifecycle transition")
         };
         assert_eq!(lifecycle.blob_identity, blob_reference_key(&blob));
         assert!(lifecycle.reference_deltas.is_empty());
@@ -367,15 +371,19 @@ mod tests {
                 }
             );
             let progressed = store.local_watch_status().unwrap();
-            assert_eq!((progressed.tail, progressed.retained_entries), (2, 2));
-            assert!(
+            // Reference settlement of a local physical replica has no new
+            // reference or accounting effects. It updates the durable blob
+            // lifecycle and cursor in the same batch without creating a
+            // self-generated source-journal position.
+            assert_eq!(progressed, full);
+            assert_eq!(
                 store
                     .source_journal_runtime_metrics()
                     .unwrap()
-                    .progress_debt_entries()
-                    >= 1
+                    .progress_debt_entries(),
+                0
             );
-            assert_eq!(store.scan_local_changes(0, 10).unwrap().len(), 2);
+            assert_eq!(store.scan_local_changes(0, 10).unwrap().len(), 1);
             let published = store.blob_reference_state(&replica).unwrap().unwrap();
             assert_eq!((published.ref_count, published.flags), (1, 0));
         }

@@ -1107,15 +1107,15 @@ mod tests {
         let changes = store.scan_local_changes(0, 10).unwrap();
         assert_eq!(changes.len(), 2);
         assert_eq!(
-            changes[0].reference_deltas(),
-            &[ReferenceDelta {
+            changes[0].reference_deltas().cloned().collect::<Vec<_>>(),
+            vec![ReferenceDelta {
                 blob: blob_reference_for_bytes(b"first"),
                 change: 1,
             }]
         );
         assert_eq!(
-            changes[1].reference_deltas(),
-            &[ReferenceDelta {
+            changes[1].reference_deltas().cloned().collect::<Vec<_>>(),
+            vec![ReferenceDelta {
                 blob: blob_reference_for_bytes(b"second"),
                 change: 1,
             }]

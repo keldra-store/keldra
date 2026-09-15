@@ -157,8 +157,11 @@ async fn sealing_creates_one_reservation_and_reuse_only_refreshes_it() {
     assert_eq!(changes.len(), 2);
     for (change, expected_revision) in changes.iter().zip([first.updated_at, refreshed.updated_at])
     {
-        let LocalChange::ContentLifecycleChanged(change) = change else {
+        let LocalChange::ContentLifecycleBatchChanged(batch) = change else {
             panic!("sealed lifecycle update must be journaled")
+        };
+        let [change] = batch.transitions.as_slice() else {
+            panic!("sealed lifecycle update must contain one transition")
         };
         assert_eq!(change.blob_identity, blob_reference_key(&blob));
         assert_eq!(change.revision, expected_revision);

@@ -108,6 +108,69 @@ fn atomic_batch_routes_once_to_each_affected_bucket() {
     );
 }
 
+#[test]
+fn lifecycle_batch_routes_once_per_bucket_and_projects_ordered_transitions() {
+    let transition =
+        |tenant_id, bucket_id, revision, path: &str| crate::ContentLifecycleTransition {
+            blob_identity: vec![revision as u8],
+            revision,
+            reference_deltas: Vec::new(),
+            accounting_transition: Some(crate::ContentAccountingTransition {
+                tenant_id,
+                bucket_id,
+                exact_path: path.into(),
+                retained_bytes_removed: revision,
+            }),
+        };
+    let change = LocalChange::content_lifecycle_batch_changed(
+        9,
+        vec![
+            transition(1, 2, 3, "first"),
+            transition(3, 4, 4, "other"),
+            transition(1, 2, 5, "last"),
+        ],
+    );
+
+    assert_eq!(
+        routes_for_change(&change),
+        vec![
+            JournalRoute::Bucket {
+                tenant_id: 1,
+                bucket_id: 2,
+            },
+            JournalRoute::Bucket {
+                tenant_id: 3,
+                bucket_id: 4,
+            },
+        ]
+    );
+    let projected = project_change_for_route(
+        JournalRoute::Bucket {
+            tenant_id: 1,
+            bucket_id: 2,
+        },
+        change.clone(),
+    )
+    .unwrap();
+    let LocalChange::ContentLifecycleBatchChanged(projected) = projected else {
+        panic!("lifecycle projection changed the event kind");
+    };
+    assert_eq!(
+        projected
+            .transitions
+            .iter()
+            .map(|transition| transition.revision)
+            .collect::<Vec<_>>(),
+        vec![3, 5]
+    );
+    assert_eq!(projected.offset, 9);
+    assert!(
+        crate::watch::encoded_change_len(&LocalChange::ContentLifecycleBatchChanged(projected))
+            .unwrap()
+            < crate::watch::encoded_change_len(&change).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn routed_pages_are_target_bounded_advance_empty_intervals_and_measure_peer_bytes() {
     let (_temporary, store) = store().await;

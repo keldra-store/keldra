@@ -645,8 +645,12 @@ fn reference_cursor_caught_up(
 fn require_no_effect_payload_suffix(changes: &[LocalChange]) -> Result<(), Status> {
     for change in changes {
         match change {
-            LocalChange::ContentLifecycleChanged(change) if change.reference_deltas.is_empty() => {}
-            LocalChange::ContentLifecycleChanged(_) => {
+            LocalChange::ContentLifecycleBatchChanged(change)
+                if change
+                    .transitions
+                    .iter()
+                    .all(|transition| transition.reference_deltas.is_empty()) => {}
+            LocalChange::ContentLifecycleBatchChanged(_) => {
                 return Err(Status::unavailable(
                     "payload handoff lifecycle suffix contains a reference effect",
                 ));
@@ -665,19 +669,22 @@ fn require_no_effect_payload_suffix(changes: &[LocalChange]) -> Result<(), Statu
 mod tests {
     use keldra_consensus::NodeId;
     use keldra_store::{
-        AggregateChanged, AggregateKind, BlobRef, ContentLifecycleChanged, LocalChange,
-        ObjectHeadChange, ObjectHeadChangeKind, ReferenceDelta, SourceId, VersionId,
+        AggregateChanged, AggregateKind, BlobRef, ContentLifecycleBatchChanged,
+        ContentLifecycleTransition, LocalChange, ObjectHeadChange, ObjectHeadChangeKind,
+        ReferenceDelta, SourceId, VersionId,
     };
 
     use super::{SourceTail, reference_cursor_caught_up, require_no_effect_payload_suffix};
 
     fn lifecycle(reference_deltas: Vec<ReferenceDelta>) -> LocalChange {
-        LocalChange::ContentLifecycleChanged(ContentLifecycleChanged {
+        LocalChange::ContentLifecycleBatchChanged(ContentLifecycleBatchChanged {
             offset: 1,
-            blob_identity: vec![7; 40],
-            revision: 2,
-            reference_deltas,
-            accounting_transition: None,
+            transitions: vec![ContentLifecycleTransition {
+                blob_identity: vec![7; 40],
+                revision: 2,
+                reference_deltas,
+                accounting_transition: None,
+            }],
         })
     }
 

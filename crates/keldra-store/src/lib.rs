@@ -165,11 +165,13 @@ pub use store::{
 };
 pub use watch::{
     AccountingHeadTransition, AggregateChanged, AggregateKind, AtomicBatchMutation,
-    AtomicBatchPublished, AtomicBatchRoute, ContentAccountingTransition, ContentLifecycleChanged,
-    DEFAULT_WATCH_MAX_BYTES, DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange,
-    LocalChangePage, LocalInvalidation, MAX_ATOMIC_BATCH_MUTATIONS,
-    MAX_ATOMIC_BATCH_PUBLISHED_BYTES, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange,
-    ObjectHeadChangeKind, OversizeLocalChange, ReferenceProof, ReferenceProofMutation,
-    RetainedVersionDeletedChange, SourceId, SourceSequenceGap, WatchCursor, WatchError,
-    WatchJournalStatus, WatchPage, WatchRetention, WatchScope, WatchStart,
+    AtomicBatchPublished, AtomicBatchRoute, ContentAccountingTransition,
+    ContentLifecycleBatchChanged, ContentLifecycleTransition, DEFAULT_WATCH_MAX_BYTES,
+    DEFAULT_WATCH_MAX_ENTRIES, InvalidationStateHint, LocalChange, LocalChangePage,
+    LocalChangeReferenceDeltas, LocalInvalidation, MAX_ATOMIC_BATCH_MUTATIONS,
+    MAX_ATOMIC_BATCH_PUBLISHED_BYTES, MAX_CONTENT_LIFECYCLE_BATCH_TRANSITIONS,
+    MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChange, ObjectHeadChangeKind,
+    OversizeLocalChange, ReferenceProof, ReferenceProofMutation, RetainedVersionDeletedChange,
+    SourceId, SourceSequenceGap, WatchCursor, WatchError, WatchJournalStatus, WatchPage,
+    WatchRetention, WatchScope, WatchStart,
 };

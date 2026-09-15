@@ -176,10 +176,13 @@ impl Store {
             // Projecting the response here avoids multiplying the complete
             // batch by every affected route without creating another durable
             // event or cursor authority.
-            let atomic = matches!(decoded.change, LocalChange::AtomicBatchPublished(_));
+            let route_projected = matches!(
+                decoded.change,
+                LocalChange::AtomicBatchPublished(_) | LocalChange::ContentLifecycleBatchChanged(_)
+            );
             let peer_encoded_bytes = decoded.peer_encoded_bytes;
             let change = project_change_for_route(route, decoded.change)?;
-            let change_bytes = if atomic {
+            let change_bytes = if route_projected {
                 encoded_change_len(&change).map_err(route_storage)?
             } else {
                 // Ordinary routed events are unchanged, so the envelope's
@@ -294,28 +297,54 @@ fn project_change_for_route(
     route: JournalRoute,
     change: LocalChange,
 ) -> Result<LocalChange, RoutedJournalError> {
-    let mut batch = match change {
-        LocalChange::AtomicBatchPublished(batch) => batch,
-        change => return Ok(change),
-    };
-    let JournalRoute::Bucket {
-        tenant_id,
-        bucket_id,
-    } = route
-    else {
-        return Err(RoutedJournalError::RouteMismatch {
-            offset: batch.offset,
-        });
-    };
-    batch
-        .mutations
-        .retain(|mutation| mutation.tenant_id == tenant_id && mutation.bucket_id == bucket_id);
-    batch
-        .validate()
-        .map_err(|_| RoutedJournalError::RouteMismatch {
-            offset: batch.offset,
-        })?;
-    Ok(LocalChange::AtomicBatchPublished(batch))
+    match change {
+        LocalChange::AtomicBatchPublished(mut batch) => {
+            let JournalRoute::Bucket {
+                tenant_id,
+                bucket_id,
+            } = route
+            else {
+                return Err(RoutedJournalError::RouteMismatch {
+                    offset: batch.offset,
+                });
+            };
+            batch.mutations.retain(|mutation| {
+                mutation.tenant_id == tenant_id && mutation.bucket_id == bucket_id
+            });
+            batch
+                .validate()
+                .map_err(|_| RoutedJournalError::RouteMismatch {
+                    offset: batch.offset,
+                })?;
+            Ok(LocalChange::AtomicBatchPublished(batch))
+        }
+        LocalChange::ContentLifecycleBatchChanged(mut batch) => {
+            let JournalRoute::Bucket {
+                tenant_id,
+                bucket_id,
+            } = route
+            else {
+                return Err(RoutedJournalError::RouteMismatch {
+                    offset: batch.offset,
+                });
+            };
+            batch.transitions.retain(|transition| {
+                transition
+                    .accounting_transition
+                    .as_ref()
+                    .is_some_and(|accounting| {
+                        accounting.tenant_id == tenant_id && accounting.bucket_id == bucket_id
+                    })
+            });
+            if batch.transitions.is_empty() {
+                return Err(RoutedJournalError::RouteMismatch {
+                    offset: batch.offset,
+                });
+            }
+            Ok(LocalChange::ContentLifecycleBatchChanged(batch))
+        }
+        change => Ok(change),
+    }
 }
 
 fn try_visit_routes_for_change<E>(
@@ -346,12 +375,18 @@ fn try_visit_routes_for_change<E>(
                 })?;
             }
         }
-        LocalChange::ContentLifecycleChanged(change) => {
-            if let Some(transition) = change.accounting_transition.as_ref() {
-                visit(JournalRoute::Bucket {
-                    tenant_id: transition.tenant_id,
-                    bucket_id: transition.bucket_id,
-                })?;
+        LocalChange::ContentLifecycleBatchChanged(change) => {
+            let mut routes = std::collections::BTreeSet::new();
+            for transition in &change.transitions {
+                let Some(transition) = transition.accounting_transition.as_ref() else {
+                    continue;
+                };
+                if routes.insert((transition.tenant_id, transition.bucket_id)) {
+                    visit(JournalRoute::Bucket {
+                        tenant_id: transition.tenant_id,
+                        bucket_id: transition.bucket_id,
+                    })?;
+                }
             }
         }
         LocalChange::AggregateChanged(_) => {}
@@ -405,13 +440,15 @@ fn route_matches(route: JournalRoute, change: &LocalChange) -> bool {
                 tenant_id,
                 bucket_id,
             },
-            LocalChange::ContentLifecycleChanged(change),
-        ) => change
-            .accounting_transition
-            .as_ref()
-            .is_some_and(|transition| {
-                transition.tenant_id == tenant_id && transition.bucket_id == bucket_id
-            }),
+            LocalChange::ContentLifecycleBatchChanged(change),
+        ) => change.transitions.iter().any(|transition| {
+            transition
+                .accounting_transition
+                .as_ref()
+                .is_some_and(|transition| {
+                    transition.tenant_id == tenant_id && transition.bucket_id == bucket_id
+                })
+        }),
         (JournalRoute::Definition(kind), LocalChange::ObjectHead(change)) => change
             .definition_transition
             .as_ref()

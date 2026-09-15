@@ -265,6 +265,7 @@ impl Store {
             || status.retained_bytes > self.watch_retention.max_bytes
             || (force_headroom && pruned_records == 0))
             && status.retention_floor < safe_through
+            && pruned_records < crate::MAX_CONTENT_LIFECYCLE_BATCH_TRANSITIONS as u64
         {
             let offset = status.retention_floor.checked_add(1).ok_or_else(|| {
                 WatchError::Storage("local invalidation retention floor is exhausted".into())
@@ -315,26 +316,31 @@ impl Store {
                     WatchError::Storage("local invalidation byte accounting is inconsistent".into())
                 })?;
         }
-        for release in delayed_releases {
-            let PendingLocalChange::ContentLifecycleChanged {
-                blob_identity,
-                revision,
-                reference_deltas,
-                accounting_transition,
-            } = release
-            else {
-                unreachable!("source-version retirement emits one lifecycle release")
-            };
+        if !delayed_releases.is_empty() {
             status.tail = status.tail.checked_add(1).ok_or_else(|| {
                 WatchError::Storage("local invalidation offset is exhausted".into())
             })?;
-            let release = LocalChange::content_lifecycle_changed(
-                status.tail,
-                blob_identity,
-                revision,
-                reference_deltas,
-                accounting_transition,
-            );
+            let transitions = delayed_releases
+                .into_iter()
+                .map(|release| {
+                    let PendingLocalChange::ContentLifecycleChanged {
+                        blob_identity,
+                        revision,
+                        reference_deltas,
+                        accounting_transition,
+                    } = release
+                    else {
+                        unreachable!("source-version retirement emits one lifecycle release")
+                    };
+                    crate::ContentLifecycleTransition {
+                        blob_identity,
+                        revision,
+                        reference_deltas,
+                        accounting_transition,
+                    }
+                })
+                .collect();
+            let release = LocalChange::content_lifecycle_batch_changed(status.tail, transitions);
             let encoded = encode_local_change(&release)
                 .map_err(|error| WatchError::Storage(error.to_string()))?;
             let logical_bytes = invalidation_record_bytes(encoded.len())
@@ -384,6 +390,17 @@ mod tests {
             bytes: vec![1],
             content_type: None,
             mode: PutMode::PutIfAbsent,
+            command_id: Some(command.into()),
+            durability: Durability::Local,
+        })
+    }
+
+    fn overwrite(path: &str, command: &str, byte: u8) -> BatchOperation {
+        BatchOperation::Put(PutRequest {
+            key: ObjectKey::new("tenant", "bucket", path).unwrap(),
+            bytes: vec![byte],
+            content_type: None,
+            mode: PutMode::Put,
             command_id: Some(command.into()),
             durability: Durability::Local,
         })
@@ -473,8 +490,9 @@ mod tests {
         let recorded = store.scan_local_changes(0, 1).unwrap();
         assert!(matches!(
             recorded.as_slice(),
-            [LocalChange::ContentLifecycleChanged(change)]
-                if change.accounting_transition.as_ref() == Some(&transition)
+            [LocalChange::ContentLifecycleBatchChanged(change)]
+                if change.transitions.len() == 1
+                    && change.transitions[0].accounting_transition.as_ref() == Some(&transition)
         ));
     }
 
@@ -617,5 +635,80 @@ mod tests {
                 .result
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn pruning_batches_ordered_version_releases_at_one_new_offset() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("store");
+        let initial = StoreOptions::new(&root, 1)
+            .with_watch_retention(WatchRetention::new(16, 1024 * 1024).unwrap());
+        let store = Store::open(initial).await.unwrap();
+        store
+            .ensure_derived_consumer_membership(fence(), &[1])
+            .await
+            .unwrap();
+        for (index, byte) in [1, 2, 3, 4].into_iter().enumerate() {
+            let outcomes = store
+                .bulk_write(vec![overwrite(
+                    "repeated",
+                    &format!("overwrite-{index}"),
+                    byte,
+                )])
+                .await;
+            assert!(outcomes[0].result.is_ok());
+        }
+        let before = store.local_watch_status().unwrap();
+        assert_eq!(before.tail, 4);
+        store
+            .advance_source_journal_reference_safe_through(before.tail)
+            .await
+            .unwrap();
+        checkpoint_all(&store, before.tail).await;
+        drop(store);
+
+        let store = Store::open(
+            StoreOptions::new(&root, 1)
+                .with_watch_retention(WatchRetention::new(1, 1024 * 1024).unwrap()),
+        )
+        .await
+        .unwrap();
+        // The reference-safe watermark is deliberately re-proved after a
+        // restart; the consumer checkpoints themselves are durable.
+        store
+            .advance_source_journal_reference_safe_through(before.tail)
+            .await
+            .unwrap();
+        // Advancing the re-proved watermark enforces retention in that same
+        // operation; a second forced pass would intentionally make additional
+        // headroom beyond the configured bound.
+        // Reading the result from the reopened store proves recovery sees the
+        // exact durable batch rather than rebuilding per-version events.
+        let after = store.local_watch_status().unwrap();
+        assert_eq!(after.tail, before.tail + 1);
+        assert_eq!(after.retention_floor, 3);
+        assert_eq!(after.retained_entries, 2);
+        drop(store);
+        let store = Store::open(
+            StoreOptions::new(&root, 1)
+                .with_watch_retention(WatchRetention::new(2, 1024 * 1024).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.local_watch_status().unwrap(), after);
+        let retained = store.scan_local_changes(after.retention_floor, 4).unwrap();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].offset(), 4);
+        let LocalChange::ContentLifecycleBatchChanged(batch) = &retained[1] else {
+            panic!("pruning must append one lifecycle batch")
+        };
+        assert_eq!(batch.offset, 5);
+        assert_eq!(batch.transitions.len(), 3);
+        assert!(batch.transitions.windows(2).all(|pair| {
+            pair[0].revision < pair[1].revision
+                && pair[0].accounting_transition.as_ref().unwrap().exact_path
+                    == pair[1].accounting_transition.as_ref().unwrap().exact_path
+        }));
+        assert_eq!(retained[1].reference_deltas().count(), 3);
     }
 }

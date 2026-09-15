@@ -443,18 +443,26 @@ pub(crate) fn is_accounting_path(path: &str) -> bool {
 /// alter an accounting rollup. Rollup publication remains excluded so an
 /// accounting worker cannot recursively wake itself.
 pub(crate) fn is_accounting_source_change(change: &LocalChange) -> bool {
-    let path = match change {
-        LocalChange::ObjectHead(change) => &change.exact_path,
-        LocalChange::RetainedVersionDeleted(change) => &change.exact_path,
-        LocalChange::ContentLifecycleChanged(change) => {
-            let Some(transition) = change.accounting_transition.as_ref() else {
-                return false;
-            };
-            &transition.exact_path
+    match change {
+        LocalChange::ObjectHead(change) => {
+            !is_accounting_path(&change.exact_path) || is_outbound_source_path(&change.exact_path)
         }
-        _ => return false,
-    };
-    !is_accounting_path(path) || is_outbound_source_path(path)
+        LocalChange::RetainedVersionDeleted(change) => {
+            !is_accounting_path(&change.exact_path) || is_outbound_source_path(&change.exact_path)
+        }
+        LocalChange::ContentLifecycleBatchChanged(change) => {
+            change.transitions.iter().any(|transition| {
+                transition
+                    .accounting_transition
+                    .as_ref()
+                    .is_some_and(|accounting| {
+                        !is_accounting_path(&accounting.exact_path)
+                            || is_outbound_source_path(&accounting.exact_path)
+                    })
+            })
+        }
+        _ => false,
+    }
 }
 
 fn is_outbound_source_path(path: &str) -> bool {
