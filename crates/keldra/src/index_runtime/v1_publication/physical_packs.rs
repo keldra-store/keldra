@@ -236,7 +236,7 @@ impl V1ProjectionPublisher {
                 Poll::Pending
             })
             .await;
-            active.swap_remove(slot);
+            drop(active.swap_remove(slot));
             staged.push((index, result?));
         }
         staged.sort_unstable_by_key(|(index, _)| *index);

@@ -37,8 +37,6 @@ use evidence::ResourceEvidence;
 use graph::{ExpectedCheck, Graph};
 use metrics::{Latencies, LatencyReport};
 
-type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RebuildState {
     schema: String,
@@ -135,7 +133,7 @@ struct ChurnEvidence {
 }
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> TestResult<()> {
+async fn main() -> Result<()> {
     let started_unix_milliseconds = now_millis()?;
     let config = Config::from_env()?;
     let graph = graph::build(config.roots, config.depth, config.fanout)?;
@@ -256,7 +254,7 @@ async fn main() -> TestResult<()> {
     Ok(())
 }
 
-async fn connect_clients(config: &Config) -> TestResult<Vec<RawAuthzClient>> {
+async fn connect_clients(config: &Config) -> Result<Vec<RawAuthzClient>> {
     let mut channels = Vec::with_capacity(config.endpoints.len());
     for endpoint in &config.endpoints {
         channels.push(connect_channel(endpoint).await?);
