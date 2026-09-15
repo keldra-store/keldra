@@ -1848,6 +1848,13 @@ mod tests {
                 )),
             }),
             version: 1,
+            result_authorization: Some(keldra_api::v1::IndexResultAuthorization {
+                policy: Some(
+                    keldra_api::v1::index_result_authorization::Policy::Application(
+                        keldra_api::v1::ApplicationIndexResultAuthorization {},
+                    ),
+                ),
+            }),
         };
         let tensor = IndexQuery {
             query: Some(index_query::Query::Tensor(TensorIndexQuery {

@@ -1104,6 +1104,13 @@ mod tests {
                         ),
                     }),
                     command_id: format!("create-{index_id}"),
+                    result_authorization: Some(keldra_api::v1::IndexResultAuthorization {
+                        policy: Some(
+                            keldra_api::v1::index_result_authorization::Policy::Application(
+                                keldra_api::v1::ApplicationIndexResultAuthorization {},
+                            ),
+                        ),
+                    }),
                 },
                 index_id,
             )
@@ -1148,6 +1155,13 @@ mod tests {
                         ),
                     }),
                     command_id: format!("create-{index_id}"),
+                    result_authorization: Some(keldra_api::v1::IndexResultAuthorization {
+                        policy: Some(
+                            keldra_api::v1::index_result_authorization::Policy::Application(
+                                keldra_api::v1::ApplicationIndexResultAuthorization {},
+                            ),
+                        ),
+                    }),
                 },
                 index_id,
             )

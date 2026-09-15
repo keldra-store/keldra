@@ -202,7 +202,13 @@ fn prepared(next_offset: u64, through_atomic_position: u64) -> PreparedAtomicPro
 fn artifact_fingerprints(plan: &AtomicPublicationPlan) -> Vec<(String, [u8; 32], Vec<u8>)> {
     plan.immutable
         .iter()
-        .map(|artifact| (artifact.path.clone(), artifact.hash, artifact.bytes.clone()))
+        .map(|artifact| {
+            (
+                artifact.path.clone(),
+                artifact.hash,
+                artifact.bytes.to_vec(),
+            )
+        })
         .collect()
 }
 
@@ -347,7 +353,7 @@ fn parallel_stage_work_preserves_window_and_artifact_order() {
             path: format!("artifact-{ordinal}"),
             kind: keldra_index::v1::ProjectionArtifactKind::Pack,
             hash: [u8::try_from(ordinal).unwrap(); 32],
-            bytes: vec![0; length],
+            bytes: vec![0; length].into(),
         })
         .collect();
     let work = immutable_stage_work(artifacts).unwrap();

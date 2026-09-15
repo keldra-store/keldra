@@ -316,6 +316,7 @@ pub(crate) fn authz_status(error: AuthorizationError) -> Status {
         AuthorizationError::InvalidLimits(_) => {
             Status::internal("authorization limits are invalid")
         }
+        AuthorizationError::EvaluationSource(_) => Status::internal(error.to_string()),
         AuthorizationError::InvalidRealm(_)
         | AuthorizationError::InvalidSchema(_)
         | AuthorizationError::InvalidTuple { .. }

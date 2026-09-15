@@ -80,6 +80,10 @@ pub(super) fn freshness(
         initial_build_complete: true,
         rebuilding: false,
         authorization_revision: request.authorization_revision,
+        // The public service binds the admitted custom-realm evidence after
+        // local or routed execution. The physical runtime cannot manufacture
+        // that logical authorization claim.
+        result_authorization: None,
         placement_term: fence.term,
         placement_index: fence.index,
         index_id: request.definition.index_id,

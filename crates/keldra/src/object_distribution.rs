@@ -554,7 +554,6 @@ impl ObjectDistribution {
     ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
-        let single_node = placement.active_node_ids().len() == 1;
         let group = self.replica_group_stable(
             &placement,
             governance.tenant_id,

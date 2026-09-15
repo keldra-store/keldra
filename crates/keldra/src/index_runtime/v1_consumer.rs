@@ -42,7 +42,7 @@ use super::v1_source_batch::{ExactMutationRequest, load_exact_mutations};
 mod compaction;
 #[path = "v1_consumer_prepare.rs"]
 mod prepare;
-use compaction::{BackgroundCompaction, compaction_in_flight, ensure_background_compaction};
+use compaction::{BackgroundCompaction, ensure_background_compaction};
 use prepare::{apply_rows, prepare_lane};
 #[cfg(test)]
 use prepare::{preparation_refill_size, selected_mutation_resident_bytes};
