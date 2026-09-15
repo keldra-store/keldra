@@ -7,7 +7,9 @@ use super::mutation_helpers::{
     mutation_capacity_kind, validate_accounting_transition, version_retention,
 };
 use super::mutation_prefetch::MutationReadCache;
-use super::mutation_types::{DistributedEvaluationContext, EvaluatedOperation};
+use super::mutation_types::{
+    DistributedEvaluationContext, EvaluatedOperation, trusted_derived_put_if_absent_replay,
+};
 use super::receipt_codec::{decode_stored_receipt, encode_stored_receipt};
 use super::*;
 use crate::model::{
@@ -630,6 +632,7 @@ impl Store {
                     source_journal_position,
                     reference_effects: LocalReferenceEffects::Deferred,
                     materialize_inline_payload: false,
+                    retain_command_receipt: true,
                 }),
                 definition_intent,
                 &mut EvaluationSubphaseMetrics::default(),
@@ -1398,8 +1401,11 @@ impl Store {
         let mut timing = evaluation_subphases.start();
         let key = operation.key();
         let encoded_key = operation.encoded_head_key();
-        let receipt_key = operation
-            .command_id()
+        let retain_command_receipt =
+            distributed.is_none_or(|context| context.retain_command_receipt);
+        let receipt_key = retain_command_receipt
+            .then(|| operation.command_id())
+            .flatten()
             .map(|command_id| receipt_key(operation.identity(), command_id));
         if let Some(receipt_key) = receipt_key.as_ref() {
             let existing = match pending_receipts.get(receipt_key) {
@@ -1646,6 +1652,14 @@ impl Store {
             }
             return Err(MutationError::Immutable);
         }
+        if !retain_command_receipt
+            && let (Some(current), Some(existing)) = (current.as_ref(), current_version.as_ref())
+            && let Some(replay) =
+                trusted_derived_put_if_absent_replay(operation, current, existing)?
+        {
+            evaluation_subphases.record_since(EvaluationSubphase::CurrentGovernance, timing);
+            return Ok(replay);
+        }
         check_precondition(operation.precondition(), current.as_ref())?;
 
         evaluation_subphases.record_since(EvaluationSubphase::CurrentGovernance, timing);
@@ -1731,7 +1745,7 @@ impl Store {
             .and_then(|stored| stored.version.blob.as_ref())
             .zip(new_blob.as_ref())
             .is_some_and(|(old, new)| old == new);
-        let receipt_expires_at_unix_millis = if receipt_key.is_some() {
+        let receipt_expires_at_unix_millis = if distributed.is_some() || receipt_key.is_some() {
             now_unix_millis
                 .checked_add(self.mutation_receipt_retention.retention_millis())
                 .ok_or_else(|| MutationError::Storage("mutation receipt expiry overflow".into()))?

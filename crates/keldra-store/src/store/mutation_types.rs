@@ -8,6 +8,10 @@ pub(super) struct DistributedEvaluationContext {
     pub(super) source_journal_position: u64,
     pub(super) reference_effects: LocalReferenceEffects,
     pub(super) materialize_inline_payload: bool,
+    /// Trusted one-node derived publication is retryable from its immutable
+    /// object identity and Current CAS, so it must not consume the public
+    /// command-receipt retention budget.
+    pub(super) retain_command_receipt: bool,
 }
 
 pub(super) struct EvaluatedOperation {
@@ -64,6 +68,46 @@ impl EvaluatedOperation {
         }
         changes
     }
+}
+
+pub(super) fn trusted_derived_put_if_absent_replay(
+    operation: &PreparedOperation,
+    current: &Head,
+    existing: &Version,
+) -> Result<Option<EvaluatedOperation>, MutationError> {
+    if !matches!(operation.put_mode(), Some(PutMode::PutIfAbsent)) || current.deleted {
+        return Ok(None);
+    }
+    let (requested_payload, requested_content_type) = match operation {
+        PreparedOperation::Put {
+            request, payload, ..
+        } => (payload.reference(), request.content_type.as_ref()),
+        PreparedOperation::Publish { request, .. } => {
+            (&request.blob, request.content_type.as_ref())
+        }
+        PreparedOperation::Clone { request, .. } => (&request.blob, request.content_type.as_ref()),
+        PreparedOperation::Delete { .. } => return Ok(None),
+    };
+    if version_blob_reference(existing)?.as_ref() != Some(requested_payload)
+        || existing.content_type.as_ref() != requested_content_type
+    {
+        return Ok(None);
+    }
+    Ok(Some(EvaluatedOperation {
+        receipt: MutationReceipt {
+            command_id: operation.command_id().map(str::to_owned),
+            fingerprint: operation.fingerprint(),
+            version: current.version,
+            deleted: false,
+            replayed: true,
+            replay_guarantee_expires_at_unix_millis: 0,
+        },
+        mutation: None,
+        reference_deltas: Vec::new(),
+        accounting_transition: None,
+        definition_transition: None,
+        alias_snapshot: None,
+    }))
 }
 
 #[cfg(test)]

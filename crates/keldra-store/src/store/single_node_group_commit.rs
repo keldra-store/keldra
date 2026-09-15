@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
+use tokio::sync::{Mutex, Notify, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, oneshot};
 use tokio::time::Instant;
 
 use super::Store;
+use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_helpers::mutation_capacity_kind;
 use crate::{
     BatchOperation, CoordinatedObjectMutation, DefinitionMutationIntent, MutationError,
@@ -194,6 +195,7 @@ pub(super) type SingleNodeOutcomes = Result<SingleNodeMutationBatch, MutationErr
 pub(super) struct SingleNodeCommitRequest {
     pub(super) operations: SingleNodeOperations,
     pub(super) context: ObjectMutationContext,
+    source_journal_admission: SourceJournalAdmission,
     enqueued_at: Instant,
     admission_wait: Duration,
     request_slot_wait: Duration,
@@ -208,6 +210,11 @@ struct QueuePermits {
     _request: tokio::sync::OwnedSemaphorePermit,
     _operations: tokio::sync::OwnedSemaphorePermit,
     _inline_bytes: tokio::sync::OwnedSemaphorePermit,
+}
+
+enum GroupDispatchGuard<'a> {
+    Ordinary { _guard: RwLockReadGuard<'a, ()> },
+    DerivedProgress { _guard: RwLockWriteGuard<'a, ()> },
 }
 
 impl SingleNodeCommitRequest {
@@ -280,6 +287,16 @@ pub(super) struct SingleNodeGroupCommit {
     inline_byte_slots: Arc<Semaphore>,
     queued_requests_total: Arc<AtomicUsize>,
     queued_requests_peak: Arc<AtomicUsize>,
+    /// Tokio's write-preferring FIFO lock is a short scheduling gate, not a
+    /// commit lock. Ordinary lane groups hold shared admission and therefore
+    /// remain parallel. A derived-progress group takes exclusive admission so
+    /// that, once queued, newer ordinary groups cannot continually invalidate
+    /// its optimistic source/receipt-authority snapshot.
+    dispatch_gate: Arc<RwLock<()>>,
+    #[cfg(test)]
+    derived_dispatch_waiters: Arc<AtomicUsize>,
+    #[cfg(test)]
+    derived_dispatch_waiting: Arc<Notify>,
 }
 
 impl SingleNodeGroupCommit {
@@ -318,6 +335,11 @@ impl SingleNodeGroupCommit {
             inline_byte_slots: Arc::new(Semaphore::new(config.max_queued_inline_bytes)),
             queued_requests_total: Arc::new(AtomicUsize::new(0)),
             queued_requests_peak: Arc::new(AtomicUsize::new(0)),
+            dispatch_gate: Arc::new(RwLock::new(())),
+            #[cfg(test)]
+            derived_dispatch_waiters: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            derived_dispatch_waiting: Arc::new(Notify::new()),
             config,
             states: Arc::new(states),
             queue_changed: Arc::new(queue_changed),
@@ -392,6 +414,9 @@ impl SingleNodeGroupCommit {
             let Some(candidate) = requests.get(request_count) else {
                 break "queue_empty";
             };
+            if candidate.source_journal_admission != first.source_journal_admission {
+                break "source_journal_admission";
+            }
             let Some(candidate_governance) = candidate.consistent_governance() else {
                 break "inconsistent_governance";
             };
@@ -459,6 +484,17 @@ impl SingleNodeGroupCommit {
         operations: SingleNodeOperations,
         context: ObjectMutationContext,
     ) -> SingleNodeOutcomes {
+        self.submit_with_admission(store, operations, context, SourceJournalAdmission::Bounded)
+            .await
+    }
+
+    pub(super) async fn submit_with_admission(
+        &self,
+        store: Store,
+        operations: SingleNodeOperations,
+        context: ObjectMutationContext,
+        source_journal_admission: SourceJournalAdmission,
+    ) -> SingleNodeOutcomes {
         let operation_count = operations.len();
         let inline_bytes = operations.iter().fold(0_usize, |total, (operation, _, _)| {
             total.saturating_add(match operation {
@@ -512,6 +548,7 @@ impl SingleNodeGroupCommit {
             state.requests.push_back(SingleNodeCommitRequest {
                 operations,
                 context,
+                source_journal_admission,
                 enqueued_at: Instant::now(),
                 admission_wait,
                 request_slot_wait,
@@ -545,6 +582,41 @@ impl SingleNodeGroupCommit {
                 "single-node commit worker stopped before replying".into(),
             ))
         })
+    }
+
+    async fn acquire_dispatch(
+        &self,
+        source_journal_admission: SourceJournalAdmission,
+    ) -> GroupDispatchGuard<'_> {
+        if source_journal_admission == SourceJournalAdmission::DerivedProgress {
+            #[cfg(test)]
+            {
+                self.derived_dispatch_waiters.fetch_add(1, Ordering::AcqRel);
+                self.derived_dispatch_waiting.notify_waiters();
+            }
+            let guard = self.dispatch_gate.write().await;
+            #[cfg(test)]
+            self.derived_dispatch_waiters.fetch_sub(1, Ordering::AcqRel);
+            GroupDispatchGuard::DerivedProgress { _guard: guard }
+        } else {
+            GroupDispatchGuard::Ordinary {
+                _guard: self.dispatch_gate.read().await,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_derived_dispatch_waiter(&self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.derived_dispatch_waiters.load(Ordering::Acquire) == 0 {
+                let notified = self.derived_dispatch_waiting.notified();
+                if self.derived_dispatch_waiters.load(Ordering::Acquire) == 0 {
+                    notified.await;
+                }
+            }
+        })
+        .await
+        .expect("derived dispatch must reach the fair scheduling gate");
     }
 
     async fn run(self, store: Store, lane: usize) {
@@ -625,6 +697,7 @@ impl SingleNodeGroupCommit {
                 .map(SingleNodeCommitRequest::operation_count)
                 .collect::<Vec<_>>();
             let context = requests[0].context;
+            let source_journal_admission = requests[0].source_journal_admission;
             let mut operations = Vec::with_capacity(operation_counts.iter().sum());
             let mut replies = Vec::with_capacity(requests.len());
             let inline_bytes = requests.iter().fold(0_usize, |total, request| {
@@ -637,8 +710,14 @@ impl SingleNodeGroupCommit {
             let operation_count = operations.len();
             let group_execute_started_epoch_milliseconds = unix_milliseconds();
             let execute_started = std::time::Instant::now();
+            let _dispatch = self.acquire_dispatch(source_journal_admission).await;
             let (results, metrics) = store
-                .coordinate_single_node_mutation_group(operations, context, &operation_counts)
+                .coordinate_single_node_mutation_group(
+                    operations,
+                    context,
+                    &operation_counts,
+                    source_journal_admission,
+                )
                 .await;
             let execute_duration = execute_started.elapsed();
             let group_execute_ended_epoch_milliseconds = unix_milliseconds();
@@ -930,6 +1009,7 @@ mod tests {
         SingleNodeCommitRequest {
             operations,
             context,
+            source_journal_admission: SourceJournalAdmission::Bounded,
             enqueued_at,
             admission_wait: Duration::ZERO,
             request_slot_wait: Duration::ZERO,
@@ -1114,6 +1194,69 @@ mod tests {
         assert!(matches!(first.as_deref(), Ok([Ok(_)])));
         assert!(matches!(second.as_deref(), Ok([Ok(_)])));
         assert_eq!(physical_commits_since(&store, before), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_derived_progress_cannot_be_overtaken_by_new_ordinary_groups() {
+        let queue = SingleNodeGroupCommit::new(
+            SingleNodeGroupCommitConfig::default()
+                .with_commit_lanes(4)
+                .unwrap(),
+        );
+        let initial_ordinary = queue
+            .acquire_dispatch(SourceJournalAdmission::Bounded)
+            .await;
+
+        let (derived_acquired, derived_acquired_rx) = oneshot::channel();
+        let (release_derived, release_derived_rx) = oneshot::channel();
+        let derived_queue = queue.clone();
+        let derived = tokio::spawn(async move {
+            let _dispatch = derived_queue
+                .acquire_dispatch(SourceJournalAdmission::DerivedProgress)
+                .await;
+            let _ = derived_acquired.send(());
+            let _ = release_derived_rx.await;
+        });
+        queue.wait_for_derived_dispatch_waiter().await;
+
+        let (ordinary_acquired, mut ordinary_acquired_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ordinary = Vec::new();
+        for lane in 0..16 {
+            let ordinary_queue = queue.clone();
+            let ordinary_acquired = ordinary_acquired.clone();
+            ordinary.push(tokio::spawn(async move {
+                let _dispatch = ordinary_queue
+                    .acquire_dispatch(SourceJournalAdmission::Bounded)
+                    .await;
+                let _ = ordinary_acquired.send(lane);
+            }));
+        }
+        drop(ordinary_acquired);
+        drop(initial_ordinary);
+
+        tokio::time::timeout(Duration::from_secs(10), derived_acquired_rx)
+            .await
+            .expect("derived progress must receive dispatch after the active ordinary group")
+            .expect("derived dispatch task must remain live");
+        assert!(
+            ordinary_acquired_rx.try_recv().is_err(),
+            "new ordinary groups must not overtake queued derived progress"
+        );
+
+        release_derived.send(()).unwrap();
+        derived.await.unwrap();
+        let mut resumed = BTreeSet::new();
+        while resumed.len() < 16 {
+            resumed.insert(
+                tokio::time::timeout(Duration::from_secs(10), ordinary_acquired_rx.recv())
+                    .await
+                    .expect("ordinary dispatch must resume after derived progress")
+                    .expect("ordinary dispatch channel must remain open"),
+            );
+        }
+        for task in ordinary {
+            task.await.unwrap();
+        }
     }
 
     #[test]
@@ -1697,6 +1840,38 @@ mod tests {
             queue.next_queue_action(&mut state, enqueued_at),
             QueueAction::Group { requests, stop_reason: "context", .. }
                 if requests.len() == 1
+        ));
+        assert_eq!(state.requests.len(), 1);
+    }
+
+    #[test]
+    fn derived_progress_is_never_combined_with_an_ordinary_group() {
+        let queue = SingleNodeGroupCommit::new(SingleNodeGroupCommitConfig::default());
+        let enqueued_at = Instant::now();
+        let mut state = QueueState::default();
+        let governance = governance_stub();
+        state.requests.push_back(queued_request(
+            &queue,
+            request("objects/ordinary", "ordinary", governance.clone()),
+            context(1),
+            enqueued_at,
+        ));
+        let mut derived = queued_request(
+            &queue,
+            request("objects/derived", "derived", governance),
+            context(1),
+            enqueued_at,
+        );
+        derived.source_journal_admission = SourceJournalAdmission::DerivedProgress;
+        state.requests.push_back(derived);
+
+        assert!(matches!(
+            queue.next_queue_action(&mut state, enqueued_at),
+            QueueAction::Group {
+                requests,
+                stop_reason: "source_journal_admission",
+                ..
+            } if requests.len() == 1
         ));
         assert_eq!(state.requests.len(), 1);
     }

@@ -436,6 +436,7 @@ impl ObjectDistribution {
             .await;
             if let Err(error) = &completed
                 && let Some(capacity) = mutation_capacity_kind(error)
+                && !derived_progress
             {
                 self.wait_for_mutation_capacity(capacity).await;
                 continue;
@@ -534,6 +535,7 @@ impl ObjectDistribution {
                 .await;
             if let Err(error) = &result
                 && let Some(capacity) = mutation_capacity_kind(error)
+                && !derived_progress
             {
                 self.wait_for_mutation_capacity(capacity).await;
                 continue;
