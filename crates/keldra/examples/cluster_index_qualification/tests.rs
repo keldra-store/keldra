@@ -195,6 +195,7 @@ fn routed_response() -> QueryIndexResponse {
             placement_index: 5,
             index_id: 41,
             definition_version: 3,
+            result_authorization: None,
         }),
     }
 }
