@@ -1,6 +1,9 @@
 use super::*;
 use crate::typed_json::{AggregateOperation, Cardinality, FieldCapabilities, FieldType};
-use crate::v1::CatalogOrdinalRange;
+use crate::v1::{
+    ArtifactPackLocator, ArtifactPackReference, ArtifactPackTable, CatalogOrdinalRange,
+    EncodedQueryBlock,
+};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -48,10 +51,50 @@ fn budget() -> Budget {
     Budget::new(QueryExecutionLimits::default_for_memory())
 }
 
+fn bound_block(encoded: &EncodedQueryBlock) -> QueryBlockDescriptor {
+    let pack_table = Arc::new(
+        ArtifactPackTable::new(vec![ArtifactPackReference {
+            ordinal: 0,
+            canonical_path: "_keldra/index-projections/v1/test/packs/0".into(),
+            object_version: 1,
+            hash: encoded.descriptor.hash,
+            length: encoded.descriptor.encoded_bytes,
+        }])
+        .unwrap(),
+    );
+    QueryBlockDescriptor {
+        kind: encoded.descriptor.kind,
+        recipe: encoded.descriptor.recipe,
+        minimum_key: encoded.descriptor.minimum_key.clone(),
+        maximum_key: encoded.descriptor.maximum_key.clone(),
+        hash: encoded.descriptor.hash,
+        encoded_bytes: encoded.descriptor.encoded_bytes,
+        records: encoded.descriptor.records,
+        locator: ArtifactPackLocator {
+            ordinal: 0,
+            offset: 0,
+            encoded_bytes: encoded.descriptor.encoded_bytes,
+            logical_bytes: encoded.descriptor.encoded_bytes,
+            checksum: encoded.descriptor.hash,
+        },
+        pack_table: pack_table.clone(),
+    }
+}
+
 #[test]
 fn canonical_run_directory_is_searched_without_materializing_an_index() {
     let first = RecipeIdentity::new([1; 32]).unwrap();
     let second = RecipeIdentity::new([2; 32]).unwrap();
+    let pack_table = Arc::new(
+        ArtifactPackTable::new(vec![ArtifactPackReference {
+            ordinal: 0,
+            canonical_path: "_keldra/index-projections/v1/test/artifacts/packs/0".into(),
+            object_version: 1,
+            hash: [9; 32],
+            length: 256,
+        }])
+        .unwrap(),
+    );
     let block = |kind, recipe, key: u8, hash: u8| QueryBlockDescriptor {
         kind,
         recipe,
@@ -60,6 +103,14 @@ fn canonical_run_directory_is_searched_without_materializing_an_index() {
         hash: [hash; 32],
         encoded_bytes: 64,
         records: 1,
+        locator: ArtifactPackLocator {
+            ordinal: 0,
+            offset: u64::from(hash.saturating_sub(1)) * 64,
+            encoded_bytes: 64,
+            logical_bytes: 64,
+            checksum: [hash; 32],
+        },
+        pack_table: pack_table.clone(),
     };
     let run = ProjectionQueryRunDescriptor {
         partition: partition(1),
@@ -68,6 +119,7 @@ fn canonical_run_directory_is_searched_without_materializing_an_index() {
         source_start_offset: 1,
         next_offset: 2,
         through_atomic_position: 1,
+        pack_table: pack_table.clone(),
         blocks: vec![
             block(QueryBlockKind::Posting, first, 1, 1),
             block(QueryBlockKind::Gate, first, 1, 2),
@@ -134,9 +186,7 @@ fn artifact_memory_refusal_happens_before_payload_loader() {
     assert!(matches!(
         ready(load_exact_pre_admitted(
             &mut loader,
-            QueryArtifactKind::Block,
-            hash,
-            1024,
+            QueryArtifactLoad::direct(QueryArtifactKind::Block, hash, 1024),
             &mut credits,
             &mut budget
         )),
@@ -161,9 +211,7 @@ fn preverified_artifact_loader_is_not_rehashed() {
 
     let loaded = ready(load_exact_pre_admitted(
         &mut loader,
-        QueryArtifactKind::Block,
-        hash,
-        bytes.len(),
+        QueryArtifactLoad::direct(QueryArtifactKind::Block, hash, bytes.len()),
         &mut credits,
         &mut budget,
     ))
@@ -207,6 +255,7 @@ fn sequential_block_scans_reuse_transient_heap_credits() {
         &mut encoding_credits,
     )
     .unwrap();
+    let descriptor = bound_block(&encoded);
     let hash = encoded.descriptor.hash;
     let mut loader = Loader {
         artifacts: [(hash, Bytes::from(encoded.bytes))].into(),
@@ -222,7 +271,7 @@ fn sequential_block_scans_reuse_transient_heap_credits() {
     for _ in 0..64 {
         let (loaded, charged) = ready(load_block(
             &mut loader,
-            &encoded.descriptor,
+            &descriptor,
             limits,
             &mut credits,
             &mut budget,
@@ -429,6 +478,7 @@ fn repeated_one_page_queries_reuse_the_validated_snapshot_without_artifact_loads
         source_start_offset: 1,
         next_offset: 2,
         through_atomic_position: 20,
+        pack_table: Arc::new(ArtifactPackTable::new(Vec::new()).unwrap()),
         blocks: Vec::new(),
     });
     let snapshot = Arc::new(ValidatedQuerySnapshot {

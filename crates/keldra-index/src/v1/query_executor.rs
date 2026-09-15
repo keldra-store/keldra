@@ -11,13 +11,13 @@ use crate::typed_json::{
 };
 
 use super::{
-    DecodedQueryBlock, LogicalProjectionBinding, MAX_QUERY_DOCUMENT_PATH_BYTES,
-    ProjectionPartitionIdentity, ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot,
-    QueryBlockCredits, QueryBlockCursor, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits,
-    QueryDocumentGate, QueryPosting, QueryRecipeCatalogProof, QueryRunChild, QueryRunPage,
-    QueryRunReference, QueryTermEntry, RecipeIdentity, StableDocumentKey, decode_doc_value,
-    decode_document_gate, decode_point, decode_positions, decode_posting,
-    decode_projection_query_run, decode_query_run_page, decode_term_entry,
+    ArtifactPackReference, DecodedQueryBlock, LogicalProjectionBinding,
+    MAX_QUERY_DOCUMENT_PATH_BYTES, ProjectionPartitionIdentity, ProjectionQueryRunDescriptor,
+    ProjectionQueryStreamRoot, QueryBlockCredits, QueryBlockCursor, QueryBlockDescriptor,
+    QueryBlockKind, QueryBlockLimits, QueryDocumentGate, QueryPosting, QueryRecipeCatalogProof,
+    QueryRunChild, QueryRunPage, QueryRunReference, QueryTermEntry, RecipeIdentity,
+    StableDocumentKey, decode_doc_value, decode_document_gate, decode_point, decode_positions,
+    decode_posting, decode_projection_query_run, decode_query_run_page, decode_term_entry,
 };
 
 #[path = "query_executor_admission.rs"]
@@ -655,12 +655,8 @@ async fn load_decoded_block<L: QueryArtifactLoader>(
 ) -> Result<Arc<DecodedQueryBlock>, IndexError> {
     let encoded_bytes =
         usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-    let request = QueryArtifactLoad {
-        kind: QueryArtifactKind::Block,
-        hash: descriptor.hash,
-        encoded_bytes,
-    };
-    if let Some(block) = loader.cached_query_block(generation, request)? {
+    let request = QueryArtifactLoad::packed(descriptor)?;
+    if let Some(block) = loader.cached_query_block(generation, request.clone())? {
         if !block.matches_descriptor(descriptor) {
             return Err(IndexError::Integrity);
         }
@@ -669,15 +665,7 @@ async fn load_decoded_block<L: QueryArtifactLoader>(
         return Ok(block);
     }
 
-    let bytes = load_exact_pre_admitted(
-        loader,
-        QueryArtifactKind::Block,
-        descriptor.hash,
-        encoded_bytes,
-        credits,
-        budget,
-    )
-    .await?;
+    let bytes = load_exact_pre_admitted(loader, request.clone(), credits, budget).await?;
     credits.release(bytes.len())?;
     let block = Arc::new(DecodedQueryBlock::from_verified_content(
         descriptor,
@@ -1310,13 +1298,9 @@ async fn seek_term_postings<L: QueryArtifactLoader>(
                 {
                     return Err(IndexError::Integrity);
                 }
-                let encoded_bytes = usize::try_from(posting_descriptor.encoded_bytes)
-                    .map_err(|_| IndexError::Integrity)?;
                 let bytes = load_exact_pre_admitted(
                     loader,
-                    QueryArtifactKind::Block,
-                    posting_descriptor.hash,
-                    encoded_bytes,
+                    QueryArtifactLoad::packed(posting_descriptor)?,
                     credits,
                     budget,
                 )
@@ -1464,13 +1448,9 @@ async fn verify_phrase<L: QueryArtifactLoader>(
         for ((run, hash), documents) in by_block {
             let descriptor =
                 manifest.find_run_block(run, hash, QueryBlockKind::Position, recipe)?;
-            let encoded_bytes =
-                usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
             let bytes = load_exact_pre_admitted(
                 loader,
-                QueryArtifactKind::Block,
-                descriptor.hash,
-                encoded_bytes,
+                QueryArtifactLoad::packed(descriptor)?,
                 credits,
                 budget,
             )
@@ -1548,9 +1528,7 @@ async fn load_block<L: QueryArtifactLoader>(
     let maximum = usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
     let bytes = load_exact_pre_admitted(
         loader,
-        QueryArtifactKind::Block,
-        descriptor.hash,
-        maximum,
+        QueryArtifactLoad::packed(descriptor)?,
         credits,
         budget,
     )
@@ -1617,9 +1595,7 @@ async fn load_selected_terms<L: QueryArtifactLoader>(
     let maximum = usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
     let bytes = load_exact_pre_admitted(
         loader,
-        QueryArtifactKind::Block,
-        descriptor.hash,
-        maximum,
+        QueryArtifactLoad::packed(descriptor)?,
         credits,
         budget,
     )
@@ -1707,9 +1683,7 @@ async fn load_candidate_doc_values<L: QueryArtifactLoader>(
             usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
         let bytes = load_exact_pre_admitted(
             loader,
-            QueryArtifactKind::Block,
-            descriptor.hash,
-            maximum,
+            QueryArtifactLoad::packed(descriptor)?,
             credits,
             budget,
         )

@@ -14,15 +14,24 @@ fn sealed(component: ComponentIdentity, records: &[(u8, Option<&[u8]>)]) -> Seal
     )
     .unwrap()
 }
-fn packed(delta: SealedComponentDelta) -> (PackedComponentDelta, Vec<u8>) {
+fn packed(delta: SealedComponentDelta) -> (PackedComponentDelta, ArtifactPackTable, Vec<u8>) {
     let bytes = delta.bytes.len();
     let pack = pack_component_deltas(vec![delta], test_pack_credits(bytes))
         .unwrap()
         .packs
         .remove(0);
-    (pack.deltas[0].clone(), pack.bytes)
+    let table = ArtifactPackTable::new(vec![ArtifactPackReference {
+        ordinal: pack.ordinal,
+        canonical_path: format!("_keldra/index-projections/v1/test/packs/{}", pack.ordinal).into(),
+        object_version: 1,
+        hash: pack.hash,
+        length: pack.bytes.len() as u64,
+    }])
+    .unwrap();
+    (pack.deltas[0].clone(), table, pack.bytes)
 }
 fn run(sequence: u64) -> ComponentSegmentDescriptor {
+    let hash = *crate::profiled_blake3_hash!(&sequence.to_le_bytes()).as_bytes();
     ComponentSegmentDescriptor {
         sequence,
         level: 0,
@@ -31,10 +40,21 @@ fn run(sequence: u64) -> ComponentSegmentDescriptor {
         source_start_offset: sequence - 1,
         next_offset: sequence,
         through_atomic_position: sequence,
-        pack_hash: *crate::profiled_blake3_hash!(&sequence.to_le_bytes()).as_bytes(),
-        pack_offset: 0,
-        encoded_bytes: 100,
-        logical_bytes: 80,
+        pack_table: ArtifactPackTable::new(vec![ArtifactPackReference {
+            ordinal: 0,
+            canonical_path: format!("_keldra/index-projections/v1/test/packs/{sequence}").into(),
+            object_version: sequence,
+            hash,
+            length: 100,
+        }])
+        .unwrap(),
+        locator: ArtifactPackLocator {
+            ordinal: 0,
+            offset: 0,
+            encoded_bytes: 100,
+            logical_bytes: 80,
+            checksum: hash,
+        },
         records: 1,
     }
 }
@@ -55,13 +75,21 @@ fn reachable_pages(
 #[test]
 fn newest_delta_wins_and_tombstones_hide_older_values() {
     let component = ComponentIdentity::Field(RecipeIdentity::new([7; 32]).unwrap());
-    let (first, first_pack) = packed(sealed(component, &[(1, Some(b"old")), (2, Some(b"kept"))]));
-    let (second, second_pack) = packed(sealed(component, &[(1, Some(b"new")), (2, None)]));
-    let one = append_component_delta(None, &first, 0, 1, 1).unwrap();
-    let two = append_component_delta(Some(&one), &second, 1, 2, 2).unwrap();
+    let (first, first_table, first_pack) =
+        packed(sealed(component, &[(1, Some(b"old")), (2, Some(b"kept"))]));
+    let (second, second_table, second_pack) =
+        packed(sealed(component, &[(1, Some(b"new")), (2, None)]));
+    let one = append_component_delta(None, &first, &first_table, 0, 1, 1).unwrap();
+    let two = append_component_delta(Some(&one), &second, &second_table, 1, 2, 2).unwrap();
     let artifacts = [
-        (first.pack_hash, first_pack),
-        (second.pack_hash, second_pack),
+        (
+            first.locator.resolve(&first_table).unwrap().hash,
+            first_pack,
+        ),
+        (
+            second.locator.resolve(&second_table).unwrap().hash,
+            second_pack,
+        ),
     ]
     .into_iter()
     .collect();
@@ -74,7 +102,9 @@ fn newest_delta_wins_and_tombstones_hide_older_values() {
         None
     );
     let newest = decode_component_stream(&two).unwrap().pop().unwrap();
-    let newest_pack = artifacts.get(&newest.pack_hash).unwrap();
+    let newest_pack = artifacts
+        .get(&newest.pack_reference().unwrap().hash)
+        .unwrap();
     assert_eq!(
         lookup_component_record_in_verified_pack(component, &newest, newest_pack, key(2)).unwrap(),
         ComponentRecordLookup::Tombstone
@@ -88,13 +118,21 @@ fn newest_delta_wins_and_tombstones_hide_older_values() {
 #[test]
 fn compaction_preserves_the_exact_newest_view() {
     let component = ComponentIdentity::Membership(RecipeIdentity::new([8; 32]).unwrap());
-    let (first, first_pack) = packed(sealed(component, &[(1, Some(b"one")), (2, Some(b"two"))]));
-    let (second, second_pack) = packed(sealed(component, &[(1, None), (3, Some(b"three"))]));
-    let one = append_component_delta(None, &first, 0, 1, 1).unwrap();
-    let two = append_component_delta(Some(&one), &second, 1, 2, 2).unwrap();
+    let (first, first_table, first_pack) =
+        packed(sealed(component, &[(1, Some(b"one")), (2, Some(b"two"))]));
+    let (second, second_table, second_pack) =
+        packed(sealed(component, &[(1, None), (3, Some(b"three"))]));
+    let one = append_component_delta(None, &first, &first_table, 0, 1, 1).unwrap();
+    let two = append_component_delta(Some(&one), &second, &second_table, 1, 2, 2).unwrap();
     let artifacts = [
-        (first.pack_hash, first_pack),
-        (second.pack_hash, second_pack),
+        (
+            first.locator.resolve(&first_table).unwrap().hash,
+            first_pack,
+        ),
+        (
+            second.locator.resolve(&second_table).unwrap().hash,
+            second_pack,
+        ),
     ]
     .into_iter()
     .collect::<BTreeMap<_, _>>();
@@ -124,15 +162,21 @@ fn compaction_preserves_the_exact_newest_view() {
             maximum_output_run_bytes: 1024,
         },
         TombstoneCompactionPolicy::Retain,
-        |hash| artifacts.get(&hash).cloned().ok_or(IndexError::Integrity),
+        |reference| {
+            artifacts
+                .get(&reference.hash)
+                .cloned()
+                .ok_or(IndexError::Integrity)
+        },
     )
     .unwrap();
     assert_eq!(compacted.len(), 1);
-    let (delta, bytes) = packed(compacted.into_iter().next().unwrap());
-    let spliced = splice_compacted_component_runs(two.root(), &plan, &[delta.clone()], |hash| {
-        pages.get(&hash).cloned().ok_or(IndexError::Integrity)
-    })
-    .unwrap();
+    let (delta, table, bytes) = packed(compacted.into_iter().next().unwrap());
+    let spliced =
+        splice_compacted_component_runs(two.root(), &plan, &[delta.clone()], &table, |hash| {
+            pages.get(&hash).cloned().ok_or(IndexError::Integrity)
+        })
+        .unwrap();
     assert!(
         spliced.new_pages.len() <= 1,
         "one-leaf compaction rewrites one page"
@@ -162,7 +206,9 @@ fn compaction_preserves_the_exact_newest_view() {
         directory_bytes: spliced.root.directory_bytes,
         pages: reachable,
     };
-    let compacted_artifacts = [(delta.pack_hash, bytes)].into_iter().collect();
+    let compacted_artifacts = [(delta.locator.resolve(&table).unwrap().hash, bytes)]
+        .into_iter()
+        .collect();
     for stable_key in [key(1), key(2), key(3), key(4)] {
         assert_eq!(
             resolve_component_record_from_verified_artifacts(&two, &artifacts, stable_key).unwrap(),
@@ -193,17 +239,20 @@ fn splice_rewrites_only_the_affected_page_path_and_refuses_unrepresentable_outpu
         next_offset: 2,
         through_atomic_position: 2,
     };
-    let (delta, _) = packed(sealed(component, &[(1, Some(b"new"))]));
+    let (delta, table, _) = packed(sealed(component, &[(1, Some(b"new"))]));
     let pages = directory
         .pages
         .iter()
         .map(|page| (page.hash, page.bytes.clone()))
         .collect::<BTreeMap<_, _>>();
-    let spliced =
-        splice_compacted_component_runs(directory.root(), &plan, &[delta.clone()], |hash| {
-            pages.get(&hash).cloned().ok_or(IndexError::Integrity)
-        })
-        .unwrap();
+    let spliced = splice_compacted_component_runs(
+        directory.root(),
+        &plan,
+        &[delta.clone()],
+        &table,
+        |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
+    )
+    .unwrap();
     assert_eq!(spliced.root.segment_count, 299);
     assert_eq!(spliced.new_pages.len(), 2, "leaf plus its root path");
     assert!(spliced.new_pages.len() < directory.pages.len());
@@ -213,6 +262,7 @@ fn splice_rewrites_only_the_affected_page_path_and_refuses_unrepresentable_outpu
         directory.root(),
         &invalid_coverage,
         &[delta.clone()],
+        &table,
         |_| Err::<Vec<u8>, _>(IndexError::Integrity),
     )
     .unwrap_err();
@@ -226,6 +276,7 @@ fn splice_rewrites_only_the_affected_page_path_and_refuses_unrepresentable_outpu
             directory.root(),
             &plan,
             &[delta.clone(), delta.clone(), delta.clone()],
+            &table,
             |_| Err::<Vec<u8>, _>(IndexError::Integrity)
         ),
         Err(IndexError::ResourceLimit { .. })
@@ -233,7 +284,7 @@ fn splice_rewrites_only_the_affected_page_path_and_refuses_unrepresentable_outpu
     let mut wrong_root = directory.root();
     wrong_root.root_hash = [42; 32];
     assert_eq!(
-        splice_compacted_component_runs(wrong_root, &plan, &[delta], |_| {
+        splice_compacted_component_runs(wrong_root, &plan, &[delta], &table, |_| {
             Err::<Vec<u8>, _>(IndexError::Integrity)
         }),
         Err(IndexError::Integrity)
@@ -251,7 +302,7 @@ fn directory_fanout_bounds_pages_for_seventy_thousand_segments() {
             .iter()
             .all(|page| page.bytes.len() < 32 * 1024)
     );
-    assert!(directory.pages.len() < 600);
+    assert!(directory.pages.len() < 1_200);
     let pages = directory
         .pages
         .iter()
@@ -367,7 +418,7 @@ fn key_cursor_does_not_open_page_subtrees_outside_the_target_range() {
             .iter()
             .all(|descriptor| descriptor.minimum_key == key(1))
     );
-    assert_eq!(page_loads, 2, "root plus only the matching leaf");
+    assert_eq!(page_loads, 3, "root plus only the two matching leaves");
 }
 
 #[test]
@@ -383,12 +434,13 @@ fn append_path_copies_only_the_logarithmic_right_spine() {
     let persisted_root = previous.component_root().unwrap();
     let reopened_root = ComponentStreamRoot::from_component_root(&persisted_root).unwrap();
     assert_eq!(reopened_root, previous.root());
-    let (delta, _) = packed(sealed(component, &[(1, Some(b"next"))]));
+    let (delta, table, _) = packed(sealed(component, &[(1, Some(b"next"))]));
 
     let appended = append_component_stream(
         Some(reopened_root),
         |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
         &delta,
+        &table,
         65_536,
         65_537,
         65_537,
@@ -425,14 +477,14 @@ fn append_path_copies_only_the_logarithmic_right_spine() {
     };
     let decoded = decode_component_stream(&complete).unwrap();
     assert_eq!(decoded.len(), 65_537);
-    assert_eq!(decoded.last().unwrap().pack_hash, delta.pack_hash);
+    assert_eq!(decoded.last().unwrap().locator, delta.locator);
 }
 
 #[test]
 fn artifact_identity_selects_a_preverified_pack() {
     let component = ComponentIdentity::DocumentHead;
-    let (segment, _) = packed(sealed(component, &[(1, Some(b"state"))]));
-    let directory = append_component_delta(None, &segment, 0, 1, 1).unwrap();
+    let (segment, table, _) = packed(sealed(component, &[(1, Some(b"state"))]));
+    let directory = append_component_delta(None, &segment, &table, 0, 1, 1).unwrap();
     let artifacts = BTreeMap::new();
     assert!(matches!(
         resolve_component_record_from_verified_artifacts(&directory, &artifacts, key(1)),

@@ -1,10 +1,24 @@
 use super::*;
 use crate::typed_json::{Collation, FieldId, FieldType};
 use crate::v1::{
-    IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage, QueryMemoryPermit,
+    ArtifactPackReference, IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage,
+    QueryMemoryPermit,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn test_pack_table(length: u64) -> Arc<ArtifactPackTable> {
+    Arc::new(
+        ArtifactPackTable::new(vec![ArtifactPackReference {
+            ordinal: 0,
+            canonical_path: "_keldra/index-projections/v1/test/artifacts/packs/0".into(),
+            object_version: 1,
+            hash: [9; 32],
+            length,
+        }])
+        .unwrap(),
+    )
+}
 
 struct TestQueryPermit {
     bytes: usize,
@@ -81,6 +95,26 @@ fn record_ref(record: &QueryBlockRecord) -> QueryBlockRecordRef<'_> {
     QueryBlockRecordRef {
         key: &record.key,
         value: &record.value,
+    }
+}
+
+fn bound(encoded: &EncodedQueryBlock) -> QueryBlockDescriptor {
+    QueryBlockDescriptor {
+        kind: encoded.descriptor.kind,
+        recipe: encoded.descriptor.recipe,
+        minimum_key: encoded.descriptor.minimum_key.clone(),
+        maximum_key: encoded.descriptor.maximum_key.clone(),
+        hash: encoded.descriptor.hash,
+        encoded_bytes: encoded.descriptor.encoded_bytes,
+        records: encoded.descriptor.records,
+        locator: ArtifactPackLocator {
+            ordinal: 0,
+            offset: 0,
+            encoded_bytes: encoded.descriptor.encoded_bytes,
+            logical_bytes: encoded.descriptor.encoded_bytes,
+            checksum: encoded.descriptor.hash,
+        },
+        pack_table: test_pack_table(encoded.descriptor.encoded_bytes),
     }
 }
 
@@ -170,13 +204,14 @@ fn cursor_is_lazy_integrity_checked_and_seekable() {
         &mut credits,
     )
     .unwrap();
+    let descriptor = bound(&encoded);
     let mut cursor =
-        QueryBlockCursor::new(&encoded.descriptor, &encoded.bytes, limits, &mut credits).unwrap();
+        QueryBlockCursor::new(&descriptor, &encoded.bytes, limits, &mut credits).unwrap();
     assert_eq!(cursor.seek_to(b"beta").unwrap().unwrap().value, b"two");
     assert!(cursor.next().unwrap().is_none());
     let mut corrupt = encoded.bytes.clone();
     corrupt[0] ^= 1;
-    assert!(QueryBlockCursor::new(&encoded.descriptor, &corrupt, limits, &mut credits).is_err());
+    assert!(QueryBlockCursor::new(&descriptor, &corrupt, limits, &mut credits).is_err());
 }
 
 #[test]
@@ -191,15 +226,12 @@ fn decoded_block_reuses_encoded_storage_and_releases_fill_credits() {
         &mut credits,
     )
     .unwrap();
+    let descriptor = bound(&encoded);
     let before_fill = credits.remaining();
     let bytes = Bytes::from(encoded.bytes);
-    let decoded = DecodedQueryBlock::from_verified_content(
-        &encoded.descriptor,
-        bytes.clone(),
-        limits,
-        &mut credits,
-    )
-    .unwrap();
+    let decoded =
+        DecodedQueryBlock::from_verified_content(&descriptor, bytes.clone(), limits, &mut credits)
+            .unwrap();
 
     assert_eq!(credits.remaining(), before_fill);
     assert_eq!(decoded.encoded_bytes(), bytes.len());
@@ -240,8 +272,9 @@ fn restart_table_limits_exact_seek_to_one_block_tail() {
         &mut credits,
     )
     .unwrap();
+    let descriptor = bound(&encoded);
     let mut cursor =
-        QueryBlockCursor::new(&encoded.descriptor, &encoded.bytes, limits, &mut credits).unwrap();
+        QueryBlockCursor::new(&descriptor, &encoded.bytes, limits, &mut credits).unwrap();
     assert_eq!(
         cursor.seek_to(b"term-151").unwrap().unwrap().key,
         b"term-151"
@@ -268,8 +301,9 @@ fn ascending_seeks_continue_from_the_current_record() {
         &mut credits,
     )
     .unwrap();
+    let descriptor = bound(&encoded);
     let mut cursor =
-        QueryBlockCursor::new(&encoded.descriptor, &encoded.bytes, limits, &mut credits).unwrap();
+        QueryBlockCursor::new(&descriptor, &encoded.bytes, limits, &mut credits).unwrap();
 
     assert_eq!(
         cursor.seek_to(b"term-130").unwrap().unwrap().key,
@@ -336,16 +370,18 @@ fn encoded_posting_merge_keeps_old_term_tombstones_and_suppresses_delete() {
         &mut reservation,
     )
     .unwrap();
+    let old_term_removal_descriptor = bound(&old_term_removal);
+    let old_live_descriptor = bound(&old_live);
     let mut inputs = [
         QueryBlockCursor::new(
-            &old_term_removal.descriptor,
+            &old_term_removal_descriptor,
             &old_term_removal.bytes,
             limits,
             &mut reservation,
         )
         .unwrap(),
         QueryBlockCursor::new(
-            &old_live.descriptor,
+            &old_live_descriptor,
             &old_live.bytes,
             limits,
             &mut reservation,
@@ -375,8 +411,9 @@ fn encoded_posting_merge_keeps_old_term_tombstones_and_suppresses_delete() {
         &mut reservation,
     )
     .unwrap();
+    let new_term_descriptor = bound(&new_term);
     let mut new_inputs = [QueryBlockCursor::new(
-        &new_term.descriptor,
+        &new_term_descriptor,
         &new_term.bytes,
         limits,
         &mut reservation,
@@ -493,6 +530,8 @@ fn descriptor_is_exact_family_partition_catalog_and_cut_binding() {
         &mut credits,
     )
     .unwrap();
+    let pack_table = test_pack_table(block.bytes.len() as u64);
+    let logical = block.descriptor;
     let descriptor = ProjectionQueryRunDescriptor {
         partition: partition(),
         physical_catalog_generation: [8; 32],
@@ -500,13 +539,68 @@ fn descriptor_is_exact_family_partition_catalog_and_cut_binding() {
         source_start_offset: 9,
         next_offset: 10,
         through_atomic_position: 11,
-        blocks: vec![block.descriptor],
+        pack_table: pack_table.clone(),
+        blocks: vec![QueryBlockDescriptor {
+            kind: logical.kind,
+            recipe: logical.recipe,
+            minimum_key: logical.minimum_key,
+            maximum_key: logical.maximum_key,
+            hash: logical.hash,
+            encoded_bytes: logical.encoded_bytes,
+            records: logical.records,
+            locator: ArtifactPackLocator {
+                ordinal: 0,
+                offset: 0,
+                encoded_bytes: logical.encoded_bytes,
+                logical_bytes: logical.encoded_bytes,
+                checksum: logical.hash,
+            },
+            pack_table,
+        }],
     };
     let encoded = encode_projection_query_run(&descriptor, limits, &mut credits).unwrap();
+    let encoded_again = encode_projection_query_run(&descriptor, limits, &mut credits).unwrap();
+    assert_eq!(encoded, encoded_again, "root codec must be deterministic");
     assert_eq!(
         decode_projection_query_run(&encoded.bytes, limits, &mut credits).unwrap(),
         descriptor
     );
+
+    let path = descriptor.pack_table.entries()[0].canonical_path.as_bytes();
+    let path_offset = encoded
+        .bytes
+        .windows(path.len())
+        .position(|candidate| candidate == path)
+        .unwrap();
+    let mut corrupt_path = encoded.bytes.clone();
+    corrupt_path[path_offset] = b'X';
+    assert!(decode_projection_query_run(&corrupt_path, limits, &mut credits).is_err());
+
+    for changed in ["path", "version", "hash", "length"] {
+        let mut reference = descriptor.pack_table.entries()[0].clone();
+        match changed {
+            "path" => {
+                reference.canonical_path =
+                    "_keldra/index-projections/v1/test/artifacts/packs/changed".into();
+            }
+            "version" => reference.object_version += 1,
+            "hash" => reference.hash = [8; 32],
+            "length" => reference.length += 1,
+            _ => unreachable!(),
+        }
+        let table = Arc::new(ArtifactPackTable::new(vec![reference]).unwrap());
+        let mut changed_descriptor = descriptor.clone();
+        changed_descriptor.pack_table = table.clone();
+        for block in &mut changed_descriptor.blocks {
+            block.pack_table = table.clone();
+        }
+        let changed_encoded =
+            encode_projection_query_run(&changed_descriptor, limits, &mut credits).unwrap();
+        assert_ne!(
+            changed_encoded.hash, encoded.hash,
+            "{changed} must be root-bound"
+        );
+    }
 }
 
 #[test]
@@ -515,6 +609,7 @@ fn run_block_count_is_bounded_by_descriptor_bytes_not_query_concurrency() {
         maximum_loaded_blocks: 1,
         ..QueryBlockLimits::default_for_memory()
     };
+    let pack_table = test_pack_table(4097);
     let blocks = (0_u64..4097)
         .map(|ordinal| {
             let key = ordinal.to_be_bytes().to_vec();
@@ -528,6 +623,14 @@ fn run_block_count_is_bounded_by_descriptor_bytes_not_query_concurrency() {
                 hash,
                 encoded_bytes: 1,
                 records: 1,
+                locator: ArtifactPackLocator {
+                    ordinal: 0,
+                    offset: ordinal,
+                    encoded_bytes: 1,
+                    logical_bytes: 1,
+                    checksum: hash,
+                },
+                pack_table: pack_table.clone(),
             }
         })
         .collect();
@@ -538,6 +641,7 @@ fn run_block_count_is_bounded_by_descriptor_bytes_not_query_concurrency() {
         source_start_offset: 9,
         next_offset: 10,
         through_atomic_position: 11,
+        pack_table,
         blocks,
     };
     let mut encode_credits = credits(2 * 1024 * 1024);
@@ -567,6 +671,7 @@ fn self_built_run_identity_failure_names_the_exact_invariant() {
         source_start_offset: 9,
         next_offset: 10,
         through_atomic_position: 11,
+        pack_table: Arc::new(ArtifactPackTable::new(Vec::new()).unwrap()),
         blocks: Vec::new(),
     };
     let error = descriptor

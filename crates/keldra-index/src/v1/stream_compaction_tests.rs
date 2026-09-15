@@ -17,13 +17,25 @@ fn sealed(component: ComponentIdentity, records: &[(u8, Option<&[u8]>)]) -> Seal
     .unwrap()
 }
 
-fn packed(delta: SealedComponentDelta) -> (PackedComponentDelta, Vec<u8>) {
+fn packed(delta: SealedComponentDelta) -> (PackedComponentDelta, ArtifactPackTable, Vec<u8>) {
     let bytes = delta.bytes.len();
     let pack = pack_component_deltas(vec![delta], test_pack_credits(bytes))
         .unwrap()
         .packs
         .remove(0);
-    (pack.deltas[0].clone(), pack.bytes)
+    let table = ArtifactPackTable::new(vec![ArtifactPackReference {
+        ordinal: pack.ordinal,
+        canonical_path: format!("_keldra/index-projections/v1/test/packs/{}", pack.ordinal).into(),
+        object_version: 1,
+        hash: pack.hash,
+        length: pack.bytes.len() as u64,
+    }])
+    .unwrap();
+    (pack.deltas[0].clone(), table, pack.bytes)
+}
+
+fn pack_hash(delta: &PackedComponentDelta, table: &ArtifactPackTable) -> [u8; 32] {
+    delta.locator.resolve(table).unwrap().hash
 }
 
 fn reachable_pages(
@@ -53,15 +65,16 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
     let mut pages = BTreeMap::new();
     let mut packs = BTreeMap::new();
 
-    let (wide_first, wide_first_pack) = packed(sealed(
+    let (wide_first, wide_first_table, wide_first_pack) = packed(sealed(
         component,
         &[(1, Some(b"wide-left")), (250, Some(b"wide-right"))],
     ));
-    packs.insert(wide_first.pack_hash, wide_first_pack);
+    packs.insert(pack_hash(&wide_first, &wide_first_table), wide_first_pack);
     let first = append_component_stream(
         None,
         |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         &wide_first,
+        &wide_first_table,
         0,
         1,
         1,
@@ -74,15 +87,19 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
             .map(|page| (page.hash, page.bytes.clone())),
     );
 
-    let (wide_second, wide_second_pack) = packed(sealed(
+    let (wide_second, wide_second_table, wide_second_pack) = packed(sealed(
         component,
         &[(1, Some(b"new-left")), (250, Some(b"new-right"))],
     ));
-    packs.insert(wide_second.pack_hash, wide_second_pack);
+    packs.insert(
+        pack_hash(&wide_second, &wide_second_table),
+        wide_second_pack,
+    );
     let second = append_component_stream(
         Some(first.root),
         |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
         &wide_second,
+        &wide_second_table,
         1,
         2,
         2,
@@ -106,15 +123,21 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         &first_plan,
         limits,
         TombstoneCompactionPolicy::Retain,
-        |hash| packs.get(&hash).cloned().ok_or(IndexError::Integrity),
+        |reference| {
+            packs
+                .get(&reference.hash)
+                .cloned()
+                .ok_or(IndexError::Integrity)
+        },
     )
     .unwrap();
-    let (wide_l1, wide_l1_pack) = packed(first_output.into_iter().next().unwrap());
-    packs.insert(wide_l1.pack_hash, wide_l1_pack);
+    let (wide_l1, wide_l1_table, wide_l1_pack) = packed(first_output.into_iter().next().unwrap());
+    packs.insert(pack_hash(&wide_l1, &wide_l1_table), wide_l1_pack);
     let first_splice = splice_compacted_component_runs(
         second.root,
         &first_plan,
         std::slice::from_ref(&wide_l1),
+        &wide_l1_table,
         |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
     )
     .unwrap();
@@ -125,13 +148,17 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
             .map(|page| (page.hash, page.bytes.clone())),
     );
 
-    let (narrow_first, narrow_first_pack) =
+    let (narrow_first, narrow_first_table, narrow_first_pack) =
         packed(sealed(component, &[(100, Some(b"narrow-one"))]));
-    packs.insert(narrow_first.pack_hash, narrow_first_pack);
+    packs.insert(
+        pack_hash(&narrow_first, &narrow_first_table),
+        narrow_first_pack,
+    );
     let third = append_component_stream(
         Some(first_splice.root),
         |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
         &narrow_first,
+        &narrow_first_table,
         2,
         3,
         3,
@@ -144,13 +171,17 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
             .map(|page| (page.hash, page.bytes.clone())),
     );
 
-    let (narrow_second, narrow_second_pack) =
+    let (narrow_second, narrow_second_table, narrow_second_pack) =
         packed(sealed(component, &[(101, Some(b"narrow-two"))]));
-    packs.insert(narrow_second.pack_hash, narrow_second_pack);
+    packs.insert(
+        pack_hash(&narrow_second, &narrow_second_table),
+        narrow_second_pack,
+    );
     let fourth = append_component_stream(
         Some(third.root),
         |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
         &narrow_second,
+        &narrow_second_table,
         3,
         4,
         4,
@@ -177,9 +208,13 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
     let mut released_plan = second_plan.clone();
     released_plan.minimum_key = key(100);
     released_plan.maximum_key = key(101);
-    let released_error = splice_compacted_component_runs(fourth.root, &released_plan, &[], |_| {
-        Err::<Vec<u8>, _>(IndexError::Integrity)
-    })
+    let released_error = splice_compacted_component_runs(
+        fourth.root,
+        &released_plan,
+        &[],
+        &ArtifactPackTable::empty(),
+        |_| Err::<Vec<u8>, _>(IndexError::Integrity),
+    )
     .unwrap_err();
     assert!(matches!(released_error, IndexError::IntegrityViolation(_)));
     assert!(released_error.to_string().contains("minimum_key"));
@@ -187,18 +222,48 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         &second_plan,
         limits,
         TombstoneCompactionPolicy::Retain,
-        |hash| packs.get(&hash).cloned().ok_or(IndexError::Integrity),
+        |reference| {
+            packs
+                .get(&reference.hash)
+                .cloned()
+                .ok_or(IndexError::Integrity)
+        },
     )
     .unwrap();
-    let packed_output = second_output
-        .into_iter()
-        .map(|delta| packed(delta).0)
+    let output_bytes = second_output.iter().map(|delta| delta.bytes.len()).sum();
+    let sealed_output =
+        pack_component_deltas(second_output, test_pack_credits(output_bytes)).unwrap();
+    let output_table = ArtifactPackTable::new(
+        sealed_output
+            .packs
+            .iter()
+            .map(|pack| ArtifactPackReference {
+                ordinal: pack.ordinal,
+                canonical_path: format!(
+                    "_keldra/index-projections/v1/test/output-packs/{}",
+                    pack.ordinal
+                )
+                .into(),
+                object_version: u64::from(pack.ordinal) + 1,
+                hash: pack.hash,
+                length: pack.bytes.len() as u64,
+            })
+            .collect(),
+    )
+    .unwrap();
+    let packed_output = sealed_output
+        .packs
+        .iter()
+        .flat_map(|pack| pack.deltas.iter().cloned())
         .collect::<Vec<_>>();
-    let second_splice =
-        splice_compacted_component_runs(fourth.root, &second_plan, &packed_output, |hash| {
-            pages.get(&hash).cloned().ok_or(IndexError::Integrity)
-        })
-        .unwrap();
+    let second_splice = splice_compacted_component_runs(
+        fourth.root,
+        &second_plan,
+        &packed_output,
+        &output_table,
+        |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
+    )
+    .unwrap();
     pages.extend(
         second_splice
             .new_pages
@@ -252,11 +317,21 @@ fn expanded_target_range_keeps_tombstones_when_older_history_overlaps_its_flank(
     let mut packs = BTreeMap::new();
     let mut segments = Vec::new();
     for (index, (level, records)) in inputs.into_iter().enumerate() {
-        let (delta, pack) = packed(sealed(component, records));
-        packs.insert(delta.pack_hash, pack);
+        let (delta, table, pack) = packed(sealed(component, records));
+        packs.insert(pack_hash(&delta, &table), pack);
         let sequence = index as u64 + 1;
-        segments
-            .push(descriptor(sequence, level, sequence - 1, sequence, sequence, &delta).unwrap());
+        segments.push(
+            descriptor(
+                sequence,
+                level,
+                sequence - 1,
+                sequence,
+                sequence,
+                &delta,
+                &table,
+            )
+            .unwrap(),
+        );
     }
     let directory = build_component_stream(component, &segments).unwrap();
     let pages = directory
@@ -288,9 +363,17 @@ fn expanded_target_range_keeps_tombstones_when_older_history_overlaps_its_flank(
         Err(IndexError::InvalidDefinition(_))
     ));
     assert!(
-        compact_component_runs(&plan, limits, TombstoneCompactionPolicy::Retain, |hash| {
-            packs.get(&hash).cloned().ok_or(IndexError::Integrity)
-        },)
+        compact_component_runs(
+            &plan,
+            limits,
+            TombstoneCompactionPolicy::Retain,
+            |reference| {
+                packs
+                    .get(&reference.hash)
+                    .cloned()
+                    .ok_or(IndexError::Integrity)
+            },
+        )
         .is_ok()
     );
 }

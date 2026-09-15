@@ -20,6 +20,7 @@ struct Key {
     authority: Authority,
     path: Arc<str>,
     hash: [u8; 32],
+    object_version: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -48,7 +49,7 @@ struct State {
     bytes: usize,
     // Nest by authority and path so hits can compare the caller's borrowed
     // path without allocating another owned copy.
-    entries: HashMap<Authority, HashMap<Arc<str>, HashMap<[u8; 32], Bytes>>>,
+    entries: HashMap<Authority, HashMap<Arc<str>, HashMap<([u8; 32], Option<u64>), Bytes>>>,
     blobs: HashMap<BlobKey, CachedBlob>,
     loading: HashMap<Key, tokio::sync::watch::Sender<bool>>,
     fifo: VecDeque<CacheKey>,
@@ -124,6 +125,7 @@ impl ImmutableArtifactCache {
         bucket_id: u64,
         path: &str,
         hash: [u8; 32],
+        object_version: Option<u64>,
         maximum_bytes: usize,
         load: F,
     ) -> Result<Option<Bytes>, Status>
@@ -133,7 +135,14 @@ impl ImmutableArtifactCache {
     {
         let mut load = Some(load);
         loop {
-            match self.begin_path_load(tenant_id, bucket_id, path, hash, maximum_bytes)? {
+            match self.begin_path_load(
+                tenant_id,
+                bucket_id,
+                path,
+                hash,
+                object_version,
+                maximum_bytes,
+            )? {
                 PathLoad::Hit(bytes) => return Ok(Some(bytes)),
                 PathLoad::Wait(mut completed) => {
                     if !*completed.borrow() {
@@ -153,7 +162,14 @@ impl ImmutableArtifactCache {
                                 "v1 projection artifact violates its exact byte bound",
                             ));
                         }
-                        self.insert(tenant_id, bucket_id, path, hash, bytes.clone());
+                        self.insert(
+                            tenant_id,
+                            bucket_id,
+                            path,
+                            hash,
+                            object_version,
+                            bytes.clone(),
+                        );
                     }
                     drop(guard);
                     return result;
@@ -168,6 +184,7 @@ impl ImmutableArtifactCache {
         bucket_id: u64,
         path: &str,
         hash: [u8; 32],
+        object_version: Option<u64>,
         maximum_bytes: usize,
     ) -> Result<PathLoad, Status> {
         let authority = Authority {
@@ -182,7 +199,7 @@ impl ImmutableArtifactCache {
             .entries
             .get(&authority)
             .and_then(|paths| paths.get(path))
-            .and_then(|hashes| hashes.get(&hash))
+            .and_then(|hashes| hashes.get(&(hash, object_version)))
         {
             if bytes.len() > maximum_bytes {
                 return Err(Status::data_loss(
@@ -195,6 +212,7 @@ impl ImmutableArtifactCache {
             authority,
             path: Arc::from(path),
             hash,
+            object_version,
         };
         if let Some(completed) = state.loading.get(&key) {
             return Ok(PathLoad::Wait(completed.subscribe()));
@@ -214,6 +232,7 @@ impl ImmutableArtifactCache {
         bucket_id: u64,
         path: &str,
         hash: [u8; 32],
+        object_version: Option<u64>,
         maximum_bytes: usize,
     ) -> Result<Option<Bytes>, Status> {
         let state = self
@@ -228,7 +247,7 @@ impl ImmutableArtifactCache {
             .entries
             .get(&authority)
             .and_then(|paths| paths.get(path))
-            .and_then(|hashes| hashes.get(&hash))
+            .and_then(|hashes| hashes.get(&(hash, object_version)))
         else {
             return Ok(None);
         };
@@ -246,6 +265,7 @@ impl ImmutableArtifactCache {
         bucket_id: u64,
         path: &str,
         hash: [u8; 32],
+        object_version: Option<u64>,
         bytes: Bytes,
     ) {
         if bytes.is_empty() {
@@ -264,7 +284,7 @@ impl ImmutableArtifactCache {
                 .entries
                 .get(&authority)
                 .and_then(|paths| paths.get(path))
-                .is_some_and(|hashes| hashes.contains_key(&hash))
+                .is_some_and(|hashes| hashes.contains_key(&(hash, object_version)))
         {
             return;
         }
@@ -276,11 +296,12 @@ impl ImmutableArtifactCache {
             .or_default()
             .entry(path.clone())
             .or_default()
-            .insert(hash, bytes);
+            .insert((hash, object_version), bytes);
         state.fifo.push_back(CacheKey::Path(Key {
             authority,
             path,
             hash,
+            object_version,
         }));
         Self::evict_to_capacity(&mut state);
     }
@@ -455,7 +476,9 @@ impl ImmutableArtifactCache {
                     if let Some(paths) = state.entries.get_mut(&oldest.authority) {
                         let mut remove_path = false;
                         if let Some(hashes) = paths.get_mut(oldest.path.as_ref()) {
-                            if let Some(evicted) = hashes.remove(&oldest.hash) {
+                            if let Some(evicted) =
+                                hashes.remove(&(oldest.hash, oldest.object_version))
+                            {
                                 evicted_bytes = evicted.len();
                             }
                             remove_path = hashes.is_empty();
@@ -490,6 +513,22 @@ impl ImmutableArtifactCache {
 
 fn resident_query_run_bytes(descriptor: &ProjectionQueryRunDescriptor) -> usize {
     std::mem::size_of::<ProjectionQueryRunDescriptor>()
+        .saturating_add(std::mem::size_of::<keldra_index::v1::ArtifactPackTable>())
+        .saturating_add(
+            descriptor
+                .pack_table
+                .entries()
+                .len()
+                .saturating_mul(std::mem::size_of::<keldra_index::v1::ArtifactPackReference>()),
+        )
+        .saturating_add(
+            descriptor
+                .pack_table
+                .entries()
+                .iter()
+                .map(|pack| pack.canonical_path.len())
+                .sum::<usize>(),
+        )
         .saturating_add(
             descriptor
                 .blocks
@@ -516,10 +555,10 @@ mod tests {
     fn cached_bytes_are_reference_counted() {
         let cache = ImmutableArtifactCache::default();
         let bytes = Bytes::from_static(b"artifact");
-        cache.insert(1, 2, "/family/packs/hash", [3; 32], bytes.clone());
+        cache.insert(1, 2, "/family/packs/hash", [3; 32], None, bytes.clone());
 
         let cached = cache
-            .get(1, 2, "/family/packs/hash", [3; 32], bytes.len())
+            .get(1, 2, "/family/packs/hash", [3; 32], None, bytes.len())
             .unwrap()
             .unwrap();
 
@@ -542,12 +581,20 @@ mod tests {
             let release_leader = release_leader.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_load(1, 2, "/family/pages/hash", [3; 32], 8, || async move {
-                        load_count.fetch_add(1, Ordering::SeqCst);
-                        leader_entered.notify_one();
-                        release_leader.notified().await;
-                        Ok(Some(Bytes::from(vec![1; 8])))
-                    })
+                    .get_or_load(
+                        1,
+                        2,
+                        "/family/pages/hash",
+                        [3; 32],
+                        None,
+                        8,
+                        || async move {
+                            load_count.fetch_add(1, Ordering::SeqCst);
+                            leader_entered.notify_one();
+                            release_leader.notified().await;
+                            Ok(Some(Bytes::from(vec![1; 8])))
+                        },
+                    )
                     .await
             })
         };
@@ -557,10 +604,18 @@ mod tests {
             let load_count = load_count.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_load(1, 2, "/family/pages/hash", [3; 32], 8, || async move {
-                        load_count.fetch_add(1, Ordering::SeqCst);
-                        Ok(Some(Bytes::from(vec![2; 8])))
-                    })
+                    .get_or_load(
+                        1,
+                        2,
+                        "/family/pages/hash",
+                        [3; 32],
+                        None,
+                        8,
+                        || async move {
+                            load_count.fetch_add(1, Ordering::SeqCst);
+                            Ok(Some(Bytes::from(vec![2; 8])))
+                        },
+                    )
                     .await
             })
         };
@@ -589,12 +644,20 @@ mod tests {
             let release_leader = release_leader.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_load(1, 2, "/family/pages/hash", [3; 32], 8, || async move {
-                        load_count.fetch_add(1, Ordering::SeqCst);
-                        leader_entered.notify_one();
-                        release_leader.notified().await;
-                        Err(Status::unavailable("authoritative read failed"))
-                    })
+                    .get_or_load(
+                        1,
+                        2,
+                        "/family/pages/hash",
+                        [3; 32],
+                        None,
+                        8,
+                        || async move {
+                            load_count.fetch_add(1, Ordering::SeqCst);
+                            leader_entered.notify_one();
+                            release_leader.notified().await;
+                            Err(Status::unavailable("authoritative read failed"))
+                        },
+                    )
                     .await
             })
         };
@@ -604,10 +667,18 @@ mod tests {
             let load_count = load_count.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_load(1, 2, "/family/pages/hash", [3; 32], 8, || async move {
-                        load_count.fetch_add(1, Ordering::SeqCst);
-                        Ok(Some(Bytes::from(vec![4; 8])))
-                    })
+                    .get_or_load(
+                        1,
+                        2,
+                        "/family/pages/hash",
+                        [3; 32],
+                        None,
+                        8,
+                        || async move {
+                            load_count.fetch_add(1, Ordering::SeqCst);
+                            Ok(Some(Bytes::from(vec![4; 8])))
+                        },
+                    )
                     .await
             })
         };
@@ -625,7 +696,7 @@ mod tests {
         let cache = ImmutableArtifactCache::default();
 
         let error = cache
-            .get_or_load(1, 2, "/family/pages/hash", [3; 32], 7, || async {
+            .get_or_load(1, 2, "/family/pages/hash", [3; 32], None, 7, || async {
                 Ok(Some(Bytes::from_static(b"artifact")))
             })
             .await
@@ -634,7 +705,7 @@ mod tests {
         assert_eq!(error.code(), Code::DataLoss);
         assert!(
             cache
-                .get(1, 2, "/family/pages/hash", [3; 32], 8)
+                .get(1, 2, "/family/pages/hash", [3; 32], None, 8)
                 .unwrap()
                 .is_none()
         );
@@ -645,17 +716,29 @@ mod tests {
         let cache = ImmutableArtifactCache::default();
         let path = "/family/packs/hash";
         let hash = [4; 32];
-        cache.insert(1, 2, path, hash, Bytes::from_static(b"artifact"));
+        cache.insert(1, 2, path, hash, None, Bytes::from_static(b"artifact"));
 
-        assert!(cache.get(1, 2, path, hash, 8).unwrap().is_some());
+        assert!(cache.get(1, 2, path, hash, None, 8).unwrap().is_some());
         assert!(
             cache
-                .get(1, 2, "/other-family/packs/hash", hash, 8)
+                .get(1, 2, "/other-family/packs/hash", hash, None, 8)
                 .unwrap()
                 .is_none()
         );
-        assert!(cache.get(9, 2, path, hash, 8).unwrap().is_none());
-        assert!(cache.get(1, 9, path, hash, 8).unwrap().is_none());
+        assert!(cache.get(9, 2, path, hash, None, 8).unwrap().is_none());
+        assert!(cache.get(1, 9, path, hash, None, 8).unwrap().is_none());
+    }
+
+    #[test]
+    fn exact_object_versions_do_not_share_path_cache_entries() {
+        let cache = ImmutableArtifactCache::default();
+        let path = "/family/packs/hash";
+        let hash = [5; 32];
+        cache.insert(1, 2, path, hash, Some(7), Bytes::from_static(b"artifact"));
+
+        assert!(cache.get(1, 2, path, hash, Some(7), 8).unwrap().is_some());
+        assert!(cache.get(1, 2, path, hash, Some(8), 8).unwrap().is_none());
+        assert!(cache.get(1, 2, path, hash, None, 8).unwrap().is_none());
     }
 
     #[test]
@@ -663,9 +746,9 @@ mod tests {
         let cache = ImmutableArtifactCache::default();
         let path = "/family/packs/hash";
         let hash = [5; 32];
-        cache.insert(1, 2, path, hash, Bytes::from_static(b"artifact"));
+        cache.insert(1, 2, path, hash, None, Bytes::from_static(b"artifact"));
 
-        let error = cache.get(1, 2, path, hash, 7).unwrap_err();
+        let error = cache.get(1, 2, path, hash, None, 7).unwrap_err();
 
         assert_eq!(error.code(), Code::DataLoss);
     }
@@ -673,11 +756,21 @@ mod tests {
     #[test]
     fn insertion_evicts_oldest_entries_to_the_byte_capacity() {
         let cache = ImmutableArtifactCache::with_capacity_bytes(5);
-        cache.insert(1, 2, "/first", [1; 32], Bytes::from_static(b"123"));
-        cache.insert(1, 2, "/second", [2; 32], Bytes::from_static(b"456"));
+        cache.insert(1, 2, "/first", [1; 32], None, Bytes::from_static(b"123"));
+        cache.insert(1, 2, "/second", [2; 32], None, Bytes::from_static(b"456"));
 
-        assert!(cache.get(1, 2, "/first", [1; 32], 3).unwrap().is_none());
-        assert!(cache.get(1, 2, "/second", [2; 32], 3).unwrap().is_some());
+        assert!(
+            cache
+                .get(1, 2, "/first", [1; 32], None, 3)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(1, 2, "/second", [2; 32], None, 3)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -735,14 +828,19 @@ mod tests {
     #[test]
     fn blob_and_path_entries_share_one_capacity_bound() {
         let cache = ImmutableArtifactCache::with_capacity_bytes(5);
-        cache.insert(1, 2, "/first", [1; 32], Bytes::from_static(b"123"));
+        cache.insert(1, 2, "/first", [1; 32], None, Bytes::from_static(b"123"));
         let blob = BlobRef {
             hash: [2; 32],
             length: 3,
         };
         cache.insert_blob(&blob, Bytes::from_static(b"456"));
 
-        assert!(cache.get(1, 2, "/first", [1; 32], 3).unwrap().is_none());
+        assert!(
+            cache
+                .get(1, 2, "/first", [1; 32], None, 3)
+                .unwrap()
+                .is_none()
+        );
         assert!(cache.get_blob(&blob, 3).unwrap().is_some());
     }
 
@@ -764,6 +862,7 @@ mod tests {
             source_start_offset: 1,
             next_offset: 2,
             through_atomic_position: 1,
+            pack_table: Arc::new(keldra_index::v1::ArtifactPackTable::empty()),
             blocks: Vec::new(),
         });
 

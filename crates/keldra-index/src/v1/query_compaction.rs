@@ -10,15 +10,18 @@ use std::mem::size_of;
 use crate::IndexError;
 use crate::typed_json::{ScalarValue, decode_scalar_sort_key};
 
-use super::query_prepare::{encode_term_shard, finish_projection_query_run, push_block};
+use super::query_prepare::{
+    encode_term_shard, prepare_projection_query_run_from_blocks, push_block,
+};
 use super::{
-    EncodedQueryBlock, PreparedQueryRunSplice, PreparedQueryTermDelta, ProjectionPartitionIdentity,
-    ProjectionQueryRunArtifacts, ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot,
-    QueryBlockCredits, QueryBlockCursor, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits,
-    QueryBlockRecord, QueryPostingShard, QueryRunCompactionPlan, QueryRunReference, QueryTermEntry,
-    RecipeIdentity, decode_doc_value, decode_document_gate, decode_point, decode_positions,
-    decode_posting, decode_projection_query_run, decode_term_entry, encode_query_block,
-    encode_term_entry, splice_compacted_query_runs,
+    ArtifactPackTable, EncodedQueryBlock, PreparedProjectionQueryRun, PreparedQueryRunSplice,
+    PreparedQueryTermDelta, ProjectionPartitionIdentity, ProjectionQueryRunArtifacts,
+    ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot, QueryBlockCredits, QueryBlockCursor,
+    QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryBlockRecord, QueryPostingShard,
+    QueryRunCompactionPlan, QueryRunReference, QueryTermEntry, RecipeIdentity,
+    UnpublishedArtifactPack, decode_doc_value, decode_document_gate, decode_point,
+    decode_positions, decode_posting, decode_projection_query_run, decode_term_entry,
+    encode_query_block, encode_term_entry, splice_compacted_query_runs,
 };
 
 #[derive(Debug)]
@@ -27,6 +30,54 @@ pub struct ChargedQueryRunCompaction {
     reference: QueryRunReference,
     splice: PreparedQueryRunSplice,
     _credits: QueryBlockCredits,
+}
+
+#[derive(Debug)]
+pub struct PreparedQueryRunCompaction {
+    prepared: PreparedProjectionQueryRun,
+    previous: ProjectionQueryStreamRoot,
+    plan: QueryRunCompactionPlan,
+}
+
+impl PreparedQueryRunCompaction {
+    pub fn packs(&self) -> &[UnpublishedArtifactPack] {
+        self.prepared.packs()
+    }
+
+    pub fn finalize<PageBytes>(
+        self,
+        pack_table: ArtifactPackTable,
+        mut load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+    ) -> Result<ChargedQueryRunCompaction, IndexError>
+    where
+        PageBytes: AsRef<[u8]>,
+    {
+        let newest = *self
+            .plan
+            .inputs_newest_first()
+            .first()
+            .ok_or(IndexError::Integrity)?;
+        let charged = self.prepared.finalize(pack_table)?;
+        let (artifacts, credits) = charged.into_parts();
+        let reference = QueryRunReference {
+            hash: artifacts.run.hash,
+            encoded_bytes: u64::try_from(artifacts.run.bytes.len())
+                .map_err(|_| IndexError::OffsetOverflow)?,
+            sequence: newest.sequence,
+            level: self.plan.output_level(),
+            source_start_offset: self.plan.source_start_offset(),
+            next_offset: self.plan.next_offset(),
+            through_atomic_position: self.plan.through_atomic_position(),
+        };
+        let splice =
+            splice_compacted_query_runs(self.previous, &self.plan, reference, &mut load_page)?;
+        Ok(ChargedQueryRunCompaction {
+            artifacts,
+            reference,
+            splice,
+            _credits: credits,
+        })
+    }
 }
 
 impl ChargedQueryRunCompaction {
@@ -69,7 +120,7 @@ impl ChargedQueryRunCompaction {
 /// Merge one selected same-level window and return both immutable run
 /// artifacts and the exact path-copy replacement for the pinned stream root.
 #[allow(clippy::too_many_arguments)]
-pub fn compact_encoded_query_runs<PageBytes>(
+pub fn prepare_encoded_query_run_compaction(
     previous: ProjectionQueryStreamRoot,
     plan: &QueryRunCompactionPlan,
     partition: ProjectionPartitionIdentity,
@@ -77,12 +128,8 @@ pub fn compact_encoded_query_runs<PageBytes>(
     limits: QueryBlockLimits,
     mut credits: QueryBlockCredits,
     mut load_run: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-    mut load_block: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
-    mut load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
-) -> Result<ChargedQueryRunCompaction, IndexError>
-where
-    PageBytes: AsRef<[u8]>,
-{
+    mut load_block: impl FnMut(&QueryBlockDescriptor) -> Result<Vec<u8>, IndexError>,
+) -> Result<PreparedQueryRunCompaction, IndexError> {
     let limits = limits.validate()?;
     partition.validate()?;
     if physical_catalog_generation == [0; 32] {
@@ -127,7 +174,7 @@ where
     merge_ordinary_runs(&runs, limits, &mut credits, &mut load_block, &mut blocks)?;
     merge_term_runs(&runs, limits, &mut credits, &mut load_block, &mut blocks)?;
     let newest = *inputs.first().ok_or(IndexError::Integrity)?;
-    let charged = finish_projection_query_run(
+    let prepared = prepare_projection_query_run_from_blocks(
         partition,
         physical_catalog_generation,
         newest.sequence,
@@ -138,23 +185,10 @@ where
         limits,
         credits,
     )?;
-    let (artifacts, credits) = charged.into_parts();
-    let reference = QueryRunReference {
-        hash: artifacts.run.hash,
-        encoded_bytes: u64::try_from(artifacts.run.bytes.len())
-            .map_err(|_| IndexError::OffsetOverflow)?,
-        sequence: newest.sequence,
-        level: plan.output_level(),
-        source_start_offset: plan.source_start_offset(),
-        next_offset: plan.next_offset(),
-        through_atomic_position: plan.through_atomic_position(),
-    };
-    let splice = splice_compacted_query_runs(previous, plan, reference, &mut load_page)?;
-    Ok(ChargedQueryRunCompaction {
-        artifacts,
-        reference,
-        splice,
-        _credits: credits,
+    Ok(PreparedQueryRunCompaction {
+        prepared,
+        previous,
+        plan: plan.clone(),
     })
 }
 
@@ -214,14 +248,6 @@ fn validate_projection_query_run_fixed(
     {
         return Err(IndexError::Integrity);
     }
-    let count = u32::from_be_bytes(
-        payload[170..174]
-            .try_into()
-            .map_err(|_| IndexError::Integrity)?,
-    ) as usize;
-    if count > limits.maximum_loaded_blocks.saturating_mul(4096) {
-        return Err(IndexError::InvalidFormat("v1 query run block count"));
-    }
     Ok(())
 }
 
@@ -265,7 +291,7 @@ impl RecordLane {
         runs: &[ProjectionQueryRunDescriptor],
         limits: QueryBlockLimits,
         credits: &mut QueryBlockCredits,
-        load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+        load: &mut impl FnMut(&QueryBlockDescriptor) -> Result<Vec<u8>, IndexError>,
     ) -> Result<(), IndexError> {
         if self.head().is_some() {
             return Ok(());
@@ -283,7 +309,7 @@ impl RecordLane {
             return Ok(());
         };
         self.next_block = block + 1;
-        let bytes = load(descriptor.hash)?;
+        let bytes = load(descriptor)?;
         let mut cursor = QueryBlockCursor::new(descriptor, &bytes, limits, credits)?;
         while let Some(record) = cursor.next()? {
             validate_ordinary_record(self.kind, record, limits)?;
@@ -412,7 +438,7 @@ fn merge_ordinary_runs(
     runs: &[ProjectionQueryRunDescriptor],
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
-    load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    load: &mut impl FnMut(&QueryBlockDescriptor) -> Result<Vec<u8>, IndexError>,
     output: &mut Vec<EncodedQueryBlock>,
 ) -> Result<(), IndexError> {
     let groups = runs
@@ -521,7 +547,7 @@ impl PostingLane {
         term: &ScalarValue,
         limits: QueryBlockLimits,
         credits: &mut QueryBlockCredits,
-        load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+        load: &mut impl FnMut(&QueryBlockDescriptor) -> Result<Vec<u8>, IndexError>,
     ) -> Result<(), IndexError> {
         if self.head().is_some() {
             return Ok(());
@@ -733,7 +759,7 @@ fn merge_term_runs(
     runs: &[ProjectionQueryRunDescriptor],
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
-    load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    load: &mut impl FnMut(&QueryBlockDescriptor) -> Result<Vec<u8>, IndexError>,
     output: &mut Vec<EncodedQueryBlock>,
 ) -> Result<(), IndexError> {
     let recipes = runs
@@ -898,13 +924,13 @@ fn visit_block(
     descriptor: &QueryBlockDescriptor,
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
-    load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    load: &mut impl FnMut(&QueryBlockDescriptor) -> Result<Vec<u8>, IndexError>,
     visit: &mut impl FnMut(
         super::QueryBlockRecordRef<'_>,
         &mut QueryBlockCredits,
     ) -> Result<(), IndexError>,
 ) -> Result<(), IndexError> {
-    let bytes = load(descriptor.hash)?;
+    let bytes = load(descriptor)?;
     let mut cursor = QueryBlockCursor::new(descriptor, &bytes, limits, credits)?;
     let result = (|| {
         while let Some(record) = cursor.next()? {
@@ -959,6 +985,90 @@ mod tests {
             pool.acquire(IndexingMemoryStage::OrderingCatalog, bytes)
                 .unwrap(),
         )
+    }
+
+    fn pack_table(packs: &[UnpublishedArtifactPack]) -> ArtifactPackTable {
+        ArtifactPackTable::new(
+            packs
+                .iter()
+                .map(|pack| super::super::ArtifactPackReference {
+                    ordinal: pack.ordinal,
+                    canonical_path: format!(
+                        "_keldra/index-projections/v1/test/packs/{}",
+                        pack.ordinal
+                    )
+                    .into(),
+                    object_version: u64::from(pack.ordinal) + 1,
+                    hash: pack.hash,
+                    length: pack.bytes.len() as u64,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn finish(
+        prepared: PreparedProjectionQueryRun,
+    ) -> super::super::ChargedProjectionQueryRunArtifacts {
+        let table = pack_table(prepared.packs());
+        prepared.finalize(table).unwrap()
+    }
+
+    fn artifact_blocks(
+        artifacts: &ProjectionQueryRunArtifacts,
+    ) -> Vec<(QueryBlockDescriptor, Vec<u8>)> {
+        let memory = pool(128 * 1024 * 1024);
+        let mut verification = credits(&memory, 128 * 1024 * 1024);
+        let run = decode_projection_query_run(
+            &artifacts.run.bytes,
+            QueryBlockLimits::default_for_memory(),
+            &mut verification,
+        )
+        .unwrap();
+        run.blocks
+            .into_iter()
+            .map(|descriptor| {
+                let reference = descriptor.pack_reference().unwrap();
+                let pack = artifacts
+                    .packs
+                    .iter()
+                    .find(|pack| pack.hash == reference.hash)
+                    .unwrap();
+                let bytes = pack.bytes[descriptor.locator.range().unwrap()].to_vec();
+                (descriptor, bytes)
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compact_encoded_query_runs<RunBytes, BlockBytes, PageBytes>(
+        previous: ProjectionQueryStreamRoot,
+        plan: &QueryRunCompactionPlan,
+        partition: ProjectionPartitionIdentity,
+        catalog: [u8; 32],
+        limits: QueryBlockLimits,
+        credits: QueryBlockCredits,
+        mut load_run: impl FnMut([u8; 32]) -> Result<RunBytes, IndexError>,
+        mut load_block: impl FnMut([u8; 32]) -> Result<BlockBytes, IndexError>,
+        load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+    ) -> Result<ChargedQueryRunCompaction, IndexError>
+    where
+        RunBytes: AsRef<[u8]>,
+        BlockBytes: AsRef<[u8]>,
+        PageBytes: AsRef<[u8]>,
+    {
+        let prepared = prepare_encoded_query_run_compaction(
+            previous,
+            plan,
+            partition,
+            catalog,
+            limits,
+            credits,
+            |hash| load_run(hash).map(|bytes| bytes.as_ref().to_vec()),
+            |descriptor| load_block(descriptor.hash).map(|bytes| bytes.as_ref().to_vec()),
+        )?;
+        let table = pack_table(prepared.packs());
+        prepared.finalize(table, load_page)
     }
 
     fn document(byte: u8) -> StableDocumentKey {
@@ -1055,18 +1165,20 @@ mod tests {
         let mut root = None;
         for (sequence, reordered) in [(1, false), (2, true)] {
             let memory = pool(32 * 1024 * 1024);
-            let charged = prepare_projection_query_run(
-                partition(),
-                [4; 32],
-                sequence,
-                sequence - 1,
-                sequence,
-                sequence,
-                batch(sequence, reordered),
-                limits,
-                credits(&memory, 32 * 1024 * 1024),
-            )
-            .unwrap();
+            let charged = finish(
+                prepare_projection_query_run(
+                    partition(),
+                    [4; 32],
+                    sequence,
+                    sequence - 1,
+                    sequence,
+                    sequence,
+                    batch(sequence, reordered),
+                    limits,
+                    credits(&memory, 32 * 1024 * 1024),
+                )
+                .unwrap(),
+            );
             let (artifacts, _) = charged.into_parts();
             let reference = QueryRunReference {
                 hash: artifacts.run.hash,
@@ -1077,10 +1189,10 @@ mod tests {
                 next_offset: sequence,
                 through_atomic_position: sequence,
             };
-            runs.insert(artifacts.run.hash, artifacts.run.bytes);
-            for block in artifacts.blocks {
-                blocks.insert(block.descriptor.hash, block.bytes);
+            for (descriptor, bytes) in artifact_blocks(&artifacts) {
+                blocks.insert(descriptor.hash, bytes);
             }
+            runs.insert(artifacts.run.hash, artifacts.run.bytes);
             let append =
                 append_query_run_path_copy(root, partition(), [4; 32], reference, |hash| {
                     pages.get(&hash).cloned().ok_or(IndexError::Integrity)
@@ -1123,11 +1235,10 @@ mod tests {
         .unwrap();
         assert_eq!(compacted.splice().root.run_count, 1);
         assert_eq!(compacted.reference().level, 1);
-        let kinds = compacted
-            .artifacts()
-            .blocks
+        let output_blocks = artifact_blocks(compacted.artifacts());
+        let kinds = output_blocks
             .iter()
-            .map(|block| block.descriptor.kind)
+            .map(|(descriptor, _)| descriptor.kind)
             .collect::<BTreeSet<_>>();
         for kind in [
             QueryBlockKind::Gate,
@@ -1140,17 +1251,15 @@ mod tests {
         ] {
             assert!(kinds.contains(&kind), "missing {kind:?}");
         }
-        let gate = compacted
-            .artifacts()
-            .blocks
+        let gate = output_blocks
             .iter()
-            .find(|block| block.descriptor.kind == QueryBlockKind::Gate)
+            .find(|(descriptor, _)| descriptor.kind == QueryBlockKind::Gate)
             .unwrap();
         let verification_memory = pool(2 * 1024 * 1024);
         let mut verification = credits(&verification_memory, 2 * 1024 * 1024);
         let mut cursor = QueryBlockCursor::new(
-            &gate.descriptor,
-            &gate.bytes,
+            &gate.0,
+            &gate.1,
             QueryBlockLimits::default_for_memory(),
             &mut verification,
         )
@@ -1177,7 +1286,7 @@ mod tests {
                 |hash| runs.get(&hash).cloned().ok_or(IndexError::Integrity),
                 |_| {
                     block_loads.set(block_loads.get() + 1);
-                    Err(IndexError::Integrity)
+                    Err::<Vec<u8>, _>(IndexError::Integrity)
                 },
                 |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
             )

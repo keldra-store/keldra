@@ -13,8 +13,8 @@ use crate::typed_json::{
 };
 
 use super::{
-    ProjectionPartitionIdentity, QueryBlockCredits, QueryDocumentGate, RecipeIdentity,
-    StableDocumentKey, decode_document_gate,
+    ArtifactPackLocator, ArtifactPackTable, ProjectionPartitionIdentity, QueryBlockCredits,
+    QueryDocumentGate, RecipeIdentity, StableDocumentKey, decode_document_gate,
 };
 
 #[cfg(test)]
@@ -186,12 +186,31 @@ pub struct QueryBlockDescriptor {
     pub hash: [u8; 32],
     pub encoded_bytes: u64,
     pub records: u32,
+    pub locator: ArtifactPackLocator,
+    pub pack_table: std::sync::Arc<ArtifactPackTable>,
+}
+
+impl QueryBlockDescriptor {
+    pub fn pack_reference(&self) -> Result<&super::ArtifactPackReference, IndexError> {
+        self.locator.resolve(&self.pack_table)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedQueryBlock {
-    pub descriptor: QueryBlockDescriptor,
+    pub descriptor: LogicalQueryBlockDescriptor,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicalQueryBlockDescriptor {
+    pub kind: QueryBlockKind,
+    pub recipe: RecipeIdentity,
+    pub minimum_key: Vec<u8>,
+    pub maximum_key: Vec<u8>,
+    pub hash: [u8; 32],
+    pub encoded_bytes: u64,
+    pub records: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +366,7 @@ pub struct ProjectionQueryRunDescriptor {
     pub source_start_offset: u64,
     pub next_offset: u64,
     pub through_atomic_position: u64,
+    pub pack_table: std::sync::Arc<ArtifactPackTable>,
     pub blocks: Vec<QueryBlockDescriptor>,
 }
 
@@ -966,7 +986,7 @@ pub fn encode_query_block(
     if bytes.len() != required {
         return Err(IndexError::Integrity);
     }
-    let descriptor = QueryBlockDescriptor {
+    let descriptor = LogicalQueryBlockDescriptor {
         kind,
         recipe,
         minimum_key: records.first().expect("nonempty").key.clone(),
@@ -1149,6 +1169,7 @@ impl ProjectionQueryRunDescriptor {
     pub fn validate(&self, limits: QueryBlockLimits) -> Result<(), IndexError> {
         limits.validate()?;
         self.partition.validate()?;
+        self.pack_table.validate()?;
         for (valid, invariant) in [
             (
                 self.physical_catalog_generation != [0; 32],
@@ -1177,11 +1198,18 @@ impl ProjectionQueryRunDescriptor {
                 || block.minimum_key > block.maximum_key
                 || block.minimum_key.len() > limits.maximum_key_bytes
                 || block.maximum_key.len() > limits.maximum_key_bytes
+                || block.locator.encoded_bytes != block.encoded_bytes
+                || block.locator.logical_bytes != block.encoded_bytes
+                || block.locator.checksum != block.hash
             {
                 return Err(IndexError::InvalidDefinition(
                     "v1 query block descriptor is invalid".into(),
                 ));
             }
+            if block.pack_table.as_ref() != self.pack_table.as_ref() {
+                return Err(IndexError::Integrity);
+            }
+            block.locator.resolve(&self.pack_table)?;
             total_descriptor_key_bytes = total_descriptor_key_bytes
                 .checked_add(block.minimum_key.len())
                 .and_then(|bytes| bytes.checked_add(block.maximum_key.len()))
@@ -1247,11 +1275,28 @@ pub fn encode_projection_query_run(
     credits: &mut QueryBlockCredits,
 ) -> Result<EncodedProjectionQueryRun, IndexError> {
     descriptor.validate(limits)?;
-    let mut required: usize = 8 + 2 + 96 + 32 + 8 * 4 + 4;
+    let mut required: usize = 8 + 2 + 96 + 32 + 8 * 4 + 4 + 4;
+    for pack in descriptor.pack_table.entries() {
+        required = required
+            .checked_add(4 + 4 + pack.canonical_path.len() + 8 + 32 + 8)
+            .ok_or(IndexError::OffsetOverflow)?;
+    }
     for block in &descriptor.blocks {
         required = required
             .checked_add(
-                1 + 32 + 8 + 4 + 4 + block.minimum_key.len() + 4 + block.maximum_key.len() + 32,
+                1 + 32
+                    + 8
+                    + 4
+                    + 4
+                    + block.minimum_key.len()
+                    + 4
+                    + block.maximum_key.len()
+                    + 32
+                    + 4
+                    + 8
+                    + 8
+                    + 8
+                    + 32,
             )
             .ok_or(IndexError::OffsetOverflow)?;
     }
@@ -1271,6 +1316,14 @@ pub fn encode_projection_query_run(
     put_u64(&mut bytes, descriptor.source_start_offset);
     put_u64(&mut bytes, descriptor.next_offset);
     put_u64(&mut bytes, descriptor.through_atomic_position);
+    put_u32(&mut bytes, descriptor.pack_table.entries().len())?;
+    for pack in descriptor.pack_table.entries() {
+        put_u32(&mut bytes, pack.ordinal as usize)?;
+        put_bytes(&mut bytes, pack.canonical_path.as_bytes())?;
+        put_u64(&mut bytes, pack.object_version);
+        bytes.extend_from_slice(&pack.hash);
+        put_u64(&mut bytes, pack.length);
+    }
     put_u32(&mut bytes, descriptor.blocks.len())?;
     for block in &descriptor.blocks {
         bytes.push(block.kind as u8);
@@ -1280,6 +1333,11 @@ pub fn encode_projection_query_run(
         put_bytes(&mut bytes, &block.minimum_key)?;
         put_bytes(&mut bytes, &block.maximum_key)?;
         bytes.extend_from_slice(&block.hash);
+        put_u32(&mut bytes, block.locator.ordinal as usize)?;
+        put_u64(&mut bytes, block.locator.offset);
+        put_u64(&mut bytes, block.locator.encoded_bytes);
+        put_u64(&mut bytes, block.locator.logical_bytes);
+        bytes.extend_from_slice(&block.locator.checksum);
     }
     if bytes.len() != required {
         return Err(IndexError::Integrity);
@@ -1313,8 +1371,37 @@ pub fn decode_projection_query_run(
     let source_start_offset = input.u64()?;
     let next_offset = input.u64()?;
     let through_atomic_position = input.u64()?;
+    let pack_count = input.u32()? as usize;
+    const MINIMUM_PACK_REFERENCE_BYTES: usize = 4 + 4 + 1 + 8 + 32 + 8;
+    if pack_count > input.remaining() / MINIMUM_PACK_REFERENCE_BYTES {
+        return Err(IndexError::UnexpectedEof {
+            expected: pack_count
+                .checked_mul(MINIMUM_PACK_REFERENCE_BYTES)
+                .and_then(|size| size.checked_add(input.offset))
+                .ok_or(IndexError::OffsetOverflow)? as u64,
+            actual: input.bytes.len() as u64,
+        });
+    }
+    let mut packs = Vec::with_capacity(pack_count);
+    for _ in 0..pack_count {
+        let ordinal = input.u32()?;
+        let canonical_path = std::str::from_utf8(input.bytes()?)
+            .map_err(|_| IndexError::InvalidFormat("v1 artifact pack path"))?
+            .to_owned();
+        let object_version = input.u64()?;
+        let hash = input.array_32()?;
+        let length = input.u64()?;
+        packs.push(super::ArtifactPackReference {
+            ordinal,
+            canonical_path: std::sync::Arc::from(canonical_path),
+            object_version,
+            hash,
+            length,
+        });
+    }
+    let pack_table = std::sync::Arc::new(ArtifactPackTable::new(packs)?);
     let count = input.u32()? as usize;
-    const MINIMUM_DESCRIPTOR_BLOCK_BYTES: usize = 1 + 32 + 8 + 4 + 4 + 4 + 32;
+    const MINIMUM_DESCRIPTOR_BLOCK_BYTES: usize = 1 + 32 + 8 + 4 + 4 + 4 + 32 + 4 + 8 + 8 + 8 + 32;
     if count > input.remaining() / MINIMUM_DESCRIPTOR_BLOCK_BYTES {
         return Err(IndexError::UnexpectedEof {
             expected: count
@@ -1334,6 +1421,13 @@ pub fn decode_projection_query_run(
         let minimum_key = input.bytes()?.to_vec();
         let maximum_key = input.bytes()?.to_vec();
         let hash = input.array_32()?;
+        let locator = ArtifactPackLocator {
+            ordinal: input.u32()?,
+            offset: input.u64()?,
+            encoded_bytes: input.u64()?,
+            logical_bytes: input.u64()?,
+            checksum: input.array_32()?,
+        };
         blocks.push(QueryBlockDescriptor {
             kind,
             recipe,
@@ -1342,6 +1436,8 @@ pub fn decode_projection_query_run(
             hash,
             encoded_bytes,
             records,
+            locator,
+            pack_table: pack_table.clone(),
         });
     }
     input.finish()?;
@@ -1352,6 +1448,7 @@ pub fn decode_projection_query_run(
         source_start_offset,
         next_offset,
         through_atomic_position,
+        pack_table,
         blocks,
     };
     descriptor.validate(limits)?;

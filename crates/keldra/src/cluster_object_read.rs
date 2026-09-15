@@ -447,6 +447,36 @@ impl ClusterObjectReader {
         }))
     }
 
+    /// Select one retained immutable version under the stable-ID authority
+    /// fence without reconstructing its payload. Index artifact roots use this
+    /// to bind a physical pack to the exact ordinary-object version they
+    /// published, even after a newer head exists at the same path.
+    pub(crate) async fn exact_version_descriptor_stable(
+        &self,
+        key: &ObjectKey,
+        tenant_id: u64,
+        bucket_id: u64,
+        version: VersionId,
+    ) -> Result<Option<Version>, Status> {
+        let placement = self.metadata.current_placement()?;
+        let mut selected = self
+            .metadata
+            .reconciled_exact_versions_stable(
+                std::slice::from_ref(key),
+                std::slice::from_ref(&version),
+                tenant_id,
+                bucket_id,
+            )
+            .await?;
+        if selected.len() != 1 {
+            return Err(Status::data_loss(
+                "exact object version read returned the wrong result cardinality",
+            ));
+        }
+        self.metadata.require_current_fence(placement.fence())?;
+        Ok(selected.pop().flatten())
+    }
+
     /// Selects current or exact-version metadata and reconstructs live bytes
     /// into an anonymous file. The file remains private until the final fence
     /// check succeeds.

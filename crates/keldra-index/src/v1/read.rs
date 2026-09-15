@@ -16,16 +16,23 @@ pub fn decode_component_records_in_pack(
     descriptor: &ComponentSegmentDescriptor,
     pack: &[u8],
 ) -> Result<Vec<ComponentDeltaRecord>, IndexError> {
-    if *crate::profiled_blake3_hash!(pack).as_bytes() != descriptor.pack_hash {
+    let reference = descriptor.pack_reference()?;
+    if *crate::profiled_blake3_hash!(pack).as_bytes() != reference.hash
+        || pack.len() as u64 != reference.length
+    {
         return Err(IndexError::Integrity);
     }
-    let start = usize::try_from(descriptor.pack_offset).map_err(|_| IndexError::OffsetOverflow)?;
-    let length =
-        usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::OffsetOverflow)?;
+    let start =
+        usize::try_from(descriptor.locator.offset).map_err(|_| IndexError::OffsetOverflow)?;
+    let length = usize::try_from(descriptor.locator.encoded_bytes)
+        .map_err(|_| IndexError::OffsetOverflow)?;
     let end = start
         .checked_add(length)
         .ok_or(IndexError::OffsetOverflow)?;
     let segment = pack.get(start..end).ok_or(IndexError::Integrity)?;
+    if *crate::profiled_blake3_hash!(segment).as_bytes() != descriptor.locator.checksum {
+        return Err(IndexError::Integrity);
+    }
     let decoded = decode_component_delta_segment(segment)?;
     if decoded.component != component || decoded.records.len() as u64 != descriptor.records {
         return Err(IndexError::Integrity);
@@ -40,9 +47,9 @@ mod tests {
     use super::*;
     use crate::v1::buffer::seal_component;
     use crate::v1::{
-        ComponentIdentity, IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage,
-        ProjectionPackCredits, RecipeIdentity, StableDocumentKey, append_component_delta,
-        decode_component_stream, pack_component_deltas,
+        ArtifactPackReference, ArtifactPackTable, ComponentIdentity, IndexingMemoryCredits,
+        IndexingMemoryLimits, IndexingMemoryStage, ProjectionPackCredits, RecipeIdentity,
+        StableDocumentKey, append_component_delta, decode_component_stream, pack_component_deltas,
     };
 
     fn pack_credits(bytes: usize) -> ProjectionPackCredits {
@@ -83,7 +90,15 @@ mod tests {
             .unwrap()
             .packs
             .remove(0);
-        let run = append_component_delta(None, &pack.deltas[0], 0, 1, 1).unwrap();
+        let table = ArtifactPackTable::new(vec![ArtifactPackReference {
+            ordinal: pack.ordinal,
+            canonical_path: "_keldra/index-projections/v1/test/packs/0".into(),
+            object_version: 1,
+            hash: pack.hash,
+            length: pack.bytes.len() as u64,
+        }])
+        .unwrap();
+        let run = append_component_delta(None, &pack.deltas[0], &table, 0, 1, 1).unwrap();
         let descriptor = decode_component_stream(&run).unwrap().remove(0);
         let records =
             decode_component_records_in_pack(component, &descriptor, &pack.bytes).unwrap();

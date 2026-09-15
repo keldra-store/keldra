@@ -2,8 +2,8 @@ use super::buffer::{ComponentDeltaCursor, seal_component};
 #[cfg(test)]
 use super::pack_component_deltas;
 use super::{
-    ComponentIdentity, ComponentRoot, PackedComponentDelta, RecipeIdentity, SealedComponentDelta,
-    StableDocumentKey,
+    ArtifactPackLocator, ArtifactPackReference, ArtifactPackTable, ComponentIdentity,
+    ComponentRoot, PackedComponentDelta, RecipeIdentity, SealedComponentDelta, StableDocumentKey,
 };
 use crate::IndexError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,6 +13,10 @@ const PAGE_MAGIC: &[u8; 8] = b"K1CSTR01";
 const PAGE_FORMAT: u16 = 1;
 const LEAF_PAGE: u8 = 1;
 pub const COMPONENT_STREAM_DIRECTORY_FANOUT: usize = 128;
+// Segment descriptors carry an exact physical-pack reference and are larger
+// than branch summaries. Keep leaf pages below the runtime's 32 KiB read bound
+// without reducing the branch or compaction fanout.
+const COMPONENT_STREAM_LEAF_FANOUT: usize = 64;
 const MAX_COMPONENT_STREAM_SEGMENTS: usize = 1_000_000;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentSegmentDescriptor {
@@ -23,10 +27,8 @@ pub struct ComponentSegmentDescriptor {
     pub source_start_offset: u64,
     pub next_offset: u64,
     pub through_atomic_position: u64,
-    pub pack_hash: [u8; 32],
-    pub pack_offset: u64,
-    pub encoded_bytes: u64,
-    pub logical_bytes: u64,
+    pub pack_table: ArtifactPackTable,
+    pub locator: ArtifactPackLocator,
     pub records: u64,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,16 +43,19 @@ impl ComponentSegmentDescriptor {
             || self.level > 63
             || self.minimum_key > self.maximum_key
             || self.source_start_offset >= self.next_offset
-            || self.pack_hash == [0; 32]
-            || self.encoded_bytes == 0
-            || self.logical_bytes == 0
             || self.records == 0
         {
             return Err(IndexError::InvalidDefinition(
                 "component stream segment descriptor is invalid".into(),
             ));
         }
+        self.pack_table.validate()?;
+        self.locator.resolve(&self.pack_table)?;
         Ok(())
+    }
+
+    pub fn pack_reference(&self) -> Result<&super::ArtifactPackReference, IndexError> {
+        self.locator.resolve(&self.pack_table)
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -292,7 +297,7 @@ pub fn build_component_stream(
     validate_segments(segments)?;
     let mut pages = Vec::new();
     let mut level = Vec::new();
-    for chunk in segments.chunks(COMPONENT_STREAM_DIRECTORY_FANOUT) {
+    for chunk in segments.chunks(COMPONENT_STREAM_LEAF_FANOUT) {
         let encoded = encode_page(component, &Page::Leaf(chunk.to_vec()))?;
         level.push(Child::from_segments(
             chunk,
@@ -335,6 +340,7 @@ pub fn append_component_stream<PageBytes>(
     previous: Option<ComponentStreamRoot>,
     mut load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     delta: &PackedComponentDelta,
+    pack_table: &ArtifactPackTable,
     source_start_offset: u64,
     next_offset: u64,
     through_atomic_position: u64,
@@ -369,6 +375,7 @@ where
         next_offset,
         through_atomic_position,
         delta,
+        pack_table,
     )?;
     let mut new_pages = Vec::new();
     let children = match previous {
@@ -425,6 +432,7 @@ where
 pub fn append_component_delta(
     previous: Option<&ComponentStreamDirectory>,
     delta: &PackedComponentDelta,
+    pack_table: &ArtifactPackTable,
     source_start_offset: u64,
     next_offset: u64,
     through_atomic_position: u64,
@@ -453,6 +461,7 @@ pub fn append_component_delta(
         next_offset,
         through_atomic_position,
         delta,
+        pack_table,
     )?);
     build_component_stream(delta.component, &segments)
 }
@@ -527,7 +536,7 @@ pub fn resolve_component_record_from_verified_artifacts(
         run.level == 0 && run.minimum_key <= stable_key && stable_key <= run.maximum_key
     }) {
         let pack = artifacts
-            .get(&descriptor.pack_hash)
+            .get(&descriptor.pack_reference()?.hash)
             .ok_or(IndexError::Integrity)?;
         match lookup_component_record_in_verified_pack(
             directory.component,
@@ -552,7 +561,7 @@ pub fn resolve_component_record_from_verified_artifacts(
             continue;
         };
         let pack = artifacts
-            .get(&descriptor.pack_hash)
+            .get(&descriptor.pack_reference()?.hash)
             .ok_or(IndexError::Integrity)?;
         match lookup_component_record_in_verified_pack(
             directory.component,
@@ -580,9 +589,11 @@ pub fn lookup_component_record_in_verified_pack(
     pack: &[u8],
     stable_key: StableDocumentKey,
 ) -> Result<ComponentRecordLookup, IndexError> {
-    let start = usize::try_from(descriptor.pack_offset).map_err(|_| IndexError::OffsetOverflow)?;
-    let length =
-        usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::OffsetOverflow)?;
+    descriptor.locator.resolve(&descriptor.pack_table)?;
+    let start =
+        usize::try_from(descriptor.locator.offset).map_err(|_| IndexError::OffsetOverflow)?;
+    let length = usize::try_from(descriptor.locator.encoded_bytes)
+        .map_err(|_| IndexError::OffsetOverflow)?;
     let end = start
         .checked_add(length)
         .ok_or(IndexError::OffsetOverflow)?;
@@ -673,7 +684,7 @@ pub fn compact_component_runs(
     plan: &ComponentCompactionPlan,
     limits: ComponentCompactionLimits,
     policy: TombstoneCompactionPolicy,
-    mut load_pack: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    mut load_pack: impl FnMut(&ArtifactPackReference) -> Result<Vec<u8>, IndexError>,
 ) -> Result<Vec<SealedComponentDelta>, IndexError> {
     let limits = limits.validate()?;
     if plan.inputs.len() < 2 || plan.inputs.len() > limits.maximum_input_runs {
@@ -691,10 +702,17 @@ pub fn compact_component_runs(
     let mut packs = BTreeMap::new();
     let mut loaded = 0_usize;
     for run in &plan.inputs {
-        if packs.contains_key(&run.pack_hash) {
+        let reference = run.pack_reference()?;
+        let identity = (
+            reference.canonical_path.clone(),
+            reference.object_version,
+            reference.hash,
+            reference.length,
+        );
+        if packs.contains_key(&identity) {
             continue;
         }
-        let pack = load_pack(run.pack_hash)?;
+        let pack = load_pack(reference)?;
         loaded = loaded
             .checked_add(pack.len())
             .ok_or(IndexError::OffsetOverflow)?;
@@ -704,23 +722,36 @@ pub fn compact_component_runs(
                 limit: limits.maximum_loaded_pack_bytes,
             });
         }
-        if *crate::profiled_blake3_hash!(&pack).as_bytes() != run.pack_hash {
+        if *crate::profiled_blake3_hash!(&pack).as_bytes() != reference.hash
+            || pack.len() as u64 != reference.length
+        {
             return Err(IndexError::Integrity);
         }
-        packs.insert(run.pack_hash, pack);
+        packs.insert(identity, pack);
     }
     let slices = plan
         .inputs
         .iter()
         .map(|run| {
-            let pack = packs.get(&run.pack_hash).ok_or(IndexError::Integrity)?;
-            let start = usize::try_from(run.pack_offset).map_err(|_| IndexError::OffsetOverflow)?;
-            let length =
-                usize::try_from(run.encoded_bytes).map_err(|_| IndexError::OffsetOverflow)?;
+            let reference = run.pack_reference()?;
+            let identity = (
+                reference.canonical_path.clone(),
+                reference.object_version,
+                reference.hash,
+                reference.length,
+            );
+            let pack = packs.get(&identity).ok_or(IndexError::Integrity)?;
+            let start =
+                usize::try_from(run.locator.offset).map_err(|_| IndexError::OffsetOverflow)?;
+            let length = usize::try_from(run.locator.encoded_bytes)
+                .map_err(|_| IndexError::OffsetOverflow)?;
             let end = start
                 .checked_add(length)
                 .ok_or(IndexError::OffsetOverflow)?;
             let bytes = pack.get(start..end).ok_or(IndexError::Integrity)?;
+            if *crate::profiled_blake3_hash!(bytes).as_bytes() != run.locator.checksum {
+                return Err(IndexError::Integrity);
+            }
             Ok(bytes)
         })
         .collect::<Result<Vec<_>, IndexError>>()?;
@@ -805,6 +836,7 @@ pub fn splice_compacted_component_runs<PageBytes>(
     previous: ComponentStreamRoot,
     plan: &ComponentCompactionPlan,
     output: &[PackedComponentDelta],
+    pack_table: &ArtifactPackTable,
     mut load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
 ) -> Result<ComponentStreamAppend, IndexError>
 where
@@ -859,6 +891,7 @@ where
                 plan.next_offset,
                 plan.through_atomic_position,
                 delta,
+                pack_table,
             )?,
         );
     }
@@ -1069,7 +1102,22 @@ fn descriptor(
     next_offset: u64,
     through_atomic_position: u64,
     delta: &PackedComponentDelta,
+    pack_table: &ArtifactPackTable,
 ) -> Result<ComponentSegmentDescriptor, IndexError> {
+    let published_pack = delta.locator.resolve(&pack_table)?;
+    // Component stream pages are long-lived roots which are merged across
+    // generations. Bind each segment to the one physical pack it needs so a
+    // page never duplicates a generation-wide pack table or keeps unrelated
+    // packs live. The locator ordinal is local to this descriptor root.
+    let pack_table = ArtifactPackTable::new(vec![ArtifactPackReference {
+        ordinal: 0,
+        canonical_path: published_pack.canonical_path.clone(),
+        object_version: published_pack.object_version,
+        hash: published_pack.hash,
+        length: published_pack.length,
+    }])?;
+    let mut locator = delta.locator;
+    locator.ordinal = 0;
     let descriptor = ComponentSegmentDescriptor {
         sequence,
         level,
@@ -1078,10 +1126,8 @@ fn descriptor(
         source_start_offset,
         next_offset,
         through_atomic_position,
-        pack_hash: delta.pack_hash,
-        pack_offset: delta.offset,
-        encoded_bytes: delta.encoded_bytes,
-        logical_bytes: delta.logical_bytes,
+        pack_table,
+        locator,
         records: delta.records,
     };
     descriptor.validate()?;
@@ -1129,7 +1175,7 @@ where
             {
                 return Err(IndexError::Integrity);
             }
-            if segments.len() < COMPONENT_STREAM_DIRECTORY_FANOUT {
+            if segments.len() < COMPONENT_STREAM_LEAF_FANOUT {
                 segments.push(descriptor.clone());
                 let encoded = encode_page(component, &Page::Leaf(segments.clone()))?;
                 let child =
@@ -1234,8 +1280,8 @@ impl Child {
             last_sequence: last.sequence,
             hash,
             segment_count: segments.len() as u64,
-            encoded_bytes: sum_segments(segments, |segment| segment.encoded_bytes)?,
-            logical_bytes: sum_segments(segments, |segment| segment.logical_bytes)?,
+            encoded_bytes: sum_segments(segments, |segment| segment.locator.encoded_bytes)?,
+            logical_bytes: sum_segments(segments, |segment| segment.locator.logical_bytes)?,
             directory_bytes: page_bytes,
             minimum_key: segments
                 .iter()
@@ -1351,7 +1397,7 @@ fn encode_page(
     put_component(&mut bytes, component);
     match page {
         Page::Leaf(segments) => {
-            if segments.is_empty() || segments.len() > COMPONENT_STREAM_DIRECTORY_FANOUT {
+            if segments.is_empty() || segments.len() > COMPONENT_STREAM_LEAF_FANOUT {
                 return Err(IndexError::InvalidDefinition(
                     "component stream leaf fanout is invalid".into(),
                 ));
@@ -1367,10 +1413,12 @@ fn encode_page(
                 put_u64(&mut bytes, segment.source_start_offset);
                 put_u64(&mut bytes, segment.next_offset);
                 put_u64(&mut bytes, segment.through_atomic_position);
-                bytes.extend_from_slice(&segment.pack_hash);
-                put_u64(&mut bytes, segment.pack_offset);
-                put_u64(&mut bytes, segment.encoded_bytes);
-                put_u64(&mut bytes, segment.logical_bytes);
+                put_pack_table(&mut bytes, &segment.pack_table)?;
+                put_u32(&mut bytes, segment.locator.ordinal);
+                put_u64(&mut bytes, segment.locator.offset);
+                put_u64(&mut bytes, segment.locator.encoded_bytes);
+                put_u64(&mut bytes, segment.locator.logical_bytes);
+                bytes.extend_from_slice(&segment.locator.checksum);
                 put_u64(&mut bytes, segment.records);
             }
         }
@@ -1455,6 +1503,11 @@ fn decode_page(component: ComponentIdentity, bytes: &[u8]) -> Result<Page, Index
     }
     let page = match kind {
         LEAF_PAGE => {
+            if count > COMPONENT_STREAM_LEAF_FANOUT {
+                return Err(IndexError::InvalidFormat(
+                    "component stream leaf fanout is invalid",
+                ));
+            }
             let mut segments = Vec::with_capacity(count);
             for _ in 0..count {
                 segments.push(ComponentSegmentDescriptor {
@@ -1465,10 +1518,14 @@ fn decode_page(component: ComponentIdentity, bytes: &[u8]) -> Result<Page, Index
                     source_start_offset: input.u64()?,
                     next_offset: input.u64()?,
                     through_atomic_position: input.u64()?,
-                    pack_hash: input.array_32()?,
-                    pack_offset: input.u64()?,
-                    encoded_bytes: input.u64()?,
-                    logical_bytes: input.u64()?,
+                    pack_table: decode_pack_table(&mut input)?,
+                    locator: ArtifactPackLocator {
+                        ordinal: input.u32()?,
+                        offset: input.u64()?,
+                        encoded_bytes: input.u64()?,
+                        logical_bytes: input.u64()?,
+                        checksum: input.array_32()?,
+                    },
                     records: input.u64()?,
                 });
             }
@@ -1574,8 +1631,53 @@ fn put_component(out: &mut Vec<u8>, component: ComponentIdentity) {
 fn put_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
 }
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_pack_table(out: &mut Vec<u8>, table: &ArtifactPackTable) -> Result<(), IndexError> {
+    table.validate()?;
+    put_u32(
+        out,
+        u32::try_from(table.entries().len()).map_err(|_| IndexError::OffsetOverflow)?,
+    );
+    for entry in table.entries() {
+        put_u32(out, entry.ordinal);
+        put_u32(
+            out,
+            u32::try_from(entry.canonical_path.len()).map_err(|_| IndexError::OffsetOverflow)?,
+        );
+        out.extend_from_slice(entry.canonical_path.as_bytes());
+        put_u64(out, entry.object_version);
+        out.extend_from_slice(&entry.hash);
+        put_u64(out, entry.length);
+    }
+    Ok(())
+}
+
+fn decode_pack_table(input: &mut Decoder<'_>) -> Result<ArtifactPackTable, IndexError> {
+    let count = input.u32()? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let ordinal = input.u32()?;
+        let path_length = input.u32()? as usize;
+        let path_bytes = input.take(path_length)?;
+        let canonical_path = std::sync::Arc::from(
+            std::str::from_utf8(path_bytes)
+                .map_err(|_| IndexError::InvalidFormat("component pack path"))?,
+        );
+        entries.push(super::ArtifactPackReference {
+            ordinal,
+            canonical_path,
+            object_version: input.u64()?,
+            hash: input.array_32()?,
+            length: input.u64()?,
+        });
+    }
+    ArtifactPackTable::new(entries)
 }
 
 struct Decoder<'a> {
@@ -1616,6 +1718,9 @@ impl<'a> Decoder<'a> {
     }
     fn u16(&mut self) -> Result<u16, IndexError> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, IndexError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
     fn u64(&mut self) -> Result<u64, IndexError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))

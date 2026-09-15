@@ -185,9 +185,34 @@ pub enum QueryArtifactKind {
     Block,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryArtifactLoad {
     pub kind: QueryArtifactKind,
     pub hash: [u8; 32],
     pub encoded_bytes: usize,
+    pub pack: Option<super::ArtifactPackReference>,
+    pub pack_offset: u64,
+}
+
+impl QueryArtifactLoad {
+    pub fn direct(kind: QueryArtifactKind, hash: [u8; 32], encoded_bytes: usize) -> Self {
+        Self {
+            kind,
+            hash,
+            encoded_bytes,
+            pack: None,
+            pack_offset: 0,
+        }
+    }
+
+    pub fn packed(block: &super::QueryBlockDescriptor) -> Result<Self, crate::IndexError> {
+        Ok(Self {
+            kind: QueryArtifactKind::Block,
+            hash: block.hash,
+            encoded_bytes: usize::try_from(block.encoded_bytes)
+                .map_err(|_| crate::IndexError::Integrity)?,
+            pack: Some(block.pack_reference()?.clone()),
+            pack_offset: block.locator.offset,
+        })
+    }
 }

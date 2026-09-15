@@ -11,10 +11,11 @@ use crate::IndexError;
 use crate::typed_json::ScalarValue;
 
 use super::{
-    EncodedProjectionQueryRun, EncodedQueryBlock, PreparedQueryFieldDelta,
-    ProjectionPartitionIdentity, ProjectionQueryRunDescriptor, QueryBlockCredits, QueryBlockKind,
-    QueryBlockLimits, QueryBlockRecord, QueryDocumentGate, QueryPositions, QueryPosting,
-    QueryPostingShard, QueryTermEntry, RecipeIdentity, StableDocumentKey, encode_doc_value,
+    ArtifactPackReference, ArtifactPackTable, EncodedProjectionQueryRun, EncodedQueryBlock,
+    PreparedQueryFieldDelta, ProjectionPartitionIdentity, ProjectionQueryRunDescriptor,
+    QueryBlockCredits, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryBlockRecord,
+    QueryDocumentGate, QueryPositions, QueryPosting, QueryPostingShard, QueryTermEntry,
+    RecipeIdentity, StableDocumentKey, UnpublishedArtifactPack, encode_doc_value,
     encode_document_gate, encode_point, encode_positions, encode_posting,
     encode_projection_query_run, encode_query_block, encode_term_entry,
 };
@@ -39,8 +40,76 @@ pub struct PreparedQueryMutationBatch {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionQueryRunArtifacts {
-    pub blocks: Vec<EncodedQueryBlock>,
+    pub packs: Vec<UnpublishedArtifactPack>,
     pub run: EncodedProjectionQueryRun,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct PreparedQueryBlockPacks {
+    pub packs: Vec<UnpublishedArtifactPack>,
+    blocks: Vec<(
+        super::LogicalQueryBlockDescriptor,
+        super::ArtifactPackLocator,
+    )>,
+}
+
+impl PreparedQueryBlockPacks {
+    pub fn bind(
+        self,
+        pack_table: ArtifactPackTable,
+    ) -> Result<(Vec<UnpublishedArtifactPack>, Vec<QueryBlockDescriptor>), IndexError> {
+        if self.packs.len() != pack_table.entries().len() {
+            return Err(IndexError::Integrity);
+        }
+        for (pack, reference) in self.packs.iter().zip(pack_table.entries()) {
+            if pack.ordinal != reference.ordinal
+                || pack.hash != reference.hash
+                || pack.bytes.len() as u64 != reference.length
+            {
+                return Err(IndexError::Integrity);
+            }
+        }
+        let pack_table = std::sync::Arc::new(pack_table);
+        let blocks = self
+            .blocks
+            .into_iter()
+            .map(|(block, locator)| {
+                locator.resolve(&pack_table)?;
+                Ok(QueryBlockDescriptor {
+                    kind: block.kind,
+                    recipe: block.recipe,
+                    minimum_key: block.minimum_key,
+                    maximum_key: block.maximum_key,
+                    hash: block.hash,
+                    encoded_bytes: block.encoded_bytes,
+                    records: block.records,
+                    locator,
+                    pack_table: pack_table.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, IndexError>>()?;
+        Ok((self.packs, blocks))
+    }
+}
+
+pub fn pack_query_blocks(
+    blocks: Vec<EncodedQueryBlock>,
+) -> Result<PreparedQueryBlockPacks, IndexError> {
+    let artifacts = blocks
+        .into_iter()
+        .map(|block| {
+            let descriptor = block.descriptor;
+            let logical_bytes = descriptor.encoded_bytes;
+            let checksum = descriptor.hash;
+            (descriptor, block.bytes, logical_bytes, checksum)
+        })
+        .collect();
+    let (packs, located) = super::artifact_pack::pack_whole_artifacts(artifacts)?;
+    let blocks = located
+        .into_iter()
+        .map(|(block, locator)| (block, locator))
+        .collect();
+    Ok(PreparedQueryBlockPacks { packs, blocks })
 }
 
 /// Holds the real pipeline permit for as long as prepared immutable bytes are
@@ -49,6 +118,43 @@ pub struct ProjectionQueryRunArtifacts {
 pub struct ChargedProjectionQueryRunArtifacts {
     artifacts: ProjectionQueryRunArtifacts,
     _credits: QueryBlockCredits,
+}
+
+#[derive(Debug)]
+pub struct PreparedProjectionQueryRun {
+    partition: ProjectionPartitionIdentity,
+    physical_catalog_generation: [u8; 32],
+    sequence: u64,
+    source_start_offset: u64,
+    next_offset: u64,
+    through_atomic_position: u64,
+    limits: QueryBlockLimits,
+    packed: PreparedQueryBlockPacks,
+    credits: QueryBlockCredits,
+}
+
+impl PreparedProjectionQueryRun {
+    pub fn packs(&self) -> &[UnpublishedArtifactPack] {
+        &self.packed.packs
+    }
+
+    pub fn finalize(
+        self,
+        pack_table: ArtifactPackTable,
+    ) -> Result<ChargedProjectionQueryRunArtifacts, IndexError> {
+        finish_projection_query_run(
+            self.partition,
+            self.physical_catalog_generation,
+            self.sequence,
+            self.source_start_offset,
+            self.next_offset,
+            self.through_atomic_position,
+            self.packed,
+            pack_table,
+            self.limits,
+            self.credits,
+        )
+    }
 }
 
 impl ChargedProjectionQueryRunArtifacts {
@@ -75,7 +181,7 @@ pub fn prepare_projection_query_run(
     batch: PreparedQueryMutationBatch,
     limits: QueryBlockLimits,
     mut credits: QueryBlockCredits,
-) -> Result<ChargedProjectionQueryRunArtifacts, IndexError> {
+) -> Result<PreparedProjectionQueryRun, IndexError> {
     let limits = limits.validate()?;
     validate_run_identity(
         partition,
@@ -231,7 +337,7 @@ pub fn prepare_projection_query_run(
             &mut blocks,
         )?;
     }
-    finish_projection_query_run(
+    prepare_projection_query_run_from_blocks(
         partition,
         physical_catalog_generation,
         sequence,
@@ -245,7 +351,7 @@ pub fn prepare_projection_query_run(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn finish_projection_query_run(
+pub(super) fn prepare_projection_query_run_from_blocks(
     partition: ProjectionPartitionIdentity,
     physical_catalog_generation: [u8; 32],
     sequence: u64,
@@ -253,6 +359,62 @@ pub(super) fn finish_projection_query_run(
     next_offset: u64,
     through_atomic_position: u64,
     mut blocks: Vec<EncodedQueryBlock>,
+    limits: QueryBlockLimits,
+    mut credits: QueryBlockCredits,
+) -> Result<PreparedProjectionQueryRun, IndexError> {
+    validate_run_identity(
+        partition,
+        physical_catalog_generation,
+        sequence,
+        source_start_offset,
+        next_offset,
+    )?;
+    blocks.sort_unstable_by(|left, right| descriptor_order(left).cmp(&descriptor_order(right)));
+    blocks.dedup_by(|left, right| left.descriptor == right.descriptor && left.bytes == right.bytes);
+    let descriptor_bytes = blocks.iter().try_fold(0usize, |bytes, block| {
+        bytes
+            .checked_add(size_of::<super::QueryBlockDescriptor>())
+            .and_then(|bytes| bytes.checked_add(block.descriptor.minimum_key.len()))
+            .and_then(|bytes| bytes.checked_add(block.descriptor.maximum_key.len()))
+            .ok_or(IndexError::OffsetOverflow)
+    })?;
+    credits.reserve(descriptor_bytes)?;
+    // Packing copies whole encoded blocks into their deterministic physical
+    // pack. Charge that short-lived second representation explicitly; once
+    // the input block vectors are consumed, the original byte charge becomes
+    // the retained pack-byte charge.
+    let transient_pack_bytes = blocks.iter().try_fold(0usize, |total, block| {
+        total
+            .checked_add(block.bytes.len())
+            .ok_or(IndexError::OffsetOverflow)
+    })?;
+    credits.reserve(transient_pack_bytes)?;
+    let packed = pack_query_blocks(blocks);
+    credits.release(transient_pack_bytes)?;
+    let packed = packed?;
+    Ok(PreparedProjectionQueryRun {
+        partition,
+        physical_catalog_generation,
+        sequence,
+        source_start_offset,
+        next_offset,
+        through_atomic_position,
+        limits,
+        packed,
+        credits,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finish_projection_query_run(
+    partition: ProjectionPartitionIdentity,
+    physical_catalog_generation: [u8; 32],
+    sequence: u64,
+    source_start_offset: u64,
+    next_offset: u64,
+    through_atomic_position: u64,
+    packed: PreparedQueryBlockPacks,
+    pack_table: ArtifactPackTable,
     limits: QueryBlockLimits,
     mut credits: QueryBlockCredits,
 ) -> Result<ChargedProjectionQueryRunArtifacts, IndexError> {
@@ -263,20 +425,17 @@ pub(super) fn finish_projection_query_run(
         source_start_offset,
         next_offset,
     )?;
-    blocks.sort_unstable_by(|left, right| descriptor_order(left).cmp(&descriptor_order(right)));
-    // Query blocks are addressed by their exact encoded hash. Different terms
-    // can produce identical position (and therefore posting) blocks, so retain
-    // one artifact descriptor while every semantic reference keeps using the
-    // same content hash.
-    blocks.dedup_by(|left, right| left.descriptor == right.descriptor && left.bytes == right.bytes);
-    let descriptor_bytes = blocks.iter().try_fold(0usize, |bytes, block| {
-        bytes
-            .checked_add(size_of::<super::QueryBlockDescriptor>())
-            .and_then(|bytes| bytes.checked_add(block.descriptor.minimum_key.len()))
-            .and_then(|bytes| bytes.checked_add(block.descriptor.maximum_key.len()))
-            .ok_or(IndexError::OffsetOverflow)
-    })?;
-    credits.reserve(descriptor_bytes)?;
+    let pack_table_bytes = pack_table.entries().iter().try_fold(
+        std::mem::size_of::<ArtifactPackTable>(),
+        |resident, reference| {
+            resident
+                .checked_add(std::mem::size_of::<ArtifactPackReference>())
+                .and_then(|bytes| bytes.checked_add(reference.canonical_path.len()))
+                .ok_or(IndexError::OffsetOverflow)
+        },
+    )?;
+    credits.reserve(pack_table_bytes)?;
+    let (packs, blocks) = packed.bind(pack_table)?;
     let descriptor = ProjectionQueryRunDescriptor {
         partition,
         physical_catalog_generation,
@@ -284,14 +443,15 @@ pub(super) fn finish_projection_query_run(
         source_start_offset,
         next_offset,
         through_atomic_position,
-        blocks: blocks
-            .iter()
-            .map(|block| block.descriptor.clone())
-            .collect(),
+        pack_table: blocks.first().map_or_else(
+            || std::sync::Arc::new(ArtifactPackTable::empty()),
+            |block| block.pack_table.clone(),
+        ),
+        blocks,
     };
     let run = encode_projection_query_run(&descriptor, limits, &mut credits)?;
     Ok(ChargedProjectionQueryRunArtifacts {
-        artifacts: ProjectionQueryRunArtifacts { blocks, run },
+        artifacts: ProjectionQueryRunArtifacts { packs, run },
         _credits: credits,
     })
 }
@@ -636,7 +796,7 @@ mod tests {
         TypedJsonFieldState,
     };
     use crate::v1::{
-        IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage,
+        ArtifactPackReference, IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage,
         decode_projection_query_run, prepare_typed_json_field_delta,
     };
 
@@ -666,6 +826,75 @@ mod tests {
                 .acquire(IndexingMemoryStage::OrderingCatalog, bytes)
                 .unwrap(),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_projection_query_run(
+        partition: ProjectionPartitionIdentity,
+        catalog: [u8; 32],
+        sequence: u64,
+        source_start_offset: u64,
+        next_offset: u64,
+        through_atomic_position: u64,
+        batch: PreparedQueryMutationBatch,
+        limits: QueryBlockLimits,
+        credits: QueryBlockCredits,
+    ) -> Result<ChargedProjectionQueryRunArtifacts, IndexError> {
+        let prepared = super::prepare_projection_query_run(
+            partition,
+            catalog,
+            sequence,
+            source_start_offset,
+            next_offset,
+            through_atomic_position,
+            batch,
+            limits,
+            credits,
+        )?;
+        let table = ArtifactPackTable::new(
+            prepared
+                .packs()
+                .iter()
+                .map(|pack| ArtifactPackReference {
+                    ordinal: pack.ordinal,
+                    canonical_path: format!(
+                        "_keldra/index-projections/v1/test/packs/{}",
+                        pack.ordinal
+                    )
+                    .into(),
+                    object_version: u64::from(pack.ordinal) + 1,
+                    hash: pack.hash,
+                    length: pack.bytes.len() as u64,
+                })
+                .collect(),
+        )?;
+        prepared.finalize(table)
+    }
+
+    fn decoded_blocks(
+        artifacts: &ProjectionQueryRunArtifacts,
+    ) -> Vec<(QueryBlockDescriptor, Vec<u8>)> {
+        let verification_pool = memory(128 * 1024 * 1024);
+        let mut verification = credits(&verification_pool, 128 * 1024 * 1024);
+        let run = decode_projection_query_run(
+            &artifacts.run.bytes,
+            QueryBlockLimits::default_for_memory(),
+            &mut verification,
+        )
+        .unwrap();
+        run.blocks
+            .into_iter()
+            .map(|descriptor| {
+                let reference = descriptor.pack_reference().unwrap();
+                let pack = artifacts
+                    .packs
+                    .iter()
+                    .find(|pack| pack.hash == reference.hash)
+                    .unwrap();
+                let bytes = pack.bytes[descriptor.locator.range().unwrap()].to_vec();
+                (descriptor, bytes)
+            })
+            .collect()
     }
 
     fn keyword() -> FieldSchema {
@@ -741,10 +970,10 @@ mod tests {
         )
         .unwrap();
         let artifacts = prepared.artifacts();
-        let kinds = artifacts
-            .blocks
+        let blocks = decoded_blocks(artifacts);
+        let kinds = blocks
             .iter()
-            .map(|block| block.descriptor.kind)
+            .map(|(descriptor, _)| descriptor.kind)
             .collect::<std::collections::BTreeSet<_>>();
         assert!(kinds.contains(&QueryBlockKind::Gate));
         assert!(kinds.contains(&QueryBlockKind::Presence));
@@ -764,7 +993,7 @@ mod tests {
         assert_eq!(descriptor.source_start_offset, 20);
         assert_eq!(descriptor.next_offset, 24);
         assert_eq!(descriptor.through_atomic_position, 11);
-        assert_eq!(descriptor.blocks.len(), artifacts.blocks.len());
+        assert_eq!(descriptor.blocks.len(), blocks.len());
     }
 
     #[test]
@@ -840,17 +1069,16 @@ mod tests {
             reservation,
         )
         .unwrap();
-        let dictionary = prepared
-            .artifacts()
-            .blocks
+        let blocks = decoded_blocks(prepared.artifacts());
+        let dictionary = blocks
             .iter()
-            .find(|block| block.descriptor.kind == QueryBlockKind::TermDictionary)
+            .find(|(descriptor, _)| descriptor.kind == QueryBlockKind::TermDictionary)
             .unwrap();
         let verify_pool = memory(2 * 1024 * 1024);
         let mut verify = credits(&verify_pool, 2 * 1024 * 1024);
         let mut cursor = super::super::QueryBlockCursor::new(
-            &dictionary.descriptor,
-            &dictionary.bytes,
+            &dictionary.0,
+            &dictionary.1,
             QueryBlockLimits::default_for_memory(),
             &mut verify,
         )
@@ -869,17 +1097,13 @@ mod tests {
                 .sum::<usize>(),
             count
         );
-        let posting_blocks = prepared
-            .artifacts()
-            .blocks
+        let posting_blocks = blocks
             .iter()
-            .filter(|block| block.descriptor.kind == QueryBlockKind::Posting)
+            .filter(|(descriptor, _)| descriptor.kind == QueryBlockKind::Posting)
             .count();
-        let position_blocks = prepared
-            .artifacts()
-            .blocks
+        let position_blocks = blocks
             .iter()
-            .filter(|block| block.descriptor.kind == QueryBlockKind::Position)
+            .filter(|(descriptor, _)| descriptor.kind == QueryBlockKind::Position)
             .count();
         assert!(posting_blocks > 1);
         assert_eq!(position_blocks, posting_blocks);
@@ -941,12 +1165,11 @@ mod tests {
             reservation,
         )
         .unwrap();
-        let postings = prepared
-            .artifacts()
-            .blocks
+        let blocks = decoded_blocks(prepared.artifacts());
+        let postings = blocks
             .iter()
-            .filter(|block| block.descriptor.kind == QueryBlockKind::Posting)
-            .map(|block| block.descriptor.records as usize)
+            .filter(|(descriptor, _)| descriptor.kind == QueryBlockKind::Posting)
+            .map(|(descriptor, _)| descriptor.records as usize)
             .sum::<usize>();
         assert_eq!(postings, 2);
     }
@@ -998,29 +1221,27 @@ mod tests {
         )
         .unwrap();
         let artifacts = prepared.artifacts();
+        let blocks = decoded_blocks(artifacts);
         assert_eq!(
-            artifacts
-                .blocks
+            blocks
                 .iter()
-                .filter(|block| block.descriptor.kind == QueryBlockKind::Position)
+                .filter(|(descriptor, _)| descriptor.kind == QueryBlockKind::Position)
                 .count(),
             1
         );
         assert_eq!(
-            artifacts
-                .blocks
+            blocks
                 .iter()
-                .filter(|block| block.descriptor.kind == QueryBlockKind::Posting)
+                .filter(|(descriptor, _)| descriptor.kind == QueryBlockKind::Posting)
                 .count(),
             1
         );
         assert_eq!(
-            artifacts
-                .blocks
+            blocks
                 .iter()
-                .find(|block| block.descriptor.kind == QueryBlockKind::TermDictionary)
+                .find(|(descriptor, _)| descriptor.kind == QueryBlockKind::TermDictionary)
                 .unwrap()
-                .descriptor
+                .0
                 .records,
             2
         );
@@ -1037,7 +1258,7 @@ mod tests {
                 .blocks
                 .len()
             },
-            artifacts.blocks.len()
+            blocks.len()
         );
     }
 }

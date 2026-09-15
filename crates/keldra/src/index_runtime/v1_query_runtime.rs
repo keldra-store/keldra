@@ -17,8 +17,7 @@ use keldra_index::v1::{
     AuthorizedQueryCandidate, LogicalFieldBinding, LogicalProjectionBinding,
     MAX_QUERY_CANDIDATE_ADMISSION_BATCH, MAX_QUERY_PARTITIONS, PinnedPartitionQueryRoot,
     ProjectionCatalogActivation, ProjectionFamilyPartitionDirectory, ProjectionGenerationHeader,
-    ProjectionPartitionIdentity, ProjectionQueryRunDescriptor, QueryAdmissionContext,
-    QueryArtifactLoad, QueryArtifactLoader, QueryBlockCredits, QueryBlockLimits,
+    ProjectionPartitionIdentity, QueryAdmissionContext, QueryBlockCredits, QueryBlockLimits,
     QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits, QueryFieldBinding,
     QueryMemoryPermit, QueryPartitionExecutor, QueryPartitionJob, QueryPublicValueEncoder,
     QueryRootCutProof, RecipeIdentity, StableDocumentKey, TypedJsonQueryRequest,
@@ -26,10 +25,9 @@ use keldra_index::v1::{
     execute_typed_json_query_with_cursor_and_executor, projection_generation_path,
     query_snapshot_identity, resolve_query_partition_results,
 };
-use keldra_store::{BlobRef, PlacementLogId};
+use keldra_store::PlacementLogId;
 use tonic::Status;
 
-use crate::cluster_object_read::ClusterObjectReader;
 use crate::cluster_peer::{LocalIndexQueryExecutor, LocalIndexQueryRequest};
 use crate::cluster_placement::ClusterPlacement;
 use crate::index_service::{
@@ -57,6 +55,9 @@ use cursor::{
 };
 use query_freshness::freshness;
 use snapshot_cache::V1QuerySnapshotCache;
+#[path = "v1_query_artifact_loader.rs"]
+mod artifact_loader;
+use artifact_loader::RuntimeArtifactLoader;
 
 const _: [(); MAX_OBJECT_PATH_BYTES] = [(); keldra_index::v1::MAX_QUERY_DOCUMENT_PATH_BYTES];
 
@@ -81,7 +82,6 @@ impl QueryMemoryPermit for IndexQueryMemoryPermit {
 #[derive(Clone)]
 pub(crate) struct V1LocalIndexQueryExecutor {
     decisions: DecisionRaft,
-    reader: ClusterObjectReader,
     catalog: IndexCatalog,
     projections: V1ProjectionPublisher,
     memory: IndexQueryMemoryBudget,
@@ -92,7 +92,6 @@ pub(crate) struct V1LocalIndexQueryExecutor {
 impl V1LocalIndexQueryExecutor {
     pub(crate) fn new(
         decisions: DecisionRaft,
-        reader: ClusterObjectReader,
         catalog: IndexCatalog,
         projections: V1ProjectionPublisher,
         memory: IndexQueryMemoryBudget,
@@ -100,7 +99,6 @@ impl V1LocalIndexQueryExecutor {
     ) -> Self {
         Self {
             decisions,
-            reader,
             catalog,
             projections,
             memory,
@@ -279,7 +277,13 @@ impl V1LocalIndexQueryExecutor {
             );
             let mut credits =
                 QueryBlockCredits::from_query_permit(Box::new(memory)).map_err(index_status)?;
-            let mut loader = RuntimeArtifactLoader::new(self.projections.clone());
+            let mut loader = RuntimeArtifactLoader::new(
+                self.projections.clone(),
+                request.storage_tenant.clone(),
+                request.definition.bucket.clone(),
+                request.tenant_id,
+                request.bucket_id,
+            );
             let mut admission = RuntimeCandidateAdmission {
                 visibility: request.candidate_visibility.clone(),
                 storage_tenant: request.storage_tenant.clone(),
@@ -929,107 +933,6 @@ fn cache_completed_snapshot(
     has_next: bool,
 ) {
     cache.insert(pinned, snapshot, resumed || has_next);
-}
-
-struct RuntimeArtifactLoader {
-    projections: V1ProjectionPublisher,
-}
-
-impl RuntimeArtifactLoader {
-    fn new(projections: V1ProjectionPublisher) -> Self {
-        Self { projections }
-    }
-}
-
-impl QueryArtifactLoader for RuntimeArtifactLoader {
-    fn load_query_artifact(
-        &mut self,
-        request: QueryArtifactLoad,
-    ) -> impl std::future::Future<Output = Result<bytes::Bytes, IndexError>> + Send {
-        async move {
-            let blob = BlobRef {
-                hash: request.hash,
-                length: request.encoded_bytes as u64,
-            };
-            let bytes = self
-                .projections
-                .read_blob_local_first(&blob, request.encoded_bytes)
-                .await
-                .map_err(|error| IndexError::Io(error.to_string()))?;
-            Ok(bytes)
-        }
-    }
-
-    fn cached_projection_query_run(
-        &self,
-        request: QueryArtifactLoad,
-    ) -> Result<Option<Arc<ProjectionQueryRunDescriptor>>, IndexError> {
-        if request.kind != keldra_index::v1::QueryArtifactKind::Run {
-            return Ok(None);
-        }
-        let blob = BlobRef {
-            hash: request.hash,
-            length: request.encoded_bytes as u64,
-        };
-        self.projections
-            .cached_query_run(&blob, request.encoded_bytes)
-            .map_err(|error| IndexError::Io(error.to_string()))
-    }
-
-    fn cache_projection_query_run(
-        &mut self,
-        request: QueryArtifactLoad,
-        descriptor: Arc<ProjectionQueryRunDescriptor>,
-    ) {
-        if request.kind == keldra_index::v1::QueryArtifactKind::Run {
-            self.projections.cache_query_run(
-                &BlobRef {
-                    hash: request.hash,
-                    length: request.encoded_bytes as u64,
-                },
-                descriptor,
-            );
-        }
-    }
-
-    fn cached_query_block(
-        &self,
-        generation: [u8; 32],
-        request: QueryArtifactLoad,
-    ) -> Result<Option<Arc<keldra_index::v1::DecodedQueryBlock>>, IndexError> {
-        if request.kind != keldra_index::v1::QueryArtifactKind::Block {
-            return Ok(None);
-        }
-        let blob = BlobRef {
-            hash: request.hash,
-            length: request.encoded_bytes as u64,
-        };
-        self.projections
-            .cached_query_block(&blob, generation, request.encoded_bytes)
-            .map_err(|error| IndexError::Io(error.to_string()))
-    }
-
-    fn cache_query_block(
-        &mut self,
-        generation: [u8; 32],
-        request: QueryArtifactLoad,
-        block: Arc<keldra_index::v1::DecodedQueryBlock>,
-    ) {
-        if request.kind == keldra_index::v1::QueryArtifactKind::Block {
-            self.projections.cache_query_block(
-                &BlobRef {
-                    hash: request.hash,
-                    length: request.encoded_bytes as u64,
-                },
-                generation,
-                block,
-            );
-        }
-    }
-
-    fn try_fork_query_loader(&self) -> Result<Option<Self>, IndexError> {
-        Ok(Some(Self::new(self.projections.clone())))
-    }
 }
 
 impl QueryPartitionExecutor for IndexQueryScheduler {

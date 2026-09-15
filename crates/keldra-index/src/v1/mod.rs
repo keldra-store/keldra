@@ -4,6 +4,7 @@
 //! reusable membership and field-recipe state. These types are deliberately
 //! storage-neutral; publication and generation fencing remain runtime duties.
 
+mod artifact_pack;
 mod buffer;
 mod codec;
 mod directory;
@@ -74,16 +75,18 @@ pub use publication::{
 };
 pub use query_blocks::{
     DEFAULT_QUERY_BLOCK_BYTES, DecodedQueryBlock, EncodedProjectionQueryRun, EncodedQueryBlock,
-    PreparedQueryFieldDelta, PreparedQueryTermDelta, ProjectionQueryRunDescriptor,
-    QueryBlockCursor, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryBlockRecord,
-    QueryBlockRecordRef, QueryDocValue, QueryPoint, QueryPositions, QueryPosting,
-    QueryPostingShard, QueryTermEntry, decode_point, decode_positions, decode_posting,
-    decode_projection_query_run, decode_term_entry, encode_point, encode_positions, encode_posting,
-    encode_projection_query_run, encode_query_block, encode_term_entry, merge_query_block_records,
-    prepare_typed_json_field_delta, seek_exact_term, visit_live_gates, visit_live_postings,
-    visit_live_range_points, visit_prefix_terms,
+    LogicalQueryBlockDescriptor, PreparedQueryFieldDelta, PreparedQueryTermDelta,
+    ProjectionQueryRunDescriptor, QueryBlockCursor, QueryBlockDescriptor, QueryBlockKind,
+    QueryBlockLimits, QueryBlockRecord, QueryBlockRecordRef, QueryDocValue, QueryPoint,
+    QueryPositions, QueryPosting, QueryPostingShard, QueryTermEntry, decode_point,
+    decode_positions, decode_posting, decode_projection_query_run, decode_term_entry, encode_point,
+    encode_positions, encode_posting, encode_projection_query_run, encode_query_block,
+    encode_term_entry, merge_query_block_records, prepare_typed_json_field_delta, seek_exact_term,
+    visit_live_gates, visit_live_postings, visit_live_range_points, visit_prefix_terms,
 };
-pub use query_compaction::{ChargedQueryRunCompaction, compact_encoded_query_runs};
+pub use query_compaction::{
+    ChargedQueryRunCompaction, PreparedQueryRunCompaction, prepare_encoded_query_run_compaction,
+};
 pub use query_credits::{QueryBlockCredits, QueryMemoryPermit};
 pub use query_doc_values::{decode_doc_value, encode_doc_value};
 pub use query_executor::{
@@ -104,8 +107,9 @@ pub use query_parallel::{
     execute_typed_json_query_with_executor, resolve_query_partition_results,
 };
 pub use query_prepare::{
-    ChargedProjectionQueryRunArtifacts, PreparedQueryMembershipDelta, PreparedQueryMutationBatch,
-    PreparedQueryRecipeDelta, ProjectionQueryRunArtifacts, prepare_projection_query_run,
+    ChargedProjectionQueryRunArtifacts, PreparedProjectionQueryRun, PreparedQueryMembershipDelta,
+    PreparedQueryMutationBatch, PreparedQueryRecipeDelta, ProjectionQueryRunArtifacts,
+    pack_query_blocks, prepare_projection_query_run,
 };
 pub use query_stream::{
     EncodedQueryRunPage, PreparedQueryRunAppend, PreparedQueryRunSplice, QUERY_RUN_PAGE_FANOUT,
@@ -131,6 +135,10 @@ pub use typed_document::{
 };
 
 pub const INDEX_FORMAT_VERSION: u16 = 1;
+pub use artifact_pack::{
+    ARTIFACT_PACK_MAX_BYTES, ArtifactPackLocator, ArtifactPackReference, ArtifactPackTable,
+    UnpublishedArtifactPack,
+};
 pub use buffer::{
     ComponentDeltaRecord, DecodedComponentDelta, ProjectionMutationBuffer, SealedComponentDelta,
     decode_component_delta, decode_component_delta_segment, decode_document_head,

@@ -22,8 +22,16 @@ fn packed(
         .unwrap()
         .packs
         .remove(0);
+    let table = ArtifactPackTable::new(vec![ArtifactPackReference {
+        ordinal: pack.ordinal,
+        canonical_path: "_keldra/index-projections/v1/test/packs/0".into(),
+        object_version: 1,
+        hash: pack.hash,
+        length: pack.bytes.len() as u64,
+    }])
+    .unwrap();
     (
-        descriptor(1, 0, 0, 1, 1, &pack.deltas[0]).unwrap(),
+        descriptor(1, 0, 0, 1, 1, &pack.deltas[0], &table).unwrap(),
         pack.bytes,
     )
 }

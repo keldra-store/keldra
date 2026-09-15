@@ -561,10 +561,10 @@ mod tests {
     use super::*;
     use crate::typed_json::ScalarValue;
     use crate::v1::{
-        ProjectionPartitionIdentity, ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot,
-        QueryArtifactLoad, QueryBlockRecord, QueryMemoryPermit, QueryPostingShard,
-        QueryRootCutProof, QueryTermEntry, RecipeIdentity, encode_posting, encode_query_block,
-        encode_term_entry,
+        ArtifactPackReference, ArtifactPackTable, ProjectionPartitionIdentity,
+        ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot, QueryArtifactLoad,
+        QueryBlockRecord, QueryMemoryPermit, QueryPostingShard, QueryRootCutProof, QueryTermEntry,
+        RecipeIdentity, encode_posting, encode_query_block, encode_term_entry,
     };
 
     struct Permit(usize);
@@ -675,7 +675,27 @@ mod tests {
         )
         .unwrap();
         let partition = ProjectionPartitionIdentity::new([1; 32], 1, [2; 32], 1, 1, 1).unwrap();
-        let mut blocks = vec![dictionary.descriptor.clone(), posting.descriptor.clone()];
+        let packed =
+            crate::v1::pack_query_blocks(vec![dictionary.clone(), posting.clone()]).unwrap();
+        let pack_table = ArtifactPackTable::new(
+            packed
+                .packs
+                .iter()
+                .map(|pack| ArtifactPackReference {
+                    ordinal: pack.ordinal,
+                    canonical_path: format!(
+                        "_keldra/index-projections/v1/test/artifacts/packs/{}",
+                        pack.ordinal
+                    )
+                    .into(),
+                    object_version: u64::from(pack.ordinal) + 1,
+                    hash: pack.hash,
+                    length: pack.bytes.len() as u64,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let (_, mut blocks) = packed.bind(pack_table).unwrap();
         blocks.sort_by(|left, right| {
             (
                 left.kind,
@@ -699,6 +719,7 @@ mod tests {
             source_start_offset: 1,
             next_offset: 6,
             through_atomic_position: 1,
+            pack_table: blocks[0].pack_table.clone(),
             blocks,
         });
         run.validate(block_limits).unwrap();

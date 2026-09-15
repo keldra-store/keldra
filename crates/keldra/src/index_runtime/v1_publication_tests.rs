@@ -1,9 +1,11 @@
 use keldra_index::v1::{
-    CanonicalRecipeState, DocumentHead, IndexingMemoryCredits, IndexingMemoryLimits,
-    IndexingMemoryStage, PreparedQueryMembershipDelta, PreparedQueryMutationBatch,
-    ProjectedDocumentState, ProjectionMutationBuffer, ProjectionPackCredits, QueryBlockCredits,
-    QueryBlockLimits, QueryDocumentGate, RecipeIdentity, StableDocumentKey, pack_component_deltas,
-    prepare_atomic_projection_generation,
+    ArtifactPackReference, ArtifactPackTable, CanonicalRecipeState, DocumentHead,
+    IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage, PreparedQueryMembershipDelta,
+    PreparedQueryMutationBatch, ProjectedDocumentState, ProjectionMutationBuffer,
+    ProjectionPackCredits, QueryBlockCredits, QueryBlockLimits, QueryDocumentGate, RecipeIdentity,
+    StableDocumentKey, pack_component_deltas,
+    prepare_atomic_projection_generation as prepare_atomic_projection_generation_packed,
+    prepare_projection_query_run,
 };
 
 use super::*;
@@ -70,6 +72,95 @@ fn pack_credits() -> ProjectionPackCredits {
         memory
             .acquire(IndexingMemoryStage::SealScratch, bytes)
             .unwrap(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_atomic_projection_generation<StreamPageBytes, QueryPageBytes>(
+    partition: ProjectionPartitionIdentity,
+    catalog: [u8; 32],
+    previous: Option<(&keldra_index::v1::ProjectionGeneration, [u8; 32])>,
+    source_start_offset: u64,
+    next_offset: u64,
+    through_atomic_position: u64,
+    inherited: Vec<keldra_index::v1::ProjectionGenerationReference>,
+    deltas: Vec<keldra_index::v1::SealedComponentDelta>,
+    batch: PreparedQueryMutationBatch,
+    limits: QueryBlockLimits,
+    query_credits: QueryBlockCredits,
+    component_credits: ProjectionPackCredits,
+    load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, keldra_index::IndexError>,
+    load_query_page: impl FnMut([u8; 32]) -> Result<QueryPageBytes, keldra_index::IndexError>,
+) -> Result<PreparedAtomicProjectionGeneration, keldra_index::IndexError>
+where
+    StreamPageBytes: AsRef<[u8]>,
+    QueryPageBytes: AsRef<[u8]>,
+{
+    let component_packs = pack_component_deltas(deltas, component_credits)?;
+    let component_table = ArtifactPackTable::new(
+        component_packs
+            .packs
+            .iter()
+            .map(|pack| ArtifactPackReference {
+                ordinal: pack.ordinal,
+                canonical_path: format!(
+                    "_keldra/index-projections/v1/test/component-packs/{}",
+                    pack.ordinal
+                )
+                .into(),
+                object_version: u64::from(pack.ordinal) + 1,
+                hash: pack.hash,
+                length: pack.bytes.len() as u64,
+            })
+            .collect(),
+    )?;
+    let sequence = previous.map_or(1, |(generation, _)| {
+        generation.query_stream_root.last_sequence + 1
+    });
+    let query = prepare_projection_query_run(
+        partition,
+        catalog,
+        sequence,
+        source_start_offset,
+        next_offset,
+        through_atomic_position,
+        batch,
+        limits,
+        query_credits,
+    )?;
+    let query_table = test_pack_table(query.packs())?;
+    prepare_atomic_projection_generation_packed(
+        partition,
+        catalog,
+        previous,
+        source_start_offset,
+        next_offset,
+        through_atomic_position,
+        inherited,
+        component_packs,
+        component_table,
+        query,
+        query_table,
+        load_stream_page,
+        load_query_page,
+    )
+}
+
+fn test_pack_table(
+    packs: &[keldra_index::v1::UnpublishedArtifactPack],
+) -> Result<ArtifactPackTable, keldra_index::IndexError> {
+    ArtifactPackTable::new(
+        packs
+            .iter()
+            .map(|pack| ArtifactPackReference {
+                ordinal: pack.ordinal,
+                canonical_path: format!("_keldra/index-projections/v1/test/packs/{}", pack.ordinal)
+                    .into(),
+                object_version: u64::from(pack.ordinal) + 1,
+                hash: pack.hash,
+                length: pack.bytes.len() as u64,
+            })
+            .collect(),
     )
 }
 

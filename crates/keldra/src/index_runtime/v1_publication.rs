@@ -10,14 +10,14 @@ use std::time::Instant;
 use bytes::Bytes;
 use keldra_index::v1::{
     ArtifactPackReference, ArtifactPackTable, AtomicProjectionPublicationCredits,
-    CanonicalRecipeState, ComponentIdentity,
-    ComponentRecordLookup, ComponentStreamReverseCursor, ComponentStreamReverseStep,
-    ComponentStreamRoot, PreparedAtomicProjectionGeneration, PreparedQueryMutationBatch,
-    ProjectedDocumentState, ProjectionCatalogActivation, ProjectionCurrent,
-    ProjectionFamilyPartitionDirectory, ProjectionGeneration, ProjectionPackCredits,
-    ProjectionPartitionIdentity, ProjectionQueryRunDescriptor, QueryBlockCredits, QueryBlockLimits,
-    QueryRunPage, StableDocumentKey, component_stream_child_hashes, decode_component_delta_segment,
-    decode_document_head, decode_projection_catalog_activation, decode_projection_current,
+    CanonicalRecipeState, ComponentIdentity, ComponentRecordLookup, ComponentStreamReverseCursor,
+    ComponentStreamReverseStep, ComponentStreamRoot, PreparedAtomicProjectionGeneration,
+    PreparedQueryMutationBatch, ProjectedDocumentState, ProjectionCatalogActivation,
+    ProjectionCurrent, ProjectionFamilyPartitionDirectory, ProjectionGeneration,
+    ProjectionPackCredits, ProjectionPartitionIdentity, ProjectionQueryRunDescriptor,
+    QueryBlockCredits, QueryBlockLimits, QueryRunPage, StableDocumentKey,
+    component_stream_child_hashes, decode_component_delta_segment, decode_document_head,
+    decode_projection_catalog_activation, decode_projection_current,
     decode_projection_family_directory, decode_projection_generation,
     decode_projection_generation_header, decode_query_run_page, decode_source_records,
     encode_projection_catalog_activation, encode_projection_family_directory,
@@ -43,6 +43,7 @@ use super::v1_compaction::{V1CompactionArtifacts, V1CompactionBase};
 use super::v1_parallel::run_bounded_ordered;
 
 mod immutable_staging;
+mod physical_packs;
 mod projection_cache_updates;
 #[cfg(test)]
 use immutable_staging::{immutable_stage_windows, immutable_stage_work, inline_window_fits};
@@ -385,9 +386,8 @@ impl V1ProjectionPublisher {
                 }
             }
         }
-        let base = previous.map(|previous| {
-            compaction.map_or(&previous.generation, |value| &value.predecessor)
-        });
+        let base = previous
+            .map(|previous| compaction.map_or(&previous.generation, |value| &value.predecessor));
         let query_sequence = base.map_or(1, |generation| {
             generation.query_stream_root.last_sequence.saturating_add(1)
         });
@@ -455,125 +455,6 @@ impl V1ProjectionPublisher {
             },
         )
         .map_err(index_status)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn publish_component_packs(
-        &self,
-        storage_tenant: &str,
-        bucket: &str,
-        tenant_id: u64,
-        bucket_id: u64,
-        partition: ProjectionPartitionIdentity,
-        packs: &[keldra_index::v1::SealedProjectionDeltaPack],
-    ) -> Result<ArtifactPackTable, Status> {
-        let inputs = packs
-            .iter()
-            .map(|pack| {
-                (
-                    pack.ordinal,
-                    projection_pack_path(partition, pack.hash),
-                    keldra_index::v1::ProjectionArtifactKind::Pack,
-                    pack.hash,
-                    pack.bytes.as_slice(),
-                )
-            })
-            .collect();
-        self.publish_physical_packs(
-            storage_tenant,
-            bucket,
-            tenant_id,
-            bucket_id,
-            partition,
-            inputs,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn publish_query_packs(
-        &self,
-        storage_tenant: &str,
-        bucket: &str,
-        tenant_id: u64,
-        bucket_id: u64,
-        partition: ProjectionPartitionIdentity,
-        packs: &[keldra_index::v1::UnpublishedArtifactPack],
-    ) -> Result<ArtifactPackTable, Status> {
-        let inputs = packs
-            .iter()
-            .map(|pack| {
-                (
-                    pack.ordinal,
-                    projection_query_run_pack_path(partition, pack.hash),
-                    keldra_index::v1::ProjectionArtifactKind::QueryRunPack,
-                    pack.hash,
-                    pack.bytes.as_slice(),
-                )
-            })
-            .collect();
-        self.publish_physical_packs(
-            storage_tenant,
-            bucket,
-            tenant_id,
-            bucket_id,
-            partition,
-            inputs,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn publish_physical_packs(
-        &self,
-        storage_tenant: &str,
-        bucket: &str,
-        tenant_id: u64,
-        bucket_id: u64,
-        partition: ProjectionPartitionIdentity,
-        packs: Vec<(u32, String, keldra_index::v1::ProjectionArtifactKind, [u8; 32], &[u8])>,
-    ) -> Result<ArtifactPackTable, Status> {
-        if packs.is_empty() {
-            return ArtifactPackTable::new(Vec::new()).map_err(index_status);
-        }
-        let mut publications = Vec::with_capacity(packs.len());
-        for (_, path, kind, hash, bytes) in &packs {
-            let blob = self.stage(bytes).await?;
-            if blob.hash != *hash || blob.length != bytes.len() as u64 {
-                return Err(Status::data_loss(
-                    "staged v1 physical pack changed its exact bytes",
-                ));
-            }
-            publications.push(request(
-                storage_tenant,
-                bucket,
-                tenant_id,
-                bucket_id,
-                projection_artifact_routing_id(partition.family_id, *kind, *hash)
-                    .map_err(index_status)?,
-                path.clone(),
-                blob,
-                None,
-            ));
-        }
-        let outcomes = self.artifacts.publish_immutable_many(publications).await?;
-        if outcomes.len() != packs.len() {
-            return Err(Status::data_loss(
-                "v1 physical pack outcomes differ from their inputs",
-            ));
-        }
-        let mut references = Vec::with_capacity(packs.len());
-        for ((ordinal, path, _, hash, bytes), outcome) in packs.into_iter().zip(outcomes) {
-            let outcome = outcome?;
-            references.push(ArtifactPackReference {
-                ordinal,
-                canonical_path: path,
-                object_version: outcome.version.0,
-                hash,
-                length: bytes.len() as u64,
-            });
-        }
-        ArtifactPackTable::new(references).map_err(index_status)
     }
 
     /// Load the one stable family lifecycle directory. This directory is not
@@ -922,16 +803,7 @@ impl V1ProjectionPublisher {
         let mut artifacts = BTreeMap::new();
         let V1CompactionArtifacts { component, query } = compaction;
         let component_credits = if let Some(component) = component {
-            let (packs, credits) = component.packs.into_parts();
-            for pack in packs {
-                insert_artifact(
-                    &mut artifacts,
-                    projection_pack_path(partition, pack.hash),
-                    keldra_index::v1::ProjectionArtifactKind::Pack,
-                    pack.hash,
-                    pack.bytes,
-                )?;
-            }
+            let (_packs, credits) = component.packs.into_parts();
             for page in component.pages {
                 insert_artifact(
                     &mut artifacts,
@@ -947,16 +819,7 @@ impl V1ProjectionPublisher {
         };
         let query_credits = if let Some(query) = query {
             let (query_artifacts, _reference, splice, credits) = query.into_parts_with_credits();
-            for block in query_artifacts.blocks {
-                insert_artifact(
-                    &mut artifacts,
-                    projection_query_run_pack_path(partition, block.descriptor.hash),
-                    keldra_index::v1::ProjectionArtifactKind::QueryRunPack,
-                    block.descriptor.hash,
-                    block.bytes,
-                )?;
-            }
-            let run = query_artifacts.run;
+            let keldra_index::v1::ProjectionQueryRunArtifacts { packs: _, run } = query_artifacts;
             insert_artifact(
                 &mut artifacts,
                 projection_query_run_pack_path(partition, run.hash),
@@ -1099,20 +962,16 @@ impl V1ProjectionPublisher {
                     if key < descriptor.minimum_key || key > descriptor.maximum_key {
                         continue;
                     }
-                    let path = projection_pack_path(generation.partition, descriptor.pack_hash);
-                    let maximum = 64 * 1024 * 1024;
+                    let pack = descriptor.pack_reference().map_err(index_status)?;
                     let bytes = self
-                        .read_immutable_object(
+                        .read_exact_artifact_pack(
                             storage_tenant,
                             bucket,
                             tenant_id,
                             bucket_id,
-                            &path,
-                            descriptor.pack_hash,
-                            maximum,
+                            pack,
                         )
-                        .await?
-                        .ok_or_else(|| Status::data_loss("v1 projection pack is absent"))?;
+                        .await?;
                     match lookup_component_record_in_verified_pack(
                         component,
                         &descriptor,
@@ -1522,6 +1381,7 @@ impl V1ProjectionPublisher {
                 bucket_id,
                 path,
                 expected_hash,
+                None,
                 maximum_bytes,
                 || async {
                     Ok(self
@@ -1707,7 +1567,7 @@ fn plan_atomic_publication(
         .flat_map(|pack| &pack.deltas)
         .try_fold(0_u64, |total, delta| {
             total
-                .checked_add(delta.encoded_bytes)
+                .checked_add(delta.locator.encoded_bytes)
                 .ok_or_else(|| Status::resource_exhausted("v1 sealed delta bytes overflow"))
         })?;
     if prepared.generation.hash
@@ -1755,19 +1615,13 @@ fn plan_atomic_publication(
         }
     }
 
-    let maximum_block_bytes = prepared
-        .query_blocks
-        .iter()
-        .map(|block| block.bytes.len())
-        .max()
-        .unwrap_or(64)
-        .max(64);
+    let maximum_block_bytes = QueryBlockLimits::default_for_memory().maximum_block_bytes;
     let query_limits = keldra_index::v1::QueryBlockLimits {
         maximum_block_bytes,
         maximum_records: u32::MAX as usize,
         maximum_key_bytes: maximum_block_bytes,
         maximum_value_bytes: maximum_block_bytes,
-        maximum_loaded_blocks: prepared.query_blocks.len().max(1),
+        maximum_loaded_blocks: QueryBlockLimits::default_for_memory().maximum_loaded_blocks,
         maximum_run_descriptor_bytes: prepared.query_run.bytes.len().max(256),
     };
     let mut validation_credits = keldra_index::v1::QueryBlockCredits::from_query_permit(Box::new(
@@ -1788,12 +1642,6 @@ fn plan_atomic_publication(
             .is_some_and(|previous| query_run.source_start_offset != previous.current.next_offset)
         || query_run.next_offset != generation.next_offset
         || query_run.through_atomic_position != generation.through_atomic_position
-        || query_run.blocks
-            != prepared
-                .query_blocks
-                .iter()
-                .map(|block| block.descriptor.clone())
-                .collect::<Vec<_>>()
     {
         return Err(Status::data_loss(
             "prepared v1 query run is not bound to its generation cut and blocks",
@@ -1817,15 +1665,8 @@ fn plan_atomic_publication(
     }
 
     let mut artifacts = BTreeMap::new();
-    for pack in prepared.packs {
-        insert_artifact(
-            &mut artifacts,
-            projection_pack_path(partition, pack.hash),
-            keldra_index::v1::ProjectionArtifactKind::Pack,
-            pack.hash,
-            pack.bytes,
-        )?;
-    }
+    // Physical packs were published first so their exact ordinary-object
+    // versions could be encoded into the root-bound locator tables.
     for page in prepared.stream_pages {
         insert_artifact(
             &mut artifacts,
@@ -1835,15 +1676,7 @@ fn plan_atomic_publication(
             page.bytes,
         )?;
     }
-    for block in prepared.query_blocks {
-        insert_artifact(
-            &mut artifacts,
-            projection_query_run_pack_path(partition, block.descriptor.hash),
-            keldra_index::v1::ProjectionArtifactKind::QueryRunPack,
-            block.descriptor.hash,
-            block.bytes,
-        )?;
-    }
+    drop(prepared.query_packs);
     insert_artifact(
         &mut artifacts,
         projection_query_run_pack_path(partition, prepared.query_run.hash),
@@ -1898,9 +1731,9 @@ fn projection_state_updates(
     let mut updates = BTreeMap::new();
     for pack in packs {
         for delta in &pack.deltas {
-            let start = usize::try_from(delta.offset)
+            let start = usize::try_from(delta.locator.offset)
                 .map_err(|_| Status::data_loss("v1 cached delta offset is unbounded"))?;
-            let length = usize::try_from(delta.encoded_bytes)
+            let length = usize::try_from(delta.locator.encoded_bytes)
                 .map_err(|_| Status::data_loss("v1 cached delta length is unbounded"))?;
             let end = start
                 .checked_add(length)

@@ -345,14 +345,15 @@ mod tests {
 
     use bytes::Bytes;
     use keldra_index::v1::{
-        AuthorizedQueryCandidate, CatalogOrdinalRange, ProjectionFamilyPartitionDirectory,
-        ProjectionPartitionIdentity, ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot,
-        QueryAdmissionContext, QueryArtifactLoad, QueryArtifactLoader, QueryBlockCredits,
-        QueryBlockKind, QueryBlockLimits, QueryCandidateAdmission, QueryCommonCut,
-        QueryDocumentGate, QueryExecutionLimits, QueryMemoryPermit, QueryRecipeCatalogProof,
-        QueryRootCutProof, QueryRunPage, QueryRunReference, RecipeIdentity, StableDocumentKey,
-        TypedJsonQueryRequest, encode_document_gate, encode_projection_query_run,
-        encode_query_block, encode_query_run_page, execute_typed_json_query,
+        ArtifactPackReference, ArtifactPackTable, AuthorizedQueryCandidate, CatalogOrdinalRange,
+        ProjectionFamilyPartitionDirectory, ProjectionPartitionIdentity,
+        ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot, QueryAdmissionContext,
+        QueryArtifactLoad, QueryArtifactLoader, QueryBlockCredits, QueryBlockKind,
+        QueryBlockLimits, QueryCandidateAdmission, QueryCommonCut, QueryDocumentGate,
+        QueryExecutionLimits, QueryMemoryPermit, QueryRecipeCatalogProof, QueryRootCutProof,
+        QueryRunPage, QueryRunReference, RecipeIdentity, StableDocumentKey, TypedJsonQueryRequest,
+        encode_document_gate, encode_projection_query_run, encode_query_block,
+        encode_query_run_page, execute_typed_json_query, pack_query_blocks,
     };
 
     use super::*;
@@ -450,6 +451,26 @@ mod tests {
             &mut encoding_credits,
         )
         .unwrap();
+        let packed = pack_query_blocks(vec![gate.clone()]).unwrap();
+        let pack_table = ArtifactPackTable::new(
+            packed
+                .packs
+                .iter()
+                .map(|pack| ArtifactPackReference {
+                    ordinal: pack.ordinal,
+                    canonical_path: format!(
+                        "_keldra/index-projections/v1/test/packs/{}",
+                        pack.ordinal
+                    )
+                    .into(),
+                    object_version: u64::from(pack.ordinal) + 1,
+                    hash: pack.hash,
+                    length: pack.bytes.len() as u64,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let (_, blocks) = packed.bind(pack_table.clone()).unwrap();
         let descriptor = ProjectionQueryRunDescriptor {
             partition,
             physical_catalog_generation: [4; 32],
@@ -457,7 +478,8 @@ mod tests {
             source_start_offset: 1,
             next_offset: 2,
             through_atomic_position: 20,
-            blocks: vec![gate.descriptor.clone()],
+            pack_table: Arc::new(pack_table),
+            blocks,
         };
         let encoded = encode_projection_query_run(
             &descriptor,

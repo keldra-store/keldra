@@ -3,14 +3,13 @@ use std::collections::BTreeSet;
 use crate::IndexError;
 
 use super::{
-    ComponentStreamRoot, EncodedComponentStreamPage, EncodedProjectionGeneration,
-    EncodedQueryBlock, EncodedQueryRunPage, PreparedQueryMutationBatch,
-    ProjectionCatalogTransition, ProjectionCurrent, ProjectionGeneration,
-    ProjectionGenerationReference, ProjectionPackCredits, ProjectionPartitionIdentity,
-    ProjectionQueryRunArtifacts, QueryBlockCredits, QueryBlockLimits, QueryRunReference,
-    SealedComponentDelta, SealedProjectionDeltaPack, append_component_stream,
-    append_query_run_path_copy, encode_projection_current, encode_projection_generation,
-    pack_component_deltas, prepare_projection_query_run,
+    ArtifactPackTable, ChargedProjectionDeltaPacks, ComponentStreamRoot,
+    EncodedComponentStreamPage, EncodedProjectionGeneration, EncodedQueryRunPage,
+    PreparedProjectionQueryRun, ProjectionCatalogTransition, ProjectionCurrent,
+    ProjectionGeneration, ProjectionGenerationReference, ProjectionPackCredits,
+    ProjectionPartitionIdentity, ProjectionQueryRunArtifacts, QueryBlockCredits, QueryRunReference,
+    SealedProjectionDeltaPack, append_component_stream, append_query_run_path_copy,
+    encode_projection_current, encode_projection_generation,
 };
 
 struct PreparedProjectionComponents {
@@ -40,7 +39,7 @@ pub struct PreparedProjectionGeneration {
 pub struct PreparedAtomicProjectionGeneration {
     pub packs: Vec<SealedProjectionDeltaPack>,
     pub stream_pages: Vec<EncodedComponentStreamPage>,
-    pub query_blocks: Vec<EncodedQueryBlock>,
+    pub query_packs: Vec<super::UnpublishedArtifactPack>,
     pub query_run: super::EncodedProjectionQueryRun,
     pub query_stream_pages: Vec<EncodedQueryRunPage>,
     pub generation: EncodedProjectionGeneration,
@@ -65,7 +64,7 @@ pub struct AtomicProjectionPublicationCredits {
 pub struct PreparedAtomicProjectionPayload {
     pub packs: Vec<SealedProjectionDeltaPack>,
     pub stream_pages: Vec<EncodedComponentStreamPage>,
-    pub query_blocks: Vec<EncodedQueryBlock>,
+    pub query_packs: Vec<super::UnpublishedArtifactPack>,
     pub query_run: super::EncodedProjectionQueryRun,
     pub query_stream_pages: Vec<EncodedQueryRunPage>,
     pub generation: EncodedProjectionGeneration,
@@ -87,7 +86,7 @@ impl PreparedAtomicProjectionGeneration {
             PreparedAtomicProjectionPayload {
                 packs: self.packs,
                 stream_pages: self.stream_pages,
-                query_blocks: self.query_blocks,
+                query_packs: self.query_packs,
                 query_run: self.query_run,
                 query_stream_pages: self.query_stream_pages,
                 generation: self.generation,
@@ -105,7 +104,7 @@ impl PreparedAtomicProjectionGeneration {
             .iter()
             .map(|pack| pack.bytes.len())
             .chain(self.stream_pages.iter().map(|page| page.bytes.len()))
-            .chain(self.query_blocks.iter().map(|block| block.bytes.len()))
+            .chain(self.query_packs.iter().map(|pack| pack.bytes.len()))
             .chain(self.query_stream_pages.iter().map(|page| page.bytes.len()))
             .chain(
                 self.generation
@@ -159,8 +158,8 @@ pub fn prepare_projection_generation<StreamPageBytes>(
     next_offset: u64,
     through_atomic_position: u64,
     inherited_partitions: Vec<ProjectionGenerationReference>,
-    deltas: Vec<SealedComponentDelta>,
-    pack_credits: ProjectionPackCredits,
+    charged_packs: ChargedProjectionDeltaPacks,
+    pack_table: ArtifactPackTable,
     load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
 ) -> Result<PreparedProjectionGeneration, IndexError>
 where
@@ -175,8 +174,8 @@ where
         next_offset,
         through_atomic_position,
         inherited_partitions,
-        deltas,
-        pack_credits,
+        charged_packs,
+        pack_table,
         load_stream_page,
     )?;
     finalize_projection_components(components)
@@ -192,8 +191,8 @@ fn prepare_projection_components<StreamPageBytes>(
     next_offset: u64,
     through_atomic_position: u64,
     inherited_partitions: Vec<ProjectionGenerationReference>,
-    deltas: Vec<SealedComponentDelta>,
-    pack_credits: ProjectionPackCredits,
+    charged_packs: ChargedProjectionDeltaPacks,
+    pack_table: ArtifactPackTable,
     mut load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
 ) -> Result<PreparedProjectionComponents, IndexError>
 where
@@ -210,7 +209,7 @@ where
         &inherited_partitions,
     )?;
     let mut components = BTreeSet::new();
-    for delta in &deltas {
+    for delta in charged_packs.packs.iter().flat_map(|pack| &pack.deltas) {
         if !components.insert(delta.component) {
             return Err(IndexError::InvalidDefinition(
                 "projection publication contains duplicate component deltas".into(),
@@ -218,8 +217,8 @@ where
         }
     }
 
-    let charged_packs = pack_component_deltas(deltas, pack_credits)?;
     let (packs, pack_credits) = (charged_packs.packs, charged_packs.credits);
+    validate_pack_bindings(&packs, &pack_table)?;
     let mut stream_pages = Vec::new();
     let mut replacements = Vec::new();
     for delta in packs.iter().flat_map(|pack| &pack.deltas) {
@@ -236,6 +235,7 @@ where
             previous_root,
             |hash| load_stream_page(hash),
             delta,
+            &pack_table,
             source_start_offset,
             next_offset,
             through_atomic_position,
@@ -285,6 +285,24 @@ where
         generation,
         pack_credits,
     })
+}
+
+fn validate_pack_bindings(
+    packs: &[SealedProjectionDeltaPack],
+    table: &ArtifactPackTable,
+) -> Result<(), IndexError> {
+    if packs.len() != table.entries().len() {
+        return Err(IndexError::Integrity);
+    }
+    for (pack, reference) in packs.iter().zip(table.entries()) {
+        if pack.ordinal != reference.ordinal
+            || pack.hash != reference.hash
+            || pack.bytes.len() as u64 != reference.length
+        {
+            return Err(IndexError::Integrity);
+        }
+    }
+    Ok(())
 }
 
 fn finalize_projection_components(
@@ -387,11 +405,10 @@ pub fn prepare_atomic_projection_generation<StreamPageBytes, QueryPageBytes>(
     next_offset: u64,
     through_atomic_position: u64,
     inherited_partitions: Vec<ProjectionGenerationReference>,
-    deltas: Vec<SealedComponentDelta>,
-    query_batch: PreparedQueryMutationBatch,
-    query_limits: QueryBlockLimits,
-    query_credits: QueryBlockCredits,
-    pack_credits: ProjectionPackCredits,
+    component_packs: ChargedProjectionDeltaPacks,
+    component_pack_table: ArtifactPackTable,
+    query: PreparedProjectionQueryRun,
+    query_pack_table: ArtifactPackTable,
     load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
     load_query_page: impl FnMut([u8; 32]) -> Result<QueryPageBytes, IndexError>,
 ) -> Result<PreparedAtomicProjectionGeneration, IndexError>
@@ -408,11 +425,10 @@ where
         next_offset,
         through_atomic_position,
         inherited_partitions,
-        deltas,
-        query_batch,
-        query_limits,
-        query_credits,
-        pack_credits,
+        component_packs,
+        component_pack_table,
+        query,
+        query_pack_table,
         load_stream_page,
         load_query_page,
     )
@@ -427,11 +443,10 @@ pub fn prepare_atomic_projection_catalog_transition<StreamPageBytes, QueryPageBy
     source_start_offset: u64,
     next_offset: u64,
     through_atomic_position: u64,
-    deltas: Vec<SealedComponentDelta>,
-    query_batch: PreparedQueryMutationBatch,
-    query_limits: QueryBlockLimits,
-    query_credits: QueryBlockCredits,
-    pack_credits: ProjectionPackCredits,
+    component_packs: ChargedProjectionDeltaPacks,
+    component_pack_table: ArtifactPackTable,
+    query: PreparedProjectionQueryRun,
+    query_pack_table: ArtifactPackTable,
     load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
     load_query_page: impl FnMut([u8; 32]) -> Result<QueryPageBytes, IndexError>,
 ) -> Result<PreparedAtomicProjectionGeneration, IndexError>
@@ -448,11 +463,10 @@ where
         next_offset,
         through_atomic_position,
         Vec::new(),
-        deltas,
-        query_batch,
-        query_limits,
-        query_credits,
-        pack_credits,
+        component_packs,
+        component_pack_table,
+        query,
+        query_pack_table,
         load_stream_page,
         load_query_page,
     )
@@ -468,11 +482,10 @@ fn prepare_atomic_projection_generation_inner<StreamPageBytes, QueryPageBytes>(
     next_offset: u64,
     through_atomic_position: u64,
     inherited_partitions: Vec<ProjectionGenerationReference>,
-    deltas: Vec<SealedComponentDelta>,
-    query_batch: PreparedQueryMutationBatch,
-    query_limits: QueryBlockLimits,
-    query_credits: QueryBlockCredits,
-    pack_credits: ProjectionPackCredits,
+    component_packs: ChargedProjectionDeltaPacks,
+    component_pack_table: ArtifactPackTable,
+    query: PreparedProjectionQueryRun,
+    query_pack_table: ArtifactPackTable,
     mut load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
     mut load_query_page: impl FnMut([u8; 32]) -> Result<QueryPageBytes, IndexError>,
 ) -> Result<PreparedAtomicProjectionGeneration, IndexError>
@@ -497,26 +510,17 @@ where
             "atomic projection preparation cut is not contiguous".into(),
         ));
     }
-    let sequence = match previous {
-        Some((generation, _)) => generation
-            .query_stream_root
-            .last_sequence
-            .checked_add(1)
-            .ok_or(IndexError::OffsetOverflow)?,
-        None => 1,
-    };
-    let charged_query = prepare_projection_query_run(
-        partition,
-        physical_catalog_generation,
-        sequence,
-        source_start_offset,
-        next_offset,
-        through_atomic_position,
-        query_batch,
-        query_limits,
+    let sequence = previous.map_or(1, |(generation, _)| {
+        generation.query_stream_root.last_sequence.saturating_add(1)
+    });
+    let charged_query = query.finalize(query_pack_table)?;
+    let (
+        ProjectionQueryRunArtifacts {
+            packs: query_packs,
+            run,
+        },
         query_credits,
-    )?;
-    let (ProjectionQueryRunArtifacts { blocks, run }, query_credits) = charged_query.into_parts();
+    ) = charged_query.into_parts();
     let previous_query_root = match previous {
         Some((generation, _)) => generation.query_stream_root,
         None => super::ProjectionQueryStreamRoot::empty(
@@ -551,8 +555,8 @@ where
         next_offset,
         through_atomic_position,
         inherited_partitions,
-        deltas,
-        pack_credits,
+        component_packs,
+        component_pack_table,
         |hash| load_stream_page(hash),
     )?;
     let generation = components
@@ -567,7 +571,7 @@ where
     let prepared = PreparedAtomicProjectionGeneration {
         packs: components.packs,
         stream_pages: components.stream_pages,
-        query_blocks: blocks,
+        query_packs,
         query_run: run,
         query_stream_pages: appended_query.pages,
         generation: encoded_generation,
@@ -586,10 +590,12 @@ mod tests {
     use super::*;
     use crate::v1::{
         CanonicalRecipeState, ComponentIdentity, ComponentStreamDirectory, DocumentHead,
-        IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage, ProjectedDocumentState,
-        ProjectionMutationBuffer, RecipeIdentity, StableDocumentKey,
+        IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage,
+        PreparedQueryMutationBatch, ProjectedDocumentState, ProjectionMutationBuffer,
+        QueryBlockLimits, RecipeIdentity, SealedComponentDelta, StableDocumentKey,
         decode_component_delta_segment, decode_component_stream, decode_projection_generation,
-        decode_projection_query_run, visit_query_runs_newest,
+        decode_projection_query_run, pack_component_deltas, prepare_projection_query_run,
+        visit_query_runs_newest,
     };
 
     fn partition(family_id: [u8; 32]) -> ProjectionPartitionIdentity {
@@ -693,6 +699,191 @@ mod tests {
             memory
                 .acquire(IndexingMemoryStage::SealScratch, bytes)
                 .unwrap(),
+        )
+    }
+
+    fn pack_table(packs: impl IntoIterator<Item = (u32, [u8; 32], u64)>) -> ArtifactPackTable {
+        ArtifactPackTable::new(
+            packs
+                .into_iter()
+                .map(
+                    |(ordinal, hash, length)| super::super::ArtifactPackReference {
+                        ordinal,
+                        canonical_path: format!(
+                            "_keldra/index-projections/v1/test/artifacts/packs/{ordinal}"
+                        )
+                        .into(),
+                        object_version: u64::from(ordinal) + 1,
+                        hash,
+                        length,
+                    },
+                )
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_projection_generation<PageBytes>(
+        partition: ProjectionPartitionIdentity,
+        catalog: [u8; 32],
+        previous: Option<(&ProjectionGeneration, [u8; 32])>,
+        source_start_offset: u64,
+        next_offset: u64,
+        through_atomic_position: u64,
+        inherited: Vec<ProjectionGenerationReference>,
+        deltas: Vec<SealedComponentDelta>,
+        credits: ProjectionPackCredits,
+        load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+    ) -> Result<PreparedProjectionGeneration, IndexError>
+    where
+        PageBytes: AsRef<[u8]>,
+    {
+        let packs = pack_component_deltas(deltas, credits)?;
+        let table = pack_table(
+            packs
+                .packs
+                .iter()
+                .map(|pack| (pack.ordinal, pack.hash, pack.bytes.len() as u64)),
+        );
+        super::prepare_projection_generation(
+            partition,
+            catalog,
+            previous,
+            source_start_offset,
+            next_offset,
+            through_atomic_position,
+            inherited,
+            packs,
+            table,
+            load_page,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_atomic_projection_generation<StreamPageBytes, QueryPageBytes>(
+        partition: ProjectionPartitionIdentity,
+        catalog: [u8; 32],
+        previous: Option<(&ProjectionGeneration, [u8; 32])>,
+        source_start_offset: u64,
+        next_offset: u64,
+        through_atomic_position: u64,
+        inherited: Vec<ProjectionGenerationReference>,
+        deltas: Vec<SealedComponentDelta>,
+        batch: PreparedQueryMutationBatch,
+        limits: QueryBlockLimits,
+        query_credits: QueryBlockCredits,
+        pack_credits: ProjectionPackCredits,
+        load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
+        load_query_page: impl FnMut([u8; 32]) -> Result<QueryPageBytes, IndexError>,
+    ) -> Result<PreparedAtomicProjectionGeneration, IndexError>
+    where
+        StreamPageBytes: AsRef<[u8]>,
+        QueryPageBytes: AsRef<[u8]>,
+    {
+        let packs = pack_component_deltas(deltas, pack_credits)?;
+        let component_table = pack_table(
+            packs
+                .packs
+                .iter()
+                .map(|pack| (pack.ordinal, pack.hash, pack.bytes.len() as u64)),
+        );
+        let sequence = previous.map_or(1, |(generation, _)| {
+            generation.query_stream_root.last_sequence + 1
+        });
+        let query = prepare_projection_query_run(
+            partition,
+            catalog,
+            sequence,
+            source_start_offset,
+            next_offset,
+            through_atomic_position,
+            batch,
+            limits,
+            query_credits,
+        )?;
+        let query_table = pack_table(
+            query
+                .packs()
+                .iter()
+                .map(|pack| (pack.ordinal, pack.hash, pack.bytes.len() as u64)),
+        );
+        super::prepare_atomic_projection_generation(
+            partition,
+            catalog,
+            previous,
+            source_start_offset,
+            next_offset,
+            through_atomic_position,
+            inherited,
+            packs,
+            component_table,
+            query,
+            query_table,
+            load_stream_page,
+            load_query_page,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_atomic_projection_catalog_transition<StreamPageBytes, QueryPageBytes>(
+        partition: ProjectionPartitionIdentity,
+        catalog: [u8; 32],
+        previous: (&ProjectionGeneration, [u8; 32]),
+        transition: ProjectionCatalogTransition,
+        source_start_offset: u64,
+        next_offset: u64,
+        through_atomic_position: u64,
+        deltas: Vec<SealedComponentDelta>,
+        batch: PreparedQueryMutationBatch,
+        limits: QueryBlockLimits,
+        query_credits: QueryBlockCredits,
+        pack_credits: ProjectionPackCredits,
+        load_stream_page: impl FnMut([u8; 32]) -> Result<StreamPageBytes, IndexError>,
+        load_query_page: impl FnMut([u8; 32]) -> Result<QueryPageBytes, IndexError>,
+    ) -> Result<PreparedAtomicProjectionGeneration, IndexError>
+    where
+        StreamPageBytes: AsRef<[u8]>,
+        QueryPageBytes: AsRef<[u8]>,
+    {
+        let packs = pack_component_deltas(deltas, pack_credits)?;
+        let component_table = pack_table(
+            packs
+                .packs
+                .iter()
+                .map(|pack| (pack.ordinal, pack.hash, pack.bytes.len() as u64)),
+        );
+        let query = prepare_projection_query_run(
+            partition,
+            catalog,
+            previous.0.query_stream_root.last_sequence + 1,
+            source_start_offset,
+            next_offset,
+            through_atomic_position,
+            batch,
+            limits,
+            query_credits,
+        )?;
+        let query_table = pack_table(
+            query
+                .packs()
+                .iter()
+                .map(|pack| (pack.ordinal, pack.hash, pack.bytes.len() as u64)),
+        );
+        super::prepare_atomic_projection_catalog_transition(
+            partition,
+            catalog,
+            previous,
+            transition,
+            source_start_offset,
+            next_offset,
+            through_atomic_position,
+            packs,
+            component_table,
+            query,
+            query_table,
+            load_stream_page,
+            load_query_page,
         )
     }
 
@@ -930,8 +1121,8 @@ mod tests {
             .deltas
             .iter()
             .map(|delta| {
-                let start = delta.offset as usize;
-                let end = start + delta.encoded_bytes as usize;
+                let start = delta.locator.offset as usize;
+                let end = start + delta.locator.encoded_bytes as usize;
                 let decoded =
                     decode_component_delta_segment(&prepared.packs[0].bytes[start..end]).unwrap();
                 decoded.component
@@ -1030,7 +1221,7 @@ mod tests {
             |_| Err::<Vec<u8>, _>(IndexError::Integrity),
         )
         .unwrap();
-        assert!(first.query_blocks.is_empty());
+        assert!(first.query_packs.is_empty());
         assert_eq!(first.query_stream_pages.len(), 1);
         let mut descriptor_credits = query_credits(1024 * 1024);
         let query_descriptor = decode_projection_query_run(

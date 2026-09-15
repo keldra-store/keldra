@@ -158,7 +158,6 @@ pub(crate) async fn start(
     let query_budget = IndexQueryMemoryBudget::from_shared(working_memory.clone());
     let local_queries: Arc<dyn LocalIndexQueryExecutor> = Arc::new(V1LocalIndexQueryExecutor::new(
         decisions.clone(),
-        reader.clone(),
         catalog.clone(),
         v1_publisher.clone(),
         query_budget,

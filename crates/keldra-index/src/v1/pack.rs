@@ -1,7 +1,9 @@
 use crate::IndexError;
-const INDEX_ARTIFACT_PACK_BYTES: usize = 64 * 1024 * 1024;
 
-use super::{ComponentIdentity, IndexingMemoryPermit, SealedComponentDelta, StableDocumentKey};
+use super::{
+    ARTIFACT_PACK_MAX_BYTES, ArtifactPackLocator, ComponentIdentity, IndexingMemoryPermit,
+    SealedComponentDelta, StableDocumentKey,
+};
 
 #[cfg(test)]
 pub(crate) fn test_pack_credits(bytes: usize) -> ProjectionPackCredits {
@@ -75,10 +77,7 @@ impl ChargedProjectionDeltaPacks {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedComponentDelta {
     pub component: ComponentIdentity,
-    pub pack_hash: [u8; 32],
-    pub offset: u64,
-    pub encoded_bytes: u64,
-    pub logical_bytes: u64,
+    pub locator: ArtifactPackLocator,
     pub records: u64,
     pub minimum_key: StableDocumentKey,
     pub maximum_key: StableDocumentKey,
@@ -86,6 +85,7 @@ pub struct PackedComponentDelta {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct SealedProjectionDeltaPack {
+    pub ordinal: u32,
     pub hash: [u8; 32],
     pub bytes: Vec<u8>,
     pub deltas: Vec<PackedComponentDelta>,
@@ -108,10 +108,10 @@ pub fn pack_component_deltas(
     let mut current_pack_bytes = 0_usize;
     for delta in &deltas {
         validate_delta(delta)?;
-        if delta.bytes.len() > INDEX_ARTIFACT_PACK_BYTES {
+        if delta.bytes.len() > ARTIFACT_PACK_MAX_BYTES {
             return Err(IndexError::ResourceLimit {
                 needed: delta.bytes.len(),
-                limit: INDEX_ARTIFACT_PACK_BYTES,
+                limit: ARTIFACT_PACK_MAX_BYTES,
             });
         }
         packed_bytes = packed_bytes
@@ -120,7 +120,7 @@ pub fn pack_component_deltas(
         if current_pack_bytes != 0
             && current_pack_bytes
                 .checked_add(delta.bytes.len())
-                .is_none_or(|needed| needed > INDEX_ARTIFACT_PACK_BYTES)
+                .is_none_or(|needed| needed > ARTIFACT_PACK_MAX_BYTES)
         {
             pack_count = pack_count
                 .checked_add(1)
@@ -142,17 +142,17 @@ pub fn pack_component_deltas(
     credits.reserve(packed_bytes)?;
     let mut remaining_bytes = packed_bytes;
     let mut packs = Vec::with_capacity(pack_count);
-    let mut bytes = Vec::with_capacity(packed_bytes.min(INDEX_ARTIFACT_PACK_BYTES));
+    let mut bytes = Vec::with_capacity(packed_bytes.min(ARTIFACT_PACK_MAX_BYTES));
     let mut staged = Vec::new();
     for delta in deltas {
         if !bytes.is_empty()
             && bytes
                 .len()
                 .checked_add(delta.bytes.len())
-                .is_none_or(|needed| needed > INDEX_ARTIFACT_PACK_BYTES)
+                .is_none_or(|needed| needed > ARTIFACT_PACK_MAX_BYTES)
         {
-            packs.push(seal_pack(bytes, staged)?);
-            bytes = Vec::with_capacity(remaining_bytes.min(INDEX_ARTIFACT_PACK_BYTES));
+            packs.push(seal_pack(packs.len(), bytes, staged)?);
+            bytes = Vec::with_capacity(remaining_bytes.min(ARTIFACT_PACK_MAX_BYTES));
             staged = Vec::new();
         }
         let offset = bytes.len() as u64;
@@ -163,35 +163,41 @@ pub fn pack_component_deltas(
         staged.push((delta, offset));
     }
     if !bytes.is_empty() {
-        packs.push(seal_pack(bytes, staged)?);
+        packs.push(seal_pack(packs.len(), bytes, staged)?);
     }
     Ok(ChargedProjectionDeltaPacks { packs, credits })
 }
 
 fn seal_pack(
+    ordinal: usize,
     bytes: Vec<u8>,
     staged: Vec<(SealedComponentDelta, u64)>,
 ) -> Result<SealedProjectionDeltaPack, IndexError> {
-    if bytes.is_empty() || bytes.len() > INDEX_ARTIFACT_PACK_BYTES || staged.is_empty() {
+    if bytes.is_empty() || bytes.len() > ARTIFACT_PACK_MAX_BYTES || staged.is_empty() {
         return Err(IndexError::InvalidDefinition(
             "projection delta pack is empty or unbounded".into(),
         ));
     }
     let hash = *crate::profiled_blake3_hash!(&bytes).as_bytes();
+    let ordinal = u32::try_from(ordinal).map_err(|_| IndexError::OffsetOverflow)?;
     let deltas = staged
         .into_iter()
         .map(|(delta, offset)| PackedComponentDelta {
             component: delta.component,
-            pack_hash: hash,
-            offset,
-            encoded_bytes: delta.encoded_bytes,
-            logical_bytes: delta.logical_bytes,
+            locator: ArtifactPackLocator {
+                ordinal,
+                offset,
+                encoded_bytes: delta.encoded_bytes,
+                logical_bytes: delta.logical_bytes,
+                checksum: delta.hash,
+            },
             records: delta.records,
             minimum_key: delta.minimum_key,
             maximum_key: delta.maximum_key,
         })
         .collect();
     Ok(SealedProjectionDeltaPack {
+        ordinal,
         hash,
         bytes,
         deltas,
@@ -296,8 +302,8 @@ mod tests {
             *crate::profiled_blake3_hash!(&packs[0].bytes).as_bytes()
         );
         for delta in &packs[0].deltas {
-            let start = delta.offset as usize;
-            let end = start + delta.encoded_bytes as usize;
+            let start = delta.locator.offset as usize;
+            let end = start + delta.locator.encoded_bytes as usize;
             assert_eq!(
                 super::super::decode_component_delta_segment(&packs[0].bytes[start..end])
                     .unwrap()
@@ -310,8 +316,8 @@ mod tests {
     #[test]
     fn packs_split_only_at_the_existing_byte_bound() {
         let component = ComponentIdentity::DocumentHead;
-        let first = delta(component, 1, INDEX_ARTIFACT_PACK_BYTES / 2);
-        let second = delta(component, 2, INDEX_ARTIFACT_PACK_BYTES / 2);
+        let first = delta(component, 1, ARTIFACT_PACK_MAX_BYTES / 2);
+        let second = delta(component, 2, ARTIFACT_PACK_MAX_BYTES / 2);
         let bytes = first.bytes.len() + second.bytes.len();
         let packs = pack_component_deltas(vec![first, second], test_pack_credits(bytes))
             .unwrap()
@@ -320,7 +326,7 @@ mod tests {
         assert!(
             packs
                 .iter()
-                .all(|pack| pack.bytes.len() <= INDEX_ARTIFACT_PACK_BYTES)
+                .all(|pack| pack.bytes.len() <= ARTIFACT_PACK_MAX_BYTES)
         );
     }
 

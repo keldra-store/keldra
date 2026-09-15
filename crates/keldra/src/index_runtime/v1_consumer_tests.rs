@@ -751,7 +751,7 @@ fn ten_thousand_hot_updates_prepare_only_256_query_documents() {
         credits,
     )
     .unwrap();
-    assert!(!artifacts.artifacts().blocks.is_empty());
+    assert!(!artifacts.packs().is_empty());
 }
 
 #[test]
@@ -802,7 +802,7 @@ fn repeated_unpublished_document_preparation_keeps_only_the_latest_query_delta()
         credits,
     )
     .unwrap();
-    assert!(!artifacts.artifacts().blocks.is_empty());
+    assert!(!artifacts.packs().is_empty());
 }
 
 #[test]

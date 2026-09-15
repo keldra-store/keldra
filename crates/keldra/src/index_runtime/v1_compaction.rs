@@ -11,9 +11,9 @@ use keldra_index::v1::{
     EncodedComponentStreamPage, IndexingMemoryPermit, ProjectionGeneration, ProjectionPackCredits,
     ProjectionQueryStreamRoot, QUERY_RUN_PAGE_FANOUT, QueryBlockCredits, QueryBlockLimits,
     QueryRunCompactionLimits, QueryRunCompactionPlan, QueryRunPage, SealedComponentDelta,
-    TombstoneCompactionPolicy, compact_component_runs, compact_encoded_query_runs,
-    component_stream_child_hashes, decode_query_run_page, pack_component_deltas,
-    projection_pack_path, projection_query_run_pack_path, projection_query_run_stream_page_path,
+    TombstoneCompactionPolicy, compact_component_runs, component_stream_child_hashes,
+    decode_query_run_page, pack_component_deltas, prepare_encoded_query_run_compaction,
+    projection_query_run_pack_path, projection_query_run_stream_page_path,
     projection_stream_page_path, select_component_compaction, select_query_run_compaction,
     splice_compacted_component_runs,
 };
@@ -161,7 +161,6 @@ impl V1ProjectionPublisher {
                             &bucket,
                             tenant_id,
                             bucket_id,
-                            partition,
                             stream,
                             &component_pages,
                             component_limits,
@@ -218,7 +217,6 @@ impl V1ProjectionPublisher {
                             &bucket,
                             tenant_id,
                             bucket_id,
-                            partition,
                             stream,
                             &pages,
                             serial_component_limits,
@@ -257,6 +255,16 @@ impl V1ProjectionPublisher {
         } else {
             let packs = pack_component_deltas(sealed, component_credits).map_err(index_status)?;
             drop(raw_output_permit);
+            let pack_table = self
+                .publish_component_packs(
+                    storage_tenant,
+                    bucket,
+                    tenant_id,
+                    bucket_id,
+                    partition,
+                    &packs.packs,
+                )
+                .await?;
             let mut replacements = Vec::new();
             let mut pages = Vec::new();
             for (plan, stream) in selected {
@@ -267,13 +275,14 @@ impl V1ProjectionPublisher {
                     .filter(|delta| delta.component == plan.component())
                     .cloned()
                     .collect::<Vec<_>>();
-                let spliced = splice_compacted_component_runs(stream, &plan, &output, |hash| {
-                    component_pages
-                        .get(&hash)
-                        .cloned()
-                        .ok_or(keldra_index::IndexError::Integrity)
-                })
-                .map_err(index_status)?;
+                let spliced =
+                    splice_compacted_component_runs(stream, &plan, &output, &pack_table, |hash| {
+                        component_pages
+                            .get(&hash)
+                            .cloned()
+                            .ok_or(keldra_index::IndexError::Integrity)
+                    })
+                    .map_err(index_status)?;
                 replacements.push(spliced.root.component_root().map_err(index_status)?);
                 pages.extend(spliced.new_pages);
             }
@@ -417,7 +426,6 @@ fn compact_component_stream(
     bucket: &str,
     tenant_id: u64,
     bucket_id: u64,
-    partition: keldra_index::v1::ProjectionPartitionIdentity,
     stream: ComponentStreamRoot,
     component_pages: &BTreeMap<[u8; 32], Bytes>,
     limits: ComponentCompactionLimits,
@@ -437,20 +445,23 @@ fn compact_component_stream(
     let Some(plan) = plan else {
         return Ok(None);
     };
-    let output = compact_component_runs(&plan, limits, TombstoneCompactionPolicy::Retain, |hash| {
-        blocking_artifact(
-            runtime,
-            &read_failure,
-            publisher,
-            storage_tenant,
-            bucket,
-            tenant_id,
-            bucket_id,
-            projection_pack_path(partition, hash),
-            hash,
-            MAX_ARTIFACT_BYTES,
-        )
-    });
+    let output = compact_component_runs(
+        &plan,
+        limits,
+        TombstoneCompactionPolicy::Retain,
+        |reference| {
+            blocking_pack(
+                runtime,
+                &read_failure,
+                publisher,
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                reference,
+            )
+        },
+    );
     let output = match output {
         Ok(output) => output,
         Err(error) => {
@@ -479,7 +490,7 @@ fn compact_query_stream(
     query_pages: &BTreeMap<[u8; 32], Bytes>,
 ) -> Result<ChargedQueryRunCompaction, Status> {
     let read_failure = Arc::new(Mutex::new(None));
-    let compacted = compact_encoded_query_runs(
+    let prepared = prepare_encoded_query_run_compaction(
         previous,
         &plan,
         partition,
@@ -500,8 +511,8 @@ fn compact_query_stream(
                 MAX_ARTIFACT_BYTES,
             )
         },
-        |hash| {
-            blocking_artifact(
+        |descriptor| {
+            blocking_query_block(
                 runtime,
                 &read_failure,
                 publisher,
@@ -509,24 +520,34 @@ fn compact_query_stream(
                 bucket,
                 tenant_id,
                 bucket_id,
-                projection_query_run_pack_path(partition, hash),
-                hash,
-                MAX_ARTIFACT_BYTES,
+                descriptor,
             )
         },
-        |hash| {
+    );
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Err(
+                recorded_artifact_failure(&read_failure).unwrap_or_else(|| index_status(error))
+            );
+        }
+    };
+    let pack_table = runtime.block_on(publisher.publish_query_packs(
+        storage_tenant,
+        bucket,
+        tenant_id,
+        bucket_id,
+        partition,
+        prepared.packs(),
+    ))?;
+    prepared
+        .finalize(pack_table, |hash| {
             query_pages
                 .get(&hash)
                 .cloned()
                 .ok_or(keldra_index::IndexError::Integrity)
-        },
-    );
-    match compacted {
-        Ok(compacted) => Ok(compacted),
-        Err(error) => {
-            Err(recorded_artifact_failure(&read_failure).unwrap_or_else(|| index_status(error)))
-        }
-    }
+        })
+        .map_err(index_status)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -688,6 +709,66 @@ fn blocking_artifact(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn blocking_pack(
+    runtime: &tokio::runtime::Handle,
+    read_failure: &Arc<Mutex<Option<Status>>>,
+    publisher: &V1ProjectionPublisher,
+    storage_tenant: &str,
+    bucket: &str,
+    tenant_id: u64,
+    bucket_id: u64,
+    reference: &keldra_index::v1::ArtifactPackReference,
+) -> Result<Vec<u8>, keldra_index::IndexError> {
+    runtime
+        .block_on(publisher.read_exact_artifact_pack(
+            storage_tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            reference,
+        ))
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| {
+            *read_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
+            keldra_index::IndexError::Io(error.to_string())
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blocking_query_block(
+    runtime: &tokio::runtime::Handle,
+    read_failure: &Arc<Mutex<Option<Status>>>,
+    publisher: &V1ProjectionPublisher,
+    storage_tenant: &str,
+    bucket: &str,
+    tenant_id: u64,
+    bucket_id: u64,
+    descriptor: &keldra_index::v1::QueryBlockDescriptor,
+) -> Result<Vec<u8>, keldra_index::IndexError> {
+    let pack = descriptor.pack_reference()?;
+    let bytes = blocking_pack(
+        runtime,
+        read_failure,
+        publisher,
+        storage_tenant,
+        bucket,
+        tenant_id,
+        bucket_id,
+        pack,
+    )?;
+    let range = descriptor.locator.range()?;
+    let block = bytes
+        .get(range)
+        .ok_or(keldra_index::IndexError::Integrity)?;
+    if *keldra_index::profiled_blake3_hash!(block).as_bytes() != descriptor.hash {
+        return Err(keldra_index::IndexError::Integrity);
+    }
+    Ok(block.to_vec())
+}
+
 fn recorded_artifact_failure(read_failure: &Arc<Mutex<Option<Status>>>) -> Option<Status> {
     read_failure
         .lock()
@@ -708,9 +789,9 @@ pub(super) fn index_status(error: keldra_index::IndexError) -> Status {
 mod tests {
     use super::*;
     use keldra_index::v1::{
-        PreparedQueryMutationBatch, ProjectionCurrent, ProjectionPartitionIdentity,
-        ProjectionQueryStreamRoot, QueryMemoryPermit, QueryRunReference,
-        append_query_run_path_copy, prepare_projection_query_run,
+        ArtifactPackTable, PreparedQueryMutationBatch, ProjectionCurrent,
+        ProjectionPartitionIdentity, ProjectionQueryStreamRoot, QueryMemoryPermit,
+        QueryRunReference, append_query_run_path_copy, prepare_projection_query_run,
     };
 
     struct Permit(usize);
@@ -799,6 +880,8 @@ mod tests {
                 QueryBlockLimits::default_for_memory(),
                 credits(),
             )
+            .unwrap()
+            .finalize(ArtifactPackTable::empty())
             .unwrap();
             let artifacts = charged.artifacts().clone();
             let reference = QueryRunReference {
@@ -844,7 +927,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let compacted = compact_encoded_query_runs(
+        let compacted = prepare_encoded_query_run_compaction(
             root,
             &plan,
             partition,
@@ -857,13 +940,14 @@ mod tests {
                     .ok_or(keldra_index::IndexError::Integrity)
             },
             |_| Err::<Vec<u8>, _>(keldra_index::IndexError::Integrity),
-            |hash| {
-                pages
-                    .get(&hash)
-                    .cloned()
-                    .ok_or(keldra_index::IndexError::Integrity)
-            },
         )
+        .unwrap()
+        .finalize(ArtifactPackTable::empty(), |hash| {
+            pages
+                .get(&hash)
+                .cloned()
+                .ok_or(keldra_index::IndexError::Integrity)
+        })
         .unwrap();
         assert!(compacted.splice().root.run_count < 64);
         pages.extend(
@@ -884,6 +968,8 @@ mod tests {
             QueryBlockLimits::default_for_memory(),
             credits(),
         )
+        .unwrap()
+        .finalize(ArtifactPackTable::empty())
         .unwrap();
         let next_artifacts = next.artifacts().clone();
         let appended = append_query_run_path_copy(

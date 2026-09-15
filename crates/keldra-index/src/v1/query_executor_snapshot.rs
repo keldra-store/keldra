@@ -93,24 +93,18 @@ struct QueryRunStream {
 
 pub(super) async fn load_exact_pre_admitted<L: QueryArtifactLoader>(
     loader: &mut L,
-    kind: QueryArtifactKind,
-    hash: [u8; 32],
-    encoded_bytes: usize,
+    request: QueryArtifactLoad,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
 ) -> Result<Bytes, IndexError> {
+    let kind = request.kind;
+    let encoded_bytes = request.encoded_bytes;
     if encoded_bytes == 0 {
         return Err(IndexError::Integrity);
     }
     budget.load(kind, encoded_bytes)?;
     credits.reserve(encoded_bytes)?;
-    let loaded = loader
-        .load_query_artifact(QueryArtifactLoad {
-            kind,
-            hash,
-            encoded_bytes,
-        })
-        .await;
+    let loaded = loader.load_query_artifact(request).await;
     let bytes = match loaded {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -186,9 +180,7 @@ impl QueryRunStream {
             }
             let bytes = load_exact_pre_admitted(
                 loader,
-                QueryArtifactKind::Page,
-                expected.hash,
-                encoded_bytes,
+                QueryArtifactLoad::direct(QueryArtifactKind::Page, expected.hash, encoded_bytes),
                 credits,
                 budget,
             )
@@ -225,12 +217,8 @@ async fn load_next_descriptor<L: QueryArtifactLoader>(
     if encoded_bytes > block_limits.maximum_run_descriptor_bytes {
         return resource(encoded_bytes, block_limits.maximum_run_descriptor_bytes);
     }
-    let request = QueryArtifactLoad {
-        kind: QueryArtifactKind::Run,
-        hash: reference.hash,
-        encoded_bytes,
-    };
-    if let Some(descriptor) = loader.cached_projection_query_run(request)? {
+    let request = QueryArtifactLoad::direct(QueryArtifactKind::Run, reference.hash, encoded_bytes);
+    if let Some(descriptor) = loader.cached_projection_query_run(request.clone())? {
         // Only descriptors produced by the validated decoder enter this
         // cache. Preserve logical load evidence, but do not repeat its full
         // structural validation on every query page.
@@ -244,15 +232,7 @@ async fn load_next_descriptor<L: QueryArtifactLoader>(
         )?;
         return Ok(Some((descriptor, 0)));
     }
-    let bytes = load_exact_pre_admitted(
-        loader,
-        request.kind,
-        request.hash,
-        request.encoded_bytes,
-        credits,
-        budget,
-    )
-    .await?;
+    let bytes = load_exact_pre_admitted(loader, request.clone(), credits, budget).await?;
     let descriptor = Arc::new(decode_projection_query_run(&bytes, block_limits, credits)?);
     credits.release(bytes.len())?;
     validate_loaded_descriptor(
