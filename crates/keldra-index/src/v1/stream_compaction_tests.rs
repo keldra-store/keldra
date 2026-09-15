@@ -257,7 +257,7 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         .flat_map(|pack| pack.deltas.iter().cloned())
         .collect::<Vec<_>>();
     let (later, later_table, later_pack) =
-        packed(sealed(component, &[(300, Some(b"later-append"))]));
+        packed(sealed(component, &[(250, Some(b"later-append"))]));
     packs.insert(pack_hash(&later, &later_table), later_pack);
     let later_append = append_component_stream(
         Some(fourth.root),
