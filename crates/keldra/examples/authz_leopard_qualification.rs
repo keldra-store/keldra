@@ -257,18 +257,25 @@ async fn main() -> Result<()> {
 async fn connect_clients(config: &Config) -> Result<Vec<RawAuthzClient>> {
     let mut channels = Vec::with_capacity(config.endpoints.len());
     for endpoint in &config.endpoints {
-        channels.push(connect_channel(endpoint).await?);
+        channels.push(
+            connect_channel(endpoint)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        );
     }
     let token = exchange_client_credentials(
         channels[0].clone(),
         config.client_id.clone(),
         config.client_secret.clone(),
     )
-    .await?
+    .await
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?
     .access_token;
     let mut clients = Vec::with_capacity(channels.len());
     for channel in channels {
-        clients.push(authz_client(channel, &token)?);
+        clients.push(
+            authz_client(channel, &token).map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        );
     }
     Ok(clients)
 }
