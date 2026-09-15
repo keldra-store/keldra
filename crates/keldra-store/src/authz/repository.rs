@@ -28,7 +28,7 @@ pub(super) struct CompiledAuthorizationKey {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct CompiledLeopardKey {
+pub(crate) struct CompiledLeopardKey {
     pub(super) scope: AuthzScope,
     pub(super) binding_generation: u64,
     pub(super) schema_ref: SchemaRef,

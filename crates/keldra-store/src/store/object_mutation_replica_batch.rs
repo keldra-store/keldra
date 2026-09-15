@@ -121,7 +121,7 @@ impl Store {
         let now = now_unix_millis()?;
         let mut batch = WriteBatch::default();
         let mut receipt_status = initial_receipt_status;
-        let pruned = BTreeSet::new();
+        let pruned = BTreeSet::<Vec<u8>>::new();
         let mut pending_heads = BTreeMap::<Vec<u8>, Head>::new();
         let mut pending_versions = BTreeMap::<Vec<u8>, Version>::new();
         let mut deleted_versions = BTreeSet::<Vec<u8>>::new();

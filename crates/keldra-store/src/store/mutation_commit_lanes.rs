@@ -1542,9 +1542,9 @@ pub(super) fn conflict_resources(
 }
 
 pub(super) fn replica_conflict_resources(mutation: &crate::ObjectMutation) -> Vec<Vec<u8>> {
-    let identity = crate::BucketIdentity {
-        tenant_id: crate::TenantId(mutation.tenant_id),
-        bucket_id: crate::BucketId(mutation.bucket_id),
+    let identity = BucketIdentity {
+        tenant_id: TenantId(mutation.tenant_id),
+        bucket_id: BucketId(mutation.bucket_id),
     };
     let mut resources = vec![
         tagged_resource(

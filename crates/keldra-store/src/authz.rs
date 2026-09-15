@@ -13,8 +13,7 @@ use thiserror::Error;
 
 use crate::Store;
 use crate::store::{
-    CF_AUTHZ_BINDINGS, CF_AUTHZ_LEOPARD_FORWARD, CF_AUTHZ_LEOPARD_REVERSE, CF_AUTHZ_RECEIPTS,
-    CF_AUTHZ_SCHEMAS, CF_AUTHZ_TENANTS, CF_AUTHZ_TUPLES,
+    CF_AUTHZ_BINDINGS, CF_AUTHZ_RECEIPTS, CF_AUTHZ_SCHEMAS, CF_AUTHZ_TENANTS, CF_AUTHZ_TUPLES,
 };
 
 pub const SYSTEM_STORAGE_TENANT_ID: &str = "_keldra";
@@ -1443,7 +1442,7 @@ impl AuthzRepository {
             published_at_revision: AuthzRevision(1),
         };
         let binding = RealmBinding {
-            scope,
+            scope: scope.clone(),
             schema_ref: schema_ref.clone(),
             generation: 1,
             authz_revision: AuthzRevision(2),

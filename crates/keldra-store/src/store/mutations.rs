@@ -1,9 +1,8 @@
 use super::evaluation_telemetry::{EvaluationSubphase, EvaluationSubphaseMetrics};
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_helpers::{
-    definition_mutation_error, definition_receipt_matches_intent, exact_version_key,
-    head_accounting_transition, is_mutation_capacity, mutation_capacity_kind,
-    validate_accounting_transition, version_retention,
+    definition_mutation_error, definition_receipt_matches_intent, head_accounting_transition,
+    is_mutation_capacity, mutation_capacity_kind, version_retention,
 };
 use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::{
