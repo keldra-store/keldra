@@ -715,7 +715,6 @@ impl Store {
             .iter()
             .map(|item| &item.operation)
             .collect::<Vec<_>>();
-        let mut baseline_prefetch_duration = std::time::Duration::ZERO;
         // The fence must precede the discovery snapshot. Ordinary path locks do
         // not exclude legacy exclusive writers, and predecessor blob stripes
         // can only be known from a head/version snapshot protected from them.
@@ -723,7 +722,7 @@ impl Store {
             self.mutation_commit_lanes.acquire_fence_measured().await;
         let prefetch_started = std::time::Instant::now();
         let mut lane_read_cache = MutationReadCache::load(self, &prepared_operations)?;
-        baseline_prefetch_duration = prefetch_started.elapsed();
+        let mut baseline_prefetch_duration = prefetch_started.elapsed();
         let mut lane_resources = prepared
             .iter()
             .flat_map(|item| {
@@ -754,11 +753,10 @@ impl Store {
         let physical_slot_count = mutation_lane
             .as_ref()
             .map_or(0, |lane| lane.physical_slot_count());
-        let mut commit_wait_duration = std::time::Duration::ZERO;
         let mut first_sequence_wait_duration = std::time::Duration::ZERO;
         let mut prior_projection_metrics =
             super::mutation_commit_lanes::LaneProjectionMetrics::default();
-        let mut baseline_revalidation_retries = 0_u64;
+        let baseline_revalidation_retries = 0_u64;
         let mut lane_authority_revalidation_retries = 0_u64;
         // Reload stripe-protected values so concurrent lanes cannot change
         // them between the discovery snapshot and this lane's atomic write.
@@ -950,7 +948,7 @@ impl Store {
             drop(guard);
             break (built, Some(completion));
         };
-        commit_wait_duration = first_sequence_wait_duration;
+        let commit_wait_duration = first_sequence_wait_duration;
         let receipt_capacity_at = attempt.receipt_capacity_at;
         let pruned_receipts = std::mem::take(&mut attempt.pruned_receipts);
         let evaluate_duration = attempt
