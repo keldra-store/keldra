@@ -1506,6 +1506,10 @@ async fn flush(
     credits: &IndexingMemoryCredits,
     limits: Limits,
 ) -> Result<(), Status> {
+    let telemetry = super::v1_telemetry::global();
+    super::v1_telemetry::V1PipelineTelemetry::add(&telemetry.flush_calls, 1);
+    let _flush_timer =
+        super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.flush_nanos);
     if !writer.pending_mutations.is_empty() {
         writer.stage = ProducerStage::Preparing;
         let next = writer.pending_next;
@@ -1538,9 +1542,11 @@ async fn flush(
     if next <= start {
         return Ok(());
     }
+    super::v1_telemetry::V1PipelineTelemetry::add(&telemetry.publication_flushes, 1);
     let projected_bytes = u64::try_from(writer.accumulator.buffered_bytes())
         .map_err(|_| Status::resource_exhausted("v1 projected bytes exceed telemetry"))?;
     writer.stage = ProducerStage::Sealing;
+    let seal_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.seal_nanos);
     let sealed = writer.accumulator.seal_and_reset().map_err(index_status)?;
     let (sealed, source_permit) = sealed.into_parts();
     let packed = sealed.deltas.iter().try_fold(0usize, |sum, delta| {
@@ -1554,11 +1560,16 @@ async fn flush(
     let _preload = credits
         .acquire(IndexingMemoryStage::ReplayInput, preload_bytes)
         .map_err(|_| Status::resource_exhausted("v1 spine preload memory unavailable"))?;
+    drop(seal_timer);
     let compaction = if let Some(background) = writer.background_compaction.take() {
         writer.stage = ProducerStage::Compacting;
         let predecessor_generation = background.predecessor_generation;
         let wait_started = Instant::now();
+        let compaction_wait_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
+            &telemetry.compaction_foreground_wait_nanos,
+        );
         let prepared = background.finish().await?;
+        drop(compaction_wait_timer);
         let matched_current = compaction_matches_current(
             predecessor_generation,
             writer
@@ -1587,6 +1598,8 @@ async fn flush(
     let query = std::mem::take(&mut writer.query);
     let placeholder = empty_query_credits(credits, limits)?;
     let query_credits = std::mem::replace(&mut writer.query_credits, placeholder);
+    let generation_build_timer =
+        super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.generation_build_nanos);
     let prepared = if let Some((base, _)) = &compaction {
         writer.stage = ProducerStage::Publishing;
         publisher
@@ -1634,6 +1647,7 @@ async fn flush(
             )
             .await?
     };
+    drop(generation_build_timer);
     // The merged query input has now been encoded into the charged immutable
     // artifacts owned by `prepared`; release its independent lane credits.
     writer.query_input_credits.clear();
@@ -1642,6 +1656,9 @@ async fn flush(
         .checked_sub(start)
         .ok_or_else(|| Status::data_loss("v1 cut regressed"))?;
     if let Some((_, artifacts)) = compaction {
+        let compaction_publication_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
+            &telemetry.compaction_artifact_publication_nanos,
+        );
         publisher
             .publish_compaction_artifacts(
                 &writer.recipe.storage_tenant,
@@ -1652,6 +1669,7 @@ async fn flush(
                 artifacts,
             )
             .await?;
+        drop(compaction_publication_timer);
     }
     let predecessor = if let Some(version) = writer.catalog_rebuild_current_version {
         V1PublicationPredecessor::CatalogRebuild(version)
@@ -1675,7 +1693,6 @@ async fn flush(
         .await?;
     writer.catalog_rebuild_current_version = None;
     writer.current = Some(published);
-    let telemetry = super::v1_telemetry::global();
     super::v1_telemetry::V1PipelineTelemetry::add(
         &telemetry.prepared_rows,
         writer.pending_prepared_rows,

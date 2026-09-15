@@ -49,6 +49,23 @@ counters!(
     catalog_checkpointed_source_payload_bytes,
     catalog_directory_publications,
     catalog_activations,
+    flush_calls,
+    publication_flushes,
+    flush_nanos,
+    exact_source_read_nanos,
+    predecessor_read_nanos,
+    prepare_nanos,
+    seal_nanos,
+    compaction_foreground_wait_nanos,
+    generation_build_nanos,
+    compaction_artifact_publication_nanos,
+    atomic_publication_nanos,
+    publication_plan_nanos,
+    immutable_staging_nanos,
+    immutable_publication_nanos,
+    current_staging_nanos,
+    current_cas_nanos,
+    post_cas_verification_nanos,
     stage_cpu_nanos,
     stage_queue_wait_nanos,
     stage_resident_bytes,
@@ -81,6 +98,27 @@ struct InFlightAdvanceSnapshot {
 pub(crate) struct InFlightAdvanceGuard {
     telemetry: Arc<V1PipelineTelemetry>,
     id: u64,
+}
+
+/// Records one wall-clock phase into a process-wide cumulative counter.
+///
+/// Drop-based accounting includes cancelled and failed attempts, which are
+/// precisely the cases where a phase can otherwise disappear from telemetry.
+pub(crate) struct CumulativePhaseTimer<'a> {
+    counter: &'a AtomicU64,
+    started_at: Instant,
+}
+
+impl CumulativePhaseTimer<'_> {
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+}
+
+impl Drop for CumulativePhaseTimer<'_> {
+    fn drop(&mut self) {
+        V1PipelineTelemetry::add_duration(self.counter, self.started_at.elapsed());
+    }
 }
 
 impl Drop for InFlightAdvanceGuard {
@@ -116,6 +154,20 @@ impl V1PipelineTelemetry {
 
     pub(crate) fn set(gauge: &AtomicU64, value: u64) {
         gauge.store(value, Ordering::Relaxed);
+    }
+
+    pub(crate) fn start_phase(counter: &AtomicU64) -> CumulativePhaseTimer<'_> {
+        CumulativePhaseTimer {
+            counter,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn add_duration(counter: &AtomicU64, duration: Duration) {
+        Self::add(
+            counter,
+            duration.as_nanos().min(u128::from(u64::MAX)) as u64,
+        );
     }
 
     fn load(counter: &AtomicU64) -> u64 {
@@ -207,6 +259,23 @@ impl V1PipelineTelemetry {
             keldra_index_v1_catalog_checkpointed_source_payload_bytes_total = Self::load(&self.catalog_checkpointed_source_payload_bytes),
             keldra_index_v1_catalog_directory_publications_total = Self::load(&self.catalog_directory_publications),
             keldra_index_v1_catalog_activations_total = Self::load(&self.catalog_activations),
+            keldra_index_v1_flush_calls_total = Self::load(&self.flush_calls),
+            keldra_index_v1_publication_flushes_total = Self::load(&self.publication_flushes),
+            keldra_index_v1_flush_nanoseconds_total = Self::load(&self.flush_nanos),
+            keldra_index_v1_exact_source_read_nanoseconds_total = Self::load(&self.exact_source_read_nanos),
+            keldra_index_v1_predecessor_read_nanoseconds_total = Self::load(&self.predecessor_read_nanos),
+            keldra_index_v1_prepare_nanoseconds_total = Self::load(&self.prepare_nanos),
+            keldra_index_v1_seal_nanoseconds_total = Self::load(&self.seal_nanos),
+            keldra_index_v1_compaction_foreground_wait_nanoseconds_total = Self::load(&self.compaction_foreground_wait_nanos),
+            keldra_index_v1_generation_build_nanoseconds_total = Self::load(&self.generation_build_nanos),
+            keldra_index_v1_compaction_artifact_publication_nanoseconds_total = Self::load(&self.compaction_artifact_publication_nanos),
+            keldra_index_v1_atomic_publication_nanoseconds_total = Self::load(&self.atomic_publication_nanos),
+            keldra_index_v1_publication_plan_nanoseconds_total = Self::load(&self.publication_plan_nanos),
+            keldra_index_v1_immutable_staging_nanoseconds_total = Self::load(&self.immutable_staging_nanos),
+            keldra_index_v1_immutable_publication_nanoseconds_total = Self::load(&self.immutable_publication_nanos),
+            keldra_index_v1_current_staging_nanoseconds_total = Self::load(&self.current_staging_nanos),
+            keldra_index_v1_current_cas_nanoseconds_total = Self::load(&self.current_cas_nanos),
+            keldra_index_v1_post_cas_verification_nanoseconds_total = Self::load(&self.post_cas_verification_nanos),
             keldra_index_v1_stage_cpu_nanoseconds_total = Self::load(&self.stage_cpu_nanos),
             keldra_index_v1_stage_queue_wait_nanoseconds_total = Self::load(&self.stage_queue_wait_nanos),
             keldra_index_v1_stage_resident_bytes = Self::load(&self.stage_resident_bytes),
@@ -282,6 +351,44 @@ mod tests {
     fn empty_control_batch_has_no_indexed_prepared_bytes() {
         assert_eq!(V1PipelineTelemetry::indexed_prepared_bytes(0, 6096), 0);
         assert_eq!(V1PipelineTelemetry::indexed_prepared_bytes(1, 6096), 6096);
+    }
+
+    #[test]
+    fn cumulative_phase_timer_records_failed_or_cancelled_scope_on_drop() {
+        let counter = AtomicU64::new(0);
+        let timer = CumulativePhaseTimer {
+            counter: &counter,
+            started_at: Instant::now()
+                .checked_sub(Duration::from_millis(10))
+                .unwrap(),
+        };
+
+        assert_eq!(V1PipelineTelemetry::load(&counter), 0);
+        drop(timer);
+        assert!(V1PipelineTelemetry::load(&counter) >= 10_000_000);
+    }
+
+    #[test]
+    fn cumulative_phase_durations_add_without_changing_other_phases() {
+        let telemetry = V1PipelineTelemetry::default();
+
+        V1PipelineTelemetry::add_duration(
+            &telemetry.exact_source_read_nanos,
+            Duration::from_millis(7),
+        );
+        V1PipelineTelemetry::add_duration(
+            &telemetry.exact_source_read_nanos,
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(
+            V1PipelineTelemetry::load(&telemetry.exact_source_read_nanos),
+            12_000_000
+        );
+        assert_eq!(
+            V1PipelineTelemetry::load(&telemetry.predecessor_read_nanos),
+            0
+        );
     }
 
     #[test]

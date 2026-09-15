@@ -14,7 +14,9 @@ pub(super) async fn prepare_lane(
     credits: &IndexingMemoryCredits,
     limits: Limits,
 ) -> Result<(), Status> {
-    let prepare_started = Instant::now();
+    let telemetry = super::super::v1_telemetry::global();
+    let prepare_timer =
+        super::super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.prepare_nanos);
     let mutation_count = mutations.len();
     let current = writer.current.clone();
     let recipe = writer.recipe.clone();
@@ -30,9 +32,12 @@ pub(super) async fn prepare_lane(
             deleted: mutation.deleted,
         })
         .collect::<Vec<_>>();
-    let exact_started = Instant::now();
+    let exact_timer = super::super::v1_telemetry::V1PipelineTelemetry::start_phase(
+        &telemetry.exact_source_read_nanos,
+    );
     let sources = load_exact_mutations(reader, &recipe, &exact_requests).await?;
-    let exact_duration = exact_started.elapsed();
+    let exact_duration = exact_timer.elapsed();
+    drop(exact_timer);
     let mut selected_inputs =
         VecDeque::from(mutations.into_iter().zip(sources).collect::<Vec<_>>());
     let mut jobs = tokio::task::JoinSet::new();
@@ -55,7 +60,9 @@ pub(super) async fn prepare_lane(
                         })
                 })
                 .collect::<Result<Vec<_>, Status>>()?;
-            let predecessor_started = Instant::now();
+            let predecessor_timer = super::super::v1_telemetry::V1PipelineTelemetry::start_phase(
+                &telemetry.predecessor_read_nanos,
+            );
             let previous = match &current {
                 Some(current) => {
                     let matched_indices = chunk
@@ -106,8 +113,8 @@ pub(super) async fn prepare_lane(
                 }
                 None => std::iter::repeat_with(Vec::new).take(chunk.len()).collect(),
             };
-            predecessor_duration =
-                predecessor_duration.saturating_add(predecessor_started.elapsed());
+            predecessor_duration = predecessor_duration.saturating_add(predecessor_timer.elapsed());
+            drop(predecessor_timer);
             predecessor_batches = predecessor_batches.saturating_add(1);
             for (((mutation, source), previous), input) in
                 chunk.into_iter().zip(previous).zip(inputs)
@@ -195,9 +202,10 @@ pub(super) async fn prepare_lane(
         });
     }
     let result = apply_rows(writer, safe_next, rows, previous, credits, limits);
+    let prepare_duration = prepare_timer.elapsed();
+    drop(prepare_timer);
     tracing::debug!(
-        histogram.keldra_index_v1_prepare_duration_seconds =
-            prepare_started.elapsed().as_secs_f64(),
+        histogram.keldra_index_v1_prepare_duration_seconds = prepare_duration.as_secs_f64(),
         histogram.keldra_index_v1_exact_source_read_duration_seconds = exact_duration.as_secs_f64(),
         histogram.keldra_index_v1_predecessor_read_duration_seconds =
             predecessor_duration.as_secs_f64(),

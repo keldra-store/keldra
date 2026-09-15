@@ -7,7 +7,10 @@ impl V1ProjectionPublisher {
         &self,
         artifacts: Vec<ArtifactBytes>,
     ) -> Result<Vec<StagedArtifact>, Status> {
-        let started = Instant::now();
+        let telemetry = super::super::v1_telemetry::global();
+        let staging_timer = super::super::v1_telemetry::V1PipelineTelemetry::start_phase(
+            &telemetry.immutable_staging_nanos,
+        );
         let artifact_count = artifacts.len();
         let work = immutable_stage_work(artifacts)?;
         let window_count = work.len();
@@ -25,9 +28,11 @@ impl V1ProjectionPublisher {
         for (_, outcome) in outcomes {
             staged.extend(outcome?);
         }
+        let staging_duration = staging_timer.elapsed();
+        drop(staging_timer);
         tracing::info!(
             histogram.keldra_index_v1_stage_immutable_artifacts_duration_seconds =
-                started.elapsed().as_secs_f64(),
+                staging_duration.as_secs_f64(),
             immutable_artifacts = artifact_count,
             staging_windows = window_count,
             maximum_parallelism = MAX_PARALLEL_IMMUTABLE_STAGE_WINDOWS,

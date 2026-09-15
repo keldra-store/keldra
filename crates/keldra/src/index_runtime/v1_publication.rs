@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use keldra_index::v1::{
-    AtomicProjectionPublicationCredits, CanonicalRecipeState, ComponentIdentity,
+    ArtifactPackReference, ArtifactPackTable, AtomicProjectionPublicationCredits,
+    CanonicalRecipeState, ComponentIdentity,
     ComponentRecordLookup, ComponentStreamReverseCursor, ComponentStreamReverseStep,
     ComponentStreamRoot, PreparedAtomicProjectionGeneration, PreparedQueryMutationBatch,
     ProjectedDocumentState, ProjectionCatalogActivation, ProjectionCurrent,
@@ -20,7 +21,8 @@ use keldra_index::v1::{
     decode_projection_family_directory, decode_projection_generation,
     decode_projection_generation_header, decode_query_run_page, decode_source_records,
     encode_projection_catalog_activation, encode_projection_family_directory,
-    lookup_component_record_in_verified_pack, prepare_atomic_projection_generation,
+    lookup_component_record_in_verified_pack, pack_component_deltas,
+    prepare_atomic_projection_generation, prepare_projection_query_run,
     projection_artifact_routing_id, projection_catalog_activation_path,
     projection_catalog_routing_id, projection_component_page_path, projection_current_path,
     projection_family_directory_path, projection_generation_path, projection_pack_path,
@@ -383,6 +385,45 @@ impl V1ProjectionPublisher {
                 }
             }
         }
+        let base = previous.map(|previous| {
+            compaction.map_or(&previous.generation, |value| &value.predecessor)
+        });
+        let query_sequence = base.map_or(1, |generation| {
+            generation.query_stream_root.last_sequence.saturating_add(1)
+        });
+        let component_packs = pack_component_deltas(deltas, pack_credits).map_err(index_status)?;
+        let query = prepare_projection_query_run(
+            partition,
+            physical_catalog_generation,
+            query_sequence,
+            source_start_offset,
+            next_offset,
+            through_atomic_position,
+            query_batch,
+            QueryBlockLimits::default_for_memory(),
+            query_credits,
+        )
+        .map_err(index_status)?;
+        let component_pack_table = self
+            .publish_component_packs(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                partition,
+                &component_packs.packs,
+            )
+            .await?;
+        let query_pack_table = self
+            .publish_query_packs(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                partition,
+                query.packs(),
+            )
+            .await?;
         prepare_atomic_projection_generation(
             partition,
             physical_catalog_generation,
@@ -396,11 +437,10 @@ impl V1ProjectionPublisher {
             next_offset,
             through_atomic_position,
             Vec::new(),
-            deltas,
-            query_batch,
-            QueryBlockLimits::default_for_memory(),
-            query_credits,
-            pack_credits,
+            component_packs,
+            component_pack_table,
+            query,
+            query_pack_table,
             |hash| {
                 component_pages
                     .get(&hash)
@@ -415,6 +455,125 @@ impl V1ProjectionPublisher {
             },
         )
         .map_err(index_status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_component_packs(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        partition: ProjectionPartitionIdentity,
+        packs: &[keldra_index::v1::SealedProjectionDeltaPack],
+    ) -> Result<ArtifactPackTable, Status> {
+        let inputs = packs
+            .iter()
+            .map(|pack| {
+                (
+                    pack.ordinal,
+                    projection_pack_path(partition, pack.hash),
+                    keldra_index::v1::ProjectionArtifactKind::Pack,
+                    pack.hash,
+                    pack.bytes.as_slice(),
+                )
+            })
+            .collect();
+        self.publish_physical_packs(
+            storage_tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            partition,
+            inputs,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_query_packs(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        partition: ProjectionPartitionIdentity,
+        packs: &[keldra_index::v1::UnpublishedArtifactPack],
+    ) -> Result<ArtifactPackTable, Status> {
+        let inputs = packs
+            .iter()
+            .map(|pack| {
+                (
+                    pack.ordinal,
+                    projection_query_run_pack_path(partition, pack.hash),
+                    keldra_index::v1::ProjectionArtifactKind::QueryRunPack,
+                    pack.hash,
+                    pack.bytes.as_slice(),
+                )
+            })
+            .collect();
+        self.publish_physical_packs(
+            storage_tenant,
+            bucket,
+            tenant_id,
+            bucket_id,
+            partition,
+            inputs,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_physical_packs(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        partition: ProjectionPartitionIdentity,
+        packs: Vec<(u32, String, keldra_index::v1::ProjectionArtifactKind, [u8; 32], &[u8])>,
+    ) -> Result<ArtifactPackTable, Status> {
+        if packs.is_empty() {
+            return ArtifactPackTable::new(Vec::new()).map_err(index_status);
+        }
+        let mut publications = Vec::with_capacity(packs.len());
+        for (_, path, kind, hash, bytes) in &packs {
+            let blob = self.stage(bytes).await?;
+            if blob.hash != *hash || blob.length != bytes.len() as u64 {
+                return Err(Status::data_loss(
+                    "staged v1 physical pack changed its exact bytes",
+                ));
+            }
+            publications.push(request(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                projection_artifact_routing_id(partition.family_id, *kind, *hash)
+                    .map_err(index_status)?,
+                path.clone(),
+                blob,
+                None,
+            ));
+        }
+        let outcomes = self.artifacts.publish_immutable_many(publications).await?;
+        if outcomes.len() != packs.len() {
+            return Err(Status::data_loss(
+                "v1 physical pack outcomes differ from their inputs",
+            ));
+        }
+        let mut references = Vec::with_capacity(packs.len());
+        for ((ordinal, path, _, hash, bytes), outcome) in packs.into_iter().zip(outcomes) {
+            let outcome = outcome?;
+            references.push(ArtifactPackReference {
+                ordinal,
+                canonical_path: path,
+                object_version: outcome.version.0,
+                hash,
+                length: bytes.len() as u64,
+            });
+        }
+        ArtifactPackTable::new(references).map_err(index_status)
     }
 
     /// Load the one stable family lifecycle directory. This directory is not
@@ -584,6 +743,10 @@ impl V1ProjectionPublisher {
         checkpointed_source_positions: u64,
         checkpointed_source_payload_bytes: u64,
     ) -> Result<LoadedV1ProjectionGeneration, Status> {
+        let telemetry = super::v1_telemetry::global();
+        let _atomic_publication_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
+            &telemetry.atomic_publication_nanos,
+        );
         let (previous, expected_current_version) = match predecessor {
             V1PublicationPredecessor::Initial => (None, None),
             V1PublicationPredecessor::Current(previous) => {
@@ -591,7 +754,11 @@ impl V1ProjectionPublisher {
             }
             V1PublicationPredecessor::CatalogRebuild(version) => (None, Some(version)),
         };
+        let publication_plan_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
+            &telemetry.publication_plan_nanos,
+        );
         let plan = plan_atomic_publication(partition, previous, prepared)?;
+        drop(publication_plan_timer);
         if checkpointed_source_positions != plan.source_positions {
             return Err(Status::data_loss(
                 "v1 publication telemetry positions do not match the prepared source cut",
@@ -628,11 +795,18 @@ impl V1ProjectionPublisher {
             ));
         }
         let immutable_publication_started = Instant::now();
+        let immutable_publication_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
+            &telemetry.immutable_publication_nanos,
+        );
         require_all_immutable_publications(
             self.artifacts.publish_immutable_many(publications).await?,
         )?;
         let immutable_publication_duration = immutable_publication_started.elapsed();
+        drop(immutable_publication_timer);
+        let current_staging_timer =
+            super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.current_staging_nanos);
         let current_blob = self.stage(&plan.current_bytes).await?;
+        drop(current_staging_timer);
         if current_blob.hash != *keldra_index::profiled_blake3_hash!(&plan.current_bytes).as_bytes()
             || current_blob.length != plan.current_bytes.len() as u64
         {
@@ -641,6 +815,8 @@ impl V1ProjectionPublisher {
             ));
         }
         let current_cas_started = Instant::now();
+        let current_cas_timer =
+            super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.current_cas_nanos);
         let outcome = self
             .artifacts
             .publish(request(
@@ -658,7 +834,11 @@ impl V1ProjectionPublisher {
         // final Current CAS which makes those artifacts reachable.
         drop(publication_credits);
         let current_cas_duration = current_cas_started.elapsed();
+        drop(current_cas_timer);
         let verification_started = Instant::now();
+        let verification_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
+            &telemetry.post_cas_verification_nanos,
+        );
         let loaded_generation = self
             .load_generation_by_hash(
                 storage_tenant,
@@ -678,6 +858,7 @@ impl V1ProjectionPublisher {
             ));
         }
         let verification_duration = verification_started.elapsed();
+        drop(verification_timer);
         let cache_scheduled = cache_update
             .is_some_and(|cache_update| self.projection_cache_updates.schedule(cache_update));
         if !cache_scheduled {
@@ -815,9 +996,14 @@ impl V1ProjectionPublisher {
                 None,
             ));
         }
+        let telemetry = super::v1_telemetry::global();
+        let immutable_publication_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
+            &telemetry.immutable_publication_nanos,
+        );
         require_all_immutable_publications(
             self.artifacts.publish_immutable_many(publications).await?,
         )?;
+        drop(immutable_publication_timer);
         // Retain byte credits until every moved payload leaves this future.
         drop((component_credits, query_credits));
         Ok(())
