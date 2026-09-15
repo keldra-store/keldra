@@ -738,6 +738,7 @@ impl Store {
                 let reference_cursor = self
                     .reference_delta_cursor(runtime.projected_watch.source_id)
                     .map_err(|error| MutationError::Storage(error.to_string()))?;
+                self.rearm_caught_up_reference_frontiers(runtime, reference_cursor)?;
                 if reference_cursor < runtime.projected_watch.tail {
                     return Err(MutationError::SourceJournalCapacity);
                 }

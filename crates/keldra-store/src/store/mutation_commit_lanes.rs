@@ -496,6 +496,35 @@ impl LaneRuntime {
 }
 
 impl Store {
+    pub(super) fn rearm_caught_up_reference_frontiers(
+        &self,
+        runtime: &mut LaneRuntime,
+        reference_cursor: u64,
+    ) -> Result<(), MutationError> {
+        if reference_cursor > runtime.reserved_watch.tail {
+            return Err(MutationError::Storage(format!(
+                "reference cursor {reference_cursor} is beyond reserved source-journal tail {}",
+                runtime.reserved_watch.tail
+            )));
+        }
+        if reference_cursor == runtime.reserved_watch.tail {
+            runtime.reserved_reference_cursor_safe = true;
+        }
+        let inline_reference_safe = self
+            .source_journal_reference_safe_through
+            .load(Ordering::Acquire);
+        if inline_reference_safe > runtime.reserved_watch.tail {
+            return Err(MutationError::Storage(format!(
+                "inline reference-safe cursor {inline_reference_safe} is beyond reserved source-journal tail {}",
+                runtime.reserved_watch.tail
+            )));
+        }
+        if inline_reference_safe == runtime.reserved_watch.tail {
+            runtime.reserved_inline_reference_safe = true;
+        }
+        Ok(())
+    }
+
     pub(super) fn refresh_stale_lane_runtime(
         &self,
         runtime: &mut LaneRuntime,
@@ -1512,6 +1541,45 @@ mod tests {
         assert!(!artifact.inline_reference_safe);
         assert!(foreground.reference_cursor_advanced);
         assert!(!foreground.inline_reference_safe);
+    }
+
+    #[tokio::test]
+    async fn caught_up_cursors_rearm_conservative_reference_frontiers() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let mut runtime = store.mutation_commit_lanes.sequence().await;
+        let runtime = runtime.as_mut().unwrap();
+        runtime.reserved_reference_cursor_safe = false;
+        runtime.reserved_inline_reference_safe = false;
+
+        store
+            .rearm_caught_up_reference_frontiers(runtime, 0)
+            .unwrap();
+
+        assert!(runtime.reserved_reference_cursor_safe);
+        assert!(runtime.reserved_inline_reference_safe);
+    }
+
+    #[tokio::test]
+    async fn caught_up_rearm_rejects_a_cursor_beyond_reserved_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let mut runtime = store.mutation_commit_lanes.sequence().await;
+        let runtime = runtime.as_mut().unwrap();
+
+        let error = store
+            .rearm_caught_up_reference_frontiers(runtime, 1)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("beyond reserved source-journal tail")
+        );
     }
 
     #[tokio::test]

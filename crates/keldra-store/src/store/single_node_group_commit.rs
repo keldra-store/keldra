@@ -662,11 +662,8 @@ impl SingleNodeGroupCommit {
             let failed_other_requests = failed_requests
                 .saturating_sub(failed_source_journal_capacity_requests)
                 .saturating_sub(failed_receipt_capacity_requests);
-            let failure_kind = results
-                .iter()
-                .find_map(|result| result.as_ref().err())
-                .map(|error| mutation_capacity_kind(error).unwrap_or("other"))
-                .unwrap_or("none");
+            let retryable_capacity_attempt_requests = failed_source_journal_capacity_requests
+                .saturating_add(failed_receipt_capacity_requests);
             let metrics = metrics.unwrap_or_default();
             let evaluation_uncategorized = metrics
                 .evaluate
@@ -680,11 +677,10 @@ impl SingleNodeGroupCommit {
                 operation_count,
                 inline_bytes,
                 failed_requests,
-                failed_internal_attempt_requests = failed_requests,
+                retryable_capacity_attempt_requests,
                 failed_source_journal_capacity_requests,
                 failed_receipt_capacity_requests,
                 failed_other_requests,
-                failure_kind,
                 group_execute_started_epoch_milliseconds,
                 group_execute_ended_epoch_milliseconds,
                 admission_wait_sum_seconds = admission_wait_seconds,
