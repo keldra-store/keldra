@@ -134,15 +134,21 @@ impl Store {
                 tokio::task::yield_now().await;
                 continue;
             }
-            let completion = runtime.reserve_with_reference_settlement(
-                staged.status,
-                receipts,
-                None,
-                true,
-                false,
-                staged.visibility_settlement_staged,
-            )?;
-            self.stage_lane_completion(&mut batch, completion)?;
+            let completion = staged
+                .map(|staged| {
+                    runtime.reserve_with_reference_settlement(
+                        staged.status,
+                        receipts,
+                        None,
+                        true,
+                        false,
+                        staged.visibility_settlement_staged,
+                    )
+                })
+                .transpose()?;
+            if let Some(completion) = completion {
+                self.stage_lane_completion(&mut batch, completion)?;
+            }
             break (batch, completion);
         };
 
@@ -150,8 +156,10 @@ impl Store {
         options.set_sync(self.sync_writes);
         let persistence = self.db.write_opt(batch, &options).map_err(storage_error);
         lane.release_physical_slot();
-        self.finish_lane_commit_cancellation_safe(completion, persistence.is_ok())
-            .await?;
+        if let Some(completion) = completion {
+            self.finish_lane_commit_cancellation_safe(completion, persistence.is_ok())
+                .await?;
+        }
         persistence?;
         Ok(references)
     }
@@ -163,7 +171,7 @@ impl Store {
         now_unix_millis: u64,
         source_status: WatchJournalStatus,
         reference_cursor: u64,
-    ) -> Result<(WriteBatch, super::mutations::StagedLocalChanges), MutationError> {
+    ) -> Result<(WriteBatch, Option<super::mutations::StagedLocalChanges>), MutationError> {
         let mut batch = WriteBatch::default();
         let mut pending_inline_payloads = BTreeSet::new();
         let mut pending_blob_references = PendingBlobReferences::new();
@@ -195,16 +203,24 @@ impl Store {
                 accounting_transition: None,
             });
         }
-        let staged = self.stage_local_changes_from_status(
-            &mut batch,
+        let admission = SourceJournalAdmission::DerivedProgress;
+        let staged = if admission.suppresses_nonlogical_lifecycle_changes(
             &changes,
             LocalReferenceEffects::NoReferenceEffects,
-            SourceJournalAdmission::DerivedProgress,
-            source_status,
-            reference_cursor,
-            true,
-            false,
-        )?;
+        )? {
+            None
+        } else {
+            Some(self.stage_local_changes_from_status(
+                &mut batch,
+                &changes,
+                LocalReferenceEffects::NoReferenceEffects,
+                admission,
+                source_status,
+                reference_cursor,
+                true,
+                false,
+            )?)
+        };
         Ok((batch, staged))
     }
 
@@ -311,7 +327,7 @@ impl Store {
             reference_deltas: Vec::new(),
             accounting_transition: None,
         }];
-        if admission.suppresses_physical_replica_changes(
+        if admission.suppresses_nonlogical_lifecycle_changes(
             &changes,
             LocalReferenceEffects::NoReferenceEffects,
         )? {

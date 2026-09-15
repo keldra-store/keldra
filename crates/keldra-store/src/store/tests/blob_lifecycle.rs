@@ -1,9 +1,6 @@
 use super::super::blob_references::blob_gc_due_key;
 use super::*;
-use crate::{
-    BlobGcBudget, BlobGcCursor, DerivedConsumerCheckpoint, DerivedConsumerKind, PlacementLogId,
-    WatchRetention,
-};
+use crate::{BlobGcBudget, BlobGcCursor, WatchRetention};
 
 fn deliver_retirement_effects(store: &Store, blob: &BlobRef, count: usize) {
     let mut batch = WriteBatch::default();
@@ -728,9 +725,12 @@ async fn derived_progress_inline_batch_uses_one_write_and_preserves_input_order(
         assert_eq!(lifecycle.ref_count, 1);
         assert_eq!(lifecycle.flags, AWAITING_PUBLISH);
     }
-    assert_eq!(
-        store.local_watch_status().unwrap().tail,
-        journal_before.tail + blobs.len() as u64
+    assert_eq!(store.local_watch_status().unwrap(), journal_before);
+    assert!(
+        store
+            .scan_local_changes(journal_before.tail, 16)
+            .unwrap()
+            .is_empty()
     );
     assert_eq!(
         store
@@ -807,44 +807,36 @@ async fn derived_progress_inline_batch_uses_exact_blob_conflicts() {
 }
 
 #[tokio::test]
-async fn cancelling_derived_inline_writer_does_not_leave_a_lane_ticket_hole() {
+async fn derived_inline_writer_does_not_reserve_a_journal_lane_completion() {
     let (_temporary, store) = store().await;
     let before = store.local_watch_status().unwrap();
     store
         .mutation_commit_lanes
         .pause_next_projection
         .store(true, std::sync::atomic::Ordering::Release);
-    let writer = store.clone();
-    let writing = tokio::spawn(async move {
-        writer
-            .stage_derived_progress_inline_blobs(&[b"detached derived artifact".to_vec()])
-            .await
-    });
-    store
-        .mutation_commit_lanes
-        .projection_write_completed
-        .acquire()
-        .await
-        .unwrap()
-        .forget();
-
-    writing.abort();
-    assert!(writing.await.unwrap_err().is_cancelled());
-    store
-        .mutation_commit_lanes
-        .projection_publish_continue
-        .add_permits(1);
-
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if store.local_watch_status().unwrap().tail == before.tail + 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+    let references = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        store.stage_derived_progress_inline_blobs(&[b"derived artifact".to_vec()]),
+    )
     .await
-    .expect("detached derived settlement advances the lane frontier");
+    .expect("derived staging does not wait for a journal lane completion")
+    .unwrap();
+
+    assert_eq!(store.local_watch_status().unwrap(), before);
+    assert_eq!(
+        store.complete_copy_state(&references[0]).await.unwrap(),
+        PayloadArtifactState::Valid
+    );
+    assert!(
+        store
+            .mutation_commit_lanes
+            .pause_next_projection
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    store
+        .mutation_commit_lanes
+        .pause_next_projection
+        .store(false, std::sync::atomic::Ordering::Release);
 }
 
 #[tokio::test]
@@ -941,21 +933,7 @@ async fn retrying_a_derived_progress_inline_batch_does_not_multiply_reservations
         assert_eq!(retried.created_at, first_state.created_at);
         assert!(retried.updated_at >= first_state.updated_at);
     }
-    let changes = store.scan_local_changes(0, 16).unwrap();
-    assert_eq!(changes.len(), blobs.len() * 2);
-    assert_eq!(
-        changes
-            .iter()
-            .filter(|change| {
-                matches!(
-                    change,
-                    LocalChange::ContentLifecycleChanged(change)
-                        if change.blob_identity == blob_reference_key(&first[0])
-                )
-            })
-            .count(),
-        4
-    );
+    assert!(store.scan_local_changes(0, 16).unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -974,6 +952,8 @@ async fn derived_progress_inline_batch_survives_reopen_before_publication() {
         .unwrap();
     let staged_status = store.local_watch_status().unwrap();
     let staged_changes = store.scan_local_changes(0, 16).unwrap();
+    assert_eq!(staged_status.tail, 0);
+    assert!(staged_changes.is_empty());
     let staged_states = references
         .iter()
         .map(|reference| store.blob_reference_state(reference).unwrap().unwrap())
@@ -995,7 +975,7 @@ async fn derived_progress_inline_batch_survives_reopen_before_publication() {
 }
 
 #[tokio::test]
-async fn derived_progress_inline_batch_journal_can_be_consumed_and_pruned() {
+async fn derived_progress_inline_batch_creates_no_journal_or_accounting_debt() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(
         StoreOptions::new(temporary.path(), 1)
@@ -1003,11 +983,6 @@ async fn derived_progress_inline_batch_journal_can_be_consumed_and_pruned() {
     )
     .await
     .unwrap();
-    let fence = PlacementLogId { term: 1, index: 1 };
-    store
-        .ensure_derived_consumer_membership(fence, &[1])
-        .await
-        .unwrap();
     store
         .stage_derived_progress_inline_blobs(&[
             b"drain artifact one".to_vec(),
@@ -1016,39 +991,12 @@ async fn derived_progress_inline_batch_journal_can_be_consumed_and_pruned() {
         .await
         .unwrap();
     let staged = store.local_watch_status().unwrap();
-    assert_eq!(staged.tail, 2);
+    assert_eq!(staged.tail, 0);
     assert_eq!(staged.settled_through, staged.tail);
-    assert_eq!(store.scan_local_changes(0, 16).unwrap().len(), 2);
-
-    store
-        .advance_source_journal_reference_safe_through(staged.tail)
-        .await
-        .unwrap();
-    for consumer_kind in DerivedConsumerKind::ALL {
-        store
-            .apply_derived_consumer_checkpoint(
-                DerivedConsumerCheckpoint {
-                    consumer_kind,
-                    source_id: staged.source_id,
-                    consumer_node_id: 1,
-                    next_offset: staged.tail + 1,
-                    observed_fence: fence,
-                },
-                &[1],
-            )
-            .await
-            .unwrap();
-    }
-    while store.prune_source_journal_for_capacity().await.unwrap() {}
-
-    let drained = store.local_watch_status().unwrap();
-    assert_eq!(drained.retention_floor, staged.tail);
-    assert_eq!(drained.retained_entries, 0);
-    assert_eq!(drained.retained_bytes, 0);
-    assert!(
-        store
-            .scan_local_changes(drained.retention_floor, 16)
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(staged.retained_entries, 0);
+    assert_eq!(staged.retained_bytes, 0);
+    assert!(store.scan_local_changes(0, 16).unwrap().is_empty());
+    let metrics = store.source_journal_runtime_metrics().unwrap();
+    assert_eq!(metrics.progress_debt_entries(), 0);
+    assert_eq!(metrics.progress_debt_bytes(), 0);
 }

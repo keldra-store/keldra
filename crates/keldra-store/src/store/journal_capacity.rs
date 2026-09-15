@@ -14,14 +14,11 @@ pub(super) enum SourceJournalAdmission {
 }
 
 impl SourceJournalAdmission {
-    pub(super) fn suppresses_physical_replica_changes(
+    pub(super) fn suppresses_nonlogical_lifecycle_changes(
         self,
         changes: &[PendingLocalChange],
         reference_effects: LocalReferenceEffects,
     ) -> Result<bool, MutationError> {
-        if self != Self::PhysicalReplica {
-            return Ok(false);
-        }
         let physical_only = reference_effects == LocalReferenceEffects::NoReferenceEffects
             && changes.iter().all(|change| {
                 matches!(
@@ -33,12 +30,12 @@ impl SourceJournalAdmission {
                     } if reference_deltas.is_empty() && accounting_transition.is_none()
                 )
             });
-        if !physical_only {
+        if self == Self::PhysicalReplica && !physical_only {
             return Err(MutationError::Storage(
                 "physical replica installation cannot suppress a logical source change".into(),
             ));
         }
-        Ok(true)
+        Ok(physical_only && matches!(self, Self::DerivedProgress | Self::PhysicalReplica))
     }
 }
 
@@ -50,7 +47,7 @@ impl Store {
         reference_effects: LocalReferenceEffects,
         admission: SourceJournalAdmission,
     ) -> Result<(), MutationError> {
-        if admission.suppresses_physical_replica_changes(changes, reference_effects)?
+        if admission.suppresses_nonlogical_lifecycle_changes(changes, reference_effects)?
             || changes.is_empty()
         {
             return Ok(());
@@ -438,6 +435,47 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn derived_progress_preserves_accounted_lifecycle_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let transition = crate::ContentAccountingTransition {
+            tenant_id: 7,
+            bucket_id: 11,
+            exact_path: "accounted".into(),
+            retained_bytes_removed: 13,
+        };
+        let changes = [PendingLocalChange::ContentLifecycleChanged {
+            blob_identity: b"accounted-derived-lifecycle".to_vec(),
+            revision: 17,
+            reference_deltas: Vec::new(),
+            accounting_transition: Some(transition.clone()),
+        }];
+        let mut batch = WriteBatch::default();
+
+        store
+            .stage_local_changes_with_admission(
+                &mut batch,
+                &changes,
+                LocalReferenceEffects::NoReferenceEffects,
+                SourceJournalAdmission::DerivedProgress,
+            )
+            .unwrap();
+        store.db.write(batch).unwrap();
+
+        let status = store.local_watch_status().unwrap();
+        assert_eq!(status.tail, 1);
+        assert_eq!(status.retained_entries, 1);
+        let recorded = store.scan_local_changes(0, 1).unwrap();
+        assert!(matches!(
+            recorded.as_slice(),
+            [LocalChange::ContentLifecycleChanged(change)]
+                if change.accounting_transition.as_ref() == Some(&transition)
+        ));
     }
 
     #[tokio::test]
