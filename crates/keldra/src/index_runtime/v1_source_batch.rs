@@ -25,6 +25,7 @@ pub(super) async fn load_exact_mutations(
     reader: &ClusterObjectReader,
     recipe: &PhysicalCatalogRecipe,
     requests: &[ExactMutationRequest<'_>],
+    maximum_parallelism: usize,
 ) -> Result<Vec<IndexSourceMutation>, Status> {
     let mut sources = std::iter::repeat_with(|| None)
         .take(requests.len())
@@ -40,25 +41,49 @@ pub(super) async fn load_exact_mutations(
         })
         .collect::<Result<Vec<_>, Status>>()?;
 
-    for read_batch in reads.chunks(MAX_OBJECT_RECORD_EXPORT_RECORDS as usize) {
-        let keys = read_batch
-            .iter()
-            .map(|(_, key, _)| key.clone())
-            .collect::<Vec<_>>();
-        let versions = read_batch
-            .iter()
-            .map(|(_, _, version)| *version)
-            .collect::<Vec<_>>();
-        let selected = reader
-            .exact_versions_stable(
-                &keys,
-                &versions,
-                recipe.family.tenant_id,
-                recipe.family.bucket_id,
-            )
-            .await?;
-        for ((index, _, _), selected) in read_batch.iter().zip(selected) {
-            sources[*index] = Some(source_from_version(requests[*index], selected)?);
+    let mut pending = std::collections::VecDeque::from(
+        reads
+            .chunks(MAX_OBJECT_RECORD_EXPORT_RECORDS as usize)
+            .map(<[_]>::to_vec)
+            .collect::<Vec<_>>(),
+    );
+    let mut active = tokio::task::JoinSet::new();
+    let maximum_parallelism = maximum_parallelism.max(1);
+    while !pending.is_empty() || !active.is_empty() {
+        while active.len() < maximum_parallelism {
+            let Some(read_batch) = pending.pop_front() else {
+                break;
+            };
+            let reader = reader.clone();
+            let tenant_id = recipe.family.tenant_id;
+            let bucket_id = recipe.family.bucket_id;
+            active.spawn(async move {
+                let keys = read_batch
+                    .iter()
+                    .map(|(_, key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                let versions = read_batch
+                    .iter()
+                    .map(|(_, _, version)| *version)
+                    .collect::<Vec<_>>();
+                let selected = reader
+                    .exact_versions_stable(&keys, &versions, tenant_id, bucket_id)
+                    .await?;
+                Ok::<_, Status>((read_batch, selected))
+            });
+        }
+        if let Some(joined) = active.join_next().await {
+            let (read_batch, selected) = joined.map_err(|error| {
+                Status::internal(format!("v1 exact source read failed: {error}"))
+            })??;
+            if selected.len() != read_batch.len() {
+                return Err(Status::data_loss(
+                    "v1 exact source batch returned the wrong result count",
+                ));
+            }
+            for ((index, _, _), selected) in read_batch.into_iter().zip(selected) {
+                sources[index] = Some(source_from_version(requests[index], selected)?);
+            }
         }
     }
 

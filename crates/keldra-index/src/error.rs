@@ -14,6 +14,8 @@ pub enum IndexError {
     Integrity,
     #[error("index integrity invariant failed: {0}")]
     IntegrityViolation(String),
+    #[error("index optimization proposal is stale")]
+    StaleProposal,
     #[error("index records must have unique keys in ascending byte order")]
     UnsortedRecords,
     #[error("invalid index definition: {0}")]

@@ -67,6 +67,7 @@ pub(super) fn ensure_background_compaction(
     let bucket_id = writer.recipe.family.bucket_id;
     let loaded = current.clone();
     let predecessor_generation = current.current.generation_hash;
+    let partition = writer.partition;
     let maximum_runs = usize::try_from(limits.lsm_runs)
         .map_err(|_| Status::invalid_argument("v1 LSM run bound exceeds this platform"))?;
     let maximum_unmerged_bytes = usize::try_from(limits.lsm_bytes)
@@ -90,6 +91,25 @@ pub(super) fn ensure_background_compaction(
                 QueryBlockCredits::from_pipeline_permit(query_permit),
             )
             .await;
+        let result = match result {
+            Ok(compaction) => {
+                match publisher
+                    .publish_compaction_artifacts(
+                        &storage_tenant,
+                        &bucket,
+                        tenant_id,
+                        bucket_id,
+                        partition,
+                        compaction.artifacts(),
+                    )
+                    .await
+                {
+                    Ok(()) => Ok(compaction),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
         compaction_ready.notify_one();
         result
     });
@@ -105,13 +125,6 @@ fn generation_needs_compaction(current: &LoadedV1ProjectionGeneration, limits: L
         || current.generation.roots.iter().any(|root| {
             root.segment_count >= limits.lsm_runs || root.encoded_bytes >= limits.lsm_bytes
         })
-}
-
-pub(super) fn compaction_matches_current(
-    predecessor_generation: [u8; 32],
-    current_generation: Option<[u8; 32]>,
-) -> bool {
-    current_generation == Some(predecessor_generation)
 }
 
 pub(super) fn compaction_in_flight(writer: &Writer) -> bool {

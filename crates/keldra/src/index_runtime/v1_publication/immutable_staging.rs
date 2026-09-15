@@ -5,6 +5,10 @@ use super::*;
 impl V1ProjectionPublisher {
     pub(super) async fn stage_immutable_artifacts(
         &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
         artifacts: Vec<ArtifactBytes>,
     ) -> Result<Vec<StagedArtifact>, Status> {
         let telemetry = super::super::v1_telemetry::global();
@@ -12,7 +16,73 @@ impl V1ProjectionPublisher {
             &telemetry.immutable_staging_nanos,
         );
         let artifact_count = artifacts.len();
-        let work = immutable_stage_work(artifacts)?;
+        let preflight = artifacts
+            .iter()
+            .enumerate()
+            .map(|(ordinal, artifact)| {
+                (
+                    ordinal,
+                    (
+                        artifact.path.clone(),
+                        artifact.hash,
+                        u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX),
+                    ),
+                )
+            })
+            .collect();
+        let publisher = self.clone();
+        let storage_tenant_owned = storage_tenant.to_owned();
+        let bucket_owned = bucket.to_owned();
+        let preflight = run_bounded_ordered(
+            preflight,
+            MAX_PARALLEL_IMMUTABLE_STAGE_WINDOWS,
+            move |(path, hash, length)| {
+                let publisher = publisher.clone();
+                let storage_tenant = storage_tenant_owned.clone();
+                let bucket = bucket_owned.clone();
+                async move {
+                    publisher
+                        .preflight_immutable_head(
+                            &storage_tenant,
+                            &bucket,
+                            tenant_id,
+                            bucket_id,
+                            &path,
+                            hash,
+                            length,
+                        )
+                        .await
+                }
+            },
+        )
+        .await?;
+        let mut existing = Vec::new();
+        let mut missing_ordinals = BTreeSet::new();
+        for (ordinal, outcome) in preflight {
+            match outcome? {
+                Some((blob, _)) => {
+                    let artifact = &artifacts[ordinal];
+                    existing.push(StagedArtifact {
+                        path: artifact.path.clone(),
+                        kind: artifact.kind,
+                        hash: artifact.hash,
+                        blob,
+                        needs_publication: false,
+                    });
+                }
+                None => {
+                    missing_ordinals.insert(ordinal);
+                }
+            }
+        }
+        let missing = artifacts
+            .into_iter()
+            .enumerate()
+            .filter_map(|(ordinal, artifact)| {
+                missing_ordinals.contains(&ordinal).then_some(artifact)
+            })
+            .collect();
+        let work = immutable_stage_work(missing)?;
         let window_count = work.len();
         let publisher = self.clone();
         let outcomes = run_bounded_ordered(
@@ -24,7 +94,8 @@ impl V1ProjectionPublisher {
             },
         )
         .await?;
-        let mut staged = Vec::with_capacity(artifact_count);
+        let mut staged = existing;
+        staged.reserve(artifact_count.saturating_sub(staged.len()));
         for (_, outcome) in outcomes {
             staged.extend(outcome?);
         }
@@ -85,7 +156,7 @@ impl V1ProjectionPublisher {
                         hash,
                         length: bytes.len(),
                     });
-                    inline_blobs.push(bytes);
+                    inline_blobs.push(bytes.to_vec());
                 }
                 if observed_bytes != bytes {
                     return Err(Status::internal(
@@ -130,6 +201,7 @@ impl V1ProjectionPublisher {
                 kind: identity.kind,
                 hash: identity.hash,
                 blob,
+                needs_publication: true,
             });
         }
         bytes.clear();
@@ -230,5 +302,6 @@ fn staged_artifact(artifact: ArtifactBytes, blob: BlobRef) -> Result<StagedArtif
         kind: artifact.kind,
         hash: artifact.hash,
         blob,
+        needs_publication: true,
     })
 }

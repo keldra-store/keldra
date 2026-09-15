@@ -29,6 +29,7 @@ pub struct ChargedQueryRunCompaction {
     artifacts: ProjectionQueryRunArtifacts,
     reference: QueryRunReference,
     splice: PreparedQueryRunSplice,
+    plan: QueryRunCompactionPlan,
     _credits: QueryBlockCredits,
 }
 
@@ -69,18 +70,35 @@ impl PreparedQueryRunCompaction {
             next_offset: self.plan.next_offset(),
             through_atomic_position: self.plan.through_atomic_position(),
         };
-        let splice =
-            splice_compacted_query_runs(self.previous, &self.plan, reference, &mut load_page)?;
+        let plan = self.plan;
+        let splice = splice_compacted_query_runs(self.previous, &plan, reference, &mut load_page)?;
         Ok(ChargedQueryRunCompaction {
             artifacts,
             reference,
             splice,
+            plan,
             _credits: credits,
         })
     }
 }
 
 impl ChargedQueryRunCompaction {
+    /// Rebase an already materialized compaction result over a newer stream
+    /// root which only appended/rearranged unrelated runs. The splice rejects
+    /// the proposal if any selected immutable input is no longer present.
+    pub fn rebase<PageBytes>(
+        &mut self,
+        previous: ProjectionQueryStreamRoot,
+        mut load_page: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+    ) -> Result<(), IndexError>
+    where
+        PageBytes: AsRef<[u8]>,
+    {
+        self.splice =
+            splice_compacted_query_runs(previous, &self.plan, self.reference, &mut load_page)?;
+        Ok(())
+    }
+
     pub const fn artifacts(&self) -> &ProjectionQueryRunArtifacts {
         &self.artifacts
     }

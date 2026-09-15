@@ -33,7 +33,8 @@ use super::v1_producer_state::{
     PartitionEvidence, PartitionEvidenceMap, ProducerStage, contain_integrity_failure,
 };
 use super::v1_publication::{
-    LoadedV1ProjectionGeneration, V1ProjectionPublisher, V1PublicationPredecessor,
+    LoadedV1ProjectionGeneration, PendingV1Publication, V1PostCasVerification,
+    V1ProjectionPublisher, V1PublicationPredecessor,
 };
 use super::v1_source_batch::{ExactMutationRequest, load_exact_mutations};
 
@@ -41,10 +42,7 @@ use super::v1_source_batch::{ExactMutationRequest, load_exact_mutations};
 mod compaction;
 #[path = "v1_consumer_prepare.rs"]
 mod prepare;
-use compaction::{
-    BackgroundCompaction, compaction_in_flight, compaction_matches_current,
-    ensure_background_compaction,
-};
+use compaction::{BackgroundCompaction, compaction_in_flight, ensure_background_compaction};
 use prepare::{apply_rows, prepare_lane};
 #[cfg(test)]
 use prepare::{preparation_refill_size, selected_mutation_resident_bytes};
@@ -103,6 +101,7 @@ struct Writer {
     pending_prepared_rows: u64,
     pending_prepared_bytes: u64,
     pending_projected_rows: u64,
+    pending_projected_encoded_bytes: u64,
     through_atomic: u64,
     pending_mutations: BTreeMap<String, Mutation>,
     pending_mutation_bytes: usize,
@@ -111,6 +110,8 @@ struct Writer {
     pending_mutation_capacity: usize,
     pending_mutation_permit: IndexingMemoryPermit,
     background_compaction: Option<BackgroundCompaction>,
+    post_cas_verification: Option<V1PostCasVerification>,
+    pending_publication: Option<PendingV1Publication>,
     halted_on_integrity_failure: bool,
     stage: ProducerStage,
 }
@@ -242,7 +243,6 @@ fn next_reconcile_delay(
     writers
         .values()
         .filter(|writer| !writer.halted_on_integrity_failure)
-        .filter(|writer| !compaction_in_flight(writer))
         .filter_map(|writer| writer.since)
         .map(|since| limits.flush_age.saturating_sub(since.elapsed()))
         .min()
@@ -539,6 +539,12 @@ async fn reconcile(
                     identical_retries = state.identical_retries,
                     "v1 projection partition will replay from Current; unrelated partitions continue"
                 );
+                // Retain a fully prepared deterministic successor across
+                // transient staging/replication failures. Its predecessor and
+                // Current CAS remain exact; immutable preflight makes already
+                // completed work reusable. Integrity failures take the
+                // containment branch above and never retry this state.
+                writers.insert(partition, writer);
             }
         }
     }
@@ -967,6 +973,7 @@ async fn open_writer(
         pending_prepared_rows: 0,
         pending_prepared_bytes: 0,
         pending_projected_rows: 0,
+        pending_projected_encoded_bytes: 0,
         through_atomic,
         pending_mutations: BTreeMap::new(),
         pending_mutation_bytes: 0,
@@ -975,6 +982,8 @@ async fn open_writer(
         pending_mutation_capacity,
         pending_mutation_permit,
         background_compaction: None,
+        post_cas_verification: None,
+        pending_publication: None,
         halted_on_integrity_failure: false,
         stage: ProducerStage::Opening,
     })
@@ -1132,6 +1141,26 @@ async fn advance(
     compaction_ready: &Arc<tokio::sync::Notify>,
     limits: Limits,
 ) -> Result<(), Status> {
+    // Observe a completed readback even when the partition has no next page.
+    // An in-flight verifier is deliberately left alone so journal read-ahead
+    // and source extraction can overlap it; the next Current CAS gates on it.
+    if writer
+        .post_cas_verification
+        .as_ref()
+        .is_some_and(V1PostCasVerification::is_finished)
+    {
+        writer
+            .post_cas_verification
+            .take()
+            .expect("finished v1 verifier exists")
+            .finish()
+            .await?;
+    }
+    if writer.pending_publication.is_some() {
+        writer.stage = ProducerStage::Publishing;
+        finish_pending_publication(writer, publisher).await?;
+        return Ok(());
+    }
     // Finish the captured baseline before entering journal replay.
     if writer.current.is_none() {
         writer.stage = ProducerStage::Backfill;
@@ -1166,70 +1195,59 @@ async fn advance(
         .unwrap_or(usize::MAX)
         .saturating_mul(JOURNAL_PAGE_RESIDENT_MULTIPLIER)
         .max(1);
-    // Charge the encoded page, decoded changes, dispatcher output, and
-    // mutation clones before reading any of them. This permit is transient;
-    // only the coalesced mutation window remains charged after this advance.
-    {
-        let _page_memory = credits
-            .acquire(IndexingMemoryStage::ReplayInput, page_memory_bytes)
-            .map_err(|_| Status::resource_exhausted("v1 journal-page memory unavailable"))?;
-        let page_started = Instant::now();
-        let page = journal
-            .next_page(
-                writer.recipe.family.tenant_id,
-                writer.recipe.family.bucket_id,
-                &writer.scanned,
-                target,
-                max_page,
-            )
-            .await
-            .map_err(event_status)?;
-        tracing::debug!(
-            histogram.keldra_index_v1_journal_page_duration_seconds =
-                page_started.elapsed().as_secs_f64(),
-            counter.keldra_index_v1_journal_page_changes =
-                page.as_ref().map_or(0, |page| page.changes.len()),
-            gauge.keldra_index_v1_journal_page_memory_bytes = page_memory_bytes,
-            "v1 producer read one bounded journal page"
-        );
-        if let Some(page) = page {
-            let mut dispatches = Vec::new();
-            for change in &page.changes {
-                let event_source = page.through.sources[&change.node].source;
-                dispatches.extend(writer.dispatcher.observe(event_source, &change.change)?);
-            }
-            writer.scanned = page.through;
-            let node = NodeId(u64::from(writer.source.node_id));
-            let proposed = writer.scanned.sources[&node].next_offset;
-            let safe_next = writer.dispatcher.checkpoint_limit(writer.source, proposed);
-            if safe_next > writer.pending_next {
-                let (page_atomic, mutations) = prepare_page(writer, dispatches, safe_next)?;
-                if !writer.pending_mutations.is_empty()
-                    && mutation_window_needed(
-                        &writer.pending_mutations,
-                        writer.pending_mutation_bytes,
-                        &mutations,
-                    )? > writer.pending_mutation_capacity
-                {
-                    flush(
-                        writer,
-                        physical_catalog_identity,
-                        reader,
-                        extractor,
-                        publisher,
-                        credits,
-                        limits,
-                    )
-                    .await?;
+    // Advance across several journal pages before yielding the partition. The
+    // mutation window owns coalesced records and their memory permit, while a
+    // transient page permit bounds each decode. This removes the former
+    // reconcile/publication barrier after every page without multiplying the
+    // configured memory ceiling.
+    let read_ahead_pages = journal_read_ahead_pages(limits.parallelism);
+    for _ in 0..read_ahead_pages {
+        let mut page_present = false;
+        // Charge the encoded page, decoded changes, dispatcher output, and
+        // mutation clones before reading any of them. This permit is transient;
+        // only the coalesced mutation window remains charged after this advance.
+        {
+            let _page_memory = credits
+                .acquire(IndexingMemoryStage::ReplayInput, page_memory_bytes)
+                .map_err(|_| Status::resource_exhausted("v1 journal-page memory unavailable"))?;
+            let page_started = Instant::now();
+            let page = journal
+                .next_page(
+                    writer.recipe.family.tenant_id,
+                    writer.recipe.family.bucket_id,
+                    &writer.scanned,
+                    target,
+                    max_page,
+                )
+                .await
+                .map_err(event_status)?;
+            tracing::debug!(
+                histogram.keldra_index_v1_journal_page_duration_seconds =
+                    page_started.elapsed().as_secs_f64(),
+                counter.keldra_index_v1_journal_page_changes =
+                    page.as_ref().map_or(0, |page| page.changes.len()),
+                gauge.keldra_index_v1_journal_page_memory_bytes = page_memory_bytes,
+                "v1 producer read one bounded journal page"
+            );
+            if let Some(page) = page {
+                page_present = true;
+                let mut dispatches = Vec::new();
+                for change in &page.changes {
+                    let event_source = page.through.sources[&change.node].source;
+                    dispatches.extend(writer.dispatcher.observe(event_source, &change.change)?);
                 }
-                let chunks =
-                    mutation_publication_chunks(mutations, safe_next, limits.flush_operations)?;
-                let chunk_count = chunks.len();
-                for (index, (mutations, chunk_next)) in chunks.into_iter().enumerate() {
-                    let operations = u64::try_from(mutations.len()).unwrap_or(u64::MAX);
+                writer.scanned = page.through;
+                let node = NodeId(u64::from(writer.source.node_id));
+                let proposed = writer.scanned.sources[&node].next_offset;
+                let safe_next = writer.dispatcher.checkpoint_limit(writer.source, proposed);
+                if safe_next > writer.pending_next {
+                    let (page_atomic, mutations) = prepare_page(writer, dispatches, safe_next)?;
                     if !writer.pending_mutations.is_empty()
-                        && writer.pending_operations.saturating_add(operations)
-                            > limits.flush_operations
+                        && mutation_window_needed(
+                            &writer.pending_mutations,
+                            writer.pending_mutation_bytes,
+                            &mutations,
+                        )? > writer.pending_mutation_capacity
                     {
                         flush(
                             writer,
@@ -1242,30 +1260,53 @@ async fn advance(
                         )
                         .await?;
                     }
-                    if index + 1 == chunk_count {
-                        writer.through_atomic = writer.through_atomic.max(page_atomic);
-                    }
-                    queue_mutations(writer, mutations, chunk_next)?;
-                    if index + 1 != chunk_count || should_flush(writer, limits) {
-                        flush(
-                            writer,
-                            physical_catalog_identity,
-                            reader,
-                            extractor,
-                            publisher,
-                            credits,
-                            limits,
-                        )
-                        .await?;
+                    let chunks =
+                        mutation_publication_chunks(mutations, safe_next, limits.flush_operations)?;
+                    let chunk_count = chunks.len();
+                    for (index, (mutations, chunk_next)) in chunks.into_iter().enumerate() {
+                        let operations = u64::try_from(mutations.len()).unwrap_or(u64::MAX);
+                        if !writer.pending_mutations.is_empty()
+                            && writer.pending_operations.saturating_add(operations)
+                                > limits.flush_operations
+                        {
+                            flush(
+                                writer,
+                                physical_catalog_identity,
+                                reader,
+                                extractor,
+                                publisher,
+                                credits,
+                                limits,
+                            )
+                            .await?;
+                        }
+                        if index + 1 == chunk_count {
+                            writer.through_atomic = writer.through_atomic.max(page_atomic);
+                        }
+                        queue_mutations(writer, mutations, chunk_next)?;
+                        if index + 1 != chunk_count || should_flush(writer, limits) {
+                            flush(
+                                writer,
+                                physical_catalog_identity,
+                                reader,
+                                extractor,
+                                publisher,
+                                credits,
+                                limits,
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
         }
+        if !page_present {
+            break;
+        }
     }
-    if !compaction_in_flight(writer)
-        && writer
-            .since
-            .is_some_and(|since| since.elapsed() >= limits.flush_age)
+    if writer
+        .since
+        .is_some_and(|since| since.elapsed() >= limits.flush_age)
     {
         flush(
             writer,
@@ -1289,6 +1330,10 @@ async fn advance(
         ProducerStage::JournalScan
     };
     Ok(())
+}
+
+fn journal_read_ahead_pages(parallelism: usize) -> usize {
+    parallelism.saturating_mul(2).clamp(2, 32)
 }
 
 fn mutation_publication_chunks(
@@ -1487,10 +1532,9 @@ fn should_flush(writer: &Writer, limits: Limits) -> bool {
     !writer.pending_mutations.is_empty()
         && (writer.pending_mutation_bytes >= limits.flush_bytes
             || writer.pending_operations >= limits.flush_operations
-            || (!compaction_in_flight(writer)
-                && writer
-                    .since
-                    .is_some_and(|since| since.elapsed() >= limits.flush_age)))
+            || writer
+                .since
+                .is_some_and(|since| since.elapsed() >= limits.flush_age))
 }
 
 fn has_publication_work(has_current: bool, prepared_source_rows: u64) -> bool {
@@ -1510,6 +1554,9 @@ async fn flush(
     super::v1_telemetry::V1PipelineTelemetry::add(&telemetry.flush_calls, 1);
     let _flush_timer =
         super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.flush_nanos);
+    if writer.pending_publication.is_some() {
+        return finish_pending_publication(writer, publisher).await;
+    }
     if !writer.pending_mutations.is_empty() {
         writer.stage = ProducerStage::Preparing;
         let next = writer.pending_next;
@@ -1545,6 +1592,7 @@ async fn flush(
     super::v1_telemetry::V1PipelineTelemetry::add(&telemetry.publication_flushes, 1);
     let projected_bytes = u64::try_from(writer.accumulator.buffered_bytes())
         .map_err(|_| Status::resource_exhausted("v1 projected bytes exceed telemetry"))?;
+    writer.pending_projected_encoded_bytes = projected_bytes;
     writer.stage = ProducerStage::Sealing;
     let seal_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.seal_nanos);
     let sealed = writer.accumulator.seal_and_reset().map_err(index_status)?;
@@ -1561,36 +1609,51 @@ async fn flush(
         .acquire(IndexingMemoryStage::ReplayInput, preload_bytes)
         .map_err(|_| Status::resource_exhausted("v1 spine preload memory unavailable"))?;
     drop(seal_timer);
-    let compaction = if let Some(background) = writer.background_compaction.take() {
+    let compaction = if writer
+        .background_compaction
+        .as_ref()
+        .is_some_and(BackgroundCompaction::is_finished)
+    {
+        let background = writer
+            .background_compaction
+            .take()
+            .expect("finished v1 compaction exists");
         writer.stage = ProducerStage::Compacting;
         let predecessor_generation = background.predecessor_generation;
-        let wait_started = Instant::now();
-        let compaction_wait_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
-            &telemetry.compaction_foreground_wait_nanos,
-        );
-        let prepared = background.finish().await?;
-        drop(compaction_wait_timer);
-        let matched_current = compaction_matches_current(
-            predecessor_generation,
-            writer
-                .current
-                .as_ref()
-                .map(|current| current.current.generation_hash),
-        );
-        tracing::debug!(
-            histogram.keldra_index_v1_compaction_foreground_wait_duration_seconds =
-                wait_started.elapsed().as_secs_f64(),
-            compaction_matched_current = matched_current,
-            "v1 producer joined background compaction at a publication boundary"
-        );
-        if matched_current {
-            Some(prepared.into_parts())
-        } else {
-            tracing::debug!(
-                predecessor_generation = ?predecessor_generation,
-                "v1 background compaction discarded after Current advanced"
-            );
-            None
+        match background.finish().await {
+            Ok(mut prepared) => {
+                let current = writer
+                    .current
+                    .as_ref()
+                    .expect("compaction requires Current");
+                match prepared
+                    .rebase_onto(
+                        publisher,
+                        &writer.recipe.storage_tenant,
+                        &writer.recipe.bucket,
+                        writer.recipe.family.tenant_id,
+                        writer.recipe.family.bucket_id,
+                        current,
+                    )
+                    .await
+                {
+                    Ok(true) => Some(prepared.into_parts()),
+                    Ok(false) => {
+                        tracing::debug!(?predecessor_generation, "stale v1 compaction discarded");
+                        None
+                    }
+                    Err(error) if error.code() != tonic::Code::DataLoss => {
+                        tracing::warn!(%error, "optional v1 compaction proposal discarded");
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if error.code() != tonic::Code::DataLoss => {
+                tracing::warn!(%error, "optional v1 background compaction failed");
+                None
+            }
+            Err(error) => return Err(error),
         }
     } else {
         None
@@ -1655,22 +1718,10 @@ async fn flush(
     let rows = next
         .checked_sub(start)
         .ok_or_else(|| Status::data_loss("v1 cut regressed"))?;
-    if let Some((_, artifacts)) = compaction {
-        let compaction_publication_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
-            &telemetry.compaction_artifact_publication_nanos,
-        );
-        publisher
-            .publish_compaction_artifacts(
-                &writer.recipe.storage_tenant,
-                &writer.recipe.bucket,
-                writer.recipe.family.tenant_id,
-                writer.recipe.family.bucket_id,
-                writer.partition,
-                artifacts,
-            )
-            .await?;
-        drop(compaction_publication_timer);
-    }
+    // Original compaction artifacts are already durable. Retain the proposal
+    // so any small path-copy pages created while rebasing are included in the
+    // successor's ordinary immutable publication and remain memory-charged.
+    let compaction_artifacts = compaction.map(|(_, artifacts)| artifacts);
     let predecessor = if let Some(version) = writer.catalog_rebuild_current_version {
         V1PublicationPredecessor::CatalogRebuild(version)
     } else if let Some(current) = writer.current.as_ref() {
@@ -1678,21 +1729,47 @@ async fn flush(
     } else {
         V1PublicationPredecessor::Initial
     };
-    let published = publisher
+    writer.pending_publication = Some(publisher.prepare_atomic_publication(
+        writer.partition,
+        predecessor,
+        prepared,
+        compaction_artifacts,
+        rows,
+        writer.source_bytes,
+    )?);
+    finish_pending_publication(writer, publisher).await
+}
+
+async fn finish_pending_publication(
+    writer: &mut Writer,
+    publisher: &V1ProjectionPublisher,
+) -> Result<(), Status> {
+    let telemetry = super::v1_telemetry::global();
+    let mut pending = writer
+        .pending_publication
+        .take()
+        .expect("v1 pending publication exists");
+    let result = publisher
         .publish_atomic_generation(
             &writer.recipe.storage_tenant,
             &writer.recipe.bucket,
             writer.recipe.family.tenant_id,
             writer.recipe.family.bucket_id,
             writer.partition,
-            predecessor,
-            prepared,
-            rows,
-            writer.source_bytes,
+            &mut pending,
+            &mut writer.post_cas_verification,
         )
-        .await?;
+        .await;
+    let (published, verification) = match result {
+        Ok(published) => published,
+        Err(error) => {
+            writer.pending_publication = Some(pending);
+            return Err(error);
+        }
+    };
     writer.catalog_rebuild_current_version = None;
     writer.current = Some(published);
+    writer.post_cas_verification = Some(verification);
     super::v1_telemetry::V1PipelineTelemetry::add(
         &telemetry.prepared_rows,
         writer.pending_prepared_rows,
@@ -1705,12 +1782,16 @@ async fn flush(
         &telemetry.projected_rows,
         writer.pending_projected_rows,
     );
-    super::v1_telemetry::V1PipelineTelemetry::add(&telemetry.projected_bytes, projected_bytes);
+    super::v1_telemetry::V1PipelineTelemetry::add(
+        &telemetry.projected_bytes,
+        writer.pending_projected_encoded_bytes,
+    );
     writer.since = None;
     writer.source_bytes = 0;
     writer.pending_prepared_rows = 0;
     writer.pending_prepared_bytes = 0;
     writer.pending_projected_rows = 0;
+    writer.pending_projected_encoded_bytes = 0;
     clear_pending_mutations(writer)?;
     Ok(())
 }

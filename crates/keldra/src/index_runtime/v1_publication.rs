@@ -45,9 +45,18 @@ use super::v1_parallel::run_bounded_ordered;
 mod immutable_staging;
 mod physical_packs;
 mod projection_cache_updates;
+mod publication_types;
 #[cfg(test)]
 use immutable_staging::{immutable_stage_windows, immutable_stage_work, inline_window_fits};
 use projection_cache_updates::ProjectionCacheAdvancer;
+use publication_types::{
+    ArtifactBytes, AtomicPublicationPlan, ComponentRecordRequest, ImmutableStageWindow,
+    InlineArtifactIdentity, ObservedSourceProgress, StagedArtifact,
+};
+pub(crate) use publication_types::{
+    LoadedV1ProjectionGeneration, PendingV1Publication, V1PostCasVerification,
+    V1PublicationPredecessor,
+};
 
 const MAX_STREAM_PAGE_BYTES: usize = 32 * 1024;
 const MAX_GENERATION_BYTES: usize = 256 * 1024;
@@ -64,85 +73,6 @@ pub(crate) struct V1ProjectionPublisher {
     immutable_cache: ImmutableArtifactCache,
     observed_source_next: ObservedSourceProgress,
     projection_cache_updates: ProjectionCacheAdvancer,
-}
-
-#[derive(Clone, Default)]
-struct ObservedSourceProgress(Arc<std::sync::Mutex<BTreeMap<ProjectionPartitionIdentity, u64>>>);
-
-impl ObservedSourceProgress {
-    fn replace(&self, observations: &BTreeMap<ProjectionPartitionIdentity, u64>) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = observations.clone();
-    }
-
-    fn get(&self, partition: ProjectionPartitionIdentity) -> Option<u64> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&partition)
-            .copied()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct LoadedV1ProjectionGeneration {
-    pub(crate) current: ProjectionCurrent,
-    pub(crate) current_object_version: VersionId,
-    pub(crate) generation: ProjectionGeneration,
-}
-
-pub(crate) enum V1PublicationPredecessor<'a> {
-    Initial,
-    Current(&'a LoadedV1ProjectionGeneration),
-    CatalogRebuild(VersionId),
-}
-
-#[derive(Debug)]
-struct ArtifactBytes {
-    path: String,
-    kind: keldra_index::v1::ProjectionArtifactKind,
-    hash: [u8; 32],
-    bytes: Vec<u8>,
-}
-
-struct StagedArtifact {
-    path: String,
-    kind: keldra_index::v1::ProjectionArtifactKind,
-    hash: [u8; 32],
-    blob: BlobRef,
-}
-
-struct InlineArtifactIdentity {
-    path: String,
-    kind: keldra_index::v1::ProjectionArtifactKind,
-    hash: [u8; 32],
-    length: usize,
-}
-
-#[derive(Clone, Copy)]
-struct ComponentRecordRequest {
-    component: ComponentIdentity,
-    key: StableDocumentKey,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum ImmutableStageWindow {
-    Inline { items: usize, bytes: usize },
-    Unary { bytes: usize },
-}
-
-#[derive(Debug)]
-struct AtomicPublicationPlan {
-    immutable: Vec<ArtifactBytes>,
-    current_bytes: Vec<u8>,
-    current: ProjectionCurrent,
-    generation: ProjectionGeneration,
-    sealed_bytes: u64,
-    source_positions: u64,
-    state_updates: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    publication_credits: AtomicProjectionPublicationCredits,
 }
 
 impl V1ProjectionPublisher {
@@ -612,22 +542,16 @@ impl V1ProjectionPublisher {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn publish_atomic_generation(
+    pub(crate) fn prepare_atomic_publication(
         &self,
-        storage_tenant: &str,
-        bucket: &str,
-        tenant_id: u64,
-        bucket_id: u64,
         partition: ProjectionPartitionIdentity,
         predecessor: V1PublicationPredecessor<'_>,
-        prepared: PreparedAtomicProjectionGeneration,
+        mut prepared: PreparedAtomicProjectionGeneration,
+        compaction: Option<V1CompactionArtifacts>,
         checkpointed_source_positions: u64,
         checkpointed_source_payload_bytes: u64,
-    ) -> Result<LoadedV1ProjectionGeneration, Status> {
+    ) -> Result<PendingV1Publication, Status> {
         let telemetry = super::v1_telemetry::global();
-        let _atomic_publication_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
-            &telemetry.atomic_publication_nanos,
-        );
         let (previous, expected_current_version) = match predecessor {
             V1PublicationPredecessor::Initial => (None, None),
             V1PublicationPredecessor::Current(previous) => {
@@ -635,6 +559,18 @@ impl V1ProjectionPublisher {
             }
             V1PublicationPredecessor::CatalogRebuild(version) => (None, Some(version)),
         };
+        if let Some(compaction) = &compaction {
+            if let Some(component) = &compaction.component {
+                prepared
+                    .stream_pages
+                    .extend(component.pages.iter().cloned());
+            }
+            if let Some(query) = &compaction.query {
+                prepared
+                    .query_stream_pages
+                    .extend(query.splice().pages.iter().cloned());
+            }
+        }
         let publication_plan_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
             &telemetry.publication_plan_nanos,
         );
@@ -645,22 +581,52 @@ impl V1ProjectionPublisher {
                 "v1 publication telemetry positions do not match the prepared source cut",
             ));
         }
+        Ok(PendingV1Publication {
+            plan,
+            expected_current_version,
+            previous_generation_hash: previous.map(|value| value.current.generation_hash),
+            checkpointed_source_positions,
+            checkpointed_source_payload_bytes,
+            _compaction: compaction,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn publish_atomic_generation(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        partition: ProjectionPartitionIdentity,
+        pending: &mut PendingV1Publication,
+        predecessor_verification: &mut Option<V1PostCasVerification>,
+    ) -> Result<(LoadedV1ProjectionGeneration, V1PostCasVerification), Status> {
+        let telemetry = super::v1_telemetry::global();
+        let _atomic_publication_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
+            &telemetry.atomic_publication_nanos,
+        );
+        let plan = &mut pending.plan;
         let sealed_bytes = plan.sealed_bytes;
         let next_offset = plan.current.next_offset;
         let generation_hash = plan.current.generation_hash;
-        let publication_credits = plan.publication_credits;
-        let cache_update = self.projection_cache_updates.admit(
-            projection_state_partition_key(tenant_id, bucket_id, partition),
-            previous.map(|previous| previous.current.generation_hash),
-            generation_hash,
-            plan.state_updates,
-        );
         let immutable_artifact_count = plan.immutable.len();
         let staging_started = Instant::now();
-        let staged_artifacts = self.stage_immutable_artifacts(plan.immutable).await?;
+        let staged_artifacts = self
+            .stage_immutable_artifacts(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                plan.immutable.clone(),
+            )
+            .await?;
         let staging_duration = staging_started.elapsed();
         let mut publications = Vec::with_capacity(staged_artifacts.len());
         for artifact in staged_artifacts {
+            if !artifact.needs_publication {
+                continue;
+            }
             let routing_id =
                 projection_artifact_routing_id(partition.family_id, artifact.kind, artifact.hash)
                     .map_err(index_status)?;
@@ -679,11 +645,19 @@ impl V1ProjectionPublisher {
         let immutable_publication_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
             &telemetry.immutable_publication_nanos,
         );
-        require_all_immutable_publications(
-            self.artifacts.publish_immutable_many(publications).await?,
-        )?;
+        require_all_immutable_publications(if publications.is_empty() {
+            Vec::new()
+        } else {
+            self.artifacts.publish_immutable_many(publications).await?
+        })?;
         let immutable_publication_duration = immutable_publication_started.elapsed();
         drop(immutable_publication_timer);
+        // Exact verification of the predecessor overlaps source reads,
+        // extraction, generation construction, staging, and immutable
+        // publication. Only the one ordered Current CAS chain waits for it.
+        if let Some(verification) = predecessor_verification.take() {
+            verification.finish().await?;
+        }
         let current_staging_timer =
             super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.current_staging_nanos);
         let current_blob = self.stage(&plan.current_bytes).await?;
@@ -708,46 +682,55 @@ impl V1ProjectionPublisher {
                 projection_routing_id(partition),
                 projection_current_path(partition),
                 current_blob,
-                expected_current_version,
+                pending.expected_current_version,
             ))
-            .await?;
-        // Retain prepared-byte admission through immutable publication and the
-        // final Current CAS which makes those artifacts reachable.
-        drop(publication_credits);
+            .await;
+        let (current_object_version, recovered_generation) = match outcome {
+            Ok(outcome) => (outcome.version, None),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Aborted
+                ) =>
+            {
+                // A routed/quorum response can be lost after the Current CAS
+                // committed. Resolve authority before retrying so an ambiguous
+                // success does not wedge on its now-stale expected version.
+                match self
+                    .load_current(storage_tenant, bucket, tenant_id, bucket_id, partition)
+                    .await?
+                {
+                    Some(loaded) if loaded.current.generation_hash == generation_hash => {
+                        (loaded.current_object_version, Some(loaded.generation))
+                    }
+                    Some(loaded)
+                        if Some(loaded.current_object_version)
+                            == pending.expected_current_version =>
+                    {
+                        return Err(error);
+                    }
+                    Some(_) => {
+                        return Err(Status::aborted(
+                            "v1 Current advanced to another generation during ambiguous publication",
+                        ));
+                    }
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        // `pending` retains prepared-byte admission through immutable
+        // publication and the Current CAS. The caller drops it only after this
+        // method reports the authoritative result.
         let current_cas_duration = current_cas_started.elapsed();
         drop(current_cas_timer);
-        let verification_started = Instant::now();
-        let verification_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
-            &telemetry.post_cas_verification_nanos,
+        let cache_update = self.projection_cache_updates.admit(
+            projection_state_partition_key(tenant_id, bucket_id, partition),
+            pending.previous_generation_hash,
+            generation_hash,
+            std::mem::take(&mut plan.state_updates),
         );
-        let loaded_generation = self
-            .load_generation_by_hash(
-                storage_tenant,
-                bucket,
-                tenant_id,
-                bucket_id,
-                partition,
-                generation_hash,
-            )
-            .await?;
-        plan.current
-            .validate_against(&loaded_generation)
-            .map_err(index_status)?;
-        if loaded_generation != plan.generation {
-            return Err(Status::data_loss(
-                "published v1 generation differs from the prepared generation",
-            ));
-        }
-        let verification_duration = verification_started.elapsed();
-        drop(verification_timer);
-        let cache_scheduled = cache_update
-            .is_some_and(|cache_update| self.projection_cache_updates.schedule(cache_update));
-        if !cache_scheduled {
-            tracing::info!(
-                counter.keldra_index_v1_projection_cache_updates_skipped = 1_u64,
-                "v1 disposable projection cache update skipped at its byte bound or shutdown"
-            );
-        }
+        let cache_admitted = cache_update.is_some();
         tracing::info!(
             histogram.keldra_index_v1_artifact_staging_duration_seconds =
                 staging_duration.as_secs_f64(),
@@ -755,10 +738,8 @@ impl V1ProjectionPublisher {
                 immutable_publication_duration.as_secs_f64(),
             histogram.keldra_index_v1_current_cas_duration_seconds =
                 current_cas_duration.as_secs_f64(),
-            histogram.keldra_index_v1_post_cas_verification_duration_seconds =
-                verification_duration.as_secs_f64(),
             immutable_artifacts = immutable_artifact_count,
-            cache_scheduled,
+            cache_admitted,
             "keldra_index_v1_publication_phases"
         );
         let _ = self.changes.send(());
@@ -775,17 +756,71 @@ impl V1ProjectionPublisher {
         );
         super::v1_telemetry::V1PipelineTelemetry::add(
             &super::v1_telemetry::global().checkpointed_source_positions,
-            checkpointed_source_positions,
+            pending.checkpointed_source_positions,
         );
         super::v1_telemetry::V1PipelineTelemetry::add(
             &super::v1_telemetry::global().checkpointed_source_payload_bytes,
-            checkpointed_source_payload_bytes,
+            pending.checkpointed_source_payload_bytes,
         );
-        Ok(LoadedV1ProjectionGeneration {
-            current: plan.current,
-            current_object_version: outcome.version,
-            generation: loaded_generation,
-        })
+        let loaded = LoadedV1ProjectionGeneration {
+            current: plan.current.clone(),
+            current_object_version,
+            generation: recovered_generation.unwrap_or_else(|| plan.generation.clone()),
+        };
+        let publisher = self.clone();
+        let storage_tenant = storage_tenant.to_owned();
+        let bucket = bucket.to_owned();
+        let expected = loaded.clone();
+        let task = tokio::spawn(async move {
+            let result = async {
+                let verification_started = Instant::now();
+                let verification_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
+                    &super::v1_telemetry::global().post_cas_verification_nanos,
+                );
+                let observed = publisher
+                    .load_generation_by_hash(
+                        &storage_tenant,
+                        &bucket,
+                        tenant_id,
+                        bucket_id,
+                        partition,
+                        generation_hash,
+                    )
+                    .await?;
+                expected
+                    .current
+                    .validate_against(&observed)
+                    .map_err(index_status)?;
+                if observed != expected.generation {
+                    return Err(Status::data_loss(
+                        "published v1 generation differs from the prepared generation",
+                    ));
+                }
+                let cache_scheduled = cache_update.is_some_and(|cache_update| {
+                    publisher.projection_cache_updates.schedule(cache_update)
+                });
+                if !cache_scheduled {
+                    tracing::info!(
+                        counter.keldra_index_v1_projection_cache_updates_skipped = 1_u64,
+                        "v1 disposable projection cache update skipped at its byte bound or shutdown"
+                    );
+                }
+                let duration = verification_started.elapsed();
+                drop(verification_timer);
+                tracing::info!(
+                    histogram.keldra_index_v1_post_cas_verification_duration_seconds =
+                        duration.as_secs_f64(),
+                    generation_hash = ?generation_hash,
+                    cache_scheduled,
+                    "keldra_index_v1_post_cas_verification"
+                );
+                Ok(())
+            }
+            .await;
+            let _ = publisher.changes.send(());
+            result
+        });
+        Ok((loaded, V1PostCasVerification { task: Some(task) }))
     }
 
     /// Make every immutable compaction output durable before the successor
@@ -798,53 +833,53 @@ impl V1ProjectionPublisher {
         tenant_id: u64,
         bucket_id: u64,
         partition: ProjectionPartitionIdentity,
-        compaction: V1CompactionArtifacts,
+        compaction: &V1CompactionArtifacts,
     ) -> Result<(), Status> {
         let mut artifacts = BTreeMap::new();
-        let V1CompactionArtifacts { component, query } = compaction;
-        let component_credits = if let Some(component) = component {
-            let (_packs, credits) = component.packs.into_parts();
-            for page in component.pages {
+        if let Some(component) = &compaction.component {
+            for page in &component.pages {
                 insert_artifact(
                     &mut artifacts,
                     projection_stream_page_path(partition, page.hash),
                     keldra_index::v1::ProjectionArtifactKind::StreamPage,
                     page.hash,
-                    page.bytes,
+                    page.bytes.clone(),
                 )?;
             }
-            Some(credits)
-        } else {
-            None
-        };
-        let query_credits = if let Some(query) = query {
-            let (query_artifacts, _reference, splice, credits) = query.into_parts_with_credits();
-            let keldra_index::v1::ProjectionQueryRunArtifacts { packs: _, run } = query_artifacts;
+        }
+        if let Some(query) = &compaction.query {
+            let run = &query.artifacts().run;
             insert_artifact(
                 &mut artifacts,
                 projection_query_run_pack_path(partition, run.hash),
                 keldra_index::v1::ProjectionArtifactKind::QueryRunPack,
                 run.hash,
-                run.bytes,
+                run.bytes.clone(),
             )?;
-            for page in splice.pages {
+            for page in &query.splice().pages {
                 insert_artifact(
                     &mut artifacts,
                     projection_query_run_stream_page_path(partition, page.hash),
                     keldra_index::v1::ProjectionArtifactKind::QueryRunStreamPage,
                     page.hash,
-                    page.bytes,
+                    page.bytes.clone(),
                 )?;
             }
-            Some(credits)
-        } else {
-            None
-        };
+        }
         let mut publications = Vec::with_capacity(artifacts.len());
         for artifact in self
-            .stage_immutable_artifacts(artifacts.into_values().collect())
+            .stage_immutable_artifacts(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                artifacts.into_values().collect(),
+            )
             .await?
         {
+            if !artifact.needs_publication {
+                continue;
+            }
             let routing_id =
                 projection_artifact_routing_id(partition.family_id, artifact.kind, artifact.hash)
                     .map_err(index_status)?;
@@ -863,12 +898,12 @@ impl V1ProjectionPublisher {
         let immutable_publication_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
             &telemetry.immutable_publication_nanos,
         );
-        require_all_immutable_publications(
-            self.artifacts.publish_immutable_many(publications).await?,
-        )?;
+        require_all_immutable_publications(if publications.is_empty() {
+            Vec::new()
+        } else {
+            self.artifacts.publish_immutable_many(publications).await?
+        })?;
         drop(immutable_publication_timer);
-        // Retain byte credits until every moved payload leaves this future.
-        drop((component_credits, query_credits));
         Ok(())
     }
 
@@ -1721,7 +1756,7 @@ fn plan_atomic_publication(
             .checked_sub(query_run.source_start_offset)
             .ok_or_else(|| Status::data_loss("v1 query run source cut moves backwards"))?,
         state_updates,
-        publication_credits,
+        _publication_credits: publication_credits,
     })
 }
 
@@ -1876,7 +1911,7 @@ fn insert_artifact(
                 path,
                 kind,
                 hash,
-                bytes,
+                bytes: Bytes::from(bytes),
             });
         }
         std::collections::btree_map::Entry::Occupied(entry)

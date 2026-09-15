@@ -35,7 +35,8 @@ pub(super) async fn prepare_lane(
     let exact_timer = super::super::v1_telemetry::V1PipelineTelemetry::start_phase(
         &telemetry.exact_source_read_nanos,
     );
-    let sources = load_exact_mutations(reader, &recipe, &exact_requests).await?;
+    let sources =
+        load_exact_mutations(reader, &recipe, &exact_requests, limits.parallelism).await?;
     let exact_duration = exact_timer.elapsed();
     drop(exact_timer);
     let mut selected_inputs =

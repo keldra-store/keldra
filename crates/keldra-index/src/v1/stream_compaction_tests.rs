@@ -256,6 +256,43 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         .iter()
         .flat_map(|pack| pack.deltas.iter().cloned())
         .collect::<Vec<_>>();
+    let (later, later_table, later_pack) =
+        packed(sealed(component, &[(300, Some(b"later-append"))]));
+    packs.insert(pack_hash(&later, &later_table), later_pack);
+    let later_append = append_component_stream(
+        Some(fourth.root),
+        |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
+        &later,
+        &later_table,
+        4,
+        5,
+        5,
+    )
+    .unwrap();
+    pages.extend(
+        later_append
+            .new_pages
+            .iter()
+            .map(|page| (page.hash, page.bytes.clone())),
+    );
+    let rebased_splice = splice_compacted_component_runs(
+        later_append.root,
+        &second_plan,
+        &packed_output,
+        &output_table,
+        |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
+    )
+    .unwrap();
+    assert_eq!(
+        rebased_splice.root.last_sequence,
+        later_append.root.last_sequence
+    );
+    assert_eq!(
+        rebased_splice.root.segment_count,
+        fourth.root.segment_count - second_plan.input_count() as u64
+            + packed_output.len() as u64
+            + 1
+    );
     let second_splice = splice_compacted_component_runs(
         fourth.root,
         &second_plan,
@@ -270,6 +307,16 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
             .iter()
             .map(|page| (page.hash, page.bytes.clone())),
     );
+    assert!(matches!(
+        splice_compacted_component_runs(
+            second_splice.root,
+            &second_plan,
+            &packed_output,
+            &output_table,
+            |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
+        ),
+        Err(IndexError::StaleProposal)
+    ));
     let mut reachable = Vec::new();
     reachable_pages(
         component,

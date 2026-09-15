@@ -496,6 +496,14 @@ fn rolling_preparation_refills_only_available_bounded_lanes() {
 }
 
 #[test]
+fn journal_read_ahead_tracks_worker_capacity_without_becoming_unbounded() {
+    assert_eq!(journal_read_ahead_pages(0), 2);
+    assert_eq!(journal_read_ahead_pages(1), 2);
+    assert_eq!(journal_read_ahead_pages(4), 8);
+    assert_eq!(journal_read_ahead_pages(64), 32);
+}
+
+#[test]
 fn only_the_latest_background_lag_observation_can_publish() {
     let epoch = AtomicU64::new(7);
     assert!(lag_observation_is_current(&epoch, 7));
@@ -503,13 +511,6 @@ fn only_the_latest_background_lag_observation_can_publish() {
     epoch.store(8, Ordering::Release);
     assert!(!lag_observation_is_current(&epoch, 7));
     assert!(lag_observation_is_current(&epoch, 8));
-}
-
-#[test]
-fn background_compaction_installs_only_on_its_exact_predecessor() {
-    assert!(compaction_matches_current([7; 32], Some([7; 32])));
-    assert!(!compaction_matches_current([7; 32], Some([8; 32])));
-    assert!(!compaction_matches_current([7; 32], None));
 }
 
 #[test]

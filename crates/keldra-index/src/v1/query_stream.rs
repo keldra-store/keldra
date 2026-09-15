@@ -324,12 +324,10 @@ where
         maximum_input_runs: QUERY_RUN_PAGE_FANOUT,
     };
     validate_compaction_plan(plan, limits)?;
-    if previous.stream_root_hash != plan.stream_root_hash
-        || previous.next_offset != plan.root_next_offset
-        || previous.through_atomic_position != plan.root_through_atomic_position
-    {
-        return Err(IndexError::Integrity);
-    }
+    // A proposal conflicts with its selected immutable runs, not with the
+    // directory root as a whole. A newer root may contain additional L0 runs;
+    // splice them around the selected window. `matched` and the final summary
+    // checks reject a proposal when any selected input was itself replaced.
     let newest = *plan
         .inputs_newest_first
         .first()
@@ -364,7 +362,7 @@ where
     )?
     .ok_or(IndexError::Integrity)?;
     if matched != selected.len() {
-        return Err(IndexError::Integrity);
+        return Err(IndexError::StaleProposal);
     }
     let summary = child_summary(&rewritten)?;
     let expected_count = previous
@@ -517,7 +515,7 @@ where
                             next.push(output);
                         }
                     }
-                    Some(_) => return Err(IndexError::Integrity),
+                    Some(_) => return Err(IndexError::StaleProposal),
                 }
             }
             if next.is_empty() {
@@ -1020,6 +1018,12 @@ mod tests {
         for page in spliced.pages {
             store.insert(page.hash, page.bytes);
         }
+        assert!(matches!(
+            splice_compacted_query_runs(spliced.root, &plan, output, |hash| {
+                store.get(&hash).cloned().ok_or(IndexError::Integrity)
+            }),
+            Err(IndexError::StaleProposal)
+        ));
         let mut seen = Vec::new();
         visit_query_runs_newest(
             spliced.root,
@@ -1055,7 +1059,7 @@ mod tests {
 
     #[test]
     fn compaction_rejects_coverage_atomic_and_root_mismatches() {
-        let (root, store) = build_stream(8);
+        let (root, mut store) = build_stream(8);
         let plan = select_query_run_compaction(
             root,
             |hash| store.get(&hash).cloned().ok_or(IndexError::Integrity),
@@ -1091,6 +1095,33 @@ mod tests {
             })
             .is_err()
         );
+
+        let appended = append_query_run_path_copy(
+            Some(root),
+            partition(),
+            [6; 32],
+            QueryRunReference {
+                hash: [239; 32],
+                encoded_bytes: 1,
+                sequence: 9,
+                level: 0,
+                source_start_offset: 8,
+                next_offset: 9,
+                through_atomic_position: 9,
+            },
+            |hash| store.get(&hash).cloned().ok_or(IndexError::Integrity),
+        )
+        .unwrap();
+        for page in appended.pages {
+            store.insert(page.hash, page.bytes);
+        }
+        let rebased = splice_compacted_query_runs(appended.root, &plan, valid, |hash| {
+            store.get(&hash).cloned().ok_or(IndexError::Integrity)
+        })
+        .unwrap();
+        assert_eq!(rebased.root.next_offset, 9);
+        assert_eq!(rebased.root.last_sequence, 9);
+        assert_eq!(rebased.root.run_count, 6);
 
         let mut false_root = root;
         false_root.run_count += 1;

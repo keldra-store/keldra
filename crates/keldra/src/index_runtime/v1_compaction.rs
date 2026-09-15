@@ -6,16 +6,16 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use keldra_index::v1::{
-    COMPONENT_STREAM_DIRECTORY_FANOUT, ChargedProjectionDeltaPacks, ChargedQueryRunCompaction,
-    ComponentCompactionLimits, ComponentCompactionPlan, ComponentStreamRoot,
-    EncodedComponentStreamPage, IndexingMemoryPermit, ProjectionGeneration, ProjectionPackCredits,
-    ProjectionQueryStreamRoot, QUERY_RUN_PAGE_FANOUT, QueryBlockCredits, QueryBlockLimits,
-    QueryRunCompactionLimits, QueryRunCompactionPlan, QueryRunPage, SealedComponentDelta,
-    TombstoneCompactionPolicy, compact_component_runs, component_stream_child_hashes,
-    decode_query_run_page, pack_component_deltas, prepare_encoded_query_run_compaction,
-    projection_query_run_pack_path, projection_query_run_stream_page_path,
-    projection_stream_page_path, select_component_compaction, select_query_run_compaction,
-    splice_compacted_component_runs,
+    ArtifactPackTable, COMPONENT_STREAM_DIRECTORY_FANOUT, ChargedProjectionDeltaPacks,
+    ChargedQueryRunCompaction, ComponentCompactionLimits, ComponentCompactionPlan,
+    ComponentStreamRoot, EncodedComponentStreamPage, IndexingMemoryPermit, PackedComponentDelta,
+    ProjectionGeneration, ProjectionPackCredits, ProjectionQueryStreamRoot, QUERY_RUN_PAGE_FANOUT,
+    QueryBlockCredits, QueryBlockLimits, QueryRunCompactionLimits, QueryRunCompactionPlan,
+    QueryRunPage, SealedComponentDelta, TombstoneCompactionPolicy, compact_component_runs,
+    component_stream_child_hashes, decode_query_run_page, pack_component_deltas,
+    prepare_encoded_query_run_compaction, projection_query_run_pack_path,
+    projection_query_run_stream_page_path, projection_stream_page_path,
+    select_component_compaction, select_query_run_compaction, splice_compacted_component_runs,
 };
 use tonic::Status;
 
@@ -30,6 +30,13 @@ const MAX_PARALLEL_COMPONENT_COMPACTIONS: usize = 4;
 pub(crate) struct V1ComponentCompaction {
     pub(crate) packs: ChargedProjectionDeltaPacks,
     pub(crate) pages: Vec<EncodedComponentStreamPage>,
+    proposals: Vec<V1ComponentCompactionProposal>,
+}
+
+struct V1ComponentCompactionProposal {
+    plan: ComponentCompactionPlan,
+    output: Vec<PackedComponentDelta>,
+    pack_table: ArtifactPackTable,
 }
 
 pub(crate) struct V1CompactionPublication {
@@ -50,8 +57,127 @@ pub(crate) struct V1CompactionArtifacts {
 }
 
 impl V1CompactionPublication {
+    pub(crate) fn artifacts(&self) -> &V1CompactionArtifacts {
+        &self.artifacts
+    }
+
     pub(crate) fn into_parts(self) -> (V1CompactionBase, V1CompactionArtifacts) {
         (self.base, self.artifacts)
+    }
+
+    /// Rebase immutable compaction outputs over a newer generation. Appended
+    /// runs are retained. A proposal is discarded only when one of its exact
+    /// selected inputs has already been replaced by another compaction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rebase_onto(
+        &mut self,
+        publisher: &V1ProjectionPublisher,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        current: &LoadedV1ProjectionGeneration,
+    ) -> Result<bool, Status> {
+        if self.base.predecessor == current.generation {
+            return Ok(true);
+        }
+        let maximum_bytes = self.base._preload_permit.bytes();
+        let partition = current.generation.partition;
+        let mut rebased = current.generation.clone();
+        let mut resident = self
+            .base
+            .component_overlay
+            .values()
+            .chain(self.base.query_overlay.values())
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes.len()))
+            .ok_or_else(|| Status::resource_exhausted("v1 compaction rebase bytes overflow"))?;
+        if resident > maximum_bytes {
+            return Err(Status::resource_exhausted(
+                "v1 compaction rebase exceeds its retained memory admission",
+            ));
+        }
+        if let Some(component) = self.artifacts.component.as_mut() {
+            for proposal in &component.proposals {
+                let index = rebased
+                    .roots
+                    .binary_search_by_key(&proposal.plan.component(), |root| root.component)
+                    .map_err(|_| Status::data_loss("v1 compaction component disappeared"))?;
+                let stream = ComponentStreamRoot::from_component_root(&rebased.roots[index])
+                    .map_err(index_status)?;
+                let mut pages = self.base.component_overlay.clone();
+                load_component_pages(
+                    publisher,
+                    storage_tenant,
+                    bucket,
+                    tenant_id,
+                    bucket_id,
+                    partition,
+                    stream,
+                    maximum_bytes,
+                    &mut resident,
+                    &mut pages,
+                )
+                .await?;
+                let spliced = match splice_compacted_component_runs(
+                    stream,
+                    &proposal.plan,
+                    &proposal.output,
+                    &proposal.pack_table,
+                    |hash| {
+                        pages
+                            .get(&hash)
+                            .cloned()
+                            .ok_or(keldra_index::IndexError::Integrity)
+                    },
+                ) {
+                    Ok(spliced) => spliced,
+                    Err(keldra_index::IndexError::StaleProposal) => return Ok(false),
+                    Err(error) => return Err(index_status(error)),
+                };
+                rebased.roots[index] = spliced.root.component_root().map_err(index_status)?;
+                for page in spliced.new_pages {
+                    self.base
+                        .component_overlay
+                        .insert(page.hash, Bytes::from(page.bytes.clone()));
+                    component.pages.push(page);
+                }
+            }
+        }
+        if let Some(query) = self.artifacts.query.as_mut() {
+            let mut pages = self.base.query_overlay.clone();
+            load_query_pages(
+                publisher,
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                partition,
+                rebased.query_stream_root.stream_root_hash,
+                maximum_bytes,
+                &mut resident,
+                &mut pages,
+            )
+            .await?;
+            match query.rebase(rebased.query_stream_root, |hash| {
+                pages
+                    .get(&hash)
+                    .cloned()
+                    .ok_or(keldra_index::IndexError::Integrity)
+            }) {
+                Ok(()) => {}
+                Err(keldra_index::IndexError::StaleProposal) => return Ok(false),
+                Err(error) => return Err(index_status(error)),
+            }
+            rebased.query_stream_root = query.splice().root;
+            for page in &query.splice().pages {
+                self.base
+                    .query_overlay
+                    .insert(page.hash, Bytes::from(page.bytes.clone()));
+            }
+        }
+        rebased.validate().map_err(index_status)?;
+        self.base.predecessor = rebased;
+        Ok(true)
     }
 }
 
@@ -266,6 +392,7 @@ impl V1ProjectionPublisher {
                 )
                 .await?;
             let mut replacements = Vec::new();
+            let mut proposals = Vec::new();
             let mut pages = Vec::new();
             for (plan, stream) in selected {
                 let output = packs
@@ -285,6 +412,11 @@ impl V1ProjectionPublisher {
                     .map_err(index_status)?;
                 replacements.push(spliced.root.component_root().map_err(index_status)?);
                 pages.extend(spliced.new_pages);
+                proposals.push(V1ComponentCompactionProposal {
+                    plan,
+                    output,
+                    pack_table: pack_table.clone(),
+                });
             }
             for replacement in replacements {
                 let index = predecessor
@@ -297,7 +429,11 @@ impl V1ProjectionPublisher {
                 Arc::make_mut(&mut component_pages)
                     .insert(page.hash, Bytes::from(page.bytes.clone()));
             }
-            Some(V1ComponentCompaction { packs, pages })
+            Some(V1ComponentCompaction {
+                packs,
+                pages,
+                proposals,
+            })
         };
 
         let query = if loaded.generation.query_stream_root.run_count >= maximum_runs as u64 {

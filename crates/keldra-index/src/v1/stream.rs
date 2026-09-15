@@ -844,7 +844,13 @@ where
 {
     validate_root(previous)?;
     validate_compaction_plan(plan)?;
-    if previous.root_hash != plan.stream_root_hash || previous.component != plan.component {
+    // The selected immutable run identities, rather than the directory root,
+    // are the compaction proposal's conflict set. Later level-zero appends may
+    // produce a new root while retaining every selected input. Rewriting that
+    // newer root is safe and lets compaction complete without stopping the
+    // ordered producer. Missing/replaced inputs are detected by `matched`
+    // below and make the proposal stale.
+    if previous.component != plan.component {
         return Err(IndexError::Integrity);
     }
     if output.len() > plan.inputs.len() {
@@ -907,7 +913,7 @@ where
         &mut matched,
     )?;
     if matched != selected.len() {
-        return Err(IndexError::Integrity);
+        return Err(IndexError::StaleProposal);
     }
     let root = rewritten
         .into_iter()
@@ -1050,7 +1056,7 @@ where
                             next.push(replacement.clone());
                         }
                     }
-                    Some(_) => return Err(IndexError::Integrity),
+                    Some(_) => return Err(IndexError::StaleProposal),
                 }
             }
             if next.is_empty() {
