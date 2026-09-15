@@ -926,6 +926,7 @@ fn diagnose_invalid_specification(specification: &TypedJsonIndexSpec) -> IndexDe
 #[cfg(test)]
 mod tests {
     use keldra_api::v1::index_field::FieldType;
+    use keldra_api::v1::index_result_authorization;
     use keldra_api::v1::index_specification::Specification;
     use keldra_api::v1::{IndexFieldCapability, IndexFieldCardinality, TextAnalyzer};
 
