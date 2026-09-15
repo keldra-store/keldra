@@ -106,6 +106,8 @@ struct QueryPhaseReport {
     scheduler_deadline_misses: u64,
     client_concurrency_rejections: u64,
     request_errors: u64,
+    request_failure_classes: Vec<MutationFailureClass>,
+    request_failure_occurrences_omitted: u64,
     timeouts: u64,
     correctness_errors: u64,
     successful_schedule_to_response_latency: LatencyReport,
@@ -267,6 +269,7 @@ impl MutationRequestFailure {
 
 const MAX_VISIBILITY_SAMPLE_FAILURE_DETAILS: usize = 16;
 const MAX_VISIBILITY_SAMPLE_ERROR_CHARS: usize = 512;
+const MAX_QUERY_FAILURE_CLASSES: usize = 8;
 const MAX_MUTATION_FAILURE_CLASSES: usize = 8;
 const MAX_MUTATION_FAILURE_MESSAGE_CHARS: usize = 512;
 
@@ -519,7 +522,7 @@ async fn run_qualification(
         &config,
         &names,
         &expected,
-        &query_channels,
+        &verification_channels,
         &verification_token,
         config.post,
         Instant::now(),
@@ -1025,8 +1028,9 @@ async fn record_query_completion(
             report.timeouts += 1;
             counters.timeouts.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
             report.request_errors += 1;
+            record_query_request_failure(report, &error);
             counters.errors.fetch_add(1, Ordering::Relaxed);
         }
         Ok(Ok(outcome)) => {
@@ -1782,6 +1786,43 @@ fn record_mutation_failure(report: &mut MutationReport, failure: MutationRequest
                 .failure_occurrences_omitted
                 .saturating_add(class.count);
         }
+    }
+}
+
+fn record_query_request_failure(report: &mut QueryPhaseReport, error: &anyhow::Error) {
+    let class = if let Some(status) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+    {
+        MutationFailureClass {
+            source: "rpc-status",
+            code: status.code() as i32,
+            code_name: format!("{:?}", status.code()),
+            message: bounded_mutation_failure_message(status.message()),
+            count: 1,
+        }
+    } else {
+        MutationFailureClass {
+            source: "client-error",
+            code: -1,
+            code_name: "NonStatus".into(),
+            message: bounded_mutation_failure_message(&format!("{error:#}")),
+            count: 1,
+        }
+    };
+    if let Some(existing) = report.request_failure_classes.iter_mut().find(|existing| {
+        existing.source == class.source
+            && existing.code == class.code
+            && existing.code_name == class.code_name
+            && existing.message == class.message
+    }) {
+        existing.count = existing.count.saturating_add(1);
+    } else if report.request_failure_classes.len() < MAX_QUERY_FAILURE_CLASSES {
+        report.request_failure_classes.push(class);
+    } else {
+        report.request_failure_occurrences_omitted = report
+            .request_failure_occurrences_omitted
+            .saturating_add(class.count);
     }
 }
 

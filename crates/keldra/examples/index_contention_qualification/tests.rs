@@ -372,11 +372,36 @@ async fn query_completion_updates_live_outcome_counters() {
     assert_eq!(report.correctness_errors, 1);
     assert_eq!(report.timeouts, 1);
     assert_eq!(report.request_errors, 1);
+    assert_eq!(report.request_failure_classes.len(), 1);
+    assert_eq!(report.request_failure_classes[0].source, "client-error");
     assert_eq!(counters.completed.load(Ordering::Relaxed), 1);
     assert_eq!(counters.correctness_errors.load(Ordering::Relaxed), 1);
     assert_eq!(counters.timeouts.load(Ordering::Relaxed), 1);
     assert_eq!(counters.errors.load(Ordering::Relaxed), 1);
     assert!(queried.contains(&3));
+}
+
+#[test]
+fn query_request_failures_preserve_bounded_tonic_evidence() {
+    let mut report = QueryPhaseReport::default();
+    let status =
+        tonic::Status::resource_exhausted("x".repeat(MAX_MUTATION_FAILURE_MESSAGE_CHARS + 10));
+    let error = anyhow::Error::new(status);
+
+    record_query_request_failure(&mut report, &error);
+    record_query_request_failure(&mut report, &error);
+
+    assert_eq!(report.request_failure_classes.len(), 1);
+    let class = &report.request_failure_classes[0];
+    assert_eq!(class.source, "rpc-status");
+    assert_eq!(class.code, tonic::Code::ResourceExhausted as i32);
+    assert_eq!(class.code_name, "ResourceExhausted");
+    assert_eq!(
+        class.message.chars().count(),
+        MAX_MUTATION_FAILURE_MESSAGE_CHARS
+    );
+    assert_eq!(class.count, 2);
+    assert_eq!(report.request_failure_occurrences_omitted, 0);
 }
 
 #[tokio::test]
