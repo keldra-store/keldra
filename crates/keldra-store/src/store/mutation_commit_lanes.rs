@@ -203,6 +203,12 @@ pub(super) struct LaneRuntime {
     pub(super) projected_watch: WatchJournalStatus,
     pub(super) projected_receipts: MutationReceiptStatus,
     pub(super) projected_high_version: Option<VersionId>,
+    /// True when the durable reference cursor may advance through every
+    /// reserved source entry.
+    reserved_reference_cursor_safe: bool,
+    /// True when the process-local retention frontier may advance through
+    /// every reserved source entry without a derived-consumer checkpoint.
+    reserved_inline_reference_safe: bool,
     pub(super) completions: BTreeMap<u64, LaneCompletionState>,
 }
 
@@ -428,8 +434,8 @@ impl LaneRuntime {
         watch: WatchJournalStatus,
         receipts: MutationReceiptStatus,
         high_version: Option<VersionId>,
-        reference_cursor_advanced: bool,
-        inline_reference_safe: bool,
+        own_reference_cursor_safe: bool,
+        own_inline_reference_safe: bool,
         visibility_settled: bool,
     ) -> Result<LaneCompletion, MutationError> {
         let ticket = self
@@ -460,6 +466,10 @@ impl LaneRuntime {
                 .checked_add(1)
                 .ok_or_else(|| MutationError::Storage("lane source offset is exhausted".into()))?
         };
+        let reference_cursor_safe =
+            self.reserved_reference_cursor_safe && own_reference_cursor_safe;
+        let inline_reference_safe =
+            self.reserved_inline_reference_safe && own_inline_reference_safe;
         let completion = LaneCompletion {
             ticket,
             first_offset,
@@ -469,7 +479,7 @@ impl LaneRuntime {
             receipt_entries,
             receipt_bytes,
             high_version,
-            reference_cursor_advanced,
+            reference_cursor_advanced: reference_cursor_safe,
             inline_reference_safe,
             visibility_settled,
         };
@@ -477,6 +487,10 @@ impl LaneRuntime {
         self.next_ticket = ticket;
         self.reserved_watch = watch;
         self.reserved_receipts = receipts;
+        if journal_entries != 0 {
+            self.reserved_reference_cursor_safe = reference_cursor_safe;
+            self.reserved_inline_reference_safe = inline_reference_safe;
+        }
         Ok(completion)
     }
 }
@@ -518,6 +532,26 @@ impl Store {
         runtime.reserved_receipts = receipts;
         runtime.projected_receipts = receipts;
         runtime.projected_high_version = high_version;
+        let reference_cursor = self
+            .reference_delta_cursor(watch.source_id)
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        if reference_cursor > watch.tail {
+            return Err(MutationError::Storage(format!(
+                "reference cursor {reference_cursor} is beyond source-journal tail {} while refreshing mutation lanes",
+                watch.tail
+            )));
+        }
+        runtime.reserved_reference_cursor_safe = reference_cursor == watch.tail;
+        let inline_reference_safe = self
+            .source_journal_reference_safe_through
+            .load(Ordering::Acquire);
+        if inline_reference_safe > watch.tail {
+            return Err(MutationError::Storage(format!(
+                "inline reference-safe cursor {inline_reference_safe} is beyond source-journal tail {} while refreshing mutation lanes",
+                watch.tail
+            )));
+        }
+        runtime.reserved_inline_reference_safe = inline_reference_safe == watch.tail;
         self.mutation_commit_lanes
             .authorities_stale
             .store(false, Ordering::Release);
@@ -580,6 +614,33 @@ impl Store {
             projected_ticket = completion.ticket;
             recovered = true;
         }
+        if recovered {
+            self.stage_lane_frontier_projection(
+                &mut batch,
+                &LaneRuntime {
+                    next_ticket: projected_ticket,
+                    projected_ticket,
+                    reserved_watch: watch,
+                    reserved_receipts: receipts,
+                    projected_watch: watch,
+                    projected_receipts: receipts,
+                    projected_high_version: high_version,
+                    reserved_reference_cursor_safe: false,
+                    reserved_inline_reference_safe: false,
+                    completions: BTreeMap::new(),
+                },
+            )?;
+            let mut options = WriteOptions::default();
+            options.disable_wal(true);
+            self.db.write_opt(batch, &options)?;
+        }
+        let reference_cursor = self.reference_delta_cursor(watch.source_id)?;
+        if reference_cursor > watch.tail {
+            anyhow::bail!(
+                "reference cursor {reference_cursor} is beyond source-journal tail {} while initializing mutation lanes",
+                watch.tail
+            );
+        }
         let runtime = LaneRuntime {
             next_ticket: projected_ticket,
             projected_ticket,
@@ -588,14 +649,10 @@ impl Store {
             projected_watch: watch,
             projected_receipts: receipts,
             projected_high_version: high_version,
+            reserved_reference_cursor_safe: reference_cursor == watch.tail,
+            reserved_inline_reference_safe: watch.retention_floor == watch.tail,
             completions: BTreeMap::new(),
         };
-        if recovered {
-            self.stage_lane_frontier_projection(&mut batch, &runtime)?;
-            let mut options = WriteOptions::default();
-            options.disable_wal(true);
-            self.db.write_opt(batch, &options)?;
-        }
         if let Some(version) = high_version {
             self.clock.observe(version);
         }
@@ -1337,6 +1394,8 @@ mod tests {
                 bytes: 20,
             },
             projected_high_version: Some(VersionId(10)),
+            reserved_reference_cursor_safe: true,
+            reserved_inline_reference_safe: true,
             completions: BTreeMap::new(),
         };
         let completion = runtime
@@ -1359,6 +1418,100 @@ mod tests {
             (completion.receipt_entries, completion.receipt_bytes),
             (1, 15)
         );
+    }
+
+    #[test]
+    fn reservations_preserve_a_contiguous_reference_safe_frontier() {
+        let initial = status(0, 0, 0);
+        let receipts = MutationReceiptStatus {
+            entries: 0,
+            bytes: 0,
+        };
+        let mut runtime = LaneRuntime {
+            next_ticket: 0,
+            projected_ticket: 0,
+            reserved_watch: initial,
+            reserved_receipts: receipts,
+            projected_watch: initial,
+            projected_receipts: receipts,
+            projected_high_version: None,
+            reserved_reference_cursor_safe: true,
+            reserved_inline_reference_safe: true,
+            completions: BTreeMap::new(),
+        };
+
+        let first = runtime
+            .reserve_with_reference_settlement(status(1, 1, 100), receipts, None, true, true, true)
+            .unwrap();
+        let second = runtime
+            .reserve_with_reference_settlement(status(2, 2, 200), receipts, None, true, true, true)
+            .unwrap();
+
+        assert!(first.reference_cursor_advanced);
+        assert!(first.inline_reference_safe);
+        assert!(second.reference_cursor_advanced);
+        assert!(second.inline_reference_safe);
+    }
+
+    #[test]
+    fn reservations_do_not_jump_an_unsettled_reference_frontier() {
+        let initial = status(1, 1, 100);
+        let receipts = MutationReceiptStatus {
+            entries: 0,
+            bytes: 0,
+        };
+        let mut runtime = LaneRuntime {
+            next_ticket: 0,
+            projected_ticket: 0,
+            reserved_watch: initial,
+            reserved_receipts: receipts,
+            projected_watch: initial,
+            projected_receipts: receipts,
+            projected_high_version: None,
+            reserved_reference_cursor_safe: false,
+            reserved_inline_reference_safe: false,
+            completions: BTreeMap::new(),
+        };
+
+        let completion = runtime
+            .reserve_with_reference_settlement(status(2, 2, 200), receipts, None, true, true, true)
+            .unwrap();
+
+        assert!(!completion.reference_cursor_advanced);
+        assert!(!completion.inline_reference_safe);
+    }
+
+    #[test]
+    fn no_reference_artifact_keeps_cursor_safe_without_skipping_retention_consumers() {
+        let initial = status(0, 0, 0);
+        let receipts = MutationReceiptStatus {
+            entries: 0,
+            bytes: 0,
+        };
+        let mut runtime = LaneRuntime {
+            next_ticket: 0,
+            projected_ticket: 0,
+            reserved_watch: initial,
+            reserved_receipts: receipts,
+            projected_watch: initial,
+            projected_receipts: receipts,
+            projected_high_version: None,
+            reserved_reference_cursor_safe: true,
+            reserved_inline_reference_safe: true,
+            completions: BTreeMap::new(),
+        };
+
+        let artifact = runtime
+            .reserve_with_reference_settlement(status(1, 1, 100), receipts, None, true, false, true)
+            .unwrap();
+        let foreground = runtime
+            .reserve_with_reference_settlement(status(2, 2, 200), receipts, None, true, true, true)
+            .unwrap();
+
+        assert!(artifact.reference_cursor_advanced);
+        assert!(!artifact.inline_reference_safe);
+        assert!(foreground.reference_cursor_advanced);
+        assert!(!foreground.inline_reference_safe);
     }
 
     #[tokio::test]

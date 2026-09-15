@@ -137,7 +137,7 @@ impl Store {
                 staged.status,
                 receipts,
                 None,
-                cursor == source.tail,
+                true,
                 false,
                 staged.visibility_settlement_staged,
             )?;
@@ -261,7 +261,7 @@ impl Store {
                             staged.status,
                             receipts,
                             None,
-                            cursor == source.tail,
+                            true,
                             false,
                             staged.visibility_settlement_staged,
                         )
