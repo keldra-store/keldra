@@ -571,6 +571,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             config.token_manager.clone(),
             name_resolver.clone(),
             index_authorization.clone(),
+            object_service.clone(),
             index_runtime.local_queries.clone(),
         )))
         .map_err(|_| anyhow::anyhow!("routed index query handler was installed more than once"))?;

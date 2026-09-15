@@ -10,12 +10,14 @@ mod service;
 pub(crate) use boundary::{
     ExecuteIndexQuery, ExecutedIndexQuery, IndexAuthorization, IndexAuthorizationEvidence,
     IndexDefinitionLister, IndexDefinitionScan, IndexDefinitionScanPage, IndexFreshnessRequirement,
-    IndexPageCursor, IndexQueryExecutor, IndexServiceDependencies, ListedIndexDefinition,
+    IndexPageCursor, IndexQueryAuthorizationEvidence, IndexQueryExecutor,
+    IndexRealmAuthorizationEvidence, IndexResultAuthorizationPolicy, IndexServiceDependencies,
+    ListedIndexDefinition, RealmIndexAuthorizationTarget, RealmIndexResultAuthorizationPolicy,
     RequiredIndexSourceCheckpoint,
 };
 pub(crate) use candidate_visibility::{
     AuthorizedSnapshotCandidates, CandidateVisibilityEvidence, IndexCandidateIdentity,
-    IndexCandidateVisibility,
+    IndexCandidateVisibility, result_authorization_policy,
 };
 
 pub(crate) use definition::{

@@ -118,6 +118,9 @@ pub(crate) const CF_AUTHZ_TENANTS: &str = "authz_tenants";
 pub(crate) const CF_AUTHZ_SCHEMAS: &str = "authz_schemas";
 pub(crate) const CF_AUTHZ_BINDINGS: &str = "authz_bindings";
 pub(crate) const CF_AUTHZ_TUPLES: &str = "authz_tuples";
+/// Disposable, revision-validated Zanzibar userset adjacency projections.
+pub(crate) const CF_AUTHZ_LEOPARD_FORWARD: &str = "authz_leopard_forward";
+pub(crate) const CF_AUTHZ_LEOPARD_REVERSE: &str = "authz_leopard_reverse";
 pub(crate) const CF_AUTHZ_RECEIPTS: &str = "authz_receipts";
 pub(crate) const CF_CREDENTIALS: &str = "credentials";
 pub(crate) const CF_DEFINITION_STATE: &str = "definition_state";
@@ -171,6 +174,8 @@ pub(crate) const COLUMN_FAMILIES: &[&str] = &[
     CF_AUTHZ_SCHEMAS,
     CF_AUTHZ_BINDINGS,
     CF_AUTHZ_TUPLES,
+    CF_AUTHZ_LEOPARD_FORWARD,
+    CF_AUTHZ_LEOPARD_REVERSE,
     CF_AUTHZ_RECEIPTS,
     CF_CREDENTIALS,
     CF_DEFINITION_STATE,
@@ -401,6 +406,7 @@ pub struct Store {
     pub(crate) authz_write_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) authz_compiled_cache:
         Arc<std::sync::Mutex<crate::authz::CompiledAuthorizationCache>>,
+    pub(crate) authz_leopard_cache: Arc<std::sync::Mutex<crate::authz::CompiledLeopardCache>>,
     pub(crate) bucket_options_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) definition_state_lock: Arc<std::sync::Mutex<()>>,
     index_projection_state_locks:
@@ -1052,6 +1058,9 @@ impl Store {
             authz_compiled_cache: Arc::new(std::sync::Mutex::new(
                 crate::authz::CompiledAuthorizationCache::default(),
             )),
+            authz_leopard_cache: Arc::new(std::sync::Mutex::new(
+                crate::authz::CompiledLeopardCache::default(),
+            )),
             bucket_options_lock: Arc::new(std::sync::Mutex::new(())),
             definition_state_lock: Arc::new(std::sync::Mutex::new(())),
             index_projection_state_locks: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
@@ -1081,10 +1090,12 @@ impl Store {
             #[cfg(test)]
             test_identity_lock: Arc::new(std::sync::Mutex::new(())),
         };
+        store.authz().ensure_leopard_indexes()?;
         store.clear_index_projection_state_cache()?;
         store
             .initialize_mutation_lane_runtime(existing_database)
             .await?;
+        store.start_mutation_lane_projector().await?;
         let durable_floor = store.local_watch_status()?.retention_floor;
         store
             .source_journal_reference_safe_through
@@ -1881,15 +1892,6 @@ fn advance_blob_reference_publication(
     }
     state.updated_at = state.updated_at.max(now_unix_millis);
     Ok(state)
-}
-
-fn blob_reference_is_garbage(
-    state: BlobReferenceState,
-    now_unix_millis: u64,
-    awaiting_publish_ttl_millis: u64,
-) -> bool {
-    (state.ref_count == 0 || state.flags & AWAITING_PUBLISH != 0)
-        && now_unix_millis.saturating_sub(state.updated_at) >= awaiting_publish_ttl_millis
 }
 
 pub(crate) fn object_path(key: &ObjectKey) -> ObjectPath {

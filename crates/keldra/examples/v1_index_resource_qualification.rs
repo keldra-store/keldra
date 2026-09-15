@@ -1622,6 +1622,7 @@ async fn query_partition(
             page_token: Vec::new(),
             tenant: String::new(),
             required_freshness: None,
+            authorization_subject: None,
         })
         .await
         .map(tonic::Response::into_inner)

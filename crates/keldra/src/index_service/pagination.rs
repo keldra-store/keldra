@@ -6,7 +6,10 @@ use tonic::Status;
 
 use crate::authentication::{Caller, JwtManager};
 
-use super::boundary::{IndexPageCursor, IndexPageTokenBinding, IndexPageTokenCodec};
+use super::boundary::{
+    IndexPageCursor, IndexPageTokenBinding, IndexPageTokenCodec, IndexRealmAuthorizationEvidence,
+    IndexResultAuthorizationPolicy,
+};
 
 pub(crate) const INDEX_PAGE_TOKEN_AUDIENCE: &str = "keldra-index-page";
 pub(crate) const INDEX_PAGE_TOKEN_PURPOSE: &str = "index-page";
@@ -31,11 +34,14 @@ pub(crate) struct IndexPageTokenClaims {
     pub(crate) commit_revision: u64,
     pub(crate) query_hash: [u8; 32],
     pub(crate) authorization_revision: u64,
+    pub(crate) result_authorization: IndexResultAuthorizationPolicy,
+    pub(crate) authorization_subject: Option<ObjectRef>,
+    pub(crate) result_authorization_evidence: Option<IndexRealmAuthorizationEvidence>,
     pub(crate) last_position: Vec<u8>,
 }
 
 impl IndexPageTokenClaims {
-    fn new(caller: &Caller, binding: IndexPageTokenBinding, cursor: &IndexPageCursor) -> Self {
+    fn new(caller: &Caller, binding: &IndexPageTokenBinding, cursor: &IndexPageCursor) -> Self {
         Self {
             format: INDEX_PAGE_TOKEN_FORMAT,
             aud: INDEX_PAGE_TOKEN_AUDIENCE.into(),
@@ -49,6 +55,9 @@ impl IndexPageTokenClaims {
             commit_revision: cursor.commit_revision,
             query_hash: binding.query_hash,
             authorization_revision: cursor.authorization_revision,
+            result_authorization: binding.result_authorization.clone(),
+            authorization_subject: binding.authorization_subject.clone(),
+            result_authorization_evidence: binding.result_authorization_evidence.clone(),
             last_position: cursor.last_position.clone(),
         }
     }
@@ -67,18 +76,26 @@ impl IndexPageTokenClaims {
             && self.definition_version != 0
             && self.authorization_revision != 0
             && !self.last_position.is_empty()
+            && policy_evidence_matches(
+                &self.result_authorization,
+                self.authorization_subject.as_ref(),
+                self.result_authorization_evidence.as_ref(),
+            )
     }
 
     fn belongs_to(&self, caller: &Caller) -> bool {
         self.storage_tenant == caller.storage_tenant().as_str() && &self.subject == caller.subject()
     }
 
-    fn matches(&self, expected: IndexPageTokenBinding) -> bool {
+    fn matches(&self, expected: &IndexPageTokenBinding) -> bool {
         self.tenant_id == expected.tenant_id
             && self.bucket_id == expected.bucket_id
             && self.index_id == expected.index_id
             && self.definition_version == expected.definition_version
             && self.query_hash == expected.query_hash
+            && self.result_authorization == expected.result_authorization
+            && self.authorization_subject == expected.authorization_subject
+            && self.result_authorization_evidence == expected.result_authorization_evidence
     }
 
     fn cursor(self) -> IndexPageCursor {
@@ -97,11 +114,12 @@ impl IndexPageTokenCodec for JwtManager {
         token: &[u8],
         expected: IndexPageTokenBinding,
     ) -> Result<IndexPageCursor, Status> {
-        require_binding(expected)?;
+        require_binding(&expected)?;
         let claims = self
             .open_index_page_token(token)
             .map_err(|_| invalid_token())?;
-        if !claims.has_valid_envelope() || !claims.belongs_to(caller) || !claims.matches(expected) {
+        if !claims.has_valid_envelope() || !claims.belongs_to(caller) || !claims.matches(&expected)
+        {
             return Err(invalid_token());
         }
         Ok(claims.cursor())
@@ -113,18 +131,27 @@ impl IndexPageTokenCodec for JwtManager {
         binding: IndexPageTokenBinding,
         cursor: &IndexPageCursor,
     ) -> Result<Vec<u8>, Status> {
-        require_binding(binding)?;
+        require_binding(&binding)?;
         require_cursor(cursor)?;
-        self.seal_index_page_token(&IndexPageTokenClaims::new(caller, binding, cursor))
+        self.seal_index_page_token(&IndexPageTokenClaims::new(caller, &binding, cursor))
             .map_err(|_| Status::internal("could not issue index page token"))
     }
 }
 
-fn require_binding(binding: IndexPageTokenBinding) -> Result<(), Status> {
+fn require_binding(binding: &IndexPageTokenBinding) -> Result<(), Status> {
     if binding.tenant_id == 0
         || binding.bucket_id == 0
         || binding.index_id == 0
         || binding.definition_version == 0
+        || !policy_subject_matches(
+            &binding.result_authorization,
+            binding.authorization_subject.as_ref(),
+        )
+        || !policy_evidence_matches(
+            &binding.result_authorization,
+            binding.authorization_subject.as_ref(),
+            binding.result_authorization_evidence.as_ref(),
+        )
     {
         Err(Status::internal("index page binding is invalid"))
     } else {
@@ -142,13 +169,48 @@ fn require_cursor(cursor: &IndexPageCursor) -> Result<(), Status> {
     }
 }
 
+fn policy_evidence_matches(
+    policy: &IndexResultAuthorizationPolicy,
+    subject: Option<&ObjectRef>,
+    evidence: Option<&IndexRealmAuthorizationEvidence>,
+) -> bool {
+    match (policy, subject, evidence) {
+        (IndexResultAuthorizationPolicy::Application, None, None) => true,
+        (IndexResultAuthorizationPolicy::Realm(_), Some(subject), Some(evidence)) => {
+            policy_subject_matches(policy, Some(subject))
+                && evidence.revision != 0
+                && evidence.binding_generation != 0
+                && evidence.schema_ref.schema_revision != 0
+        }
+        _ => false,
+    }
+}
+
+fn policy_subject_matches(
+    policy: &IndexResultAuthorizationPolicy,
+    subject: Option<&ObjectRef>,
+) -> bool {
+    match (policy, subject) {
+        (IndexResultAuthorizationPolicy::Application, None) => true,
+        (IndexResultAuthorizationPolicy::Realm(policy), Some(subject)) => {
+            !subject.is_anonymous()
+                && !subject.is_public()
+                && keldra_authz::RealmId::custom(&policy.realm).is_ok()
+                && ObjectRef::opaque(&policy.resource_namespace, "validation")
+                    .and_then(|resource| keldra_authz::UsersetRef::new(resource, &policy.relation))
+                    .is_ok()
+        }
+        _ => false,
+    }
+}
+
 fn invalid_token() -> Status {
     Status::invalid_argument("index page token is invalid for this query")
 }
 
 #[cfg(test)]
 mod tests {
-    use keldra_store::StorageTenantId;
+    use keldra_store::{SchemaDigest, SchemaId, SchemaRef, StorageTenantId};
 
     use super::*;
     use crate::authentication::PUT_TOKEN_LIFETIME;
@@ -167,6 +229,9 @@ mod tests {
             index_id: 17,
             definition_version: 23,
             query_hash: [5; 32],
+            result_authorization: IndexResultAuthorizationPolicy::Application,
+            authorization_subject: None,
+            result_authorization_evidence: None,
         }
     }
 
@@ -250,7 +315,7 @@ mod tests {
         let manager = JwtManager::new(KEY).unwrap();
         let caller = caller("tenant-a", "app-a");
         let expected = binding();
-        let mut claims = IndexPageTokenClaims::new(&caller, expected, &cursor());
+        let mut claims = IndexPageTokenClaims::new(&caller, &expected, &cursor());
         claims.format = 0;
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
@@ -276,5 +341,48 @@ mod tests {
                 .decode(&caller, put_token.as_bytes(), binding())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn realm_page_token_binds_end_user_policy_revision_and_schema() {
+        let manager = JwtManager::new(KEY).unwrap();
+        let caller = caller("tenant-a", "app-a");
+        let mut binding = binding();
+        binding.result_authorization = IndexResultAuthorizationPolicy::Realm(
+            super::super::boundary::RealmIndexResultAuthorizationPolicy {
+                realm: "workspace".into(),
+                resource_namespace: "document".into(),
+                relation: "view".into(),
+                target: super::super::boundary::RealmIndexAuthorizationTarget::ResultPath,
+            },
+        );
+        binding.authorization_subject = Some(ObjectRef::opaque("user", "alice").unwrap());
+        let cursor = cursor();
+        binding.result_authorization_evidence = Some(IndexRealmAuthorizationEvidence {
+            revision: 47,
+            binding_generation: 53,
+            schema_ref: SchemaRef {
+                schema_id: SchemaId::parse("documents").unwrap(),
+                schema_revision: 59,
+                schema_digest: SchemaDigest([11; 32]),
+            },
+        });
+        let token = manager.encode(&caller, binding.clone(), &cursor).unwrap();
+        assert_eq!(
+            manager.decode(&caller, &token, binding.clone()).unwrap(),
+            cursor
+        );
+
+        let mut another_subject = binding.clone();
+        another_subject.authorization_subject = Some(ObjectRef::opaque("user", "bob").unwrap());
+        assert!(manager.decode(&caller, &token, another_subject).is_err());
+
+        binding
+            .result_authorization_evidence
+            .as_mut()
+            .unwrap()
+            .schema_ref
+            .schema_revision += 1;
+        assert!(manager.decode(&caller, &token, binding).is_err());
     }
 }

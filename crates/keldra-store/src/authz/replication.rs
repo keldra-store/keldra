@@ -501,15 +501,29 @@ impl AuthzRepository {
                 for change in mutations {
                     let key = tuple_key(&mutation.scope, &change.tuple)?;
                     match change.kind {
-                        TupleMutationKind::Add => batch.put_cf(
-                            self.cf(CF_AUTHZ_TUPLES)?,
-                            key,
-                            encode_json(&StoredTuple {
-                                tuple: change.tuple.clone(),
-                            })?,
-                        ),
+                        TupleMutationKind::Add => {
+                            batch.put_cf(
+                                self.cf(CF_AUTHZ_TUPLES)?,
+                                key,
+                                encode_json(&StoredTuple {
+                                    tuple: change.tuple.clone(),
+                                })?,
+                            );
+                            self.stage_leopard_tuple(
+                                &mut batch,
+                                &mutation.scope,
+                                &change.tuple,
+                                true,
+                            )?;
+                        }
                         TupleMutationKind::Remove => {
-                            batch.delete_cf(self.cf(CF_AUTHZ_TUPLES)?, key)
+                            batch.delete_cf(self.cf(CF_AUTHZ_TUPLES)?, key);
+                            self.stage_leopard_tuple(
+                                &mut batch,
+                                &mutation.scope,
+                                &change.tuple,
+                                false,
+                            )?;
                         }
                     }
                 }

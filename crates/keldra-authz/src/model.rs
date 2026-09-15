@@ -24,6 +24,7 @@ pub enum AuthorizationError {
     InvalidSchema(String),
     InvalidTuple { index: usize, reason: String },
     InvalidCheck(String),
+    EvaluationSource(String),
     EvaluationLimit { limit: &'static str, maximum: usize },
 }
 
@@ -44,6 +45,12 @@ impl fmt::Display for AuthorizationError {
             }
             Self::InvalidCheck(reason) => {
                 write!(formatter, "invalid authorization check: {reason}")
+            }
+            Self::EvaluationSource(reason) => {
+                write!(
+                    formatter,
+                    "authorization evaluation source failed: {reason}"
+                )
             }
             Self::EvaluationLimit { limit, maximum } => write!(
                 formatter,

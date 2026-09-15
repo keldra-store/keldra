@@ -456,6 +456,7 @@ async fn execute(
             page_token,
             tenant: String::new(),
             required_freshness: None,
+            authorization_subject: None,
         })
         .await
         .context("run production-shaped TypedJson query")?

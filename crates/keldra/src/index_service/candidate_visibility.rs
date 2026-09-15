@@ -11,11 +11,16 @@
 
 use std::sync::Arc;
 
-use keldra_api::v1::{IndexKind, IndexQueryHit};
-use keldra_store::ObjectKey;
+use keldra_api::v1::index_result_authorization::Policy as ApiResultAuthorizationPolicy;
+use keldra_api::v1::{IndexAuthorizationTarget, IndexDefinition, IndexKind, IndexQueryHit};
+use keldra_authz::{ExactPath, ObjectRef, RealmId};
+use keldra_store::{AuthzScope, ObjectKey, StorageTenantId};
 use tonic::Status;
 
-use super::boundary::IndexAuthorization;
+use super::boundary::{
+    IndexAuthorization, IndexQueryAuthorizationEvidence, IndexResultAuthorizationPolicy,
+    RealmIndexAuthorizationTarget, RealmIndexResultAuthorizationPolicy,
+};
 use crate::authentication::{Caller, PluginObjectScope};
 use crate::authorization::ObjectPermission;
 use crate::object_path_access;
@@ -60,7 +65,10 @@ pub(crate) trait IndexCandidateVisibility: Send + Sync + 'static {
 #[derive(Clone)]
 pub(crate) struct AuthorizedSnapshotCandidates {
     caller: Caller,
-    authorization_revision: u64,
+    tenant_id: u64,
+    admission: IndexQueryAuthorizationEvidence,
+    result_policy: IndexResultAuthorizationPolicy,
+    authorization_subject: Option<ObjectRef>,
     bucket: String,
     path_prefix: String,
     kind: IndexKind,
@@ -72,7 +80,10 @@ impl AuthorizedSnapshotCandidates {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         caller: Caller,
-        authorization_revision: u64,
+        tenant_id: u64,
+        admission: IndexQueryAuthorizationEvidence,
+        result_policy: IndexResultAuthorizationPolicy,
+        authorization_subject: Option<ObjectRef>,
         bucket: String,
         path_prefix: String,
         kind: IndexKind,
@@ -81,7 +92,10 @@ impl AuthorizedSnapshotCandidates {
     ) -> Self {
         Self {
             caller,
-            authorization_revision,
+            tenant_id,
+            admission,
+            result_policy,
+            authorization_subject,
             bucket,
             path_prefix,
             kind,
@@ -140,6 +154,71 @@ impl AuthorizedSnapshotCandidates {
                 .as_ref()
                 .is_none_or(|scope| scope.allows(key.tenant(), key.bucket(), key.path()))
     }
+
+    fn realm_resource(
+        &self,
+        policy: &RealmIndexResultAuthorizationPolicy,
+        source: &ObjectKey,
+        result: &ObjectKey,
+    ) -> Result<ObjectRef, Status> {
+        let target = match policy.target {
+            RealmIndexAuthorizationTarget::CanonicalSourcePath => source,
+            RealmIndexAuthorizationTarget::ResultPath => result,
+        };
+        ObjectRef::exact_path(
+            policy.resource_namespace.clone(),
+            ExactPath::new(target.tenant(), target.bucket(), target.path())
+                .map_err(crate::authz_api::authz_status)?,
+        )
+        .map_err(crate::authz_api::authz_status)
+    }
+}
+
+pub(crate) fn result_authorization_policy(
+    definition: &IndexDefinition,
+) -> Result<IndexResultAuthorizationPolicy, Status> {
+    let policy = definition
+        .result_authorization
+        .as_ref()
+        .and_then(|authorization| authorization.policy.as_ref())
+        .ok_or_else(|| Status::data_loss("index definition has no result authorization policy"))?;
+    match policy {
+        ApiResultAuthorizationPolicy::Application(_) => {
+            Ok(IndexResultAuthorizationPolicy::Application)
+        }
+        ApiResultAuthorizationPolicy::Realm(policy) => {
+            RealmId::custom(&policy.realm).map_err(crate::authz_api::authz_status)?;
+            ObjectRef::opaque(&policy.resource_namespace, "validation")
+                .map_err(crate::authz_api::authz_status)?;
+            keldra_authz::UsersetRef::new(
+                ObjectRef::opaque(&policy.resource_namespace, "validation")
+                    .map_err(crate::authz_api::authz_status)?,
+                &policy.relation,
+            )
+            .map_err(crate::authz_api::authz_status)?;
+            let target = match IndexAuthorizationTarget::try_from(policy.target) {
+                Ok(IndexAuthorizationTarget::CanonicalSourcePath) => {
+                    RealmIndexAuthorizationTarget::CanonicalSourcePath
+                }
+                Ok(IndexAuthorizationTarget::ResultPath) => {
+                    RealmIndexAuthorizationTarget::ResultPath
+                }
+                Ok(IndexAuthorizationTarget::Unspecified) | Err(_) => {
+                    return Err(Status::data_loss(
+                        "index definition has an invalid result authorization target",
+                    ));
+                }
+            };
+            Ok(IndexResultAuthorizationPolicy::Realm(
+                RealmIndexResultAuthorizationPolicy {
+                    realm: policy.realm.clone(),
+                    resource_namespace: policy.resource_namespace.clone(),
+                    relation: policy.relation.clone(),
+                    target,
+                },
+            ))
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -153,7 +232,7 @@ impl IndexCandidateVisibility for AuthorizedSnapshotCandidates {
                 "index candidate visibility batch exceeds its bound",
             ));
         }
-        if self.authorization_revision == 0 {
+        if self.admission.system_revision == 0 {
             return Err(Status::data_loss(
                 "index candidate visibility has no Zanzibar admission revision",
             ));
@@ -161,44 +240,111 @@ impl IndexCandidateVisibility for AuthorizedSnapshotCandidates {
         if candidates.is_empty() {
             return Ok(CandidateVisibilityEvidence {
                 visible: Vec::new(),
-                authorization_revision: self.authorization_revision,
+                authorization_revision: self.admission.system_revision,
                 denied: 0,
             });
         }
 
         let mut checks = Vec::with_capacity(candidates.len());
         let mut capability_allowed = Vec::with_capacity(candidates.len());
+        let mut realm_resources = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             let (source, result) = self.validate_candidate(candidate)?;
             capability_allowed
                 .push(self.capability_allows(&source) && self.capability_allows(&result));
             let resource = if matches!(self.kind, IndexKind::GitSource | IndexKind::Tensor) {
-                result
+                result.clone()
             } else {
-                source
+                source.clone()
             };
             checks.push((resource, ObjectPermission::Get));
+            realm_resources.push(match &self.result_policy {
+                IndexResultAuthorizationPolicy::Application => None,
+                IndexResultAuthorizationPolicy::Realm(policy) => {
+                    Some(self.realm_resource(policy, &source, &result)?)
+                }
+            });
         }
         let evidence = self
             .authorization
-            .allows_objects_with_evidence(&self.caller, &checks)
+            .allows_objects_at_revision_with_evidence(
+                &self.caller,
+                &checks,
+                self.admission.system_revision,
+            )
             .await?;
         if evidence.revision == 0 || evidence.allowed.len() != checks.len() {
             return Err(Status::data_loss(
                 "Zanzibar returned invalid index authorization evidence",
             ));
         }
-        if evidence.revision != self.authorization_revision {
+        if evidence.revision != self.admission.system_revision {
             return Err(Status::failed_precondition(
                 "authorization revision changed during index execution",
             ));
         }
-        let visible = evidence
+        let mut visible = evidence
             .allowed
             .into_iter()
             .zip(capability_allowed)
             .map(|(authorized, capability)| authorized && capability)
             .collect::<Vec<_>>();
+        if let IndexResultAuthorizationPolicy::Realm(policy) = &self.result_policy {
+            let required = self.admission.result.as_ref().ok_or_else(|| {
+                Status::data_loss("custom-realm query has no authorization evidence")
+            })?;
+            let subject = self.authorization_subject.as_ref().ok_or_else(|| {
+                Status::permission_denied("custom-realm query requires an end-user subject")
+            })?;
+            let scope = AuthzScope::new(
+                StorageTenantId::parse(self.caller.storage_tenant().as_str())
+                    .map_err(|error| Status::data_loss(error.to_string()))?,
+                RealmId::custom(&policy.realm).map_err(crate::authz_api::authz_status)?,
+            )
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+            let admitted_indexes = visible
+                .iter()
+                .enumerate()
+                .filter_map(|(index, admitted)| admitted.then_some(index))
+                .collect::<Vec<_>>();
+            if !admitted_indexes.is_empty() {
+                let resources = admitted_indexes
+                    .iter()
+                    .map(|index| {
+                        realm_resources[*index].clone().ok_or_else(|| {
+                            Status::internal("custom-realm candidate mapping is missing")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Status>>()?;
+                let checked = self
+                    .authorization
+                    .allows_realm_results_with_evidence(
+                        &self.caller,
+                        self.tenant_id,
+                        &scope,
+                        subject,
+                        &policy.relation,
+                        &resources,
+                        self.admission.system_revision,
+                        required,
+                    )
+                    .await?;
+                if checked.revision != required.revision
+                    || checked.allowed.len() != admitted_indexes.len()
+                {
+                    return Err(Status::data_loss(
+                        "custom realm returned invalid index authorization evidence",
+                    ));
+                }
+                for (index, allowed) in admitted_indexes.into_iter().zip(checked.allowed) {
+                    visible[index] &= allowed;
+                }
+            }
+        } else if self.admission.result.is_some() || self.authorization_subject.is_some() {
+            return Err(Status::data_loss(
+                "application-authorized query carries custom-realm evidence",
+            ));
+        }
         let denied = u64::try_from(visible.iter().filter(|allowed| !**allowed).count())
             .map_err(|_| Status::resource_exhausted("candidate count exceeds u64"))?;
         Ok(CandidateVisibilityEvidence {
@@ -211,12 +357,16 @@ impl IndexCandidateVisibility for AuthorizedSnapshotCandidates {
 
 #[cfg(test)]
 mod tests {
-    use keldra_api::v1::ObjectAddress;
-    use keldra_store::StorageTenantId;
+    use keldra_api::v1::{
+        ApplicationIndexResultAuthorization, IndexResultAuthorization, ObjectAddress,
+        RealmIndexResultAuthorization, index_result_authorization,
+    };
+    use keldra_authz::ObjectId;
+    use keldra_store::{SchemaDigest, SchemaId, SchemaRef, StorageTenantId};
     use std::sync::Mutex;
 
     use super::*;
-    use crate::index_service::IndexAuthorizationEvidence;
+    use crate::index_service::{IndexAuthorizationEvidence, IndexRealmAuthorizationEvidence};
 
     struct TestAuthorization;
 
@@ -239,6 +389,92 @@ mod tests {
 
     struct RecordingAuthorization {
         seen: Mutex<Vec<String>>,
+    }
+
+    struct CustomRealmAuthorization;
+
+    struct IntersectingRealmAuthorization {
+        realm_resources: Mutex<Vec<String>>,
+    }
+
+    #[tonic::async_trait]
+    impl IndexAuthorization for CustomRealmAuthorization {
+        async fn allows_objects_with_evidence(
+            &self,
+            _caller: &Caller,
+            requests: &[(ObjectKey, ObjectPermission)],
+        ) -> Result<IndexAuthorizationEvidence, Status> {
+            Ok(IndexAuthorizationEvidence {
+                allowed: vec![true; requests.len()],
+                revision: 9,
+            })
+        }
+
+        async fn allows_realm_results_with_evidence(
+            &self,
+            _caller: &Caller,
+            _stable_tenant_id: u64,
+            _scope: &AuthzScope,
+            _authorization_subject: &ObjectRef,
+            relation: &str,
+            resources: &[ObjectRef],
+            required_system_revision: u64,
+            required: &IndexRealmAuthorizationEvidence,
+        ) -> Result<IndexAuthorizationEvidence, Status> {
+            assert_eq!(relation, "view");
+            assert_eq!(required_system_revision, 9);
+            Ok(IndexAuthorizationEvidence {
+                allowed: resources
+                    .iter()
+                    .map(|resource| match &resource.id {
+                        ObjectId::ExactPath(path) => path.path != "canonical/denied",
+                        ObjectId::Opaque(_) => false,
+                    })
+                    .collect(),
+                revision: required.revision,
+            })
+        }
+    }
+
+    #[tonic::async_trait]
+    impl IndexAuthorization for IntersectingRealmAuthorization {
+        async fn allows_objects_with_evidence(
+            &self,
+            _caller: &Caller,
+            requests: &[(ObjectKey, ObjectPermission)],
+        ) -> Result<IndexAuthorizationEvidence, Status> {
+            Ok(IndexAuthorizationEvidence {
+                allowed: requests
+                    .iter()
+                    .map(|(key, _)| key.path() != "docs/system-denied")
+                    .collect(),
+                revision: 9,
+            })
+        }
+
+        async fn allows_realm_results_with_evidence(
+            &self,
+            _caller: &Caller,
+            _stable_tenant_id: u64,
+            _scope: &AuthzScope,
+            _authorization_subject: &ObjectRef,
+            _relation: &str,
+            resources: &[ObjectRef],
+            _required_system_revision: u64,
+            required: &IndexRealmAuthorizationEvidence,
+        ) -> Result<IndexAuthorizationEvidence, Status> {
+            *self.realm_resources.lock().unwrap() = resources
+                .iter()
+                .map(|resource| match &resource.id {
+                    ObjectId::ExactPath(path) => path.path.clone(),
+                    ObjectId::Opaque(id) => id.clone(),
+                })
+                .collect();
+            Ok(IndexAuthorizationEvidence {
+                allowed: vec![true; resources.len()],
+                revision: required.revision,
+            })
+        }
     }
 
     #[tonic::async_trait]
@@ -287,13 +523,31 @@ mod tests {
                 "application",
             )
             .unwrap(),
-            9,
+            11,
+            IndexQueryAuthorizationEvidence {
+                system_revision: 9,
+                result: None,
+            },
+            IndexResultAuthorizationPolicy::Application,
+            None,
             "objects".into(),
             "docs/".into(),
             kind,
             None,
             Arc::new(TestAuthorization),
         )
+    }
+
+    fn realm_evidence() -> IndexRealmAuthorizationEvidence {
+        IndexRealmAuthorizationEvidence {
+            revision: 17,
+            binding_generation: 3,
+            schema_ref: SchemaRef {
+                schema_id: SchemaId::parse("documents").unwrap(),
+                schema_revision: 5,
+                schema_digest: SchemaDigest([7; 32]),
+            },
+        }
     }
 
     #[tokio::test]
@@ -363,7 +617,7 @@ mod tests {
         );
 
         let mut changed = visibility;
-        changed.authorization_revision = 8;
+        changed.admission.system_revision = 8;
         assert_eq!(
             changed
                 .evaluate(&[candidate("docs/live")])
@@ -400,7 +654,13 @@ mod tests {
                 "application",
             )
             .unwrap(),
-            9,
+            11,
+            IndexQueryAuthorizationEvidence {
+                system_revision: 9,
+                result: None,
+            },
+            IndexResultAuthorizationPolicy::Application,
+            None,
             "objects".into(),
             "docs/".into(),
             IndexKind::Path,
@@ -414,6 +674,159 @@ mod tests {
         assert_eq!(
             *authorization.seen.lock().unwrap(),
             vec!["canonical/live".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_realm_intersects_system_access_and_uses_canonical_source_mapping() {
+        let policy = RealmIndexResultAuthorizationPolicy {
+            realm: "workspace".into(),
+            resource_namespace: "document".into(),
+            relation: "view".into(),
+            target: RealmIndexAuthorizationTarget::CanonicalSourcePath,
+        };
+        let visibility = AuthorizedSnapshotCandidates::new(
+            Caller::from_authenticated_application(
+                StorageTenantId::parse("tenant").unwrap(),
+                "application",
+            )
+            .unwrap(),
+            11,
+            IndexQueryAuthorizationEvidence {
+                system_revision: 9,
+                result: Some(realm_evidence()),
+            },
+            IndexResultAuthorizationPolicy::Realm(policy),
+            Some(ObjectRef::opaque("user", "alice").unwrap()),
+            "objects".into(),
+            "docs/".into(),
+            IndexKind::Path,
+            None,
+            Arc::new(CustomRealmAuthorization),
+        );
+        let mut allowed = candidate("docs/allowed");
+        allowed.authorization_source_path = "canonical/allowed".into();
+        let mut denied = candidate("docs/denied");
+        denied.authorization_source_path = "canonical/denied".into();
+
+        let result = visibility.evaluate(&[allowed, denied]).await.unwrap();
+
+        assert_eq!(result.visible, [true, false]);
+        assert_eq!(result.denied, 1);
+    }
+
+    #[tokio::test]
+    async fn custom_realm_cannot_restore_a_candidate_denied_by_application_access() {
+        let authorization = Arc::new(IntersectingRealmAuthorization {
+            realm_resources: Mutex::new(Vec::new()),
+        });
+        let visibility = AuthorizedSnapshotCandidates::new(
+            Caller::from_authenticated_application(
+                StorageTenantId::parse("tenant").unwrap(),
+                "application",
+            )
+            .unwrap(),
+            11,
+            IndexQueryAuthorizationEvidence {
+                system_revision: 9,
+                result: Some(realm_evidence()),
+            },
+            IndexResultAuthorizationPolicy::Realm(RealmIndexResultAuthorizationPolicy {
+                realm: "workspace".into(),
+                resource_namespace: "document".into(),
+                relation: "view".into(),
+                target: RealmIndexAuthorizationTarget::CanonicalSourcePath,
+            }),
+            Some(ObjectRef::opaque("user", "alice").unwrap()),
+            "objects".into(),
+            "docs/".into(),
+            IndexKind::Path,
+            None,
+            authorization.clone(),
+        );
+
+        let result = visibility
+            .evaluate(&[
+                candidate("docs/system-denied"),
+                candidate("docs/system-allowed"),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(result.visible, [false, true]);
+        assert_eq!(result.denied, 1);
+        assert_eq!(
+            *authorization.realm_resources.lock().unwrap(),
+            ["docs/system-allowed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn result_path_policy_authorizes_the_public_result_not_its_source() {
+        let policy = RealmIndexResultAuthorizationPolicy {
+            realm: "workspace".into(),
+            resource_namespace: "document".into(),
+            relation: "view".into(),
+            target: RealmIndexAuthorizationTarget::ResultPath,
+        };
+        let visibility = AuthorizedSnapshotCandidates::new(
+            Caller::from_authenticated_application(
+                StorageTenantId::parse("tenant").unwrap(),
+                "application",
+            )
+            .unwrap(),
+            11,
+            IndexQueryAuthorizationEvidence {
+                system_revision: 9,
+                result: Some(realm_evidence()),
+            },
+            IndexResultAuthorizationPolicy::Realm(policy),
+            Some(ObjectRef::opaque("user", "alice").unwrap()),
+            "objects".into(),
+            "docs/".into(),
+            IndexKind::GitSource,
+            None,
+            Arc::new(CustomRealmAuthorization),
+        );
+        let mut candidate = candidate("docs/source.json");
+        candidate.authorization_source_path = "canonical/denied".into();
+        candidate.result.address.as_mut().unwrap().path = "payloads/visible.bin".into();
+
+        assert_eq!(
+            visibility.evaluate(&[candidate]).await.unwrap().visible,
+            [true]
+        );
+    }
+
+    #[test]
+    fn definition_policy_decoding_has_no_implicit_or_unspecified_fallback() {
+        let mut definition = IndexDefinition::default();
+        assert_eq!(
+            result_authorization_policy(&definition).unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+        definition.result_authorization = Some(IndexResultAuthorization {
+            policy: Some(index_result_authorization::Policy::Application(
+                ApplicationIndexResultAuthorization {},
+            )),
+        });
+        assert_eq!(
+            result_authorization_policy(&definition).unwrap(),
+            IndexResultAuthorizationPolicy::Application
+        );
+        definition.result_authorization = Some(IndexResultAuthorization {
+            policy: Some(index_result_authorization::Policy::Realm(
+                RealmIndexResultAuthorization {
+                    realm: "workspace".into(),
+                    resource_namespace: "document".into(),
+                    relation: "view".into(),
+                    target: IndexAuthorizationTarget::Unspecified as i32,
+                },
+            )),
+        });
+        assert_eq!(
+            result_authorization_policy(&definition).unwrap_err().code(),
+            tonic::Code::DataLoss
         );
     }
 

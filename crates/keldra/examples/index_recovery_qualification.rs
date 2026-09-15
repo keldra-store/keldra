@@ -11,20 +11,22 @@ use keldra_storage::v1::bulk_operation::Operation as BulkOperationValue;
 use keldra_storage::v1::bulk_outcome::Outcome as BulkOutcomeValue;
 use keldra_storage::v1::index_field::FieldType as IndexFieldType;
 use keldra_storage::v1::index_query::Query as QueryValue;
+use keldra_storage::v1::index_result_authorization;
 use keldra_storage::v1::index_service_client::IndexServiceClient;
 use keldra_storage::v1::index_specification::Specification as SpecificationValue;
 use keldra_storage::v1::object_head::State as ObjectHeadState;
 use keldra_storage::v1::put_header::Operation as PutOperationValue;
 use keldra_storage::v1::{
-    BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
-    DeleteRequest, Durability, FullTextField, FullTextIndexQuery, FullTextIndexSpec,
-    GitSourceIndexQuery, GitSourceIndexSpec, HeadObjectRequest, HybridIndexQuery, HybridIndexSpec,
-    IndexField, IndexFieldCapability, IndexFieldCardinality, IndexPredicate,
-    IndexPredicateExpression, IndexPredicateOperator, IndexQuery, IndexSpecification,
-    KeywordIndexField, MetadataFilterIndexQuery, MetadataFilterIndexSpec, MutationFailureCode,
-    MutationReceipt, ObjectAddress, ObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader,
-    PutOperation, QueryIndexRequest, TensorIndexQuery, TensorIndexSpec, TypedJsonIndexQuery,
-    TypedJsonIndexSpec, VectorIndexQuery, VectorIndexSpec, VectorMetric,
+    ApplicationIndexResultAuthorization, BulkOperation, BulkPutRequest, BulkWriteRequest,
+    CreateBucketRequest, CreateIndexRequest, DeleteRequest, Durability, FullTextField,
+    FullTextIndexQuery, FullTextIndexSpec, GitSourceIndexQuery, GitSourceIndexSpec,
+    HeadObjectRequest, HybridIndexQuery, HybridIndexSpec, IndexField, IndexFieldCapability,
+    IndexFieldCardinality, IndexPredicate, IndexPredicateExpression, IndexPredicateOperator,
+    IndexQuery, IndexResultAuthorization, IndexSpecification, KeywordIndexField,
+    MetadataFilterIndexQuery, MetadataFilterIndexSpec, MutationFailureCode, MutationReceipt,
+    ObjectAddress, ObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader, PutOperation,
+    QueryIndexRequest, TensorIndexQuery, TensorIndexSpec, TypedJsonIndexQuery, TypedJsonIndexSpec,
+    VectorIndexQuery, VectorIndexSpec, VectorMetric,
 };
 use keldra_storage::{
     BearerToken, RawClient, administration_client, connect_channel, exchange_client_credentials,
@@ -38,6 +40,14 @@ use tonic::{Code, Status};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 type IndexClient = IndexServiceClient<InterceptedService<Channel, BearerToken>>;
+
+fn application_result_authorization() -> IndexResultAuthorization {
+    IndexResultAuthorization {
+        policy: Some(index_result_authorization::Policy::Application(
+            ApplicationIndexResultAuthorization {},
+        )),
+    }
+}
 
 const WAIT_LIMIT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -706,6 +716,7 @@ async fn create_recovery_index(
             content_type: "application/json".into(),
             specification: Some(case.specification.clone()),
             command_id: format!("index-recovery-create-{}-{command}", case.kind),
+            result_authorization: Some(application_result_authorization()),
         })
         .await?
         .into_inner();
@@ -733,6 +744,7 @@ async fn create_path_index(
                 specification: Some(SpecificationValue::Path(PathIndexSpec {})),
             }),
             command_id: format!("index-recovery-create-{command}"),
+            result_authorization: Some(application_result_authorization()),
         })
         .await?
         .into_inner();
@@ -1185,6 +1197,7 @@ fn query(bucket: &str) -> QueryIndexRequest {
         page_token: Vec::new(),
         tenant: String::new(),
         required_freshness: None,
+        authorization_subject: None,
     }
 }
 
@@ -1197,6 +1210,7 @@ fn recovery_query(bucket: &str, case: &RecoveryCase) -> QueryIndexRequest {
         page_token: Vec::new(),
         tenant: String::new(),
         required_freshness: None,
+        authorization_subject: None,
     }
 }
 

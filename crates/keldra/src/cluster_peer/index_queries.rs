@@ -8,9 +8,17 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use keldra_api::v1::index_query::Query as IndexQueryValue;
-use keldra_api::v1::{IndexAggregateOperation, IndexDefinition, IndexKind, IndexQuery};
+use keldra_api::v1::object_chunk::Value as ObjectChunkValue;
+use keldra_api::v1::object_head::State as ObjectState;
+use keldra_api::v1::object_service_server::ObjectService;
+use keldra_api::v1::{
+    GetObjectRequest, IndexAggregateOperation, IndexDefinition, IndexKind, IndexQuery,
+    ObjectAddress,
+};
+use keldra_authz::ObjectRef;
 use keldra_consensus::NodeId;
 use keldra_store::{ObjectKey, PlacementLogId, StorageTenantId};
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
 use super::transport::add_bearer_and_timeout_with_limit;
@@ -18,16 +26,18 @@ use super::{
     CLUSTER_PEER_SCHEMA_VERSION, ClusterPeerService, ClusterPeerTransport, require_response_schema,
     wire,
 };
-use crate::authentication::JwtManager;
-use crate::authorization::ObjectPermission;
+use crate::authentication::{AnonymousObjectRequest, Caller, JwtManager, PluginObjectScope};
 use crate::cluster_placement::ClusterPlacement;
 use crate::distributed_list::OriginalBearer;
 use crate::index_runtime::placement::{IndexIdentity, IndexPlacement};
 use crate::index_service::{
     AuthorizedSnapshotCandidates, ExecutedIndexQuery, IndexAuthorization, IndexCandidateVisibility,
-    IndexFreshnessRequirement, IndexPageCursor, RequiredIndexSourceCheckpoint, definition_path,
+    IndexFreshnessRequirement, IndexPageCursor, IndexQueryAuthorizationEvidence,
+    IndexRealmAuthorizationEvidence, IndexResultAuthorizationPolicy, RequiredIndexSourceCheckpoint,
+    StoredIndexDefinition, definition_path, result_authorization_policy,
 };
 use crate::logical_name_resolution::LogicalNameResolver;
+use crate::object_service::ObjectServiceImpl;
 
 const MAX_QUERY_HITS: usize = 1_000;
 const MAX_QUERY_COMPUTATIONS: usize = 32;
@@ -47,6 +57,11 @@ pub(crate) struct RoutedIndexQueryRequest {
     pub(crate) limit: usize,
     pub(crate) resume: Option<IndexPageCursor>,
     pub(crate) required_freshness: Option<IndexFreshnessRequirement>,
+    pub(crate) authorization_subject: Option<ObjectRef>,
+    pub(crate) system_authorization_revision: u64,
+    pub(crate) result_authorization_revision: Option<u64>,
+    pub(crate) result_authorization_binding_generation: Option<u64>,
+    pub(crate) result_authorization_schema_ref: Option<keldra_store::SchemaRef>,
 }
 
 #[derive(Clone)]
@@ -119,6 +134,7 @@ pub(crate) struct AuthorizedIndexQueryHandler {
     tokens: JwtManager,
     names: LogicalNameResolver,
     authorization: Arc<dyn IndexAuthorization>,
+    objects: ObjectServiceImpl,
     executor: Arc<dyn LocalIndexQueryExecutor>,
 }
 
@@ -128,6 +144,7 @@ impl AuthorizedIndexQueryHandler {
         tokens: JwtManager,
         names: LogicalNameResolver,
         authorization: Arc<dyn IndexAuthorization>,
+        objects: ObjectServiceImpl,
         executor: Arc<dyn LocalIndexQueryExecutor>,
     ) -> Self {
         Self {
@@ -135,8 +152,100 @@ impl AuthorizedIndexQueryHandler {
             tokens,
             names,
             authorization,
+            objects,
             executor,
         }
+    }
+
+    async fn load_routed_definition(
+        &self,
+        caller: &Caller,
+        bearer: &str,
+        plugin_scope: Option<&PluginObjectScope>,
+        locator: &IndexDefinition,
+        deadline: tokio::time::Instant,
+    ) -> Result<IndexDefinition, Status> {
+        let key = definition_object_key(caller, locator)?;
+        let mut request = Request::new(GetObjectRequest {
+            address: Some(ObjectAddress {
+                tenant: key.tenant().to_owned(),
+                bucket: key.bucket().to_owned(),
+                path: key.path().to_owned(),
+            }),
+            version: None,
+        });
+        if bearer == keldra_authz::ANONYMOUS_SUBJECT_ID {
+            request.extensions_mut().insert(AnonymousObjectRequest);
+        } else {
+            request.extensions_mut().insert(caller.clone());
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {bearer}")
+                    .parse()
+                    .map_err(|_| Status::internal("could not forward routed bearer"))?,
+            );
+        }
+        if let Some(plugin_scope) = plugin_scope {
+            request.extensions_mut().insert(plugin_scope.clone());
+        }
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| Status::deadline_exceeded("routed index query deadline exceeded"))?;
+        request.set_timeout(remaining);
+        crate::object_path_access::mark_index(&mut request);
+        let mut stream = ObjectService::get_object(&self.objects, request)
+            .await?
+            .into_inner();
+        let first = stream
+            .next()
+            .await
+            .transpose()?
+            .ok_or_else(|| Status::data_loss("routed index definition returned no head"))?;
+        let present = match first.value {
+            Some(ObjectChunkValue::Head(head)) => match head.state {
+                Some(ObjectState::Present(present)) => present,
+                Some(ObjectState::Deleted(_)) | Some(ObjectState::NeverExisted(_)) => {
+                    return Err(Status::not_found("routed index definition does not exist"));
+                }
+                None => {
+                    return Err(Status::data_loss(
+                        "routed index definition head has no state",
+                    ));
+                }
+            },
+            Some(ObjectChunkValue::Bytes(_)) | None => {
+                return Err(Status::data_loss(
+                    "routed index definition did not begin with a head",
+                ));
+            }
+        };
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk?.value {
+                Some(ObjectChunkValue::Bytes(chunk)) => bytes.extend_from_slice(&chunk),
+                Some(ObjectChunkValue::Head(_)) | None => {
+                    return Err(Status::data_loss(
+                        "routed index definition stream contains an invalid frame",
+                    ));
+                }
+            }
+        }
+        if present.version == 0 || u64::try_from(bytes.len()).ok() != Some(present.content_length) {
+            return Err(Status::data_loss(
+                "routed index definition body does not match its head",
+            ));
+        }
+        let stored = StoredIndexDefinition::decode(&bytes)?;
+        if stored.tenant != caller.storage_tenant().as_str()
+            || stored.bucket != locator.bucket
+            || stored.name != locator.name
+        {
+            return Err(Status::data_loss(
+                "routed index definition payload does not match its object address",
+            ));
+        }
+        stored.to_api(present.version)
     }
 }
 
@@ -163,56 +272,90 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
                 "routed index stable IDs no longer match mutable names",
             ));
         }
-        let definition_key = definition_object_key(&caller, &call.request.definition)?;
-        let before = self
-            .authorization
-            .allows_objects_with_evidence(
+        let mut request = call.request;
+        let supplied_identity = (
+            request.definition.index_id,
+            request.definition.version,
+            request.definition.bucket.clone(),
+            request.definition.name.clone(),
+        );
+        request.definition = self
+            .load_routed_definition(
                 &caller,
-                &[(definition_key.clone(), ObjectPermission::Get)],
+                &call.bearer,
+                plugin_scope.as_ref(),
+                &request.definition,
+                call.deadline,
             )
             .await?;
-        require_authorization_evidence(&before, 1)?;
-        if !before.allowed[0] {
-            return Err(Status::permission_denied(
-                "index definition read is not authorized",
-            ));
-        }
-        if call
-            .request
-            .resume
-            .as_ref()
-            .is_some_and(|resume| resume.authorization_revision != before.revision)
+        if supplied_identity
+            != (
+                request.definition.index_id,
+                request.definition.version,
+                request.definition.bucket.clone(),
+                request.definition.name.clone(),
+            )
         {
             return Err(Status::failed_precondition(
-                "page token authorization revision is no longer current",
+                "routed index definition changed before execution",
+            ));
+        }
+        validate_query_kind(&request.definition, &request.query)?;
+        let result_policy = result_authorization_policy(&request.definition)?;
+        validate_routed_subject(
+            &caller,
+            &result_policy,
+            request.authorization_subject.as_ref(),
+        )?;
+        let definition_key = definition_object_key(&caller, &request.definition)?;
+        let admission = self
+            .authorization
+            .admit_query(
+                &caller,
+                request.tenant_id,
+                &definition_key,
+                &result_policy,
+                request.authorization_subject.as_ref(),
+            )
+            .await?;
+        require_requested_authorization(&request, &admission)?;
+        if request
+            .resume
+            .as_ref()
+            .is_some_and(|resume| resume.authorization_revision != admission.system_revision)
+        {
+            return Err(Status::failed_precondition(
+                "page token authorization evidence is no longer current",
             ));
         }
 
-        let request = call.request;
         let query_shape = request.query.clone();
         let result_tenant = caller.storage_tenant().as_str().to_owned();
         let result_bucket = request.definition.bucket.clone();
-        let authorization_revision = before.revision;
+        let authorization_revision = admission.system_revision;
         let resume = request.resume.clone();
         let kind = IndexKind::try_from(request.definition.kind)
             .map_err(|_| Status::data_loss("routed index definition has an unknown kind"))?;
         let candidate_visibility: Arc<dyn IndexCandidateVisibility> =
             Arc::new(AuthorizedSnapshotCandidates::new(
                 caller.clone(),
-                authorization_revision,
+                request.tenant_id,
+                admission.clone(),
+                result_policy,
+                request.authorization_subject.clone(),
                 request.definition.bucket.clone(),
                 request.definition.path_prefix.clone(),
                 kind,
                 plugin_scope,
                 self.authorization.clone(),
             ));
-        let result = self
+        let mut result = self
             .executor
             .execute_local(LocalIndexQueryRequest {
                 storage_tenant: caller.storage_tenant().as_str().to_owned(),
                 tenant_id: request.tenant_id,
                 bucket_id: request.bucket_id,
-                definition: request.definition,
+                definition: request.definition.clone(),
                 query: request.query,
                 limit: request.limit,
                 resume,
@@ -222,10 +365,11 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
                 deadline: call.deadline,
             })
             .await?;
+        bind_result_authorization_freshness(&mut result, &request.definition, &admission)?;
         validate_result(&result, request.resume.as_ref(), request.limit)?;
         require_result_scope(&result, &result_tenant, &result_bucket)?;
         require_computation_shape(&result, &query_shape)?;
-        require_result_authorization_revision(&result, authorization_revision)?;
+        require_result_authorization_evidence(&result, &admission)?;
         Ok(result)
     }
 }
@@ -336,6 +480,7 @@ fn request_to_wire(
 ) -> Result<wire::RouteIndexQueryRequest, Status> {
     let limit = u32::try_from(request.limit)
         .map_err(|_| Status::invalid_argument("index query limit does not fit u32"))?;
+    let resume_result_authorization_revision = request.result_authorization_revision;
     Ok(wire::RouteIndexQueryRequest {
         peer: Some(peer),
         storage_tenant: request.storage_tenant,
@@ -347,15 +492,35 @@ fn request_to_wire(
         resume: request.resume.map(|resume| wire::RoutedIndexQueryResume {
             commit_revision: resume.commit_revision,
             last_position: resume.last_position,
-            authorization_revision: resume.authorization_revision,
+            system_authorization_revision: resume.authorization_revision,
+            result_authorization_revision: resume_result_authorization_revision,
         }),
         required_freshness: request.required_freshness.map(freshness_to_wire),
+        authorization_subject: request
+            .authorization_subject
+            .as_ref()
+            .map(crate::authz_api::object_to_api),
+        system_authorization_revision: request.system_authorization_revision,
+        result_authorization_revision: request.result_authorization_revision,
+        result_authorization_binding_generation: request.result_authorization_binding_generation,
+        result_authorization_schema_ref: request
+            .result_authorization_schema_ref
+            .as_ref()
+            .map(crate::authz_api::schema_ref_to_api),
     })
 }
 
 fn request_from_wire(
     request: &wire::RouteIndexQueryRequest,
 ) -> Result<RoutedIndexQueryRequest, Status> {
+    if request.resume.as_ref().is_some_and(|resume| {
+        resume.result_authorization_revision != request.result_authorization_revision
+            || resume.system_authorization_revision != request.system_authorization_revision
+    }) {
+        return Err(Status::invalid_argument(
+            "routed continuation authorization evidence conflicts with its request",
+        ));
+    }
     let value = RoutedIndexQueryRequest {
         storage_tenant: request.storage_tenant.clone(),
         tenant_id: request.tenant_id,
@@ -373,12 +538,25 @@ fn request_from_wire(
         resume: request.resume.as_ref().map(|resume| IndexPageCursor {
             commit_revision: resume.commit_revision,
             last_position: resume.last_position.clone(),
-            authorization_revision: resume.authorization_revision,
+            authorization_revision: resume.system_authorization_revision,
         }),
         required_freshness: request
             .required_freshness
             .as_ref()
             .map(freshness_from_wire)
+            .transpose()?,
+        authorization_subject: request
+            .authorization_subject
+            .clone()
+            .map(|subject| crate::authz_api::object_from_api(Some(subject)))
+            .transpose()?,
+        system_authorization_revision: request.system_authorization_revision,
+        result_authorization_revision: request.result_authorization_revision,
+        result_authorization_binding_generation: request.result_authorization_binding_generation,
+        result_authorization_schema_ref: request
+            .result_authorization_schema_ref
+            .clone()
+            .map(|schema_ref| crate::authz_api::schema_ref_from_api(Some(schema_ref)))
             .transpose()?,
     };
     validate_request(&value)?;
@@ -428,6 +606,7 @@ fn validate_request(request: &RoutedIndexQueryRequest) -> Result<(), Status> {
         || request.limit == 0
         || request.limit > MAX_QUERY_HITS
         || request.definition.specification.is_none()
+        || request.system_authorization_revision == 0
     {
         return Err(Status::invalid_argument(
             "routed index identity, definition, and limit must be valid",
@@ -437,6 +616,32 @@ fn validate_request(request: &RoutedIndexQueryRequest) -> Result<(), Status> {
     ObjectKey::new("validation", &request.definition.bucket, "validation")
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     validate_query_kind(&request.definition, &request.query)?;
+    let policy = result_authorization_policy(&request.definition)?;
+    match (
+        &policy,
+        request.authorization_subject.as_ref(),
+        request.result_authorization_revision,
+        request.result_authorization_binding_generation,
+        request.result_authorization_schema_ref.as_ref(),
+    ) {
+        (IndexResultAuthorizationPolicy::Application, None, None, None, None) => {}
+        (
+            IndexResultAuthorizationPolicy::Realm(_),
+            Some(subject),
+            Some(revision),
+            Some(generation),
+            Some(schema_ref),
+        ) if !subject.is_anonymous()
+            && !subject.is_public()
+            && revision != 0
+            && generation != 0
+            && schema_ref.schema_revision != 0 => {}
+        _ => {
+            return Err(Status::invalid_argument(
+                "routed index result authorization operands do not match the definition",
+            ));
+        }
+    }
     if let Some(resume) = request.resume.as_ref() {
         if resume.authorization_revision == 0 || resume.last_position.is_empty() {
             return Err(Status::invalid_argument(
@@ -539,6 +744,91 @@ fn routed_caller(
     Ok((caller, plugin_scope))
 }
 
+fn validate_routed_subject(
+    caller: &Caller,
+    policy: &IndexResultAuthorizationPolicy,
+    subject: Option<&ObjectRef>,
+) -> Result<(), Status> {
+    match (policy, subject) {
+        (IndexResultAuthorizationPolicy::Application, None) => Ok(()),
+        (IndexResultAuthorizationPolicy::Application, Some(_)) => Err(Status::invalid_argument(
+            "application-authorized routed query carries an end-user subject",
+        )),
+        (IndexResultAuthorizationPolicy::Realm(_), None) => Err(Status::invalid_argument(
+            "custom-realm routed query has no end-user subject",
+        )),
+        (IndexResultAuthorizationPolicy::Realm(_), Some(subject))
+            if !caller.subject().is_anonymous()
+                && !subject.is_anonymous()
+                && !subject.is_public() =>
+        {
+            Ok(())
+        }
+        (IndexResultAuthorizationPolicy::Realm(_), Some(_)) => Err(Status::unauthenticated(
+            "custom-realm routed query requires authenticated concrete principals",
+        )),
+    }
+}
+
+fn require_requested_authorization(
+    request: &RoutedIndexQueryRequest,
+    admission: &IndexQueryAuthorizationEvidence,
+) -> Result<(), Status> {
+    if request.system_authorization_revision == 0 || admission.system_revision == 0 {
+        return Err(Status::data_loss(
+            "routed index query has no protected authorization revision",
+        ));
+    }
+    let admitted_result = admission.result.as_ref().map(|evidence| {
+        (
+            evidence.revision,
+            evidence.binding_generation,
+            evidence.schema_ref.clone(),
+        )
+    });
+    let requested_result = request
+        .result_authorization_revision
+        .zip(request.result_authorization_binding_generation)
+        .zip(request.result_authorization_schema_ref.clone())
+        .map(|((revision, generation), schema_ref)| (revision, generation, schema_ref));
+    if request.system_authorization_revision != admission.system_revision
+        || requested_result != admitted_result
+    {
+        return Err(Status::failed_precondition(
+            "routed index authorization evidence is no longer current",
+        ));
+    }
+    Ok(())
+}
+
+fn bind_result_authorization_freshness(
+    result: &mut ExecutedIndexQuery,
+    definition: &IndexDefinition,
+    admission: &IndexQueryAuthorizationEvidence,
+) -> Result<(), Status> {
+    result.freshness.authorization_revision = admission.system_revision;
+    result.freshness.result_authorization = match (
+        result_authorization_policy(definition)?,
+        admission.result.as_ref(),
+    ) {
+        (IndexResultAuthorizationPolicy::Application, None) => None,
+        (IndexResultAuthorizationPolicy::Realm(policy), Some(evidence)) => {
+            Some(keldra_api::v1::IndexResultAuthorizationFreshness {
+                realm: policy.realm,
+                authorization_revision: evidence.revision,
+                binding_generation: evidence.binding_generation,
+                schema_ref: Some(crate::authz_api::schema_ref_to_api(&evidence.schema_ref)),
+            })
+        }
+        _ => {
+            return Err(Status::data_loss(
+                "routed result authorization evidence does not match the definition",
+            ));
+        }
+    };
+    Ok(())
+}
+
 fn validate_result(
     result: &ExecutedIndexQuery,
     resume: Option<&IndexPageCursor>,
@@ -565,6 +855,19 @@ fn validate_result(
         || result.freshness.index_id == 0
         || result.freshness.definition_version == 0
         || result.freshness.authorization_revision == 0
+        || result
+            .freshness
+            .result_authorization
+            .as_ref()
+            .is_some_and(|evidence| {
+                evidence.realm.is_empty()
+                    || evidence.authorization_revision == 0
+                    || evidence.binding_generation == 0
+                    || evidence
+                        .schema_ref
+                        .as_ref()
+                        .is_none_or(|schema| schema.schema_revision == 0)
+            })
         || result
             .freshness
             .sources
@@ -699,18 +1002,35 @@ fn require_computation_shape(
     }
 }
 
-fn require_result_authorization_revision(
+fn require_result_authorization_evidence(
     result: &ExecutedIndexQuery,
-    required: u64,
+    required: &IndexQueryAuthorizationEvidence,
 ) -> Result<(), Status> {
-    if required == 0 || result.freshness.authorization_revision == 0 {
+    if required.system_revision == 0 || result.freshness.authorization_revision == 0 {
         return Err(Status::data_loss(
             "routed index result has no Zanzibar authorization revision",
         ));
     }
-    if result.freshness.authorization_revision != required {
+    if result.freshness.authorization_revision != required.system_revision {
         return Err(Status::failed_precondition(
             "authorization revision changed during index execution",
+        ));
+    }
+    let returned = result
+        .freshness
+        .result_authorization
+        .as_ref()
+        .map(|evidence| {
+            Ok::<_, Status>(IndexRealmAuthorizationEvidence {
+                revision: evidence.authorization_revision,
+                binding_generation: evidence.binding_generation,
+                schema_ref: crate::authz_api::schema_ref_from_api(evidence.schema_ref.clone())?,
+            })
+        })
+        .transpose()?;
+    if returned != required.result {
+        return Err(Status::failed_precondition(
+            "custom-realm authorization evidence changed during routed execution",
         ));
     }
     Ok(())
@@ -721,7 +1041,17 @@ fn validate_query_kind(definition: &IndexDefinition, query: &IndexQuery) -> Resu
         .map_err(|_| Status::invalid_argument("routed index kind is unknown"))?;
     let matches = matches!(
         (kind, query.query.as_ref()),
-        (IndexKind::TypedJson, Some(IndexQueryValue::TypedJson(_)))
+        (IndexKind::Path, Some(IndexQueryValue::Path(_)))
+            | (
+                IndexKind::MetadataFilter,
+                Some(IndexQueryValue::MetadataFilter(_))
+            )
+            | (IndexKind::TypedJson, Some(IndexQueryValue::TypedJson(_)))
+            | (IndexKind::FullText, Some(IndexQueryValue::FullText(_)))
+            | (IndexKind::Vector, Some(IndexQueryValue::Vector(_)))
+            | (IndexKind::Hybrid, Some(IndexQueryValue::Hybrid(_)))
+            | (IndexKind::GitSource, Some(IndexQueryValue::GitSource(_)))
+            | (IndexKind::Tensor, Some(IndexQueryValue::Tensor(_)))
     );
     if matches {
         Ok(())
@@ -764,25 +1094,14 @@ fn definition_object_key(
     .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
-fn require_authorization_evidence(
-    evidence: &crate::index_service::IndexAuthorizationEvidence,
-    expected: usize,
-) -> Result<(), Status> {
-    if evidence.revision == 0 || evidence.allowed.len() != expected {
-        Err(Status::data_loss(
-            "Zanzibar returned invalid routed index authorization evidence",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use keldra_api::v1::{
-        IndexAggregateOperation, IndexAggregateRequest, IndexAggregateResult, IndexFacetBucket,
-        IndexFacetRequest, IndexFacetResult, IndexSpecification, PathIndexQuery,
-        TypedJsonIndexQuery, index_query, index_specification,
+        ApplicationIndexResultAuthorization, IndexAggregateOperation, IndexAggregateRequest,
+        IndexAggregateResult, IndexFacetBucket, IndexFacetRequest, IndexFacetResult,
+        IndexResultAuthorization, IndexSpecification, PathIndexQuery,
+        RealmIndexResultAuthorization, TypedJsonIndexQuery, index_query,
+        index_result_authorization, index_specification,
     };
 
     use super::*;
@@ -805,6 +1124,11 @@ mod tests {
                     )),
                 }),
                 version: 13,
+                result_authorization: Some(IndexResultAuthorization {
+                    policy: Some(index_result_authorization::Policy::Application(
+                        ApplicationIndexResultAuthorization {},
+                    )),
+                }),
             },
             query: IndexQuery {
                 query: Some(index_query::Query::TypedJson(Default::default())),
@@ -816,6 +1140,11 @@ mod tests {
                 authorization_revision: 19,
             }),
             required_freshness: None,
+            authorization_subject: None,
+            system_authorization_revision: 19,
+            result_authorization_revision: None,
+            result_authorization_binding_generation: None,
+            result_authorization_schema_ref: None,
         }
     }
 
@@ -858,6 +1187,46 @@ mod tests {
         assert_eq!(decoded.definition, value.definition);
         assert_eq!(decoded.query, value.query);
         assert_eq!(decoded.resume, value.resume);
+        assert_eq!(decoded.authorization_subject, value.authorization_subject);
+        assert_eq!(
+            decoded.system_authorization_revision,
+            value.system_authorization_revision
+        );
+    }
+
+    #[test]
+    fn routed_wire_binds_custom_realm_subject_and_both_authorization_revisions() {
+        let mut value = request();
+        value.definition.result_authorization = Some(IndexResultAuthorization {
+            policy: Some(index_result_authorization::Policy::Realm(
+                RealmIndexResultAuthorization {
+                    realm: "workspace".into(),
+                    resource_namespace: "document".into(),
+                    relation: "view".into(),
+                    target: keldra_api::v1::IndexAuthorizationTarget::ResultPath as i32,
+                },
+            )),
+        });
+        value.authorization_subject = Some(ObjectRef::opaque("user", "alice").unwrap());
+        value.result_authorization_revision = Some(23);
+        value.result_authorization_binding_generation = Some(29);
+        value.result_authorization_schema_ref = Some(keldra_store::SchemaRef {
+            schema_id: keldra_store::SchemaId::parse("documents").unwrap(),
+            schema_revision: 31,
+            schema_digest: keldra_store::SchemaDigest([7; 32]),
+        });
+
+        let wire = request_to_wire(wire::PeerContext::default(), value.clone()).unwrap();
+        let decoded = request_from_wire(&wire).unwrap();
+
+        assert_eq!(decoded.authorization_subject, value.authorization_subject);
+        assert_eq!(decoded.result_authorization_revision, Some(23));
+        assert_eq!(decoded.result_authorization_binding_generation, Some(29));
+        assert_eq!(
+            decoded.result_authorization_schema_ref,
+            value.result_authorization_schema_ref
+        );
+        assert_eq!(wire.resume.unwrap().result_authorization_revision, Some(23));
     }
 
     #[test]
@@ -1145,18 +1514,22 @@ mod tests {
             },
             next_position: None,
         };
-        require_result_authorization_revision(&result, 19).unwrap();
+        let required = IndexQueryAuthorizationEvidence {
+            system_revision: 19,
+            result: None,
+        };
+        require_result_authorization_evidence(&result, &required).unwrap();
 
         result.freshness.authorization_revision = 0;
         assert_eq!(
-            require_result_authorization_revision(&result, 19)
+            require_result_authorization_evidence(&result, &required)
                 .unwrap_err()
                 .code(),
             tonic::Code::DataLoss
         );
         result.freshness.authorization_revision = 20;
         assert_eq!(
-            require_result_authorization_revision(&result, 19)
+            require_result_authorization_evidence(&result, &required)
                 .unwrap_err()
                 .code(),
             tonic::Code::FailedPrecondition

@@ -115,13 +115,27 @@ impl IndexQueryExecutor for DistributedIndexQueryExecutor {
             limit: request.limit,
             resume: request.resume.clone(),
             required_freshness: request.required_freshness.clone(),
+            authorization_subject: request.authorization_subject.clone(),
+            system_authorization_revision: request.authorization_revision,
+            result_authorization_revision: request
+                .result_authorization
+                .as_ref()
+                .map(|evidence| evidence.revision),
+            result_authorization_binding_generation: request
+                .result_authorization
+                .as_ref()
+                .map(|evidence| evidence.binding_generation),
+            result_authorization_schema_ref: request
+                .result_authorization
+                .as_ref()
+                .map(|evidence| evidence.schema_ref.clone()),
         };
         let placement_ref = &placement;
         let bearer_ref = bearer.as_str();
         let context = &request.context;
         let candidate_visibility = request.candidate_visibility.clone();
         let authorization_revision = request.authorization_revision;
-        let result = execute_with_owner_failover(replicas, first_replica, |target| {
+        let mut result = execute_with_owner_failover(replicas, first_replica, |target| {
             let routed = routed.clone();
             let candidate_visibility = candidate_visibility.clone();
             let remaining = context.remaining();
@@ -139,6 +153,12 @@ impl IndexQueryExecutor for DistributedIndexQueryExecutor {
             }
         })
         .await?;
+        bind_and_require_authorization_evidence(
+            &mut result,
+            &request.definition,
+            request.authorization_revision,
+            request.result_authorization.as_ref(),
+        )?;
         if self.placement()?.fence() != placement.fence() {
             return Err(Status::unavailable(
                 "index query placement changed during execution",
@@ -146,6 +166,47 @@ impl IndexQueryExecutor for DistributedIndexQueryExecutor {
         }
         Ok(result)
     }
+}
+
+fn bind_and_require_authorization_evidence(
+    result: &mut ExecutedIndexQuery,
+    definition: &keldra_api::v1::IndexDefinition,
+    system_revision: u64,
+    result_evidence: Option<&crate::index_service::IndexRealmAuthorizationEvidence>,
+) -> Result<(), Status> {
+    if result.freshness.authorization_revision != system_revision {
+        return Err(Status::failed_precondition(
+            "index query authorization revision changed during execution",
+        ));
+    }
+    let expected = match (
+        crate::index_service::result_authorization_policy(definition)?,
+        result_evidence,
+    ) {
+        (crate::index_service::IndexResultAuthorizationPolicy::Application, None) => None,
+        (crate::index_service::IndexResultAuthorizationPolicy::Realm(policy), Some(evidence)) => {
+            Some(keldra_api::v1::IndexResultAuthorizationFreshness {
+                realm: policy.realm,
+                authorization_revision: evidence.revision,
+                binding_generation: evidence.binding_generation,
+                schema_ref: Some(crate::authz_api::schema_ref_to_api(&evidence.schema_ref)),
+            })
+        }
+        _ => {
+            return Err(Status::data_loss(
+                "index query result authorization evidence does not match its definition",
+            ));
+        }
+    };
+    if result.freshness.result_authorization.is_some()
+        && result.freshness.result_authorization != expected
+    {
+        return Err(Status::failed_precondition(
+            "custom-realm authorization evidence changed on the query replica",
+        ));
+    }
+    result.freshness.result_authorization = expected;
+    Ok(())
 }
 
 async fn execute_with_owner_failover<T, F, Fut>(

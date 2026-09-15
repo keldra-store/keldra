@@ -21,7 +21,10 @@ use super::{
     schema_digest_key, schema_revision_key, storage_error, tuple_key, tuple_prefix,
     validate_binding, validate_stored_schema, validate_stored_tuple_receipt_shape,
 };
-use crate::store::{CF_AUTHZ_BINDINGS, CF_AUTHZ_RECEIPTS, CF_AUTHZ_SCHEMAS, CF_AUTHZ_TUPLES};
+use crate::store::{
+    CF_AUTHZ_BINDINGS, CF_AUTHZ_LEOPARD_FORWARD, CF_AUTHZ_LEOPARD_REVERSE, CF_AUTHZ_RECEIPTS,
+    CF_AUTHZ_SCHEMAS, CF_AUTHZ_TUPLES,
+};
 
 pub const AUTHZ_REALM_SNAPSHOT_FORMAT: u16 = 1;
 pub const AUTHZ_REALM_STATE_FORMAT: u16 = 1;
@@ -710,6 +713,19 @@ impl AuthzRepository {
             }
             batch.delete_cf(self.cf(CF_AUTHZ_TUPLES)?, key);
         }
+        for column_family in [CF_AUTHZ_LEOPARD_FORWARD, CF_AUTHZ_LEOPARD_REVERSE] {
+            let prefix = super::leopard::leopard_scope_prefix(column_family, scope);
+            for item in self.db.iterator_cf(
+                self.cf(column_family)?,
+                IteratorMode::From(&prefix, Direction::Forward),
+            ) {
+                let (key, _) = item.map_err(storage_error)?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                batch.delete_cf(self.cf(column_family)?, key);
+            }
+        }
         for key in receipt_deletions {
             batch.delete_cf(self.cf(CF_AUTHZ_RECEIPTS)?, key);
         }
@@ -752,6 +768,7 @@ impl AuthzRepository {
                     tuple: tuple.clone(),
                 })?,
             );
+            self.stage_leopard_tuple(&mut batch, scope, tuple, true)?;
         }
         for (key, encoded) in encoded_receipts {
             batch.put_cf(self.cf(CF_AUTHZ_RECEIPTS)?, key, encoded);
@@ -957,7 +974,7 @@ fn snapshot_json<T: DeserializeOwned>(
         .map_err(Into::into)
 }
 
-fn decode_binding_scope(key: &[u8]) -> Result<AuthzScope, AuthzRealmSnapshotError> {
+pub(super) fn decode_binding_scope(key: &[u8]) -> Result<AuthzScope, AuthzRealmSnapshotError> {
     if key.first() != Some(&b'B') {
         return Err(invalid_aggregate("authorization binding key is malformed"));
     }

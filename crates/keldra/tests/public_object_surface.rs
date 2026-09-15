@@ -9,6 +9,7 @@ use keldra_api::v1::application_role_request::Target as ApplicationRoleTarget;
 use keldra_api::v1::batch_get_outcome::Outcome as BatchOutcomeValue;
 use keldra_api::v1::bulk_operation::Operation as BulkOperationValue;
 use keldra_api::v1::bulk_outcome::Outcome as BulkOutcomeValue;
+use keldra_api::v1::index_result_authorization;
 use keldra_api::v1::index_service_client::IndexServiceClient;
 use keldra_api::v1::index_specification::Specification as IndexSpecificationValue;
 use keldra_api::v1::object_head::State as HeadState;
@@ -17,18 +18,19 @@ use keldra_api::v1::put_header::Operation as PutOperationValue;
 use keldra_api::v1::watch_message::Message as WatchMessageValue;
 use keldra_api::v1::watch_prefix_request::Start as WatchStart;
 use keldra_api::v1::{
-    AccountingMeasurementState, ApplicationRoleRequest, BatchGetRequest, BucketApplicationRole,
-    BucketApplicationRoleTarget, BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest,
-    CreateIndexRequest, DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
-    DisableAccountingRequest, Durability, EnableAccountingRequest, GetAccountingRequest,
-    GetClusterCapabilitiesRequest, GetIndexRequest, GetObjectRequest, HeadObjectRequest,
-    IndexField, IndexFieldCapability, IndexFieldCardinality, IndexQuery, IndexSpecification,
-    InvokeProgramRequest, KeywordIndexField, ListObjectVersionsRequest, ListObjectsRequest,
-    MutationFailureCode, ObjectAddress, ObjectVersioning as ApiObjectVersioning, PathIndexQuery,
-    PutHeader, PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation,
-    PutRequest, PutToken, QueryIndexRequest, ReadFailureCode, RebuildIndexRequest,
-    SetBucketPolicyRequest, SetBucketVersioningRequest, TypedJsonIndexSpec, UpdateIndexRequest,
-    WatchNow, WatchPrefixRequest, WatchStateHint,
+    AccountingMeasurementState, ApplicationIndexResultAuthorization, ApplicationRoleRequest,
+    BatchGetRequest, BucketApplicationRole, BucketApplicationRoleTarget, BucketPolicy,
+    BulkOperation, BulkPutRequest, BulkWriteRequest, CreateIndexRequest, DeleteIfVersionRequest,
+    DeleteRequest, DeleteVersionRequest, DisableAccountingRequest, Durability,
+    EnableAccountingRequest, GetAccountingRequest, GetClusterCapabilitiesRequest, GetIndexRequest,
+    GetObjectRequest, HeadObjectRequest, IndexField, IndexFieldCapability, IndexFieldCardinality,
+    IndexQuery, IndexResultAuthorization, IndexSpecification, InvokeProgramRequest,
+    KeywordIndexField, ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode,
+    ObjectAddress, ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PutHeader,
+    PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest,
+    PutToken, QueryIndexRequest, ReadFailureCode, RebuildIndexRequest, SetBucketPolicyRequest,
+    SetBucketVersioningRequest, TypedJsonIndexSpec, UpdateIndexRequest, WatchNow,
+    WatchPrefixRequest, WatchStateHint,
 };
 use keldra_authz::ObjectRef;
 use keldra_store::{
@@ -55,6 +57,14 @@ fn typed_json_specification() -> IndexSpecification {
             }],
             physical_order: Vec::new(),
         })),
+    }
+}
+
+fn application_result_authorization() -> IndexResultAuthorization {
+    IndexResultAuthorization {
+        policy: Some(index_result_authorization::Policy::Application(
+            ApplicationIndexResultAuthorization {},
+        )),
     }
 }
 
@@ -512,6 +522,7 @@ async fn raw_reserved_objects_are_denied_but_trusted_adapters_still_work() {
                 content_type: String::new(),
                 specification: Some(typed_json_specification()),
                 command_id: "create-reserved-boundary".into(),
+                result_authorization: Some(application_result_authorization()),
             },
             token,
         ))
@@ -567,6 +578,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
         content_type: String::new(),
         specification: Some(typed_json_specification()),
         command_id: "create-authorization-boundary".into(),
+        result_authorization: Some(application_result_authorization()),
     };
     assert_permission_denied(
         indexes
@@ -601,6 +613,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
                     content_type: String::new(),
                     specification: Some(typed_json_specification()),
                     command_id: "update-authorization-boundary".into(),
+                    result_authorization: Some(application_result_authorization()),
                 },
                 &denied_token,
             ))
@@ -635,6 +648,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
                     page_token: Vec::new(),
                     tenant: String::new(),
                     required_freshness: None,
+                    authorization_subject: None,
                 },
                 &denied_token,
             ))
@@ -728,6 +742,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
                 content_type: String::new(),
                 specification: Some(typed_json_specification()),
                 command_id: "update-after-rebuild".into(),
+                result_authorization: Some(application_result_authorization()),
             },
             owner_token,
         ))

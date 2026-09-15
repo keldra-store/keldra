@@ -8,8 +8,8 @@ use tokio::time::{Instant, sleep};
 use tonic::Code;
 
 use super::{
-    CONTENT_TYPE, EngineCase, IndexClient, POLL_INTERVAL, TestResult, WAIT_LIMIT, create_bucket,
-    invalid, retryable_transport,
+    CONTENT_TYPE, EngineCase, IndexClient, POLL_INTERVAL, TestResult, WAIT_LIMIT,
+    application_result_authorization, create_bucket, invalid, retryable_transport,
 };
 
 const INITIAL_PREFIX: &str = "docs/";
@@ -39,6 +39,7 @@ pub(super) async fn qualify(
                 content_type: CONTENT_TYPE.into(),
                 specification: Some(case.specification.clone()),
                 command_id: format!("qualification-lifecycle-create-{}", case.name),
+                result_authorization: Some(application_result_authorization()),
             })
             .await?
             .into_inner();
@@ -53,6 +54,7 @@ pub(super) async fn qualify(
                 content_type: CONTENT_TYPE.into(),
                 specification: Some(case.specification.clone()),
                 command_id: format!("qualification-lifecycle-update-{}", case.name),
+                result_authorization: Some(application_result_authorization()),
             })
             .await?
             .into_inner();

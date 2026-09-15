@@ -649,10 +649,10 @@ impl AuthzDistributionCore {
         consistency: AuthzConsistency,
         check: AuthorizationCheck,
     ) -> Result<(bool, AuthzRevision), Status> {
-        let (allowed, revision) = self
+        let result = self
             .fresh_checks(replicas, scope, consistency, vec![check])
             .await?;
-        Ok((allowed[0], revision))
+        Ok((result.allowed[0], result.revision))
     }
 
     async fn fresh_checks(
@@ -661,7 +661,7 @@ impl AuthzDistributionCore {
         scope: AuthzScope,
         consistency: AuthzConsistency,
         checks: Vec<AuthorizationCheck>,
-    ) -> Result<(Vec<bool>, AuthzRevision), Status> {
+    ) -> Result<keldra_store::AuthzBatchCheck, Status> {
         if self.reconcile(replicas, &scope).await?.is_none() {
             return Err(Status::failed_precondition(
                 "authorization realm has no schema binding",
@@ -674,7 +674,7 @@ impl AuthzDistributionCore {
         .await
         .map_err(|error| Status::internal(format!("authorization worker failed: {error}")))?
         .map_err(authz_status)?;
-        Ok((result.allowed, result.revision))
+        Ok(result)
     }
 }
 
@@ -932,21 +932,31 @@ impl ZanzibarDistribution {
         consistency: AuthzConsistency,
         checks: Vec<AuthorizationCheck>,
     ) -> Result<(Vec<bool>, AuthzRevision, u64), Status> {
+        let evidence = self
+            .fresh_checks_with_evidence(stable_tenant_id, scope, consistency, checks)
+            .await?;
+        Ok((
+            evidence.allowed,
+            evidence.revision,
+            evidence.binding_generation,
+        ))
+    }
+
+    pub(crate) async fn fresh_checks_with_evidence(
+        &self,
+        stable_tenant_id: u64,
+        scope: AuthzScope,
+        consistency: AuthzConsistency,
+        checks: Vec<AuthorizationCheck>,
+    ) -> Result<keldra_store::AuthzBatchCheck, Status> {
         let _serial = self.core.coordinator_lane(stable_tenant_id).read().await;
         let (replicas, placement_fence) = self.require_read_replica(stable_tenant_id)?;
-        let checked_scope = scope.clone();
-        let (allowed, revision) = self
+        let result = self
             .core
             .fresh_checks(&replicas, scope, consistency, checks)
             .await?;
-        let binding = self
-            .core
-            .repository
-            .get_binding(&checked_scope)
-            .map_err(authz_status)?
-            .ok_or_else(|| Status::failed_precondition("authorization realm has no binding"))?;
         self.require_unchanged_fresh_context(stable_tenant_id, &replicas.group, placement_fence)?;
-        Ok((allowed, revision, binding.generation))
+        Ok(result)
     }
 
     fn require_unchanged_fresh_context(

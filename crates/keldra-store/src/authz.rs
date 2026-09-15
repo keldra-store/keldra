@@ -13,7 +13,8 @@ use thiserror::Error;
 
 use crate::Store;
 use crate::store::{
-    CF_AUTHZ_BINDINGS, CF_AUTHZ_RECEIPTS, CF_AUTHZ_SCHEMAS, CF_AUTHZ_TENANTS, CF_AUTHZ_TUPLES,
+    CF_AUTHZ_BINDINGS, CF_AUTHZ_LEOPARD_FORWARD, CF_AUTHZ_LEOPARD_REVERSE, CF_AUTHZ_RECEIPTS,
+    CF_AUTHZ_SCHEMAS, CF_AUTHZ_TENANTS, CF_AUTHZ_TUPLES,
 };
 
 pub const SYSTEM_STORAGE_TENANT_ID: &str = "_keldra";
@@ -320,7 +321,12 @@ pub struct RealmSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthzBatchCheck {
+    /// Exact tenant-wide revision pinned by the RocksDB snapshot.
     pub revision: AuthzRevision,
+    /// Exact realm aggregate revision at that same snapshot.
+    pub realm_revision: AuthzRevision,
+    pub binding_generation: u64,
+    pub schema_ref: SchemaRef,
     pub allowed: Vec<bool>,
 }
 
@@ -849,7 +855,7 @@ impl AuthzRepository {
                 && existing.tuple != mutation.tuple
             {
                 return Err(AuthzStoreError::Storage(
-                    "authorization tuple digest collision".into(),
+                    "authorization tuple key resolves to another canonical tuple".into(),
                 ));
             }
             match mutation.kind {
@@ -866,6 +872,7 @@ impl AuthzRepository {
                                 tuple: mutation.tuple.clone(),
                             })?,
                         );
+                        self.stage_leopard_tuple(batch, &request.scope, &mutation.tuple, true)?;
                     }
                 }
                 TupleMutationKind::Remove => {
@@ -875,6 +882,7 @@ impl AuthzRepository {
                         })?;
                         changed = true;
                         batch.delete_cf(self.cf(CF_AUTHZ_TUPLES)?, key);
+                        self.stage_leopard_tuple(batch, &request.scope, &mutation.tuple, false)?;
                     }
                 }
             }
@@ -1212,63 +1220,6 @@ impl AuthzRepository {
         Ok((result.allowed[0], result.revision))
     }
 
-    pub fn batch_check(
-        &self,
-        scope: &AuthzScope,
-        consistency: AuthzConsistency,
-        checks: &[AuthorizationCheck],
-    ) -> Result<AuthzBatchCheck, AuthzStoreError> {
-        if checks.len() > self.limits.max_checks_per_batch {
-            return Err(AuthzStoreError::InvalidInput(format!(
-                "authorization check batch has {} entries, exceeding {}",
-                checks.len(),
-                self.limits.max_checks_per_batch
-            )));
-        }
-        if let Some((authorization, revision)) = self.cached_authorization(scope, consistency)? {
-            return Ok(AuthzBatchCheck {
-                revision,
-                allowed: authorization.check_many(checks)?,
-            });
-        }
-        let snapshot = self.read_realm_snapshot(scope, consistency)?;
-        let cache_key = CompiledAuthorizationKey {
-            scope: scope.clone(),
-            realm_revision: snapshot.realm_revision,
-            binding_generation: snapshot.binding.generation,
-            schema_ref: snapshot.binding.schema_ref.clone(),
-            limits: self.limits.evaluator,
-        };
-        let authorization = self
-            .compiled_cache
-            .lock()
-            .map_err(|_| AuthzStoreError::Storage("authorization cache lock poisoned".into()))?
-            .get(&cache_key);
-        let authorization = match authorization {
-            Some(authorization) => authorization,
-            None => {
-                let authorization = Arc::new(Authorization::new(
-                    scope.realm.clone(),
-                    snapshot.schema,
-                    snapshot.tuples,
-                    self.limits.evaluator,
-                )?);
-                self.compiled_cache
-                    .lock()
-                    .map_err(|_| {
-                        AuthzStoreError::Storage("authorization cache lock poisoned".into())
-                    })?
-                    .insert(cache_key, authorization.clone());
-                authorization
-            }
-        };
-        let allowed = authorization.check_many(checks)?;
-        Ok(AuthzBatchCheck {
-            revision: snapshot.revision,
-            allowed,
-        })
-    }
-
     /// Read a snapshot and validate it through the same disposable compiled
     /// projection used by checks. Keeping snapshot creation inside the
     /// repository prevents callers from injecting an untrusted cache entry.
@@ -1523,9 +1474,10 @@ impl AuthzRepository {
             self.cf(CF_AUTHZ_TUPLES)?,
             tuple_key,
             encode_json(&StoredTuple {
-                tuple: bootstrap_tuple,
+                tuple: bootstrap_tuple.clone(),
             })?,
         );
+        self.stage_leopard_tuple(batch, &scope, &bootstrap_tuple, true)?;
         self.stage_tenant_revision(batch, &tenant, AuthzRevision(3))
     }
 
@@ -1952,17 +1904,11 @@ fn binding_key(scope: &AuthzScope) -> Vec<u8> {
 }
 
 fn tuple_prefix(scope: &AuthzScope) -> Vec<u8> {
-    let mut key = vec![b'T'];
-    push_component(&mut key, scope.storage_tenant.as_str().as_bytes());
-    push_component(&mut key, scope.realm.as_str().as_bytes());
-    key
+    leopard::canonical_tuple_prefix(scope)
 }
 
 fn tuple_key(scope: &AuthzScope, tuple: &Tuple) -> Result<Vec<u8>, AuthzStoreError> {
-    let mut key = tuple_prefix(scope);
-    let encoded = serde_json::to_vec(tuple).map_err(storage_error)?;
-    key.extend_from_slice(blake3::hash(&encoded).as_bytes());
-    Ok(key)
+    Ok(leopard::canonical_tuple_key(scope, tuple))
 }
 
 fn receipt_key(
@@ -1983,8 +1929,11 @@ mod tests;
 
 mod repository;
 pub use repository::AuthzRepository;
-pub(crate) use repository::CompiledAuthorizationCache;
 use repository::CompiledAuthorizationKey;
+pub(super) use repository::CompiledLeopardKey;
+pub(crate) use repository::{CompiledAuthorizationCache, CompiledLeopardCache};
+
+mod leopard;
 
 mod catalogue;
 pub use catalogue::*;

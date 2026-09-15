@@ -15,7 +15,10 @@ mod evaluator;
 mod model;
 mod schema;
 
-pub use evaluator::Authorization;
+pub use evaluator::{
+    Authorization, LeopardAuthorization, LeopardEvaluation, LeopardEvaluationStats,
+    check_many_with_leopard,
+};
 pub use model::{
     ANONYMOUS_SUBJECT_ID, AllowedSubject, AuthorizationCheck, AuthorizationError,
     AuthorizationLimits, DEFAULT_REALM_ID, ExactPath, MAX_NAMESPACE_BYTES, MAX_PATH_BYTES,

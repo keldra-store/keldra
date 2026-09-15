@@ -145,6 +145,15 @@ Pass the request to `IndexServiceClient::create_index`. Query hits return the
 ordinary object address and exact version; fetch selected source objects with
 `GetObject` or `BatchGet`.
 
+`TypedJsonIndexBuilder::finish` explicitly selects application result
+authorization. Existing application-scoped queries therefore set
+`QueryIndexRequest.authorization_subject` to `None`. To enforce an end-user
+realm, replace the request's `result_authorization` with an
+`IndexResultAuthorization` whose policy is `Policy::Realm` before `CreateIndex`
+and pass a concrete object `Subject` on every query; see the repository
+README's custom-realm example. Realm authorization intersects the authenticated
+application's access and never grants the application additional object access.
+
 The concrete builders are `BooleanField`, `SignedIntegerField`,
 `UnsignedIntegerField`, `FloatField`, `KeywordField`, `TextField`, and
 `DateField`. Date fields use ISO-8601 by default; pass a pattern created by

@@ -15,8 +15,8 @@ use tonic::Status;
 
 use crate::authentication::Caller;
 use crate::authorization::{
-    ObjectPermission, SYSTEM_STABLE_TENANT_ID, bucket_policy_authorization_check,
-    object_authorization_checks,
+    ObjectPermission, RealmPermission, SYSTEM_STABLE_TENANT_ID, bucket_policy_authorization_check,
+    object_authorization_checks, realm_authorization_check,
 };
 use crate::authz_distribution::ZanzibarDistribution;
 use crate::cluster_peer::ClusterPeerTransport;
@@ -95,6 +95,16 @@ impl AuthoritativeSystemAuthorization {
         caller: &Caller,
         requests: &[(ObjectKey, ObjectPermission)],
     ) -> Result<FreshAuthorizationResult, Status> {
+        self.allows_objects_with_consistency(caller, requests, AuthzConsistency::Latest)
+            .await
+    }
+
+    async fn allows_objects_with_consistency(
+        &self,
+        caller: &Caller,
+        requests: &[(ObjectKey, ObjectPermission)],
+        consistency: AuthzConsistency,
+    ) -> Result<FreshAuthorizationResult, Status> {
         if requests.is_empty() {
             return Err(Status::invalid_argument(
                 "authorization check batch must not be empty",
@@ -127,7 +137,7 @@ impl AuthoritativeSystemAuthorization {
         }
         let bindings = self.stable_bucket_bindings(requests).await?;
         let first = self
-            .fresh_system_checks(AuthzConsistency::Latest, bucket_checks, bindings.clone())
+            .fresh_system_checks(consistency, bucket_checks, bindings.clone())
             .await?;
         let mut allowed = request_bucket_indexes
             .iter()
@@ -538,6 +548,185 @@ impl crate::index_service::IndexAuthorization for AuthoritativeSystemAuthorizati
         Ok(crate::index_service::IndexAuthorizationEvidence {
             allowed: evidence.allowed,
             revision: evidence.revision.0,
+        })
+    }
+
+    async fn allows_objects_at_revision_with_evidence(
+        &self,
+        caller: &Caller,
+        requests: &[(ObjectKey, ObjectPermission)],
+        required_revision: u64,
+    ) -> Result<crate::index_service::IndexAuthorizationEvidence, Status> {
+        if required_revision == 0 {
+            return Err(Status::invalid_argument(
+                "protected authorization revision must be non-zero",
+            ));
+        }
+        let evidence = self
+            .allows_objects_with_consistency(
+                caller,
+                requests,
+                AuthzConsistency::Exact(AuthzRevision(required_revision)),
+            )
+            .await?;
+        if evidence.revision.0 != required_revision {
+            return Err(Status::failed_precondition(
+                "protected authorization revision changed during index execution",
+            ));
+        }
+        Ok(crate::index_service::IndexAuthorizationEvidence {
+            allowed: evidence.allowed,
+            revision: evidence.revision.0,
+        })
+    }
+
+    async fn admit_query(
+        &self,
+        caller: &Caller,
+        stable_tenant_id: u64,
+        definition: &ObjectKey,
+        policy: &crate::index_service::IndexResultAuthorizationPolicy,
+        authorization_subject: Option<&ObjectRef>,
+    ) -> Result<crate::index_service::IndexQueryAuthorizationEvidence, Status> {
+        let definition_evidence = self
+            .allows_objects_with_evidence(caller, &[(definition.clone(), ObjectPermission::Get)])
+            .await?;
+        if definition_evidence.allowed != [true] {
+            return Err(Status::permission_denied(
+                "index definition query is not authorized",
+            ));
+        }
+        let system_revision = definition_evidence.revision.0;
+        let crate::index_service::IndexResultAuthorizationPolicy::Realm(policy) = policy else {
+            if authorization_subject.is_some() {
+                return Err(Status::invalid_argument(
+                    "authorization subject is valid only for a realm-authorized index",
+                ));
+            }
+            return Ok(crate::index_service::IndexQueryAuthorizationEvidence {
+                system_revision,
+                result: None,
+            });
+        };
+        if caller.subject().is_anonymous() {
+            return Err(Status::unauthenticated(
+                "realm-authorized index queries require an authenticated application",
+            ));
+        }
+        let authorization_subject = authorization_subject.ok_or_else(|| {
+            Status::invalid_argument(
+                "realm-authorized index query requires an authorization subject",
+            )
+        })?;
+        if authorization_subject.is_anonymous() || authorization_subject.is_public() {
+            return Err(Status::invalid_argument(
+                "index authorization subject must identify one concrete end user",
+            ));
+        }
+        let realm =
+            keldra_authz::RealmId::custom(&policy.realm).map_err(crate::authz_api::authz_status)?;
+        let delegation = realm_authorization_check(
+            caller.subject(),
+            caller.storage_tenant().as_str(),
+            &realm,
+            RealmPermission::Check,
+        )
+        .map_err(crate::authz_api::authz_status)?;
+        let delegated = self
+            .fresh_system_checks(
+                AuthzConsistency::Exact(definition_evidence.revision),
+                vec![delegation],
+                Vec::new(),
+            )
+            .await?;
+        if delegated.revision != definition_evidence.revision || delegated.allowed != [true] {
+            return Err(Status::permission_denied(
+                "application may not evaluate the index authorization realm",
+            ));
+        }
+        let scope = AuthzScope::new(caller.storage_tenant().clone(), realm)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let probe = AuthorizationCheck::new(
+            authorization_subject.clone(),
+            ObjectRef::opaque(&policy.resource_namespace, "_keldra_index_admission")
+                .map_err(crate::authz_api::authz_status)?,
+            &policy.relation,
+        );
+        let result = self
+            .zanzibar
+            .fresh_checks_with_evidence(
+                stable_tenant_id,
+                scope,
+                AuthzConsistency::Latest,
+                vec![probe],
+            )
+            .await?;
+        Ok(crate::index_service::IndexQueryAuthorizationEvidence {
+            system_revision,
+            result: Some(crate::index_service::IndexRealmAuthorizationEvidence {
+                revision: result.revision.0,
+                binding_generation: result.binding_generation,
+                schema_ref: result.schema_ref,
+            }),
+        })
+    }
+
+    async fn allows_realm_results_with_evidence(
+        &self,
+        caller: &Caller,
+        stable_tenant_id: u64,
+        scope: &AuthzScope,
+        authorization_subject: &ObjectRef,
+        relation: &str,
+        resources: &[ObjectRef],
+        required_system_revision: u64,
+        required: &crate::index_service::IndexRealmAuthorizationEvidence,
+    ) -> Result<crate::index_service::IndexAuthorizationEvidence, Status> {
+        if required_system_revision == 0
+            || required.revision == 0
+            || required.binding_generation == 0
+            || scope.storage_tenant.as_str() != caller.storage_tenant().as_str()
+            || caller.subject().is_anonymous()
+            || authorization_subject.is_anonymous()
+            || authorization_subject.is_public()
+        {
+            return Err(Status::permission_denied(
+                "realm result authorization evidence is invalid",
+            ));
+        }
+        // Query admission already proved this caller's realm delegation at
+        // `required_system_revision`. That immutable revision cannot change
+        // during candidate evaluation, and each routed destination performs
+        // its own admission before constructing the candidate gate. Repeating
+        // the same protected-realm check for every candidate batch would add
+        // an RPC without strengthening the pinned authorization decision.
+        let checks = resources
+            .iter()
+            .cloned()
+            .map(|resource| {
+                AuthorizationCheck::new(authorization_subject.clone(), resource, relation)
+            })
+            .collect::<Vec<_>>();
+        let result = self
+            .zanzibar
+            .fresh_checks_with_evidence(
+                stable_tenant_id,
+                scope.clone(),
+                AuthzConsistency::Exact(AuthzRevision(required.revision)),
+                checks,
+            )
+            .await?;
+        if result.revision.0 != required.revision
+            || result.binding_generation != required.binding_generation
+            || result.schema_ref != required.schema_ref
+        {
+            return Err(Status::failed_precondition(
+                "index authorization realm changed during query execution",
+            ));
+        }
+        Ok(crate::index_service::IndexAuthorizationEvidence {
+            allowed: result.allowed,
+            revision: result.revision.0,
         })
     }
 }

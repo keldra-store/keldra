@@ -260,6 +260,7 @@ async fn verify_task_index_eventually(
             sources: Vec::new(),
             atomic_through: Some(atomic_through),
         }),
+        authorization_subject: None,
     };
     let deadline = Instant::now() + REPLICA_WAIT_LIMIT;
     let expected_sources = clients.len();

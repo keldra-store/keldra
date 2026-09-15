@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use keldra_storage::v1::Durability;
 use serde::Serialize;
 use std::{env, path::PathBuf, time::Duration};
 
@@ -7,6 +8,13 @@ const MAX_QUALIFICATION_PHYSICAL_RECIPES: usize = 64;
 pub(super) const MAX_QUALIFICATION_MUTABLE_RECORDS: u64 = 1_000_000;
 
 const PREFIX: &str = "KELDRA_INDEX_CONTENTION_";
+
+pub(super) fn configured_durability(config: &Config) -> Durability {
+    match config.durability.as_str() {
+        "REPLICATED" => Durability::Replicated,
+        _ => Durability::Local,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]

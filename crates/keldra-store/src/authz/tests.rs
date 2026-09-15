@@ -277,7 +277,7 @@ async fn tuple_batches_are_atomic_replayable_and_principal_scoped() {
         .unwrap();
     assert_eq!(result.revision, AuthzRevision(4));
     assert_eq!(result.allowed, vec![true]);
-    assert_eq!(repository.compiled_cache.lock().unwrap().entries.len(), 1);
+    assert_eq!(repository.leopard_cache.lock().unwrap().entries.len(), 1);
     let cached = repository
         .batch_check(
             &realm,
@@ -291,9 +291,9 @@ async fn tuple_batches_are_atomic_replayable_and_principal_scoped() {
         .unwrap();
     assert_eq!(cached.allowed, vec![true]);
     {
-        let cache = repository.compiled_cache.lock().unwrap();
+        let cache = repository.leopard_cache.lock().unwrap();
         assert_eq!(cache.entries.len(), 1);
-        assert_eq!(cache.entries[0].key.realm_revision, AuthzRevision(4));
+        assert_eq!(cache.entries[0].0.binding_generation, 1);
     }
     let snapshot = repository
         .validated_realm_snapshot(&realm, AuthzConsistency::Exact(AuthzRevision(4)))
@@ -322,6 +322,110 @@ async fn tuple_batches_are_atomic_replayable_and_principal_scoped() {
         .unwrap();
     assert_eq!(durable.revision, AuthzRevision(4));
     assert_eq!(durable.tuples.len(), 2);
+}
+
+#[tokio::test]
+async fn leopard_edges_follow_tuple_add_remove_and_rebuild_from_authority() {
+    let (directory, store) = store().await;
+    let repository = store.authz();
+    let realm = scope("acme", "groups");
+    let published = publish(
+        &repository,
+        tenant("acme"),
+        "documents",
+        document_schema(false),
+        AuthzRevision::ZERO,
+    );
+    bind(
+        &repository,
+        realm.clone(),
+        published.schema_ref,
+        AuthzRevision(1),
+    );
+    let tuple = viewer_tuple("one", "alice");
+    repository
+        .mutate_tuples(TupleBatchRequest {
+            scope: realm.clone(),
+            principal: principal("writer"),
+            expected_revision: Some(AuthzRevision(2)),
+            expected_binding_generation: 1,
+            operation_id: None,
+            mutations: vec![TupleMutation {
+                kind: TupleMutationKind::Add,
+                tuple: tuple.clone(),
+            }],
+        })
+        .unwrap();
+    let userset = UsersetRef::new(resource("one"), "viewer").unwrap();
+    let subject = TupleSubject::Object(principal("alice"));
+    assert_eq!(
+        repository
+            .leopard_direct_subjects(&realm, &userset)
+            .unwrap(),
+        vec![subject.clone()]
+    );
+    assert_eq!(
+        repository
+            .leopard_containing_usersets(&realm, &subject)
+            .unwrap(),
+        vec![userset.clone()]
+    );
+
+    for cf_name in [CF_AUTHZ_LEOPARD_FORWARD, CF_AUTHZ_LEOPARD_REVERSE] {
+        let cf = repository.cf(cf_name).unwrap();
+        let keys = repository
+            .db
+            .iterator_cf(cf, IteratorMode::Start)
+            .map(|item| item.unwrap().0)
+            .collect::<Vec<_>>();
+        for key in keys {
+            repository.db.delete_cf(cf, key).unwrap();
+        }
+    }
+    drop(repository);
+    drop(store);
+    let reopened = Store::open(StoreOptions::new(directory.path(), 7))
+        .await
+        .unwrap();
+    let repository = reopened.authz();
+    assert_eq!(
+        repository
+            .leopard_direct_subjects(&realm, &userset)
+            .unwrap(),
+        vec![subject.clone()]
+    );
+    assert_eq!(
+        repository
+            .leopard_containing_usersets(&realm, &subject)
+            .unwrap(),
+        vec![userset.clone()]
+    );
+
+    repository
+        .mutate_tuples(TupleBatchRequest {
+            scope: realm.clone(),
+            principal: principal("writer"),
+            expected_revision: Some(AuthzRevision(3)),
+            expected_binding_generation: 1,
+            operation_id: None,
+            mutations: vec![TupleMutation {
+                kind: TupleMutationKind::Remove,
+                tuple,
+            }],
+        })
+        .unwrap();
+    assert!(
+        repository
+            .leopard_direct_subjects(&realm, &userset)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repository
+            .leopard_containing_usersets(&realm, &subject)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -384,7 +488,7 @@ async fn retained_tuple_replay_restores_the_original_revision_for_same_mutation(
 }
 
 #[tokio::test]
-async fn compiled_authorization_cache_misses_after_a_tuple_mutation() {
+async fn leopard_schema_cache_survives_a_tuple_only_revision() {
     let (_directory, store) = store().await;
     let repository = store.authz();
     let realm = scope("acme", "cache-revision");
@@ -408,12 +512,9 @@ async fn compiled_authorization_cache_misses_after_a_tuple_mutation() {
             .unwrap()
             .0
     );
-    assert_eq!(
-        repository.compiled_cache.lock().unwrap().entries[0]
-            .key
-            .realm_revision,
-        AuthzRevision(2)
-    );
+    let cached_schema = repository.leopard_cache.lock().unwrap().entries[0]
+        .1
+        .clone();
 
     repository
         .mutate_tuples(TupleBatchRequest {
@@ -434,15 +535,15 @@ async fn compiled_authorization_cache_misses_after_a_tuple_mutation() {
             .unwrap()
             .0
     );
-    let cache = repository.compiled_cache.lock().unwrap();
+    let cache = repository.leopard_cache.lock().unwrap();
     assert_eq!(cache.entries.len(), 1);
-    assert_eq!(cache.entries[0].key.realm_revision, AuthzRevision(3));
-    assert_eq!(cache.byte_weight, cache.entries[0].byte_weight);
+    assert!(Arc::ptr_eq(&cached_schema, &cache.entries[0].1));
+    assert_eq!(cache.byte_weight, cache.entries[0].2);
     assert!(cache.byte_weight > 0);
 }
 
 #[tokio::test]
-async fn compiled_authorization_cache_rejects_an_entry_over_its_byte_budget() {
+async fn leopard_schema_cache_rejects_an_entry_over_its_byte_budget() {
     let (_directory, store) = store().await;
     let repository = store.authz();
     let realm = scope("acme", "cache-byte-budget");
@@ -459,7 +560,7 @@ async fn compiled_authorization_cache_rejects_an_entry_over_its_byte_budget() {
         published.schema_ref,
         AuthzRevision(1),
     );
-    repository.compiled_cache.lock().unwrap().max_byte_weight = 1;
+    repository.leopard_cache.lock().unwrap().max_byte_weight = 1;
     repository
         .check(
             &realm,
@@ -467,7 +568,7 @@ async fn compiled_authorization_cache_rejects_an_entry_over_its_byte_budget() {
             &AuthorizationCheck::new(principal("alice"), resource("one"), "view"),
         )
         .unwrap();
-    let cache = repository.compiled_cache.lock().unwrap();
+    let cache = repository.leopard_cache.lock().unwrap();
     assert!(cache.entries.is_empty());
     assert_eq!(cache.byte_weight, 0);
 }

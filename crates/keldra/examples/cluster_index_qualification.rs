@@ -24,7 +24,7 @@ use keldra_storage::v1::{
     PathIndexQuery, PathIndexSpec, PutHeader, PutOperation, QueryIndexRequest, QueryIndexResponse,
     RebuildIndexRequest, SetBucketPublicReadRequest, SignedIntegerIndexField, TensorIndexQuery,
     TensorIndexSpec, TextAnalyzer, TextIndexField, TypedJsonIndexQuery, TypedJsonIndexSpec,
-    UnsignedIntegerIndexField, VectorIndexQuery, VectorIndexSpec, VectorMetric,
+    UnsignedIntegerIndexField, VectorIndexQuery,
 };
 use keldra_storage::{
     BearerToken, RawAdministrationClient, RawClient, administration_client, connect_channel,
@@ -37,14 +37,17 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::{Code, Request};
 
+#[path = "cluster_index_qualification/authorization.rs"]
+mod authorization;
 #[path = "cluster_index_qualification/definition_lifecycle.rs"]
 mod definition_lifecycle;
 #[path = "cluster_index_qualification/typed_capabilities.rs"]
 mod typed_capabilities;
+use authorization::application_result_authorization;
 use typed_capabilities::{
     boolean_field, custom_date_field, date_field, float_field, keyword_field, keyword_multi_field,
     signed_integer_field, signed_integer_multi_field, text_field, typed_json_order,
-    unsigned_integer_field,
+    unsigned_integer_field, vector_spec,
 };
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -168,6 +171,7 @@ async fn main() -> TestResult<()> {
                 content_type: CONTENT_TYPE.into(),
                 specification: Some(case.specification.clone()),
                 command_id: format!("qualification-create-{}", case.name),
+                result_authorization: Some(application_result_authorization()),
             })
             .await?
             .into_inner();
@@ -1511,6 +1515,7 @@ fn request(case: &EngineCase) -> QueryIndexRequest {
         page_token: Vec::new(),
         tenant: String::new(),
         required_freshness: None,
+        authorization_subject: None,
     }
 }
 
@@ -1961,15 +1966,6 @@ fn semantic_documents() -> Vec<(&'static str, &'static [u8])> {
 
 fn semantic_paths() -> Vec<&'static str> {
     vec!["docs/music.json", "docs/rust.json", "docs/storage.json"]
-}
-
-fn vector_spec() -> VectorIndexSpec {
-    VectorIndexSpec {
-        json_pointer: "/embedding".into(),
-        dimensions: 3,
-        metric: VectorMetric::Cosine as i32,
-        normalize: true,
-    }
 }
 
 fn specification(value: SpecificationValue) -> IndexSpecification {

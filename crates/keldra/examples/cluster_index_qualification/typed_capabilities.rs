@@ -1,10 +1,20 @@
 use super::*;
+use keldra_storage::v1::{VectorIndexSpec, VectorMetric};
 
 const ACTIVE: &[&str] = &[
     "docs/active-c.json",
     "docs/active-b.json",
     "docs/active-a.json",
 ];
+
+pub(super) fn vector_spec() -> VectorIndexSpec {
+    VectorIndexSpec {
+        json_pointer: "/embedding".into(),
+        dimensions: 3,
+        metric: VectorMetric::Cosine as i32,
+        normalize: true,
+    }
+}
 
 pub(super) fn keyword_field(
     name: &str,
@@ -467,6 +477,7 @@ async fn execute(
         page_token: Vec::new(),
         tenant: String::new(),
         required_freshness: None,
+        authorization_subject: None,
     };
     let deadline = Instant::now() + WAIT_LIMIT;
     loop {

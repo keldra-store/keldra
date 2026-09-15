@@ -650,6 +650,345 @@ fn compiled_authorization_reports_nonzero_byte_weight() {
 }
 
 #[test]
+fn leopard_evaluation_loads_only_reached_usersets_and_reuses_them_per_batch() {
+    use std::collections::BTreeMap;
+
+    let alice = opaque("user", "alice");
+    let report = path("reports/a.json");
+    let unrelated = path("reports/unrelated.json");
+    let reader = UsersetRef::new(report.clone(), "reader").unwrap();
+    let mut forward = BTreeMap::from([
+        (reader.clone(), vec![TupleSubject::Object(alice.clone())]),
+        (
+            UsersetRef::new(unrelated, "reader").unwrap(),
+            vec![TupleSubject::Object(opaque("user", "bob"))],
+        ),
+    ]);
+    let mut reverse = BTreeMap::from([(TupleSubject::Object(alice.clone()), vec![reader.clone()])]);
+    let compiled = LeopardAuthorization::new(
+        realm("leopard"),
+        object_schema(),
+        AuthorizationLimits::default(),
+    )
+    .unwrap();
+    let check = AuthorizationCheck::new(alice, report.clone(), "read");
+    let denied = AuthorizationCheck::new(opaque("user", "charlie"), report, "read");
+    let evidence = compiled
+        .check_many_with_evidence(
+            &[check.clone(), denied.clone(), denied, check],
+            |userset| Ok(forward.remove(userset).unwrap_or_default()),
+            |subject| Ok(reverse.remove(subject).unwrap_or_default()),
+        )
+        .unwrap();
+
+    assert_eq!(evidence.allowed, vec![true, false, false, true]);
+    assert_eq!(evidence.stats.visited_usersets, 6);
+    assert_eq!(evidence.stats.forward_prefix_reads, 0);
+    assert_eq!(evidence.stats.forward_usersets_loaded, 0);
+    assert_eq!(evidence.stats.forward_edges_loaded, 0);
+    assert_eq!(evidence.stats.reverse_prefix_reads, 2);
+    assert_eq!(evidence.stats.reverse_subjects_loaded, 2);
+    assert_eq!(evidence.stats.reverse_edges_loaded, 1);
+    assert_eq!(evidence.stats.adjacency_cache_hits, 1);
+    assert_eq!(evidence.stats.adjacency_cache_misses, 2);
+    assert!(forward.contains_key(&reader));
+    assert_eq!(forward.len(), 2);
+}
+
+#[test]
+fn leopard_nested_group_membership_walks_reverse_ancestors_not_forward_siblings() {
+    use std::collections::BTreeMap;
+
+    let schema = Schema::new([
+        NamespaceDefinition::new(
+            "document",
+            [
+                RelationDefinition::direct(
+                    "viewer",
+                    [AllowedSubject::any_userset("group", "member")],
+                ),
+                RelationDefinition::permission(
+                    "view",
+                    [RewriteRule::Inherit {
+                        relation: "viewer".into(),
+                    }],
+                ),
+            ],
+        ),
+        NamespaceDefinition::new(
+            "group",
+            [RelationDefinition::direct(
+                "member",
+                [
+                    AllowedSubject::any_object("user"),
+                    AllowedSubject::any_userset("group", "member"),
+                ],
+            )],
+        ),
+    ]);
+    let alice = opaque("user", "alice");
+    let leaf = UsersetRef::new(opaque("group", "leaf"), "member").unwrap();
+    let middle = UsersetRef::new(opaque("group", "middle"), "member").unwrap();
+    let root = UsersetRef::new(opaque("group", "root"), "member").unwrap();
+    let document = opaque("document", "report");
+    let document_viewers = UsersetRef::new(document.clone(), "viewer").unwrap();
+    let mut reverse = BTreeMap::from([
+        (TupleSubject::Object(alice.clone()), vec![leaf.clone()]),
+        (TupleSubject::Userset(leaf), vec![middle.clone()]),
+        (TupleSubject::Userset(middle), vec![root.clone()]),
+        (TupleSubject::Userset(root), vec![document_viewers]),
+    ]);
+    let compiled = LeopardAuthorization::new(
+        realm("nested-leopard"),
+        schema,
+        AuthorizationLimits::default(),
+    )
+    .unwrap();
+
+    let evidence = compiled
+        .check_many_with_evidence(
+            &[AuthorizationCheck::new(alice, document, "view")],
+            |_| panic!("direct membership must not scan forward from the root userset"),
+            |subject| Ok(reverse.remove(subject).unwrap_or_default()),
+        )
+        .unwrap();
+
+    assert_eq!(evidence.allowed, [true]);
+    assert_eq!(evidence.stats.forward_prefix_reads, 0);
+    assert_eq!(evidence.stats.forward_edges_loaded, 0);
+    assert_eq!(evidence.stats.reverse_prefix_reads, 4);
+    assert_eq!(evidence.stats.reverse_edges_loaded, 4);
+}
+
+#[test]
+fn leopard_preserves_tuple_to_userset_rewrites_with_bidirectional_indexes() {
+    use std::collections::BTreeMap;
+
+    let alice = opaque("user", "alice");
+    let bob = opaque("user", "bob");
+    let report = path("reports/a.json");
+    let folder = opaque("folder", "reports");
+    let tuples = vec![
+        Tuple::new(report.clone(), "parent", folder.clone()),
+        Tuple::new(folder, "viewer", alice.clone()),
+    ];
+    let authority = Authorization::new(
+        realm("tuple-to-userset-authority"),
+        object_schema(),
+        tuples.clone(),
+        AuthorizationLimits::default(),
+    )
+    .unwrap();
+    let mut forward = BTreeMap::<UsersetRef, Vec<TupleSubject>>::new();
+    let mut reverse = BTreeMap::<TupleSubject, Vec<UsersetRef>>::new();
+    for tuple in tuples {
+        let userset = UsersetRef::new(tuple.object, tuple.relation).unwrap();
+        forward
+            .entry(userset.clone())
+            .or_default()
+            .push(tuple.subject.clone());
+        reverse.entry(tuple.subject).or_default().push(userset);
+    }
+    let checks = vec![
+        AuthorizationCheck::new(alice, report.clone(), "read"),
+        AuthorizationCheck::new(bob, report, "read"),
+    ];
+    let expected = authority.check_many(&checks).unwrap();
+    let leopard = LeopardAuthorization::new(
+        realm("tuple-to-userset-leopard"),
+        object_schema(),
+        AuthorizationLimits::default(),
+    )
+    .unwrap()
+    .check_many_with_evidence(
+        &checks,
+        |userset| Ok(forward.get(userset).cloned().unwrap_or_default()),
+        |subject| Ok(reverse.get(subject).cloned().unwrap_or_default()),
+    )
+    .unwrap();
+
+    assert_eq!(expected, vec![true, false]);
+    assert_eq!(leopard.allowed, expected);
+    assert!(leopard.stats.forward_prefix_reads > 0);
+    assert!(leopard.stats.reverse_prefix_reads > 0);
+}
+
+#[test]
+fn leopard_falls_forward_when_a_direct_tuple_contains_a_permission_userset() {
+    use std::collections::BTreeMap;
+
+    let schema = Schema::new([
+        NamespaceDefinition::new(
+            "group",
+            [
+                RelationDefinition::direct("member", [AllowedSubject::any_object("user")]),
+                RelationDefinition::permission(
+                    "view",
+                    [RewriteRule::Inherit {
+                        relation: "member".into(),
+                    }],
+                ),
+            ],
+        ),
+        NamespaceDefinition::new(
+            "document",
+            [
+                RelationDefinition::direct(
+                    "viewer",
+                    [AllowedSubject::any_userset("group", "view")],
+                ),
+                RelationDefinition::permission(
+                    "view",
+                    [RewriteRule::Inherit {
+                        relation: "viewer".into(),
+                    }],
+                ),
+            ],
+        ),
+    ]);
+    let alice = opaque("user", "alice");
+    let group = opaque("group", "engineering");
+    let group_members = UsersetRef::new(group.clone(), "member").unwrap();
+    let group_view = UsersetRef::new(group.clone(), "view").unwrap();
+    let document = opaque("document", "design");
+    let document_viewers = UsersetRef::new(document.clone(), "viewer").unwrap();
+    let tuples = vec![
+        Tuple::new(group, "member", alice.clone()),
+        Tuple::userset(document.clone(), "viewer", group_view.clone()),
+    ];
+    let expected = Authorization::new(
+        realm("permission-userset-authority"),
+        schema.clone(),
+        tuples,
+        AuthorizationLimits::default(),
+    )
+    .unwrap()
+    .check(&AuthorizationCheck::new(
+        alice.clone(),
+        document.clone(),
+        "view",
+    ))
+    .unwrap();
+    let forward = BTreeMap::from([(
+        document_viewers.clone(),
+        vec![TupleSubject::Userset(group_view.clone())],
+    )]);
+    let reverse = BTreeMap::from([
+        (TupleSubject::Object(alice.clone()), vec![group_members]),
+        (TupleSubject::Userset(group_view), vec![document_viewers]),
+    ]);
+    let evidence = LeopardAuthorization::new(
+        realm("permission-userset-leopard"),
+        schema,
+        AuthorizationLimits::default(),
+    )
+    .unwrap()
+    .check_many_with_evidence(
+        &[AuthorizationCheck::new(alice, document, "view")],
+        |userset| Ok(forward.get(userset).cloned().unwrap_or_default()),
+        |subject| Ok(reverse.get(subject).cloned().unwrap_or_default()),
+    )
+    .unwrap();
+
+    assert!(expected);
+    assert_eq!(evidence.allowed, [expected]);
+    assert_eq!(evidence.stats.forward_prefix_reads, 1);
+    assert!(evidence.stats.reverse_prefix_reads >= 2);
+}
+
+#[test]
+fn leopard_permission_fallback_propagates_through_direct_relation_cycles() {
+    use std::collections::BTreeMap;
+
+    let schema = Schema::new([
+        NamespaceDefinition::new(
+            "group",
+            [
+                RelationDefinition::direct(
+                    "a",
+                    [
+                        AllowedSubject::any_userset("group", "z"),
+                        AllowedSubject::any_userset("group", "view"),
+                    ],
+                ),
+                RelationDefinition::direct("member", [AllowedSubject::any_object("user")]),
+                RelationDefinition::permission(
+                    "view",
+                    [RewriteRule::Inherit {
+                        relation: "member".into(),
+                    }],
+                ),
+                RelationDefinition::direct("z", [AllowedSubject::any_userset("group", "a")]),
+            ],
+        ),
+        NamespaceDefinition::new(
+            "report",
+            [
+                RelationDefinition::direct("viewer", [AllowedSubject::any_userset("group", "z")]),
+                RelationDefinition::permission(
+                    "view",
+                    [RewriteRule::Inherit {
+                        relation: "viewer".into(),
+                    }],
+                ),
+            ],
+        ),
+    ]);
+    let alice = opaque("user", "alice");
+    let group = opaque("group", "engineering");
+    let group_view = UsersetRef::new(group.clone(), "view").unwrap();
+    let group_a = UsersetRef::new(group.clone(), "a").unwrap();
+    let group_z = UsersetRef::new(group.clone(), "z").unwrap();
+    let report = opaque("report", "design");
+    let tuples = vec![
+        Tuple::new(group, "member", alice.clone()),
+        Tuple::userset(group_a.object.clone(), "a", group_view.clone()),
+        Tuple::userset(group_z.object.clone(), "z", group_a.clone()),
+        Tuple::userset(report.clone(), "viewer", group_z.clone()),
+    ];
+    let expected = Authorization::new(
+        realm("cycle-authority"),
+        schema.clone(),
+        tuples.clone(),
+        AuthorizationLimits::default(),
+    )
+    .unwrap()
+    .check(&AuthorizationCheck::new(
+        alice.clone(),
+        report.clone(),
+        "view",
+    ))
+    .unwrap();
+    let mut forward = BTreeMap::<UsersetRef, Vec<TupleSubject>>::new();
+    let mut reverse = BTreeMap::<TupleSubject, Vec<UsersetRef>>::new();
+    for tuple in tuples {
+        let parent = UsersetRef::new(tuple.object, tuple.relation).unwrap();
+        forward
+            .entry(parent.clone())
+            .or_default()
+            .push(tuple.subject.clone());
+        reverse.entry(tuple.subject).or_default().push(parent);
+    }
+    let evidence = LeopardAuthorization::new(
+        realm("cycle-leopard"),
+        schema,
+        AuthorizationLimits::default(),
+    )
+    .unwrap()
+    .check_many_with_evidence(
+        &[AuthorizationCheck::new(alice, report, "view")],
+        |userset| Ok(forward.get(userset).cloned().unwrap_or_default()),
+        |subject| Ok(reverse.get(subject).cloned().unwrap_or_default()),
+    )
+    .unwrap();
+
+    assert!(expected);
+    assert_eq!(evidence.allowed, [expected]);
+    assert!(evidence.stats.forward_prefix_reads >= 3);
+    assert!(evidence.stats.reverse_prefix_reads >= 2);
+}
+
+#[test]
 fn exact_paths_are_canonical_and_never_gain_implicit_prefix_rights() {
     assert!(ExactPath::new("acme", "objects", "/absolute").is_err());
     assert!(ExactPath::new("acme", "objects", "double//segment").is_err());

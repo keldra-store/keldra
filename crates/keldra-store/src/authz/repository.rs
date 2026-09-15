@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use keldra_authz::LeopardAuthorization;
+
 use super::*;
 
 const COMPILED_AUTHORIZATION_CACHE_ENTRIES: usize = 64;
@@ -13,6 +15,7 @@ pub struct AuthzRepository {
     pub(super) sync_writes: bool,
     pub(super) limits: AuthzStoreLimits,
     pub(super) compiled_cache: Arc<Mutex<CompiledAuthorizationCache>>,
+    pub(super) leopard_cache: Arc<Mutex<CompiledLeopardCache>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -22,6 +25,56 @@ pub(super) struct CompiledAuthorizationKey {
     pub(super) binding_generation: u64,
     pub(super) schema_ref: SchemaRef,
     pub(super) limits: AuthorizationLimits,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct CompiledLeopardKey {
+    pub(super) scope: AuthzScope,
+    pub(super) binding_generation: u64,
+    pub(super) schema_ref: SchemaRef,
+    pub(super) limits: AuthorizationLimits,
+}
+
+pub(crate) struct CompiledLeopardCache {
+    pub(super) entries: VecDeque<(CompiledLeopardKey, Arc<LeopardAuthorization>, usize)>,
+    pub(super) byte_weight: usize,
+    pub(super) max_byte_weight: usize,
+}
+
+impl Default for CompiledLeopardCache {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            byte_weight: 0,
+            max_byte_weight: COMPILED_AUTHORIZATION_CACHE_BYTES,
+        }
+    }
+}
+
+impl CompiledLeopardCache {
+    pub(super) fn get(&mut self, key: &CompiledLeopardKey) -> Option<Arc<LeopardAuthorization>> {
+        let index = self.entries.iter().position(|entry| entry.0 == *key)?;
+        let entry = self.entries.remove(index)?;
+        let value = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(value)
+    }
+
+    pub(super) fn insert(&mut self, key: CompiledLeopardKey, value: Arc<LeopardAuthorization>) {
+        let byte_weight = value.estimated_heap_bytes();
+        self.entries.retain(|entry| entry.0 != key);
+        self.byte_weight = self.entries.iter().map(|entry| entry.2).sum();
+        self.byte_weight = self.byte_weight.saturating_add(byte_weight);
+        self.entries.push_back((key, value, byte_weight));
+        while self.entries.len() > COMPILED_AUTHORIZATION_CACHE_ENTRIES
+            || self.byte_weight > self.max_byte_weight
+        {
+            let Some((_, _, evicted_bytes)) = self.entries.pop_front() else {
+                break;
+            };
+            self.byte_weight = self.byte_weight.saturating_sub(evicted_bytes);
+        }
+    }
 }
 
 pub(super) struct CompiledAuthorizationEntry {
@@ -119,6 +172,7 @@ impl Store {
             sync_writes: self.sync_writes,
             limits: AuthzStoreLimits::default(),
             compiled_cache: self.authz_compiled_cache.clone(),
+            leopard_cache: self.authz_leopard_cache.clone(),
         }
     }
 
@@ -129,6 +183,7 @@ impl Store {
             sync_writes: self.sync_writes,
             limits,
             compiled_cache: self.authz_compiled_cache.clone(),
+            leopard_cache: self.authz_leopard_cache.clone(),
         }
     }
 }

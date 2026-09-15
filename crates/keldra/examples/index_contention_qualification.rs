@@ -14,6 +14,8 @@ mod data;
 mod metrics;
 #[path = "index_contention_qualification/progress.rs"]
 mod progress;
+#[path = "index_contention_qualification/recipes.rs"]
+mod recipes;
 #[path = "index_contention_qualification/terminal.rs"]
 mod terminal;
 #[cfg(test)]
@@ -25,7 +27,7 @@ mod verification;
 mod visibility;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use config::{Config, MutationWorkload};
+use config::{Config, MutationWorkload, configured_durability};
 use data::CONTENT_TYPE;
 use keldra_storage::v1::bulk_operation::Operation as BulkOperationValue;
 use keldra_storage::v1::bulk_outcome::Outcome as BulkOutcomeValue;
@@ -33,8 +35,8 @@ use keldra_storage::v1::index_query::Query as QueryValue;
 use keldra_storage::v1::index_service_client::IndexServiceClient;
 use keldra_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
-    Durability, IndexPredicate, IndexPredicateExpression, IndexPredicateOperator, IndexQuery,
-    ObjectAddress, ObjectVersioning, QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
+    IndexPredicate, IndexPredicateExpression, IndexPredicateOperator, IndexQuery, ObjectAddress,
+    ObjectVersioning, QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
 };
 use keldra_storage::{
     BearerToken, KeywordField, RawClient, TypedJsonIndexBuilder, administration_client,
@@ -42,6 +44,7 @@ use keldra_storage::{
 };
 use metrics::{Latencies, LatencyReport};
 use progress::Counters;
+use recipes::{physical_recipe, qualification_definition_positions, recipe_probe_pointer};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -1927,6 +1930,7 @@ async fn query_page(
             page_token,
             tenant: String::new(),
             required_freshness: None,
+            authorization_subject: None,
         })
         .await
         .map(tonic::Response::into_inner)
@@ -1961,13 +1965,6 @@ fn index_client(channel: Channel, token: &str) -> Result<IndexClient> {
     )
 }
 
-fn configured_durability(config: &Config) -> Durability {
-    match config.durability.as_str() {
-        "REPLICATED" => Durability::Replicated,
-        _ => Durability::Local,
-    }
-}
-
 async fn connect_all(endpoints: &[String]) -> Result<Vec<Channel>> {
     let mut channels = Vec::with_capacity(endpoints.len());
     for endpoint in endpoints {
@@ -1988,41 +1985,6 @@ async fn fresh_token(config: &Config, channel: &Channel) -> Result<String> {
     )
     .await?
     .access_token)
-}
-
-fn physical_recipe(position: usize, physical_recipe_count: usize) -> usize {
-    position % physical_recipe_count
-}
-
-fn qualification_definition_positions(
-    definition_count: usize,
-    physical_recipe_count: usize,
-    maximum: usize,
-) -> Vec<usize> {
-    if definition_count <= maximum {
-        return (0..definition_count).collect();
-    }
-    let mut positions = (0..physical_recipe_count).collect::<BTreeSet<_>>();
-    let remaining = maximum - physical_recipe_count;
-    if remaining == 0 {
-        return positions.into_iter().collect();
-    }
-    if remaining == 1 {
-        positions.insert(definition_count - 1);
-        return positions.into_iter().collect();
-    }
-    for ordinal in 0..remaining {
-        positions.insert(
-            physical_recipe_count
-                + ordinal.saturating_mul(definition_count - 1 - physical_recipe_count)
-                    / (remaining - 1),
-        );
-    }
-    positions.into_iter().collect()
-}
-
-fn recipe_probe_pointer(recipe: usize) -> String {
-    format!("/probes/{recipe:02}")
 }
 
 fn unix_millis() -> Result<u128> {

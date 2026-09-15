@@ -18,6 +18,7 @@ use keldra_api::v1::{
     MutationReceipt, ObjectAddress, QueryIndexRequest, QueryIndexResponse, ReadFailureCode,
     RebuildIndexRequest, UpdateIndexRequest,
 };
+use keldra_authz::{ObjectRef, TupleSubject};
 use keldra_store::{
     DefinitionKind, DefinitionMutationIntent, DefinitionOperation, ObjectKey, StorageTenantId,
 };
@@ -34,12 +35,14 @@ use crate::object_service::{ObjectServiceImpl, request_deadline, run_request_unt
 
 use super::boundary::{
     ExecuteIndexQuery, IndexAuthorizationEvidence, IndexDefinitionScan, IndexDefinitionScanPage,
-    IndexFreshnessRequirement, IndexPageCursor, IndexPageTokenBinding, IndexRequestContext,
+    IndexFreshnessRequirement, IndexPageCursor, IndexPageTokenBinding,
+    IndexQueryAuthorizationEvidence, IndexRequestContext, IndexResultAuthorizationPolicy,
     IndexServiceDependencies, RequiredIndexSourceCheckpoint,
 };
 use super::{
     AuthorizedSnapshotCandidates, IndexCandidateVisibility, StoredIndexDefinition, definition_path,
-    derive_index_id, validate_command_id, validate_create_definition, validate_update_definition,
+    derive_index_id, result_authorization_policy, validate_command_id, validate_create_definition,
+    validate_update_definition,
 };
 
 const DEFINITION_CONTENT_TYPE: &str = "application/vnd.keldra.index-definition+json";
@@ -667,14 +670,6 @@ impl IndexServiceRpc for IndexServiceImpl {
                 let limit = page_limit(request.limit)?;
                 let definition_key =
                     definition_key(context.caller(), &request.bucket, &request.index_name)?;
-                let admission = authorize_definition_access_with_evidence(
-                    self.dependencies.authorization.as_ref(),
-                    context.caller(),
-                    &definition_key,
-                    ObjectPermission::Get,
-                    "index definition query is not authorized",
-                )
-                .await?;
                 let loaded = self
                     .load_definition(&context, &request.bucket, &request.index_name)
                     .await?;
@@ -684,12 +679,33 @@ impl IndexServiceRpc for IndexServiceImpl {
                     .names
                     .resolve_bucket_ids(tenant, &request.bucket)
                     .await?;
+                let result_policy = result_authorization_policy(&loaded.api)?;
+                let authorization_subject = query_authorization_subject(
+                    context.caller(),
+                    &result_policy,
+                    request.authorization_subject,
+                )?;
+                let admission = self
+                    .dependencies
+                    .authorization
+                    .admit_query(
+                        context.caller(),
+                        tenant_id,
+                        &definition_key,
+                        &result_policy,
+                        authorization_subject.as_ref(),
+                    )
+                    .await?;
+                validate_query_authorization_evidence(&admission, &result_policy)?;
                 let binding = IndexPageTokenBinding {
                     tenant_id,
                     bucket_id,
                     index_id: loaded.api.index_id,
                     definition_version: loaded.api.version,
                     query_hash: canonical_query_hash(&query),
+                    result_authorization: result_policy.clone(),
+                    authorization_subject: authorization_subject.clone(),
+                    result_authorization_evidence: admission.result.clone(),
                 };
                 let resume = if request.page_token.is_empty() {
                     None
@@ -697,7 +713,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                     let cursor = self.dependencies.page_tokens.decode(
                         context.caller(),
                         &request.page_token,
-                        binding,
+                        binding.clone(),
                     )?;
                     validate_page_cursor(&cursor)?;
                     Some(cursor)
@@ -707,10 +723,9 @@ impl IndexServiceRpc for IndexServiceImpl {
                         "required freshness cannot be combined with a continuation token",
                     ));
                 }
-                if resume
-                    .as_ref()
-                    .is_some_and(|cursor| cursor.authorization_revision != admission.revision)
-                {
+                if resume.as_ref().is_some_and(|cursor| {
+                    cursor.authorization_revision != admission.system_revision
+                }) {
                     return Err(Status::failed_precondition(
                         "page token authorization revision is no longer current",
                     ));
@@ -720,7 +735,10 @@ impl IndexServiceRpc for IndexServiceImpl {
                 let candidate_visibility: Arc<dyn IndexCandidateVisibility> =
                     Arc::new(AuthorizedSnapshotCandidates::new(
                         context.caller().clone(),
-                        admission.revision,
+                        tenant_id,
+                        admission.clone(),
+                        result_policy.clone(),
+                        authorization_subject,
                         loaded.stored.bucket.clone(),
                         loaded.stored.path_prefix.clone(),
                         kind,
@@ -738,13 +756,15 @@ impl IndexServiceRpc for IndexServiceImpl {
                         query,
                         limit,
                         candidate_visibility,
-                        authorization_revision: admission.revision,
+                        authorization_revision: admission.system_revision,
+                        result_authorization: admission.result.clone(),
+                        authorization_subject: binding.authorization_subject.clone(),
                         resume: resume.clone(),
                         required_freshness,
                     })
                     .await?;
+                bind_logical_freshness(&mut executed, &loaded.api, &result_policy, &admission);
                 validate_execution(&executed, resume.as_ref(), limit)?;
-                bind_logical_freshness(&mut executed, &loaded.api);
                 let authorization_revision = executed.freshness.authorization_revision;
                 let next_page_token = match executed.next_position {
                     Some(last_position) => self.dependencies.page_tokens.encode(
@@ -1158,12 +1178,87 @@ fn validate_query_kind(definition: &IndexDefinition, query: &IndexQuery) -> Resu
     }
 }
 
+fn query_authorization_subject(
+    caller: &Caller,
+    policy: &IndexResultAuthorizationPolicy,
+    subject: Option<keldra_api::v1::Subject>,
+) -> Result<Option<ObjectRef>, Status> {
+    match (policy, subject) {
+        (IndexResultAuthorizationPolicy::Application, None) => Ok(None),
+        (IndexResultAuthorizationPolicy::Application, Some(_)) => Err(Status::invalid_argument(
+            "authorization_subject is not accepted by an application-authorized index",
+        )),
+        (IndexResultAuthorizationPolicy::Realm(_), None) => Err(Status::invalid_argument(
+            "authorization_subject is required by this index",
+        )),
+        (IndexResultAuthorizationPolicy::Realm(_), Some(subject)) => {
+            if caller.subject().is_anonymous() {
+                return Err(Status::unauthenticated(
+                    "custom-realm index queries require an authenticated application",
+                ));
+            }
+            let subject = match crate::authz_api::subject_from_api(Some(subject))? {
+                TupleSubject::Object(subject) => subject,
+                TupleSubject::Userset(_) => {
+                    return Err(Status::invalid_argument(
+                        "authorization_subject must be one typed object",
+                    ));
+                }
+            };
+            if subject.is_anonymous() || subject.is_public() {
+                return Err(Status::invalid_argument(
+                    "authorization_subject must identify one concrete end user",
+                ));
+            }
+            Ok(Some(subject))
+        }
+    }
+}
+
+fn validate_query_authorization_evidence(
+    evidence: &IndexQueryAuthorizationEvidence,
+    policy: &IndexResultAuthorizationPolicy,
+) -> Result<(), Status> {
+    if evidence.system_revision == 0 {
+        return Err(Status::data_loss(
+            "index query admission returned no protected authorization revision",
+        ));
+    }
+    match (policy, evidence.result.as_ref()) {
+        (IndexResultAuthorizationPolicy::Application, None) => Ok(()),
+        (IndexResultAuthorizationPolicy::Realm(_), Some(result))
+            if result.revision != 0
+                && result.binding_generation != 0
+                && result.schema_ref.schema_revision != 0 =>
+        {
+            Ok(())
+        }
+        _ => Err(Status::data_loss(
+            "index query admission returned authorization evidence for another policy",
+        )),
+    }
+}
+
 fn bind_logical_freshness(
     execution: &mut super::boundary::ExecutedIndexQuery,
     definition: &IndexDefinition,
+    policy: &IndexResultAuthorizationPolicy,
+    authorization: &IndexQueryAuthorizationEvidence,
 ) {
     execution.freshness.index_id = definition.index_id;
     execution.freshness.definition_version = definition.version;
+    execution.freshness.authorization_revision = authorization.system_revision;
+    execution.freshness.result_authorization = authorization.result.as_ref().map(|evidence| {
+        keldra_api::v1::IndexResultAuthorizationFreshness {
+            realm: match policy {
+                IndexResultAuthorizationPolicy::Realm(policy) => policy.realm.clone(),
+                IndexResultAuthorizationPolicy::Application => String::new(),
+            },
+            authorization_revision: evidence.revision,
+            binding_generation: evidence.binding_generation,
+            schema_ref: Some(crate::authz_api::schema_ref_to_api(&evidence.schema_ref)),
+        }
+    });
 }
 
 fn validate_execution(
@@ -1184,6 +1279,24 @@ fn validate_execution(
     if execution.freshness.authorization_revision == 0 {
         return Err(Status::data_loss(
             "index executor returned no Zanzibar authorization revision",
+        ));
+    }
+    if execution
+        .freshness
+        .result_authorization
+        .as_ref()
+        .is_some_and(|result| {
+            result.realm.is_empty()
+                || result.authorization_revision == 0
+                || result.binding_generation == 0
+                || result
+                    .schema_ref
+                    .as_ref()
+                    .is_none_or(|schema| schema.schema_revision == 0)
+        })
+    {
+        return Err(Status::data_loss(
+            "index executor returned invalid custom-realm authorization evidence",
         ));
     }
     if let Some(resume) = resume {
@@ -1522,6 +1635,57 @@ mod tests {
     }
 
     #[test]
+    fn custom_realm_subject_is_required_and_must_be_a_concrete_end_user() {
+        let policy = IndexResultAuthorizationPolicy::Realm(
+            super::super::boundary::RealmIndexResultAuthorizationPolicy {
+                realm: "workspace".into(),
+                resource_namespace: "document".into(),
+                relation: "view".into(),
+                target: super::super::boundary::RealmIndexAuthorizationTarget::ResultPath,
+            },
+        );
+        assert_eq!(
+            query_authorization_subject(&caller(), &policy, None)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let alice = ObjectRef::opaque("user", "alice").unwrap();
+        let supplied = crate::authz_api::subject_to_api(&TupleSubject::Object(alice.clone()));
+        assert_eq!(
+            query_authorization_subject(&caller(), &policy, Some(supplied)).unwrap(),
+            Some(alice)
+        );
+        let anonymous = Caller::from_anonymous(StorageTenantId::parse("tenant").unwrap());
+        let supplied = crate::authz_api::subject_to_api(&TupleSubject::Object(
+            ObjectRef::opaque("user", "alice").unwrap(),
+        ));
+        assert_eq!(
+            query_authorization_subject(&anonymous, &policy, Some(supplied))
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn application_policy_rejects_an_end_user_operand() {
+        let supplied = crate::authz_api::subject_to_api(&TupleSubject::Object(
+            ObjectRef::opaque("user", "alice").unwrap(),
+        ));
+        assert_eq!(
+            query_authorization_subject(
+                &caller(),
+                &IndexResultAuthorizationPolicy::Application,
+                Some(supplied),
+            )
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
     fn continuations_require_position_and_authorization_revision() {
         assert!(
             validate_page_cursor(&IndexPageCursor {
@@ -1617,7 +1781,15 @@ mod tests {
             ..Default::default()
         };
 
-        bind_logical_freshness(&mut execution, &definition);
+        bind_logical_freshness(
+            &mut execution,
+            &definition,
+            &IndexResultAuthorizationPolicy::Application,
+            &IndexQueryAuthorizationEvidence {
+                system_revision: 9,
+                result: None,
+            },
+        );
 
         assert_eq!(execution.freshness.index_id, 7);
         assert_eq!(execution.freshness.definition_version, 8);

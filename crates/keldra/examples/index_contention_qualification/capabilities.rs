@@ -260,6 +260,7 @@ async fn execute(
             page_token: Vec::new(),
             tenant: String::new(),
             required_freshness: None,
+            authorization_subject: None,
         }),
     )
     .await

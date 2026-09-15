@@ -11,7 +11,9 @@ use keldra_api::v1::{
     IndexAggregateResult, IndexDefinition, IndexFacetResult, IndexFreshness, IndexQuery,
     IndexQueryHit,
 };
-use keldra_store::ObjectKey;
+use keldra_authz::ObjectRef;
+use keldra_store::{AuthzScope, ObjectKey, SchemaRef};
+use serde::{Deserialize, Serialize};
 use tonic::Status;
 use tonic::metadata::MetadataMap;
 
@@ -127,6 +129,45 @@ pub(crate) struct IndexAuthorizationEvidence {
     pub(crate) revision: u64,
 }
 
+/// Definition-owned result policy. Keeping this as a validated domain value
+/// prevents public and routed query paths from interpreting protobuf defaults
+/// differently.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum IndexResultAuthorizationPolicy {
+    Application,
+    Realm(RealmIndexResultAuthorizationPolicy),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum RealmIndexAuthorizationTarget {
+    CanonicalSourcePath,
+    ResultPath,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RealmIndexResultAuthorizationPolicy {
+    pub(crate) realm: String,
+    pub(crate) resource_namespace: String,
+    pub(crate) relation: String,
+    pub(crate) target: RealmIndexAuthorizationTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct IndexRealmAuthorizationEvidence {
+    pub(crate) revision: u64,
+    pub(crate) binding_generation: u64,
+    pub(crate) schema_ref: SchemaRef,
+}
+
+/// Complete immutable Zanzibar evidence for one query. The protected system
+/// revision always exists; custom-realm evidence exists only for definitions
+/// which opt into end-user filtering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IndexQueryAuthorizationEvidence {
+    pub(crate) system_revision: u64,
+    pub(crate) result: Option<IndexRealmAuthorizationEvidence>,
+}
+
 #[tonic::async_trait]
 pub(crate) trait IndexAuthorization: Send + Sync + 'static {
     async fn allows_objects_with_evidence(
@@ -134,6 +175,82 @@ pub(crate) trait IndexAuthorization: Send + Sync + 'static {
         caller: &Caller,
         requests: &[(ObjectKey, ObjectPermission)],
     ) -> Result<IndexAuthorizationEvidence, Status>;
+
+    /// Evaluate protected application/object access at exactly the revision
+    /// established when the query was admitted. Production implementations
+    /// must read that immutable revision rather than sampling `Latest` and
+    /// comparing afterward. The default keeps test doubles source-compatible
+    /// while still failing closed if their evidence moved.
+    async fn allows_objects_at_revision_with_evidence(
+        &self,
+        caller: &Caller,
+        requests: &[(ObjectKey, ObjectPermission)],
+        required_revision: u64,
+    ) -> Result<IndexAuthorizationEvidence, Status> {
+        let evidence = self.allows_objects_with_evidence(caller, requests).await?;
+        if required_revision == 0 || evidence.revision != required_revision {
+            return Err(Status::failed_precondition(
+                "protected authorization revision changed during index execution",
+            ));
+        }
+        Ok(evidence)
+    }
+
+    /// Admit the definition and, for a custom policy, prove the application is
+    /// allowed to evaluate that realm before pinning its current authority.
+    async fn admit_query(
+        &self,
+        caller: &Caller,
+        _stable_tenant_id: u64,
+        definition: &ObjectKey,
+        policy: &IndexResultAuthorizationPolicy,
+        authorization_subject: Option<&ObjectRef>,
+    ) -> Result<IndexQueryAuthorizationEvidence, Status> {
+        if !matches!(policy, IndexResultAuthorizationPolicy::Application)
+            || authorization_subject.is_some()
+        {
+            return Err(Status::failed_precondition(
+                "custom-realm index authorization is not installed",
+            ));
+        }
+        let evidence = self
+            .allows_objects_with_evidence(caller, &[(definition.clone(), ObjectPermission::Get)])
+            .await?;
+        if evidence.revision == 0 || evidence.allowed.as_slice() != [true] {
+            return if evidence.allowed.as_slice() == [false] {
+                Err(Status::permission_denied(
+                    "index definition query is not authorized",
+                ))
+            } else {
+                Err(Status::data_loss(
+                    "index definition authorization returned invalid evidence",
+                ))
+            };
+        }
+        Ok(IndexQueryAuthorizationEvidence {
+            system_revision: evidence.revision,
+            result: None,
+        })
+    }
+
+    /// Evaluate custom-realm candidates at exactly the admitted revision and
+    /// binding. Implementations must fail rather than silently moving to a
+    /// newer schema or revision.
+    async fn allows_realm_results_with_evidence(
+        &self,
+        _caller: &Caller,
+        _stable_tenant_id: u64,
+        _scope: &AuthzScope,
+        _authorization_subject: &ObjectRef,
+        _relation: &str,
+        _resources: &[ObjectRef],
+        _required_system_revision: u64,
+        _required: &IndexRealmAuthorizationEvidence,
+    ) -> Result<IndexAuthorizationEvidence, Status> {
+        Err(Status::failed_precondition(
+            "custom-realm index authorization is not installed",
+        ))
+    }
 }
 
 #[tonic::async_trait]
@@ -160,17 +277,21 @@ impl IndexDefinitionReader for crate::cluster_object_read::ClusterObjectReader {
 }
 
 /// Immutable values to which every opaque query page token is bound.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexPageTokenBinding {
     pub(crate) tenant_id: u64,
     pub(crate) bucket_id: u64,
     pub(crate) index_id: u64,
     pub(crate) definition_version: u64,
     pub(crate) query_hash: [u8; 32],
+    pub(crate) result_authorization: IndexResultAuthorizationPolicy,
+    pub(crate) authorization_subject: Option<ObjectRef>,
+    pub(crate) result_authorization_evidence: Option<IndexRealmAuthorizationEvidence>,
 }
 
-/// Mutable cursor evidence carried by a valid page token. A continuation is
-/// always pinned to one immutable revision and one Zanzibar revision.
+/// Mutable engine cursor carried by a valid page token. The surrounding token
+/// binding carries the caller, result policy, end-user subject, and both
+/// Zanzibar authorities so engine code cannot omit those security operands.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexPageCursor {
     pub(crate) commit_revision: u64,
@@ -211,6 +332,8 @@ pub(crate) struct ExecuteIndexQuery {
     /// Zanzibar revision established by the one definition-admission check for
     /// this execution. It also binds empty results and any continuation token.
     pub(crate) authorization_revision: u64,
+    pub(crate) result_authorization: Option<IndexRealmAuthorizationEvidence>,
+    pub(crate) authorization_subject: Option<ObjectRef>,
     /// `None` selects the latest published revision. A continuation supplies
     /// the exact immutable revision and engine-specific last position.
     pub(crate) resume: Option<IndexPageCursor>,

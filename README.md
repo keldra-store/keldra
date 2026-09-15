@@ -539,7 +539,10 @@ write, index-management, or administration access.
 anonymous query must set `QueryIndexRequest.tenant`; an authenticated query may
 leave it empty because the signed token supplies the tenant. Supplying a tenant
 with an authenticated query never changes identity—it must match the token.
-Index creation, updates, discovery, and deletion always require credentials.
+Anonymous queries are available only for application-authorized indexes; a
+custom-realm index requires both an authenticated application and its concrete
+end-user `authorization_subject`. Index creation, updates, discovery, and
+deletion always require credentials.
 
 ## Compare-and-swap and immutable data
 
@@ -663,7 +666,10 @@ let mut indices = index_client(channel, &token.access_token)?;
 Call `CreateIndex` with a Typed JSON `CreateIndexRequest`, then `QueryIndex`
 with a `TypedJsonIndexQuery`. Typed fields map to JSON Pointers and explicitly
 declare their exact, prefix, range, order, facet, aggregate, or full-text
-capabilities.
+capabilities. Every index also declares its result-authorization policy. The
+Rust typed-index builder explicitly selects application authorization: results
+remain limited by the authenticated application's ordinary object access, and
+queries set `authorization_subject` to `None`.
 
 ### Typed JSON API
 
@@ -704,6 +710,8 @@ let response = indices.query_index(QueryIndexRequest {
     limit: 100,
     page_token: vec![],
     tenant: String::new(), // inferred from the authenticated caller
+    required_freshness: None,
+    authorization_subject: None,
 }).await?.into_inner();
 
 for hit in response.hits {
@@ -713,6 +721,71 @@ println!("freshness: {:?}", response.freshness);
 # Ok(())
 # }
 ```
+
+For an API server serving many end users, bind the index to a custom
+authorization realm instead of creating one Keldra credential per user. This
+policy maps each indexed object's canonical source path into the `document`
+namespace and requires the end-user subject to have the `view` relation in the
+`customer-access` realm:
+
+```rust,no_run
+use keldra::v1::index_result_authorization::Policy;
+use keldra::v1::object_ref::Id;
+use keldra::v1::subject::Kind;
+use keldra::v1::*;
+use keldra::{KeywordField, TypedJsonIndexBuilder};
+
+# async fn realm_example(mut indices: keldra::v1::index_service_client::IndexServiceClient<tonic::service::interceptor::InterceptedService<tonic::transport::Channel, keldra::BearerToken>>) -> Result<(), tonic::Status> {
+let mut definition = TypedJsonIndexBuilder::new("objects", "visible-documents")
+    .path_prefix("documents/")
+    .content_type("application/json")
+    .field(KeywordField::single("status", "/status").exact())
+    .finish("create-visible-documents")
+    .expect("valid static index definition");
+definition.result_authorization = Some(IndexResultAuthorization {
+    policy: Some(Policy::Realm(RealmIndexResultAuthorization {
+        realm: "customer-access".into(),
+        resource_namespace: "document".into(),
+        relation: "view".into(),
+        target: IndexAuthorizationTarget::CanonicalSourcePath as i32,
+    })),
+});
+indices.create_index(definition).await?;
+
+let query = QueryIndexRequest {
+    bucket: "objects".into(),
+    index_name: "visible-documents".into(),
+    query: Some(IndexQuery {
+        query: Some(index_query::Query::TypedJson(TypedJsonIndexQuery {
+            predicate: None,
+            order: vec![],
+            facets: vec![],
+            aggregates: vec![],
+        })),
+    }),
+    limit: 100,
+    page_token: vec![],
+    tenant: String::new(),
+    required_freshness: None,
+    authorization_subject: Some(Subject {
+        kind: Some(Kind::Object(ObjectRef {
+            namespace: "user".into(),
+            id: Some(Id::OpaqueId("01JUSEREXAMPLE000000000000".into())),
+        })),
+    }),
+};
+let response = indices.query_index(query).await?.into_inner();
+# let _ = response;
+# Ok(())
+# }
+```
+
+The credentialed application must itself be authorized to evaluate the custom
+realm. Keldra intersects application access with the pinned end-user realm
+check; the custom policy cannot expand application access. The subject must be
+a concrete object, and it is required on every query of a realm-authorized
+index. Pagination tokens bind the caller, subject, policy, and authorization
+revisions, so they cannot be replayed under a different authorization context.
 
 Typed JSON Date fields accept ISO-8601 strings by default, or one validated
 POSIX strftime pattern selected in their definition. Values with an explicit

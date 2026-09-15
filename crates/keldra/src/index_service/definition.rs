@@ -2,11 +2,14 @@ use std::collections::BTreeSet;
 
 use keldra_api::typed_json::validate_typed_json_specification;
 use keldra_api::v1::index_field::FieldType;
+use keldra_api::v1::index_result_authorization::Policy as ResultAuthorizationPolicy;
 use keldra_api::v1::index_specification::Specification;
 use keldra_api::v1::{
-    CreateIndexRequest, IndexDefinition, IndexKind, IndexSpecification, UpdateIndexRequest,
+    CreateIndexRequest, IndexAuthorizationTarget, IndexDefinition, IndexKind,
+    IndexResultAuthorization, IndexSpecification, UpdateIndexRequest,
 };
 use keldra_atomic_program::MAX_OBJECT_PATH_BYTES;
+use keldra_authz::{ObjectRef, RealmId, UsersetRef};
 use keldra_index::typed_json::DateFormat;
 use keldra_store::INDEX_DEFINITION_PREFIX;
 use prost::Message;
@@ -33,6 +36,7 @@ pub(crate) struct StoredIndexDefinition {
     pub path_prefix: String,
     pub content_type: Option<String>,
     specification_protobuf: Vec<u8>,
+    result_authorization_protobuf: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_explicit_rebuild_at_unix_millis: Option<u64>,
 }
@@ -54,6 +58,10 @@ impl StoredIndexDefinition {
             return Err(Status::internal("allocated index ID is zero"));
         }
         let specification = validate_create_definition(&request)?;
+        let result_authorization = validate_result_authorization(
+            request.result_authorization.clone(),
+            "index result authorization is required",
+        )?;
         Ok(Self {
             format: STORED_DEFINITION_FORMAT,
             index_id,
@@ -63,12 +71,17 @@ impl StoredIndexDefinition {
             path_prefix: request.path_prefix,
             content_type: optional_content_type(request.content_type)?,
             specification_protobuf: specification.encode_to_vec(),
+            result_authorization_protobuf: result_authorization.encode_to_vec(),
             last_explicit_rebuild_at_unix_millis: None,
         })
     }
 
     pub(crate) fn updated(&self, request: UpdateIndexRequest) -> Result<Self, Status> {
         let specification = validate_update_definition(&request)?;
+        let result_authorization = validate_result_authorization(
+            request.result_authorization.clone(),
+            "index result authorization is required",
+        )?;
         if request.bucket != self.bucket || request.name != self.name {
             return Err(Status::invalid_argument(
                 "index bucket and name are immutable",
@@ -83,6 +96,7 @@ impl StoredIndexDefinition {
             path_prefix: request.path_prefix,
             content_type: optional_content_type(request.content_type)?,
             specification_protobuf: specification.encode_to_vec(),
+            result_authorization_protobuf: result_authorization.encode_to_vec(),
             last_explicit_rebuild_at_unix_millis: self.last_explicit_rebuild_at_unix_millis,
         })
     }
@@ -137,6 +151,11 @@ impl StoredIndexDefinition {
             &specification,
         )
         .map_err(|_| Status::data_loss("stored index schema is invalid"))?;
+        validate_result_authorization(
+            Some(stored.result_authorization()?),
+            "stored index result authorization is absent",
+        )
+        .map_err(|_| Status::data_loss("stored index result authorization is invalid"))?;
         if let Some(accepted_at_unix_millis) = stored.last_explicit_rebuild_at_unix_millis {
             validate_explicit_rebuild(accepted_at_unix_millis)
                 .map_err(|_| Status::data_loss("stored explicit index rebuild is invalid"))?;
@@ -149,9 +168,15 @@ impl StoredIndexDefinition {
             .map_err(|_| Status::data_loss("stored index specification cannot be decoded"))
     }
 
+    pub(crate) fn result_authorization(&self) -> Result<IndexResultAuthorization, Status> {
+        IndexResultAuthorization::decode(self.result_authorization_protobuf.as_slice())
+            .map_err(|_| Status::data_loss("stored index result authorization cannot be decoded"))
+    }
+
     pub(crate) fn to_api(&self, object_version: u64) -> Result<IndexDefinition, Status> {
         let specification = self.specification()?;
         let kind = kind_for(&specification)?;
+        let result_authorization = self.result_authorization()?;
         Ok(IndexDefinition {
             index_id: self.index_id,
             bucket: self.bucket.clone(),
@@ -161,8 +186,44 @@ impl StoredIndexDefinition {
             kind: kind as i32,
             specification: Some(specification),
             version: object_version,
+            result_authorization: Some(result_authorization),
         })
     }
+}
+
+pub(crate) fn validate_result_authorization(
+    value: Option<IndexResultAuthorization>,
+    missing: &'static str,
+) -> Result<IndexResultAuthorization, Status> {
+    let value = value.ok_or_else(|| Status::invalid_argument(missing))?;
+    match value.policy.as_ref() {
+        Some(ResultAuthorizationPolicy::Application(_)) => {}
+        Some(ResultAuthorizationPolicy::Realm(policy)) => {
+            RealmId::custom(&policy.realm)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let resource = ObjectRef::opaque(&policy.resource_namespace, "_validation")
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            UsersetRef::new(resource, &policy.relation)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            match IndexAuthorizationTarget::try_from(policy.target) {
+                Ok(
+                    IndexAuthorizationTarget::CanonicalSourcePath
+                    | IndexAuthorizationTarget::ResultPath,
+                ) => {}
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "index result authorization target is required",
+                    ));
+                }
+            }
+        }
+        None => {
+            return Err(Status::invalid_argument(
+                "index result authorization policy is required",
+            ));
+        }
+    }
+    Ok(value)
 }
 
 pub(crate) fn definition_path(name: &str) -> Result<String, Status> {
@@ -239,6 +300,10 @@ pub(crate) fn validate_create_definition(
         &specification,
     )
     .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    validate_result_authorization(
+        request.result_authorization.clone(),
+        "index result authorization is required",
+    )?;
     Ok(specification)
 }
 
@@ -266,6 +331,10 @@ pub(crate) fn validate_update_definition(
         &specification,
     )
     .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    validate_result_authorization(
+        request.result_authorization.clone(),
+        "index result authorization is required",
+    )?;
     Ok(specification)
 }
 
@@ -401,9 +470,10 @@ fn validate_explicit_rebuild(accepted_at_unix_millis: u64) -> Result<(), Status>
 #[cfg(test)]
 mod tests {
     use keldra_api::v1::{
-        DateIndexField, IndexField, IndexFieldCapability, IndexFieldCardinality, IndexOrder,
-        IndexOrderDirection, KeywordIndexField, SignedIntegerIndexField, TensorIndexSpec,
-        TypedJsonIndexSpec, index_specification,
+        ApplicationIndexResultAuthorization, DateIndexField, IndexField, IndexFieldCapability,
+        IndexFieldCardinality, IndexOrder, IndexOrderDirection, KeywordIndexField,
+        SignedIntegerIndexField, TensorIndexSpec, TypedJsonIndexSpec, index_result_authorization,
+        index_specification,
     };
 
     use super::*;
@@ -431,6 +501,11 @@ mod tests {
                         }],
                         physical_order: Vec::new(),
                     },
+                )),
+            }),
+            result_authorization: Some(IndexResultAuthorization {
+                policy: Some(index_result_authorization::Policy::Application(
+                    ApplicationIndexResultAuthorization {},
                 )),
             }),
             command_id: "create-index".into(),
@@ -474,6 +549,7 @@ mod tests {
                 path_prefix: "tenant/456/".into(),
                 content_type: create.content_type,
                 specification: create.specification,
+                result_authorization: create.result_authorization,
                 expected_version: 8,
                 command_id: "update-index".into(),
             })

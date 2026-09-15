@@ -804,7 +804,8 @@ message RetainedSourceSnapshotResponse {
 message RoutedIndexQueryResume {
   uint64 commit_revision = 1;
   bytes last_position = 2;
-  uint64 authorization_revision = 3;
+  uint64 system_authorization_revision = 3;
+  optional uint64 result_authorization_revision = 4;
 }
 
 message RoutedIndexRequiredSourceCheckpoint {
@@ -832,6 +833,13 @@ message RouteIndexQueryRequest {
   optional RoutedIndexQueryResume resume = 7;
   string storage_tenant = 8;
   optional RoutedIndexFreshnessRequirement required_freshness = 9;
+  // The destination treats this only as an operand. It reloads the exact
+  // definition and independently proves the bearer may check that realm.
+  optional keldra.v1.ObjectRef authorization_subject = 10;
+  uint64 system_authorization_revision = 11;
+  optional uint64 result_authorization_revision = 12;
+  optional uint64 result_authorization_binding_generation = 13;
+  optional keldra.v1.SchemaRef result_authorization_schema_ref = 14;
 }
 
 // Raw committed-view results. Public page tokens are minted only by public ingress

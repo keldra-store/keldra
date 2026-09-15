@@ -9,12 +9,14 @@ use jiff::Timestamp;
 use jiff::fmt::strtime::{self, BrokenDownTime};
 use keldra_api::typed_json::validate_typed_json_specification;
 use keldra_api::v1::index_field::FieldType;
+use keldra_api::v1::index_result_authorization;
 use keldra_api::v1::index_specification::Specification;
 use keldra_api::v1::{
-    BooleanIndexField, CreateIndexRequest, DateIndexField, FloatIndexField, IndexField,
-    IndexFieldCapability, IndexFieldCardinality, IndexOrder, IndexOrderDirection,
-    IndexSpecification, KeywordIndexField, SignedIntegerIndexField, TextAnalyzer, TextIndexField,
-    TypedJsonIndexSpec, UnsignedIntegerIndexField,
+    ApplicationIndexResultAuthorization, BooleanIndexField, CreateIndexRequest, DateIndexField,
+    FloatIndexField, IndexField, IndexFieldCapability, IndexFieldCardinality, IndexOrder,
+    IndexOrderDirection, IndexResultAuthorization, IndexSpecification, KeywordIndexField,
+    SignedIntegerIndexField, TextAnalyzer, TextIndexField, TypedJsonIndexSpec,
+    UnsignedIntegerIndexField,
 };
 
 const MAX_INDEX_NAME_BYTES: usize = 128;
@@ -829,6 +831,11 @@ impl TypedJsonIndexBuilder<state::NonEmpty> {
                 })),
             }),
             command_id,
+            result_authorization: Some(IndexResultAuthorization {
+                policy: Some(index_result_authorization::Policy::Application(
+                    ApplicationIndexResultAuthorization {},
+                )),
+            }),
         })
     }
 }
@@ -954,6 +961,13 @@ mod tests {
             .finish("create-advisories")
             .unwrap();
 
+        assert!(matches!(
+            request
+                .result_authorization
+                .as_ref()
+                .and_then(|authorization| authorization.policy.as_ref()),
+            Some(index_result_authorization::Policy::Application(_))
+        ));
         let Specification::TypedJson(specification) =
             request.specification.unwrap().specification.unwrap()
         else {

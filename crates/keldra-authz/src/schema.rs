@@ -126,6 +126,55 @@ impl CompiledSchema {
         }
     }
 
+    /// Direct relations for which reverse tuple ancestry alone is incomplete.
+    /// A stored userset subject may name a permission rather than another
+    /// writable relation; satisfying that subject requires evaluating its
+    /// rewrite, so callers must retain a bounded forward fallback for every
+    /// direct relation which can reach such a subject through direct nesting.
+    pub(crate) fn direct_relations_requiring_forward_membership(
+        &self,
+    ) -> BTreeSet<(String, String)> {
+        let mut required = BTreeSet::new();
+        for (namespace_name, namespace) in &self.namespaces {
+            for (relation_name, relation) in &namespace.relations {
+                if matches!(relation, CompiledRelation::Direct { .. })
+                    && self.relation_reaches_permission_subject(
+                        namespace_name,
+                        relation_name,
+                        &mut BTreeSet::new(),
+                    )
+                {
+                    required.insert((namespace_name.clone(), relation_name.clone()));
+                }
+            }
+        }
+        required
+    }
+
+    fn relation_reaches_permission_subject(
+        &self,
+        namespace: &str,
+        relation: &str,
+        visiting: &mut BTreeSet<(String, String)>,
+    ) -> bool {
+        let key = (namespace.to_owned(), relation.to_owned());
+        if !visiting.insert(key.clone()) {
+            return false;
+        }
+        let result = match self.relation(namespace, relation) {
+            Some(CompiledRelation::Permission { .. }) => true,
+            Some(CompiledRelation::Direct { allowed_subjects }) => allowed_subjects
+                .iter()
+                .filter_map(allowed_userset_relation)
+                .any(|(namespace, relation)| {
+                    self.relation_reaches_permission_subject(namespace, relation, visiting)
+                }),
+            None => false,
+        };
+        visiting.remove(&key);
+        result
+    }
+
     fn validate_references(&self) -> crate::Result<()> {
         for (namespace_name, namespace) in &self.namespaces {
             for (relation_name, relation) in &namespace.relations {
@@ -224,6 +273,24 @@ impl CompiledSchema {
                 "{label} `{namespace}#{relation}` is not declared"
             ))
         })
+    }
+}
+
+fn allowed_userset_relation(subject: &AllowedSubject) -> Option<(&str, &str)> {
+    match subject {
+        AllowedSubject::AnyUserset {
+            namespace,
+            relation,
+        } => Some((namespace, relation)),
+        AllowedSubject::Exact {
+            subject: TupleSubject::Userset(userset),
+        } => Some((&userset.object.namespace, &userset.relation)),
+        AllowedSubject::AnyObject { .. }
+        | AllowedSubject::Exact {
+            subject: TupleSubject::Object(_),
+        }
+        | AllowedSubject::SameResourceId { .. }
+        | AllowedSubject::Public => None,
     }
 }
 

@@ -412,6 +412,32 @@ message IndexSpecification {
   }
 }
 
+// Every index explicitly declares the authority used to filter its results.
+// Application access retains Keldra's protected object permissions. Realm
+// access intersects those permissions with one caller-delegated end-user
+// check; it can never elevate the authenticated application.
+message ApplicationIndexResultAuthorization {}
+
+enum IndexAuthorizationTarget {
+  INDEX_AUTHORIZATION_TARGET_UNSPECIFIED = 0;
+  INDEX_AUTHORIZATION_TARGET_CANONICAL_SOURCE_PATH = 1;
+  INDEX_AUTHORIZATION_TARGET_RESULT_PATH = 2;
+}
+
+message RealmIndexResultAuthorization {
+  string realm = 1;
+  string resource_namespace = 2;
+  string relation = 3;
+  IndexAuthorizationTarget target = 4;
+}
+
+message IndexResultAuthorization {
+  oneof policy {
+    ApplicationIndexResultAuthorization application = 1;
+    RealmIndexResultAuthorization realm = 2;
+  }
+}
+
 // Index names are immutable bucket-local identifiers. Mutable display labels
 // belong in application data. Placement uses the server-allocated index_id.
 message IndexDefinition {
@@ -425,6 +451,7 @@ message IndexDefinition {
   IndexKind kind = 6;
   IndexSpecification specification = 7;
   uint64 version = 8;
+  IndexResultAuthorization result_authorization = 9;
 }
 
 message CreateIndexRequest {
@@ -434,6 +461,7 @@ message CreateIndexRequest {
   string content_type = 4;
   IndexSpecification specification = 5;
   string command_id = 6;
+  IndexResultAuthorization result_authorization = 7;
 }
 
 message UpdateIndexRequest {
@@ -444,6 +472,7 @@ message UpdateIndexRequest {
   string content_type = 5;
   IndexSpecification specification = 6;
   string command_id = 7;
+  IndexResultAuthorization result_authorization = 8;
 }
 
 message GetIndexRequest {
@@ -668,6 +697,10 @@ message QueryIndexRequest {
   // every supplied source-local cursor and the atomic cursor, if supplied.
   // The server waits only until this request's deadline.
   IndexFreshnessRequirement required_freshness = 7;
+  // Required by a realm-authorized definition and rejected by an
+  // application-authorized definition. This is an authorization operand, not
+  // an authenticated caller and therefore cannot grant storage capability.
+  Subject authorization_subject = 8;
 }
 
 message IndexRequiredSourceCheckpoint {
@@ -720,6 +753,15 @@ message IndexFreshness {
   // Whole-index cardinalities are deliberately not public because exact-hit
   // Zanzibar filtering must not leak counts from unauthorized objects.
   reserved 11, 12;
+  IndexResultAuthorizationFreshness result_authorization = 13;
+}
+
+message IndexResultAuthorizationFreshness {
+  string realm = 1;
+  // Tenant-wide revision of the custom authorization authority.
+  uint64 authorization_revision = 2;
+  uint64 binding_generation = 3;
+  SchemaRef schema_ref = 4;
 }
 
 message QueryIndexResponse {
