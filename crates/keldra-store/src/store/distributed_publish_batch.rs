@@ -115,7 +115,9 @@ pub(super) struct CoordinatorBatchMetrics {
 #[derive(Clone, Copy)]
 enum CoordinatorBatchPayloadPreparation {
     Distributed,
-    SingleNode,
+    SingleNode {
+        source_journal_admission: SourceJournalAdmission,
+    },
 }
 
 impl Store {
@@ -126,6 +128,7 @@ impl Store {
         reference_effects: LocalReferenceEffects,
         status: WatchJournalStatus,
         reference_cursor: u64,
+        source_journal_admission: SourceJournalAdmission,
     ) -> Result<Option<StagedLocalChanges>, MutationError> {
         if changes.is_empty() {
             return Ok(None);
@@ -134,7 +137,7 @@ impl Store {
             batch,
             changes,
             reference_effects,
-            SourceJournalAdmission::Bounded,
+            source_journal_admission,
             status,
             reference_cursor,
             false,
@@ -158,7 +161,7 @@ impl Store {
             CoordinatorBatchPayloadPreparation::Distributed => {
                 (LocalReferenceEffects::Deferred, None)
             }
-            CoordinatorBatchPayloadPreparation::SingleNode => {
+            CoordinatorBatchPayloadPreparation::SingleNode { .. } => {
                 // Lane primary batches apply reference effects inline but do
                 // not publish the durable reference cursor. The ordered lane
                 // projector owns that cursor, and `reserved_watch` is the
@@ -175,7 +178,7 @@ impl Store {
         let mut receipt_status = initial_receipt_status;
         let pruned_receipts = if matches!(
             payload_preparation,
-            CoordinatorBatchPayloadPreparation::SingleNode
+            CoordinatorBatchPayloadPreparation::SingleNode { .. }
         ) {
             BTreeSet::new()
         } else {
@@ -199,7 +202,7 @@ impl Store {
         let mut evaluated = BTreeMap::new();
         let mut receipt_capacity_at = None;
         let mut evaluation_subphases = match payload_preparation {
-            CoordinatorBatchPayloadPreparation::SingleNode => {
+            CoordinatorBatchPayloadPreparation::SingleNode { .. } => {
                 EvaluationSubphaseMetrics::single_node_group()
             }
             CoordinatorBatchPayloadPreparation::Distributed => EvaluationSubphaseMetrics::default(),
@@ -229,7 +232,7 @@ impl Store {
                         reference_effects,
                         materialize_inline_payload: matches!(
                             payload_preparation,
-                            CoordinatorBatchPayloadPreparation::SingleNode
+                            CoordinatorBatchPayloadPreparation::SingleNode { .. }
                         ),
                     }),
                     item.definition_intent,
@@ -314,14 +317,16 @@ impl Store {
             self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
         }
         let staged_local_changes = match payload_preparation {
-            CoordinatorBatchPayloadPreparation::SingleNode => self
-                .stage_single_node_local_changes(
-                    &mut batch,
-                    &pending_changes,
-                    reference_effects,
-                    source,
-                    reference_cursor.expect("single-node reference cursor was read"),
-                )?,
+            CoordinatorBatchPayloadPreparation::SingleNode {
+                source_journal_admission,
+            } => self.stage_single_node_local_changes(
+                &mut batch,
+                &pending_changes,
+                reference_effects,
+                source,
+                reference_cursor.expect("single-node reference cursor was read"),
+                source_journal_admission,
+            )?,
             CoordinatorBatchPayloadPreparation::Distributed => {
                 self.stage_local_changes(&mut batch, &pending_changes, reference_effects)?;
                 None
@@ -429,7 +434,9 @@ impl Store {
             .coordinate_mutation_batch(
                 operations,
                 context,
-                CoordinatorBatchPayloadPreparation::SingleNode,
+                CoordinatorBatchPayloadPreparation::SingleNode {
+                    source_journal_admission: SourceJournalAdmission::Bounded,
+                },
             )
             .await;
         let mut evaluated = match evaluated {
@@ -548,7 +555,7 @@ impl Store {
                 CoordinatorBatchPayloadPreparation::Distributed => {
                     self.prepare(operation, identity, true).await
                 }
-                CoordinatorBatchPayloadPreparation::SingleNode => {
+                CoordinatorBatchPayloadPreparation::SingleNode { .. } => {
                     self.prepare_single_node_coordinated(operation, identity)
                         .await
                 }
@@ -582,7 +589,7 @@ impl Store {
         let path_wait_duration = path_wait_started.elapsed();
         let lane_mode = matches!(
             payload_preparation,
-            CoordinatorBatchPayloadPreparation::SingleNode
+            CoordinatorBatchPayloadPreparation::SingleNode { .. }
         );
         let prepared_operations = prepared
             .iter()
@@ -1074,6 +1081,45 @@ impl Store {
         .await
     }
 
+    /// Coordinate trusted derived-progress publication for a topology with one
+    /// active node. Reference deltas are applied in the same atomic lane commit
+    /// as the object metadata, so there is no quorum settlement or deferred
+    /// source-journal debt for the distribution layer to complete.
+    #[doc(hidden)]
+    pub async fn coordinate_single_node_derived_progress_publish_batch_with_governance(
+        &self,
+        requests: Vec<PublishRequest>,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+    ) -> Result<SingleNodeMutationBatch, MutationError> {
+        if requests.is_empty() {
+            return Ok(SingleNodeMutationBatch {
+                outcomes: Vec::new(),
+                source_journal_settlement: SourceJournalSettlement::CompletedByCoordinator,
+            });
+        }
+        let operations = requests
+            .into_iter()
+            .map(|request| (BatchOperation::Publish(request), governance.clone(), None))
+            .collect();
+        let evaluated = self
+            .coordinate_mutation_batch(
+                operations,
+                context,
+                CoordinatorBatchPayloadPreparation::SingleNode {
+                    source_journal_admission: SourceJournalAdmission::DerivedProgress,
+                },
+            )
+            .await?;
+        if evaluated.receipt_capacity_at.is_some() {
+            return Err(MutationError::ReceiptCapacity);
+        }
+        Ok(SingleNodeMutationBatch {
+            outcomes: evaluated.outcomes,
+            source_journal_settlement: SourceJournalSettlement::CompletedByCoordinator,
+        })
+    }
+
     async fn coordinate_distributed_publish_batch_with_admission(
         &self,
         requests: Vec<PublishRequest>,
@@ -1318,6 +1364,96 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn single_node_derived_publish_uses_inline_reference_lane_beyond_journal_limit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            StoreOptions::new(temporary.path(), 1)
+                .with_watch_retention(WatchRetention::new(1, 1024 * 1024).unwrap()),
+        )
+        .await
+        .unwrap();
+        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: store.bucket_policy("tenant", "bucket").unwrap(),
+        };
+        let context = ObjectMutationContext {
+            active_placement_log_id: PlacementLogId { term: 4, index: 2 },
+            serving_fence_term: 4,
+        };
+        let initial = store
+            .coordinate_single_node_mutation_batch(
+                vec![governed_put(
+                    "objects/source",
+                    "source",
+                    b"source",
+                    governance.clone(),
+                )],
+                context,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(initial.as_slice(), [Ok(_)]));
+
+        let blob = store
+            .stage_derived_progress_blob(b"immutable index progress")
+            .await
+            .unwrap();
+        let batch = store
+            .coordinate_single_node_derived_progress_publish_batch_with_governance(
+                vec![request(
+                    "_keldra/index-projections/v1/component/current",
+                    "derived-current",
+                    blob.clone(),
+                )],
+                governance.clone(),
+                context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.source_journal_settlement,
+            SourceJournalSettlement::CompletedByCoordinator
+        );
+        let coordinated = batch.outcomes.into_iter().next().unwrap().unwrap();
+        assert!(!coordinated.receipt.replayed);
+        assert!(coordinated.mutation.is_some());
+        let reference_state = store.blob_reference_state(&blob).unwrap().unwrap();
+        assert_eq!((reference_state.ref_count, reference_state.flags), (1, 0));
+        let status = store.local_watch_status().unwrap();
+        assert_eq!(status.settled_through, status.tail);
+        assert_eq!(
+            store.reference_delta_cursor(status.source_id).unwrap(),
+            status.tail
+        );
+        assert!(
+            store
+                .source_journal_runtime_metrics()
+                .unwrap()
+                .progress_debt_entries()
+                > 0
+        );
+
+        let bounded = store
+            .coordinate_mutation_batch(
+                vec![governed_put(
+                    "objects/bounded",
+                    "bounded",
+                    b"bounded",
+                    governance,
+                )],
+                context,
+                CoordinatorBatchPayloadPreparation::SingleNode {
+                    source_journal_admission: SourceJournalAdmission::Bounded,
+                },
+            )
+            .await;
+        assert!(matches!(bounded, Err(MutationError::SourceJournalCapacity)));
+    }
+
     async fn conflict_resources_for_put(
         store: &Store,
         governance: &ObjectMutationGovernance,
@@ -1397,7 +1533,9 @@ mod tests {
                             governance,
                         )],
                         context,
-                        CoordinatorBatchPayloadPreparation::SingleNode,
+                        CoordinatorBatchPayloadPreparation::SingleNode {
+                            source_journal_admission: SourceJournalAdmission::Bounded,
+                        },
                     )
                     .await
             }
@@ -1424,7 +1562,9 @@ mod tests {
                     governance.clone(),
                 )],
                 context,
-                CoordinatorBatchPayloadPreparation::SingleNode,
+                CoordinatorBatchPayloadPreparation::SingleNode {
+                    source_journal_admission: SourceJournalAdmission::Bounded,
+                },
             ),
         )
         .await
@@ -1464,7 +1604,9 @@ mod tests {
                 .coordinate_mutation_batch(
                     vec![governed_put(path, command, bytes, governance.clone())],
                     context,
-                    CoordinatorBatchPayloadPreparation::SingleNode,
+                    CoordinatorBatchPayloadPreparation::SingleNode {
+                        source_journal_admission: SourceJournalAdmission::Bounded,
+                    },
                 )
                 .await
                 .unwrap();
@@ -1499,7 +1641,9 @@ mod tests {
                     governance.clone(),
                 )],
                 context,
-                CoordinatorBatchPayloadPreparation::SingleNode,
+                CoordinatorBatchPayloadPreparation::SingleNode {
+                    source_journal_admission: SourceJournalAdmission::Bounded,
+                },
             )
             .await
             .unwrap();
@@ -1521,7 +1665,9 @@ mod tests {
                     governance,
                 )],
                 context,
-                CoordinatorBatchPayloadPreparation::SingleNode,
+                CoordinatorBatchPayloadPreparation::SingleNode {
+                    source_journal_admission: SourceJournalAdmission::Bounded,
+                },
             )
             .await
             .unwrap();

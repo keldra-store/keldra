@@ -333,6 +333,7 @@ impl ObjectDistribution {
                 .map_err(payload_status)?;
             evidence.push(prepared);
         }
+        let single_node = placement.active_node_ids().len() == 1;
 
         loop {
             let permit = self.mutation_admission.enter()?;
@@ -361,8 +362,37 @@ impl ObjectDistribution {
             let completion_group = group.clone();
             let completed = complete_metadata(async move {
                 let _permit = permit;
-                let coordinated = if derived_progress {
-                    completion
+                let (coordinated, settlement) = if single_node && !derived_progress {
+                    let operations = completion_requests
+                        .iter()
+                        .cloned()
+                        .map(|request| {
+                            (
+                                BatchOperation::Publish(request),
+                                completion_governance.clone(),
+                                None,
+                            )
+                        })
+                        .collect();
+                    let batch = completion
+                        .store
+                        .coordinate_single_node_mutation_batch_with_settlement(operations, context)
+                        .await
+                        .map_err(mutation_status)?;
+                    (batch.outcomes, batch.source_journal_settlement)
+                } else if derived_progress && single_node {
+                    let batch = completion
+                        .store
+                        .coordinate_single_node_derived_progress_publish_batch_with_governance(
+                            completion_requests.clone(),
+                            completion_governance,
+                            context,
+                        )
+                        .await
+                        .map_err(mutation_status)?;
+                    (batch.outcomes, batch.source_journal_settlement)
+                } else if derived_progress {
+                    let outcomes = completion
                         .store
                         .coordinate_derived_progress_publish_batch_with_governance(
                             completion_requests.clone(),
@@ -370,8 +400,10 @@ impl ObjectDistribution {
                             context,
                         )
                         .await
+                        .map_err(mutation_status)?;
+                    (outcomes, SourceJournalSettlement::RequiredAfterQuorum)
                 } else {
-                    completion
+                    let outcomes = completion
                         .store
                         .coordinate_distributed_publish_batch_with_governance(
                             completion_requests.clone(),
@@ -379,14 +411,15 @@ impl ObjectDistribution {
                             context,
                         )
                         .await
-                }
-                .map_err(mutation_status)?;
+                        .map_err(mutation_status)?;
+                    (outcomes, SourceJournalSettlement::RequiredAfterQuorum)
+                };
                 let replicated = completion
                     .replicate_mutation_group_batch(
                         &completion_placement,
                         &completion_group,
                         &coordinated,
-                        SourceJournalSettlement::RequiredAfterQuorum,
+                        settlement,
                     )
                     .await;
                 let mut outcomes = Vec::with_capacity(coordinated.len());
@@ -556,42 +589,89 @@ impl ObjectDistribution {
             )
             .await?;
         let durability = request.durability;
+        let single_node = placement.active_node_ids().len() == 1;
         let completion = self.clone();
         let completion_placement = placement.clone();
         let coordinated = complete_metadata(async move {
             let _permit = permit;
-            let coordinated = match (definition_intent, derived_progress) {
+            let (coordinated, settlement) = match (definition_intent, derived_progress) {
+                (intent, false) if single_node => {
+                    let batch = completion
+                        .store
+                        .coordinate_single_node_mutation_batch_with_settlement(
+                            vec![(BatchOperation::Publish(request), governance, intent)],
+                            context,
+                        )
+                        .await
+                        .map_err(mutation_status)?;
+                    let coordinated = batch
+                        .outcomes
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            Status::data_loss("single-node publication omitted its outcome")
+                        })?
+                        .map_err(mutation_status)?;
+                    (coordinated, batch.source_journal_settlement)
+                }
                 (Some(intent), false) => {
-                    completion
+                    let coordinated = completion
                         .store
                         .coordinate_distributed_definition_publish_with_governance(
                             request, governance, context, intent,
                         )
                         .await
+                        .map_err(mutation_status)?;
+                    (coordinated, SourceJournalSettlement::RequiredAfterQuorum)
                 }
                 (None, false) => {
-                    completion
+                    let coordinated = completion
                         .store
                         .coordinate_distributed_publish_with_governance(
                             request, governance, context,
                         )
                         .await
+                        .map_err(mutation_status)?;
+                    (coordinated, SourceJournalSettlement::RequiredAfterQuorum)
+                }
+                (None, true) if single_node => {
+                    let batch = completion
+                        .store
+                        .coordinate_single_node_derived_progress_publish_batch_with_governance(
+                            vec![request],
+                            governance,
+                            context,
+                        )
+                        .await
+                        .map_err(mutation_status)?;
+                    let coordinated = batch
+                        .outcomes
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            Status::data_loss("single-node derived publication omitted its outcome")
+                        })?
+                        .map_err(mutation_status)?;
+                    (coordinated, batch.source_journal_settlement)
                 }
                 (None, true) => {
-                    completion
+                    let coordinated = completion
                         .store
                         .coordinate_derived_progress_publish_with_governance(
                             request, governance, context,
                         )
                         .await
+                        .map_err(mutation_status)?;
+                    (coordinated, SourceJournalSettlement::RequiredAfterQuorum)
                 }
-                (Some(_), true) => Err(MutationError::InvalidObjectMutation(
-                    "definition publication cannot claim derived progress admission".into(),
-                )),
-            }
-            .map_err(mutation_status)?;
+                (Some(_), true) => {
+                    return Err(Status::invalid_argument(
+                        "definition publication cannot claim derived progress admission",
+                    ));
+                }
+            };
             completion
-                .replicate(&completion_placement, &group, &coordinated)
+                .replicate(&completion_placement, &group, &coordinated, settlement)
                 .await?;
             Ok::<_, Status>(coordinated)
         })
@@ -796,7 +876,12 @@ impl ObjectDistribution {
             }
             .map_err(mutation_status)?;
             completion
-                .replicate(&completion_placement, &group, &coordinated)
+                .replicate(
+                    &completion_placement,
+                    &group,
+                    &coordinated,
+                    SourceJournalSettlement::RequiredAfterQuorum,
+                )
                 .await?;
             Ok::<_, Status>(coordinated)
         })
@@ -1242,10 +1327,12 @@ impl ObjectDistribution {
         placement: &ClusterPlacement,
         group: &MutableRecordReplicaGroup,
         coordinated: &CoordinatedObjectMutation,
+        settlement: SourceJournalSettlement,
     ) -> Result<(), Status> {
         if let Some((source, offsets)) = self
             .replicate_without_settlement(placement, group, coordinated)
             .await?
+            && matches!(settlement, SourceJournalSettlement::RequiredAfterQuorum)
             && let Err(error) = self
                 .store
                 .settle_source_journal_positions_if_contiguous(source, &offsets)
