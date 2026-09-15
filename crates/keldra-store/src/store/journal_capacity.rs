@@ -489,7 +489,8 @@ mod tests {
 
         let status = store.local_watch_status().unwrap();
         let primary = store.scan_local_changes(0, 16).unwrap();
-        assert!(!primary.is_empty());
+        assert_eq!(primary.len(), 1);
+        assert!(matches!(primary[0], LocalChange::ObjectHead(_)));
         assert_eq!(primary.last().unwrap().offset(), status.tail);
         let identity = store.resolve_bucket_identity("tenant", "bucket").unwrap();
         let routed = store
@@ -582,6 +583,7 @@ mod tests {
         .await
         .unwrap();
 
+        store.stage_blob(b"capacity filler").await.unwrap();
         publish_progress(&store, "trusted-progress").await;
         let debt = store.source_journal_runtime_metrics().unwrap();
         assert!(debt.progress_debt_entries() >= 1);
