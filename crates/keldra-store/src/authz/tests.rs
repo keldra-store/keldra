@@ -1,10 +1,12 @@
 use keldra_authz::{
-    AllowedSubject, NamespaceDefinition, ObjectRef, RelationDefinition, RewriteRule,
+    AllowedSubject, NamespaceDefinition, ObjectRef, RelationDefinition, RewriteRule, TupleSubject,
+    UsersetRef,
 };
 use tempfile::TempDir;
 
 use super::*;
 use crate::StoreOptions;
+use crate::store::{CF_AUTHZ_LEOPARD_FORWARD, CF_AUTHZ_LEOPARD_REVERSE};
 
 fn tenant(value: &str) -> StorageTenantId {
     StorageTenantId::parse(value).unwrap()
