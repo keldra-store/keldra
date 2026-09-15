@@ -8,6 +8,15 @@ use super::mutation_prefetch::MutationReadCache;
 use super::payload_artifacts::{ArtifactKind, ArtifactManifest, RocksArtifactReader};
 use super::*;
 
+fn blob_reference_is_garbage(
+    state: BlobReferenceState,
+    now_unix_millis: u64,
+    awaiting_publish_ttl_millis: u64,
+) -> bool {
+    (state.ref_count == 0 || state.flags & AWAITING_PUBLISH != 0)
+        && now_unix_millis.saturating_sub(state.updated_at) >= awaiting_publish_ttl_millis
+}
+
 const BLOB_GC_DUE_DOMAIN: u8 = b'B';
 const BLOB_GC_COMPLETE_KIND: u8 = 0;
 const BLOB_GC_SHARD_KIND: u8 = 1;
@@ -98,7 +107,7 @@ impl Store {
             .map(super::mutation_commit_lanes::blob_conflict_resource);
         let mut lane = self.mutation_commit_lanes.acquire(resources).await;
         if self.mutation_commit_lanes.projection_retry_needed() {
-            self.project_lane_completions().await?;
+            self.request_lane_projection().await?;
         }
 
         let (batch, completion) = loop {
@@ -239,7 +248,7 @@ impl Store {
         loop {
             let mut lane = self.mutation_commit_lanes.acquire(resources.clone()).await;
             if self.mutation_commit_lanes.projection_retry_needed() {
-                self.project_lane_completions().await?;
+                self.request_lane_projection().await?;
             }
             let prepared = loop {
                 let (source, receipts, cursor) = {

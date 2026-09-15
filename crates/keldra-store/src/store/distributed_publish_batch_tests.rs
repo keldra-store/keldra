@@ -78,8 +78,10 @@ async fn single_node_derived_publish_uses_inline_reference_lane_beyond_journal_l
         .stage_derived_progress_blob(b"immutable index progress")
         .await
         .unwrap();
-    let batch = store
-        .coordinate_single_node_derived_progress_publish_batch_with_governance(
+    let legacy_mutex = store.commit_lock.lock().await;
+    let batch = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        store.coordinate_single_node_derived_progress_publish_batch_with_governance(
             vec![request(
                 "_keldra/index-projections/v1/component/current",
                 "derived-current",
@@ -87,9 +89,12 @@ async fn single_node_derived_publish_uses_inline_reference_lane_beyond_journal_l
             )],
             governance.clone(),
             context,
-        )
-        .await
-        .unwrap();
+        ),
+    )
+    .await
+    .expect("single-node derived publication must not wait for the process commit mutex")
+    .unwrap();
+    drop(legacy_mutex);
     assert_eq!(
         batch.source_journal_settlement,
         SourceJournalSettlement::CompletedByCoordinator
@@ -776,4 +781,37 @@ async fn derived_publication_does_not_consume_full_public_receipt_capacity() {
         .unwrap_err();
     assert_eq!(error, MutationError::ReceiptCapacity);
     assert_eq!(store.mutation_receipt_status().unwrap(), full);
+}
+
+#[tokio::test]
+async fn distributed_coordinator_does_not_use_the_process_commit_mutex() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let blob = store.stage_blob(b"cluster lane payload").await.unwrap();
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let governance = ObjectMutationGovernance {
+        tenant_id,
+        bucket_id,
+        versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+        policy: store.bucket_policy("tenant", "bucket").unwrap(),
+    };
+    let legacy_mutex = store.commit_lock.lock().await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        store.coordinate_distributed_publish_batch_with_governance(
+            vec![request("objects/cluster-lane", "cluster-lane", blob)],
+            governance,
+            ObjectMutationContext {
+                active_placement_log_id: PlacementLogId { term: 4, index: 8 },
+                serving_fence_term: 4,
+            },
+        ),
+    )
+    .await
+    .expect("distributed coordination must not wait for the process commit mutex")
+    .unwrap();
+    drop(legacy_mutex);
+    assert!(matches!(result.as_slice(), [Ok(_)]));
 }

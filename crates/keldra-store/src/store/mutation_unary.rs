@@ -63,19 +63,16 @@ impl Store {
             ));
         }
         governance.validate()?;
-        let identity = BucketIdentity {
-            tenant_id: TenantId(governance.tenant_id),
-            bucket_id: BucketId(governance.bucket_id),
-        };
-        let prepared = self.prepare_verified_distributed_publish(request, identity)?;
-        self.coordinate_prepared_object_mutation(
-            prepared,
-            context,
-            governance,
-            None,
-            SourceJournalAdmission::Bounded,
-        )
-        .await
+        let mut outcomes = self
+            .coordinate_distributed_mutation_batch_with_admission(
+                vec![(BatchOperation::Publish(request), governance, None)],
+                context,
+                SourceJournalAdmission::Bounded,
+            )
+            .await?;
+        outcomes.pop().ok_or_else(|| {
+            MutationError::Storage("distributed publish batch omitted its singleton outcome".into())
+        })?
     }
 
     pub(super) fn prepare_verified_distributed_publish(

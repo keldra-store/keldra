@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{Mutex, Notify, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
 use tokio::time::Instant;
 
 use super::Store;
@@ -212,11 +212,6 @@ struct QueuePermits {
     _inline_bytes: tokio::sync::OwnedSemaphorePermit,
 }
 
-enum GroupDispatchGuard<'a> {
-    Ordinary { _guard: RwLockReadGuard<'a, ()> },
-    DerivedProgress { _guard: RwLockWriteGuard<'a, ()> },
-}
-
 impl SingleNodeCommitRequest {
     fn operation_count(&self) -> usize {
         self.operations.len()
@@ -287,16 +282,6 @@ pub(super) struct SingleNodeGroupCommit {
     inline_byte_slots: Arc<Semaphore>,
     queued_requests_total: Arc<AtomicUsize>,
     queued_requests_peak: Arc<AtomicUsize>,
-    /// Tokio's write-preferring FIFO lock is a short scheduling gate, not a
-    /// commit lock. Ordinary lane groups hold shared admission and therefore
-    /// remain parallel. A derived-progress group takes exclusive admission so
-    /// that, once queued, newer ordinary groups cannot continually invalidate
-    /// its optimistic source/receipt-authority snapshot.
-    dispatch_gate: Arc<RwLock<()>>,
-    #[cfg(test)]
-    derived_dispatch_waiters: Arc<AtomicUsize>,
-    #[cfg(test)]
-    derived_dispatch_waiting: Arc<Notify>,
 }
 
 impl SingleNodeGroupCommit {
@@ -335,11 +320,6 @@ impl SingleNodeGroupCommit {
             inline_byte_slots: Arc::new(Semaphore::new(config.max_queued_inline_bytes)),
             queued_requests_total: Arc::new(AtomicUsize::new(0)),
             queued_requests_peak: Arc::new(AtomicUsize::new(0)),
-            dispatch_gate: Arc::new(RwLock::new(())),
-            #[cfg(test)]
-            derived_dispatch_waiters: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            derived_dispatch_waiting: Arc::new(Notify::new()),
             config,
             states: Arc::new(states),
             queue_changed: Arc::new(queue_changed),
@@ -545,7 +525,7 @@ impl SingleNodeGroupCommit {
         let start_worker = {
             let mut state = self.states[lane].lock().await;
             let enqueue_lock_wait = enqueue_lock_started.elapsed();
-            state.requests.push_back(SingleNodeCommitRequest {
+            let request = SingleNodeCommitRequest {
                 operations,
                 context,
                 source_journal_admission,
@@ -561,7 +541,23 @@ impl SingleNodeGroupCommit {
                     _operations: operation_permit,
                     _inline_bytes: inline_byte_permit,
                 },
-            });
+            };
+            if source_journal_admission == SourceJournalAdmission::DerivedProgress {
+                // Give trusted progress traffic bounded queue priority without
+                // excluding independent ordinary lanes. It may pass only
+                // requests that have not begun; all derived requests retain
+                // FIFO order with one another.
+                let position = state
+                    .requests
+                    .iter()
+                    .position(|queued| {
+                        queued.source_journal_admission != SourceJournalAdmission::DerivedProgress
+                    })
+                    .unwrap_or(state.requests.len());
+                state.requests.insert(position, request);
+            } else {
+                state.requests.push_back(request);
+            }
             state.peak_depth = state.peak_depth.max(state.requests.len());
             self.record_enqueued_request();
             if state.worker_running {
@@ -582,41 +578,6 @@ impl SingleNodeGroupCommit {
                 "single-node commit worker stopped before replying".into(),
             ))
         })
-    }
-
-    async fn acquire_dispatch(
-        &self,
-        source_journal_admission: SourceJournalAdmission,
-    ) -> GroupDispatchGuard<'_> {
-        if source_journal_admission == SourceJournalAdmission::DerivedProgress {
-            #[cfg(test)]
-            {
-                self.derived_dispatch_waiters.fetch_add(1, Ordering::AcqRel);
-                self.derived_dispatch_waiting.notify_waiters();
-            }
-            let guard = self.dispatch_gate.write().await;
-            #[cfg(test)]
-            self.derived_dispatch_waiters.fetch_sub(1, Ordering::AcqRel);
-            GroupDispatchGuard::DerivedProgress { _guard: guard }
-        } else {
-            GroupDispatchGuard::Ordinary {
-                _guard: self.dispatch_gate.read().await,
-            }
-        }
-    }
-
-    #[cfg(test)]
-    async fn wait_for_derived_dispatch_waiter(&self) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while self.derived_dispatch_waiters.load(Ordering::Acquire) == 0 {
-                let notified = self.derived_dispatch_waiting.notified();
-                if self.derived_dispatch_waiters.load(Ordering::Acquire) == 0 {
-                    notified.await;
-                }
-            }
-        })
-        .await
-        .expect("derived dispatch must reach the fair scheduling gate");
     }
 
     async fn run(self, store: Store, lane: usize) {
@@ -710,7 +671,6 @@ impl SingleNodeGroupCommit {
             let operation_count = operations.len();
             let group_execute_started_epoch_milliseconds = unix_milliseconds();
             let execute_started = std::time::Instant::now();
-            let _dispatch = self.acquire_dispatch(source_journal_admission).await;
             let (results, metrics) = store
                 .coordinate_single_node_mutation_group(
                     operations,
@@ -1194,69 +1154,6 @@ mod tests {
         assert!(matches!(first.as_deref(), Ok([Ok(_)])));
         assert!(matches!(second.as_deref(), Ok([Ok(_)])));
         assert_eq!(physical_commits_since(&store, before), 1);
-    }
-
-    #[tokio::test]
-    async fn queued_derived_progress_cannot_be_overtaken_by_new_ordinary_groups() {
-        let queue = SingleNodeGroupCommit::new(
-            SingleNodeGroupCommitConfig::default()
-                .with_commit_lanes(4)
-                .unwrap(),
-        );
-        let initial_ordinary = queue
-            .acquire_dispatch(SourceJournalAdmission::Bounded)
-            .await;
-
-        let (derived_acquired, derived_acquired_rx) = oneshot::channel();
-        let (release_derived, release_derived_rx) = oneshot::channel();
-        let derived_queue = queue.clone();
-        let derived = tokio::spawn(async move {
-            let _dispatch = derived_queue
-                .acquire_dispatch(SourceJournalAdmission::DerivedProgress)
-                .await;
-            let _ = derived_acquired.send(());
-            let _ = release_derived_rx.await;
-        });
-        queue.wait_for_derived_dispatch_waiter().await;
-
-        let (ordinary_acquired, mut ordinary_acquired_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut ordinary = Vec::new();
-        for lane in 0..16 {
-            let ordinary_queue = queue.clone();
-            let ordinary_acquired = ordinary_acquired.clone();
-            ordinary.push(tokio::spawn(async move {
-                let _dispatch = ordinary_queue
-                    .acquire_dispatch(SourceJournalAdmission::Bounded)
-                    .await;
-                let _ = ordinary_acquired.send(lane);
-            }));
-        }
-        drop(ordinary_acquired);
-        drop(initial_ordinary);
-
-        tokio::time::timeout(Duration::from_secs(10), derived_acquired_rx)
-            .await
-            .expect("derived progress must receive dispatch after the active ordinary group")
-            .expect("derived dispatch task must remain live");
-        assert!(
-            ordinary_acquired_rx.try_recv().is_err(),
-            "new ordinary groups must not overtake queued derived progress"
-        );
-
-        release_derived.send(()).unwrap();
-        derived.await.unwrap();
-        let mut resumed = BTreeSet::new();
-        while resumed.len() < 16 {
-            resumed.insert(
-                tokio::time::timeout(Duration::from_secs(10), ordinary_acquired_rx.recv())
-                    .await
-                    .expect("ordinary dispatch must resume after derived progress")
-                    .expect("ordinary dispatch channel must remain open"),
-            );
-        }
-        for task in ordinary {
-            task.await.unwrap();
-        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{
     Mutex, Notify, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
-    RwLockWriteGuard, Semaphore,
+    RwLockWriteGuard, Semaphore, mpsc, oneshot,
 };
 
 use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
@@ -27,6 +27,12 @@ pub(super) const LANE_FRONTIER_KEY: &[u8] = b"mutation_lane_frontier_current_v1"
 pub(super) const LANE_COMPLETION_PREFIX: &[u8] = b"mutation_lane_completion_v1/";
 const LANE_COMPLETION_FORMAT: u8 = 1;
 const LANE_COMPLETION_BYTES: usize = 1 + 8 * 7 + 1 + 8 + 3;
+const LANE_PROJECTION_QUEUE_CAPACITY: usize = 1_024;
+
+struct LaneProjectionRequest {
+    store: Store,
+    reply: oneshot::Sender<Result<LaneProjectionMetrics, MutationError>>,
+}
 
 #[derive(Clone)]
 pub(super) struct MutationCommitLanes {
@@ -38,6 +44,8 @@ pub(super) struct MutationCommitLanes {
     physical_slot_count: usize,
     sequence: Arc<Mutex<Option<LaneRuntime>>>,
     projection: Arc<Mutex<()>>,
+    projection_tx: mpsc::Sender<LaneProjectionRequest>,
+    projection_rx: Arc<Mutex<Option<mpsc::Receiver<LaneProjectionRequest>>>>,
     projection_retry_needed: Arc<AtomicBool>,
     frontier_notify: Arc<Notify>,
     authorities_stale: Arc<AtomicBool>,
@@ -210,6 +218,13 @@ pub(super) struct LaneRuntime {
     /// every reserved source entry without a derived-consumer checkpoint.
     reserved_inline_reference_safe: bool,
     pub(super) completions: BTreeMap<u64, LaneCompletionState>,
+    /// Quorum-proven source positions not yet consumed by the contiguous
+    /// visibility frontier. These are process-local hints; recovery re-proves
+    /// them from authoritative replica evidence after restart.
+    pub(super) visibility_proofs: BTreeSet<u64>,
+    /// Recovery may prove an entire contiguous prefix without materializing
+    /// one in-memory set entry per journal position.
+    pub(super) visibility_prefix_proof: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +235,7 @@ pub(super) enum LaneCompletionState {
 
 impl MutationCommitLanes {
     pub(super) fn new(commit_lanes: usize) -> Self {
+        let (projection_tx, projection_rx) = mpsc::channel(LANE_PROJECTION_QUEUE_CAPACITY);
         Self {
             fence: Arc::new(RwLock::new(())),
             conflicts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
@@ -229,6 +245,8 @@ impl MutationCommitLanes {
             physical_slot_count: commit_lanes,
             sequence: Arc::new(Mutex::new(None)),
             projection: Arc::new(Mutex::new(())),
+            projection_tx,
+            projection_rx: Arc::new(Mutex::new(Some(projection_rx))),
             projection_retry_needed: Arc::new(AtomicBool::new(false)),
             frontier_notify: Arc::new(Notify::new()),
             authorities_stale: Arc::new(AtomicBool::new(false)),
@@ -371,6 +389,10 @@ impl MutationCommitLanes {
 
     pub(super) fn projection_retry_needed(&self) -> bool {
         self.projection_retry_needed.load(Ordering::Acquire)
+    }
+
+    async fn take_projection_receiver(&self) -> Option<mpsc::Receiver<LaneProjectionRequest>> {
+        self.projection_rx.lock().await.take()
     }
 
     #[cfg(test)]
@@ -561,6 +583,11 @@ impl Store {
         runtime.reserved_receipts = receipts;
         runtime.projected_receipts = receipts;
         runtime.projected_high_version = high_version;
+        // Quorum proofs are disposable recovery hints, not authority. An
+        // exclusive legacy writer invalidates their snapshot; the recovery
+        // worker will re-prove any still-unsettled positions.
+        runtime.visibility_proofs.clear();
+        runtime.visibility_prefix_proof = None;
         let reference_cursor = self
             .reference_delta_cursor(watch.source_id)
             .map_err(|error| MutationError::Storage(error.to_string()))?;
@@ -657,6 +684,8 @@ impl Store {
                     reserved_reference_cursor_safe: false,
                     reserved_inline_reference_safe: false,
                     completions: BTreeMap::new(),
+                    visibility_proofs: BTreeSet::new(),
+                    visibility_prefix_proof: None,
                 },
             )?;
             let mut options = WriteOptions::default();
@@ -681,6 +710,8 @@ impl Store {
             reserved_reference_cursor_safe: reference_cursor == watch.tail,
             reserved_inline_reference_safe: watch.retention_floor == watch.tail,
             completions: BTreeMap::new(),
+            visibility_proofs: BTreeSet::new(),
+            visibility_prefix_proof: None,
         };
         if let Some(version) = high_version {
             self.clock.observe(version);
@@ -690,6 +721,59 @@ impl Store {
             anyhow::bail!("mutation lane runtime was initialized twice");
         }
         Ok(())
+    }
+
+    /// Starts the one bounded projector for this Store. Physical mutation
+    /// lanes submit only a wake/reply handle; the worker drains all requests
+    /// already admitted and projects the largest contiguous completion and
+    /// quorum-proof prefix with one RocksDB batch.
+    pub(super) async fn start_mutation_lane_projector(&self) -> anyhow::Result<()> {
+        let mut receiver = self
+            .mutation_commit_lanes
+            .take_projection_receiver()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("mutation lane projector was started twice"))?;
+        tokio::spawn(async move {
+            while let Some(first) = receiver.recv().await {
+                let mut requests = Vec::with_capacity(LANE_PROJECTION_QUEUE_CAPACITY.min(64));
+                requests.push(first);
+                while requests.len() < LANE_PROJECTION_QUEUE_CAPACITY {
+                    match receiver.try_recv() {
+                        Ok(request) => requests.push(request),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+                let store = requests[0].store.clone();
+                let result = store.project_lane_completions().await;
+                for (index, request) in requests.into_iter().enumerate() {
+                    let response = match &result {
+                        Ok(metrics) if index == 0 => Ok(*metrics),
+                        Ok(_) => Ok(LaneProjectionMetrics::default()),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let _ = request.reply.send(response);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    pub(super) async fn request_lane_projection(
+        &self,
+    ) -> Result<LaneProjectionMetrics, MutationError> {
+        let (reply, response) = oneshot::channel();
+        self.mutation_commit_lanes
+            .projection_tx
+            .send(LaneProjectionRequest {
+                store: self.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| MutationError::Storage("mutation lane projector stopped".into()))?;
+        response
+            .await
+            .map_err(|_| MutationError::Storage("mutation lane projector dropped a reply".into()))?
     }
 
     fn verify_lane_journal_range(&self, completion: LaneCompletion) -> anyhow::Result<()> {
@@ -771,7 +855,7 @@ impl Store {
             metrics.completion_ticket_lag =
                 completion.ticket.saturating_sub(runtime.projected_ticket);
         }
-        let projection = self.project_lane_completions().await?;
+        let projection = self.request_lane_projection().await?;
         metrics.projection_write = projection.write;
         metrics.contiguous_projection_completions = projection.completions;
         let frontier_wait_started = Instant::now();
@@ -789,6 +873,91 @@ impl Store {
             }
             notified.await;
         }
+    }
+
+    pub(super) async fn settle_lane_source_journal_positions(
+        &self,
+        source: crate::SourceId,
+        offsets: &[u64],
+    ) -> Result<Option<u64>, MutationError> {
+        if offsets.is_empty() {
+            return Ok(None);
+        }
+        // Exclude the remaining genuinely exclusive administrative writers
+        // while refreshing the lane authority, but do not exclude any other
+        // ordinary or derived mutation lane.
+        let _fence = self.mutation_commit_lanes.acquire_fence().await;
+        let before = {
+            let mut runtime = self.mutation_commit_lanes.sequence().await;
+            let runtime = runtime.as_mut().ok_or_else(|| {
+                MutationError::Storage("mutation lane runtime is not initialized".into())
+            })?;
+            self.refresh_stale_lane_runtime(runtime)?;
+            if source != runtime.reserved_watch.source_id {
+                return Err(MutationError::Storage(format!(
+                    "source journal identity {source:?} does not match local source {:?}",
+                    runtime.reserved_watch.source_id
+                )));
+            }
+            if offsets
+                .iter()
+                .any(|offset| *offset > runtime.reserved_watch.tail)
+            {
+                return Err(MutationError::Storage(format!(
+                    "source journal settled cursor is beyond reserved tail {}",
+                    runtime.reserved_watch.tail
+                )));
+            }
+            let before = runtime.projected_watch.settled_through;
+            runtime
+                .visibility_proofs
+                .extend(offsets.iter().copied().filter(|offset| *offset > before));
+            before
+        };
+        self.request_lane_projection().await?;
+        let runtime = self.mutation_commit_lanes.sequence().await;
+        let runtime = runtime.as_ref().ok_or_else(|| {
+            MutationError::Storage("mutation lane runtime is not initialized".into())
+        })?;
+        Ok((runtime.projected_watch.settled_through > before)
+            .then_some(runtime.projected_watch.settled_through))
+    }
+
+    pub(super) async fn settle_lane_source_journal_through(
+        &self,
+        source: crate::SourceId,
+        offset: u64,
+    ) -> Result<(), MutationError> {
+        let _fence = self.mutation_commit_lanes.acquire_fence().await;
+        {
+            let mut sequence = self.mutation_commit_lanes.sequence().await;
+            let runtime = sequence.as_mut().ok_or_else(|| {
+                MutationError::Storage("mutation lane runtime is not initialized".into())
+            })?;
+            self.refresh_stale_lane_runtime(runtime)?;
+            if source != runtime.reserved_watch.source_id {
+                return Err(MutationError::Storage(format!(
+                    "source journal identity {source:?} does not match local source {:?}",
+                    runtime.reserved_watch.source_id
+                )));
+            }
+            if offset > runtime.reserved_watch.tail {
+                return Err(MutationError::Storage(format!(
+                    "source journal settled cursor {offset} is beyond reserved tail {}",
+                    runtime.reserved_watch.tail
+                )));
+            }
+            if offset <= runtime.projected_watch.settled_through {
+                return Ok(());
+            }
+            runtime.visibility_prefix_proof = Some(
+                runtime
+                    .visibility_prefix_proof
+                    .map_or(offset, |current| current.max(offset)),
+            );
+        }
+        self.request_lane_projection().await?;
+        Ok(())
     }
 
     /// Settles a reserved ticket in an independently owned task.
@@ -931,6 +1100,7 @@ impl Store {
             )?;
         }
         self.mutation_commit_lanes.frontier_notify.notify_waiters();
+        self.mutation_capacity_notify.notify_waiters();
         self.notify_local_invalidations_from_status(projected_watch);
         Ok(LaneProjectionMetrics {
             write,
@@ -947,6 +1117,7 @@ impl Store {
         let mut requires_sync = false;
         let mut completions = Vec::new();
         let mut inline_reference_safe_through = None;
+        let base_settled_through = prospective.projected_watch.settled_through;
         loop {
             let next = prospective.projected_ticket.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("mutation lane frontier is exhausted".into())
@@ -983,7 +1154,37 @@ impl Store {
             }
             prospective.projected_ticket = next;
         }
-        if completions.is_empty() {
+        while prospective.projected_watch.settled_through < prospective.projected_watch.tail {
+            let next = prospective
+                .projected_watch
+                .settled_through
+                .checked_add(1)
+                .ok_or_else(|| {
+                    MutationError::Storage("source settlement frontier is exhausted".into())
+                })?;
+            let prefix_proven = prospective
+                .visibility_prefix_proof
+                .is_some_and(|through| next <= through);
+            if !prefix_proven && !prospective.visibility_proofs.remove(&next) {
+                break;
+            }
+            prospective.projected_watch.settled_through = next;
+        }
+        prospective
+            .visibility_proofs
+            .retain(|offset| *offset > prospective.projected_watch.settled_through);
+        if prospective
+            .visibility_prefix_proof
+            .is_some_and(|through| through <= prospective.projected_watch.settled_through)
+        {
+            prospective.visibility_prefix_proof = None;
+        }
+        if prospective.projected_watch.settled_through != base_settled_through {
+            requires_sync = true;
+        }
+        if completions.is_empty()
+            && prospective.projected_watch.settled_through == base_settled_through
+        {
             return Ok(None);
         }
         prospective.reserved_watch.settled_through = prospective.projected_watch.settled_through;
@@ -1022,6 +1223,15 @@ impl Store {
         runtime.projected_watch = plan.prospective.projected_watch;
         runtime.projected_receipts = plan.prospective.projected_receipts;
         runtime.projected_high_version = plan.prospective.projected_high_version;
+        runtime
+            .visibility_proofs
+            .retain(|offset| *offset > runtime.projected_watch.settled_through);
+        if runtime
+            .visibility_prefix_proof
+            .is_some_and(|through| through <= runtime.projected_watch.settled_through)
+        {
+            runtime.visibility_prefix_proof = None;
+        }
         runtime.reserved_watch.settled_through = runtime.projected_watch.settled_through;
         Ok(())
     }
@@ -1303,8 +1513,7 @@ pub(super) fn conflict_resources(
             tagged_resource(
                 1,
                 [
-                    path.tenant.as_bytes(),
-                    path.bucket.as_bytes(),
+                    operation.identity().encode().as_slice(),
                     path.path.as_bytes(),
                 ],
             )
@@ -1332,6 +1541,31 @@ pub(super) fn conflict_resources(
     resources
 }
 
+pub(super) fn replica_conflict_resources(mutation: &crate::ObjectMutation) -> Vec<Vec<u8>> {
+    let identity = crate::BucketIdentity {
+        tenant_id: crate::TenantId(mutation.tenant_id),
+        bucket_id: crate::BucketId(mutation.bucket_id),
+    };
+    let mut resources = vec![
+        tagged_resource(
+            1,
+            [identity.encode().as_slice(), mutation.exact_path.as_bytes()],
+        ),
+        tagged_resource(2, [receipt_key(identity, &mutation.command_id).as_slice()]),
+    ];
+    if let Some(transition) = mutation.definition_transition.as_ref() {
+        resources.push(tagged_resource(
+            4,
+            [
+                identity.encode().as_slice(),
+                &[transition.kind as u8],
+                transition.definition_id.to_be_bytes().as_slice(),
+            ],
+        ));
+    }
+    resources
+}
+
 pub(super) fn blob_conflict_resource(reference: &crate::BlobRef) -> Vec<u8> {
     tagged_resource(
         3,
@@ -1344,6 +1578,14 @@ pub(super) fn blob_conflict_resource(reference: &crate::BlobRef) -> Vec<u8> {
 
 pub(super) fn artifact_conflict_resource(identity: &[u8]) -> Vec<u8> {
     tagged_resource(5, [identity])
+}
+
+/// One local source journal has one Raft-fenced derived-consumer membership
+/// and checkpoint namespace. Updates within that namespace must be ordered,
+/// but they do not conflict with object paths, receipts, blobs, definitions,
+/// or immutable artifacts.
+pub(super) fn derived_consumer_conflict_resource() -> Vec<u8> {
+    tagged_resource(6, std::iter::empty::<&[u8]>())
 }
 
 fn tagged_resource<'a>(tag: u8, parts: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {

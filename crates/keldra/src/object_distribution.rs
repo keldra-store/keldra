@@ -554,6 +554,7 @@ impl ObjectDistribution {
     ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
+        let single_node = placement.active_node_ids().len() == 1;
         let group = self.replica_group_stable(
             &placement,
             governance.tenant_id,
@@ -764,26 +765,6 @@ impl ObjectDistribution {
         let hot = self.hot_indexing.get().and_then(|ingress| {
             ingress.pending(governance.tenant_id, governance.bucket_id, &operation)
         });
-        if matches!(&operation, BatchOperation::Clone(_)) && self.is_single_node()? {
-            let _permit = self.mutation_admission.enter()?;
-            let result = match definition_intent {
-                Some(intent) => {
-                    self.store
-                        .mutate_definition_with_governance_and_backpressure(
-                            operation, governance, intent,
-                        )
-                        .await
-                }
-                None => {
-                    self.store
-                        .mutate_with_governance_and_backpressure(operation, governance)
-                        .await
-                }
-            }
-            .map_err(mutation_status);
-            self.admit_hot_result(hot, &result);
-            return result;
-        }
         loop {
             let result = self
                 .mutate_with_governance_and_definition_intent_once(
@@ -811,13 +792,14 @@ impl ObjectDistribution {
     ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
+        let single_node = placement.active_node_ids().len() == 1;
         // A unary bulk put arrives with inline bytes rather than a previously
         // sealed upload token. Seal those bytes on this path coordinator, then
         // use the same payload preparation and verified Publish path as PutEnd.
         // Metadata is not evaluated until the requested payload durability has
         // been proved.
         let operation = match operation {
-            operation if placement.active_node_ids().len() == 1 => operation,
+            operation if single_node => operation,
             BatchOperation::Put(request) => {
                 let publish = stage_distributed_put(&self.store, request).await?;
                 return self
@@ -860,30 +842,45 @@ impl ObjectDistribution {
         let completion_placement = placement.clone();
         let coordinated = complete_metadata(async move {
             let _permit = permit;
-            let coordinated = match definition_intent {
+            let (coordinated, settlement) = match definition_intent {
                 Some(intent) => {
-                    completion
+                    let coordinated = completion
                         .store
                         .coordinate_definition_object_mutation_with_governance(
                             operation, governance, context, intent,
                         )
                         .await
+                        .map_err(mutation_status)?;
+                    (coordinated, SourceJournalSettlement::RequiredAfterQuorum)
+                }
+                None if single_node && matches!(&operation, BatchOperation::Clone(_)) => {
+                    let batch = completion
+                        .store
+                        .coordinate_single_node_mutation_batch_with_settlement(
+                            vec![(operation, governance, None)],
+                            context,
+                        )
+                        .await
+                        .map_err(mutation_status)?;
+                    let coordinated = batch
+                        .outcomes
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| Status::data_loss("single-node clone omitted its outcome"))?
+                        .map_err(mutation_status)?;
+                    (coordinated, batch.source_journal_settlement)
                 }
                 None => {
-                    completion
+                    let coordinated = completion
                         .store
                         .coordinate_object_mutation_with_governance(operation, governance, context)
                         .await
+                        .map_err(mutation_status)?;
+                    (coordinated, SourceJournalSettlement::RequiredAfterQuorum)
                 }
-            }
-            .map_err(mutation_status)?;
+            };
             completion
-                .replicate(
-                    &completion_placement,
-                    &group,
-                    &coordinated,
-                    SourceJournalSettlement::RequiredAfterQuorum,
-                )
+                .replicate(&completion_placement, &group, &coordinated, settlement)
                 .await?;
             Ok::<_, Status>(coordinated)
         })

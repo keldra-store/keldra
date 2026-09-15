@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use rocksdb::{WriteBatch, WriteOptions};
 
+use super::mutation_commit_lanes::derived_consumer_conflict_resource;
 use super::{CF_METADATA, Store};
 use crate::key::STORAGE_KEY_FORMAT_VERSION;
 use crate::{
@@ -36,12 +37,16 @@ impl Store {
     ) -> Result<(), DerivedConsumerError> {
         validate_fence(fence)?;
         validate_active_nodes(active_nodes)?;
-        let _commit_guard = self.lock_commit("derived_membership").await;
+        let mut lane = self
+            .mutation_commit_lanes
+            .acquire([derived_consumer_conflict_resource()])
+            .await;
         let source = self.local_status()?;
         let mut batch = WriteBatch::default();
         let changed = self.stage_membership(&mut batch, source, fence, active_nodes)?;
         if changed {
             self.write_derived_batch(batch)?;
+            lane.release_physical_slot();
             self.mutation_capacity_notify.notify_waiters();
             self.notify_local_invalidations();
         }
@@ -65,7 +70,10 @@ impl Store {
             return Err(DerivedConsumerError::InactiveConsumer);
         }
 
-        let _commit_guard = self.lock_commit("derived_checkpoint").await;
+        let mut lane = self
+            .mutation_commit_lanes
+            .acquire([derived_consumer_conflict_resource()])
+            .await;
         let source = self.local_status()?;
         if checkpoint.source_id != source.source_id {
             return Err(DerivedConsumerError::SourceMismatch);
@@ -127,11 +135,15 @@ impl Store {
         if !batch.is_empty() {
             self.write_derived_batch(batch)?;
         }
+        lane.release_physical_slot();
         let status = self
             .derived_consumer_status()?
             .ok_or_else(|| malformed("derived membership disappeared after checkpoint apply"))?;
-        self.enforce_local_watch_retention()
-            .map_err(|error| DerivedConsumerError::Storage(error.to_string()))?;
+        // Checkpoint publication makes additional retention safe, but it does
+        // not mutate the source journal itself. A writer waiting for capacity
+        // performs the proof-backed prune under the source-journal authority;
+        // keeping that pass separate avoids fencing unrelated ingest for every
+        // routine consumer heartbeat.
         self.mutation_capacity_notify.notify_waiters();
         self.notify_local_invalidations();
         Ok(status)
@@ -140,15 +152,15 @@ impl Store {
     pub fn derived_consumer_status(
         &self,
     ) -> Result<Option<DerivedConsumerStatus>, DerivedConsumerError> {
-        let Some(membership) = self.read_membership()? else {
+        let snapshot = self.db.snapshot();
+        let Some(membership) = self.read_membership_at(&snapshot)? else {
             return Ok(None);
         };
         let mut minima = [u64::MAX; 2];
         for kind in DerivedConsumerKind::ALL {
             for node in &membership.active_nodes {
                 let key = checkpoint_key(membership.fence, kind, *node);
-                let encoded = self
-                    .db
+                let encoded = snapshot
                     .get_cf(self.metadata_cf()?, key)
                     .map_err(storage)?
                     .ok_or_else(|| malformed("ACTIVE derived checkpoint is missing"))?;
@@ -177,7 +189,8 @@ impl Store {
         kind: DerivedConsumerKind,
         consumer_node_id: u16,
     ) -> Result<Option<DerivedConsumerCheckpoint>, DerivedConsumerError> {
-        let Some(membership) = self.read_membership()? else {
+        let snapshot = self.db.snapshot();
+        let Some(membership) = self.read_membership_at(&snapshot)? else {
             return Ok(None);
         };
         if membership
@@ -188,7 +201,7 @@ impl Store {
             return Ok(None);
         }
         let key = checkpoint_key(membership.fence, kind, consumer_node_id);
-        self.db
+        snapshot
             .get_cf(self.metadata_cf()?, key)
             .map_err(storage)?
             .map(|encoded| {
@@ -327,6 +340,17 @@ impl Store {
 
     fn read_membership(&self) -> Result<Option<DerivedMembership>, DerivedConsumerError> {
         self.db
+            .get_cf(self.metadata_cf()?, MEMBERSHIP_KEY)
+            .map_err(storage)?
+            .map(|encoded| decode_membership(&encoded))
+            .transpose()
+    }
+
+    fn read_membership_at(
+        &self,
+        snapshot: &rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB>,
+    ) -> Result<Option<DerivedMembership>, DerivedConsumerError> {
+        snapshot
             .get_cf(self.metadata_cf()?, MEMBERSHIP_KEY)
             .map_err(storage)?
             .map(|encoded| decode_membership(&encoded))

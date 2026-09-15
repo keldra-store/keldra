@@ -4,6 +4,13 @@ use super::mutation_helpers::{validate_accounting_transition, version_retention}
 use super::*;
 use crate::{ObjectMutation, ReplicaObjectMutationApplied};
 
+struct ReplicaMutationAttempt {
+    batch: WriteBatch,
+    receipt_status: MutationReceiptStatus,
+    high_watermark: Option<VersionId>,
+    outcomes: Vec<ReplicaObjectMutationApplied>,
+}
+
 impl Store {
     /// Apply a coordinator-produced group with one synchronous RocksDB write.
     ///
@@ -22,20 +29,104 @@ impl Store {
         }
         for mutation in mutations {
             mutation.validate()?;
+            // Observing a valid remote version before asynchronous physical
+            // application is conservative (a failed write may leave a clock
+            // gap) and prevents an independent local coordinator from issuing
+            // a lower version while this replica lane is in flight.
+            self.clock.observe(mutation.version.id);
         }
 
-        let _commit_guard = self.lock_commit("object_mutation_replica").await;
+        let fence = self.mutation_commit_lanes.acquire_fence().await;
+        let resources = mutations
+            .iter()
+            .flat_map(super::mutation_commit_lanes::replica_conflict_resources)
+            .collect::<Vec<_>>();
+        let mut lane = self
+            .mutation_commit_lanes
+            .acquire_with_fence(fence, resources)
+            .await;
+        let (mut attempt, completion) = loop {
+            let (watch, receipts, high_watermark) = {
+                let mut runtime = self.mutation_commit_lanes.sequence().await;
+                let runtime = runtime.as_mut().ok_or_else(|| {
+                    MutationError::Storage("mutation lane runtime is not initialized".into())
+                })?;
+                self.refresh_stale_lane_runtime(runtime)?;
+                (
+                    runtime.reserved_watch,
+                    runtime.reserved_receipts,
+                    runtime.projected_high_version,
+                )
+            };
+            let mut attempt =
+                match self.build_replica_mutation_attempt(mutations, receipts, high_watermark) {
+                    Ok(attempt) => attempt,
+                    Err(MutationError::ReceiptCapacity) => {
+                        drop(lane);
+                        if !self.prune_expired_receipts_for_capacity().await? {
+                            return Err(MutationError::ReceiptCapacity);
+                        }
+                        return Box::pin(self.apply_object_mutation_replica_batch(mutations)).await;
+                    }
+                    Err(error) => return Err(error),
+                };
+            if attempt.batch.is_empty() {
+                break (attempt, None);
+            }
+            let mut sequence = self.mutation_commit_lanes.sequence().await;
+            let runtime = sequence.as_mut().ok_or_else(|| {
+                MutationError::Storage("mutation lane runtime is not initialized".into())
+            })?;
+            if runtime.reserved_watch != watch || runtime.reserved_receipts != receipts {
+                drop(sequence);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let completion = runtime.reserve_with_reference_settlement(
+                watch,
+                attempt.receipt_status,
+                attempt.high_watermark,
+                true,
+                true,
+                true,
+            )?;
+            self.stage_lane_completion(&mut attempt.batch, completion)?;
+            drop(sequence);
+            break (attempt, Some(completion));
+        };
+        let mut write = WriteOptions::default();
+        write.set_sync(self.sync_writes);
+        let persistence = if attempt.batch.is_empty() {
+            Ok(())
+        } else {
+            self.db
+                .write_opt(std::mem::take(&mut attempt.batch), &write)
+                .map_err(storage_error)
+        };
+        lane.release_physical_slot();
+        if let Some(completion) = completion {
+            self.finish_lane_commit_cancellation_safe(completion, persistence.is_ok())
+                .await?;
+        }
+        persistence?;
+        Ok(attempt.outcomes)
+    }
+
+    fn build_replica_mutation_attempt(
+        &self,
+        mutations: &[ObjectMutation],
+        initial_receipt_status: MutationReceiptStatus,
+        initial_high_watermark: Option<VersionId>,
+    ) -> Result<ReplicaMutationAttempt, MutationError> {
         let now = now_unix_millis()?;
         let mut batch = WriteBatch::default();
-        let mut receipt_status = self.mutation_receipt_status()?;
-        let initial_receipt_status = receipt_status;
-        let pruned = self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
+        let mut receipt_status = initial_receipt_status;
+        let pruned = BTreeSet::new();
         let mut pending_heads = BTreeMap::<Vec<u8>, Head>::new();
         let mut pending_versions = BTreeMap::<Vec<u8>, Version>::new();
         let mut deleted_versions = BTreeSet::<Vec<u8>>::new();
         let mut pending_receipts = BTreeMap::<Vec<u8>, StoredReceipt>::new();
-        let mut high_watermark =
-            self.read_json::<VersionId>(CF_METADATA, VERSION_HIGH_WATERMARK_KEY)?;
+        let mut high_watermark = initial_high_watermark;
         let mut outcomes = Vec::with_capacity(mutations.len());
 
         for mutation in mutations {
@@ -301,28 +392,12 @@ impl Store {
             });
         }
 
-        if receipt_status != initial_receipt_status {
-            self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
-        }
-        if let Some(high_watermark) = high_watermark {
-            batch.put_cf(
-                self.cf(CF_METADATA)?,
-                VERSION_HIGH_WATERMARK_KEY,
-                serde_json::to_vec(&high_watermark).map_err(storage_error)?,
-            );
-        }
-        if !batch.is_empty() {
-            let mut options = WriteOptions::default();
-            options.set_sync(self.sync_writes);
-            self.db.write_opt(batch, &options).map_err(storage_error)?;
-        }
-        if !pruned.is_empty() {
-            self.mutation_capacity_notify.notify_waiters();
-        }
-        for mutation in mutations {
-            self.clock.observe(mutation.version.id);
-        }
-        Ok(outcomes)
+        Ok(ReplicaMutationAttempt {
+            batch,
+            receipt_status,
+            high_watermark,
+            outcomes,
+        })
     }
 }
 
@@ -401,6 +476,29 @@ mod tests {
             result.push(coordinated.mutation.unwrap());
         }
         result
+    }
+
+    #[tokio::test]
+    async fn replica_batch_does_not_use_the_process_commit_mutex() {
+        let mutations = mutations(vec![
+            put("objects/replica-lane-a", "replica-lane-a"),
+            put("objects/replica-lane-b", "replica-lane-b"),
+        ])
+        .await;
+        let temporary = tempfile::tempdir().unwrap();
+        let replica = Store::open(StoreOptions::new(temporary.path(), 2))
+            .await
+            .unwrap();
+        let legacy_mutex = replica.commit_lock.lock().await;
+        let applied = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            replica.apply_object_mutation_replica_batch(&mutations),
+        )
+        .await
+        .expect("replica lanes must not wait for the process commit mutex")
+        .unwrap();
+        drop(legacy_mutex);
+        assert_eq!(applied.len(), mutations.len());
     }
 
     #[tokio::test]

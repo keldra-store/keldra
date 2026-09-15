@@ -185,8 +185,7 @@ impl Store {
         &self,
         offset: u64,
     ) -> Result<(), MutationError> {
-        let _commit_guard = self.lock_commit("watch_journal").await;
-        let mut status = self
+        let status = self
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         let current = status.settled_through;
@@ -207,20 +206,8 @@ impl Store {
         if offset == current {
             return Ok(());
         }
-        status.settled_through = offset;
-        let mut options = WriteOptions::default();
-        options.set_sync(self.sync_writes);
-        self.db
-            .put_cf_opt(
-                self.cf(CF_METADATA)?,
-                LOCAL_INVALIDATION_STATUS_KEY,
-                encode_watch_journal_status(status),
-                &options,
-            )
-            .map_err(storage_error)?;
-        self.mutation_capacity_notify.notify_waiters();
-        self.notify_local_invalidations();
-        Ok(())
+        self.settle_lane_source_journal_through(status.source_id, offset)
+            .await
     }
 
     /// Durably settles one quorum-proven source position when it is the next
@@ -248,53 +235,18 @@ impl Store {
             record_settlement_outcome(SettlementOutcome::Empty);
             return Ok(None);
         }
-        let _commit_guard = self.lock_commit("watch_journal").await;
-        let mut status = self
+        let before = self
             .local_watch_status()
-            .map_err(|error| MutationError::Storage(error.to_string()))?;
-        if source != status.source_id {
-            return Err(MutationError::Storage(format!(
-                "source journal identity {source:?} does not match local source {:?}",
-                status.source_id
-            )));
+            .map_err(|error| MutationError::Storage(error.to_string()))?
+            .settled_through;
+        let settled = self
+            .settle_lane_source_journal_positions(source, offsets)
+            .await?;
+        match settled {
+            Some(_) => record_settlement_outcome(SettlementOutcome::Advanced),
+            None => record_settlement_outcome(settlement_noop_outcome(before, offsets)),
         }
-        if offsets.iter().any(|offset| *offset > status.tail) {
-            return Err(MutationError::Storage(format!(
-                "source journal settled cursor is beyond tail {}",
-                status.tail
-            )));
-        }
-        let proven = offsets.iter().copied().collect::<BTreeSet<_>>();
-        let mut through = status.settled_through;
-        loop {
-            let next = through.checked_add(1).ok_or_else(|| {
-                MutationError::Storage("source journal settled cursor overflowed".into())
-            })?;
-            if !proven.contains(&next) {
-                break;
-            }
-            through = next;
-        }
-        if through == status.settled_through {
-            record_settlement_outcome(settlement_noop_outcome(status.settled_through, offsets));
-            return Ok(None);
-        }
-
-        status.settled_through = through;
-        let mut options = WriteOptions::default();
-        options.set_sync(self.sync_writes);
-        self.db
-            .put_cf_opt(
-                self.cf(CF_METADATA)?,
-                LOCAL_INVALIDATION_STATUS_KEY,
-                encode_watch_journal_status(status),
-                &options,
-            )
-            .map_err(storage_error)?;
-        self.mutation_capacity_notify.notify_waiters();
-        self.notify_local_invalidations();
-        record_settlement_outcome(SettlementOutcome::Advanced);
-        Ok(Some(through))
+        Ok(settled)
     }
 
     /// Reconstructs the volatile reference-safe cut after a one-node mutation

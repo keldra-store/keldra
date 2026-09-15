@@ -63,6 +63,8 @@ fn reservation_assigns_monotonic_tickets_and_exact_source_ranges() {
         reserved_reference_cursor_safe: true,
         reserved_inline_reference_safe: true,
         completions: BTreeMap::new(),
+        visibility_proofs: BTreeSet::new(),
+        visibility_prefix_proof: None,
     };
     let completion = runtime
         .reserve(
@@ -104,6 +106,8 @@ fn reservations_preserve_a_contiguous_reference_safe_frontier() {
         reserved_reference_cursor_safe: true,
         reserved_inline_reference_safe: true,
         completions: BTreeMap::new(),
+        visibility_proofs: BTreeSet::new(),
+        visibility_prefix_proof: None,
     };
 
     let first = runtime
@@ -137,6 +141,8 @@ fn reservations_do_not_jump_an_unsettled_reference_frontier() {
         reserved_reference_cursor_safe: false,
         reserved_inline_reference_safe: false,
         completions: BTreeMap::new(),
+        visibility_proofs: BTreeSet::new(),
+        visibility_prefix_proof: None,
     };
 
     let completion = runtime
@@ -165,6 +171,8 @@ fn no_reference_artifact_keeps_cursor_safe_without_skipping_retention_consumers(
         reserved_reference_cursor_safe: true,
         reserved_inline_reference_safe: true,
         completions: BTreeMap::new(),
+        visibility_proofs: BTreeSet::new(),
+        visibility_prefix_proof: None,
     };
 
     let artifact = runtime
@@ -364,6 +372,100 @@ async fn out_of_order_reference_completion_does_not_cross_visibility_frontier() 
         .unwrap();
     assert_eq!(page.invalidations.len(), 2);
     assert_eq!(page.checkpoint.offset(), 2);
+}
+
+#[tokio::test]
+async fn quorum_visibility_proofs_batch_and_never_cross_a_gap() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let source = store.local_watch_status().unwrap().source_id;
+    for offset in [1_u64, 2] {
+        let change = LocalChange::sequence_gap(offset);
+        let encoded = encode_local_change(&change).unwrap();
+        let completion = {
+            let mut runtime = store.mutation_commit_lanes.sequence().await;
+            let runtime = runtime.as_mut().unwrap();
+            let mut watch = runtime.reserved_watch;
+            watch.tail = offset;
+            watch.retained_entries += 1;
+            watch.retained_bytes += invalidation_record_bytes(encoded.len());
+            let receipts = runtime.reserved_receipts;
+            runtime
+                .reserve_with_reference_settlement(watch, receipts, None, false, false, false)
+                .unwrap()
+        };
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            store.cf(CF_LOCAL_INVALIDATIONS).unwrap(),
+            invalidation_key(offset),
+            encoded,
+        );
+        store.stage_lane_completion(&mut batch, completion).unwrap();
+        store.db.write(batch).unwrap();
+        store.finish_lane_commit(completion, true).await.unwrap();
+    }
+    assert_eq!(store.local_watch_status().unwrap().settled_through, 0);
+
+    assert_eq!(
+        store
+            .settle_source_journal_positions_if_contiguous(source, &[2])
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(store.local_watch_status().unwrap().settled_through, 0);
+    assert_eq!(
+        store
+            .settle_source_journal_positions_if_contiguous(source, &[1])
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(store.local_watch_status().unwrap().settled_through, 2);
+}
+
+#[tokio::test]
+async fn recovered_visibility_prefix_uses_one_bounded_projection_request() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let source = store.local_watch_status().unwrap().source_id;
+    for offset in 1..=3 {
+        let encoded = encode_local_change(&LocalChange::sequence_gap(offset)).unwrap();
+        let completion = {
+            let mut runtime = store.mutation_commit_lanes.sequence().await;
+            let runtime = runtime.as_mut().unwrap();
+            let mut reserved = runtime.reserved_watch;
+            reserved.tail = offset;
+            reserved.retained_entries += 1;
+            reserved.retained_bytes += invalidation_record_bytes(encoded.len());
+            let receipts = runtime.reserved_receipts;
+            runtime
+                .reserve_with_reference_settlement(reserved, receipts, None, false, false, false)
+                .unwrap()
+        };
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            store.cf(CF_LOCAL_INVALIDATIONS).unwrap(),
+            invalidation_key(offset),
+            encoded,
+        );
+        store.stage_lane_completion(&mut batch, completion).unwrap();
+        store.db.write(batch).unwrap();
+        store.finish_lane_commit(completion, true).await.unwrap();
+    }
+
+    store
+        .settle_lane_source_journal_through(source, 3)
+        .await
+        .unwrap();
+    assert_eq!(store.local_watch_status().unwrap().settled_through, 3);
+    let runtime = store.mutation_commit_lanes.sequence().await;
+    assert!(runtime.as_ref().unwrap().visibility_proofs.is_empty());
+    assert!(runtime.as_ref().unwrap().visibility_prefix_proof.is_none());
 }
 
 #[tokio::test]
@@ -762,6 +864,35 @@ async fn shared_resource_excludes_a_second_lane() {
     assert!(!waiting.is_finished());
     drop(first);
     waiting.await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_local_store_mutation_does_not_wait_for_an_unrelated_lane() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let held = store
+        .mutation_commit_lanes
+        .acquire([b"synthetic-unrelated-resource".to_vec()])
+        .await;
+
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(1),
+        store.put(PutRequest {
+            key: ObjectKey::new("tenant", "bucket", "objects/direct-local").unwrap(),
+            bytes: b"direct-local".to_vec(),
+            content_type: Some("application/octet-stream".into()),
+            mode: PutMode::PutIfAbsent,
+            command_id: Some("direct-local-command".into()),
+            durability: Durability::Local,
+        }),
+    )
+    .await
+    .expect("an unrelated active lane must not impose an exclusive commit fence")
+    .unwrap();
+    assert!(!receipt.replayed);
+    drop(held);
 }
 
 #[tokio::test]

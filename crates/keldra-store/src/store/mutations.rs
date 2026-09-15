@@ -1,10 +1,9 @@
-use super::bulk_phases::{BulkStorePhase, BulkStorePhaseTracker};
 use super::evaluation_telemetry::{EvaluationSubphase, EvaluationSubphaseMetrics};
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_helpers::{
     definition_mutation_error, definition_receipt_matches_intent, exact_version_key,
-    fail_unresolved_prepared, head_accounting_transition, is_mutation_capacity,
-    mutation_capacity_kind, validate_accounting_transition, version_retention,
+    head_accounting_transition, is_mutation_capacity, mutation_capacity_kind,
+    validate_accounting_transition, version_retention,
 };
 use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::{
@@ -144,6 +143,7 @@ impl Store {
         backpressure: bool,
         source_journal_admission: SourceJournalAdmission,
     ) -> Vec<BatchOutcome> {
+        let governance_supplied = governance.is_some();
         if definition_intent.is_some() && operations.len() != 1 {
             return operations
                 .into_iter()
@@ -156,12 +156,10 @@ impl Store {
                 })
                 .collect();
         }
-        let mut phase = BulkStorePhaseTracker::start(operations.len());
-        let prepare_started = std::time::Instant::now();
-        let mut prepared = Vec::with_capacity(operations.len());
-        let mut early = BTreeMap::new();
-        let mut identity_cache =
-            BTreeMap::<(String, String), Result<BucketIdentity, MutationError>>::new();
+        let mut pending = Vec::with_capacity(operations.len());
+        let mut completed = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
+        let mut governance_cache =
+            BTreeMap::<(String, String), Result<ObjectMutationGovernance, MutationError>>::new();
         for (index, operation) in operations.into_iter().enumerate() {
             let logical_key = match &operation {
                 BatchOperation::Put(request) => &request.key,
@@ -169,281 +167,127 @@ impl Store {
                 BatchOperation::Clone(request) => &request.destination,
                 BatchOperation::Delete(request) => &request.key,
             };
-            let identity = governance.as_ref().map_or_else(
+            let resolved = governance.clone().map_or_else(
                 || {
                     let cache_key = (
                         logical_key.tenant().to_owned(),
                         logical_key.bucket().to_owned(),
                     );
-                    identity_cache
+                    governance_cache
                         .entry(cache_key)
                         .or_insert_with(|| {
-                            self.resolve_bucket_identity(logical_key.tenant(), logical_key.bucket())
+                            let identity = self.resolve_bucket_identity(
+                                logical_key.tenant(),
+                                logical_key.bucket(),
+                            )?;
+                            Ok(ObjectMutationGovernance {
+                                tenant_id: identity.tenant_id.0,
+                                bucket_id: identity.bucket_id.0,
+                                versioning: self.bucket_versioning_by_key(&identity.encode())?,
+                                policy: self
+                                    .bucket_policy_by_key(&identity.encode())?
+                                    .unwrap_or_default(),
+                            })
                         })
                         .clone()
                 },
-                |governance| {
-                    Ok(BucketIdentity {
-                        tenant_id: TenantId(governance.tenant_id),
-                        bucket_id: BucketId(governance.bucket_id),
-                    })
-                },
+                Ok,
             );
-            let result = match identity {
-                Ok(identity) => self.prepare(operation, identity, false).await,
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(operation) => prepared.push((index, operation)),
+            match resolved {
+                Ok(resolved) => pending.push((index, operation, resolved, definition_intent)),
                 Err(error) => {
-                    early.insert(index, error);
+                    completed.insert(index, Err(error));
                 }
             }
         }
-        let prepare_duration = prepare_started.elapsed();
-        tracing::info!(
-            histogram.keldra_store_bulk_prepare_duration_seconds = prepare_duration.as_secs_f64(),
-            operation_count = prepared.len(),
-            "object storage bulk preparation completed"
-        );
-        let mut completed = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
-        loop {
-            let _policy_guard = self.policy_gate.read().await;
-            let lock_started = std::time::Instant::now();
-            let path_lock_started = lock_started;
-            phase.enter(BulkStorePhase::OrdinaryPathLock);
-            let _guards = self
-                .ordinary_locks
-                .acquire(
-                    &prepared
-                        .iter()
-                        .flat_map(|(_, operation)| operation.lock_paths())
-                        .collect::<Vec<_>>(),
+
+        while !pending.is_empty() {
+            let lane_operations = pending
+                .iter()
+                .map(|(_, operation, governance, intent)| {
+                    (operation.clone(), governance.clone(), *intent)
+                })
+                .collect();
+            match self
+                .commit_direct_local_mutation_batch(
+                    lane_operations,
+                    source_journal_admission,
+                    governance_supplied,
                 )
-                .await;
-            let path_lock_wait = path_lock_started.elapsed();
-            phase.enter(BulkStorePhase::CommitLock);
-            let _commit_guard = self.lock_commit("bulk_mutation").await;
-            let commit_lock_wait = _commit_guard.wait_duration();
-            let lock_duration = lock_started.elapsed();
-            let mut batch = WriteBatch::default();
-            let now = match now_unix_millis() {
-                Ok(now) => now,
-                Err(error) => {
-                    return fail_prepared_operations(completed, early, prepared, error);
-                }
-            };
-            let mut receipt_status = match self.mutation_receipt_status() {
-                Ok(status) => status,
-                Err(error) => {
-                    return fail_prepared_operations(completed, early, prepared, error);
-                }
-            };
-            let initial_receipt_status = receipt_status;
-            let pruned_receipts =
-                match self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status) {
-                    Ok(pruned) => pruned,
-                    Err(error) => {
-                        return fail_prepared_operations(completed, early, prepared, error);
+                .await
+            {
+                Ok((outcomes, _receipt_capacity_at)) => {
+                    if outcomes.len() != pending.len() {
+                        let error = MutationError::Storage(
+                            "local lane batch outcome count is inconsistent".into(),
+                        );
+                        for (index, _, _, _) in pending.drain(..) {
+                            completed.insert(index, Err(error.clone()));
+                        }
+                        break;
                     }
-                };
-            let read_cache = match MutationReadCache::load(
-                self,
-                &prepared
-                    .iter()
-                    .map(|(_, operation)| operation)
-                    .collect::<Vec<_>>(),
-            ) {
-                Ok(read_cache) => read_cache,
-                Err(error) => {
-                    return fail_prepared_operations(completed, early, prepared, error);
-                }
-            };
-            let mut pending_heads = BTreeMap::<Vec<u8>, Head>::new();
-            let mut pending_versions = BTreeMap::<Vec<u8>, Version>::new();
-            let mut pending_receipts = BTreeMap::<Vec<u8>, StoredReceipt>::new();
-            let mut pending_blob_references = PendingBlobReferences::new();
-            let mut pending_inline_payloads = BTreeSet::<Vec<u8>>::new();
-            let mut policy_cache = BTreeMap::<Vec<u8>, Result<BucketPolicy, MutationError>>::new();
-            let mut versioning_cache =
-                BTreeMap::<Vec<u8>, Result<ObjectVersioning, MutationError>>::new();
-            if let Some(governance) = governance.as_ref() {
-                let identity = BucketIdentity {
-                    tenant_id: TenantId(governance.tenant_id),
-                    bucket_id: BucketId(governance.bucket_id),
-                }
-                .encode()
-                .to_vec();
-                policy_cache.insert(identity.clone(), Ok(governance.policy.clone()));
-                versioning_cache.insert(identity, Ok(governance.versioning));
-            }
-            read_cache.seed_bucket_settings(&mut policy_cache, &mut versioning_cache);
-            let mut results = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
-            let mut batch_high_watermark = None;
-            let mut pending_changes = Vec::new();
-            let mut receipt_capacity_at = None;
-            let evaluate_started = std::time::Instant::now();
-            phase.enter(BulkStorePhase::Evaluation);
-            for (prepared_index, (index, operation)) in prepared.iter().enumerate() {
-                if let Some(error) = operation.lock_paths().iter().find_map(|path| {
-                    self.require_unreserved_object_locked(operation.identity(), &path.path, None)
-                        .err()
-                }) {
-                    results.insert(*index, Err(error));
-                    continue;
-                }
-                let outcome = self
-                    .evaluate_operation(
-                        &operation,
-                        &mut batch,
-                        &mut pending_heads,
-                        &mut pending_versions,
-                        &mut pending_receipts,
-                        &mut pending_blob_references,
-                        &mut pending_inline_payloads,
-                        &read_cache,
-                        &mut policy_cache,
-                        &mut versioning_cache,
-                        &pruned_receipts,
-                        &mut receipt_status,
-                        now,
-                        None,
-                        definition_intent,
-                        &mut EvaluationSubphaseMetrics::default(),
+                    let mut retry = Vec::new();
+                    let mut retry_capacity = None;
+                    let mut contradictory_capacity = false;
+                    for ((index, operation, governance, intent), outcome) in
+                        pending.drain(..).zip(outcomes)
+                    {
+                        if backpressure
+                            && outcome
+                                .as_ref()
+                                .is_err_and(|error| is_mutation_capacity(error))
+                        {
+                            let capacity = outcome
+                                .as_ref()
+                                .err()
+                                .and_then(mutation_capacity_kind)
+                                .expect("capacity outcome was matched");
+                            if retry_capacity.is_some_and(|existing| existing != capacity) {
+                                contradictory_capacity = true;
+                            } else {
+                                retry_capacity = Some(capacity);
+                            }
+                            retry.push((index, operation, governance, intent));
+                        } else {
+                            completed.insert(index, outcome);
+                        }
+                    }
+                    if retry.is_empty() {
+                        break;
+                    }
+                    if contradictory_capacity {
+                        let error = MutationError::Storage(
+                            "one local lane batch returned contradictory capacity authorities"
+                                .into(),
+                        );
+                        for (index, _, _, _) in retry.drain(..) {
+                            completed.insert(index, Err(error.clone()));
+                        }
+                        break;
+                    }
+                    pending = retry;
+                    self.wait_for_capacity_with_metrics(
+                        retry_capacity.expect("a capacity retry names its authority"),
                     )
                     .await;
-                if backpressure
-                    && outcome
-                        .as_ref()
-                        .is_err_and(|error| matches!(error, MutationError::ReceiptCapacity))
-                {
-                    results.insert(*index, outcome.map(|evaluated| evaluated.receipt));
-                    receipt_capacity_at = Some(prepared_index);
-                    break;
-                }
-                if let Ok(evaluated) = &outcome
-                    && !evaluated.receipt.replayed
-                {
-                    batch_high_watermark = Some(
-                        batch_high_watermark
-                            .map_or(evaluated.receipt.version, |current: VersionId| {
-                                current.max(evaluated.receipt.version)
-                            }),
-                    );
-                    pending_changes.extend(
-                        evaluated
-                            .pending_head_changes(operation.identity(), operation.key().path()),
-                    );
-                }
-                results.insert(*index, outcome.map(|evaluated| evaluated.receipt));
-            }
-            let evaluate_duration = evaluate_started.elapsed();
-            let persistence_started = std::time::Instant::now();
-            phase.enter(BulkStorePhase::Persistence);
-            let persistence = (|| {
-                if receipt_status != initial_receipt_status {
-                    self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
-                }
-                self.stage_local_changes_with_admission(
-                    &mut batch,
-                    &pending_changes,
-                    LocalReferenceEffects::AppliedInline,
-                    source_journal_admission,
-                )?;
-                if let Some(high_watermark) = batch_high_watermark {
-                    batch.put_cf(
-                        self.cf(CF_METADATA)?,
-                        VERSION_HIGH_WATERMARK_KEY,
-                        serde_json::to_vec(&high_watermark).map_err(storage_error)?,
-                    );
-                }
-                if batch.is_empty() {
-                    return Ok(());
-                }
-                let mut options = WriteOptions::default();
-                options.set_sync(self.sync_writes);
-                self.db.write_opt(batch, &options).map_err(storage_error)
-            })();
-            let persistence_duration = persistence_started.elapsed();
-            tracing::info!(
-                histogram.keldra_store_bulk_lock_duration_seconds = lock_duration.as_secs_f64(),
-                histogram.keldra_store_bulk_ordinary_path_lock_wait_duration_seconds =
-                    path_lock_wait.as_secs_f64(),
-                histogram.keldra_store_bulk_commit_lock_wait_duration_seconds =
-                    commit_lock_wait.as_secs_f64(),
-                histogram.keldra_store_bulk_evaluate_duration_seconds =
-                    evaluate_duration.as_secs_f64(),
-                histogram.keldra_store_bulk_persist_duration_seconds =
-                    persistence_duration.as_secs_f64(),
-                operation_count = prepared.len(),
-                "object storage bulk phases completed"
-            );
-            match persistence {
-                Ok(()) => {
-                    if !pruned_receipts.is_empty() {
-                        self.mutation_capacity_notify.notify_waiters();
-                    }
-                    if !pending_changes.is_empty() {
-                        phase.enter(BulkStorePhase::SourceSettlement);
-                        if let Err(error) = self.settle_inline_source_changes() {
-                            fail_unresolved_prepared(&mut results, &prepared, error);
-                            completed.extend(results);
-                            return completed
-                                .into_iter()
-                                .chain(early.into_iter().map(|(index, error)| (index, Err(error))))
-                                .map(|(index, result)| BatchOutcome { index, result })
-                                .collect();
-                        }
-                        self.notify_local_invalidations();
-                    }
                 }
                 Err(error) if backpressure && is_mutation_capacity(&error) => {
                     let capacity =
                         mutation_capacity_kind(&error).expect("capacity error was matched");
-                    drop(_commit_guard);
-                    drop(_guards);
-                    drop(_policy_guard);
-                    phase.enter(BulkStorePhase::CapacityWait);
                     self.wait_for_capacity_with_metrics(capacity).await;
-                    continue;
                 }
                 Err(error) => {
-                    fail_unresolved_prepared(&mut results, &prepared, error);
-                    completed.extend(results);
-                    completed.extend(early.into_iter().map(|(index, error)| (index, Err(error))));
-                    return completed
-                        .into_iter()
-                        .map(|(index, result)| BatchOutcome { index, result })
-                        .collect();
-                }
-            }
-            if backpressure && let Some(retry_from) = receipt_capacity_at {
-                let retry = prepared.split_off(retry_from);
-                let capacity_index = retry
-                    .first()
-                    .map(|(index, _)| *index)
-                    .expect("receipt-capacity retry retains its first operation");
-                for (index, result) in results {
-                    if index != capacity_index {
-                        completed.insert(index, result);
+                    for (index, _, _, _) in pending.drain(..) {
+                        completed.insert(index, Err(error.clone()));
                     }
+                    break;
                 }
-                prepared = retry;
-                drop(_commit_guard);
-                drop(_guards);
-                drop(_policy_guard);
-                phase.enter(BulkStorePhase::CapacityWait);
-                self.wait_for_capacity_with_metrics("receipt").await;
-                continue;
             }
-            completed.extend(results);
-            completed.extend(early.into_iter().map(|(index, error)| (index, Err(error))));
-            phase.complete();
-            return completed
-                .into_iter()
-                .map(|(index, result)| BatchOutcome { index, result })
-                .collect();
         }
+        completed
+            .into_iter()
+            .map(|(index, result)| BatchOutcome { index, result })
+            .collect()
     }
 
     async fn wait_for_capacity_with_metrics(&self, capacity: &'static str) {
@@ -498,19 +342,18 @@ impl Store {
             ));
         }
         governance.validate()?;
-        let identity = BucketIdentity {
-            tenant_id: TenantId(governance.tenant_id),
-            bucket_id: BucketId(governance.bucket_id),
-        };
-        let prepared = self.prepare(operation, identity, true).await?;
-        self.coordinate_prepared_object_mutation(
-            prepared,
-            context,
-            governance,
-            None,
-            SourceJournalAdmission::Bounded,
-        )
-        .await
+        let mut outcomes = self
+            .coordinate_distributed_mutation_batch_with_admission(
+                vec![(operation, governance, None)],
+                context,
+                SourceJournalAdmission::Bounded,
+            )
+            .await?;
+        outcomes.pop().ok_or_else(|| {
+            MutationError::Storage(
+                "distributed mutation batch omitted its singleton outcome".into(),
+            )
+        })?
     }
     pub async fn coordinate_definition_object_mutation_with_governance(
         &self,
@@ -531,19 +374,16 @@ impl Store {
         }
         governance.validate()?;
         intent.validate().map_err(definition_mutation_error)?;
-        let identity = BucketIdentity {
-            tenant_id: TenantId(governance.tenant_id),
-            bucket_id: BucketId(governance.bucket_id),
-        };
-        let prepared = self.prepare(operation, identity, true).await?;
-        self.coordinate_prepared_object_mutation(
-            prepared,
-            context,
-            governance,
-            Some(intent),
-            SourceJournalAdmission::Bounded,
-        )
-        .await
+        let mut outcomes = self
+            .coordinate_distributed_mutation_batch_with_admission(
+                vec![(operation, governance, Some(intent))],
+                context,
+                SourceJournalAdmission::Bounded,
+            )
+            .await?;
+        outcomes.pop().ok_or_else(|| {
+            MutationError::Storage("definition mutation batch omitted its singleton outcome".into())
+        })?
     }
     pub async fn coordinate_distributed_definition_publish_with_governance(
         &self,
@@ -559,399 +399,27 @@ impl Store {
         }
         governance.validate()?;
         intent.validate().map_err(definition_mutation_error)?;
-        let identity = BucketIdentity {
-            tenant_id: TenantId(governance.tenant_id),
-            bucket_id: BucketId(governance.bucket_id),
-        };
-        let prepared = self.prepare_verified_distributed_publish(request, identity)?;
-        self.coordinate_prepared_object_mutation(
-            prepared,
-            context,
-            governance,
-            Some(intent),
-            SourceJournalAdmission::Bounded,
-        )
-        .await
-    }
-    pub(super) async fn coordinate_prepared_object_mutation(
-        &self,
-        prepared: PreparedOperation,
-        context: ObjectMutationContext,
-        governance: ObjectMutationGovernance,
-        definition_intent: Option<DefinitionMutationIntent>,
-        source_journal_admission: SourceJournalAdmission,
-    ) -> Result<CoordinatedObjectMutation, MutationError> {
-        if prepared.command_id().is_none() {
-            return Err(MutationError::InvalidCommandId);
-        }
-        let identity = prepared.identity();
-        let _path_guard = self.ordinary_locks.acquire(&prepared.lock_paths()).await;
-        let _commit_guard = self.lock_commit("coordinated_object_mutation").await;
-        for path in prepared.lock_paths() {
-            self.require_unreserved_object_locked(identity, &path.path, None)?;
-        }
-        let source = self
-            .local_watch_status()
-            .map_err(|error| MutationError::Storage(error.to_string()))?;
-        let source_journal_position = source.tail.checked_add(1).ok_or_else(|| {
-            MutationError::Storage("local invalidation offset is exhausted".into())
-        })?;
-        let now = now_unix_millis()?;
-        let mut batch = WriteBatch::default();
-        let mut receipt_status = self.mutation_receipt_status()?;
-        let initial_receipt_status = receipt_status;
-        let pruned_receipts =
-            self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
-        let mut pending_heads = BTreeMap::new();
-        let mut pending_versions = BTreeMap::new();
-        let mut pending_receipts = BTreeMap::new();
-        let mut pending_blob_references = PendingBlobReferences::new();
-        let mut pending_inline_payloads = BTreeSet::new();
-        let read_cache = MutationReadCache::default();
-        let encoded_bucket = prepared.identity().encode().to_vec();
-        let mut policy_cache = BTreeMap::from([(encoded_bucket.clone(), Ok(governance.policy))]);
-        let mut versioning_cache = BTreeMap::from([(encoded_bucket, Ok(governance.versioning))]);
-        let evaluated = self
-            .evaluate_operation(
-                &prepared,
-                &mut batch,
-                &mut pending_heads,
-                &mut pending_versions,
-                &mut pending_receipts,
-                &mut pending_blob_references,
-                &mut pending_inline_payloads,
-                &read_cache,
-                &mut policy_cache,
-                &mut versioning_cache,
-                &pruned_receipts,
-                &mut receipt_status,
-                now,
-                Some(DistributedEvaluationContext {
-                    mutation: context,
-                    source_id: source.source_id,
-                    source_journal_position,
-                    reference_effects: LocalReferenceEffects::Deferred,
-                    materialize_inline_payload: false,
-                    retain_command_receipt: true,
-                }),
-                definition_intent,
-                &mut EvaluationSubphaseMetrics::default(),
+        let mut outcomes = self
+            .coordinate_distributed_mutation_batch_with_admission(
+                vec![(BatchOperation::Publish(request), governance, Some(intent))],
+                context,
+                SourceJournalAdmission::Bounded,
             )
             .await?;
-        let created = !evaluated.receipt.replayed;
-        if created {
-            let mutation = evaluated.mutation.as_ref().ok_or_else(|| {
-                MutationError::Storage("distributed mutation result is missing".into())
-            })?;
-            if mutation.stamp.source_journal_position != source_journal_position {
-                return Err(MutationError::Storage(
-                    "distributed mutation source position changed during evaluation".into(),
-                ));
-            }
-            self.stage_local_changes_with_admission(
-                &mut batch,
-                &evaluated.pending_head_changes(identity, prepared.key().path()),
-                LocalReferenceEffects::Deferred,
-                source_journal_admission,
-            )?;
-            batch.put_cf(
-                self.cf(CF_METADATA)?,
-                VERSION_HIGH_WATERMARK_KEY,
-                serde_json::to_vec(&evaluated.receipt.version).map_err(storage_error)?,
-            );
-        }
-        if let Some(mutation) = evaluated.mutation.as_ref() {
-            self.stage_object_mutation_reference_proof(&mut batch, mutation)?;
-        }
-        if receipt_status != initial_receipt_status {
-            self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
-        }
-        if !batch.is_empty() {
-            let mut options = WriteOptions::default();
-            options.set_sync(self.sync_writes);
-            self.db.write_opt(batch, &options).map_err(storage_error)?;
-        }
-        if !pruned_receipts.is_empty() {
-            self.mutation_capacity_notify.notify_waiters();
-        }
-        if created {
-            self.notify_local_invalidations();
-        }
-        Ok(CoordinatedObjectMutation {
-            receipt: evaluated.receipt,
-            mutation: evaluated.mutation,
-        })
+        outcomes.pop().ok_or_else(|| {
+            MutationError::Storage("definition publish batch omitted its singleton outcome".into())
+        })?
     }
     /// Applies a coordinator result; reference owners consume the source journal.
     pub async fn apply_object_mutation_replica(
         &self,
         mutation: &ObjectMutation,
     ) -> Result<ReplicaObjectMutationApplied, MutationError> {
-        mutation.validate()?;
-        let identity = BucketIdentity {
-            tenant_id: TenantId(mutation.tenant_id),
-            bucket_id: BucketId(mutation.bucket_id),
-        };
-        let encoded_head_key = identity.head_key(&mutation.exact_path);
-        let encoded_version_key =
-            exact_version_key(identity, &mutation.exact_path, mutation.version.id);
-        let primary_receipt_key = receipt_key(identity, &mutation.command_id);
-        let _commit_guard = self.lock_commit("object_mutation_replica").await;
-        self.require_unreserved_object_locked(identity, &mutation.exact_path, None)?;
-        let retention = version_retention(mutation.versioning);
-        let now = now_unix_millis()?;
-        let retained_identical_receipt = if let Some(existing) =
-            self.read_stored_receipt(&primary_receipt_key)?
-            && existing.expires_at_unix_millis > now
-        {
-            if existing.fingerprint != mutation.input_fingerprint
-                || existing.version != mutation.version.id
-                || existing.deleted != mutation.version.deleted
-                || existing.expires_at_unix_millis != mutation.receipt_expires_at_unix_millis
-                || existing.object_mutation.as_ref() != Some(mutation)
-            {
-                return Err(MutationError::ObjectMutationConflict);
-            }
-            true
-        } else {
-            false
-        };
-        let mut batch = WriteBatch::default();
-        let proof_staged = self.stage_object_mutation_reference_proof(&mut batch, mutation)?;
-        let current = self.head_by_storage_key(&encoded_head_key)?;
-        let locator_applied = mutation
-            .definition_transition
-            .as_ref()
-            .map(|transition| self.definition_transition_is_applied(transition))
-            .transpose()?
-            .unwrap_or(true);
-        let mut already_applied = false;
-        match current.as_ref() {
-            None if mutation.stamp.predecessor_version.is_some() => {
-                return Err(MutationError::ObjectMutationLineageGap {
-                    current: None,
-                    predecessor: mutation.stamp.predecessor_version,
-                });
-            }
-            None => {}
-            Some(head) if head.version == mutation.version.id => {
-                let descriptor = self
-                    .stored_version_by_key(&encoded_version_key)?
-                    .map(|stored| stored.version)
-                    .ok_or_else(|| {
-                        MutationError::Storage(
-                            "replicated head references a missing version descriptor".into(),
-                        )
-                    })?;
-                if head.deleted == mutation.version.deleted
-                    && head.mutation_stamp == Some(mutation.stamp)
-                    && descriptor == mutation.version
-                {
-                    if retained_identical_receipt && !proof_staged && locator_applied {
-                        return Ok(ReplicaObjectMutationApplied {
-                            version: mutation.version.id,
-                            replayed: true,
-                        });
-                    }
-                    already_applied = true;
-                } else if head.mutation_stamp.is_some_and(|stamp| {
-                    stamp.predecessor_version == mutation.stamp.predecessor_version
-                }) {
-                    return Err(MutationError::ObjectMutationSibling {
-                        predecessor: mutation.stamp.predecessor_version,
-                    });
-                } else {
-                    return Err(MutationError::ObjectMutationConflict);
-                }
-            }
-            Some(head) if Some(head.version) == mutation.stamp.predecessor_version => {}
-            Some(head)
-                if retained_identical_receipt
-                    && head.mutation_stamp.is_some_and(|stamp| {
-                        stamp.predecessor_version == Some(mutation.version.id)
-                    }) =>
-            {
-                if !proof_staged {
-                    return Ok(ReplicaObjectMutationApplied {
-                        version: mutation.version.id,
-                        replayed: true,
-                    });
-                }
-                already_applied = true;
-            }
-            Some(head)
-                if head.mutation_stamp.is_some_and(|stamp| {
-                    stamp.predecessor_version == mutation.stamp.predecessor_version
-                }) =>
-            {
-                return Err(MutationError::ObjectMutationSibling {
-                    predecessor: mutation.stamp.predecessor_version,
-                });
-            }
-            Some(head) => {
-                return Err(MutationError::ObjectMutationLineageGap {
-                    current: Some(head.version),
-                    predecessor: mutation.stamp.predecessor_version,
-                });
-            }
-        }
-        if !already_applied {
-            let predecessor = match mutation.stamp.predecessor_version {
-                Some(version) => Some(
-                    self.stored_version_by_key(&exact_version_key(
-                        identity,
-                        &mutation.exact_path,
-                        version,
-                    ))?
-                    .map(|stored| stored.version)
-                    .ok_or_else(|| {
-                        MutationError::Storage(
-                            "replicated predecessor references a missing version descriptor".into(),
-                        )
-                    })?,
-                ),
-                None => None,
-            };
-            validate_accounting_transition(mutation, predecessor.as_ref())?;
-            if predecessor
-                .as_ref()
-                .is_some_and(|version| version.protected_link_descriptor)
-            {
-                return Err(MutationError::InvalidObjectMutation(
-                    "protected alias descriptors must be mutated through sealed link authority"
-                        .into(),
-                ));
-            }
-            if self.alias_registry_locked(identity, &mutation.exact_path)?
-                != mutation
-                    .alias_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.registry.clone())
-            {
-                return Err(MutationError::ObjectMutationConflict);
-            }
-            if let Some(snapshot) = mutation.alias_snapshot.as_ref() {
-                if predecessor.as_ref() != Some(&snapshot.canonical_version) {
-                    return Err(MutationError::ObjectMutationConflict);
-                }
-            }
-        }
-        if let Some(existing) = self.stored_version_by_key(&encoded_version_key)?
-            && existing.version != mutation.version
-        {
-            return Err(MutationError::ObjectMutationConflict);
-        }
-        let mut receipt_status = self.mutation_receipt_status()?;
-        let initial_receipt_status = receipt_status;
-        let pruned = self.stage_expired_mutation_receipts(&mut batch, now, &mut receipt_status)?;
-        if !retained_identical_receipt
-            && !pruned.contains(&primary_receipt_key)
-            && self.read_stored_receipt(&primary_receipt_key)?.is_some()
-        {
-            return Err(MutationError::ObjectMutationConflict);
-        }
-        if !already_applied {
-            if let Some(predecessor) = mutation.stamp.predecessor_version {
-                let predecessor_key =
-                    exact_version_key(identity, &mutation.exact_path, predecessor);
-                if let Some(stored) = self.stored_version_by_key(&predecessor_key)? {
-                    match stored.retention {
-                        StoredVersionRetention::JournalPending
-                            if retention == StoredVersionRetention::UserRetained =>
-                        {
-                            batch.put_cf(
-                                self.cf(CF_VERSIONS)?,
-                                predecessor_key,
-                                StoredVersion::new(
-                                    stored.version,
-                                    StoredVersionRetention::UserRetained,
-                                )
-                                .encode()?,
-                            );
-                        }
-                        StoredVersionRetention::JournalReleased
-                            if retention == StoredVersionRetention::UserRetained =>
-                        {
-                            batch.put_cf(
-                                self.cf(CF_VERSIONS)?,
-                                predecessor_key,
-                                StoredVersion::new(
-                                    stored.version,
-                                    StoredVersionRetention::UserRetained,
-                                )
-                                .encode()?,
-                            );
-                        }
-                        StoredVersionRetention::JournalReleased => {
-                            batch.delete_cf(self.cf(CF_VERSIONS)?, predecessor_key);
-                        }
-                        StoredVersionRetention::JournalPending
-                        | StoredVersionRetention::UserRetained => {}
-                    }
-                }
-            }
-            batch.put_cf(
-                self.cf(CF_VERSIONS)?,
-                &encoded_version_key,
-                StoredVersion::new(mutation.version.clone(), retention).encode()?,
-            );
-            batch.put_cf(
-                self.cf(CF_HEADS)?,
-                &encoded_head_key,
-                encode_head(&Head {
-                    version: mutation.version.id,
-                    deleted: mutation.version.deleted,
-                    mutation_stamp: Some(mutation.stamp),
-                })?,
-            );
-        }
-        if !retained_identical_receipt && mutation.receipt_expires_at_unix_millis > now {
-            self.stage_stored_mutation_receipt(
-                &mut batch,
-                primary_receipt_key,
-                StoredReceipt {
-                    fingerprint: mutation.input_fingerprint,
-                    version: mutation.version.id,
-                    deleted: mutation.version.deleted,
-                    expires_at_unix_millis: mutation.receipt_expires_at_unix_millis,
-                    object_mutation: Some(mutation.clone()),
-                    definition_transition: mutation.definition_transition.clone(),
-                },
-                &mut receipt_status,
-                &mut BTreeMap::new(),
-            )?;
-        }
-        if receipt_status != initial_receipt_status {
-            self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
-        }
-        let high_watermark = self
-            .read_json::<VersionId>(CF_METADATA, VERSION_HIGH_WATERMARK_KEY)?
-            .map_or(mutation.version.id, |current| {
-                current.max(mutation.version.id)
-            });
-        batch.put_cf(
-            self.cf(CF_METADATA)?,
-            VERSION_HIGH_WATERMARK_KEY,
-            serde_json::to_vec(&high_watermark).map_err(storage_error)?,
-        );
-        let mutation_is_current = !already_applied
-            || current
-                .as_ref()
-                .is_some_and(|head| head.version == mutation.version.id);
-        if mutation_is_current && let Some(transition) = mutation.definition_transition.as_ref() {
-            self.stage_definition_transition(&mut batch, transition)
-                .map_err(definition_mutation_error)?;
-        }
-        let mut options = WriteOptions::default();
-        options.set_sync(self.sync_writes);
-        self.db.write_opt(batch, &options).map_err(storage_error)?;
-        if !pruned.is_empty() {
-            self.mutation_capacity_notify.notify_waiters();
-        }
-        self.clock.observe(mutation.version.id);
-        Ok(ReplicaObjectMutationApplied {
-            version: mutation.version.id,
-            replayed: already_applied,
+        let mut applied = self
+            .apply_object_mutation_replica_batch(std::slice::from_ref(mutation))
+            .await?;
+        applied.pop().ok_or_else(|| {
+            MutationError::Storage("replica mutation batch omitted its singleton outcome".into())
         })
     }
     pub(crate) fn stage_local_changes(
@@ -1418,9 +886,12 @@ impl Store {
             };
             if let Some(existing) = existing {
                 if existing.expires_at_unix_millis <= now_unix_millis {
-                    return Err(MutationError::Storage(
-                        "expired mutation receipt escaped pruning".into(),
-                    ));
+                    // Lane writers never prune from an optimistic authority
+                    // snapshot: two independent lanes could otherwise debit
+                    // the same expired row. Surface bounded capacity so the
+                    // existing exclusive maintenance pass prunes once, then
+                    // the idempotent caller retries against fresh authority.
+                    return Err(MutationError::ReceiptCapacity);
                 }
                 if existing.fingerprint != operation.fingerprint() {
                     return Err(MutationError::IdempotencyConflict);

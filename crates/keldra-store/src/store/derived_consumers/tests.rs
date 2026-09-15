@@ -123,6 +123,36 @@ async fn checkpoint_apply_is_idempotent_and_rejects_regression_or_future_progres
 }
 
 #[tokio::test]
+async fn routine_membership_and_checkpoint_writes_do_not_take_the_legacy_commit_mutex() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    put(&store, "one").await;
+    let source = store.local_watch_status().unwrap().source_id;
+
+    let legacy_commit = store.commit_lock.lock().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        store.ensure_derived_consumer_membership(fence(1), &[1]),
+    )
+    .await
+    .expect("membership publication must not wait for the legacy commit mutex")
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        store.apply_derived_consumer_checkpoint(
+            checkpoint(source, DerivedConsumerKind::Index, 1, 2, fence(1)),
+            &[1],
+        ),
+    )
+    .await
+    .expect("checkpoint publication must not wait for the legacy commit mutex")
+    .unwrap();
+    drop(legacy_commit);
+}
+
+#[tokio::test]
 async fn membership_and_both_checkpoint_kinds_survive_reopen() {
     let temporary = tempfile::tempdir().unwrap();
     let options = StoreOptions::new(temporary.path(), 1);
