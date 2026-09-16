@@ -1115,6 +1115,26 @@ fn handoff_dedup_selects_furthest_source_position() {
 }
 
 #[test]
+fn equal_cut_handoff_duplicates_reject_conflicting_authorization_source() {
+    let mut credits = credits(64 * 1024);
+    let mut budget = budget();
+    let mut selected = BTreeMap::new();
+    let mut first = candidate(partition(2), 20);
+    first.canonical_source_path = Some("objects/owner-a.json".into());
+    select_handoff_candidate(&mut selected, first.clone(), &mut credits, &mut budget).unwrap();
+    let mut conflicting = candidate(partition(1), 20);
+    conflicting.canonical_source_path = Some("objects/owner-b.json".into());
+    assert!(matches!(
+        select_handoff_candidate(&mut selected, conflicting, &mut credits, &mut budget),
+        Err(IndexError::Integrity)
+    ));
+    assert_eq!(
+        selected[&first.document].canonical_source_path,
+        first.canonical_source_path
+    );
+}
+
+#[test]
 fn handoff_replacement_owns_exactly_one_candidate_charge() {
     let mut selected = BTreeMap::new();
     let mut credits = credits(16 * 1024);

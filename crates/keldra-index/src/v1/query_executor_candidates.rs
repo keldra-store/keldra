@@ -106,6 +106,7 @@ pub(super) fn select_handoff_candidate(
                     if incoming.material_source_version != current.material_source_version
                         || incoming.current_source_version != current.current_source_version
                         || incoming.source_path != current.source_path
+                        || incoming.canonical_source_path != current.canonical_source_path
                         || incoming.result_path != current.result_path
                         || incoming.result_version != current.result_version =>
                 {
