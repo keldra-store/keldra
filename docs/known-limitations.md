@@ -1,5 +1,11 @@
 # Keldra known limitations
 
+Typed-JSON query byte-work and heap ceilings follow the attainable configured
+query-memory budget (`KELDRA_INDEX_QUERY_MEMORY_BYTES`), bounded by aggregate
+working-memory admission. There is no separate fixed 256 MiB per-query ceiling.
+Increasing query memory must also fit `KELDRA_INDEX_WORKING_MEMORY_BYTES` together
+with the configured indexing pipeline; concurrent queries share that admission.
+
 ## Coupled operator-secret lifecycle
 
 One immutable operator secret currently derives the JWT signing key, the key

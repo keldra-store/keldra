@@ -66,7 +66,6 @@ const CONTROL_OBJECT_MAX_BYTES: usize = 256 * 1024;
 // at the next power-of-two bound: the default 512 MiB query share still admits
 // all 32 public-query lanes without forcing every query through a failed pass.
 const MIN_QUERY_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_QUERY_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 // This is a logical-work limit, not a conversion of the memory lease.
 const MAX_QUERY_CANDIDATES: usize = 1_000_000;
 const MAX_PREDECESSOR_GENERATION_LOADS: usize = 4_096;
@@ -225,7 +224,8 @@ impl V1LocalIndexQueryExecutor {
             "v1 query pinned its common-cut root vector"
         );
 
-        let limits = execution_limits(request.limit)?;
+        let maximum_memory = self.memory.maximum_bounded_lease(u64::MAX);
+        let limits = execution_limits(request.limit, maximum_memory)?;
         let query = TypedJsonQueryRequest {
             logical,
             fields: schema
@@ -255,7 +255,6 @@ impl V1LocalIndexQueryExecutor {
                 request.limit
             },
         };
-        let maximum_memory = self.memory.maximum_bounded_lease(MAX_QUERY_MEMORY_BYTES);
         let mut requested_memory = MIN_QUERY_MEMORY_BYTES.min(maximum_memory);
         let mut retries = 0usize;
         let (result, _credits) = loop {
@@ -266,7 +265,7 @@ impl V1LocalIndexQueryExecutor {
             );
             let memory = self
                 .memory
-                .acquire_bounded(requested_memory, MAX_QUERY_MEMORY_BYTES)
+                .acquire_bounded(requested_memory, maximum_memory)
                 .await
                 .map_err(|error| Status::resource_exhausted(error.to_string()))?;
             tracing::debug!(
@@ -1084,13 +1083,13 @@ fn next_query_memory_lease(current: u64, required: usize, maximum: u64) -> Resul
     Ok(next)
 }
 
-fn execution_limits(requested: usize) -> Result<QueryExecutionLimits, Status> {
+fn execution_limits(requested: usize, maximum_memory: u64) -> Result<QueryExecutionLimits, Status> {
     if requested > MAX_QUERY_CANDIDATES {
         return Err(Status::resource_exhausted(
             "v1 query result page exceeds the bounded candidate limit",
         ));
     }
-    let maximum_memory = usize::try_from(MAX_QUERY_MEMORY_BYTES)
+    let maximum_memory = usize::try_from(maximum_memory)
         .map_err(|_| Status::resource_exhausted("v1 query memory maximum exceeds this platform"))?;
     Ok(QueryExecutionLimits {
         maximum_partitions: MAX_QUERY_PARTITIONS,
@@ -1282,6 +1281,7 @@ fn index_status(error: IndexError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const MAX_QUERY_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
     use keldra_index::v1::{ProjectionQueryStreamRoot, QueryAdmissionCandidate, StableDocumentKey};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1299,7 +1299,7 @@ mod tests {
 
     #[test]
     fn execution_limits_are_fixed_independently_of_adaptive_leases() {
-        let limits = execution_limits(100).unwrap();
+        let limits = execution_limits(100, MAX_QUERY_MEMORY_BYTES).unwrap();
 
         assert_eq!(limits.maximum_partitions, MAX_QUERY_PARTITIONS);
         assert_eq!(limits.maximum_candidates, MAX_QUERY_CANDIDATES);
@@ -1314,8 +1314,19 @@ mod tests {
 
     #[test]
     fn requested_page_cannot_expand_bounded_logical_work() {
-        assert!(execution_limits(MAX_QUERY_CANDIDATES).is_ok());
-        assert!(execution_limits(MAX_QUERY_CANDIDATES + 1).is_err());
+        assert!(execution_limits(MAX_QUERY_CANDIDATES, MAX_QUERY_MEMORY_BYTES).is_ok());
+        assert!(execution_limits(MAX_QUERY_CANDIDATES + 1, MAX_QUERY_MEMORY_BYTES).is_err());
+    }
+
+    #[test]
+    fn configured_query_memory_can_exceed_the_old_fixed_ceiling() {
+        let configured = 2 * 1024 * 1024 * 1024;
+        let budget = IndexQueryMemoryBudget::new(configured).unwrap();
+        let maximum = budget.maximum_bounded_lease(u64::MAX);
+        let limits = execution_limits(100, maximum).unwrap();
+        assert_eq!(maximum, configured);
+        assert_eq!(limits.maximum_loaded_bytes, configured as usize);
+        assert_eq!(limits.maximum_heap_bytes, configured as usize);
     }
 
     #[test]
