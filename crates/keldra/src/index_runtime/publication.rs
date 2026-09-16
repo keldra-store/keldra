@@ -912,8 +912,8 @@ impl IndexArtifactRouter {
             .collect::<Vec<_>>();
         let mut work = Vec::new();
         for ((coordinator, address), group) in groups {
-            for batch in bounded_artifact_batches(group)? {
-                work.push((work.len(), (coordinator, address.clone(), batch)));
+            for publication in immutable_publication_work(group)? {
+                work.push((work.len(), (coordinator, address.clone(), publication)));
             }
         }
         let batch_count = work.len();
@@ -921,32 +921,71 @@ impl IndexArtifactRouter {
         let published = run_bounded_ordered(
             work,
             MAX_PARALLEL_IMMUTABLE_PUBLICATIONS,
-            move |(coordinator, address, batch)| {
+            move |(coordinator, address, publication)| {
                 let router = router.clone();
                 let placement = placement.clone();
                 async move {
-                    let (indices, publications): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+                    let indices = publication.indices();
                     let published = async {
                         router.require_fence(fence)?;
-                        let published = match address.as_deref() {
-                            Some(address) => {
-                                router
-                                    .peers
-                                    .publish_index_artifacts(
-                                        coordinator,
-                                        address,
-                                        fence,
-                                        &publications,
-                                    )
-                                    .await
-                            }
-                            None => {
-                                router
-                                    .coordinator
-                                    .publish_many(router.local_node, placement, publications)
-                                    .await
-                            }
-                        };
+                        let single_placement = placement.clone();
+                        let single_router = &router;
+                        let batch_router = &router;
+                        let published = publication
+                            .dispatch(
+                                address,
+                                |address, request| async move {
+                                    match address.as_deref() {
+                                        Some(address) => {
+                                            single_router
+                                                .peers
+                                                .publish_index_artifact(
+                                                    coordinator,
+                                                    address,
+                                                    fence,
+                                                    &request,
+                                                )
+                                                .await
+                                        }
+                                        None => {
+                                            single_router
+                                                .coordinator
+                                                .publish(
+                                                    single_router.local_node,
+                                                    single_placement,
+                                                    request,
+                                                )
+                                                .await
+                                        }
+                                    }
+                                },
+                                |address, publications| async move {
+                                    match address.as_deref() {
+                                        Some(address) => {
+                                            batch_router
+                                                .peers
+                                                .publish_index_artifacts(
+                                                    coordinator,
+                                                    address,
+                                                    fence,
+                                                    &publications,
+                                                )
+                                                .await
+                                        }
+                                        None => {
+                                            batch_router
+                                                .coordinator
+                                                .publish_many(
+                                                    batch_router.local_node,
+                                                    placement,
+                                                    publications,
+                                                )
+                                                .await
+                                        }
+                                    }
+                                },
+                            )
+                            .await;
                         router.require_fence(fence)?;
                         published
                     }
@@ -1222,18 +1261,64 @@ impl IndexArtifactRouter {
     }
 }
 
-fn bounded_artifact_batches(
+enum ImmutablePublicationWork {
+    Single(usize, IndexArtifactPublish),
+    Batch(Vec<(usize, IndexArtifactPublish)>),
+}
+
+impl ImmutablePublicationWork {
+    fn indices(&self) -> Vec<usize> {
+        match self {
+            Self::Single(index, _) => vec![*index],
+            Self::Batch(batch) => batch.iter().map(|(index, _)| *index).collect(),
+        }
+    }
+
+    async fn dispatch<S, SF, B, BF>(
+        self,
+        address: Option<String>,
+        single: S,
+        batch: B,
+    ) -> Result<Vec<IndexArtifactPublicationOutcome>, Status>
+    where
+        S: FnOnce(Option<String>, IndexArtifactPublish) -> SF,
+        SF: Future<Output = Result<IndexArtifactOutcome, Status>>,
+        B: FnOnce(Option<String>, Vec<IndexArtifactPublish>) -> BF,
+        BF: Future<Output = Result<Vec<IndexArtifactPublicationOutcome>, Status>>,
+    {
+        match self {
+            Self::Single(_, request) => single(address, request)
+                .await
+                .map(|outcome| vec![Ok(outcome)]),
+            Self::Batch(batch_requests) => {
+                batch(
+                    address,
+                    batch_requests
+                        .into_iter()
+                        .map(|(_, request)| request)
+                        .collect(),
+                )
+                .await
+            }
+        }
+    }
+}
+
+fn immutable_publication_work(
     requests: Vec<(usize, IndexArtifactPublish)>,
-) -> Result<Vec<Vec<(usize, IndexArtifactPublish)>>, Status> {
+) -> Result<Vec<ImmutablePublicationWork>, Status> {
     let mut batches = Vec::new();
     let mut batch = Vec::new();
     let mut batch_bytes = 0_u64;
     for request in requests {
         let item_bytes = request.1.blob.length;
         if item_bytes > MAX_INDEX_ARTIFACT_BATCH_BYTES {
-            return Err(Status::resource_exhausted(
-                "one index artifact exceeds the grouped publication byte bound",
-            ));
+            if !batch.is_empty() {
+                batches.push(ImmutablePublicationWork::Batch(std::mem::take(&mut batch)));
+                batch_bytes = 0;
+            }
+            batches.push(ImmutablePublicationWork::Single(request.0, request.1));
+            continue;
         }
         let next_bytes = batch_bytes.checked_add(item_bytes).ok_or_else(|| {
             Status::resource_exhausted("index artifact batch byte count overflow")
@@ -1242,7 +1327,7 @@ fn bounded_artifact_batches(
             && (batch.len() == MAX_INDEX_ARTIFACT_BATCH_ITEMS
                 || next_bytes > MAX_INDEX_ARTIFACT_BATCH_BYTES)
         {
-            batches.push(std::mem::take(&mut batch));
+            batches.push(ImmutablePublicationWork::Batch(std::mem::take(&mut batch)));
             batch_bytes = 0;
         }
         batch_bytes = batch_bytes
@@ -1251,7 +1336,7 @@ fn bounded_artifact_batches(
         batch.push(request);
     }
     if !batch.is_empty() {
-        batches.push(batch);
+        batches.push(ImmutablePublicationWork::Batch(batch));
     }
     Ok(batches)
 }
@@ -1663,12 +1748,134 @@ mod tests {
                 (index, request)
             })
             .collect();
-        let batches = bounded_artifact_batches(group).unwrap();
+        let batches = immutable_publication_work(group).unwrap();
 
         assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), MAX_INDEX_ARTIFACT_BATCH_ITEMS);
-        assert_eq!(batches[1].len(), 1);
-        assert_eq!(batches[0][0].0, 0);
-        assert_eq!(batches[1][0].0, MAX_INDEX_ARTIFACT_BATCH_ITEMS);
+        let ImmutablePublicationWork::Batch(first) = &batches[0] else {
+            panic!("small artifacts must remain grouped")
+        };
+        let ImmutablePublicationWork::Batch(last) = &batches[1] else {
+            panic!("small artifacts must remain grouped")
+        };
+        assert_eq!(first.len(), MAX_INDEX_ARTIFACT_BATCH_ITEMS);
+        assert_eq!(last.len(), 1);
+        assert_eq!(first[0].0, 0);
+        assert_eq!(last[0].0, MAX_INDEX_ARTIFACT_BATCH_ITEMS);
+    }
+
+    fn projection_immutable(index: u8, bytes: u64) -> IndexArtifactPublish {
+        let family = [7; 32];
+        let partition =
+            keldra_index::v1::ProjectionPartitionIdentity::new(family, 3, [4; 32], 5, 6, 8)
+                .unwrap();
+        let hash = [index + 1; 32];
+        let mut request = artifact_publish(
+            keldra_index::v1::projection_query_run_pack_path(partition, hash),
+            None,
+        );
+        request.blob = BlobRef {
+            hash,
+            length: bytes,
+        };
+        request.index_id = keldra_index::v1::projection_artifact_routing_id(
+            family,
+            keldra_index::v1::ProjectionArtifactKind::QueryRunPack,
+            hash,
+        )
+        .unwrap();
+        request
+    }
+
+    #[tokio::test]
+    async fn oversized_immutable_uses_singular_local_and_remote_dispatch_in_input_order() {
+        for address in [None, Some("https://peer.example:50052".to_owned())] {
+            let requests = [1, 71_385_275, MAX_INDEX_ARTIFACT_BATCH_BYTES, 1, 71_385_275]
+                .into_iter()
+                .enumerate()
+                .map(|(index, bytes)| (index, projection_immutable(index as u8, bytes)))
+                .collect();
+            let work = immutable_publication_work(requests).unwrap();
+            assert_eq!(work.len(), 5);
+            let mut outcomes = std::iter::repeat_with(|| None).take(5).collect::<Vec<_>>();
+            for publication in work {
+                let indices = publication.indices();
+                let single_address = address.clone();
+                let batch_address = address.clone();
+                let published = publication
+                    .dispatch(
+                        address.clone(),
+                        |destination, request| async move {
+                            assert_eq!(destination, single_address);
+                            assert_eq!(
+                                request.validate().unwrap(),
+                                ArtifactPathKind::ProjectionImmutable
+                            );
+                            assert!(request.blob.length > MAX_INDEX_ARTIFACT_BATCH_BYTES);
+                            // Singular dispatch retains the exact staged BlobRef;
+                            // the callback stands for the existing local/peer API.
+                            Ok(IndexArtifactOutcome {
+                                version: VersionId(u64::from(request.blob.hash[0])),
+                                replayed: false,
+                            })
+                        },
+                        |destination, requests| async move {
+                            assert_eq!(destination, batch_address);
+                            validate_immutable_batch(&requests).unwrap();
+                            Ok(requests
+                                .into_iter()
+                                .map(|request| {
+                                    Ok(IndexArtifactOutcome {
+                                        version: VersionId(u64::from(request.blob.hash[0])),
+                                        replayed: false,
+                                    })
+                                })
+                                .collect())
+                        },
+                    )
+                    .await
+                    .unwrap();
+                record_grouped_artifact_outcomes(&mut outcomes, indices, published).unwrap();
+            }
+            assert_eq!(
+                ordered_grouped_artifact_outcomes(outcomes)
+                    .unwrap()
+                    .into_iter()
+                    .map(|outcome| outcome.unwrap().version)
+                    .collect::<Vec<_>>(),
+                (1..=5).map(VersionId).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_singular_errors_propagate_and_batch_validator_is_not_relaxed() {
+        let request = projection_immutable(0, 71_385_275);
+        assert_eq!(
+            validate_immutable_batch(std::slice::from_ref(&request))
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        let mut work = immutable_publication_work(vec![(0, request)]).unwrap();
+        assert!(matches!(&work[0], ImmutablePublicationWork::Single(0, _)));
+        let error = work
+            .remove(0)
+            .dispatch(
+                None,
+                |_, _| async { Err(Status::unavailable("singular publication failed")) },
+                |_, _| async { panic!("oversized artifact must never reach batch RPC") },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(error.message(), "singular publication failed");
+        let requests = vec![
+            projection_immutable(1, MAX_INDEX_ARTIFACT_BATCH_BYTES),
+            projection_immutable(2, 1),
+        ];
+        assert_eq!(
+            validate_immutable_batch(&requests).unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
     }
 }
