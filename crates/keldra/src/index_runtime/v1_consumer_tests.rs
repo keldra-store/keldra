@@ -1,6 +1,368 @@
 use super::*;
 use keldra_index::v1::IndexingMemoryLimits;
 
+fn retry_writer(credits: &IndexingMemoryCredits) -> Writer {
+    use keldra_api::v1::*;
+    let catalog = IndexCatalog::default();
+    let definition = crate::index_service::StoredIndexDefinition::create(
+        "tenant".into(),
+        CreateIndexRequest {
+            bucket: "bucket".into(),
+            name: "retry-marker".into(),
+            path_prefix: String::new(),
+            content_type: String::new(),
+            specification: Some(IndexSpecification {
+                specification: Some(index_specification::Specification::TypedJson(
+                    TypedJsonIndexSpec {
+                        fields: vec![IndexField {
+                            name: "value".into(),
+                            json_pointer: "/value".into(),
+                            cardinality: IndexFieldCardinality::Single as i32,
+                            capabilities: vec![IndexFieldCapability::Exact as i32],
+                            field_type: Some(index_field::FieldType::Keyword(KeywordIndexField {})),
+                        }],
+                        physical_order: Vec::new(),
+                    },
+                )),
+            }),
+            command_id: "retry-marker-create".into(),
+            result_authorization: Some(IndexResultAuthorization {
+                policy: Some(index_result_authorization::Policy::Application(
+                    ApplicationIndexResultAuthorization {},
+                )),
+            }),
+        },
+        1,
+    )
+    .unwrap();
+    catalog
+        .upsert(super::super::catalog::CatalogDefinition::new(1, 2, 1, definition).unwrap())
+        .unwrap();
+    let recipe = catalog.physical_snapshot().unwrap().recipes[0].clone();
+    let source = SourceId {
+        node_id: 1,
+        source_epoch: [4; 32],
+    };
+    let partition = partition();
+    let scanned = IndexBarrier {
+        fence: keldra_store::PlacementLogId { term: 1, index: 1 },
+        atomic: super::super::events::AtomicProgramWatermark::new(None, None, 0),
+        sources: BTreeMap::from([(
+            NodeId(1),
+            super::super::events::IndexSourceCursor {
+                source,
+                next_offset: 12,
+            },
+        )]),
+    };
+    Writer {
+        current: Some(loaded_current(recipe.physical_generation, VersionId(90))),
+        recipe,
+        source,
+        partition,
+        catalog_rebuild_current_version: None,
+        dispatcher: None,
+        look_ahead: None,
+        look_ahead_context: None,
+        look_ahead_permitted: false,
+        look_ahead_progress: None,
+        look_ahead_prepared: BTreeMap::new(),
+        scanned,
+        accumulator: PartitionProjectionAccumulator::new(
+            source_scope(source),
+            partition,
+            12,
+            4096,
+            credits.clone(),
+        )
+        .unwrap(),
+        baseline: None,
+        query: PreparedQueryMutationBatch::default(),
+        query_credits: QueryBlockCredits::from_growable_pipeline_permit(
+            credits
+                .acquire(IndexingMemoryStage::OrderingCatalog, 1)
+                .unwrap(),
+            4096,
+        )
+        .unwrap(),
+        query_input_credits: Vec::new(),
+        sealing_progress: None,
+        since: None,
+        source_bytes: 0,
+        pending_prepared_rows: 0,
+        pending_prepared_bytes: 0,
+        pending_projected_rows: 0,
+        pending_projected_encoded_bytes: 0,
+        through_atomic: 0,
+        pending_mutations: BTreeMap::new(),
+        pending_mutation_bytes: 0,
+        pending_operations: 0,
+        pending_next: 12,
+        pending_mutation_capacity: 4096,
+        pending_mutation_permit: credits
+            .acquire(IndexingMemoryStage::ReplayInput, 1)
+            .unwrap(),
+        background_compaction: None,
+        post_cas_verification: None,
+        pending_publication: None,
+        halted_on_integrity_failure: false,
+        stage: ProducerStage::Preparing,
+    }
+}
+
+fn retry_credits() -> IndexingMemoryCredits {
+    let bytes = 1024 * 1024;
+    IndexingMemoryCredits::new(
+        bytes,
+        IndexingMemoryLimits {
+            hot_payload_bytes: bytes,
+            worker_scratch_bytes: bytes,
+            prepared_rows_bytes: bytes,
+            replay_input_bytes: bytes,
+            projection_accumulator_bytes: bytes,
+            seal_scratch_bytes: bytes,
+            ordering_catalog_bytes: bytes,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn retry_discards_consumed_sealed_state_before_pending_publication_exists() {
+    use keldra_index::v1::{DocumentHead, ProjectedDocumentState};
+    let credits = retry_credits();
+    let mut writer = retry_writer(&credits);
+    let scope = source_scope(writer.source);
+    let path = "objects/marker-12";
+    let row = PreparedProjectionRow {
+        source_offset: 12,
+        mutation_ordinal: 0,
+        source_path: path.into(),
+        source_version: 12,
+        projected_states: vec![
+            ProjectedDocumentState::new(
+                scope,
+                DocumentHead::new(scope, path.into(), 0, 12, None, true).unwrap(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        ],
+    };
+    let batch = PreparedProjectionBatchReservation::reserve(&credits, 4096)
+        .unwrap()
+        .finish(scope, 12, 13, vec![row])
+        .unwrap();
+    assert!(matches!(
+        writer.accumulator.apply_batch(batch).unwrap(),
+        ProjectionBatchAdmission::Applied { .. }
+    ));
+    assert!(writer.accumulator.buffered_bytes() > 0);
+    let durable = writer.current.clone().unwrap();
+    writer
+        .scanned
+        .sources
+        .get_mut(&NodeId(1))
+        .unwrap()
+        .next_offset = 13;
+    writer.pending_next = 13;
+    writer.query = query_update(
+        keldra_index::v1::StableDocumentKey::derive(scope, path, 0).unwrap(),
+        path,
+        12,
+    );
+    // These are the actual destructive consumption operations before flush
+    // creates pending_publication; the failure must not keep this writer.
+    let sealed = writer.accumulator.seal_and_reset().unwrap();
+    let consumed_query = std::mem::take(&mut writer.query);
+    assert_eq!(sealed.projection.checkpoint.next_offset, 13);
+    assert_eq!(writer.accumulator.next_offset(), 13);
+    assert_eq!(writer.accumulator.buffered_bytes(), 0);
+    assert!(writer.pending_publication.is_none());
+    drop(sealed);
+    drop(consumed_query);
+    let mut evidence = PartitionEvidenceMap::from([(
+        partition(),
+        PartitionEvidence::opened(writer.source, [3; 32], [5; 32], 12),
+    )]);
+    let mut writers = BTreeMap::new();
+    assert!(outcome_handling::record_partition_outcome(
+        partition(),
+        writer,
+        Err(Status::unavailable(
+            "artifact staging failed before pending successor"
+        )),
+        &mut writers,
+        &mut evidence
+    ));
+    assert!(!writers.contains_key(&partition()));
+    assert_eq!(evidence[&partition()].published_next, 12);
+    assert_eq!(credits.used_bytes(), 0);
+    let mut reopened = retry_writer(&credits);
+    reopened.current = Some(durable);
+    assert_eq!(reopened.accumulator.next_offset(), 12);
+    assert_eq!(reopened.pending_next, 12);
+    assert_eq!(reopened.scanned.sources[&NodeId(1)].next_offset, 12);
+}
+
+#[test]
+fn successful_advance_retains_writer_and_integrity_failure_retains_halted_writer() {
+    let credits = retry_credits();
+    let writer = retry_writer(&credits);
+    let mut evidence = PartitionEvidenceMap::from([(
+        partition(),
+        PartitionEvidence::opened(writer.source, [3; 32], [5; 32], 12),
+    )]);
+    let mut writers = BTreeMap::new();
+    assert!(!outcome_handling::record_partition_outcome(
+        partition(),
+        writer,
+        Ok(()),
+        &mut writers,
+        &mut evidence
+    ));
+    assert!(writers.contains_key(&partition()));
+    assert!(!writers[&partition()].halted_on_integrity_failure);
+    assert_eq!(evidence[&partition()].published_next, 12);
+    let mut writer = writers.remove(&partition()).unwrap();
+    writer.stage = ProducerStage::Compacting;
+    assert!(!outcome_handling::record_partition_outcome(
+        partition(),
+        writer,
+        Err(Status::data_loss("compaction invariant failed")),
+        &mut writers,
+        &mut evidence
+    ));
+    assert!(writers[&partition()].halted_on_integrity_failure);
+    assert!(evidence[&partition()].halted);
+    assert_eq!(evidence[&partition()].published_next, 12);
+}
+
+#[test]
+fn retry_discards_scanned_writer_and_replays_all_source_page_chunks() {
+    let bytes = 1024 * 1024;
+    let credits = IndexingMemoryCredits::new(
+        bytes,
+        IndexingMemoryLimits {
+            hot_payload_bytes: bytes,
+            worker_scratch_bytes: bytes,
+            prepared_rows_bytes: bytes,
+            replay_input_bytes: bytes,
+            projection_accumulator_bytes: bytes,
+            seal_scratch_bytes: bytes,
+            ordering_catalog_bytes: bytes,
+        },
+    )
+    .unwrap();
+    let mut writer = retry_writer(&credits);
+    let durable = writer.current.clone().unwrap();
+    let source = writer.source;
+    let dispatches = (12..15)
+        .map(|offset| V1SourceDispatch::OrdinaryHead {
+            source,
+            head: ObjectHeadChange {
+                offset,
+                tenant_id: 1,
+                bucket_id: 2,
+                exact_path: format!("objects/marker-{offset}"),
+                canonical_path: None,
+                path_version: VersionId(offset),
+                kind: ObjectHeadChangeKind::Put,
+                program_commit_cursor: None,
+                reference_deltas: Vec::new(),
+                accounting_transition: None,
+                definition_transition: None,
+            },
+        })
+        .collect::<Vec<_>>();
+    let (_, mutations) = prepare_page(&writer, dispatches.clone(), 15).unwrap();
+    let mut chunks = publication_chunks(
+        mutations,
+        15,
+        1,
+        0,
+        0,
+        |mutation| mutation.offset,
+        |mutation| mutation.atomic_group,
+    )
+    .unwrap();
+    assert_eq!(chunks.len(), 3);
+    // Production advances scanned before flushing/queuing these local chunks.
+    writer
+        .scanned
+        .sources
+        .get_mut(&NodeId(1))
+        .unwrap()
+        .next_offset = 15;
+    let first = chunks.remove(0);
+    queue_mutations(&mut writer, first.mutations, first.next).unwrap();
+    assert_eq!(writer.pending_next, 13);
+    assert_eq!(writer.pending_mutations.len(), 1);
+    assert_eq!(writer.accumulator.next_offset(), 12);
+    assert_eq!(
+        chunks
+            .iter()
+            .flat_map(|chunk| &chunk.mutations)
+            .map(|mutation| mutation.offset)
+            .collect::<Vec<_>>(),
+        vec![13, 14]
+    );
+    let mut evidence = PartitionEvidenceMap::from([(
+        partition(),
+        PartitionEvidence::opened(source, [3; 32], [5; 32], 12),
+    )]);
+    let mut writers = BTreeMap::new();
+    assert!(outcome_handling::record_partition_outcome(
+        partition(),
+        writer,
+        Err(Status::resource_exhausted(
+            "preparation construction memory unavailable"
+        )),
+        &mut writers,
+        &mut evidence
+    ));
+    assert!(
+        !writers.contains_key(&partition()),
+        "an advanced retry writer would skip unqueued marker chunks"
+    );
+    assert_eq!(evidence[&partition()].published_next, 12);
+    assert_eq!(evidence[&partition()].identical_retries, 1);
+    for stage in [
+        IndexingMemoryStage::ReplayInput,
+        IndexingMemoryStage::OrderingCatalog,
+        IndexingMemoryStage::ProjectionAccumulator,
+    ] {
+        assert_eq!(
+            credits.stage_used_bytes(stage),
+            0,
+            "discard releases speculative writer memory"
+        );
+    }
+    // Reopening starts from durable Current, not the consumed page's scan cut.
+    let mut reopened = retry_writer(&credits);
+    reopened.current = Some(durable);
+    let (_, replay) = prepare_page(&reopened, dispatches, 15).unwrap();
+    assert_eq!(
+        replay
+            .iter()
+            .map(|mutation| mutation.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "objects/marker-12",
+            "objects/marker-13",
+            "objects/marker-14"
+        ]
+    );
+    assert_eq!(
+        replay
+            .iter()
+            .map(|mutation| mutation.version)
+            .collect::<Vec<_>>(),
+        vec![12, 13, 14]
+    );
+    assert_eq!(reopened.scanned.sources[&NodeId(1)].next_offset, 12);
+}
+
 #[test]
 fn integrity_failure_halts_only_the_affected_partition() {
     assert!(halts_partition(&Status::data_loss(

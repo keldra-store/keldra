@@ -143,6 +143,10 @@ impl PartitionEvidence {
             self.last_error_message = None;
             self.halted = false;
         }
+        // Reopening discarded all speculative processing, even when Current
+        // did not change. Do not report the failed writer's discarded frontier
+        // as progress owned by its replacement.
+        self.processed_next = published_next;
         self.stage = ProducerStage::Opening;
     }
 
@@ -295,5 +299,28 @@ mod tests {
         assert_eq!(evidence.processed_next, 12);
         assert_eq!(evidence.identical_retries, 0);
         assert!(evidence.last_error.is_none());
+    }
+
+    #[test]
+    fn retry_reopen_discards_speculative_progress_at_unchanged_current() {
+        let mut evidence = new_evidence();
+        let cut = evidence.published_next;
+        evidence.observe_progress(cut, cut + 100, ProducerStage::Preparing);
+        evidence.record_retry(ProducerStage::Preparing, &Status::unavailable("retry"));
+        let retries = evidence.identical_retries;
+        let last_progress = evidence.last_progress_at;
+        evidence.reopened(
+            evidence.source,
+            evidence.family_id,
+            evidence.physical_generation,
+            cut,
+        );
+
+        assert_eq!(evidence.published_next, cut);
+        assert_eq!(evidence.processed_next, cut);
+        assert_eq!(evidence.stage, ProducerStage::Opening);
+        assert_eq!(evidence.identical_retries, retries);
+        assert_eq!(evidence.last_progress_at, last_progress);
+        assert!(evidence.last_error.is_some());
     }
 }
