@@ -6,6 +6,7 @@ use std::error::Error;
 use std::io;
 use std::time::Duration;
 
+use keldra_storage::v1::index_field::FieldType as IndexFieldType;
 use keldra_storage::v1::index_query::Query as QueryValue;
 use keldra_storage::v1::index_result_authorization::Policy as AuthorizationPolicy;
 use keldra_storage::v1::index_service_client::IndexServiceClient;
@@ -15,12 +16,14 @@ use keldra_storage::v1::subject::Kind as SubjectKind;
 use keldra_storage::v1::subject_selector::Selector;
 use keldra_storage::v1::tuple_mutation::Operation as TupleOperation;
 use keldra_storage::v1::{
-    AnyObjectSelector, AuthzScope, BindSchemaRequest, CreateBucketRequest, CreateIndexRequest,
-    DirectRelation, Durability, IndexAuthorizationTarget, IndexQuery, IndexResultAuthorization,
-    IndexSpecification, MutateTuplesRequest, NamespaceDefinition, ObjectAddress, ObjectRef,
-    ObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader, PutOperation, PutSchemaRequest,
-    QueryIndexRequest, RealmIndexResultAuthorization, RelationDefinition, RelationTuple, Subject,
-    SubjectSelector, TupleMutation,
+    AnyObjectSelector, AuthzScope, BindSchemaRequest, BooleanIndexField, CreateBucketRequest,
+    CreateIndexRequest, DirectRelation, Durability, IndexAuthorizationTarget, IndexField,
+    IndexFieldCapability, IndexFieldCardinality, IndexPredicate, IndexPredicateExpression,
+    IndexPredicateOperator, IndexQuery, IndexResultAuthorization, IndexSpecification,
+    MutateTuplesRequest, NamespaceDefinition, ObjectAddress, ObjectRef, ObjectVersioning,
+    PutHeader, PutOperation, PutSchemaRequest, QueryIndexRequest, RealmIndexResultAuthorization,
+    RelationDefinition, RelationTuple, Subject, SubjectSelector, TupleMutation,
+    TypedJsonIndexQuery, TypedJsonIndexSpec,
 };
 use keldra_storage::{
     BearerToken, RawClient, administration_client, authz_client, connect_channel,
@@ -178,7 +181,16 @@ async fn main() -> TestResult<()> {
             path_prefix: "docs/".into(),
             content_type: "application/json".into(),
             specification: Some(IndexSpecification {
-                specification: Some(SpecificationValue::Path(PathIndexSpec {})),
+                specification: Some(SpecificationValue::TypedJson(TypedJsonIndexSpec {
+                    fields: vec![IndexField {
+                        name: "qualified".into(),
+                        json_pointer: "/qualified".into(),
+                        cardinality: IndexFieldCardinality::Single as i32,
+                        capabilities: vec![IndexFieldCapability::Exact as i32],
+                        field_type: Some(IndexFieldType::Boolean(BooleanIndexField {})),
+                    }],
+                    physical_order: Vec::new(),
+                })),
             }),
             command_id: format!("realm-index-create-{}-node", endpoints.len()),
             result_authorization: Some(realm_result_authorization()),
@@ -495,9 +507,15 @@ fn query_request(bucket: &str, user: &str, limit: u32, page_token: Vec<u8>) -> Q
         bucket: bucket.into(),
         index_name: INDEX_NAME.into(),
         query: Some(IndexQuery {
-            query: Some(QueryValue::Path(PathIndexQuery {
-                prefix: "docs/".into(),
-                start_after: None,
+            query: Some(QueryValue::TypedJson(TypedJsonIndexQuery {
+                predicate: Some(IndexPredicateExpression::leaf(IndexPredicate {
+                    field: "qualified".into(),
+                    operator: IndexPredicateOperator::Equal as i32,
+                    values_json: vec![b"true".to_vec()],
+                })),
+                order: Vec::new(),
+                facets: Vec::new(),
+                aggregates: Vec::new(),
             })),
         }),
         limit,
