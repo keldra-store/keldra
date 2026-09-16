@@ -25,6 +25,15 @@ use crate::placement::PlacementNode;
 pub(crate) const PAYLOAD_READ_FRAME_BYTES: usize = 64 * 1024;
 const MAX_SMALL_READ_CONCURRENCY: usize = 8;
 
+#[path = "payload_read_ranges.rs"]
+mod ranges;
+
+/// Global admission for each range attempt and EC reconstruction workspace.
+pub(crate) trait PayloadRangeMemory: Send + Sync {
+    fn try_reserve(&self, bytes: usize) -> Result<Box<dyn Send + Sync>, tonic::Status>;
+}
+pub(crate) type PayloadRangeLease = Arc<Box<dyn Send + Sync>>;
+
 /// The immutable placement inputs used for one read attempt.
 pub(crate) trait PayloadReadPlacementView: Send + Sync {
     fn cluster_id(&self) -> ClusterId;
@@ -42,6 +51,24 @@ pub(crate) trait PayloadReadPlacementView: Send + Sync {
 /// an existing corrupt artifact only after the supplied bytes verify.
 #[tonic::async_trait]
 pub(crate) trait PayloadReadTransport: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    async fn get_range(
+        &self,
+        _fence: PlacementLogId,
+        _target: NodeId,
+        _address: &str,
+        _reference: &BlobRef,
+        _offset: u64,
+        _length: u64,
+        _ordinal: Option<u16>,
+        _deadline: Option<tokio::time::Instant>,
+        _memory: PayloadRangeLease,
+    ) -> Result<Vec<u8>, PayloadReadTransportError> {
+        Err(PayloadReadTransportError::Unavailable(
+            "bounded range adapter is absent".into(),
+        ))
+    }
+
     async fn get_small(
         &self,
         fence: PlacementLogId,
@@ -1016,12 +1043,52 @@ mod tests {
         complete: BTreeMap<NodeId, Vec<u8>>,
         shards: BTreeMap<(NodeId, u16), Vec<u8>>,
         hung_shards: BTreeSet<NodeId>,
+        range_profile: Option<ErasureProfile>,
         small_repairs: Mutex<Vec<NodeId>>,
         shard_repairs: AtomicUsize,
     }
 
     #[tonic::async_trait]
     impl PayloadReadTransport for TestTransport {
+        #[allow(clippy::too_many_arguments)]
+        async fn get_range(
+            &self,
+            _fence: PlacementLogId,
+            target: NodeId,
+            _address: &str,
+            reference: &BlobRef,
+            offset: u64,
+            length: u64,
+            ordinal: Option<u16>,
+            _deadline: Option<tokio::time::Instant>,
+            _memory: PayloadRangeLease,
+        ) -> Result<Vec<u8>, PayloadReadTransportError> {
+            if self.hung_shards.contains(&target) {
+                std::future::pending::<()>().await;
+            }
+            if let Some(ordinal) = ordinal {
+                let encoded = self
+                    .shards
+                    .get(&(target, ordinal))
+                    .ok_or(PayloadReadTransportError::NotFound)?;
+                let codec = ErasureCodec::new(self.range_profile.unwrap_or_default()).unwrap();
+                let (header, start, extent, _) = codec
+                    .range_extent(reference, ordinal, offset, length)
+                    .map_err(|error| {
+                        PayloadReadTransportError::InvalidArtifact(error.to_string())
+                    })?;
+                let mut bytes = encoded[..header as usize].to_vec();
+                bytes.extend_from_slice(&encoded[start as usize..(start + extent) as usize]);
+                return Ok(bytes);
+            }
+            let bytes = self
+                .complete
+                .get(&target)
+                .or_else(|| self.small.get(&target))
+                .ok_or(PayloadReadTransportError::NotFound)?;
+            Ok(bytes[offset as usize..(offset + length) as usize].to_vec())
+        }
+
         async fn get_small(
             &self,
             _fence: PlacementLogId,
@@ -1185,6 +1252,287 @@ mod tests {
         expected.sort();
         assert_eq!(repaired, expected);
         assert!(!repaired.contains(&source));
+    }
+
+    #[tokio::test]
+    async fn range_attempts_require_memory_admission_before_dispatch() {
+        struct DenyMemory;
+        impl PayloadRangeMemory for DenyMemory {
+            fn try_reserve(&self, _: usize) -> Result<Box<dyn Send + Sync>, tonic::Status> {
+                Err(tonic::Status::resource_exhausted(
+                    "test denied range scratch",
+                ))
+            }
+        }
+        let bytes = large_bytes();
+        let reference = reference(&bytes);
+        let reader = DistributedPayloadReader::new(
+            ErasureProfile::default(),
+            Arc::new(TestTransport::default()),
+            Arc::new(MemorySpools),
+        )
+        .unwrap();
+        let error = reader
+            .read_verified_range(
+                &TestPlacement::new(&[1]),
+                &reference,
+                0,
+                16,
+                16,
+                *blake3::hash(&bytes[..16]).as_bytes(),
+                None,
+                Arc::new(DenyMemory),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    struct TestRangeMemory;
+    impl PayloadRangeMemory for TestRangeMemory {
+        fn try_reserve(&self, _: usize) -> Result<Box<dyn Send + Sync>, tonic::Status> {
+            Ok(Box::new(()))
+        }
+    }
+
+    struct TestRangeBudget {
+        used: Arc<AtomicUsize>,
+        maximum: usize,
+    }
+    struct TestRangeCharge {
+        used: Arc<AtomicUsize>,
+        bytes: usize,
+    }
+    impl Drop for TestRangeCharge {
+        fn drop(&mut self) {
+            self.used.fetch_sub(self.bytes, Ordering::SeqCst);
+        }
+    }
+    impl PayloadRangeMemory for TestRangeBudget {
+        fn try_reserve(&self, bytes: usize) -> Result<Box<dyn Send + Sync>, tonic::Status> {
+            self.used
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                    used.checked_add(bytes).filter(|next| *next <= self.maximum)
+                })
+                .map_err(|_| tonic::Status::resource_exhausted("test range capacity"))?;
+            Ok(Box::new(TestRangeCharge {
+                used: self.used.clone(),
+                bytes,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_range_succeeds_with_capacity_for_only_one_owner() {
+        let bytes = large_bytes();
+        let reference = reference(&bytes);
+        let transport = Arc::new(TestTransport {
+            complete: BTreeMap::from([(NodeId(1), bytes.clone()), (NodeId(2), bytes.clone())]),
+            ..TestTransport::default()
+        });
+        let reader = DistributedPayloadReader::new(
+            ErasureProfile::default(),
+            transport,
+            Arc::new(MemorySpools),
+        )
+        .unwrap();
+        let child = &bytes[37..103];
+        let memory = Arc::new(TestRangeBudget {
+            used: Arc::new(AtomicUsize::new(0)),
+            maximum: 2 * child.len() + 1024,
+        });
+        let result = reader
+            .read_verified_range(
+                &TestPlacement::new(&[1, 2]),
+                &reference,
+                37,
+                child.len() as u64,
+                child.len(),
+                *blake3::hash(child).as_bytes(),
+                None,
+                memory.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, child);
+        tokio::task::yield_now().await;
+        assert_eq!(memory.used.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nondefault_erasure_range_succeeds_with_only_quorum_capacity() {
+        let bytes = large_bytes();
+        let reference = reference(&bytes);
+        let profile = ErasureProfile::new(2, 1, 16).unwrap();
+        let placement = TestPlacement::new(&[1, 2, 3]);
+        let PayloadPlacement::Large(desired) = select_payload_placement(
+            placement.cluster_id(),
+            &reference,
+            profile,
+            placement.placement_nodes(),
+        ) else {
+            panic!("expected erasure placement");
+        };
+        let codec = ErasureCodec::new(profile).unwrap();
+        let mut encoded = vec![Vec::new(); usize::from(profile.total_shards())];
+        codec
+            .encode(Cursor::new(&bytes), &reference, &mut encoded)
+            .unwrap();
+        let shards = desired
+            .shards()
+            .iter()
+            .map(|shard| {
+                (
+                    (shard.owner(), shard.ordinal()),
+                    encoded[usize::from(shard.ordinal())].clone(),
+                )
+            })
+            .collect();
+        let transport = Arc::new(TestTransport {
+            shards,
+            range_profile: Some(profile),
+            ..TestTransport::default()
+        });
+        let reader =
+            DistributedPayloadReader::new(profile, transport, Arc::new(MemorySpools)).unwrap();
+        let child = &bytes[37..103];
+        let scratch = 2 * usize::from(profile.total_shards()) * profile.stripe_unit() as usize;
+        let attempts = desired
+            .shards()
+            .iter()
+            .take(usize::from(profile.data_shards()))
+            .map(|shard| {
+                let (header, _, extent, _) = codec
+                    .range_extent(&reference, shard.ordinal(), 37, child.len() as u64)
+                    .unwrap();
+                2 * (header + extent) as usize + 1024
+            })
+            .sum::<usize>();
+        let memory = Arc::new(TestRangeBudget {
+            used: Arc::new(AtomicUsize::new(0)),
+            maximum: scratch + attempts,
+        });
+        let result = reader
+            .read_verified_range(
+                &placement,
+                &reference,
+                37,
+                child.len() as u64,
+                child.len(),
+                *blake3::hash(child).as_bytes(),
+                None,
+                memory.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, child);
+        tokio::task::yield_now().await;
+        assert_eq!(memory.used.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn verified_child_range_rejects_wrong_published_hash() {
+        let bytes = large_bytes();
+        let reference = reference(&bytes);
+        let transport = Arc::new(TestTransport {
+            complete: BTreeMap::from([(NodeId(1), bytes.clone())]),
+            ..TestTransport::default()
+        });
+        let reader = DistributedPayloadReader::new(
+            ErasureProfile::default(),
+            transport,
+            Arc::new(MemorySpools),
+        )
+        .unwrap();
+        let child = &bytes[37..103];
+        assert_eq!(
+            reader
+                .read_verified_range(
+                    &TestPlacement::new(&[1]),
+                    &reference,
+                    37,
+                    child.len() as u64,
+                    child.len(),
+                    *blake3::hash(child).as_bytes(),
+                    None,
+                    Arc::new(TestRangeMemory)
+                )
+                .await
+                .unwrap(),
+            child
+        );
+        assert!(
+            reader
+                .read_verified_range(
+                    &TestPlacement::new(&[1]),
+                    &reference,
+                    37,
+                    child.len() as u64,
+                    child.len(),
+                    [0; 32],
+                    None,
+                    Arc::new(TestRangeMemory)
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_erasure_range_ignores_a_hung_owner_after_verified_quorum() {
+        let bytes = large_bytes();
+        let reference = reference(&bytes);
+        let profile = ErasureProfile::default();
+        let placement = TestPlacement::new(&[1, 2, 3]);
+        let PayloadPlacement::Large(desired) = select_payload_placement(
+            placement.cluster_id(),
+            &reference,
+            profile,
+            placement.placement_nodes(),
+        ) else {
+            panic!("expected EC");
+        };
+        let codec = ErasureCodec::new(profile).unwrap();
+        let mut encoded = vec![Vec::new(); profile.total_shards() as usize];
+        codec
+            .encode(Cursor::new(&bytes), &reference, &mut encoded)
+            .unwrap();
+        let hung = desired.shards()[0].owner();
+        let shards = desired
+            .shards()
+            .iter()
+            .map(|shard| {
+                (
+                    (shard.owner(), shard.ordinal()),
+                    encoded[shard.ordinal() as usize].clone(),
+                )
+            })
+            .collect();
+        let transport = Arc::new(TestTransport {
+            shards,
+            hung_shards: BTreeSet::from([hung]),
+            ..TestTransport::default()
+        });
+        let reader =
+            DistributedPayloadReader::new(profile, transport, Arc::new(MemorySpools)).unwrap();
+        let child = &bytes[31_000..34_000];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            reader.read_verified_range(
+                &placement,
+                &reference,
+                31_000,
+                child.len() as u64,
+                child.len(),
+                *blake3::hash(child).as_bytes(),
+                None,
+                Arc::new(TestRangeMemory),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, child);
     }
 
     #[tokio::test]

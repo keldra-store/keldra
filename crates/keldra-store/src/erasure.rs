@@ -346,6 +346,145 @@ impl ErasureCodec {
         Ok(())
     }
 
+    /// Physical framed extent for only the stripes intersecting a blob range.
+    /// The returned header and extent are disjoint; callers read both without
+    /// traversing preceding stripes. The final stripe may have shorter chunks.
+    pub fn range_extent(
+        &self,
+        expected: &BlobRef,
+        ordinal: u16,
+        offset: u64,
+        length: u64,
+    ) -> Result<(u64, u64, u64, u64), ErasureError> {
+        if ordinal >= self.profile.total_shards()
+            || length == 0
+            || offset
+                .checked_add(length)
+                .is_none_or(|end| end > expected.length)
+        {
+            return Err(ErasureError::Codec("invalid erasure range".into()));
+        }
+        let first = offset / self.profile.stripe_width();
+        let last = (offset + length - 1) / self.profile.stripe_width();
+        let stride = u64::from(self.profile.stripe_unit) + FRAME_PREFIX_BYTES as u64;
+        let start = first
+            .checked_mul(stride)
+            .and_then(|bytes| bytes.checked_add(HEADER_BYTES as u64))
+            .ok_or_else(|| ErasureError::Codec("encoded range offset overflow".into()))?;
+        let bytes = (last - first)
+            .checked_mul(stride)
+            .and_then(|bytes| bytes.checked_add(FRAME_PREFIX_BYTES as u64))
+            .and_then(|bytes| {
+                bytes.checked_add(self.profile.chunk_length(expected.length, last, ordinal) as u64)
+            })
+            .ok_or_else(|| ErasureError::Codec("encoded range length overflow".into()))?;
+        Ok((HEADER_BYTES as u64, start, bytes, first))
+    }
+
+    /// Decode header plus selected framed stripes, retaining all existing CRC
+    /// and ordinal checks. The caller must verify the resulting range against
+    /// a published child content identity; a partial blob cannot verify its
+    /// enclosing whole-blob hash.
+    pub fn reconstruct_range<R: Read>(
+        &self,
+        expected: &BlobRef,
+        offset: u64,
+        length: u64,
+        shards: &mut [Option<R>],
+    ) -> Result<Vec<u8>, ErasureError> {
+        self.require_shard_count(shards.len())?;
+        let (_, _, _, first) = self.range_extent(expected, 0, offset, length)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| ErasureError::Codec("range end overflow".into()))?;
+        let last = (end - 1) / self.profile.stripe_width();
+        let mut headers = Vec::with_capacity(shards.len());
+        for ordinal in 0..self.profile.total_shards() {
+            let index = usize::from(ordinal);
+            let header = shards[index]
+                .as_mut()
+                .and_then(|reader| read_header(reader, expected, ordinal).ok());
+            if header.is_none() {
+                shards[index] = None;
+            }
+            headers.push(header_body(expected, ordinal));
+        }
+        let capacity = usize::try_from(length)
+            .map_err(|_| ErasureError::Codec("range exceeds platform".into()))?;
+        let mut output = Vec::with_capacity(capacity);
+        for stripe in first..=last {
+            let mut chunks = Vec::with_capacity(shards.len());
+            for ordinal in 0..self.profile.total_shards() {
+                let index = usize::from(ordinal);
+                let chunk_length = self.profile.chunk_length(expected.length, stripe, ordinal);
+                let mut invalid_tail = false;
+                let chunk = shards[index]
+                    .as_mut()
+                    .and_then(|reader| {
+                        let chunk =
+                            read_chunk(reader, &headers[index], ordinal, stripe, chunk_length)
+                                .ok()?;
+                        // The range contract supplies header + selected frames,
+                        // not the entire original shard. Discard malformed tails
+                        // before reconstruction, preserving healthy quorum.
+                        if stripe == last && !matches!(read_one(reader), Ok(None)) {
+                            invalid_tail = true;
+                            return None;
+                        }
+                        Some(chunk)
+                    })
+                    .map(|mut chunk| {
+                        chunk.resize(self.profile.stripe_unit as usize, 0);
+                        chunk
+                    });
+                // A consumed CRC-invalid frame does not invalidate later
+                // stripes: each stripe may have a different healthy quorum.
+                if invalid_tail {
+                    shards[index] = None;
+                }
+                chunks.push(chunk);
+            }
+            let available = chunks.iter().flatten().count();
+            if available < usize::from(self.profile.data_shards) {
+                return Err(ErasureError::TooFewValidChunks {
+                    stripe,
+                    required: self.profile.data_shards,
+                    available: available as u16,
+                });
+            }
+            self.reed_solomon
+                .reconstruct_data(&mut chunks)
+                .map_err(|error| ErasureError::Codec(error.to_string()))?;
+            for ordinal in 0..self.profile.data_shards {
+                let chunk_length =
+                    self.profile.chunk_length(expected.length, stripe, ordinal) as u64;
+                if chunk_length == 0 {
+                    continue;
+                }
+                let start = stripe
+                    .checked_mul(self.profile.stripe_width())
+                    .and_then(|start| {
+                        start.checked_add(u64::from(ordinal) * u64::from(self.profile.stripe_unit))
+                    })
+                    .ok_or_else(|| ErasureError::Codec("range chunk offset overflow".into()))?;
+                let from = offset.saturating_sub(start).min(chunk_length) as usize;
+                let through = end.saturating_sub(start).min(chunk_length) as usize;
+                if through > from {
+                    let chunk = chunks[usize::from(ordinal)].as_ref().ok_or_else(|| {
+                        ErasureError::Codec("range data was not reconstructed".into())
+                    })?;
+                    output.extend_from_slice(&chunk[from..through]);
+                }
+            }
+        }
+        if output.len() != capacity {
+            return Err(ErasureError::Codec(
+                "range reconstruction is truncated".into(),
+            ));
+        }
+        Ok(output)
+    }
+
     /// Reconstruct from an ordinal-addressed subset of shard streams.
     ///
     /// This is the peer/coordinator-facing form of [`Self::reconstruct`]. It
@@ -645,6 +784,148 @@ mod tests {
     }
 
     #[test]
+    fn bounded_ranges_reconstruct_cross_stripe_and_tail_with_missing_data_shard() {
+        let bytes = (0..173).map(|n| n as u8).collect::<Vec<_>>();
+        let (codec, reference, encoded) = encode(ErasureProfile::new(2, 1, 16).unwrap(), &bytes);
+        for (offset, length) in [(31, 35), (160, 13), (0, 1), (80, 17)] {
+            let mut selected = encoded
+                .iter()
+                .enumerate()
+                .map(|(ordinal, shard)| {
+                    if ordinal == 0 {
+                        return None;
+                    }
+                    let (header, start, extent, _) = codec
+                        .range_extent(&reference, ordinal as u16, offset, length)
+                        .unwrap();
+                    let mut range = shard[..header as usize].to_vec();
+                    range.extend_from_slice(&shard[start as usize..(start + extent) as usize]);
+                    Some(Cursor::new(range))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                codec
+                    .reconstruct_range(&reference, offset, length, &mut selected)
+                    .unwrap(),
+                bytes[offset as usize..(offset + length) as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn range_crc_rejects_corruption_without_returning_partial_bytes() {
+        let (codec, reference, encoded) = encode(ErasureProfile::new(2, 1, 16).unwrap(), &[7; 128]);
+        let mut selected = encoded
+            .iter()
+            .enumerate()
+            .map(|(ordinal, shard)| {
+                if ordinal == 2 {
+                    return None;
+                }
+                let (header, start, extent, _) = codec
+                    .range_extent(&reference, ordinal as u16, 64, 32)
+                    .unwrap();
+                let mut range = shard[..header as usize].to_vec();
+                range.extend_from_slice(&shard[start as usize..(start + extent) as usize]);
+                if ordinal == 0 {
+                    range[header as usize + FRAME_PREFIX_BYTES] ^= 1;
+                }
+                Some(Cursor::new(range))
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            codec.reconstruct_range(&reference, 64, 32, &mut selected),
+            Err(ErasureError::TooFewValidChunks { .. })
+        ));
+        assert!(codec.range_extent(&reference, 0, u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn bounded_range_rejects_extra_framed_stream_tail_and_invalid_bounds() {
+        let (codec, reference, encoded) = encode(ErasureProfile::new(2, 1, 16).unwrap(), &[7; 128]);
+        let mut selected = encoded
+            .iter()
+            .enumerate()
+            .map(|(ordinal, shard)| {
+                let (header, start, extent, _) = codec
+                    .range_extent(&reference, ordinal as u16, 64, 32)
+                    .unwrap();
+                let mut range = shard[..header as usize].to_vec();
+                range.extend_from_slice(&shard[start as usize..(start + extent) as usize]);
+                if ordinal == 0 {
+                    range.push(0);
+                }
+                Some(Cursor::new(range))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codec
+                .reconstruct_range(&reference, 64, 32, &mut selected)
+                .unwrap(),
+            vec![7; 32]
+        );
+        assert!(
+            selected[0].is_none(),
+            "malformed tail must not contribute to reconstruction"
+        );
+        let mut insufficient = encoded
+            .iter()
+            .enumerate()
+            .map(|(ordinal, shard)| {
+                if ordinal == 2 {
+                    return None;
+                }
+                let (header, start, extent, _) = codec
+                    .range_extent(&reference, ordinal as u16, 64, 32)
+                    .unwrap();
+                let mut range = shard[..header as usize].to_vec();
+                range.extend_from_slice(&shard[start as usize..(start + extent) as usize]);
+                if ordinal == 0 {
+                    range.push(0);
+                }
+                Some(Cursor::new(range))
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            codec.reconstruct_range(&reference, 64, 32, &mut insufficient),
+            Err(ErasureError::TooFewValidChunks { .. })
+        ));
+        let mut wrong_identity = encoded
+            .iter()
+            .enumerate()
+            .map(|(ordinal, shard)| {
+                let (header, start, extent, _) = codec
+                    .range_extent(&reference, ordinal as u16, 64, 32)
+                    .unwrap();
+                let mut range = shard[..header as usize].to_vec();
+                range.extend_from_slice(&shard[start as usize..(start + extent) as usize]);
+                Some(Cursor::new(range))
+            })
+            .collect::<Vec<_>>();
+        wrong_identity.swap(0, 1);
+        assert!(
+            matches!(
+                codec.reconstruct_range(&reference, 64, 32, &mut wrong_identity),
+                Err(ErasureError::TooFewValidChunks { .. })
+            ),
+            "correct CRC cannot substitute another shard ordinal"
+        );
+        for (ordinal, offset, length) in [
+            (0, 128, 1),
+            (0, 129, 0),
+            (0, 0, 0),
+            (3, 0, 1),
+            (0, u64::MAX, 1),
+        ] {
+            assert!(
+                codec
+                    .range_extent(&reference, ordinal, offset, length)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn default_profile_is_two_data_one_parity_with_sixteen_kibibyte_stripes() {
         let profile = ErasureProfile::default();
         assert_eq!(profile.data_shards(), 2);
@@ -763,6 +1044,37 @@ mod tests {
             .reconstruct(&reference, &mut available, &mut reconstructed)
             .unwrap();
         assert_eq!(reconstructed, payload);
+    }
+
+    #[test]
+    fn bounded_range_recovers_different_crc_invalid_shards_per_stripe() {
+        let profile = ErasureProfile::new(2, 1, 4).unwrap();
+        let payload = (0_u8..32).collect::<Vec<_>>();
+        let (codec, reference, mut encoded) = encode(profile, &payload);
+        let frame_bytes = FRAME_PREFIX_BYTES + profile.stripe_unit() as usize;
+        // Select logical stripes 1 and 2, corrupting a different data shard
+        // in each. Neither shard can be discarded for the entire range.
+        encoded[0][first_payload_offset() + frame_bytes] ^= 1;
+        encoded[1][first_payload_offset() + 2 * frame_bytes] ^= 1;
+        let (offset, length) = (9, 14);
+        let mut selected = encoded
+            .iter()
+            .enumerate()
+            .map(|(ordinal, shard)| {
+                let (header, start, extent, _) = codec
+                    .range_extent(&reference, ordinal as u16, offset, length)
+                    .unwrap();
+                let mut range = shard[..header as usize].to_vec();
+                range.extend_from_slice(&shard[start as usize..(start + extent) as usize]);
+                Some(Cursor::new(range))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codec
+                .reconstruct_range(&reference, offset, length, &mut selected)
+                .unwrap(),
+            payload[offset as usize..(offset + length) as usize]
+        );
     }
 
     #[test]

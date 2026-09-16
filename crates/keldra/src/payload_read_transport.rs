@@ -47,6 +47,73 @@ impl StorePayloadReadTransport {
 
 #[tonic::async_trait]
 impl PayloadReadTransport for StorePayloadReadTransport {
+    #[allow(clippy::too_many_arguments)]
+    async fn get_range(
+        &self,
+        fence: PlacementLogId,
+        target: NodeId,
+        address: &str,
+        reference: &BlobRef,
+        offset: u64,
+        length: u64,
+        ordinal: Option<u16>,
+        deadline: Option<tokio::time::Instant>,
+        memory: crate::payload_read::PayloadRangeLease,
+    ) -> Result<Vec<u8>, PayloadReadTransportError> {
+        if !self.is_local(target) {
+            let expected = match ordinal {
+                None => length,
+                Some(ordinal) => {
+                    let (header, _, extent, _) = self
+                        .codec
+                        .range_extent(reference, ordinal, offset, length)
+                        .map_err(|error| {
+                            PayloadReadTransportError::InvalidArtifact(error.to_string())
+                        })?;
+                    header.checked_add(extent).ok_or_else(|| {
+                        PayloadReadTransportError::InvalidArtifact(
+                            "encoded range extent overflow".into(),
+                        )
+                    })?
+                }
+            };
+            return self
+                .peers
+                .get_payload_range(
+                    target, address, fence, reference, offset, length, ordinal, deadline, expected,
+                )
+                .await
+                .map_err(map_peer_error);
+        }
+        // Byte-plane message bound also bounds encoded EC stripe headroom.
+        let maximum = 64 * 1024 * 1024;
+        match ordinal {
+            None => {
+                let store = self.store.clone();
+                let reference = reference.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _memory = memory;
+                    store.read_complete_copy_range(&reference, offset, length, maximum)
+                })
+                .await
+                .map_err(|error| PayloadReadTransportError::Unavailable(error.to_string()))?
+                .map_err(|error| PayloadReadTransportError::InvalidArtifact(error.to_string()))
+            }
+            Some(ordinal) => {
+                let store = self.store.clone();
+                let codec = self.codec.clone();
+                let identity = ShardIdentity::new(reference.clone(), ordinal);
+                tokio::task::spawn_blocking(move || {
+                    let _memory = memory;
+                    store.get_shard_range(&codec, &identity, offset, length, maximum)
+                })
+                .await
+                .map_err(|error| PayloadReadTransportError::Unavailable(error.to_string()))?
+                .map_err(map_shard_error)
+            }
+        }
+    }
+
     async fn get_small(
         &self,
         _fence: PlacementLogId,

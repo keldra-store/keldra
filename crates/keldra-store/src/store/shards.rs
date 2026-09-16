@@ -480,6 +480,44 @@ impl Store {
         })
     }
 
+    /// Header plus only the encoded stripes intersecting a logical range.
+    /// CRCs and the published child hash are checked by range reconstruction.
+    pub fn get_shard_range(
+        &self,
+        codec: &ErasureCodec,
+        identity: &ShardIdentity,
+        offset: u64,
+        length: u64,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, ShardStoreError> {
+        identity.validate_for(codec)?;
+        let state = self
+            .shard_reference_state(identity)?
+            .ok_or(ShardStoreError::NotFound)?;
+        if state.ref_count == 0 {
+            return Err(ShardStoreError::NotFound);
+        }
+        let (header, start, extent, _) =
+            codec.range_extent(identity.blob(), identity.ordinal(), offset, length)?;
+        if header
+            .checked_add(extent)
+            .is_none_or(|count| count > maximum_bytes as u64)
+        {
+            return Err(shard_error(MutationError::Storage(
+                "shard range exceeds admitted bound".into(),
+            )));
+        }
+        let mut bytes = self
+            .read_encoded_shard_range(identity, 0, header, maximum_bytes)
+            .map_err(shard_error)?;
+        bytes.extend_from_slice(
+            &self
+                .read_encoded_shard_range(identity, start, extent, maximum_bytes)
+                .map_err(shard_error)?,
+        );
+        Ok(bytes)
+    }
+
     pub fn shard_reference_state(
         &self,
         identity: &ShardIdentity,

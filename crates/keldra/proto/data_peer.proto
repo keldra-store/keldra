@@ -404,6 +404,25 @@ message ShardRequest {
   uint32 ordinal = 4;
 }
 
+// Exact logical range at one placement fence. Absence of shard_ordinal reads
+// a complete copy; presence returns its header plus intersecting EC stripes.
+// The consumer verifies child bytes against a published child hash, never a
+// digest asserted by this response.
+message PayloadRangeRequest {
+  PeerContext peer = 1;
+  BlobIdentity blob = 2;
+  uint64 placement_fence_term = 3;
+  uint64 placement_fence_index = 4;
+  uint64 offset = 5;
+  uint64 length = 6;
+  optional uint32 shard_ordinal = 7;
+}
+
+message PayloadRangeResponse {
+  uint32 schema_version = 1;
+  bytes content = 2;
+}
+
 message ExistsResponse {
   uint32 schema_version = 1;
   bool exists = 2;
@@ -650,6 +669,7 @@ service DataPeer {
   rpc PutSmallContent(stream SmallContentPutFrame) returns (ContentStored);
 
   rpc GetCompleteSource(ContentRequest) returns (stream ContentFrame);
+  rpc GetPayloadRange(PayloadRangeRequest) returns (PayloadRangeResponse);
   rpc GetCompleteSourceState(CompleteSourceStateRequest) returns (CompleteSourceState);
   rpc PutCompleteSource(stream CompleteSourcePutFrame) returns (CompleteSourceStored);
 

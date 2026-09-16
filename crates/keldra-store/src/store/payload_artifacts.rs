@@ -5,6 +5,12 @@ use rocksdb::{DB, WriteBatch};
 
 use super::*;
 
+#[path = "payload_artifact_ranges.rs"]
+mod ranges;
+
+#[path = "payload_shard_ranges.rs"]
+mod shard_ranges;
+
 const ARTIFACT_MANIFEST_FORMAT: u8 = 1;
 const ARTIFACT_INSTALL_FORMAT: u8 = 1;
 const COMPLETE_IDENTITY_KIND: u8 = 1;

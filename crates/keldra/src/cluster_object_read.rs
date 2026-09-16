@@ -544,6 +544,43 @@ impl ClusterObjectReader {
     /// Reconstruct one ordinary content-addressed blob without inventing an
     /// object path. Atomic recovery uses this for the complete prepared bundle
     /// named by Raft.
+    /// Read only an exact immutable child extent, verifying its published
+    /// identity across complete-copy and erasure-coded placements alike.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn read_verified_blob_range(
+        &self,
+        reference: &BlobRef,
+        offset: u64,
+        length: u64,
+        maximum_bytes: usize,
+        expected_child_hash: [u8; 32],
+        deadline: Option<tokio::time::Instant>,
+        memory: Arc<dyn crate::payload_read::PayloadRangeMemory>,
+    ) -> Result<Vec<u8>, Status> {
+        let placement = self.metadata.current_placement()?;
+        self.metadata.require_current_fence(placement.fence())?;
+        let read = self.payload.read_verified_range(
+            placement.as_ref(),
+            reference,
+            offset,
+            length,
+            maximum_bytes,
+            expected_child_hash,
+            deadline,
+            memory,
+        );
+        let bytes = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, read)
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded("verified range caller deadline exceeded")
+                })??,
+            None => read.await?,
+        };
+        self.metadata.require_current_fence(placement.fence())?;
+        Ok(bytes)
+    }
+
     pub(crate) async fn read_blob_bytes(&self, reference: &BlobRef) -> Result<Vec<u8>, Status> {
         let mut payload = self.open_blob_payload(reference).await?;
         let mut bytes = Vec::new();

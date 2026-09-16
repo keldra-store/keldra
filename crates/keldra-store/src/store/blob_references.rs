@@ -643,6 +643,37 @@ impl Store {
         }
     }
 
+    /// Reads an exact bounded range of a live immutable blob. Empty ranges at
+    /// EOF are valid; ranges past EOF, overflow and bounds violations fail.
+    /// Only intersecting payload chunks are retrieved. This trusted local read
+    /// retains the same liveness and storage checks as `read_blob_bytes`.
+    pub async fn read_blob_range(
+        &self,
+        reference: &BlobRef,
+        offset: u64,
+        length: u64,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, MutationError> {
+        self.read_blob_range_sync(reference, offset, length, maximum_bytes)
+    }
+
+    /// Synchronous bounded native read for blocking-executor callers.
+    pub fn read_blob_range_sync(
+        &self,
+        reference: &BlobRef,
+        offset: u64,
+        length: u64,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, MutationError> {
+        let state = self
+            .blob_reference_state(reference)?
+            .filter(|state| state.ref_count != 0)
+            .ok_or(MutationError::BlobNotFound)?;
+        validate_blob_reference_state(state)?;
+        self.read_complete_artifact_range_for_reference(reference, offset, length, maximum_bytes)?
+            .ok_or(MutationError::BlobNotFound)
+    }
+
     /// Reads one live blob into a single owned allocation.
     pub async fn read_blob_bytes(&self, reference: &BlobRef) -> Result<Vec<u8>, MutationError> {
         let state = self

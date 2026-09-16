@@ -18,6 +18,7 @@ use std::task::{Context, Poll};
 
 mod definition_coordination;
 mod derived_consumer;
+mod payload_ranges;
 
 use definition_coordination::*;
 
