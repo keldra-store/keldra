@@ -56,6 +56,97 @@ fn committed_exact_version_is_consumed_once() {
     assert_eq!(ingress.fifo_len(), 0);
 }
 
+#[tokio::test]
+async fn journal_consumer_waits_for_admitted_exact_preparation() {
+    let ingress = HotProjectionIngress::new(16 * 1_024).unwrap();
+    ingress.activate_test_route(1, 2);
+    let registered = ingress
+        .register_preparing(
+            ingress.pending(1, 2, &put("waiting", 100)).unwrap(),
+            VersionId(7),
+        )
+        .unwrap();
+    let waiter = {
+        let ingress = ingress.clone();
+        tokio::spawn(async move {
+            ingress
+                .take_exact_selected_for_generation_wait(1, 2, "waiting", 7, [9; 32])
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    ingress.finish_selected(registered, selected("ready"));
+
+    let selected = waiter
+        .await
+        .unwrap()
+        .expect("exact selection is handed off");
+    assert_eq!(
+        selected.get("/value").unwrap().values,
+        [keldra_index::typed_json::ScalarValue::String(
+            "ready".into()
+        )]
+    );
+    assert_eq!(ingress.slot_len(), 0);
+}
+
+#[tokio::test]
+async fn discard_wakes_a_consumer_waiting_on_paused_preparation() {
+    let ingress = HotProjectionIngress::new(16 * 1_024).unwrap();
+    ingress.activate_test_route(1, 2);
+    let registered = ingress
+        .register_preparing(
+            ingress.pending(1, 2, &put("discarded", 100)).unwrap(),
+            VersionId(7),
+        )
+        .unwrap();
+    let waiter = {
+        let ingress = ingress.clone();
+        tokio::spawn(async move {
+            ingress
+                .take_exact_selected_for_generation_wait(1, 2, "discarded", 7, [9; 32])
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    ingress.discard_through(1, 2, "discarded", 7);
+
+    assert!(waiter.await.unwrap().is_none());
+    drop(registered);
+}
+
+#[tokio::test]
+async fn catalog_replacement_wakes_a_consumer_waiting_on_paused_preparation() {
+    let ingress = HotProjectionIngress::new(16 * 1_024).unwrap();
+    ingress.activate_test_route(1, 2);
+    let registered = ingress
+        .register_preparing(
+            ingress.pending(1, 2, &put("catalog", 100)).unwrap(),
+            VersionId(7),
+        )
+        .unwrap();
+    let waiter = {
+        let ingress = ingress.clone();
+        tokio::spawn(async move {
+            ingress
+                .take_exact_selected_for_generation_wait(1, 2, "catalog", 7, [9; 32])
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        ingress.replace_compiled_catalog(Arc::new(PhysicalCatalogSnapshot {
+            generation: 2,
+            identity: [8; 32],
+            recipes: Arc::from(Vec::new()),
+            resident_lease: None,
+        }))
+    );
+
+    assert!(waiter.await.unwrap().is_none());
+    drop(registered);
+}
+
 #[test]
 fn repeated_mutations_retain_only_the_latest_version_per_path() {
     let ingress = HotProjectionIngress::new(16 * 1_024).unwrap();
@@ -202,7 +293,7 @@ fn newer_commit_supersedes_older_ready_state_after_its_token_was_cancelled() {
 }
 
 #[test]
-fn consumer_fallback_cancels_preparing_token_without_resurrection() {
+fn non_waiting_probe_does_not_cancel_admitted_preparation() {
     let ingress = HotProjectionIngress::new(8 * 1_024).unwrap();
     ingress.activate_test_route(1, 2);
     let registered = ingress
@@ -215,6 +306,8 @@ fn consumer_fallback_cancels_preparing_token_without_resurrection() {
     assert!(ingress.take_exact_selected(1, 2, "overtaken", 7).is_none());
     ingress.finish_selected(registered, selected("late"));
 
+    assert_eq!(ingress.slot_len(), 1);
+    assert!(ingress.take_exact_selected(1, 2, "overtaken", 7).is_some());
     assert_eq!(ingress.slot_len(), 0);
     assert_eq!(ingress.fifo_len(), 0);
     assert_eq!(ingress.used_bytes(), 0);
@@ -346,7 +439,13 @@ fn delete_and_no_payload_commits_invalidate_older_ready_data() {
 
     ingress.admit_committed(ingress.pending(1, 2, &put("a", 100)), &receipt(3));
     let no_payload = ingress
-        .replay_only_pending(1, 2, "a", [9; 32], Arc::from([]))
+        .replay_only_pending(
+            1,
+            2,
+            "a",
+            [9; 32],
+            CompiledScalarProjectionPlan::compile(Arc::from(Vec::<String>::new())).unwrap(),
+        )
         .unwrap();
     ingress.admit_committed(Some(no_payload), &receipt(4));
     assert!(ingress.take_exact_selected(1, 2, "a", 3).is_none());
@@ -373,6 +472,7 @@ fn replacing_catalog_generation_clears_ready_and_preparing_state() {
             generation: 2,
             identity: [7; 32],
             recipes: Arc::from(Vec::new()),
+            resident_lease: None,
         }))
     );
     assert_eq!(ingress.slot_len(), 0);
@@ -394,8 +494,24 @@ fn reclaimed_selector_generations_release_unused_vector_capacity() {
             generation: 2,
             identity: [7; 32],
             recipes: Arc::from(Vec::new()),
+            resident_lease: None,
         }))
     );
+    {
+        let state = ingress
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.retired_selectors.len(), 1);
+        assert_eq!(
+            state.retired_selectors[0].charge,
+            selector_resident_bytes(pending.projection_plan().pointers())
+                .saturating_add(pending.projection_plan().descriptor_resident_bytes())
+                .saturating_add(ENTRY_OVERHEAD_BYTES)
+                .saturating_add(std::mem::size_of::<RetiredSelectors>()),
+            "retired generation must remain fully charged while a pending/ready value holds it"
+        );
+    }
     drop(pending);
 
     let mut state = ingress
@@ -448,8 +564,34 @@ fn hot_ingress_swaps_only_the_compiled_physical_router() {
     ingress.activate_test_route(1, 2);
     let first = ingress.pending(1, 2, &put("objects/a", 100)).unwrap();
     let second = ingress.pending(1, 2, &put("objects/b", 100)).unwrap();
-    assert!(Arc::ptr_eq(first.pointers(), second.pointers()));
+    assert!(Arc::ptr_eq(
+        first.projection_plan(),
+        second.projection_plan()
+    ));
     assert!(ingress.router_bytes() > 0);
+}
+
+#[test]
+fn hot_execution_queue_is_bounded_by_worker_capacity() {
+    let execution = HotProjectionCpu::new(super::super::cpu::IndexCpuPool::new(2).unwrap());
+    let first = execution.capacity.clone().try_acquire_owned().unwrap();
+    let second = execution.capacity.clone().try_acquire_owned().unwrap();
+    assert!(execution.capacity.clone().try_acquire_owned().is_err());
+    drop(first);
+    assert!(execution.capacity.clone().try_acquire_owned().is_ok());
+    drop(second);
+}
+
+#[test]
+fn projected_pending_state_charges_execution_control_overhead() {
+    let base = pending_state_resident_bytes(17);
+    let payload = 211;
+    let projection_workspace = 97;
+    let charged = projected_pending_charge(17, payload, projection_workspace).unwrap();
+    assert_eq!(
+        charged - base - payload - projection_workspace,
+        HOT_EXECUTION_OVERHEAD_BYTES
+    );
 }
 
 #[test]
@@ -462,7 +604,8 @@ fn compiled_router_obeys_segment_aware_public_prefix_semantics() {
     let router = CompiledBucketRouter {
         generation: [1; 32],
         root: router.root,
-        pointers: Arc::from([]),
+        projection_plan: CompiledScalarProjectionPlan::compile(Arc::from(Vec::<String>::new()))
+            .unwrap(),
         charge: 0,
         selector_charge: 0,
     };
@@ -478,7 +621,8 @@ fn compiled_router_obeys_segment_aware_public_prefix_semantics() {
     let children = CompiledBucketRouter {
         generation: [1; 32],
         root: children.root,
-        pointers: Arc::from([]),
+        projection_plan: CompiledScalarProjectionPlan::compile(Arc::from(Vec::<String>::new()))
+            .unwrap(),
         charge: 0,
         selector_charge: 0,
     };

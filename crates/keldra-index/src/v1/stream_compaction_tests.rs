@@ -50,7 +50,10 @@ fn reachable_pages(
             reachable_pages(component, child.hash, pages, reachable);
         }
     }
-    reachable.push(EncodedComponentStreamPage { hash, bytes });
+    reachable.push(EncodedComponentStreamPage {
+        hash,
+        bytes: bytes.into(),
+    });
 }
 
 #[test]
@@ -84,7 +87,7 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         first
             .new_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone())),
+            .map(|page| (page.hash, page.bytes.to_vec())),
     );
 
     let (wide_second, wide_second_table, wide_second_pack) = packed(sealed(
@@ -109,7 +112,7 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         second
             .new_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone())),
+            .map(|page| (page.hash, page.bytes.to_vec())),
     );
 
     let first_plan = select_component_compaction(
@@ -145,7 +148,7 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         first_splice
             .new_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone())),
+            .map(|page| (page.hash, page.bytes.to_vec())),
     );
 
     let (narrow_first, narrow_first_table, narrow_first_pack) =
@@ -168,7 +171,7 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         third
             .new_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone())),
+            .map(|page| (page.hash, page.bytes.to_vec())),
     );
 
     let (narrow_second, narrow_second_table, narrow_second_pack) =
@@ -191,7 +194,7 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         fourth
             .new_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone())),
+            .map(|page| (page.hash, page.bytes.to_vec())),
     );
 
     let second_plan = select_component_compaction(
@@ -273,7 +276,7 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         later_append
             .new_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone())),
+            .map(|page| (page.hash, page.bytes.to_vec())),
     );
     let rebased_splice = splice_compacted_component_runs(
         later_append.root,
@@ -305,7 +308,7 @@ fn second_compaction_uses_the_full_overlapping_target_range() {
         second_splice
             .new_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone())),
+            .map(|page| (page.hash, page.bytes.to_vec())),
     );
     assert!(matches!(
         splice_compacted_component_runs(
@@ -384,7 +387,7 @@ fn expanded_target_range_keeps_tombstones_when_older_history_overlaps_its_flank(
     let pages = directory
         .pages
         .iter()
-        .map(|page| (page.hash, page.bytes.clone()))
+        .map(|page| (page.hash, page.bytes.to_vec()))
         .collect::<BTreeMap<_, _>>();
 
     let plan = select_component_compaction(

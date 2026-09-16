@@ -461,7 +461,7 @@ pub fn decode_component_directory(
     for page in &directory.pages {
         if page.hash == [0; 32]
             || page.hash != *crate::profiled_blake3_hash!(&page.bytes).as_bytes()
-            || pages.insert(page.hash, page.bytes.as_slice()).is_some()
+            || pages.insert(page.hash, page.bytes.as_ref()).is_some()
         {
             return Err(IndexError::Integrity);
         }

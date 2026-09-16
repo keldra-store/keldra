@@ -104,7 +104,6 @@ impl V1CompactionPublication {
                     .map_err(|_| Status::data_loss("v1 compaction component disappeared"))?;
                 let stream = ComponentStreamRoot::from_component_root(&rebased.roots[index])
                     .map_err(index_status)?;
-                let mut pages = self.base.component_overlay.clone();
                 load_component_pages(
                     publisher,
                     storage_tenant,
@@ -115,7 +114,7 @@ impl V1CompactionPublication {
                     stream,
                     maximum_bytes,
                     &mut resident,
-                    &mut pages,
+                    &mut self.base.component_overlay,
                 )
                 .await?;
                 let spliced = match splice_compacted_component_runs(
@@ -124,7 +123,8 @@ impl V1CompactionPublication {
                     &proposal.output,
                     &proposal.pack_table,
                     |hash| {
-                        pages
+                        self.base
+                            .component_overlay
                             .get(&hash)
                             .cloned()
                             .ok_or(keldra_index::IndexError::Integrity)
@@ -136,15 +136,18 @@ impl V1CompactionPublication {
                 };
                 rebased.roots[index] = spliced.root.component_root().map_err(index_status)?;
                 for page in spliced.new_pages {
-                    self.base
-                        .component_overlay
-                        .insert(page.hash, Bytes::from(page.bytes.clone()));
+                    retain_generated_page(
+                        maximum_bytes,
+                        &mut resident,
+                        &mut self.base.component_overlay,
+                        page.hash,
+                        page.bytes.clone(),
+                    )?;
                     component.pages.push(page);
                 }
             }
         }
         if let Some(query) = self.artifacts.query.as_mut() {
-            let mut pages = self.base.query_overlay.clone();
             load_query_pages(
                 publisher,
                 storage_tenant,
@@ -155,11 +158,12 @@ impl V1CompactionPublication {
                 rebased.query_stream_root.stream_root_hash,
                 maximum_bytes,
                 &mut resident,
-                &mut pages,
+                &mut self.base.query_overlay,
             )
             .await?;
             match query.rebase(rebased.query_stream_root, |hash| {
-                pages
+                self.base
+                    .query_overlay
                     .get(&hash)
                     .cloned()
                     .ok_or(keldra_index::IndexError::Integrity)
@@ -170,9 +174,13 @@ impl V1CompactionPublication {
             }
             rebased.query_stream_root = query.splice().root;
             for page in &query.splice().pages {
-                self.base
-                    .query_overlay
-                    .insert(page.hash, Bytes::from(page.bytes.clone()));
+                retain_generated_page(
+                    maximum_bytes,
+                    &mut resident,
+                    &mut self.base.query_overlay,
+                    page.hash,
+                    page.bytes.clone(),
+                )?;
             }
         }
         rebased.validate().map_err(index_status)?;
@@ -426,8 +434,13 @@ impl V1ProjectionPublisher {
                 predecessor.roots[index] = replacement;
             }
             for page in &pages {
-                Arc::make_mut(&mut component_pages)
-                    .insert(page.hash, Bytes::from(page.bytes.clone()));
+                retain_generated_page(
+                    maximum_preload_bytes,
+                    &mut resident,
+                    Arc::make_mut(&mut component_pages),
+                    page.hash,
+                    page.bytes.clone(),
+                )?;
             }
             Some(V1ComponentCompaction {
                 packs,
@@ -503,7 +516,13 @@ impl V1ProjectionPublisher {
                 .map_err(|error| Status::internal(error.to_string()))??;
             predecessor.query_stream_root = compacted.splice().root;
             for page in &compacted.splice().pages {
-                query_pages.insert(page.hash, Bytes::from(page.bytes.clone()));
+                retain_generated_page(
+                    maximum_preload_bytes,
+                    &mut resident,
+                    &mut query_pages,
+                    page.hash,
+                    page.bytes.clone(),
+                )?;
             }
             Some((compacted, query_pages))
         } else {
@@ -534,6 +553,37 @@ impl V1ProjectionPublisher {
             artifacts: V1CompactionArtifacts { component, query },
         })
     }
+}
+
+/// Retain one newly encoded page under the same exact admission as loaded
+/// pages. The page owner and overlay share one `Bytes` allocation; duplicate
+/// content hashes therefore neither allocate nor consume admission twice.
+fn retain_generated_page(
+    maximum_bytes: usize,
+    resident: &mut usize,
+    overlay: &mut BTreeMap<[u8; 32], Bytes>,
+    hash: [u8; 32],
+    bytes: Bytes,
+) -> Result<(), Status> {
+    if let Some(existing) = overlay.get(&hash) {
+        if existing != &bytes {
+            return Err(Status::data_loss(
+                "v1 compaction page hash names conflicting encoded bytes",
+            ));
+        }
+        return Ok(());
+    }
+    let retained = resident
+        .checked_add(bytes.len())
+        .ok_or_else(|| Status::resource_exhausted("v1 compaction retained bytes overflow"))?;
+    if retained > maximum_bytes {
+        return Err(Status::resource_exhausted(
+            "v1 compaction generated pages exceed retained memory admission",
+        ));
+    }
+    overlay.insert(hash, bytes);
+    *resident = retained;
+    Ok(())
 }
 
 fn component_compaction_schedule(
@@ -984,6 +1034,36 @@ mod tests {
         let error = charge_preload(&mut resident, 425, 1024, "query").unwrap_err();
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
         assert_eq!(resident, 600);
+    }
+
+    #[test]
+    fn generated_page_is_shared_and_charged_once() {
+        let mut resident = 7;
+        let mut overlay = BTreeMap::new();
+        let page = Bytes::from_static(b"generated page");
+        retain_generated_page(64, &mut resident, &mut overlay, [8; 32], page.clone()).unwrap();
+        assert_eq!(resident, 7 + page.len());
+        assert_eq!(overlay[&[8; 32]].as_ptr(), page.as_ptr());
+
+        retain_generated_page(64, &mut resident, &mut overlay, [8; 32], page).unwrap();
+        assert_eq!(resident, 7 + b"generated page".len());
+    }
+
+    #[test]
+    fn generated_page_cannot_exceed_retained_admission() {
+        let mut resident = 7;
+        let mut overlay = BTreeMap::new();
+        let error = retain_generated_page(
+            8,
+            &mut resident,
+            &mut overlay,
+            [8; 32],
+            Bytes::from_static(b"two bytes"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(resident, 7);
+        assert!(overlay.is_empty());
     }
 
     fn partition() -> ProjectionPartitionIdentity {

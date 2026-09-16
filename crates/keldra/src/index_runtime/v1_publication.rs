@@ -42,6 +42,7 @@ use super::v1_artifact_cache::ImmutableArtifactCache;
 use super::v1_compaction::{V1CompactionArtifacts, V1CompactionBase};
 use super::v1_parallel::run_bounded_ordered;
 
+mod compaction_publication;
 mod immutable_staging;
 mod physical_packs;
 mod projection_cache_updates;
@@ -55,7 +56,7 @@ use publication_types::{
 };
 pub(crate) use publication_types::{
     LoadedV1ProjectionGeneration, PendingV1Publication, V1PostCasVerification,
-    V1PublicationPredecessor,
+    V1PublicationPredecessor, finish_required_post_cas_verification,
 };
 
 const MAX_STREAM_PAGE_BYTES: usize = 32 * 1024;
@@ -655,16 +656,16 @@ impl V1ProjectionPublisher {
         // Exact verification of the predecessor overlaps source reads,
         // extraction, generation construction, staging, and immutable
         // publication. Only the one ordered Current CAS chain waits for it.
-        if let Some(verification) = predecessor_verification.take() {
-            verification.finish().await?;
+        if predecessor_verification.is_some() {
+            finish_required_post_cas_verification(predecessor_verification).await?;
         }
         let current_staging_timer =
             super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.current_staging_nanos);
         let current_blob = self.stage(&plan.current_bytes).await?;
         drop(current_staging_timer);
-        if current_blob.hash != *keldra_index::profiled_blake3_hash!(&plan.current_bytes).as_bytes()
-            || current_blob.length != plan.current_bytes.len() as u64
-        {
+        // `stage` derives the BlobRef from these exact bytes. Re-hashing them
+        // here only repeats the content-addressing work at a trusted boundary.
+        if current_blob.length != plan.current_bytes.len() as u64 {
             return Err(Status::data_loss(
                 "staged v1 current changed its exact bytes",
             ));
@@ -771,56 +772,68 @@ impl V1ProjectionPublisher {
         let storage_tenant = storage_tenant.to_owned();
         let bucket = bucket.to_owned();
         let expected = loaded.clone();
-        let task = tokio::spawn(async move {
-            let result = async {
-                let verification_started = Instant::now();
-                let verification_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
-                    &super::v1_telemetry::global().post_cas_verification_nanos,
-                );
-                let observed = publisher
-                    .load_generation_by_hash(
-                        &storage_tenant,
-                        &bucket,
-                        tenant_id,
-                        bucket_id,
-                        partition,
-                        generation_hash,
-                    )
-                    .await?;
-                expected
-                    .current
-                    .validate_against(&observed)
-                    .map_err(index_status)?;
-                if observed != expected.generation {
-                    return Err(Status::data_loss(
-                        "published v1 generation differs from the prepared generation",
-                    ));
-                }
-                let cache_scheduled = cache_update.is_some_and(|cache_update| {
-                    publisher.projection_cache_updates.schedule(cache_update)
-                });
-                if !cache_scheduled {
-                    tracing::info!(
-                        counter.keldra_index_v1_projection_cache_updates_skipped = 1_u64,
-                        "v1 disposable projection cache update skipped at its byte bound or shutdown"
+        let cache_update = Arc::new(std::sync::Mutex::new(cache_update));
+        let verification = V1PostCasVerification::start(move || {
+            let publisher = publisher.clone();
+            let storage_tenant = storage_tenant.clone();
+            let bucket = bucket.clone();
+            let expected = expected.clone();
+            let cache_update = Arc::clone(&cache_update);
+            async move {
+                let result = async {
+                    let verification_started = Instant::now();
+                    let verification_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(
+                        &super::v1_telemetry::global().post_cas_verification_nanos,
                     );
+                    let observed = publisher
+                        .load_generation_by_hash(
+                            &storage_tenant,
+                            &bucket,
+                            tenant_id,
+                            bucket_id,
+                            partition,
+                            generation_hash,
+                        )
+                        .await?;
+                    expected
+                        .current
+                        .validate_against(&observed)
+                        .map_err(index_status)?;
+                    if observed != expected.generation {
+                        return Err(Status::data_loss(
+                            "published v1 generation differs from the prepared generation",
+                        ));
+                    }
+                    let cache_update = cache_update
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    let cache_scheduled = cache_update.is_some_and(|cache_update| {
+                        publisher.projection_cache_updates.schedule(cache_update)
+                    });
+                    if !cache_scheduled {
+                        tracing::info!(
+                            counter.keldra_index_v1_projection_cache_updates_skipped = 1_u64,
+                            "v1 disposable projection cache update skipped at its byte bound or shutdown"
+                        );
+                    }
+                    let duration = verification_started.elapsed();
+                    drop(verification_timer);
+                    tracing::info!(
+                        histogram.keldra_index_v1_post_cas_verification_duration_seconds =
+                            duration.as_secs_f64(),
+                        generation_hash = ?generation_hash,
+                        cache_scheduled,
+                        "keldra_index_v1_post_cas_verification"
+                    );
+                    Ok(())
                 }
-                let duration = verification_started.elapsed();
-                drop(verification_timer);
-                tracing::info!(
-                    histogram.keldra_index_v1_post_cas_verification_duration_seconds =
-                        duration.as_secs_f64(),
-                    generation_hash = ?generation_hash,
-                    cache_scheduled,
-                    "keldra_index_v1_post_cas_verification"
-                );
-                Ok(())
+                .await;
+                let _ = publisher.changes.send(());
+                result
             }
-            .await;
-            let _ = publisher.changes.send(());
-            result
         });
-        Ok((loaded, V1PostCasVerification { task: Some(task) }))
+        Ok((loaded, verification))
     }
 
     /// Make every immutable compaction output durable before the successor
@@ -991,7 +1004,11 @@ impl V1ProjectionPublisher {
                         )
                         .await?
                         .ok_or_else(|| Status::data_loss("v1 stream page is absent"))?;
-                    cursor.provide_page(hash, &bytes).map_err(index_status)?;
+                    // `read_immutable_object` binds the object path to this
+                    // content identity before returning trusted-local bytes.
+                    cursor
+                        .provide_verified_page(hash, &bytes)
+                        .map_err(index_status)?;
                 }
                 ComponentStreamReverseStep::Segment(descriptor) => {
                     if key < descriptor.minimum_key || key > descriptor.maximum_key {
@@ -1514,6 +1531,10 @@ impl V1ProjectionPublisher {
         self.immutable_cache.get_query_run(blob, maximum_bytes)
     }
 
+    pub(super) fn immutable_cache(&self) -> &super::v1_artifact_cache::ImmutableArtifactCache {
+        &self.immutable_cache
+    }
+
     pub(crate) fn cache_query_run(
         &self,
         blob: &BlobRef,
@@ -1605,13 +1626,9 @@ fn plan_atomic_publication(
                 .checked_add(delta.locator.encoded_bytes)
                 .ok_or_else(|| Status::resource_exhausted("v1 sealed delta bytes overflow"))
         })?;
-    if prepared.generation.hash
-        != *keldra_index::profiled_blake3_hash!(&prepared.generation.bytes).as_bytes()
-    {
-        return Err(Status::data_loss(
-            "prepared v1 generation has the wrong content hash",
-        ));
-    }
+    // The encoder produced the generation bytes and their content identity as
+    // one value. Validate structure and bindings below without hashing that
+    // same trusted in-memory value again.
     let generation = decode_projection_generation(
         &prepared.generation.bytes,
         &prepared.generation.component_directory,
@@ -1669,9 +1686,7 @@ fn plan_atomic_publication(
         &mut validation_credits,
     )
     .map_err(index_status)?;
-    if prepared.query_run.hash
-        != *keldra_index::profiled_blake3_hash!(&prepared.query_run.bytes).as_bytes()
-        || query_run.partition != partition
+    if query_run.partition != partition
         || query_run.physical_catalog_generation != generation.physical_catalog_generation
         || previous
             .is_some_and(|previous| query_run.source_start_offset != previous.current.next_offset)
@@ -1756,7 +1771,7 @@ fn plan_atomic_publication(
             .checked_sub(query_run.source_start_offset)
             .ok_or_else(|| Status::data_loss("v1 query run source cut moves backwards"))?,
         state_updates,
-        _publication_credits: publication_credits,
+        _publication_credits: Some(publication_credits),
     })
 }
 
@@ -1871,11 +1886,9 @@ fn newest_prepared_query_run(
         let page = pages.get(&hash).ok_or_else(|| {
             Status::data_loss("prepared v1 query stream omits its new right spine")
         })?;
-        if page.hash != *keldra_index::profiled_blake3_hash!(&page.bytes).as_bytes() {
-            return Err(Status::data_loss(
-                "prepared v1 query stream page has the wrong content hash",
-            ));
-        }
+        // EncodedQueryRunPage is emitted with its identity by the page-tree
+        // encoder. The decoded child links and traversal below prove that the
+        // supplied page occupies the expected position.
         match decode_query_run_page(&page.bytes).map_err(index_status)? {
             QueryRunPage::Leaf(runs) => {
                 return runs
@@ -1898,20 +1911,19 @@ fn insert_artifact(
     path: String,
     kind: keldra_index::v1::ProjectionArtifactKind,
     hash: [u8; 32],
-    bytes: Vec<u8>,
+    bytes: impl Into<Bytes>,
 ) -> Result<(), Status> {
-    if hash != *keldra_index::profiled_blake3_hash!(&bytes).as_bytes() {
-        return Err(Status::data_loss(
-            "prepared v1 projection artifact has the wrong content hash",
-        ));
-    }
+    // All callers supply encoder-produced hash/byte pairs. Content hashing is
+    // performed once by the encoder; publication retains collision/conflict
+    // detection for duplicate immutable paths below.
+    let bytes = bytes.into();
     match artifacts.entry(path.clone()) {
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(ArtifactBytes {
                 path,
                 kind,
                 hash,
-                bytes: Bytes::from(bytes),
+                bytes,
             });
         }
         std::collections::btree_map::Entry::Occupied(entry)

@@ -344,7 +344,13 @@ impl V1ProjectionPublisher {
                             "v1 artifact pack object version differs from its root identity",
                         ));
                     }
-                    let bytes = self.read_blob_local_first(blob, maximum_bytes).await?;
+                    // The exact path/version cache is the one owner for a
+                    // physical pack. Going through the content-only blob cache
+                    // here would retain and charge the same `Bytes` allocation
+                    // twice under two eviction records.
+                    let bytes = self
+                        .read_blob_local_first_uncached(blob, maximum_bytes)
+                        .await?;
                     Ok(Some(Bytes::from(bytes)))
                 },
             )

@@ -70,7 +70,10 @@ fn reachable_pages(
             reachable_pages(component, child.hash, pages, reachable);
         }
     }
-    reachable.push(EncodedComponentStreamPage { hash, bytes });
+    reachable.push(EncodedComponentStreamPage {
+        hash,
+        bytes: bytes.into(),
+    });
 }
 #[test]
 fn newest_delta_wins_and_tombstones_hide_older_values() {
@@ -139,7 +142,7 @@ fn compaction_preserves_the_exact_newest_view() {
     let pages = two
         .pages
         .iter()
-        .map(|page| (page.hash, page.bytes.clone()))
+        .map(|page| (page.hash, page.bytes.to_vec()))
         .collect::<BTreeMap<_, _>>();
     let plan = select_component_compaction(
         two.root(),
@@ -186,7 +189,7 @@ fn compaction_preserves_the_exact_newest_view() {
         spliced
             .new_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone())),
+            .map(|page| (page.hash, page.bytes.to_vec())),
     );
     let mut reachable = Vec::new();
     reachable_pages(
@@ -243,7 +246,7 @@ fn splice_rewrites_only_the_affected_page_path_and_refuses_unrepresentable_outpu
     let pages = directory
         .pages
         .iter()
-        .map(|page| (page.hash, page.bytes.clone()))
+        .map(|page| (page.hash, page.bytes.to_vec()))
         .collect::<BTreeMap<_, _>>();
     let spliced = splice_compacted_component_runs(
         directory.root(),
@@ -306,7 +309,7 @@ fn directory_fanout_bounds_pages_for_seventy_thousand_segments() {
     let pages = directory
         .pages
         .iter()
-        .map(|page| (page.hash, page.bytes.clone()))
+        .map(|page| (page.hash, page.bytes.to_vec()))
         .collect::<BTreeMap<_, _>>();
     let root_children = component_stream_child_hashes(
         directory.component,
@@ -324,7 +327,7 @@ fn compaction_uses_level_summaries_to_prune_the_page_tree() {
     let pages = directory
         .pages
         .iter()
-        .map(|page| (page.hash, page.bytes.clone()))
+        .map(|page| (page.hash, page.bytes.to_vec()))
         .collect::<BTreeMap<_, _>>();
     let mut loads = 0usize;
     let plan = select_component_compaction(
@@ -357,7 +360,7 @@ fn reverse_cursor_reaches_newest_segment_without_opening_all_pages() {
     let pages = directory
         .pages
         .iter()
-        .map(|page| (page.hash, page.bytes.clone()))
+        .map(|page| (page.hash, page.bytes.to_vec()))
         .collect::<BTreeMap<_, _>>();
     let mut cursor = ComponentStreamReverseCursor::new(directory.root()).unwrap();
     let mut page_loads = 0;
@@ -394,7 +397,7 @@ fn key_cursor_does_not_open_page_subtrees_outside_the_target_range() {
     let pages = directory
         .pages
         .iter()
-        .map(|page| (page.hash, page.bytes.clone()))
+        .map(|page| (page.hash, page.bytes.to_vec()))
         .collect::<BTreeMap<_, _>>();
     let mut cursor = ComponentStreamReverseCursor::for_key(directory.root(), key(1)).unwrap();
     let mut page_loads = 0;
@@ -429,7 +432,7 @@ fn append_path_copies_only_the_logarithmic_right_spine() {
     let pages = previous
         .pages
         .iter()
-        .map(|page| (page.hash, page.bytes.clone()))
+        .map(|page| (page.hash, page.bytes.to_vec()))
         .collect::<BTreeMap<_, _>>();
     let persisted_root = previous.component_root().unwrap();
     let reopened_root = ComponentStreamRoot::from_component_root(&persisted_root).unwrap();
@@ -455,7 +458,7 @@ fn append_path_copies_only_the_logarithmic_right_spine() {
         appended
             .new_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone())),
+            .map(|page| (page.hash, page.bytes.to_vec())),
     );
     let mut all_pages = Vec::new();
     reachable_pages(

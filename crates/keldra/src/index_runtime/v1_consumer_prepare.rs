@@ -2,6 +2,8 @@
 
 use super::*;
 
+const PREPARATION_CHUNK_MUTATIONS: usize = 256;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare_lane(
     writer: &mut Writer,
@@ -21,26 +23,10 @@ pub(super) async fn prepare_lane(
     let current = writer.current.clone();
     let recipe = writer.recipe.clone();
     let scope = source_scope(writer.source);
-    let input_bytes = limits.worker_bytes;
-    let mut prepared_values = Vec::new();
-    let exact_requests = mutations
-        .iter()
-        .map(|mutation| ExactMutationRequest {
-            path: &mutation.path,
-            canonical_path: mutation.canonical_path.as_deref(),
-            version: mutation.version,
-            deleted: mutation.deleted,
-        })
-        .collect::<Vec<_>>();
-    let exact_timer = super::super::v1_telemetry::V1PipelineTelemetry::start_phase(
-        &telemetry.exact_source_read_nanos,
-    );
-    let sources =
-        load_exact_mutations(reader, &recipe, &exact_requests, limits.parallelism).await?;
-    let exact_duration = exact_timer.elapsed();
-    drop(exact_timer);
-    let mut selected_inputs =
-        VecDeque::from(mutations.into_iter().zip(sources).collect::<Vec<_>>());
+    let mut prepared_chunks = BTreeMap::new();
+    let mut next_chunk_ordinal = 0usize;
+    let mut exact_duration = Duration::ZERO;
+    let mut selected_inputs = VecDeque::from(mutations);
     let mut jobs = tokio::task::JoinSet::new();
     let mut first_failure = None;
     let mut predecessor_duration = Duration::ZERO;
@@ -48,26 +34,55 @@ pub(super) async fn prepare_lane(
     let selection_started = Instant::now();
     while !selected_inputs.is_empty() || !jobs.is_empty() {
         let refill = preparation_refill_size(selected_inputs.len(), jobs.len(), limits.parallelism);
-        if refill > 0 {
-            let chunk = (0..refill)
+        for _ in 0..refill {
+            let chunk_len = preparation_chunk_size(selected_inputs.len());
+            let construction =
+                acquire_preparation_construction(credits, limits.worker_bytes, chunk_len)?;
+            let chunk = (0..chunk_len)
                 .filter_map(|_| selected_inputs.pop_front())
                 .collect::<Vec<_>>();
-            let inputs = (0..chunk.len())
-                .map(|_| {
-                    credits
-                        .acquire(IndexingMemoryStage::ReplayInput, input_bytes)
-                        .map_err(|_| {
-                            Status::resource_exhausted("v1 replay input memory unavailable")
-                        })
-                })
-                .collect::<Result<Vec<_>, Status>>()?;
-            let predecessor_timer = super::super::v1_telemetry::V1PipelineTelemetry::start_phase(
-                &telemetry.predecessor_read_nanos,
-            );
-            let previous = match &current {
-                Some(current) => {
-                    let matched_indices = chunk
+            // One admitted worker workspace covers the bounded batched source
+            // and predecessor reads. Each selected mutation then transfers to
+            // its exact retained permit before CPU preparation, so concurrent
+            // chunks remain bounded without reverting to one RPC per object.
+            let extractor = extractor.clone();
+            let recipe = recipe.clone();
+            let credits = credits.clone();
+            let reader = reader.clone();
+            let publisher = publisher.clone();
+            let current = current.clone();
+            let chunk_ordinal = next_chunk_ordinal;
+            next_chunk_ordinal = next_chunk_ordinal.saturating_add(1);
+            jobs.spawn(async move {
+                let _construction = construction;
+                let mut metadata = Vec::with_capacity(chunk.len());
+                let mut prepare_inputs = Vec::with_capacity(chunk.len());
+                let mut exact_duration = Duration::ZERO;
+                let mut predecessor_duration = Duration::ZERO;
+                let exact_timer = super::super::v1_telemetry::V1PipelineTelemetry::start_phase(
+                    &telemetry.exact_source_read_nanos,
+                );
+                let exact_requests = chunk
+                    .iter()
+                    .map(|mutation| ExactMutationRequest {
+                        path: &mutation.path,
+                        canonical_path: mutation.canonical_path.as_deref(),
+                        version: mutation.version,
+                        deleted: mutation.deleted,
+                    })
+                    .collect::<Vec<_>>();
+                let sources = load_exact_mutations(&reader, &recipe, &exact_requests, 1).await?;
+                exact_duration = exact_duration.saturating_add(exact_timer.elapsed());
+                drop(exact_timer);
+
+                let predecessor_timer =
+                    super::super::v1_telemetry::V1PipelineTelemetry::start_phase(
+                        &telemetry.predecessor_read_nanos,
+                    );
+                let matched_indices = if current.is_some() {
+                    chunk
                         .iter()
+                        .zip(&sources)
                         .enumerate()
                         .filter_map(|(index, (mutation, source))| {
                             let content_type = match source {
@@ -87,12 +102,16 @@ pub(super) async fn prepare_lane(
                                 .is_empty())
                             .then_some(index)
                         })
-                        .collect::<Vec<_>>();
-                    let source_paths = matched_indices
-                        .iter()
-                        .map(|index| chunk[*index].0.path.as_str())
-                        .collect::<Vec<_>>();
-                    let matched_previous = publisher
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let source_paths = matched_indices
+                    .iter()
+                    .map(|index| chunk[*index].path.as_str())
+                    .collect::<Vec<_>>();
+                let matched_previous = if let Some(current) = &current {
+                    publisher
                         .load_source_states_batch(
                             &recipe.storage_tenant,
                             &recipe.bucket,
@@ -101,42 +120,41 @@ pub(super) async fn prepare_lane(
                             current,
                             scope,
                             &source_paths,
-                            limits.parallelism,
+                            1,
                         )
-                        .await?;
-                    let mut previous = std::iter::repeat_with(Vec::new)
-                        .take(chunk.len())
-                        .collect::<Vec<_>>();
-                    for (index, states) in matched_indices.into_iter().zip(matched_previous) {
-                        previous[index] = states;
-                    }
-                    previous
+                        .await?
+                } else {
+                    Vec::new()
+                };
+                if matched_previous.len() != matched_indices.len() {
+                    return Err(Status::data_loss(
+                        "v1 predecessor batch returned the wrong result count",
+                    ));
                 }
-                None => std::iter::repeat_with(Vec::new).take(chunk.len()).collect(),
-            };
-            predecessor_duration = predecessor_duration.saturating_add(predecessor_timer.elapsed());
-            drop(predecessor_timer);
-            predecessor_batches = predecessor_batches.saturating_add(1);
-            for (((mutation, source), previous), input) in
-                chunk.into_iter().zip(previous).zip(inputs)
-            {
-                let extractor = extractor.clone();
-                let prepare_extractor = extractor.clone();
-                let recipe = recipe.clone();
-                let credits = credits.clone();
-                jobs.spawn(async move {
-                    let Some(value) = select_mutation(
-                        extractor,
+                let predecessor_batches = u64::from(!source_paths.is_empty());
+                let mut previous = std::iter::repeat_with(Vec::new)
+                    .take(chunk.len())
+                    .collect::<Vec<_>>();
+                for (index, states) in matched_indices.into_iter().zip(matched_previous) {
+                    previous[index] = states;
+                }
+                predecessor_duration =
+                    predecessor_duration.saturating_add(predecessor_timer.elapsed());
+                drop(predecessor_timer);
+
+                for ((mutation, source), previous) in chunk.into_iter().zip(sources).zip(previous) {
+                    let value = select_mutation(
+                        extractor.clone(),
                         recipe.clone(),
                         physical_catalog_identity,
                         mutation,
                         source,
                         previous,
-                        input,
+                        &credits,
                     )
-                    .await?
-                    else {
-                        return Ok(None);
+                    .await?;
+                    let Some(value) = value else {
+                        continue;
                     };
                     let SelectedMutation {
                         mutation,
@@ -145,28 +163,60 @@ pub(super) async fn prepare_lane(
                         source_bytes,
                         _input,
                     } = value;
-                    let query_credits = empty_query_credits(&credits, limits)?;
-                    let (selected, previous, prepared, query_credits) = prepare_extractor
-                        .prepare_owned(scope, selected, recipe, previous, query_credits)
-                        .await?;
-                    Ok::<_, Status>(Some((
-                        SelectedMutation {
-                            mutation,
-                            selected,
-                            previous,
-                            source_bytes,
-                            _input,
-                        },
-                        prepared,
-                        query_credits,
-                    )))
-                });
-            }
+                    metadata.push((mutation, source_bytes, _input));
+                    prepare_inputs.push((
+                        selected,
+                        previous,
+                        empty_query_credits(&credits, limits)?,
+                    ));
+                }
+                let prepared = extractor
+                    .prepare_batch_owned(scope, recipe, prepare_inputs)
+                    .await?;
+                Ok::<_, Status>((
+                    chunk_ordinal,
+                    metadata
+                        .into_iter()
+                        .zip(prepared)
+                        .map(
+                            |(
+                                (mutation, source_bytes, input),
+                                (selected, previous, prepared, query_credits),
+                            )| {
+                                (
+                                    SelectedMutation {
+                                        mutation,
+                                        selected,
+                                        previous,
+                                        source_bytes,
+                                        _input: input,
+                                    },
+                                    prepared,
+                                    query_credits,
+                                )
+                            },
+                        )
+                        .collect::<Vec<_>>(),
+                    exact_duration,
+                    predecessor_duration,
+                    predecessor_batches,
+                ))
+            });
+        }
+        if !selected_inputs.is_empty()
+            && preparation_refill_size(selected_inputs.len(), jobs.len(), limits.parallelism) > 0
+        {
+            continue;
         }
         if let Some(joined) = jobs.join_next().await {
             match joined {
-                Ok(Ok(Some(value))) => prepared_values.push(value),
-                Ok(Ok(None)) => {}
+                Ok(Ok((ordinal, values, chunk_exact, chunk_predecessor, chunk_batches))) => {
+                    exact_duration = exact_duration.saturating_add(chunk_exact);
+                    predecessor_duration = predecessor_duration.saturating_add(chunk_predecessor);
+                    predecessor_batches = predecessor_batches.saturating_add(chunk_batches);
+                    let replaced = prepared_chunks.insert(ordinal, values);
+                    debug_assert!(replaced.is_none(), "preparation chunk ordinal is unique");
+                }
                 Ok(Err(error)) => {
                     first_failure.get_or_insert(error);
                     selected_inputs.clear();
@@ -184,8 +234,9 @@ pub(super) async fn prepare_lane(
         return Err(error);
     }
     let selection_duration = selection_started.elapsed();
-    prepared_values.sort_by_key(|(value, _, _)| (value.mutation.offset, value.mutation.ordinal));
-    let mut rows = Vec::with_capacity(prepared_values.len());
+    let prepared_count = prepared_chunks.values().map(Vec::len).sum();
+    let prepared_values = prepared_chunks.into_values().flatten();
+    let mut rows = Vec::with_capacity(prepared_count);
     let mut previous = BTreeMap::new();
     let merge_started = Instant::now();
     for (value, prepared, query_credits) in prepared_values {
@@ -213,11 +264,33 @@ pub(super) async fn prepare_lane(
         histogram.keldra_index_v1_selection_duration_seconds = selection_duration.as_secs_f64(),
         histogram.keldra_index_v1_merge_duration_seconds = merge_started.elapsed().as_secs_f64(),
         counter.keldra_index_v1_prepare_mutations = mutation_count,
+        counter.keldra_index_v1_prepare_chunks = next_chunk_ordinal,
         counter.keldra_index_v1_predecessor_batches = predecessor_batches,
         gauge.keldra_index_v1_prepare_parallelism = limits.parallelism,
         "v1 producer prepared one mutation window"
     );
     result
+}
+
+pub(super) fn acquire_preparation_construction(
+    credits: &IndexingMemoryCredits,
+    worker_bytes: usize,
+    chunk_len: usize,
+) -> Result<IndexingMemoryPermit, Status> {
+    let chunk_descriptors = chunk_len
+        .checked_mul(std::mem::size_of::<Mutation>())
+        .ok_or_else(|| Status::resource_exhausted("v1 replay chunk size overflow"))?;
+    let construction_bytes = worker_bytes
+        .max(1)
+        .checked_add(chunk_descriptors)
+        .ok_or_else(|| Status::resource_exhausted("v1 replay chunk size overflow"))?;
+    credits
+        .acquire(IndexingMemoryStage::ReplayInput, construction_bytes)
+        .map_err(|_| Status::resource_exhausted("v1 replay chunk memory unavailable"))
+}
+
+pub(super) fn preparation_chunk_size(pending: usize) -> usize {
+    pending.min(PREPARATION_CHUNK_MUTATIONS)
 }
 
 pub(super) fn preparation_refill_size(
@@ -226,20 +299,22 @@ pub(super) fn preparation_refill_size(
     maximum_parallelism: usize,
 ) -> usize {
     let maximum_parallelism = maximum_parallelism.max(1);
-    if pending == 0 || active > maximum_parallelism.saturating_div(2) {
+    if pending == 0 {
         return 0;
     }
-    pending.min(maximum_parallelism.saturating_sub(active))
+    pending
+        .div_ceil(PREPARATION_CHUNK_MUTATIONS)
+        .min(maximum_parallelism.saturating_sub(active))
 }
 
 async fn select_mutation(
     extractor: V1ProjectionExtractor,
-    recipe: PhysicalCatalogRecipe,
+    recipe: Arc<PhysicalCatalogRecipe>,
     physical_catalog_identity: [u8; 32],
     mutation: Mutation,
     source: IndexSourceMutation,
     previous: Vec<keldra_index::v1::ProjectedDocumentState>,
-    mut input: keldra_index::v1::IndexingMemoryPermit,
+    credits: &IndexingMemoryCredits,
 ) -> Result<Option<SelectedMutation>, Status> {
     let source_bytes = match &source {
         IndexSourceMutation::Upsert(object) => object.content_length,
@@ -278,15 +353,9 @@ async fn select_mutation(
         )
         .await?;
     let retained_bytes = selected_mutation_resident_bytes(&mutation, &selected, &previous)?;
-    if retained_bytes > input.bytes() {
-        return Err(Status::resource_exhausted(format!(
-            "v1 replay selection requires {retained_bytes} bytes but its construction bound is {}",
-            input.bytes()
-        )));
-    }
-    input
-        .shrink_to(retained_bytes.max(1))
-        .map_err(index_status)?;
+    let input = credits
+        .acquire(IndexingMemoryStage::ReplayInput, retained_bytes.max(1))
+        .map_err(|_| Status::resource_exhausted("v1 replay input memory unavailable"))?;
     Ok(Some(SelectedMutation {
         mutation,
         selected,
@@ -299,6 +368,20 @@ async fn select_mutation(
 pub(super) fn selected_mutation_resident_bytes(
     mutation: &Mutation,
     selected: &SelectedV1Source,
+    previous: &[keldra_index::v1::ProjectedDocumentState],
+) -> Result<usize, Status> {
+    let mut bytes = selected_mutation_base_resident_bytes(mutation, &selected.source, previous)?;
+    if let Some(projection) = &selected.selected {
+        bytes = bytes
+            .checked_add(projection.resident_bytes().map_err(index_status)?)
+            .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?;
+    }
+    Ok(bytes)
+}
+
+fn selected_mutation_base_resident_bytes(
+    mutation: &Mutation,
+    source: &IndexSourceMutation,
     previous: &[keldra_index::v1::ProjectedDocumentState],
 ) -> Result<usize, Status> {
     let mut bytes = std::mem::size_of::<SelectedMutation>()
@@ -314,7 +397,7 @@ pub(super) fn selected_mutation_resident_bytes(
         .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?;
     bytes = bytes
         .checked_add(
-            match &selected.source {
+            match source {
                 IndexSourceMutation::Upsert(object) => std::mem::size_of::<IndexBuildObject>()
                     .checked_add(object.path.capacity())
                     .and_then(|value| {
@@ -345,11 +428,6 @@ pub(super) fn selected_mutation_resident_bytes(
             .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?,
         )
         .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?;
-    if let Some(projection) = &selected.selected {
-        bytes = bytes
-            .checked_add(projection.resident_bytes().map_err(index_status)?)
-            .ok_or_else(|| Status::resource_exhausted("v1 replay selection size overflow"))?;
-    }
     bytes = bytes
         .checked_add(
             previous

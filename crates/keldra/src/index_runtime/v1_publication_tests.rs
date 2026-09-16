@@ -299,8 +299,8 @@ fn atomic_plan_contains_query_artifacts_and_generation_before_current_phase() {
                 artifact.kind == keldra_index::v1::ProjectionArtifactKind::QueryRunPack
             })
             .count(),
-        2,
-        "the gate block and its run descriptor must both be immutable"
+        1,
+        "query data packs are published before planning; the run descriptor remains in the atomic immutable set"
     );
     assert_eq!(plan.current.next_offset, 1);
 }
@@ -368,6 +368,21 @@ fn parallel_stage_work_preserves_window_and_artifact_order() {
             .collect::<Vec<_>>(),
         vec!["artifact-0", "artifact-1", "artifact-2", "artifact-3"]
     );
+}
+
+#[test]
+fn immutable_stage_work_moves_shared_bytes_without_copying() {
+    let bytes = Bytes::from(vec![0x5a; 1_024]);
+    let allocation = bytes.as_ptr();
+    let artifacts = vec![ArtifactBytes {
+        path: "shared-artifact".into(),
+        kind: keldra_index::v1::ProjectionArtifactKind::Pack,
+        hash: [7; 32],
+        bytes,
+    }];
+    let work = immutable_stage_work(artifacts).unwrap();
+    let staged = &work[0].1.1[0].bytes;
+    assert_eq!(staged.as_ptr(), allocation);
 }
 
 #[test]
@@ -472,5 +487,88 @@ fn current_and_query_cut_cannot_be_crossed() {
     let mut crossed = prepared(1, 11);
     crossed.current = prepared(2, 12).current;
     let error = plan_atomic_publication(partition(), None, crossed).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DataLoss);
+}
+
+#[tokio::test]
+async fn transient_post_cas_failure_retains_and_retries_mandatory_verification() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let verification_attempts = Arc::clone(&attempts);
+    let mut verification = Some(V1PostCasVerification::start(move || {
+        let attempt = verification_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async move {
+            if attempt == 0 {
+                Err(Status::unavailable("injected readback failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }));
+
+    let error = finish_required_post_cas_verification(&mut verification)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(verification.is_some());
+
+    finish_required_post_cas_verification(&mut verification)
+        .await
+        .unwrap();
+    assert!(verification.is_none());
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn integrity_post_cas_failure_clears_contained_verification() {
+    let mut verification = Some(V1PostCasVerification::start(|| async {
+        Err(Status::data_loss("injected exact readback mismatch"))
+    }));
+
+    let error = finish_required_post_cas_verification(&mut verification)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DataLoss);
+    assert!(verification.is_none());
+}
+
+#[test]
+fn idle_compaction_successor_preserves_cut_and_advances_generation() {
+    let plan = plan_atomic_publication(partition(), None, prepared(1, 11)).unwrap();
+    let loaded = LoadedV1ProjectionGeneration {
+        current: plan.current,
+        current_object_version: VersionId(41),
+        generation: plan.generation,
+    };
+    let compacted = loaded.generation.clone();
+
+    let successor =
+        compaction_publication::compaction_successor_generation(&loaded, &compacted).unwrap();
+
+    assert_eq!(successor.next_offset, loaded.generation.next_offset);
+    assert_eq!(
+        successor.through_atomic_position,
+        loaded.generation.through_atomic_position
+    );
+    assert_eq!(successor.revision, loaded.generation.revision + 1);
+    assert_eq!(
+        successor.previous_generation_hash,
+        Some(loaded.current.generation_hash)
+    );
+    assert_eq!(successor.query_stream_root, compacted.query_stream_root);
+}
+
+#[test]
+fn idle_compaction_rejects_a_changed_source_cut() {
+    let plan = plan_atomic_publication(partition(), None, prepared(1, 11)).unwrap();
+    let loaded = LoadedV1ProjectionGeneration {
+        current: plan.current,
+        current_object_version: VersionId(41),
+        generation: plan.generation,
+    };
+    let mut compacted = loaded.generation.clone();
+    compacted.next_offset += 1;
+
+    let error =
+        compaction_publication::compaction_successor_generation(&loaded, &compacted).unwrap_err();
     assert_eq!(error.code(), tonic::Code::DataLoss);
 }

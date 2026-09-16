@@ -1,6 +1,8 @@
 //! Background compaction ownership and bounded launch for the v1 producer.
 
-use super::super::v1_compaction::V1CompactionPublication;
+use super::super::v1_compaction::{
+    V1CompactionArtifacts, V1CompactionBase, V1CompactionPublication,
+};
 use super::*;
 
 pub(super) struct BackgroundCompaction {
@@ -30,6 +32,106 @@ impl Drop for BackgroundCompaction {
             task.abort();
         }
     }
+}
+
+pub(super) fn should_harvest_background_compaction(
+    has_current: bool,
+    prepared_source_rows: u64,
+    mutation_window_empty: bool,
+    compaction_finished: bool,
+) -> bool {
+    compaction_finished
+        && mutation_window_empty
+        && !has_publication_work(has_current, prepared_source_rows)
+}
+
+pub(super) async fn take_finished_background_compaction(
+    writer: &mut Writer,
+    publisher: &V1ProjectionPublisher,
+) -> Result<Option<(V1CompactionBase, V1CompactionArtifacts)>, Status> {
+    if !writer
+        .background_compaction
+        .as_ref()
+        .is_some_and(BackgroundCompaction::is_finished)
+    {
+        return Ok(None);
+    }
+    let background = writer
+        .background_compaction
+        .take()
+        .expect("finished v1 compaction exists");
+    writer.stage = ProducerStage::Compacting;
+    let predecessor_generation = background.predecessor_generation;
+    let mut prepared = match background.finish().await {
+        Ok(prepared) => prepared,
+        Err(error) if error.code() != tonic::Code::DataLoss => {
+            tracing::warn!(%error, "optional v1 background compaction failed");
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let current = writer
+        .current
+        .as_ref()
+        .expect("compaction requires Current");
+    match prepared
+        .rebase_onto(
+            publisher,
+            &writer.recipe.storage_tenant,
+            &writer.recipe.bucket,
+            writer.recipe.family.tenant_id,
+            writer.recipe.family.bucket_id,
+            current,
+        )
+        .await
+    {
+        Ok(true) => {
+            let (base, artifacts) = prepared.into_parts();
+            if base.predecessor.roots == current.generation.roots
+                && base.predecessor.query_stream_root == current.generation.query_stream_root
+            {
+                tracing::debug!(
+                    ?predecessor_generation,
+                    "no-op v1 compaction proposal discarded"
+                );
+                Ok(None)
+            } else {
+                Ok(Some((base, artifacts)))
+            }
+        }
+        Ok(false) => {
+            tracing::debug!(?predecessor_generation, "stale v1 compaction discarded");
+            Ok(None)
+        }
+        Err(error) if error.code() != tonic::Code::DataLoss => {
+            tracing::warn!(%error, "optional v1 compaction proposal discarded");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) async fn publish_finished_background_compaction(
+    writer: &mut Writer,
+    publisher: &V1ProjectionPublisher,
+) -> Result<bool, Status> {
+    let Some((base, artifacts)) = take_finished_background_compaction(writer, publisher).await?
+    else {
+        return Ok(false);
+    };
+    let current = writer
+        .current
+        .as_ref()
+        .expect("compaction publication requires Current");
+    writer.pending_publication = Some(publisher.prepare_compaction_publication(
+        writer.partition,
+        current,
+        base,
+        artifacts,
+    )?);
+    writer.stage = ProducerStage::Publishing;
+    finish_pending_publication(writer, publisher).await?;
+    Ok(true)
 }
 
 pub(super) fn ensure_background_compaction(

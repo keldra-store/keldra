@@ -21,7 +21,9 @@ use super::catalog::PhysicalCatalogRecipe;
 use super::cpu::IndexCpuPool;
 use super::date::parse_millis;
 use super::hot_ingress::HotProjectionIngress;
-use super::json_projection::{ProjectedScalarPointers, project_scalar_pointers};
+use super::json_projection::{
+    CompiledScalarProjectionPlan, ProjectedScalarPointers, project_compiled_scalar_pointers,
+};
 use super::source::{IndexBuildObject, IndexSourceMutation};
 
 #[derive(Clone)]
@@ -57,7 +59,7 @@ impl V1ProjectionExtractor {
         tenant_id: u64,
         bucket_id: u64,
         source: IndexSourceMutation,
-        recipes: &[PhysicalCatalogRecipe],
+        recipes: &[Arc<PhysicalCatalogRecipe>],
         physical_catalog_identity: [u8; 32],
     ) -> Result<SelectedV1Source, Status> {
         let object = match source {
@@ -77,32 +79,37 @@ impl V1ProjectionExtractor {
                 });
             }
         };
-        let pointers = if recipes.len() == 1 {
-            recipes[0].selectors.clone()
+        let projection_plan = if recipes.len() == 1 {
+            Arc::clone(&recipes[0].projection_plan)
         } else {
-            Arc::from(
+            let pointers = Arc::from(
                 recipes
                     .iter()
-                    .flat_map(|recipe| recipe.selectors.iter().cloned())
+                    .flat_map(|recipe| recipe.projection_plan.pointers().iter().cloned())
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect::<Vec<_>>(),
-            )
+            );
+            CompiledScalarProjectionPlan::compile(pointers).map_err(index_status)?
         };
-        if pointers.is_empty() {
+        if projection_plan.pointers().is_empty() {
             self.discard_hot_through(tenant_id, bucket_id, &object.path, object.version);
             return Ok(SelectedV1Source {
                 source: IndexSourceMutation::Upsert(object),
                 selected: None,
             });
         }
-        if let Some(selected) = self.hot.take_exact_selected_for_generation(
-            tenant_id,
-            bucket_id,
-            &object.path,
-            object.version,
-            physical_catalog_identity,
-        ) {
+        if let Some(selected) = self
+            .hot
+            .take_exact_selected_for_generation_wait(
+                tenant_id,
+                bucket_id,
+                &object.path,
+                object.version,
+                physical_catalog_identity,
+            )
+            .await
+        {
             super::v1_telemetry::V1PipelineTelemetry::add(
                 &super::v1_telemetry::global().hot_prepared_hits,
                 1,
@@ -125,7 +132,8 @@ impl V1ProjectionExtractor {
             .submit(move || {
                 let started = Instant::now();
                 let wait = started.saturating_duration_since(queued_at);
-                let selected = project_scalar_pointers(&mut payload, &pointers, maximum)?;
+                let selected =
+                    project_compiled_scalar_pointers(&mut payload, projection_plan, maximum)?;
                 Ok::<_, keldra_index::IndexError>((selected, started.elapsed(), wait))
             })
             .await
@@ -233,30 +241,37 @@ impl V1ProjectionExtractor {
         .map_err(|error| object_index_status(&diagnostic_path, error))
     }
 
-    /// Prepare one already-selected source on the process-owned projection
-    /// pool. Owned inputs and credits cross the worker boundary together so
-    /// the async coordinator can merge results later in stable source order.
-    pub(crate) async fn prepare_owned(
+    /// Prepare a substantial ordered chunk in one CPU-pool job. The caller
+    /// keeps chunks bounded by both mutation count and retained credits, so a
+    /// worker can reuse its stack and allocator capacity without creating one
+    /// scheduler job for every document.
+    pub(crate) async fn prepare_batch_owned(
         &self,
         source_scope: [u8; 32],
-        selected: SelectedV1Source,
-        recipe: PhysicalCatalogRecipe,
-        previous: Vec<ProjectedDocumentState>,
-        mut credits: QueryBlockCredits,
+        recipe: Arc<PhysicalCatalogRecipe>,
+        inputs: Vec<(
+            SelectedV1Source,
+            Vec<ProjectedDocumentState>,
+            QueryBlockCredits,
+        )>,
     ) -> Result<
-        (
+        Vec<(
             SelectedV1Source,
             Vec<ProjectedDocumentState>,
             PreparedTypedJsonDocument,
             QueryBlockCredits,
-        ),
+        )>,
         Status,
     > {
         self.cpu
             .submit(move || {
-                let prepared =
-                    Self::prepare(source_scope, &selected, &recipe, &previous, &mut credits)?;
-                Ok((selected, previous, prepared, credits))
+                let mut output = Vec::with_capacity(inputs.len());
+                for (selected, previous, mut credits) in inputs {
+                    let prepared =
+                        Self::prepare(source_scope, &selected, &recipe, &previous, &mut credits)?;
+                    output.push((selected, previous, prepared, credits));
+                }
+                Ok(output)
             })
             .await
             .map_err(|error| Status::internal(error.to_string()))?
@@ -381,12 +396,12 @@ fn object_index_status(path: &str, error: keldra_index::IndexError) -> Status {
 }
 
 pub(crate) fn matching_recipes(
-    recipes: &[PhysicalCatalogRecipe],
+    recipes: &[Arc<PhysicalCatalogRecipe>],
     tenant_id: u64,
     bucket_id: u64,
     path: &str,
     content_type: Option<&str>,
-) -> Vec<PhysicalCatalogRecipe> {
+) -> Vec<Arc<PhysicalCatalogRecipe>> {
     recipes
         .iter()
         .filter(|recipe| {

@@ -156,7 +156,10 @@ impl V1ProjectionPublisher {
                         hash,
                         length: bytes.len(),
                     });
-                    inline_blobs.push(bytes.to_vec());
+                    // Store staging accepts shared immutable buffers, so this
+                    // window consumes the already-admitted publication bytes
+                    // instead of creating an uncharged second allocation.
+                    inline_blobs.push(bytes);
                 }
                 if observed_bytes != bytes {
                     return Err(Status::internal(
@@ -174,7 +177,7 @@ impl V1ProjectionPublisher {
     async fn flush_inline_artifacts(
         &self,
         identities: &mut Vec<InlineArtifactIdentity>,
-        bytes: &mut Vec<Vec<u8>>,
+        bytes: &mut Vec<Bytes>,
         staged: &mut Vec<StagedArtifact>,
     ) -> Result<(), Status> {
         if bytes.is_empty() {

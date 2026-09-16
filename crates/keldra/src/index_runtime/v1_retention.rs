@@ -188,7 +188,7 @@ async fn catalog_checkpoint_limit(
 async fn family_coverage(
     cursor: IndexSourceCursor,
     target: &super::events::IndexBarrier,
-    recipes: &[PhysicalCatalogRecipe],
+    recipes: &[Arc<PhysicalCatalogRecipe>],
     journal: &IndexEventJournal,
     projections: &V1ProjectionPublisher,
 ) -> Result<Option<u64>, Status> {

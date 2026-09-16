@@ -6,6 +6,7 @@ use super::{
     ComponentRoot, PackedComponentDelta, RecipeIdentity, SealedComponentDelta, StableDocumentKey,
 };
 use crate::IndexError;
+use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
 #[path = "stream_compaction.rs"]
 mod compaction_selection;
@@ -61,7 +62,9 @@ impl ComponentSegmentDescriptor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedComponentStreamPage {
     pub hash: [u8; 32],
-    pub bytes: Vec<u8>,
+    /// One immutable allocation shared by compaction overlays, retry state,
+    /// and durable staging. Cloning a page never copies its encoded body.
+    pub bytes: Bytes,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentStreamDirectory {
@@ -214,10 +217,25 @@ impl ComponentStreamReverseCursor {
     }
 
     pub fn provide_page(&mut self, hash: [u8; 32], bytes: &[u8]) -> Result<(), IndexError> {
+        if hash != *crate::profiled_blake3_hash!(bytes).as_bytes() {
+            return Err(IndexError::Integrity);
+        }
+        self.provide_verified_page(hash, bytes)
+    }
+
+    /// Supplies bytes whose content identity was already verified at the
+    /// storage or network boundary. Structural and parent-summary validation
+    /// still run; only the duplicate full-page hash is omitted.
+    #[doc(hidden)]
+    pub fn provide_verified_page(
+        &mut self,
+        hash: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<(), IndexError> {
         let expected = self.awaiting_page.take().ok_or_else(|| {
             IndexError::InvalidDefinition("component cursor did not request a page".into())
         })?;
-        if hash != expected.hash || hash != *crate::profiled_blake3_hash!(bytes).as_bytes() {
+        if hash != expected.hash {
             return Err(IndexError::Integrity);
         }
         match decode_page(self.component, bytes)? {
@@ -486,7 +504,7 @@ pub fn decode_component_stream(
     for page in &directory.pages {
         if page.hash == [0; 32]
             || page.hash != *crate::profiled_blake3_hash!(&page.bytes).as_bytes()
-            || pages.insert(page.hash, page.bytes.as_slice()).is_some()
+            || pages.insert(page.hash, page.bytes.as_ref()).is_some()
         {
             return Err(IndexError::Integrity);
         }
@@ -1455,7 +1473,7 @@ fn encode_page(
     }
     Ok(EncodedComponentStreamPage {
         hash: *crate::profiled_blake3_hash!(&bytes).as_bytes(),
-        bytes,
+        bytes: Bytes::from(bytes),
     })
 }
 

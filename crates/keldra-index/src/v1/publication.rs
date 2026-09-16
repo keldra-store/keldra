@@ -656,7 +656,7 @@ mod tests {
         prepared
             .stream_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone()))
+            .map(|page| (page.hash, page.bytes.to_vec()))
             .collect()
     }
 
@@ -1247,7 +1247,7 @@ mod tests {
         let query_pages = first
             .query_stream_pages
             .iter()
-            .map(|page| (page.hash, page.bytes.clone()))
+            .map(|page| (page.hash, page.bytes.to_vec()))
             .collect::<BTreeMap<_, _>>();
         let mut references = Vec::new();
         visit_query_runs_newest(

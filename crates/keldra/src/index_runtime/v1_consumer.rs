@@ -27,14 +27,17 @@ use super::source::{IndexBuildObject, IndexSourceMutation};
 use super::v1_backfill::open_partition_baseline;
 use super::v1_extractor::{SelectedV1Source, V1ProjectionExtractor, matching_recipes};
 use super::v1_journal_dispatch::{V1OrderedSourceDispatcher, V1SourceDispatch};
-use super::v1_mutation_window::coalesce_latest_by_source_path;
+use super::v1_mutation_window::{
+    MAX_ADVANCE_SLICE_BYTES, bounded_advance_operations, coalesce_latest_by_source_path,
+    journal_read_ahead_pages, publication_chunks,
+};
 use super::v1_parallel::{partition_lane_parallelism, run_bounded_ordered};
 use super::v1_producer_state::{
     PartitionEvidence, PartitionEvidenceMap, ProducerStage, contain_integrity_failure,
 };
 use super::v1_publication::{
     LoadedV1ProjectionGeneration, PendingV1Publication, V1PostCasVerification,
-    V1ProjectionPublisher, V1PublicationPredecessor,
+    V1ProjectionPublisher, V1PublicationPredecessor, finish_required_post_cas_verification,
 };
 use super::v1_source_batch::{ExactMutationRequest, load_exact_mutations};
 
@@ -42,10 +45,16 @@ use super::v1_source_batch::{ExactMutationRequest, load_exact_mutations};
 mod compaction;
 #[path = "v1_consumer_prepare.rs"]
 mod prepare;
-use compaction::{BackgroundCompaction, ensure_background_compaction};
-use prepare::{apply_rows, prepare_lane};
+use compaction::{
+    BackgroundCompaction, ensure_background_compaction, publish_finished_background_compaction,
+    should_harvest_background_compaction, take_finished_background_compaction,
+};
 #[cfg(test)]
-use prepare::{preparation_refill_size, selected_mutation_resident_bytes};
+use prepare::{
+    acquire_preparation_construction, preparation_chunk_size, preparation_refill_size,
+    selected_mutation_resident_bytes,
+};
+use prepare::{apply_rows, prepare_lane};
 
 const RETRY: Duration = Duration::from_millis(250);
 const SAFETY_RECONCILE: Duration = Duration::from_secs(30);
@@ -82,7 +91,7 @@ struct Limits {
 }
 
 struct Writer {
-    recipe: PhysicalCatalogRecipe,
+    recipe: Arc<PhysicalCatalogRecipe>,
     source: SourceId,
     partition: ProjectionPartitionIdentity,
     current: Option<LoadedV1ProjectionGeneration>,
@@ -126,6 +135,10 @@ struct Mutation {
     canonical_path: Option<String>,
     version: u64,
     deleted: bool,
+    /// Finalized atomic-batch cursor. Every source-local mutation carrying the
+    /// same cursor is one indivisible publication unit even when its source
+    /// journal positions differ.
+    atomic_group: Option<u64>,
     /// The first journal transition for this path after durable Current proves
     /// that no live predecessor existed. This evidence survives newest-wins
     /// coalescing across the complete unpublished window.
@@ -257,6 +270,7 @@ fn limits(config: IndexRuntimeConfig) -> Result<Limits, Status> {
     let bytes = configured.saturating_div(2).max(1);
     let flush_bytes = usize::try_from(config.flush_bytes())
         .map_err(|_| Status::invalid_argument("v1 flush bytes exceed this platform"))?
+        .min(MAX_ADVANCE_SLICE_BYTES)
         .min(bytes.saturating_div(4).max(1));
     // Projection output may legitimately exceed its bounded journal input.
     // Reserve a bounded producer share rather than treating flush as an output cap.
@@ -273,10 +287,10 @@ fn limits(config: IndexRuntimeConfig) -> Result<Limits, Status> {
         flush_bytes,
         projection_batch_bytes,
         flush_age: config.flush_max_age(),
-        // The charged mutation window is the authoritative memory bound. Keep
-        // the configured operation bound instead of imposing an unrelated
-        // fixed ceiling that forces extra publications on larger budgets.
-        flush_operations: config.flush_max_operations(),
+        // The charged mutation window remains the memory authority. A hard
+        // operation ceiling additionally bounds visibility latency under a
+        // sustained backlog; atomic source units remain indivisible.
+        flush_operations: bounded_advance_operations(config.flush_max_operations()),
         lsm_runs: u64::from(config.lsm_max_runs_per_level()),
         lsm_bytes: config.lsm_max_unmerged_bytes_per_level(),
         parallelism,
@@ -885,7 +899,7 @@ fn routed_lag_start(published_next: u64) -> u64 {
 }
 
 async fn open_writer(
-    recipe: PhysicalCatalogRecipe,
+    recipe: Arc<PhysicalCatalogRecipe>,
     partition: ProjectionPartitionIdentity,
     target: &IndexBarrier,
     publisher: &V1ProjectionPublisher,
@@ -1149,12 +1163,7 @@ async fn advance(
         .as_ref()
         .is_some_and(V1PostCasVerification::is_finished)
     {
-        writer
-            .post_cas_verification
-            .take()
-            .expect("finished v1 verifier exists")
-            .finish()
-            .await?;
+        finish_required_post_cas_verification(&mut writer.post_cas_verification).await?;
     }
     if writer.pending_publication.is_some() {
         writer.stage = ProducerStage::Publishing;
@@ -1185,6 +1194,18 @@ async fn advance(
         compaction_ready,
         limits,
     )?;
+    if should_harvest_background_compaction(
+        writer.current.is_some(),
+        writer.pending_prepared_rows,
+        writer.pending_mutations.is_empty(),
+        writer
+            .background_compaction
+            .as_ref()
+            .is_some_and(BackgroundCompaction::is_finished),
+    ) && publish_finished_background_compaction(writer, publisher).await?
+    {
+        return Ok(());
+    }
     writer.stage = ProducerStage::JournalScan;
     // Leave charged mutation-window room for the decoded journal page.
     let max_page = u64::try_from(limits.flush_bytes.saturating_div(4).max(1))
@@ -1260,11 +1281,18 @@ async fn advance(
                         )
                         .await?;
                     }
-                    let chunks =
-                        mutation_publication_chunks(mutations, safe_next, limits.flush_operations)?;
+                    let chunks = publication_chunks(
+                        mutations,
+                        safe_next,
+                        limits.flush_operations,
+                        writer.through_atomic,
+                        page_atomic,
+                        |mutation| mutation.offset,
+                        |mutation| mutation.atomic_group,
+                    )?;
                     let chunk_count = chunks.len();
-                    for (index, (mutations, chunk_next)) in chunks.into_iter().enumerate() {
-                        let operations = u64::try_from(mutations.len()).unwrap_or(u64::MAX);
+                    for (index, chunk) in chunks.into_iter().enumerate() {
+                        let operations = u64::try_from(chunk.mutations.len()).unwrap_or(u64::MAX);
                         if !writer.pending_mutations.is_empty()
                             && writer.pending_operations.saturating_add(operations)
                                 > limits.flush_operations
@@ -1280,10 +1308,8 @@ async fn advance(
                             )
                             .await?;
                         }
-                        if index + 1 == chunk_count {
-                            writer.through_atomic = writer.through_atomic.max(page_atomic);
-                        }
-                        queue_mutations(writer, mutations, chunk_next)?;
+                        writer.through_atomic = chunk.through_atomic;
+                        queue_mutations(writer, chunk.mutations, chunk.next)?;
                         if index + 1 != chunk_count || should_flush(writer, limits) {
                             flush(
                                 writer,
@@ -1330,43 +1356,6 @@ async fn advance(
         ProducerStage::JournalScan
     };
     Ok(())
-}
-
-fn journal_read_ahead_pages(parallelism: usize) -> usize {
-    parallelism.saturating_mul(2).clamp(2, 32)
-}
-
-fn mutation_publication_chunks(
-    mutations: Vec<Mutation>,
-    safe_next: u64,
-    maximum_operations: u64,
-) -> Result<Vec<(Vec<Mutation>, u64)>, Status> {
-    if mutations.is_empty() {
-        return Ok(vec![(Vec::new(), safe_next)]);
-    }
-    let maximum_operations = usize::try_from(maximum_operations)
-        .unwrap_or(usize::MAX)
-        .max(1);
-    let mut chunks = Vec::new();
-    let mut remaining = mutations;
-    while remaining.len() > maximum_operations {
-        let mut split = maximum_operations;
-        while split < remaining.len() && remaining[split - 1].offset == remaining[split].offset {
-            split += 1;
-        }
-        if split == remaining.len() {
-            break;
-        }
-        let rest = remaining.split_off(split);
-        let next = rest
-            .first()
-            .map(|mutation| mutation.offset)
-            .ok_or_else(|| Status::data_loss("v1 publication split lost its next mutation"))?;
-        chunks.push((remaining, next));
-        remaining = rest;
-    }
-    chunks.push((remaining, safe_next));
-    Ok(chunks)
 }
 
 fn prepare_page(
@@ -1609,55 +1598,7 @@ async fn flush(
         .acquire(IndexingMemoryStage::ReplayInput, preload_bytes)
         .map_err(|_| Status::resource_exhausted("v1 spine preload memory unavailable"))?;
     drop(seal_timer);
-    let compaction = if writer
-        .background_compaction
-        .as_ref()
-        .is_some_and(BackgroundCompaction::is_finished)
-    {
-        let background = writer
-            .background_compaction
-            .take()
-            .expect("finished v1 compaction exists");
-        writer.stage = ProducerStage::Compacting;
-        let predecessor_generation = background.predecessor_generation;
-        match background.finish().await {
-            Ok(mut prepared) => {
-                let current = writer
-                    .current
-                    .as_ref()
-                    .expect("compaction requires Current");
-                match prepared
-                    .rebase_onto(
-                        publisher,
-                        &writer.recipe.storage_tenant,
-                        &writer.recipe.bucket,
-                        writer.recipe.family.tenant_id,
-                        writer.recipe.family.bucket_id,
-                        current,
-                    )
-                    .await
-                {
-                    Ok(true) => Some(prepared.into_parts()),
-                    Ok(false) => {
-                        tracing::debug!(?predecessor_generation, "stale v1 compaction discarded");
-                        None
-                    }
-                    Err(error) if error.code() != tonic::Code::DataLoss => {
-                        tracing::warn!(%error, "optional v1 compaction proposal discarded");
-                        None
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(error) if error.code() != tonic::Code::DataLoss => {
-                tracing::warn!(%error, "optional v1 background compaction failed");
-                None
-            }
-            Err(error) => return Err(error),
-        }
-    } else {
-        None
-    };
+    let compaction = take_finished_background_compaction(writer, publisher).await?;
     let query = std::mem::take(&mut writer.query);
     let placeholder = empty_query_credits(credits, limits)?;
     let query_credits = std::mem::replace(&mut writer.query_credits, placeholder);
@@ -1830,6 +1771,7 @@ fn dispatch_mutations(dispatch: V1SourceDispatch) -> Result<(u64, Vec<Mutation>)
                         canonical_path: mutation.canonical_path,
                         version: mutation.path_version.0,
                         deleted: mutation.deleted,
+                        atomic_group: Some(group.cursor),
                         // Atomic summaries carry no predecessor accounting evidence.
                         predecessor_absent_at_window_start: false,
                     })
@@ -1854,6 +1796,7 @@ fn head_mutation(head: ObjectHeadChange, ordinal: u32) -> Mutation {
         canonical_path: head.canonical_path,
         version: head.path_version.0,
         deleted: matches!(head.kind, ObjectHeadChangeKind::Delete),
+        atomic_group: None,
         predecessor_absent_at_window_start,
     }
 }

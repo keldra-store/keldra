@@ -6,6 +6,7 @@
 //! does not materialize that corpus in the producer.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use keldra_index::v1::{
     IndexingMemoryCredits, IndexingMemoryPermit, IndexingMemoryStage, ProjectionPartitionIdentity,
@@ -24,7 +25,7 @@ use super::v1_extractor::{SelectedV1Source, V1ProjectionExtractor, matching_reci
 /// incarnation at one captured journal tail.
 pub(crate) struct V1PartitionBaseline {
     snapshot: ClusterIndexSourceSnapshot,
-    recipe: PhysicalCatalogRecipe,
+    recipe: Arc<PhysicalCatalogRecipe>,
     source: SourceId,
     captured_tail: u64,
     captured_next_offset: u64,
@@ -49,7 +50,7 @@ pub(crate) struct V1BaselineSelected {
 /// Open a partition-exact baseline at the source snapshot's captured tail.
 pub(crate) async fn open_partition_baseline(
     scanner: &ClusterIndexScanner,
-    recipe: &PhysicalCatalogRecipe,
+    recipe: &Arc<PhysicalCatalogRecipe>,
     source: SourceId,
     partition: ProjectionPartitionIdentity,
     maximum_frame_bytes: u64,

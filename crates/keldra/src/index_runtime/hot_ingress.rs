@@ -12,9 +12,18 @@ use std::sync::{Arc, Mutex};
 use keldra_store::{BatchOperation, MutationReceipt, VersionId};
 
 use super::catalog::PhysicalCatalogSnapshot;
-use super::json_projection::{ProjectedScalarPointers, project_scalar_pointers};
+#[cfg(test)]
+use super::json_projection::project_scalar_pointers;
+use super::json_projection::{
+    CompiledScalarProjectionPlan, ProjectedScalarPointers, project_compiled_scalar_pointers,
+};
 
 const ENTRY_OVERHEAD_BYTES: usize = 256;
+
+/// Conservative resident allowance for the Tokio task, Rayon queue closure,
+/// oneshot state, and semaphore permit owned by one hot projection execution.
+/// Payload/parser memory is charged separately from this control overhead.
+const HOT_EXECUTION_OVERHEAD_BYTES: usize = 1_024;
 
 /// A deliberately conservative allowance for one independently allocated
 /// ordered-map/set entry, including allocator metadata and unused node slots.
@@ -24,8 +33,24 @@ const TREE_ENTRY_OVERHEAD_BYTES: usize = 256;
 pub(crate) struct HotProjectionIngress {
     inner: Arc<Mutex<HotState>>,
     maximum_bytes: usize,
-    cpu: Arc<std::sync::OnceLock<super::cpu::IndexCpuPool>>,
+    cpu: Arc<std::sync::OnceLock<HotProjectionCpu>>,
     changes: tokio::sync::broadcast::Sender<()>,
+}
+
+#[derive(Clone)]
+struct HotProjectionCpu {
+    pool: super::cpu::IndexCpuPool,
+    capacity: Arc<tokio::sync::Semaphore>,
+}
+
+impl HotProjectionCpu {
+    fn new(pool: super::cpu::IndexCpuPool) -> Self {
+        let workers = pool.workers();
+        Self {
+            pool,
+            capacity: Arc::new(tokio::sync::Semaphore::new(workers)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -125,11 +150,11 @@ struct HotState {
     retired_selectors: Vec<RetiredSelectors>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct CompiledBucketRouter {
     generation: [u8; 32],
     root: PrefixNode,
-    pointers: Arc<[String]>,
+    projection_plan: Arc<CompiledScalarProjectionPlan>,
     charge: usize,
     selector_charge: usize,
 }
@@ -140,7 +165,7 @@ struct BuildingBucketRouter {
 }
 
 struct RetiredSelectors {
-    pointers: Arc<[String]>,
+    projection_plan: Arc<CompiledScalarProjectionPlan>,
     charge: usize,
 }
 
@@ -250,12 +275,13 @@ pub(crate) struct PendingHotProjection {
     router_generation: [u8; 32],
     projection_limit: usize,
     maximum_bytes: usize,
+    changes: tokio::sync::broadcast::Sender<()>,
 }
 
 struct PendingOwned {
     path: Arc<str>,
     bytes: Vec<u8>,
-    pointers: Arc<[String]>,
+    projection_plan: Arc<CompiledScalarProjectionPlan>,
 }
 
 struct RegisteredHotProjection {
@@ -278,6 +304,7 @@ impl Drop for PendingHotProjection {
             drop(key);
             release_pending_reservation(&mut state, self);
             emit_hot_resident(&state, self.maximum_bytes);
+            let _ = self.changes.send(());
         }
     }
 }
@@ -297,8 +324,8 @@ impl PendingHotProjection {
         &self.owned().bytes
     }
 
-    fn pointers(&self) -> &Arc<[String]> {
-        &self.owned().pointers
+    fn projection_plan(&self) -> &Arc<CompiledScalarProjectionPlan> {
+        &self.owned().projection_plan
     }
 
     fn key(&self) -> HotPathKey {
@@ -313,6 +340,7 @@ impl PendingHotProjection {
 impl Drop for RegisteredHotProjection {
     fn drop(&mut self) {
         if !self.cleanup_armed {
+            let _ = self.pending.changes.send(());
             return;
         }
         let key = self.pending.key();
@@ -331,6 +359,8 @@ impl Drop for RegisteredHotProjection {
         drop(key);
         release_pending_reservation(&mut state, &mut self.pending);
         emit_hot_resident(&state, self.pending.maximum_bytes);
+        drop(state);
+        let _ = self.pending.changes.send(());
     }
 }
 
@@ -355,7 +385,7 @@ impl HotProjectionIngress {
 
     pub(crate) fn install_cpu(&self, cpu: super::cpu::IndexCpuPool) -> Result<(), &'static str> {
         self.cpu
-            .set(cpu)
+            .set(HotProjectionCpu::new(cpu))
             .map_err(|_| "TypedJson hot indexing CPU pool was installed more than once")
     }
 
@@ -364,7 +394,7 @@ impl HotProjectionIngress {
     /// only clone the resulting selector `Arc`.
     pub(crate) fn replace_compiled_catalog(&self, snapshot: Arc<PhysicalCatalogSnapshot>) -> bool {
         let estimated = estimate_router_bytes(&snapshot);
-        {
+        let (catalog_admitted, wake_waiters) = {
             let mut state = self
                 .inner
                 .lock()
@@ -374,13 +404,21 @@ impl HotProjectionIngress {
             // it form one disposable view. Drop the view before sizing its
             // replacement; in-flight work remains charged by its reservation
             // and its token can no longer publish a stale completion.
-            clear_incompatible_slots(&mut state, snapshot.identity);
+            let wake_waiters = clear_incompatible_slots(&mut state, snapshot.identity);
             if total_bytes(&state).saturating_add(estimated) > self.maximum_bytes {
                 disable_routes(&mut state);
                 emit_hot_resident(&state, self.maximum_bytes);
-                return false;
+                (false, wake_waiters)
+            } else {
+                state.reserved_bytes = state.reserved_bytes.saturating_add(estimated);
+                (true, wake_waiters)
             }
-            state.reserved_bytes = state.reserved_bytes.saturating_add(estimated);
+        };
+        if wake_waiters {
+            let _ = self.changes.send(());
+        }
+        if !catalog_admitted {
+            return false;
         }
 
         let mut building = BTreeMap::<(u64, u64), BuildingBucketRouter>::new();
@@ -392,19 +430,36 @@ impl HotProjectionIngress {
                     pointers: BTreeSet::new(),
                 });
             bucket.insert(&recipe.path_prefix, recipe.content_type.as_deref());
-            bucket.pointers.extend(recipe.selectors.iter().cloned());
+            bucket
+                .pointers
+                .extend(recipe.projection_plan.pointers().iter().cloned());
         }
         let mut compiled = BTreeMap::new();
         for (identity, bucket) in building {
             let pointers = Arc::<[String]>::from(bucket.pointers.into_iter().collect::<Vec<_>>());
+            let Ok(projection_plan) = CompiledScalarProjectionPlan::compile(Arc::clone(&pointers))
+            else {
+                let mut state = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                disable_routes(&mut state);
+                state.reserved_bytes = state.reserved_bytes.saturating_sub(estimated);
+                emit_hot_resident(&state, self.maximum_bytes);
+                return false;
+            };
             let selector_charge = selector_resident_bytes(&pointers);
-            let charge = compiled_router_resident_bytes(&bucket.root, selector_charge);
+            let charge = compiled_router_resident_bytes(
+                &bucket.root,
+                selector_charge,
+                projection_plan.descriptor_resident_bytes(),
+            );
             compiled.insert(
                 identity,
                 CompiledBucketRouter {
                     generation: snapshot.identity,
                     root: bucket.root,
-                    pointers,
+                    projection_plan,
                     charge,
                     selector_charge,
                 },
@@ -423,7 +478,7 @@ impl HotProjectionIngress {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Admissions may have raced with router construction under the old
         // generation. Invalidate those tokens at the publication boundary.
-        clear_incompatible_slots(&mut state, snapshot.identity);
+        let wake_waiters = clear_incompatible_slots(&mut state, snapshot.identity);
         disable_routes(&mut state);
         reclaim_retired_selectors(&mut state);
         let additional_charge = compiled_charge.saturating_sub(estimated);
@@ -434,12 +489,20 @@ impl HotProjectionIngress {
             drop(compiled);
             state.reserved_bytes = state.reserved_bytes.saturating_sub(estimated);
             emit_hot_resident(&state, self.maximum_bytes);
+            drop(state);
+            if wake_waiters {
+                let _ = self.changes.send(());
+            }
             return false;
         }
         state.compiled_routes = compiled;
         state.router_bytes = state.router_bytes.saturating_add(compiled_charge);
         state.reserved_bytes = state.reserved_bytes.saturating_sub(estimated);
         emit_hot_resident(&state, self.maximum_bytes);
+        drop(state);
+        if wake_waiters {
+            let _ = self.changes.send(());
+        }
         true
     }
 
@@ -481,16 +544,16 @@ impl HotProjectionIngress {
                 return None;
             }
             let project = match_content_type && router.matches(key.path(), content_type);
-            Some((router.generation, router.pointers.clone(), project))
+            Some((router.generation, router.projection_plan.clone(), project))
         };
-        let (router_generation, pointers, project) = route?;
-        if !project || pointers.is_empty() {
+        let (router_generation, projection_plan, project) = route?;
+        if !project || projection_plan.pointers().is_empty() {
             return self.replay_only_pending(
                 tenant_id,
                 bucket_id,
                 key.path(),
                 router_generation,
-                pointers,
+                projection_plan,
             );
         }
         if bytes.is_none() {
@@ -499,7 +562,7 @@ impl HotProjectionIngress {
                 bucket_id,
                 key.path(),
                 router_generation,
-                pointers,
+                projection_plan,
             );
         }
         let bytes = bytes.expect("put bytes were checked");
@@ -509,20 +572,18 @@ impl HotProjectionIngress {
             monotonic_counter.keldra_index_pipeline_hot_offered_bytes_total = bytes.len() as u64,
             "committed payload offered to the bounded indexing fast path"
         );
-        // `project_scalar_pointers` charges construction to its selected-byte
-        // limit, then remaps that result from synthetic names to JSON pointers.
-        // Reserve both representations before cloning the source bytes. A hot
-        // projection that expands beyond this source-sized speculative window
-        // simply falls back to authoritative storage replay.
+        // The compiled ordinal plan charges selected construction to its byte
+        // limit and reuses the catalogue-owned descriptors. Reserve its parser
+        // workspace before cloning source bytes. A projection that expands
+        // beyond this speculative window falls back to authoritative replay.
         let sizing = || {
             let projection_limit = ENTRY_OVERHEAD_BYTES
                 .checked_add(bytes.len())?
-                .checked_add(selector_resident_bytes(&pointers).checked_mul(4)?)?
-                .checked_add(pointers.len().checked_mul(TREE_ENTRY_OVERHEAD_BYTES)?)?;
-            let projection_workspace = projection_limit.checked_mul(2)?;
-            let charge = pending_state_resident_bytes(key.path().len())
-                .checked_add(bytes.len())?
-                .checked_add(projection_workspace)?;
+                .checked_add(projection_plan.selection_floor_bytes())?;
+            let projection_workspace =
+                projection_limit.checked_add(projection_plan.scratch_resident_bytes())?;
+            let charge =
+                projected_pending_charge(key.path().len(), bytes.len(), projection_workspace)?;
             Some((projection_limit, charge))
         };
         let Some((projection_limit, charge)) = sizing() else {
@@ -532,7 +593,7 @@ impl HotProjectionIngress {
                 bucket_id,
                 key.path(),
                 router_generation,
-                pointers,
+                projection_plan,
             );
         };
         if charge > self.maximum_bytes {
@@ -542,7 +603,7 @@ impl HotProjectionIngress {
                 bucket_id,
                 key.path(),
                 router_generation,
-                pointers,
+                projection_plan,
             );
         }
         self.register_pending(
@@ -553,7 +614,7 @@ impl HotProjectionIngress {
             charge,
             true,
             router_generation,
-            pointers.clone(),
+            projection_plan.clone(),
             projection_limit,
         )
         .or_else(|| {
@@ -562,7 +623,7 @@ impl HotProjectionIngress {
                 bucket_id,
                 key.path(),
                 router_generation,
-                pointers,
+                projection_plan,
             )
         })
     }
@@ -573,7 +634,7 @@ impl HotProjectionIngress {
         bucket_id: u64,
         path: &str,
         router_generation: [u8; 32],
-        pointers: Arc<[String]>,
+        projection_plan: Arc<CompiledScalarProjectionPlan>,
     ) -> Option<PendingHotProjection> {
         self.register_pending(
             tenant_id,
@@ -583,7 +644,7 @@ impl HotProjectionIngress {
             pending_state_resident_bytes(path.len()),
             false,
             router_generation,
-            pointers,
+            projection_plan,
             0,
         )
     }
@@ -598,7 +659,7 @@ impl HotProjectionIngress {
         charge: usize,
         project: bool,
         router_generation: [u8; 32],
-        pointers: Arc<[String]>,
+        projection_plan: Arc<CompiledScalarProjectionPlan>,
         projection_limit: usize,
     ) -> Option<PendingHotProjection> {
         let (path, token) = {
@@ -610,8 +671,12 @@ impl HotProjectionIngress {
             if current_router_generation_parts(&state, tenant_id, bucket_id)
                 != Some(router_generation)
             {
-                cancel_path_parts(&mut state, tenant_id, bucket_id, path);
+                let wake_waiters = cancel_path_parts(&mut state, tenant_id, bucket_id, path);
                 emit_hot_resident(&state, self.maximum_bytes);
+                drop(state);
+                if wake_waiters {
+                    let _ = self.changes.send(());
+                }
                 return None;
             }
             evict_retained_until_fits(&mut state, charge, self.maximum_bytes);
@@ -621,15 +686,23 @@ impl HotProjectionIngress {
                 // This callback will have no token and therefore can never
                 // publish. Cancel existing state now so it cannot outlive a
                 // successful untracked mutation of this path.
-                cancel_path_parts(&mut state, tenant_id, bucket_id, path);
+                let wake_waiters = cancel_path_parts(&mut state, tenant_id, bucket_id, path);
                 emit_hot_resident(&state, self.maximum_bytes);
                 emit_rejected("inflight_budget_full", bytes.len() as u64);
+                drop(state);
+                if wake_waiters {
+                    let _ = self.changes.send(());
+                }
                 return None;
             }
             let Some(token) = allocate_token(&mut state) else {
-                cancel_path_parts(&mut state, tenant_id, bucket_id, path);
+                let wake_waiters = cancel_path_parts(&mut state, tenant_id, bucket_id, path);
                 emit_hot_resident(&state, self.maximum_bytes);
                 emit_rejected("sequence_exhausted", bytes.len() as u64);
+                drop(state);
+                if wake_waiters {
+                    let _ = self.changes.send(());
+                }
                 return None;
             };
             state.reserved_bytes = state
@@ -661,7 +734,7 @@ impl HotProjectionIngress {
             owned: Some(PendingOwned {
                 path,
                 bytes: bytes.to_vec(),
-                pointers,
+                projection_plan,
             }),
             charge,
             token,
@@ -671,6 +744,7 @@ impl HotProjectionIngress {
             router_generation,
             projection_limit,
             maximum_bytes: self.maximum_bytes,
+            changes: self.changes.clone(),
         })
     }
 
@@ -714,11 +788,26 @@ impl HotProjectionIngress {
             let _ = ingress.changes.send(());
             return;
         }
+        #[cfg(not(test))]
+        let execution_permit = match cpu
+            .as_ref()
+            .expect("hot projection CPU availability was checked")
+            .capacity
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                ingress.finish_replay_only(registered, "cpu_capacity_full", payload_bytes);
+                let _ = ingress.changes.send(());
+                return;
+            }
+        };
         #[cfg(test)]
         {
-            let selected = project_scalar_pointers(
+            let selected = project_compiled_scalar_pointers(
                 &mut Cursor::new(registered.pending.bytes()),
-                registered.pending.pointers(),
+                Arc::clone(registered.pending.projection_plan()),
                 registered.pending.projection_limit,
             );
             match selected {
@@ -737,15 +826,20 @@ impl HotProjectionIngress {
         {
             let cpu = cpu.expect("hot projection CPU availability was checked");
             tokio::spawn(async move {
+                // Admission covers both the async bridge and its queued Rayon
+                // closure. Cancellation drops this permit and RegisteredHotProjection,
+                // releasing queue capacity and the exact memory reservation.
+                let _execution_permit = execution_permit;
                 let task_ingress = ingress.clone();
                 let selected = cpu
+                    .pool
                     .submit(move || {
                         if !task_ingress.preparation_is_current(&registered) {
                             return (registered, None);
                         }
-                        let selected = project_scalar_pointers(
+                        let selected = project_compiled_scalar_pointers(
                             &mut Cursor::new(registered.pending.bytes()),
-                            registered.pending.pointers(),
+                            Arc::clone(registered.pending.projection_plan()),
                             registered.pending.projection_limit,
                         );
                         (registered, Some(selected))
@@ -799,12 +893,15 @@ impl HotProjectionIngress {
         // sibling that was already pending; a later successful callback still
         // retires this slot even though its own publish token is gone.
         cancel_pending_tokens_for_path(&mut state, &key);
-        let may_publish_version = supersede_older(&mut state, &key, exact_version);
+        let (may_publish_version, wake_waiters) = supersede_older(&mut state, &key, exact_version);
         if !claimed {
             drop(key);
             release_pending_reservation(&mut state, &mut pending);
             emit_hot_resident(&state, self.maximum_bytes);
             drop(state);
+            if wake_waiters {
+                let _ = self.changes.send(());
+            }
             emit_replay_required("cancelled_before_commit_callback", payload_bytes);
             return None;
         }
@@ -813,6 +910,9 @@ impl HotProjectionIngress {
             release_pending_reservation(&mut state, &mut pending);
             emit_hot_resident(&state, self.maximum_bytes);
             drop(state);
+            if wake_waiters {
+                let _ = self.changes.send(());
+            }
             emit_replay_required("stale_committed_version", payload_bytes);
             return None;
         }
@@ -821,6 +921,9 @@ impl HotProjectionIngress {
             release_pending_reservation(&mut state, &mut pending);
             emit_hot_resident(&state, self.maximum_bytes);
             drop(state);
+            if wake_waiters {
+                let _ = self.changes.send(());
+            }
             emit_replay_required("catalog_changed", payload_bytes);
             return None;
         }
@@ -835,6 +938,9 @@ impl HotProjectionIngress {
         );
         emit_hot_resident(&state, self.maximum_bytes);
         drop(state);
+        if wake_waiters {
+            let _ = self.changes.send(());
+        }
         Some(RegisteredHotProjection {
             router_generation: pending.router_generation,
             pending,
@@ -854,17 +960,25 @@ impl HotProjectionIngress {
         let claimed =
             claim_pending_token(&mut state, &key, pending.token, pending.router_generation);
         cancel_pending_tokens_for_path(&mut state, &key);
-        let may_publish_version = supersede_older(&mut state, &key, exact_version);
+        let (may_publish_version, wake_waiters) = supersede_older(&mut state, &key, exact_version);
         if !claimed || !may_publish_version {
             drop(key);
             release_pending_reservation(&mut state, &mut pending);
             emit_hot_resident(&state, self.maximum_bytes);
+            drop(state);
+            if wake_waiters {
+                let _ = self.changes.send(());
+            }
             return;
         }
         if current_router_generation(&state, &key) != Some(pending.router_generation) {
             drop(key);
             release_pending_reservation(&mut state, &mut pending);
             emit_hot_resident(&state, self.maximum_bytes);
+            drop(state);
+            if wake_waiters {
+                let _ = self.changes.send(());
+            }
             return;
         }
         let token = pending.token;
@@ -885,6 +999,10 @@ impl HotProjectionIngress {
             "a charged pending token reserves its replay barrier replacement"
         );
         emit_hot_resident(&state, self.maximum_bytes);
+        drop(state);
+        if wake_waiters {
+            let _ = self.changes.send(());
+        }
     }
 
     fn preparation_is_current(&self, registered: &RegisteredHotProjection) -> bool {
@@ -995,7 +1113,7 @@ impl HotProjectionIngress {
         };
         let charge = ready_slot_resident_bytes(
             registered.pending.path().len(),
-            registered.pending.pointers().len(),
+            registered.pending.projection_plan().pointers().len(),
             selected_bytes,
         );
         let Some(charge) = charge.filter(|charge| *charge <= self.maximum_bytes) else {
@@ -1094,6 +1212,55 @@ impl HotProjectionIngress {
         );
     }
 
+    /// Await an exact committed hot selection only while its already-admitted
+    /// preparation is still running. This closes the race where the journal
+    /// consumer used to delete a `Preparing` slot and synchronously reopen the
+    /// same payload from authoritative storage.
+    pub(crate) async fn take_exact_selected_for_generation_wait(
+        &self,
+        tenant_id: u64,
+        bucket_id: u64,
+        path: &str,
+        version: u64,
+        router_generation: [u8; 32],
+    ) -> Option<ProjectedScalarPointers> {
+        let mut changes = self.subscribe();
+        loop {
+            let waiting = {
+                let state = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let key = HotPathKey {
+                    tenant_id,
+                    bucket_id,
+                    path: Arc::from(path),
+                };
+                matches!(
+                    state.slots.get(&key),
+                    Some(HotSlot::Preparing {
+                        exact_version,
+                        router_generation: generation,
+                        ..
+                    }) if *exact_version == VersionId(version)
+                        && *generation == router_generation
+                )
+            };
+            if !waiting {
+                return self.take_exact_selected_for_generation(
+                    tenant_id,
+                    bucket_id,
+                    path,
+                    version,
+                    router_generation,
+                );
+            }
+            if changes.recv().await.is_err() {
+                return None;
+            }
+        }
+    }
+
     pub(crate) fn take_exact_selected_for_generation(
         &self,
         tenant_id: u64,
@@ -1135,6 +1302,13 @@ impl HotProjectionIngress {
             if cancelled_pending != 0 {
                 emit_hot_resident(&state, self.maximum_bytes);
             }
+            return None;
+        }
+        if state
+            .slots
+            .get(&key)
+            .is_some_and(|slot| matches!(slot, HotSlot::Preparing { .. }))
+        {
             return None;
         }
         let slot = remove_slot(&mut state, &key).expect("observed hot slot remained locked");
@@ -1199,13 +1373,17 @@ impl HotProjectionIngress {
             .get(&key)
             .is_some_and(|slot| slot.exact_version() <= VersionId(version))
         {
-            remove_slot(&mut state, &key);
-            true
+            remove_slot(&mut state, &key)
         } else {
-            false
+            None
         };
-        if removed || cancelled_pending != 0 {
+        if removed.is_some() || cancelled_pending != 0 {
             emit_hot_resident(&state, self.maximum_bytes);
+        }
+        let wake_waiters = removed.is_some_and(|slot| matches!(slot, HotSlot::Preparing { .. }));
+        drop(state);
+        if wake_waiters {
+            let _ = self.changes.send(());
         }
     }
 
@@ -1273,15 +1451,20 @@ impl HotProjectionIngress {
         router.insert("", Some("application/json"));
         router.pointers.insert("/value".into());
         let pointers = Arc::from(router.pointers.into_iter().collect::<Vec<_>>());
+        let projection_plan = CompiledScalarProjectionPlan::compile(Arc::clone(&pointers)).unwrap();
         let selector_charge = selector_resident_bytes(&pointers);
-        let charge = compiled_router_resident_bytes(&router.root, selector_charge);
+        let charge = compiled_router_resident_bytes(
+            &router.root,
+            selector_charge,
+            projection_plan.descriptor_resident_bytes(),
+        );
         state.router_bytes = state.router_bytes.saturating_add(charge);
         state.compiled_routes.insert(
             (tenant_id, bucket_id),
             CompiledBucketRouter {
                 generation: [9; 32],
                 root: router.root,
-                pointers,
+                projection_plan,
                 charge,
                 selector_charge,
             },
@@ -1345,7 +1528,7 @@ fn cancel_pending_tokens_for_path(state: &mut HotState, key: &HotPathKey) -> usi
     before.saturating_sub(state.pending_tokens.len())
 }
 
-fn cancel_path_parts(state: &mut HotState, tenant_id: u64, bucket_id: u64, path: &str) {
+fn cancel_path_parts(state: &mut HotState, tenant_id: u64, bucket_id: u64, path: &str) -> bool {
     state.pending_tokens.retain(|pending, _| {
         pending.path.tenant_id != tenant_id
             || pending.path.bucket_id != bucket_id
@@ -1358,9 +1541,8 @@ fn cancel_path_parts(state: &mut HotState, tenant_id: u64, bucket_id: u64, path:
             key.tenant_id == tenant_id && key.bucket_id == bucket_id && key.path.as_ref() == path
         })
         .cloned();
-    if let Some(key) = slot {
-        remove_slot(state, &key);
-    }
+    slot.and_then(|key| remove_slot(state, &key))
+        .is_some_and(|slot| matches!(slot, HotSlot::Preparing { .. }))
 }
 
 fn allocate_token(state: &mut HotState) -> Option<u64> {
@@ -1389,11 +1571,16 @@ fn preparing_matches(
 
 /// Remove a strictly older version before publishing the path's next state.
 /// Equal or newer versions win when commit callbacks arrive out of order.
-fn supersede_older(state: &mut HotState, key: &HotPathKey, exact_version: VersionId) -> bool {
+fn supersede_older(
+    state: &mut HotState,
+    key: &HotPathKey,
+    exact_version: VersionId,
+) -> (bool, bool) {
     match state.slots.get(key).map(HotSlot::exact_version) {
-        Some(current) if current >= exact_version => false,
+        Some(current) if current >= exact_version => (false, false),
         Some(_) => {
-            remove_slot(state, key);
+            let wake_waiters = remove_slot(state, key)
+                .is_some_and(|slot| matches!(slot, HotSlot::Preparing { .. }));
             super::v1_telemetry::V1PipelineTelemetry::add(
                 &super::v1_telemetry::global().hot_superseded,
                 1,
@@ -1403,9 +1590,9 @@ fn supersede_older(state: &mut HotState, key: &HotPathKey, exact_version: Versio
                 monotonic_counter.keldra_index_pipeline_hot_superseded_rows_total = 1_u64,
                 "newer committed object superseded hot-ingress path state"
             );
-            true
+            (true, wake_waiters)
         }
-        None => true,
+        None => (true, false),
     }
 }
 
@@ -1416,7 +1603,7 @@ fn remove_slot(state: &mut HotState, key: &HotPathKey) -> Option<HotSlot> {
     Some(slot)
 }
 
-fn clear_incompatible_slots(state: &mut HotState, router_generation: [u8; 32]) {
+fn clear_incompatible_slots(state: &mut HotState, router_generation: [u8; 32]) -> bool {
     state
         .pending_tokens
         .retain(|_, generation| *generation == router_generation);
@@ -1426,9 +1613,10 @@ fn clear_incompatible_slots(state: &mut HotState, router_generation: [u8; 32]) {
         .filter(|(_, slot)| slot.router_generation() != router_generation)
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
-    for key in incompatible {
-        remove_slot(state, &key);
-    }
+    incompatible.into_iter().fold(false, |wake, key| {
+        remove_slot(state, &key).is_some_and(|slot| matches!(slot, HotSlot::Preparing { .. }))
+            || wake
+    })
 }
 
 fn insert_replay_only(
@@ -1529,6 +1717,17 @@ fn pending_state_resident_bytes(path_bytes: usize) -> usize {
         .saturating_add(std::mem::size_of::<PendingHotProjection>())
 }
 
+fn projected_pending_charge(
+    path_bytes: usize,
+    payload_bytes: usize,
+    projection_workspace: usize,
+) -> Option<usize> {
+    pending_state_resident_bytes(path_bytes)
+        .checked_add(payload_bytes)?
+        .checked_add(projection_workspace)?
+        .checked_add(HOT_EXECUTION_OVERHEAD_BYTES)
+}
+
 fn replay_slot_resident_bytes(path_bytes: usize) -> Option<usize> {
     retained_slot_state_resident_bytes(path_bytes)
 }
@@ -1583,9 +1782,14 @@ fn prefix_node_resident_bytes(node: &PrefixNode) -> usize {
         )
 }
 
-fn compiled_router_resident_bytes(root: &PrefixNode, selector_bytes: usize) -> usize {
+fn compiled_router_resident_bytes(
+    root: &PrefixNode,
+    selector_bytes: usize,
+    projection_plan_bytes: usize,
+) -> usize {
     prefix_node_resident_bytes(root)
         .saturating_add(selector_bytes)
+        .saturating_add(projection_plan_bytes)
         .saturating_add(TREE_ENTRY_OVERHEAD_BYTES)
         .saturating_add(std::mem::size_of::<(u64, u64)>())
         .saturating_add(
@@ -1606,15 +1810,14 @@ fn estimate_router_bytes(snapshot: &PhysicalCatalogSnapshot) -> usize {
                 .saturating_add(std::mem::size_of::<String>())
                 .saturating_add(content_type.capacity())
         });
-        let selector_tree = recipe
-            .selectors
-            .len()
-            .saturating_mul(TREE_ENTRY_OVERHEAD_BYTES);
+        let selectors = recipe.projection_plan.pointers();
+        let selector_tree = selectors.len().saturating_mul(TREE_ENTRY_OVERHEAD_BYTES);
         bytes
             .saturating_add(TREE_ENTRY_OVERHEAD_BYTES.saturating_mul(2))
             .saturating_add(path_nodes)
             .saturating_add(content_type)
-            .saturating_add(selector_resident_bytes(&recipe.selectors))
+            .saturating_add(selector_resident_bytes(selectors))
+            .saturating_add(recipe.projection_plan.descriptor_resident_bytes())
             .saturating_add(selector_tree)
     })
 }
@@ -1622,7 +1825,7 @@ fn estimate_router_bytes(snapshot: &PhysicalCatalogSnapshot) -> usize {
 fn reclaim_retired_selectors(state: &mut HotState) {
     let mut reclaimed = 0_usize;
     state.retired_selectors.retain(|retired| {
-        if Arc::strong_count(&retired.pointers) == 1 {
+        if Arc::strong_count(&retired.projection_plan) == 1 {
             reclaimed = reclaimed.saturating_add(retired.charge);
             false
         } else {
@@ -1639,13 +1842,15 @@ fn disable_routes(state: &mut HotState) {
     let routes = std::mem::take(&mut state.compiled_routes);
     for (_, router) in routes {
         state.router_bytes = state.router_bytes.saturating_sub(router.charge);
-        if Arc::strong_count(&router.pointers) > 1 {
-            let charge = router.selector_charge.saturating_add(
-                ENTRY_OVERHEAD_BYTES.saturating_add(std::mem::size_of::<RetiredSelectors>()),
-            );
+        if Arc::strong_count(&router.projection_plan) > 1 {
+            let charge = router
+                .selector_charge
+                .saturating_add(router.projection_plan.descriptor_resident_bytes())
+                .saturating_add(ENTRY_OVERHEAD_BYTES)
+                .saturating_add(std::mem::size_of::<RetiredSelectors>());
             state.router_bytes = state.router_bytes.saturating_add(charge);
             state.retired_selectors.push(RetiredSelectors {
-                pointers: router.pointers,
+                projection_plan: router.projection_plan,
                 charge,
             });
         }

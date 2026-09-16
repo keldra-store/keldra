@@ -1,6 +1,12 @@
 //! Retained state for retryable and asynchronously verified v1 publication.
 
 use super::*;
+use std::future::Future;
+use std::pin::Pin;
+
+type PostCasVerificationFuture = Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>;
+type PostCasVerificationFactory =
+    Arc<dyn Fn() -> PostCasVerificationFuture + Send + Sync + 'static>;
 
 #[derive(Clone, Default)]
 pub(super) struct ObservedSourceProgress(
@@ -81,7 +87,7 @@ pub(super) struct AtomicPublicationPlan {
     pub(super) sealed_bytes: u64,
     pub(super) source_positions: u64,
     pub(super) state_updates: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    pub(super) _publication_credits: AtomicProjectionPublicationCredits,
+    pub(super) _publication_credits: Option<AtomicProjectionPublicationCredits>,
 }
 
 /// Fully encoded deterministic successor retained across transient staging,
@@ -103,22 +109,68 @@ pub(crate) struct PendingV1Publication {
 /// durable concurrently, but its Current CAS must await this proof.
 pub(crate) struct V1PostCasVerification {
     pub(super) task: Option<tokio::task::JoinHandle<Result<(), Status>>>,
+    retry: PostCasVerificationFactory,
 }
 
 impl V1PostCasVerification {
+    pub(super) fn start<F, Fut>(factory: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), Status>> + Send + 'static,
+    {
+        let retry: PostCasVerificationFactory = Arc::new(move || Box::pin(factory()));
+        let task = Some(tokio::spawn(retry()));
+        Self { task, retry }
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.task
             .as_ref()
             .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
-    pub(crate) async fn finish(mut self) -> Result<(), Status> {
-        self.task
+    async fn finish_attempt(&mut self) -> Result<(), Status> {
+        let result = match self
+            .task
             .take()
             .expect("v1 post-CAS verifier task exists")
             .await
-            .map_err(|error| Status::internal(format!("v1 post-CAS verifier failed: {error}")))?
+        {
+            Ok(result) => result,
+            Err(error) => Err(Status::internal(format!(
+                "v1 post-CAS verifier failed: {error}"
+            ))),
+        };
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code() != tonic::Code::DataLoss)
+        {
+            self.task = Some(tokio::spawn((self.retry)()));
+        }
+        result
     }
+}
+
+/// Complete one mandatory exact readback. A transient failure leaves a fresh
+/// attempt installed in `verification`, so the next publication cannot evade
+/// the proof by retrying. Only success or a contained integrity failure clears
+/// the obligation.
+pub(crate) async fn finish_required_post_cas_verification(
+    verification: &mut Option<V1PostCasVerification>,
+) -> Result<(), Status> {
+    let result = verification
+        .as_mut()
+        .expect("v1 post-CAS verifier exists")
+        .finish_attempt()
+        .await;
+    if result.is_ok()
+        || result
+            .as_ref()
+            .is_err_and(|error| error.code() == tonic::Code::DataLoss)
+    {
+        verification.take();
+    }
+    result
 }
 
 impl Drop for V1PostCasVerification {

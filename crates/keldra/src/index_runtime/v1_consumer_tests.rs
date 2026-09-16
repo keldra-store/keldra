@@ -299,6 +299,7 @@ fn mutation(path: &str, offset: u64) -> Mutation {
         canonical_path: None,
         version: offset,
         deleted: false,
+        atomic_group: None,
         predecessor_absent_at_window_start: false,
     }
 }
@@ -426,7 +427,7 @@ fn empty_physical_family_writers_do_not_preallocate_query_capacity() {
 }
 
 #[test]
-fn projection_batch_headroom_scales_with_pipeline_memory() {
+fn projection_batch_headroom_scales_while_advance_work_remains_bounded() {
     let config = IndexRuntimeConfig::new(4)
         .unwrap()
         .with_pipeline_memory_bytes(4 * 1024 * 1024 * 1024)
@@ -434,22 +435,19 @@ fn projection_batch_headroom_scales_with_pipeline_memory() {
     let limits = limits(config).unwrap();
 
     assert_eq!(limits.bytes, 2 * 1024 * 1024 * 1024);
-    assert_eq!(limits.flush_bytes, 16 * 1024 * 1024);
+    assert_eq!(limits.flush_bytes, MAX_ADVANCE_SLICE_BYTES);
     assert_eq!(limits.projection_batch_bytes, 512 * 1024 * 1024);
-    assert_eq!(
-        limits.flush_operations,
-        IndexRuntimeConfig::DEFAULT_FLUSH_MAX_OPERATIONS
-    );
+    assert_eq!(limits.flush_operations, 4_096);
 }
 
 #[test]
-fn configured_flush_operation_bound_is_not_replaced_by_a_fixed_small_batch() {
+fn configured_flush_operation_bound_is_capped_for_visibility_latency() {
     let config = IndexRuntimeConfig::new(4)
         .unwrap()
         .with_flush_boundaries(16 * 1024 * 1024, 1_000, 131_072)
         .unwrap();
 
-    assert_eq!(limits(config).unwrap().flush_operations, 131_072);
+    assert_eq!(limits(config).unwrap().flush_operations, 4_096);
 }
 
 #[test]
@@ -487,12 +485,54 @@ fn no_progress_does_not_busy_reschedule_a_partition() {
 
 #[test]
 fn rolling_preparation_refills_only_available_bounded_lanes() {
-    assert_eq!(preparation_refill_size(10, 0, 4), 4);
-    assert_eq!(preparation_refill_size(10, 2, 4), 2);
-    assert_eq!(preparation_refill_size(10, 3, 4), 0);
+    assert_eq!(preparation_refill_size(1_000, 0, 4), 4);
+    assert_eq!(preparation_refill_size(1_000, 2, 4), 2);
+    assert_eq!(preparation_refill_size(1_000, 3, 4), 1);
+    assert_eq!(preparation_refill_size(10, 0, 4), 1);
     assert_eq!(preparation_refill_size(1, 0, 4), 1);
     assert_eq!(preparation_refill_size(0, 0, 4), 0);
     assert_eq!(preparation_refill_size(3, 0, 0), 1);
+}
+
+#[test]
+fn preparation_jobs_are_substantial_bounded_chunks() {
+    assert_eq!(preparation_chunk_size(0), 0);
+    assert_eq!(preparation_chunk_size(1), 1);
+    assert_eq!(preparation_chunk_size(256), 256);
+    assert_eq!(preparation_chunk_size(10_000), 256);
+}
+
+#[test]
+fn preparation_chunk_admits_one_bounded_batch_workspace_before_exact_retention() {
+    let bytes = 128 * 1_024;
+    let credits = IndexingMemoryCredits::new(
+        bytes,
+        IndexingMemoryLimits {
+            hot_payload_bytes: bytes,
+            worker_scratch_bytes: bytes,
+            prepared_rows_bytes: bytes,
+            replay_input_bytes: bytes,
+            projection_accumulator_bytes: bytes,
+            seal_scratch_bytes: bytes,
+            ordering_catalog_bytes: bytes,
+        },
+    )
+    .unwrap();
+
+    let construction = acquire_preparation_construction(&credits, 1_024, 256).unwrap();
+    let expected = 1_024 + 256 * std::mem::size_of::<Mutation>();
+    assert_eq!(construction.bytes(), expected);
+    assert_eq!(
+        credits.stage_used_bytes(IndexingMemoryStage::ReplayInput),
+        expected,
+        "a 256-item CPU chunk charges its descriptor vector and one bounded batch workspace, not 256 independent workspaces"
+    );
+    assert!(expected < 256 * 1_024);
+    drop(construction);
+    assert_eq!(
+        credits.stage_used_bytes(IndexingMemoryStage::ReplayInput),
+        0
+    );
 }
 
 #[test]
@@ -501,6 +541,15 @@ fn journal_read_ahead_tracks_worker_capacity_without_becoming_unbounded() {
     assert_eq!(journal_read_ahead_pages(1), 2);
     assert_eq!(journal_read_ahead_pages(4), 8);
     assert_eq!(journal_read_ahead_pages(64), 32);
+}
+
+#[test]
+fn producer_advance_slices_have_a_hard_operation_ceiling() {
+    assert_eq!(bounded_advance_operations(u64::MAX), 4_096);
+    assert_eq!(bounded_advance_operations(8_192), 4_096);
+    assert_eq!(bounded_advance_operations(512), 512);
+    assert_eq!(bounded_advance_operations(0), 1);
+    assert_eq!(MAX_ADVANCE_SLICE_BYTES, 4 * 1024 * 1024);
 }
 
 #[test]
@@ -514,27 +563,43 @@ fn only_the_latest_background_lag_observation_can_publish() {
 }
 
 #[test]
-fn publication_chunks_preserve_atomic_offset_groups_and_contiguous_cuts() {
+fn publication_chunks_preserve_named_atomic_groups_and_contiguous_cuts() {
     let mutations = vec![
         mutation("objects/a", 1),
-        mutation("objects/b", 2),
+        Mutation {
+            atomic_group: Some(9),
+            ..mutation("objects/b", 2)
+        },
         Mutation {
             ordinal: 1,
+            atomic_group: Some(9),
             ..mutation("objects/c", 2)
         },
         mutation("objects/d", 3),
         mutation("objects/e", 4),
     ];
 
-    let chunks = mutation_publication_chunks(mutations, 5, 2).unwrap();
+    let chunks = publication_chunks(
+        mutations,
+        5,
+        2,
+        9,
+        9,
+        |mutation| mutation.offset,
+        |mutation| mutation.atomic_group,
+    )
+    .unwrap();
 
     assert_eq!(chunks.len(), 2);
-    assert_eq!(chunks[0].0.len(), 3);
-    assert_eq!(chunks[0].1, 3);
-    assert_eq!(chunks[1].0.len(), 2);
-    assert_eq!(chunks[1].1, 5);
-    assert!(chunks.iter().all(|(chunk, _)| {
+    assert_eq!(chunks[0].mutations.len(), 3);
+    assert_eq!(chunks[0].next, 3);
+    assert_eq!(chunks[0].through_atomic, 9);
+    assert_eq!(chunks[1].mutations.len(), 2);
+    assert_eq!(chunks[1].next, 5);
+    assert_eq!(chunks[1].through_atomic, 9);
+    assert!(chunks.iter().all(|chunk| {
         chunk
+            .mutations
             .windows(2)
             .all(|pair| (pair[0].offset, pair[0].ordinal) < (pair[1].offset, pair[1].ordinal))
     }));
@@ -545,15 +610,138 @@ fn one_large_atomic_group_remains_indivisible() {
     let mutations = (0..8)
         .map(|ordinal| Mutation {
             ordinal,
+            atomic_group: Some(77),
             ..mutation(&format!("objects/{ordinal}"), 7)
         })
         .collect();
 
-    let chunks = mutation_publication_chunks(mutations, 8, 2).unwrap();
+    let chunks = publication_chunks(
+        mutations,
+        8,
+        2,
+        76,
+        77,
+        |mutation| mutation.offset,
+        |mutation| mutation.atomic_group,
+    )
+    .unwrap();
 
     assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].0.len(), 8);
-    assert_eq!(chunks[0].1, 8);
+    assert_eq!(chunks[0].mutations.len(), 8);
+    assert_eq!(chunks[0].next, 8);
+    assert_eq!(chunks[0].through_atomic, 77);
+}
+
+#[test]
+fn distinct_source_offsets_in_one_atomic_group_cross_the_slice_together() {
+    let mut mutations = (1..=4_095)
+        .map(|offset| mutation(&format!("ordinary/{offset}"), offset))
+        .collect::<Vec<_>>();
+    mutations.push(Mutation {
+        atomic_group: Some(91),
+        ..mutation("atomic/a", 4_096)
+    });
+    mutations.push(Mutation {
+        atomic_group: Some(91),
+        ..mutation("atomic/b", 4_097)
+    });
+    mutations.push(mutation("ordinary/tail", 4_098));
+
+    let chunks = publication_chunks(
+        mutations,
+        4_099,
+        4_096,
+        91,
+        91,
+        |mutation| mutation.offset,
+        |mutation| mutation.atomic_group,
+    )
+    .unwrap();
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].mutations.len(), 4_097);
+    assert_eq!(chunks[0].next, 4_098);
+    assert_eq!(chunks[0].through_atomic, 91);
+    assert_eq!(chunks[1].mutations.len(), 1);
+    assert_eq!(chunks[1].next, 4_099);
+    assert_eq!(chunks[1].through_atomic, 91);
+}
+
+#[test]
+fn atomic_chunk_is_not_visible_at_an_older_cross_partition_common_cut() {
+    let mutations = vec![
+        Mutation {
+            atomic_group: Some(91),
+            ..mutation("atomic/a", 1)
+        },
+        Mutation {
+            ordinal: 1,
+            atomic_group: Some(91),
+            ..mutation("atomic/b", 1)
+        },
+        mutation("ordinary/tail", 2),
+    ];
+    let chunks = publication_chunks(
+        mutations,
+        3,
+        2,
+        90,
+        90,
+        |mutation| mutation.offset,
+        |mutation| mutation.atomic_group,
+    )
+    .unwrap();
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].through_atomic, 91);
+    let other_partition_through_atomic = 90;
+    let common_cut = chunks[0].through_atomic.min(other_partition_through_atomic);
+    assert_eq!(common_cut, 90);
+    assert!(chunks[0].through_atomic > common_cut);
+}
+
+#[test]
+fn superseding_mutation_cannot_split_an_atomic_unit_across_generations() {
+    let units = vec![
+        (
+            91,
+            vec![
+                Mutation {
+                    atomic_group: Some(91),
+                    ..mutation("objects/a", 1)
+                },
+                Mutation {
+                    ordinal: 1,
+                    atomic_group: Some(91),
+                    ..mutation("objects/b", 1)
+                },
+            ],
+        ),
+        (0, vec![mutation("objects/a", 2), mutation("ordinary/c", 3)]),
+    ];
+    let (page_atomic, mutations) = coalesce_units(90, units).unwrap();
+    assert_eq!(
+        mutations
+            .iter()
+            .map(|mutation| mutation.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["objects/b", "objects/a", "ordinary/c"]
+    );
+
+    let chunks = publication_chunks(
+        mutations,
+        4,
+        2,
+        90,
+        page_atomic,
+        |mutation| mutation.offset,
+        |mutation| mutation.atomic_group,
+    )
+    .unwrap();
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].through_atomic, 91);
+    assert_eq!(chunks[0].next, 4);
 }
 
 #[test]
@@ -824,4 +1012,12 @@ fn replay_selection_holds_measured_metadata_not_construction_headroom() {
 
     assert!(retained < 1024);
     assert!(retained >= std::mem::size_of::<SelectedMutation>());
+}
+
+#[test]
+fn completed_compaction_is_harvested_without_new_source_work() {
+    assert!(should_harvest_background_compaction(true, 0, true, true));
+    assert!(!should_harvest_background_compaction(true, 1, true, true));
+    assert!(!should_harvest_background_compaction(true, 0, false, true));
+    assert!(!should_harvest_background_compaction(true, 0, true, false));
 }
