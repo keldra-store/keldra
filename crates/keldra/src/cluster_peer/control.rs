@@ -1,6 +1,8 @@
 use std::sync::{Arc, OnceLock};
 
-use keldra_store::{LogicalRecordId, LogicalRecordValue, PlacementLogId, TupleBatchRequest};
+use keldra_store::{
+    BindSchemaRequest, LogicalRecordId, LogicalRecordValue, PlacementLogId, TupleBatchRequest,
+};
 use tonic::{Request, Response, Status};
 
 use super::{CLUSTER_PEER_SCHEMA_VERSION, ClusterPeerService, decode_json, encode_json, wire};
@@ -314,13 +316,17 @@ impl ClusterPeerService {
         request: Request<wire::CoordinateSystemGrantRequest>,
     ) -> Result<Response<wire::CoordinateSystemGrantResponse>, Status> {
         let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
-        self.require_executor_source(admitted.authenticated.node_id)?;
+        if request.get_ref().first_realm_owner_grant {
+            self.require_executor_source_retryable(admitted.authenticated.node_id)?;
+        } else {
+            self.require_executor_source(admitted.authenticated.node_id)?;
+        }
         let value: TupleBatchRequest = decode_json(&request.get_ref().tuple_batch_json)?;
         let receipt = tokio::time::timeout(
             admitted.timeout,
             self.distributed_control
                 .get()?
-                .coordinate_system_grant(value),
+                .coordinate_system_grant(value, request.get_ref().first_realm_owner_grant),
         )
         .await
         .map_err(|_| Status::deadline_exceeded("system grant deadline exceeded"))??;
@@ -328,6 +334,62 @@ impl ClusterPeerService {
         Ok(Response::new(wire::CoordinateSystemGrantResponse {
             schema_version: CLUSTER_PEER_SCHEMA_VERSION,
             receipt_json: encode_json(&receipt)?,
+        }))
+    }
+
+    pub(super) async fn route_first_realm_binding_call(
+        &self,
+        request: Request<wire::RouteFirstRealmBindingRequest>,
+    ) -> Result<Response<wire::FirstRealmBindingResponse>, Status> {
+        let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 1)?;
+        let bearer = OriginalBearer::from_metadata(request.metadata())?;
+        let value: BindSchemaRequest = decode_json(&request.get_ref().binding_json)?;
+        let bound = tokio::time::timeout(
+            admitted.timeout,
+            self.distributed_control
+                .get()?
+                .execute_routed_first_realm_binding(
+                    bearer.signed_token(),
+                    request.get_ref().stable_tenant_id,
+                    value,
+                ),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("first realm binding deadline exceeded"))??;
+        self.require_unchanged_control(admitted.placement.fence())?;
+        Ok(Response::new(wire::FirstRealmBindingResponse {
+            schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+            bound_realm_json: encode_json(&bound)?,
+        }))
+    }
+
+    pub(super) async fn coordinate_first_realm_binding_call(
+        &self,
+        request: Request<wire::CoordinateFirstRealmBindingRequest>,
+    ) -> Result<Response<wire::FirstRealmBindingResponse>, Status> {
+        let admitted = self.admit(&request, request.get_ref().peer.as_ref(), 0)?;
+        self.require_executor_source_retryable(admitted.authenticated.node_id)?;
+        let value: BindSchemaRequest = decode_json(&request.get_ref().binding_json)?;
+        let bound = tokio::time::timeout(
+            admitted.timeout,
+            self.distributed_control
+                .get()?
+                .coordinate_first_realm_binding(
+                    request.get_ref().stable_tenant_id,
+                    value,
+                    request.get_ref().validate_only,
+                ),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("realm binding coordination deadline exceeded"))??;
+        self.require_unchanged_control(admitted.placement.fence())?;
+        Ok(Response::new(wire::FirstRealmBindingResponse {
+            schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+            bound_realm_json: bound
+                .as_ref()
+                .map(encode_json)
+                .transpose()?
+                .unwrap_or_default(),
         }))
     }
 
@@ -346,6 +408,15 @@ impl ClusterPeerService {
                 "administration coordination source is not the nominated executor",
             ))
         }
+    }
+
+    fn require_executor_source_retryable(
+        &self,
+        source: keldra_consensus::NodeId,
+    ) -> Result<(), Status> {
+        self.require_executor_source(source).map_err(|_| {
+            Status::unavailable("nominated executor changed during first realm binding")
+        })
     }
 
     fn require_unchanged_control(&self, expected: PlacementLogId) -> Result<(), Status> {

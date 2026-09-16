@@ -5,8 +5,8 @@ use std::sync::{Arc, OnceLock};
 use keldra_authz::AuthorizationCheck;
 use keldra_consensus::{NodeId, PeerSpkiSha256};
 use keldra_store::{
-    AuthzConsistency, AuthzRealmMutation, AuthzRealmSnapshotError, AuthzRealmTransferManifest,
-    AuthzRevision, AuthzScope, AuthzStoreError, PlacementLogId,
+    AuthzBatchCheck, AuthzConsistency, AuthzRealmMutation, AuthzRealmSnapshotError,
+    AuthzRealmTransferManifest, AuthzRevision, AuthzScope, AuthzStoreError, PlacementLogId,
 };
 use tonic::{Request, Response, Status, Streaming};
 
@@ -43,37 +43,7 @@ pub(crate) trait FreshAuthorizationHandler: Send + Sync + 'static {
         scope: AuthzScope,
         consistency: AuthzConsistency,
         checks: Vec<AuthorizationCheck>,
-    ) -> Result<(Vec<bool>, AuthzRevision, u64), Status> {
-        if checks.is_empty() {
-            return Err(Status::invalid_argument(
-                "authorization check batch must not be empty",
-            ));
-        }
-        let mut allowed = Vec::with_capacity(checks.len());
-        let mut pinned = None;
-        let mut generation = None;
-        for check in checks {
-            let requested = pinned.map_or(consistency, AuthzConsistency::Exact);
-            let (result, revision, observed_generation) = self
-                .fresh_check(stable_tenant_id, scope.clone(), requested, check)
-                .await?;
-            if pinned.is_some_and(|pinned| pinned != revision)
-                || generation.is_some_and(|generation| generation != observed_generation)
-            {
-                return Err(Status::unavailable(
-                    "authorization revision changed during batch evaluation",
-                ));
-            }
-            pinned = Some(revision);
-            generation = Some(observed_generation);
-            allowed.push(result);
-        }
-        Ok((
-            allowed,
-            pinned.expect("non-empty checks establish a revision"),
-            generation.expect("non-empty checks establish a generation"),
-        ))
-    }
+    ) -> Result<AuthzBatchCheck, Status>;
 }
 
 #[tonic::async_trait]
@@ -101,8 +71,8 @@ impl FreshAuthorizationHandler for ZanzibarDistribution {
         scope: AuthzScope,
         consistency: AuthzConsistency,
         checks: Vec<AuthorizationCheck>,
-    ) -> Result<(Vec<bool>, AuthzRevision, u64), Status> {
-        ZanzibarDistribution::fresh_checks_with_generation(
+    ) -> Result<AuthzBatchCheck, Status> {
+        ZanzibarDistribution::fresh_checks_with_evidence(
             self,
             stable_tenant_id,
             scope,
@@ -152,7 +122,7 @@ impl LateBoundFreshAuthorization {
         scope: AuthzScope,
         consistency: AuthzConsistency,
         checks: Vec<AuthorizationCheck>,
-    ) -> Result<(Vec<bool>, AuthzRevision, u64), Status> {
+    ) -> Result<AuthzBatchCheck, Status> {
         let handler = self
             .inner
             .get()
@@ -466,7 +436,7 @@ impl ClusterPeerService {
             deadline,
         )
         .await?;
-        let (allowed, revision, binding_generation) = tokio::time::timeout_at(
+        let evidence = tokio::time::timeout_at(
             deadline,
             self.fresh_authorization
                 .check_many(stable_tenant_id, scope, consistency, checks),
@@ -475,9 +445,10 @@ impl ClusterPeerService {
         .map_err(|_| Status::deadline_exceeded("authorization deadline exceeded"))??;
         Ok(Response::new(wire::FreshAuthorizationChecksResult {
             schema_version: CLUSTER_PEER_SCHEMA_VERSION,
-            allowed,
-            revision: revision.0,
-            binding_generation,
+            allowed: evidence.allowed,
+            revision: evidence.revision.0,
+            binding_generation: evidence.binding_generation,
+            schema_ref: Some(crate::authz_api::schema_ref_to_api(&evidence.schema_ref)),
         }))
     }
 }

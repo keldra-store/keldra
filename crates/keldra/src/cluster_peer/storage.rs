@@ -982,6 +982,13 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         self.route_admin_change_application_role_call(request).await
     }
 
+    async fn route_first_realm_binding(
+        &self,
+        request: Request<wire::RouteFirstRealmBindingRequest>,
+    ) -> Result<Response<wire::FirstRealmBindingResponse>, Status> {
+        self.route_first_realm_binding_call(request).await
+    }
+
     async fn route_invoke_program(
         &self,
         request: Request<wire::RouteInvokeProgramRequest>,
@@ -994,6 +1001,13 @@ impl wire::cluster_peer_server::ClusterPeer for ClusterPeerService {
         request: Request<wire::RouteBuiltInReplayBatchRequest>,
     ) -> Result<Response<wire::RouteBuiltInReplayBatchResponse>, Status> {
         self.route_builtin_replay_batch_call(request).await
+    }
+
+    async fn coordinate_first_realm_binding(
+        &self,
+        request: Request<wire::CoordinateFirstRealmBindingRequest>,
+    ) -> Result<Response<wire::FirstRealmBindingResponse>, Status> {
+        self.coordinate_first_realm_binding_call(request).await
     }
 
     async fn stage_program_path(

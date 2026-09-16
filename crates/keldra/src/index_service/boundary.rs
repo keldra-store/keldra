@@ -206,13 +206,6 @@ pub(crate) trait IndexAuthorization: Send + Sync + 'static {
         policy: &IndexResultAuthorizationPolicy,
         authorization_subject: Option<&ObjectRef>,
     ) -> Result<IndexQueryAuthorizationEvidence, Status> {
-        if !matches!(policy, IndexResultAuthorizationPolicy::Application)
-            || authorization_subject.is_some()
-        {
-            return Err(Status::failed_precondition(
-                "custom-realm index authorization is not installed",
-            ));
-        }
         let evidence = self
             .allows_objects_with_evidence(caller, &[(definition.clone(), ObjectPermission::Get)])
             .await?;
@@ -226,6 +219,13 @@ pub(crate) trait IndexAuthorization: Send + Sync + 'static {
                     "index definition authorization returned invalid evidence",
                 ))
             };
+        }
+        if !matches!(policy, IndexResultAuthorizationPolicy::Application)
+            || authorization_subject.is_some()
+        {
+            return Err(Status::failed_precondition(
+                "custom-realm index authorization is not installed",
+            ));
         }
         Ok(IndexQueryAuthorizationEvidence {
             system_revision: evidence.revision,

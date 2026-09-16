@@ -113,8 +113,10 @@ assert_source_tree_exact
 qualification_examples=(
   accounting_qualification
   atomic_program_qualification
+  authz_leopard_qualification
   cluster_cutover_qualification
   personaldb_qualification
+  realm_index_qualification
   s3_qualification
 )
 qualification_example_flags=()
@@ -522,6 +524,69 @@ create_bucket() {
     | grep -Fq "bucket=${bucket}"
 }
 
+run_realm_index_qualification() {
+  local topology="$1"
+  shift
+  local tenant="qrealm-index-${topology}-${$}"
+  local client_id="${tenant}-client"
+  local client_secret="qualification-realm-index-${topology}-secret-000000000000"
+  local -a endpoints=()
+  local node
+  provision_tenant "${tenant}" "${client_id}" "${client_secret}"
+  for node in "$@"; do
+    endpoints+=("$(public_endpoint_for "${node}")")
+  done
+  KELDRA_REALM_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${endpoints[*]}")" \
+  KELDRA_REALM_INDEX_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_REALM_INDEX_QUALIFICATION_BUCKET="realm-index-${topology}-${$}" \
+  KELDRA_REALM_INDEX_QUALIFICATION_CLIENT_ID="${client_id}" \
+  KELDRA_REALM_INDEX_QUALIFICATION_CLIENT_SECRET="${client_secret}" \
+    "${qualification_binaries[realm_index_qualification]}"
+  echo "[keldra-qualification] ${topology}-node fresh custom-realm binding, filtered index visibility, revoke, and recovery passed"
+}
+
+run_leopard_authorization_qualification() {
+  local tenant="qleopard-three-${$}"
+  local client_id="${tenant}-client"
+  local client_secret="qualification-leopard-three-secret-000000000000000000"
+  local -a endpoints=()
+  local node
+  provision_tenant "${tenant}" "${client_id}" "${client_secret}"
+  for node in keldra-1 keldra-2 keldra-3; do
+    endpoints+=("$(public_endpoint_for "${node}")")
+  done
+  KELDRA_AUTHZ_LEOPARD_ENDPOINTS="$(IFS=,; echo "${endpoints[*]}")" \
+  KELDRA_AUTHZ_LEOPARD_CLIENT_ID="${client_id}" \
+  KELDRA_AUTHZ_LEOPARD_CLIENT_SECRET="${client_secret}" \
+  KELDRA_AUTHZ_LEOPARD_TENANT="${tenant}" \
+  KELDRA_AUTHZ_LEOPARD_REALM="leopard-three-${$}" \
+  KELDRA_AUTHZ_LEOPARD_SCHEMA_ID="leopard-three-${$}-v1" \
+  KELDRA_AUTHZ_LEOPARD_BENCHMARK_BATCHES=32 \
+  KELDRA_AUTHZ_LEOPARD_MAX_IN_FLIGHT=4 \
+  KELDRA_AUTHZ_LEOPARD_REQUIRE_INTERNAL_TELEMETRY=false \
+    "${qualification_binaries[authz_leopard_qualification]}"
+  echo "[keldra-qualification] three-node public Leopard nested-userset, exact-revision, mutation, and replica correctness passed"
+}
+
+verify_three_node_realm_index() {
+  local condition="$1"
+  shift
+  local tenant="qrealm-index-three-${$}"
+  local -a endpoints=()
+  local node
+  for node in "$@"; do
+    endpoints+=("$(public_endpoint_for "${node}")")
+  done
+  KELDRA_REALM_INDEX_QUALIFICATION_ENDPOINTS="$(IFS=,; echo "${endpoints[*]}")" \
+  KELDRA_REALM_INDEX_QUALIFICATION_TENANT="${tenant}" \
+  KELDRA_REALM_INDEX_QUALIFICATION_BUCKET="realm-index-three-${$}" \
+  KELDRA_REALM_INDEX_QUALIFICATION_CLIENT_ID="${tenant}-client" \
+  KELDRA_REALM_INDEX_QUALIFICATION_CLIENT_SECRET="qualification-realm-index-three-secret-000000000000" \
+  KELDRA_REALM_INDEX_QUALIFICATION_VERIFY_ONLY=1 \
+    "${qualification_binaries[realm_index_qualification]}"
+  echo "[keldra-qualification] realm-authorized index remained correct ${condition}"
+}
+
 expect_failure() {
   local label="$1"
   shift
@@ -778,6 +843,7 @@ cmp "${KELDRA_QUALIFICATION_DIR}/artifacts/growth-two-large.bin" \
 require_qprobe_head keldra-1 growth/from-two.bin "${growth_two_head}"
 echo "[keldra-qualification] two-node REPLICATED read preserved its head and bytes"
 wait_for_background_join keldra-2 "${joining_node_handoff_timeout_seconds}"
+run_realm_index_qualification two keldra-1 keldra-2
 
 start_source_journal_phase "${pressure_source_journal_max_entries}" keldra-1 keldra-2
 echo "[keldra-qualification] cutover pressure phase uses source-journal max entries ${pressure_source_journal_max_entries}"
@@ -804,6 +870,8 @@ wait_for_background_join keldra-3 "${joining_node_handoff_timeout_seconds}"
 qualify_no_event_membership_cutover \
   keldra-2 2 qprobe-client "${qprobe_secret}" qprobe objects \
   "${pressure_source_journal_max_entries}"
+run_realm_index_qualification three keldra-1 keldra-2 keldra-3
+run_leopard_authorization_qualification
 
 for unavailable_node in keldra-1 keldra-2 keldra-3; do
   case "${unavailable_node}" in
@@ -811,6 +879,13 @@ for unavailable_node in keldra-1 keldra-2 keldra-3; do
     keldra-2|keldra-3) growth_reader=keldra-1 ;;
   esac
   compose stop -t 30 "${unavailable_node}"
+  case "${unavailable_node}" in
+    keldra-1) realm_index_readers=(keldra-2 keldra-3) ;;
+    keldra-2) realm_index_readers=(keldra-1 keldra-3) ;;
+    keldra-3) realm_index_readers=(keldra-1 keldra-2) ;;
+  esac
+  verify_three_node_realm_index \
+    "while ${unavailable_node} was unavailable" "${realm_index_readers[@]}"
   for growth_object in from-one from-two; do
     case "${growth_object}" in
       from-one)
@@ -840,6 +915,8 @@ for unavailable_node in keldra-1 keldra-2 keldra-3; do
     "${unavailable_node}" growth/from-one.bin "${growth_one_head}"
   wait_for_qprobe_head_after_growth \
     "${unavailable_node}" growth/from-two.bin "${growth_two_head}"
+  verify_three_node_realm_index \
+    "after ${unavailable_node} recovered" keldra-1 keldra-2 keldra-3
 done
 echo "[keldra-qualification] three-node 2+1 reads preserved both large object heads and bytes through every single-node outage"
 start_release_source_journal_phase "${release_source_journal_max_entries}"

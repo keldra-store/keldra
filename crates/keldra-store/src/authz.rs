@@ -16,6 +16,9 @@ use crate::store::{
     CF_AUTHZ_BINDINGS, CF_AUTHZ_RECEIPTS, CF_AUTHZ_SCHEMAS, CF_AUTHZ_TENANTS, CF_AUTHZ_TUPLES,
 };
 
+mod first_binding;
+pub use first_binding::protected_realm_owner_request;
+
 pub const SYSTEM_STORAGE_TENANT_ID: &str = "_keldra";
 pub const DEFAULT_AUTHZ_RECEIPT_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_AUTHZ_RECEIPT_MAX_ENTRIES: usize = 4_096;
@@ -228,7 +231,7 @@ pub struct RealmBinding {
     pub tuple_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindSchemaRequest {
     pub scope: AuthzScope,
     pub schema_ref: SchemaRef,
@@ -742,7 +745,7 @@ impl AuthzRepository {
             ));
         }
 
-        let protected_request = protected_realm_owner_request(&binding.scope, protected)?;
+        let protected_request = protected_realm_owner_request(&binding.scope, protected, None)?;
         let _guard = self.lock_writes()?;
         let mut batch = WriteBatch::default();
         let realm = self.prepare_binding(&binding, true, &mut batch)?;
@@ -1509,42 +1512,6 @@ impl AuthzRepository {
         options.set_sync(self.sync_writes);
         self.db.write_opt(batch, &options).map_err(storage_error)
     }
-}
-
-fn protected_realm_owner_request(
-    custom_scope: &AuthzScope,
-    protected: ProtectedRealmOwnership,
-) -> Result<TupleBatchRequest, AuthzStoreError> {
-    let realm_resource = ObjectRef::opaque(
-        "authz_realm",
-        format!(
-            "{}/{}",
-            custom_scope.storage_tenant.as_str(),
-            custom_scope.realm.as_str()
-        ),
-    )?;
-    let parent_tenant = ObjectRef::opaque(
-        "storage_tenant",
-        custom_scope.storage_tenant.as_str().to_owned(),
-    )?;
-    let owner = protected.principal.clone();
-    Ok(TupleBatchRequest {
-        scope: AuthzScope::system(),
-        principal: protected.principal,
-        expected_revision: Some(protected.expected_revision),
-        expected_binding_generation: protected.expected_binding_generation,
-        operation_id: None,
-        mutations: vec![
-            TupleMutation {
-                kind: TupleMutationKind::Add,
-                tuple: Tuple::new(realm_resource.clone(), "parent_tenant", parent_tenant),
-            },
-            TupleMutation {
-                kind: TupleMutationKind::Add,
-                tuple: Tuple::new(realm_resource, "owner", owner),
-            },
-        ],
-    })
 }
 
 fn canonical_schema(

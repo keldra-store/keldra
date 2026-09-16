@@ -9,8 +9,7 @@ use keldra_authz::AuthorizationCheck;
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
     AuthzRevision, AuthzScope, BindSchemaRequest, CoordinatedAuthzRealmResult,
-    ProtectedRealmOwnership, PublishSchemaRequest, SchemaId, Store, TupleBatchRequest,
-    TupleMutation, TupleMutationKind,
+    PublishSchemaRequest, SchemaId, Store, TupleBatchRequest, TupleMutation, TupleMutationKind,
 };
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Status};
@@ -34,6 +33,7 @@ use crate::authz_api::{
 use crate::authz_distribution::ZanzibarDistribution;
 use crate::cluster_peer::{ClusterPeerTransport, RoutedAuthzHandler, RoutedCall};
 use crate::cluster_placement::ClusterPlacement;
+use crate::distributed_control_plane::DistributedControlPlane;
 use crate::distributed_list::OriginalBearer;
 use crate::logical_name_resolution::{LogicalNameResolution, LogicalNameResolver};
 use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
@@ -54,6 +54,7 @@ pub(crate) struct DistributedAuthzService {
     names: LogicalNameResolver,
     system: AuthoritativeSystemAuthorization,
     tokens: JwtManager,
+    control: Arc<DistributedControlPlane>,
 }
 
 impl DistributedAuthzService {
@@ -67,6 +68,7 @@ impl DistributedAuthzService {
         names: LogicalNameResolver,
         system: AuthoritativeSystemAuthorization,
         tokens: JwtManager,
+        control: Arc<DistributedControlPlane>,
     ) -> Self {
         Self {
             local_node,
@@ -77,6 +79,7 @@ impl DistributedAuthzService {
             names,
             system,
             tokens,
+            control,
         }
     }
 
@@ -153,40 +156,20 @@ impl DistributedAuthzService {
             .map_err(authz_store_status)?
             .is_none()
         {
-            let check = storage_tenant_authorization_check(
-                caller.subject(),
-                caller.storage_tenant().as_str(),
-                StorageTenantPermission::ManageAuthz,
-            )
-            .map_err(crate::authz_api::authz_status)?;
-            let system = self.system.fresh_system_check(check).await?;
-            if !system.allowed[0] {
-                return Err(Status::permission_denied(
-                    "first realm binding is not authorized",
-                ));
-            }
-            require_single_node_first_bind(self.placement()?.active_node_ids().len())?;
-            let repository = self.zanzibar.repository().clone();
-            let principal = caller.subject().clone();
-            let bound = super::run_authz(move || {
-                repository
-                    .bind_schema_with_protected_owner(
-                        BindSchemaRequest {
-                            scope,
-                            schema_ref,
-                            expected_generation: request.expected_binding_generation,
-                            expected_revision: None,
-                        },
-                        ProtectedRealmOwnership {
-                            principal,
-                            expected_revision: system.revision,
-                            expected_binding_generation: system.binding_generation,
-                        },
-                    )
-                    .map(|result| result.realm)
-                    .map_err(super::AuthzServiceError::from)
-            })
-            .await?;
+            let bound = self
+                .control
+                .bind_first_custom_realm(
+                    caller,
+                    bearer,
+                    tenant_id,
+                    BindSchemaRequest {
+                        scope,
+                        schema_ref,
+                        expected_generation: request.expected_binding_generation,
+                        expected_revision: None,
+                    },
+                )
+                .await?;
             return Ok(api::BindSchemaResponse {
                 binding: Some(binding_to_api(&bound.binding)),
                 revision: bound.binding.authz_revision.0,
@@ -627,16 +610,6 @@ struct Target {
     address: String,
 }
 
-fn require_single_node_first_bind(active_nodes: usize) -> Result<(), Status> {
-    if active_nodes == 1 {
-        Ok(())
-    } else {
-        Err(Status::unavailable(
-            "first realm binding is unavailable in a multi-node cluster",
-        ))
-    }
-}
-
 #[derive(Clone)]
 struct RoutedDistributedAuthz {
     service: super::AuthzServiceImpl,
@@ -762,21 +735,5 @@ impl RoutedAuthzHandler for RoutedDistributedAuthz {
                 .await?
                 .into_inner(),
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn first_bind_keeps_the_atomic_local_path_on_one_node() {
-        require_single_node_first_bind(1).unwrap();
-    }
-
-    #[test]
-    fn first_bind_fails_closed_before_cross_zanzibar_multi_node_work() {
-        let status = require_single_node_first_bind(3).unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 }

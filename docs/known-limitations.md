@@ -173,16 +173,6 @@ Applications that require this maintenance operation should defer it while a
 cluster has exactly two ACTIVE nodes; a later capability can add explicit
 lineage for retained-history maintenance.
 
-## First custom-realm binding in a multi-node cluster
-
-The first schema binding for a custom Zanzibar realm must atomically create
-the realm binding and its protected-system ownership grant. Keldra keeps
-that guarantee on a one-node cluster, but rejects the first binding with
-`UNAVAILABLE` when more than one node is active. Existing realms can be
-rebound and used normally across the cluster. A later capability must add one
-bounded cross-Zanzibar operation before enabling first binding on multi-node
-clusters; this does not weaken the atomic ownership guarantee.
-
 ## Cluster lifecycle operations
 
 Keldra supports genesis, authorized node preparation, learner catch-up, typed

@@ -26,11 +26,11 @@ use keldra_api::v1::{
     GetObjectRequest, HeadObjectRequest, IndexField, IndexFieldCapability, IndexFieldCardinality,
     IndexQuery, IndexResultAuthorization, IndexSpecification, InvokeProgramRequest,
     KeywordIndexField, ListObjectVersionsRequest, ListObjectsRequest, MutationFailureCode,
-    ObjectAddress, ObjectVersioning as ApiObjectVersioning, PathIndexQuery, PutHeader,
-    PutIfAbsentOperation, PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest,
-    PutToken, QueryIndexRequest, ReadFailureCode, RebuildIndexRequest, SetBucketPolicyRequest,
-    SetBucketVersioningRequest, TypedJsonIndexSpec, UpdateIndexRequest, WatchNow,
-    WatchPrefixRequest, WatchStateHint,
+    ObjectAddress, ObjectVersioning as ApiObjectVersioning, PutHeader, PutIfAbsentOperation,
+    PutIfVersionOperation, PutImmutableOperation, PutOperation, PutRequest, PutToken,
+    QueryIndexRequest, ReadFailureCode, RebuildIndexRequest, SetBucketPolicyRequest,
+    SetBucketVersioningRequest, TypedJsonIndexQuery, TypedJsonIndexSpec, UpdateIndexRequest,
+    WatchNow, WatchPrefixRequest, WatchStateHint,
 };
 use keldra_authz::ObjectRef;
 use keldra_store::{
@@ -639,10 +639,14 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
                     bucket: "objects".into(),
                     index_name: "authorization-boundary".into(),
                     query: Some(IndexQuery {
-                        query: Some(keldra_api::v1::index_query::Query::Path(PathIndexQuery {
-                            prefix: String::new(),
-                            start_after: None,
-                        })),
+                        query: Some(keldra_api::v1::index_query::Query::TypedJson(
+                            TypedJsonIndexQuery {
+                                predicate: None,
+                                order: Vec::new(),
+                                facets: Vec::new(),
+                                aggregates: Vec::new(),
+                            },
+                        )),
                     }),
                     limit: 10,
                     page_token: Vec::new(),
@@ -1798,7 +1802,12 @@ fn assert_unauthenticated<T>(result: Result<Response<T>, Status>) {
 fn assert_permission_denied<T>(result: Result<Response<T>, Status>) {
     match result {
         Ok(_) => panic!("reserved object RPC accepted a raw public request"),
-        Err(status) => assert_eq!(status.code(), Code::PermissionDenied),
+        Err(status) => assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "unexpected public RPC rejection: {}",
+            status.message()
+        ),
     }
 }
 

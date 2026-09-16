@@ -891,7 +891,7 @@ async fn coordinator_lanes_do_not_couple_unrelated_tenants() {
         })
         .unwrap();
     let _writer = core.coordinator_lane(first_tenant).write().await;
-    tokio::time::timeout(
+    let _unrelated_reader = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         core.coordinator_lane(other_tenant).read(),
     )

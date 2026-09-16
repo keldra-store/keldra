@@ -673,18 +673,14 @@ impl IndexServiceRpc for IndexServiceImpl {
                 let loaded = self
                     .load_definition(&context, &request.bucket, &request.index_name)
                     .await?;
-                validate_query_kind(&loaded.api, &query)?;
                 let tenant = context.caller().storage_tenant().as_str();
                 let (tenant_id, bucket_id) = self
                     .names
                     .resolve_bucket_ids(tenant, &request.bucket)
                     .await?;
                 let result_policy = result_authorization_policy(&loaded.api)?;
-                let authorization_subject = query_authorization_subject(
-                    context.caller(),
-                    &result_policy,
-                    request.authorization_subject,
-                )?;
+                let authorization_subject =
+                    decode_query_authorization_subject(request.authorization_subject)?;
                 let admission = self
                     .dependencies
                     .authorization
@@ -697,6 +693,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                     )
                     .await?;
                 validate_query_authorization_evidence(&admission, &result_policy)?;
+                validate_query_kind(&loaded.api, &query)?;
                 let binding = IndexPageTokenBinding {
                     tenant_id,
                     bucket_id,
@@ -1178,41 +1175,26 @@ fn validate_query_kind(definition: &IndexDefinition, query: &IndexQuery) -> Resu
     }
 }
 
-fn query_authorization_subject(
-    caller: &Caller,
-    policy: &IndexResultAuthorizationPolicy,
+fn decode_query_authorization_subject(
     subject: Option<keldra_api::v1::Subject>,
 ) -> Result<Option<ObjectRef>, Status> {
-    match (policy, subject) {
-        (IndexResultAuthorizationPolicy::Application, None) => Ok(None),
-        (IndexResultAuthorizationPolicy::Application, Some(_)) => Err(Status::invalid_argument(
-            "authorization_subject is not accepted by an application-authorized index",
-        )),
-        (IndexResultAuthorizationPolicy::Realm(_), None) => Err(Status::invalid_argument(
-            "authorization_subject is required by this index",
-        )),
-        (IndexResultAuthorizationPolicy::Realm(_), Some(subject)) => {
-            if caller.subject().is_anonymous() {
-                return Err(Status::unauthenticated(
-                    "custom-realm index queries require an authenticated application",
-                ));
-            }
-            let subject = match crate::authz_api::subject_from_api(Some(subject))? {
-                TupleSubject::Object(subject) => subject,
-                TupleSubject::Userset(_) => {
-                    return Err(Status::invalid_argument(
-                        "authorization_subject must be one typed object",
-                    ));
-                }
-            };
-            if subject.is_anonymous() || subject.is_public() {
-                return Err(Status::invalid_argument(
-                    "authorization_subject must identify one concrete end user",
-                ));
-            }
-            Ok(Some(subject))
+    let Some(subject) = subject else {
+        return Ok(None);
+    };
+    let subject = match crate::authz_api::subject_from_api(Some(subject))? {
+        TupleSubject::Object(subject) => subject,
+        TupleSubject::Userset(_) => {
+            return Err(Status::invalid_argument(
+                "authorization_subject must be one typed object",
+            ));
         }
+    };
+    if subject.is_anonymous() || subject.is_public() {
+        return Err(Status::invalid_argument(
+            "authorization_subject must identify one concrete end user",
+        ));
     }
+    Ok(Some(subject))
 }
 
 fn validate_query_authorization_evidence(
@@ -1494,6 +1476,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn query_admission_denies_definition_access_before_policy_validation() {
+        let authorization = FakeAuthorization {
+            allowed: vec![false],
+            revision: 3,
+            seen: Mutex::new(Vec::new()),
+        };
+        let key = ObjectKey::new("tenant", "objects", definition_path("by-path").unwrap()).unwrap();
+        let subject = ObjectRef::opaque("user", "alice").unwrap();
+        let error = super::super::boundary::IndexAuthorization::admit_query(
+            &authorization,
+            &caller(),
+            7,
+            &key,
+            &IndexResultAuthorizationPolicy::Application,
+            Some(&subject),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            authorization.seen.lock().unwrap().as_slice(),
+            &[(key, ObjectPermission::Get)]
+        );
+    }
+
     #[test]
     fn explicit_rebuild_interval_is_one_full_hour() {
         assert!(enforce_explicit_rebuild_interval(None, 1).is_ok());
@@ -1635,52 +1643,24 @@ mod tests {
     }
 
     #[test]
-    fn custom_realm_subject_is_required_and_must_be_a_concrete_end_user() {
-        let policy = IndexResultAuthorizationPolicy::Realm(
-            super::super::boundary::RealmIndexResultAuthorizationPolicy {
-                realm: "workspace".into(),
-                resource_namespace: "document".into(),
-                relation: "view".into(),
-                target: super::super::boundary::RealmIndexAuthorizationTarget::ResultPath,
-            },
-        );
-        assert_eq!(
-            query_authorization_subject(&caller(), &policy, None)
-                .unwrap_err()
-                .code(),
-            tonic::Code::InvalidArgument
-        );
+    fn authorization_subject_decoder_accepts_omission_and_one_concrete_end_user() {
+        assert_eq!(decode_query_authorization_subject(None).unwrap(), None);
         let alice = ObjectRef::opaque("user", "alice").unwrap();
         let supplied = crate::authz_api::subject_to_api(&TupleSubject::Object(alice.clone()));
         assert_eq!(
-            query_authorization_subject(&caller(), &policy, Some(supplied)).unwrap(),
+            decode_query_authorization_subject(Some(supplied)).unwrap(),
             Some(alice)
-        );
-        let anonymous = Caller::from_anonymous(StorageTenantId::parse("tenant").unwrap());
-        let supplied = crate::authz_api::subject_to_api(&TupleSubject::Object(
-            ObjectRef::opaque("user", "alice").unwrap(),
-        ));
-        assert_eq!(
-            query_authorization_subject(&anonymous, &policy, Some(supplied))
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unauthenticated
         );
     }
 
     #[test]
-    fn application_policy_rejects_an_end_user_operand() {
-        let supplied = crate::authz_api::subject_to_api(&TupleSubject::Object(
-            ObjectRef::opaque("user", "alice").unwrap(),
-        ));
+    fn authorization_subject_decoder_rejects_non_concrete_principals() {
+        let supplied =
+            crate::authz_api::subject_to_api(&TupleSubject::Object(ObjectRef::anonymous()));
         assert_eq!(
-            query_authorization_subject(
-                &caller(),
-                &IndexResultAuthorizationPolicy::Application,
-                Some(supplied),
-            )
-            .unwrap_err()
-            .code(),
+            decode_query_authorization_subject(Some(supplied))
+                .unwrap_err()
+                .code(),
             tonic::Code::InvalidArgument
         );
     }

@@ -38,15 +38,24 @@ pub(super) fn canonical_tuple_prefix(scope: &AuthzScope) -> Vec<u8> {
 }
 
 pub(super) fn canonical_tuple_key(scope: &AuthzScope, tuple: &Tuple) -> Vec<u8> {
+    let mut key = canonical_userset_prefix(scope, &tuple.object, &tuple.relation);
+    put_subject(&mut key, &tuple.subject);
+    key
+}
+
+pub(super) fn canonical_userset_prefix(
+    scope: &AuthzScope,
+    object: &ObjectRef,
+    relation: &str,
+) -> Vec<u8> {
     let mut key = canonical_tuple_prefix(scope);
     put_userset(
         &mut key,
         &UsersetRef {
-            object: tuple.object.clone(),
-            relation: tuple.relation.clone(),
+            object: object.clone(),
+            relation: relation.to_owned(),
         },
     );
-    put_subject(&mut key, &tuple.subject);
     key
 }
 

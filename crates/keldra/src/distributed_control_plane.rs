@@ -29,9 +29,9 @@ use crate::cluster_peer::ClusterPeerTransport;
 use crate::cluster_placement::ClusterPlacement;
 use crate::distributed_list::OriginalBearer;
 use crate::logical_record_distribution::LogicalRecordDistribution;
-use crate::mutable_record_replica_group::MutableRecordReplicaGroup;
-use crate::placement::PlacementKind;
 use crate::serving_fence::ServingAuthority;
+
+mod first_realm_binding;
 
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_RETRY_INTERVAL: Duration = Duration::from_millis(25);
@@ -496,9 +496,19 @@ impl DistributedControlPlane {
 
     pub(crate) async fn coordinate_system_grant(
         &self,
-        request: TupleBatchRequest,
+        mut request: TupleBatchRequest,
+        first_realm_owner_grant: bool,
     ) -> Result<TupleBatchReceipt, Status> {
         self.require_system_realm_coordinator()?;
+        if first_realm_owner_grant {
+            self.zanzibar
+                .reconcile_realm(SYSTEM_STABLE_TENANT_ID, &AuthzScope::system())
+                .await?;
+            self.zanzibar
+                .repository()
+                .normalize_first_realm_owner_grant(&mut request)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        }
         let coordinated = self
             .zanzibar
             .mutate_tuples_journaled(SYSTEM_STABLE_TENANT_ID, &self.store, request)
@@ -1462,7 +1472,7 @@ impl DistributedControlPlane {
         request: TupleBatchRequest,
     ) -> Result<TupleBatchReceipt, Status> {
         let Some(target) = self.system_realm_target()? else {
-            return self.coordinate_system_grant(request).await;
+            return self.coordinate_system_grant(request, false).await;
         };
         let receipt = self
             .peers
@@ -1470,6 +1480,7 @@ impl DistributedControlPlane {
                 target.node_id,
                 &target.address,
                 &request,
+                false,
                 CONTROL_OPERATION_TIMEOUT,
             )
             .await?;
@@ -1669,49 +1680,6 @@ impl DistributedControlPlane {
         } else {
             Err(Status::failed_precondition(
                 "administration request did not reach the nominated executor",
-            ))
-        }
-    }
-
-    fn system_realm_target(&self) -> Result<Option<ControlTarget>, Status> {
-        let placement = self.placement()?;
-        let group = MutableRecordReplicaGroup::select(
-            PlacementKind::ZanzibarRealm,
-            placement.cluster_id(),
-            &SYSTEM_STABLE_TENANT_ID.to_be_bytes(),
-            placement.placement_nodes(),
-        )
-        .ok_or_else(|| Status::unavailable("cluster has no system Zanzibar replica"))?;
-        let node = group.coordinator();
-        if node == self.local_node {
-            return Ok(None);
-        }
-        let address = placement
-            .address(node)
-            .ok_or_else(|| Status::unavailable("system Zanzibar coordinator has no address"))?;
-        Ok(Some(ControlTarget {
-            node_id: node,
-            address: address.0.clone(),
-            placement_fence: placement.fence(),
-        }))
-    }
-
-    fn require_system_realm_coordinator(&self) -> Result<(), Status> {
-        if self.system_realm_target()?.is_none() {
-            Ok(())
-        } else {
-            Err(Status::failed_precondition(
-                "administration grant did not reach the system Zanzibar coordinator",
-            ))
-        }
-    }
-
-    fn require_same_system_realm_target(&self, expected: &ControlTarget) -> Result<(), Status> {
-        if self.system_realm_target()?.as_ref() == Some(expected) {
-            Ok(())
-        } else {
-            Err(Status::unavailable(
-                "system Zanzibar placement changed during administration",
             ))
         }
     }

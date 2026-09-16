@@ -549,7 +549,7 @@ pub(super) fn binding_to_api(binding: &keldra_store::RealmBinding) -> api::Schem
     }
 }
 
-pub(super) fn authz_store_status(error: AuthzStoreError) -> Status {
+pub(crate) fn authz_store_status(error: AuthzStoreError) -> Status {
     match error {
         AuthzStoreError::InvalidInput(_) | AuthzStoreError::Authorization(_) => {
             Status::invalid_argument(error.to_string())

@@ -649,6 +649,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         name_resolver,
         authoritative_system,
         config.token_manager.clone(),
+        distributed_control.clone(),
     );
     let authz_service =
         authz_service::AuthzServiceImpl::new(authz_repository).with_distributed(distributed_authz);

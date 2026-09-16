@@ -49,7 +49,7 @@ pub use authz::{
     RealmBinding, RealmSnapshot, ReplicaAuthzRealmMutationApplied,
     ReplicaAuthzSchemaPublicationApplied, SYSTEM_STORAGE_TENANT_ID, SchemaDigest, SchemaId,
     SchemaRef, StorageTenantId, TupleBatchReceipt, TupleBatchRequest, TupleMutation,
-    TupleMutationKind,
+    TupleMutationKind, protected_realm_owner_request,
 };
 pub use blob::{AWAITING_PUBLISH, BlobReader, BlobRef, BlobReferenceState, BlobUpload};
 pub use blob_gc::{BlobGcBudget, BlobGcCursor, BlobGcTick};

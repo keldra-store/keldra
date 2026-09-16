@@ -9,12 +9,12 @@ use keldra_api::v1::{
 };
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_store::{
-    AuthzSchemaPublicationMutation, DefinitionKind, DefinitionMutationIntent, LogicalRecordApplied,
-    LogicalRecordCandidate, LogicalRecordId, LogicalRecordMutation, LogicalRecordSnapshotApplied,
-    LogicalRecordValue, ObjectHeadChange, PlacementLogId, ProgramAliasRegistryMutation,
-    ProgramAliasRegistryStage, ProgramPathMutation, ProgramPathStage, ProgramReservation,
-    ReferenceProof, ReplicaAuthzSchemaPublicationApplied, SourceId, TupleBatchReceipt,
-    TupleBatchRequest, VersionId, WatchJournalStatus,
+    AuthzSchemaPublicationMutation, BindSchemaRequest, BoundRealm, DefinitionKind,
+    DefinitionMutationIntent, LogicalRecordApplied, LogicalRecordCandidate, LogicalRecordId,
+    LogicalRecordMutation, LogicalRecordSnapshotApplied, LogicalRecordValue, ObjectHeadChange,
+    PlacementLogId, ProgramAliasRegistryMutation, ProgramAliasRegistryStage, ProgramPathMutation,
+    ProgramPathStage, ProgramReservation, ReferenceProof, ReplicaAuthzSchemaPublicationApplied,
+    SourceId, TupleBatchReceipt, TupleBatchRequest, VersionId, WatchJournalStatus,
 };
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
@@ -1242,6 +1242,7 @@ impl ClusterPeerTransport {
         target: NodeId,
         address: &str,
         value: &TupleBatchRequest,
+        first_realm_owner_grant: bool,
         remaining: Duration,
     ) -> Result<TupleBatchReceipt, Status> {
         let fence = self.placement()?.fence();
@@ -1250,11 +1251,65 @@ impl ClusterPeerTransport {
             .coordinate_system_grant(wire::CoordinateSystemGrantRequest {
                 peer: Some(self.context(fence, 0, remaining)?),
                 tuple_batch_json: encode_json(value)?,
+                first_realm_owner_grant,
             })
             .await?
             .into_inner();
         require_response_schema(response.schema_version)?;
         decode_json(&response.receipt_json)
+    }
+
+    pub(crate) async fn route_first_realm_binding(
+        &self,
+        target: NodeId,
+        address: &str,
+        bearer: &str,
+        stable_tenant_id: u64,
+        value: &BindSchemaRequest,
+        remaining: Duration,
+    ) -> Result<BoundRealm, Status> {
+        let fence = self.placement()?.fence();
+        let mut request = Request::new(wire::RouteFirstRealmBindingRequest {
+            peer: Some(self.context(fence, 1, remaining)?),
+            stable_tenant_id,
+            binding_json: encode_json(value)?,
+        });
+        add_bearer_and_timeout(&mut request, bearer, remaining)?;
+        let response = self
+            .client(target, address)?
+            .route_first_realm_binding(request)
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        decode_json(&response.bound_realm_json)
+    }
+
+    pub(crate) async fn coordinate_first_realm_binding(
+        &self,
+        target: NodeId,
+        address: &str,
+        stable_tenant_id: u64,
+        value: &BindSchemaRequest,
+        validate_only: bool,
+        remaining: Duration,
+    ) -> Result<Option<BoundRealm>, Status> {
+        let fence = self.placement()?.fence();
+        let response = self
+            .client(target, address)?
+            .coordinate_first_realm_binding(wire::CoordinateFirstRealmBindingRequest {
+                peer: Some(self.context(fence, 0, remaining)?),
+                stable_tenant_id,
+                binding_json: encode_json(value)?,
+                validate_only,
+            })
+            .await?
+            .into_inner();
+        require_response_schema(response.schema_version)?;
+        if response.bound_realm_json.is_empty() {
+            Ok(None)
+        } else {
+            decode_json(&response.bound_realm_json).map(Some)
+        }
     }
 
     pub(super) fn placement(&self) -> Result<ClusterPlacement, Status> {

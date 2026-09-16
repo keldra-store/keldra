@@ -665,12 +665,36 @@ fn leopard_evaluation_loads_only_reached_usersets_and_reuses_them_per_batch() {
         ),
     ]);
     let mut reverse = BTreeMap::from([(TupleSubject::Object(alice.clone()), vec![reader.clone()])]);
-    let compiled = LeopardAuthorization::new(
-        realm("leopard"),
-        object_schema(),
-        AuthorizationLimits::default(),
-    )
-    .unwrap();
+    let schema = Schema::new([
+        NamespaceDefinition::new(
+            "object",
+            [
+                RelationDefinition::direct(
+                    "reader",
+                    [
+                        AllowedSubject::any_object("user"),
+                        AllowedSubject::any_userset("group", "member"),
+                    ],
+                ),
+                RelationDefinition::permission(
+                    "read",
+                    [RewriteRule::Inherit {
+                        relation: "reader".into(),
+                    }],
+                ),
+            ],
+        ),
+        NamespaceDefinition::new(
+            "group",
+            [RelationDefinition::direct(
+                "member",
+                [AllowedSubject::any_object("user")],
+            )],
+        ),
+    ]);
+    let compiled =
+        LeopardAuthorization::new(realm("leopard"), schema, AuthorizationLimits::default())
+            .unwrap();
     let check = AuthorizationCheck::new(alice, report.clone(), "read");
     let denied = AuthorizationCheck::new(opaque("user", "charlie"), report, "read");
     let evidence = compiled

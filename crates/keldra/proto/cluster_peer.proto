@@ -198,6 +198,7 @@ message FreshAuthorizationChecksResult {
   repeated bool allowed = 2;
   uint64 revision = 3;
   uint64 binding_generation = 4;
+  keldra.v1.SchemaRef schema_ref = 5;
 }
 
 message Exists {
@@ -471,11 +472,35 @@ message CoordinatedLogicalReadResponse {
 message CoordinateSystemGrantRequest {
   PeerContext peer = 1;
   bytes tuple_batch_json = 2;
+  // Enforce permanent first-custom-realm owner identity before applying or
+  // replaying this prerequisite grant.
+  bool first_realm_owner_grant = 3;
 }
 
 message CoordinateSystemGrantResponse {
   uint32 schema_version = 1;
   bytes receipt_json = 2;
+}
+
+// Private executor route for the one cross-realm operation needed to create a
+// custom realm. The binding is an internal typed value, never a public tunnel.
+message RouteFirstRealmBindingRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes binding_json = 3;
+}
+
+message CoordinateFirstRealmBindingRequest {
+  PeerContext peer = 1;
+  uint64 stable_tenant_id = 2;
+  bytes binding_json = 3;
+  bool validate_only = 4;
+}
+
+message FirstRealmBindingResponse {
+  uint32 schema_version = 1;
+  // Empty for a successful read-only preflight.
+  bytes bound_realm_json = 2;
 }
 
 message RouteInvokeProgramRequest {
@@ -1030,6 +1055,7 @@ service ClusterPeer {
   rpc RouteAdminSetBucketVersioning(RouteAdminSetBucketVersioningRequest) returns (keldra.v1.SetBucketVersioningResponse);
   rpc RouteAdminSetBucketPublicRead(RouteAdminSetBucketPublicReadRequest) returns (keldra.v1.SetBucketPublicReadResponse);
   rpc RouteAdminChangeApplicationRole(RouteAdminChangeApplicationRoleRequest) returns (keldra.v1.ApplicationRoleResponse);
+  rpc RouteFirstRealmBinding(RouteFirstRealmBindingRequest) returns (FirstRealmBindingResponse);
   rpc RouteInvokeProgram(RouteInvokeProgramRequest) returns (keldra.v1.InvokeProgramResponse);
   rpc RouteBuiltInReplayBatch(RouteBuiltInReplayBatchRequest) returns (RouteBuiltInReplayBatchResponse);
   rpc RouteAuthzPutSchema(RouteAuthzPutSchemaRequest) returns (keldra.v1.PutSchemaResponse);
@@ -1077,4 +1103,5 @@ service ClusterPeer {
   rpc CoordinateLogicalRecord(CoordinateLogicalRecordRequest) returns (CoordinateLogicalRecordResponse);
   rpc ReadCoordinatedLogicalRecord(CoordinatedLogicalReadRequest) returns (CoordinatedLogicalReadResponse);
   rpc CoordinateSystemGrant(CoordinateSystemGrantRequest) returns (CoordinateSystemGrantResponse);
+  rpc CoordinateFirstRealmBinding(CoordinateFirstRealmBindingRequest) returns (FirstRealmBindingResponse);
 }

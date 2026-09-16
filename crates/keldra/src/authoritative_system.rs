@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use keldra_authz::{AuthorizationCheck, ObjectRef};
 use keldra_consensus::{DecisionRaft, NodeId};
-use keldra_store::{AuthzConsistency, AuthzRevision, AuthzScope, ObjectKey};
+use keldra_store::{AuthzConsistency, AuthzRevision, AuthzScope, ObjectKey, SchemaRef};
 use tonic::Status;
 
 use crate::authentication::Caller;
@@ -42,6 +42,7 @@ pub(crate) struct FreshAuthorizationResult {
     pub(crate) allowed: Vec<bool>,
     pub(crate) revision: AuthzRevision,
     pub(crate) binding_generation: u64,
+    pub(crate) schema_ref: SchemaRef,
 }
 
 #[derive(Clone)]
@@ -148,6 +149,7 @@ impl AuthoritativeSystemAuthorization {
                 allowed,
                 revision: first.revision,
                 binding_generation: first.binding_generation,
+                schema_ref: first.schema_ref,
             });
         }
 
@@ -165,6 +167,7 @@ impl AuthoritativeSystemAuthorization {
             .await?;
         if second.revision != first.revision
             || second.binding_generation != first.binding_generation
+            || second.schema_ref != first.schema_ref
         {
             return Err(Status::unavailable(
                 "authorization view changed while applying exact-object fallbacks",
@@ -177,6 +180,7 @@ impl AuthoritativeSystemAuthorization {
             allowed,
             revision: first.revision,
             binding_generation: first.binding_generation,
+            schema_ref: first.schema_ref,
         })
     }
 
@@ -413,9 +417,9 @@ impl AuthoritativeSystemAuthorization {
             let result = if target == self.local_node {
                 tokio::time::timeout(timeout, async {
                     self.verify_stable_buckets(stable_buckets).await?;
-                    let (allowed, revision, binding_generation) = self
+                    let evidence = self
                         .zanzibar
-                        .fresh_checks_with_generation(
+                        .fresh_checks_with_evidence(
                             stable_tenant_id,
                             scope.clone(),
                             consistency,
@@ -423,9 +427,10 @@ impl AuthoritativeSystemAuthorization {
                         )
                         .await?;
                     Ok::<_, Status>(FreshAuthorizationResult {
-                        allowed,
-                        revision,
-                        binding_generation,
+                        allowed: evidence.allowed,
+                        revision: evidence.revision,
+                        binding_generation: evidence.binding_generation,
+                        schema_ref: evidence.schema_ref,
                     })
                 })
                 .await
@@ -653,12 +658,12 @@ impl crate::index_service::IndexAuthorization for AuthoritativeSystemAuthorizati
             &policy.relation,
         );
         let result = self
-            .zanzibar
-            .fresh_checks_with_evidence(
+            .fresh_checks_with_placement_retry(
                 stable_tenant_id,
-                scope,
+                &scope,
                 AuthzConsistency::Latest,
-                vec![probe],
+                &[probe],
+                &[],
             )
             .await?;
         Ok(crate::index_service::IndexQueryAuthorizationEvidence {
@@ -708,12 +713,12 @@ impl crate::index_service::IndexAuthorization for AuthoritativeSystemAuthorizati
             })
             .collect::<Vec<_>>();
         let result = self
-            .zanzibar
-            .fresh_checks_with_evidence(
+            .fresh_checks_with_placement_retry(
                 stable_tenant_id,
-                scope.clone(),
+                scope,
                 AuthzConsistency::Exact(AuthzRevision(required.revision)),
-                checks,
+                &checks,
+                &[],
             )
             .await?;
         if result.revision.0 != required.revision
@@ -762,6 +767,46 @@ mod tests {
         assert_eq!(
             authorization_read_targets_local_first(&[NodeId(1), NodeId(2), NodeId(3)], NodeId(9),),
             vec![NodeId(1), NodeId(2), NodeId(3)]
+        );
+    }
+
+    #[test]
+    fn custom_realm_reads_route_to_selected_replicas_when_index_node_is_not_one() {
+        use std::num::NonZeroU32;
+
+        use keldra_consensus::ClusterId;
+
+        use crate::placement::{PlacementKind, PlacementNode, rank_nodes};
+
+        let nodes = (1..=6)
+            .map(|node| PlacementNode::new(NodeId(node), NonZeroU32::new(1_000_000).unwrap()))
+            .collect::<Vec<_>>();
+        let cluster_id = ClusterId([7; 16]);
+        let stable_tenant_id = 11_u64;
+        let realm = MutableRecordReplicaGroup::select(
+            PlacementKind::ZanzibarRealm,
+            cluster_id,
+            &stable_tenant_id.to_be_bytes(),
+            &nodes,
+        )
+        .unwrap();
+        let realm_replicas = realm.replicas();
+        let index_node = (1_u64..)
+            .find_map(|bucket_id| {
+                let mut key = [0_u8; 24];
+                key[..8].copy_from_slice(&stable_tenant_id.to_be_bytes());
+                key[8..16].copy_from_slice(&bucket_id.to_be_bytes());
+                key[16..].copy_from_slice(&1_u64.to_be_bytes());
+                rank_nodes(PlacementKind::FutureIndex, cluster_id, &key, &nodes)
+                    .into_iter()
+                    .take(3)
+                    .map(PlacementNode::node_id)
+                    .find(|node| !realm_replicas.contains(node))
+            })
+            .expect("six-node topology has an index replica outside a three-node realm group");
+        assert_eq!(
+            authorization_read_targets_local_first(realm_replicas, index_node),
+            realm_replicas.to_vec()
         );
     }
 

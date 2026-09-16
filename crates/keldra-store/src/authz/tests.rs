@@ -1008,6 +1008,13 @@ async fn first_binding_and_protected_owner_tuples_commit_all_or_nothing() {
         expected_revision: Some(AuthzRevision(1)),
     };
 
+    // Two racers may both pass the read-only preflight. It must not publish
+    // state; executor serialization and the permanent protected owner decide
+    // which caller can finish.
+    repository.validate_first_binding(&binding_request).unwrap();
+    repository.validate_first_binding(&binding_request).unwrap();
+    assert_eq!(repository.get_binding(&custom_scope).unwrap(), None);
+
     let invalid = repository.bind_schema_with_protected_owner(
         binding_request.clone(),
         ProtectedRealmOwnership {
@@ -1074,6 +1081,174 @@ async fn first_binding_and_protected_owner_tuples_commit_all_or_nothing() {
             .unwrap(),
         AuthzRevision(3)
     );
+
+    // Model retries after the short-lived operation receipt has expired. The
+    // durable tuples converge the exact owner and permanently reject a
+    // different caller which lost the first-bind race.
+    let mut same_owner = protected_realm_owner_request(
+        &custom_scope,
+        ProtectedRealmOwnership {
+            principal: principal("alice"),
+            expected_revision: AuthzRevision(3),
+            expected_binding_generation: 1,
+        },
+        Some("expired-receipt-retry".into()),
+    )
+    .unwrap();
+    assert!(
+        repository
+            .normalize_first_realm_owner_grant(&mut same_owner)
+            .unwrap()
+    );
+    assert_eq!(same_owner.expected_revision, Some(AuthzRevision(3)));
+    assert_eq!(same_owner.operation_id, None);
+
+    let mut stale_authorization = protected_realm_owner_request(
+        &custom_scope,
+        ProtectedRealmOwnership {
+            principal: principal("alice"),
+            expected_revision: AuthzRevision(2),
+            expected_binding_generation: 1,
+        },
+        Some("stale-authorization".into()),
+    )
+    .unwrap();
+    assert!(matches!(
+        repository.normalize_first_realm_owner_grant(&mut stale_authorization),
+        Err(AuthzStoreError::RevisionConflict {
+            expected: AuthzRevision(2),
+            current: AuthzRevision(3),
+        })
+    ));
+
+    let mut different_owner = protected_realm_owner_request(
+        &custom_scope,
+        ProtectedRealmOwnership {
+            principal: principal("mallory"),
+            expected_revision: AuthzRevision(3),
+            expected_binding_generation: 1,
+        },
+        Some("different-racer".into()),
+    )
+    .unwrap();
+    assert!(matches!(
+        repository.normalize_first_realm_owner_grant(&mut different_owner),
+        Err(AuthzStoreError::InvalidInput(message))
+            if message.contains("different or incomplete protected owner")
+    ));
+}
+
+#[tokio::test]
+async fn first_binding_race_keeps_the_durable_owner_after_receipt_expiry() {
+    let (_directory, store) = store().await;
+    let repository = store.authz();
+    let system_publication = publish(
+        &repository,
+        StorageTenantId::system(),
+        "keldra-system",
+        system_schema(),
+        AuthzRevision::ZERO,
+    );
+    bind(
+        &repository,
+        AuthzScope::system(),
+        system_publication.schema_ref,
+        AuthzRevision(1),
+    );
+    let custom_scope = scope("acme", "relationships");
+    let custom_publication = publish(
+        &repository,
+        tenant("acme"),
+        "documents",
+        document_schema(false),
+        AuthzRevision::ZERO,
+    );
+    let binding = BindSchemaRequest {
+        scope: custom_scope.clone(),
+        schema_ref: custom_publication.schema_ref,
+        expected_generation: Some(0),
+        expected_revision: Some(AuthzRevision(1)),
+    };
+
+    repository.validate_first_binding(&binding).unwrap();
+    repository.validate_first_binding(&binding).unwrap();
+    assert_eq!(repository.get_binding(&custom_scope).unwrap(), None);
+
+    let owner = ProtectedRealmOwnership {
+        principal: principal("alice"),
+        expected_revision: AuthzRevision(2),
+        expected_binding_generation: 1,
+    };
+    repository
+        .mutate_tuples(
+            protected_realm_owner_request(&custom_scope, owner.clone(), Some("first-racer".into()))
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(repository.get_binding(&custom_scope).unwrap(), None);
+
+    let mut stale_retry =
+        protected_realm_owner_request(&custom_scope, owner, Some("stale-expired-receipt".into()))
+            .unwrap();
+    assert!(matches!(
+        repository.normalize_first_realm_owner_grant(&mut stale_retry),
+        Err(AuthzStoreError::RevisionConflict {
+            expected: AuthzRevision(2),
+            current: AuthzRevision(3),
+        })
+    ));
+
+    let mut exact_retry = protected_realm_owner_request(
+        &custom_scope,
+        ProtectedRealmOwnership {
+            principal: principal("alice"),
+            expected_revision: AuthzRevision(3),
+            expected_binding_generation: 1,
+        },
+        Some("expired-receipt".into()),
+    )
+    .unwrap();
+    assert!(
+        repository
+            .normalize_first_realm_owner_grant(&mut exact_retry)
+            .unwrap()
+    );
+    assert_eq!(exact_retry.operation_id, None);
+
+    let mut losing_racer = protected_realm_owner_request(
+        &custom_scope,
+        ProtectedRealmOwnership {
+            principal: principal("mallory"),
+            expected_revision: AuthzRevision(3),
+            expected_binding_generation: 1,
+        },
+        Some("second-racer".into()),
+    )
+    .unwrap();
+    assert!(matches!(
+        repository.normalize_first_realm_owner_grant(&mut losing_racer),
+        Err(AuthzStoreError::InvalidInput(message))
+            if message.contains("different or incomplete protected owner")
+    ));
+
+    let realm_resource = ObjectRef::opaque("authz_realm", "acme/relationships").unwrap();
+    repository
+        .mutate_tuples(TupleBatchRequest {
+            scope: AuthzScope::system(),
+            principal: principal("alice"),
+            expected_revision: Some(AuthzRevision(3)),
+            expected_binding_generation: 1,
+            operation_id: Some("inject-conflicting-owner".into()),
+            mutations: vec![TupleMutation {
+                kind: TupleMutationKind::Add,
+                tuple: Tuple::new(realm_resource, "owner", principal("mallory")),
+            }],
+        })
+        .unwrap();
+    assert!(matches!(
+        repository.normalize_first_realm_owner_grant(&mut exact_retry),
+        Err(AuthzStoreError::InvalidInput(_))
+    ));
 }
 
 #[test]

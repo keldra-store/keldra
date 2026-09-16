@@ -333,18 +333,31 @@ impl ClusterPeerTransport {
             .fresh_authorization_checks(request)
             .await?
             .into_inner();
-        require_response_schema(response.schema_version)?;
-        if response.allowed.len() != checks.len() {
-            return Err(Status::data_loss(
-                "fresh authorization result count differs from its request",
-            ));
-        }
-        Ok(FreshAuthorizationResult {
-            allowed: response.allowed,
-            revision: AuthzRevision(response.revision),
-            binding_generation: response.binding_generation,
-        })
+        decode_fresh_authorization_checks(response, checks.len())
     }
+}
+
+fn decode_fresh_authorization_checks(
+    response: wire::FreshAuthorizationChecksResult,
+    expected_checks: usize,
+) -> Result<FreshAuthorizationResult, Status> {
+    require_response_schema(response.schema_version)?;
+    if response.allowed.len() != expected_checks
+        || response.revision == 0
+        || response.binding_generation == 0
+    {
+        return Err(Status::data_loss(
+            "fresh authorization result evidence is incomplete or misaligned",
+        ));
+    }
+    let schema_ref = crate::authz_api::schema_ref_from_api(response.schema_ref)
+        .map_err(|_| Status::data_loss("fresh authorization result schema evidence is invalid"))?;
+    Ok(FreshAuthorizationResult {
+        allowed: response.allowed,
+        revision: AuthzRevision(response.revision),
+        binding_generation: response.binding_generation,
+        schema_ref,
+    })
 }
 
 async fn next_source_frame(
@@ -432,5 +445,51 @@ fn consistency_to_wire(consistency: AuthzConsistency) -> (wire::AuthorizationCon
             wire::AuthorizationConsistencyMode::AuthorizationConsistencyExact,
             revision.0,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cluster_peer::CLUSTER_PEER_SCHEMA_VERSION;
+
+    use super::*;
+
+    fn fresh_response() -> wire::FreshAuthorizationChecksResult {
+        wire::FreshAuthorizationChecksResult {
+            schema_version: CLUSTER_PEER_SCHEMA_VERSION,
+            allowed: vec![true],
+            revision: 11,
+            binding_generation: 3,
+            schema_ref: Some(keldra_api::v1::SchemaRef {
+                schema_id: "documents".into(),
+                schema_revision: 7,
+                schema_digest: vec![9; 32],
+            }),
+        }
+    }
+
+    #[test]
+    fn routed_batch_preserves_complete_revision_binding_and_schema_evidence() {
+        let decoded = decode_fresh_authorization_checks(fresh_response(), 1).unwrap();
+        assert_eq!(decoded.allowed, [true]);
+        assert_eq!(decoded.revision, AuthzRevision(11));
+        assert_eq!(decoded.binding_generation, 3);
+        assert_eq!(decoded.schema_ref.schema_revision, 7);
+        assert_eq!(decoded.schema_ref.schema_digest.0, [9; 32]);
+    }
+
+    #[test]
+    fn routed_batch_rejects_missing_schema_or_misaligned_results() {
+        let mut missing_schema = fresh_response();
+        missing_schema.schema_ref = None;
+        assert!(decode_fresh_authorization_checks(missing_schema, 1).is_err());
+
+        let misaligned = fresh_response();
+        assert_eq!(
+            decode_fresh_authorization_checks(misaligned, 2)
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
+        );
     }
 }
