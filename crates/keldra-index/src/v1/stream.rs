@@ -653,6 +653,8 @@ pub struct ComponentCompactionLimits {
     pub l0_trigger: usize,
     pub maximum_input_runs: usize,
     pub maximum_loaded_pack_bytes: usize,
+    /// Maximum encoded bytes in one indivisible output segment. Resident merge
+    /// workspace is admitted separately by the runtime's shared memory credits.
     pub maximum_output_run_bytes: usize,
 }
 
@@ -815,7 +817,7 @@ pub fn compact_component_runs(
     }
     let mut output = Vec::new();
     let mut records = BTreeMap::new();
-    let mut resident = 0_usize;
+    let mut encoded_records_bytes = 0_usize;
     while let Some((key, lanes)) = pending_keys.pop_first() {
         let winner = lanes
             .iter()
@@ -823,31 +825,43 @@ pub fn compact_component_runs(
             .max_by_key(|index| plan.inputs[*index].sequence)
             .and_then(|index| heads[index].map(|record| (index, record)))
             .ok_or(IndexError::Integrity)?;
-        let replacement = winner.1.replacement.map(<[u8]>::to_vec);
-        let record_bytes = 160_usize
-            .checked_add(replacement.as_ref().map_or(0, Vec::len))
-            .ok_or(IndexError::OffsetOverflow)?;
-        if record_bytes > limits.maximum_output_run_bytes {
-            return Err(IndexError::ResourceLimit {
-                needed: record_bytes,
-                limit: limits.maximum_output_run_bytes,
-            });
-        }
-        if resident > 0 && resident.saturating_add(record_bytes) > limits.maximum_output_run_bytes {
-            output.push(seal_component(
-                plan.component,
-                std::mem::take(&mut records),
-            )?);
-            resident = 0;
-        }
-        if replacement.is_some()
+        if winner.1.replacement.is_some()
             || policy == TombstoneCompactionPolicy::Retain
             || !plan.covers_oldest_history
         {
-            resident = resident
+            let record_bytes = 33usize
+                .checked_add(match winner.1.replacement {
+                    Some(value) => value
+                        .len()
+                        .checked_add(8)
+                        .ok_or(IndexError::OffsetOverflow)?,
+                    None => 0,
+                })
+                .ok_or(IndexError::OffsetOverflow)?;
+            let single = component_run_encoded_bytes(plan.component, 1, record_bytes)?;
+            if single > limits.maximum_output_run_bytes {
+                return Err(IndexError::ResourceLimit {
+                    needed: single,
+                    limit: limits.maximum_output_run_bytes,
+                });
+            }
+            let combined = encoded_records_bytes
                 .checked_add(record_bytes)
                 .ok_or(IndexError::OffsetOverflow)?;
-            records.insert(key, replacement);
+            if !records.is_empty()
+                && component_run_encoded_bytes(plan.component, records.len() + 1, combined)?
+                    > limits.maximum_output_run_bytes
+            {
+                output.push(seal_component(
+                    plan.component,
+                    std::mem::take(&mut records),
+                )?);
+                encoded_records_bytes = 0;
+            }
+            encoded_records_bytes = encoded_records_bytes
+                .checked_add(record_bytes)
+                .ok_or(IndexError::OffsetOverflow)?;
+            records.insert(key, winner.1.replacement.map(<[u8]>::to_vec));
         }
         for index in lanes {
             heads[index] = cursors[index].next_record()?;
@@ -866,6 +880,29 @@ pub fn compact_component_runs(
         return Err(IndexError::Integrity);
     }
     Ok(output)
+}
+
+/// Exact size of the frozen K1DELTA1 encoding: magic/u16 component/u64 count,
+/// u32 restart interval/count, one u32 offset per 64 records, then key/tag and
+/// optional u64-length-prefixed value bytes. No resident-map accounting here.
+fn component_run_encoded_bytes(
+    component: ComponentIdentity,
+    records: usize,
+    record_bytes: usize,
+) -> Result<usize, IndexError> {
+    let component_bytes = match component {
+        ComponentIdentity::DocumentHead | ComponentIdentity::SourceRecords => 1usize,
+        ComponentIdentity::Membership(_)
+        | ComponentIdentity::Field(_)
+        | ComponentIdentity::Order(_) => 33,
+    };
+    let header = 8usize + 2 + component_bytes + 8 + 4 + 4;
+    records
+        .div_ceil(64)
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(header))
+        .and_then(|bytes| bytes.checked_add(record_bytes))
+        .ok_or(IndexError::OffsetOverflow)
 }
 pub fn splice_compacted_component_runs<PageBytes>(
     previous: ComponentStreamRoot,

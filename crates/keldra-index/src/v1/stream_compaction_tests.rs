@@ -38,6 +38,180 @@ fn pack_hash(delta: &PackedComponentDelta, table: &ArtifactPackTable) -> [u8; 32
     delta.locator.resolve(table).unwrap().hash
 }
 
+fn merge_packed_inputs(
+    component: ComponentIdentity,
+    inputs: Vec<SealedComponentDelta>,
+    limit: usize,
+) -> Vec<SealedComponentDelta> {
+    let mut packs = BTreeMap::new();
+    let mut segments = Vec::new();
+    for (index, input) in inputs.into_iter().enumerate() {
+        let (delta, table, bytes) = packed(input);
+        packs.insert(pack_hash(&delta, &table), bytes);
+        let sequence = index as u64 + 1;
+        segments.push(
+            descriptor(
+                sequence,
+                0,
+                sequence - 1,
+                sequence,
+                sequence,
+                &delta,
+                &table,
+            )
+            .unwrap(),
+        );
+    }
+    let directory = build_component_stream(component, &segments).unwrap();
+    let pages = directory
+        .pages
+        .iter()
+        .map(|page| (page.hash, page.bytes.to_vec()))
+        .collect::<BTreeMap<_, _>>();
+    let limits = ComponentCompactionLimits {
+        l0_trigger: 2,
+        maximum_input_runs: 4,
+        maximum_loaded_pack_bytes: 64 * 1024 * 1024,
+        maximum_output_run_bytes: limit,
+    };
+    let plan = select_component_compaction(
+        directory.root(),
+        |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
+        limits,
+    )
+    .unwrap()
+    .unwrap();
+    compact_component_runs(
+        &plan,
+        limits,
+        TombstoneCompactionPolicy::Retain,
+        |reference| {
+            packs
+                .get(&reference.hash)
+                .cloned()
+                .ok_or(IndexError::Integrity)
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn exact_output_size_matches_frozen_headers_restarts_and_tombstones() {
+    for component in [
+        ComponentIdentity::DocumentHead,
+        ComponentIdentity::SourceRecords,
+        ComponentIdentity::Membership(RecipeIdentity::new([1; 32]).unwrap()),
+        ComponentIdentity::Field(RecipeIdentity::new([2; 32]).unwrap()),
+        ComponentIdentity::Order(RecipeIdentity::new([3; 32]).unwrap()),
+    ] {
+        for count in [1usize, 63, 64, 65, 127, 128, 129] {
+            let records = (1..=count)
+                .map(|ordinal| {
+                    (
+                        key(ordinal as u8),
+                        if ordinal % 2 == 0 {
+                            None
+                        } else {
+                            Some(b"data".to_vec())
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let record_bytes = records
+                .values()
+                .map(|value| 33 + value.as_ref().map_or(0, |value| 8 + value.len()))
+                .sum();
+            let expected = component_run_encoded_bytes(component, count, record_bytes).unwrap();
+            assert_eq!(
+                seal_component(component, records).unwrap().bytes.len(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn observed_seventeen_megabyte_component_merge_splits_into_packable_children() {
+    let component = ComponentIdentity::DocumentHead;
+    let cap = super::super::ARTIFACT_PACK_MAX_BYTES;
+    let observed = 17_447_376usize;
+    let overhead = component_run_encoded_bytes(component, 2, 2 * 41).unwrap();
+    let values = observed - overhead;
+    let first = vec![1; values / 2];
+    let second = vec![2; values - first.len()];
+    let output = merge_packed_inputs(
+        component,
+        vec![
+            sealed(component, &[(1, Some(&first))]),
+            sealed(component, &[(2, Some(&second))]),
+        ],
+        cap,
+    );
+    assert_eq!(output.len(), 2);
+    assert!(output.iter().all(|delta| delta.bytes.len() <= cap));
+    let decoded = output
+        .iter()
+        .flat_map(|delta| super::super::buffer::decode_component_delta(&delta.bytes).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(decoded[0].stable_key, key(1));
+    assert_eq!(decoded[0].replacement.as_deref(), Some(first.as_slice()));
+    assert_eq!(decoded[1].stable_key, key(2));
+    assert_eq!(decoded[1].replacement.as_deref(), Some(second.as_slice()));
+    drop(decoded);
+    let packed_bytes = output.iter().map(|delta| delta.bytes.len()).sum();
+    let packs = pack_component_deltas(output, test_pack_credits(packed_bytes)).unwrap();
+    assert_eq!(packs.packs.len(), 2);
+    assert!(packs.packs.iter().all(|pack| pack.bytes.len() <= cap));
+    assert_eq!(
+        packs
+            .packs
+            .iter()
+            .flat_map(|pack| &pack.deltas)
+            .map(|delta| delta.records)
+            .sum::<u64>(),
+        2
+    );
+}
+
+#[test]
+fn legal_single_record_at_physical_cap_is_not_refused_for_resident_map_overhead() {
+    let component = ComponentIdentity::DocumentHead;
+    let cap = super::super::ARTIFACT_PACK_MAX_BYTES;
+    let overhead = component_run_encoded_bytes(component, 1, 41).unwrap();
+    let value = vec![3; cap - overhead];
+    assert!(
+        160 + value.len() > cap,
+        "this legal record exceeds the old resident-based cutoff"
+    );
+    let output = merge_packed_inputs(
+        component,
+        vec![
+            sealed(component, &[(1, Some(&value))]),
+            sealed(component, &[(2, None)]),
+        ],
+        cap,
+    );
+    assert_eq!(output.len(), 2);
+    assert_eq!(output[0].bytes.len(), cap);
+    let tombstone = super::super::buffer::decode_component_delta(&output[1].bytes).unwrap();
+    assert_eq!(tombstone[0].stable_key, key(2));
+    assert!(tombstone[0].replacement.is_none());
+    let packed_bytes = output.iter().map(|delta| delta.bytes.len()).sum();
+    assert_eq!(
+        pack_component_deltas(output, test_pack_credits(packed_bytes))
+            .unwrap()
+            .packs
+            .len(),
+        2
+    );
+    let oversized = sealed(component, &[(1, Some(&vec![4; value.len() + 1]))]);
+    assert_eq!(oversized.bytes.len(), cap + 1);
+    assert!(
+        matches!(pack_component_deltas(vec![oversized], test_pack_credits(cap + 1)),
+        Err(IndexError::ResourceLimit { needed, limit }) if needed == cap + 1 && limit == cap)
+    );
+}
+
 fn reachable_pages(
     component: ComponentIdentity,
     hash: [u8; 32],

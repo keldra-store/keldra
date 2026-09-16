@@ -23,6 +23,14 @@ use super::v1_parallel::run_bounded_ordered;
 use super::v1_publication::{LoadedV1ProjectionGeneration, V1ProjectionPublisher};
 
 const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+
+fn component_output_run_limit(maximum_unmerged_bytes: usize) -> usize {
+    // A merge can use the shared working-memory budget, but each indivisible
+    // encoded child must fit the existing physical pack format's hard bound.
+    maximum_unmerged_bytes
+        .min(keldra_index::v1::ARTIFACT_PACK_MAX_BYTES)
+        .max(1024)
+}
 const MAX_PAGE_BYTES: usize = 32 * 1024;
 const MAX_PARALLEL_COMPONENT_COMPACTIONS: usize = 4;
 
@@ -218,7 +226,7 @@ impl V1ProjectionPublisher {
             l0_trigger: component_fan_in.min(8),
             maximum_input_runs: component_fan_in,
             maximum_loaded_pack_bytes: credits.total_limit_bytes(),
-            maximum_output_run_bytes: maximum_unmerged_bytes.min(MAX_ARTIFACT_BYTES).max(1024),
+            maximum_output_run_bytes: component_output_run_limit(maximum_unmerged_bytes),
         };
         let eligible = loaded
             .generation
@@ -575,7 +583,7 @@ fn compact_component_stream_accounted(
                 .ok_or_else(|| Status::resource_exhausted("merge record count overflow"))?;
     }
     // Input Bytes and the component cursor's Vec copy can coexist. Resident
-    // replacement-map records use the same 160-byte charge as the native merge;
+    // replacement-map records retain their separate 160-byte workspace charge;
     // each record additionally bounds a worst-case standalone encoded header
     // and restart entry. This is selected-input-sized construction headroom.
     let needed = pack_bytes
@@ -891,6 +899,15 @@ mod tests {
 
     fn credits() -> QueryBlockCredits {
         QueryBlockCredits::from_query_permit(Box::new(Permit(16 * 1024 * 1024))).unwrap()
+    }
+
+    #[test]
+    fn component_output_limit_matches_indivisible_physical_child_not_total_memory() {
+        let cap = keldra_index::v1::ARTIFACT_PACK_MAX_BYTES;
+        assert_eq!(component_output_run_limit(1024 * 1024 * 1024), cap);
+        assert_eq!(component_output_run_limit(MAX_ARTIFACT_BYTES), cap);
+        assert_eq!(component_output_run_limit(4 * 1024 * 1024), 4 * 1024 * 1024);
+        assert_eq!(component_output_run_limit(1), 1024);
     }
 
     #[test]
