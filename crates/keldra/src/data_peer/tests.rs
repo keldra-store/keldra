@@ -45,7 +45,7 @@ async fn duplicate_shard_seal_drains_bounded_pipe_until_upload_eof() {
     // the upload cannot fit in the pipe while AlreadyPresent returns early.
     let (mut sender, receiver) = tokio::io::duplex(1);
     let seal_store = store.clone();
-    let seal_codec = codec.clone();
+    let seal_codec = ErasureCodec::new(codec.profile()).unwrap();
     let seal_identity = identity.clone();
     let seal = tokio::spawn(async move {
         seal_replica_shard_and_drain(&seal_store, &seal_codec, &seal_identity, receiver).await
