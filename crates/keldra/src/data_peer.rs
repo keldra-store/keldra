@@ -815,9 +815,7 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         let codec = self.codec.clone();
         let seal_identity = identity.clone();
         let seal = tokio::spawn(async move {
-            store
-                .seal_replica_shard_stream(&codec, &seal_identity, receiver)
-                .await
+            seal_replica_shard_and_drain(&store, &codec, &seal_identity, receiver).await
         });
 
         let transfer = async {
@@ -1042,6 +1040,27 @@ impl wire::data_peer_server::DataPeer for DataPeerService {
         handoff::install_payload_lifecycle(self, request).await
     }
 }
+
+async fn seal_replica_shard_and_drain(
+    store: &Store,
+    codec: &ErasureCodec,
+    identity: &ShardIdentity,
+    mut receiver: impl tokio::io::AsyncRead + Unpin,
+) -> Result<ShardSealOutcome, ShardStoreError> {
+    let outcome = store
+        .seal_replica_shard_stream(codec, identity, &mut receiver)
+        .await?;
+    if outcome == ShardSealOutcome::AlreadyPresent {
+        // The store has validated the existing immutable artifact without
+        // consuming this upload. Keep the pipe alive until the RPC has checked
+        // every frame and its exact terminal length; do not acknowledge early.
+        tokio::io::copy(&mut receiver, &mut tokio::io::sink())
+            .await
+            .map_err(|error| ShardStoreError::Storage(error.to_string()))?;
+    }
+    Ok(outcome)
+}
+
 #[cfg(test)]
 #[path = "data_peer/tests.rs"]
 mod tests;

@@ -19,6 +19,57 @@ mod support;
 
 use support::*;
 
+#[tokio::test]
+async fn duplicate_shard_seal_drains_bounded_pipe_until_upload_eof() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(directory.path(), 1))
+        .await
+        .unwrap();
+    let content = vec![7; DATA_PEER_FRAME_BYTES * 2 + 333];
+    let blob = store.stage_blob(&content).await.unwrap();
+    let codec = ErasureCodec::new(ErasureProfile::default()).unwrap();
+    let mut shards = vec![Vec::new(); usize::from(codec.profile().total_shards())];
+    store
+        .encode_sealed_source(&codec, &blob, &mut shards)
+        .await
+        .unwrap();
+    let identity = ShardIdentity::new(blob, 0);
+    assert_eq!(
+        store
+            .seal_replica_shard_stream(&codec, &identity, Cursor::new(&shards[0]))
+            .await
+            .unwrap(),
+        ShardSealOutcome::Created
+    );
+    // Capacity one makes dropping an unconsumed duplicate reader deterministic:
+    // the upload cannot fit in the pipe while AlreadyPresent returns early.
+    let (mut sender, receiver) = tokio::io::duplex(1);
+    let seal_store = store.clone();
+    let seal_codec = codec.clone();
+    let seal_identity = identity.clone();
+    let seal = tokio::spawn(async move {
+        seal_replica_shard_and_drain(&seal_store, &seal_codec, &seal_identity, receiver).await
+    });
+    tokio::time::timeout(Duration::from_secs(30), sender.write_all(&shards[0]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !seal.is_finished(),
+        "duplicate acknowledgment must wait for upload EOF"
+    );
+    sender.shutdown().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(30), seal)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        ShardSealOutcome::AlreadyPresent
+    );
+    store.validate_shard(&codec, &identity).unwrap();
+}
+
 #[test]
 fn joining_callers_have_only_join_control_authority() {
     let cluster_id = ClusterId(*b"join-control-tst");
@@ -889,13 +940,15 @@ async fn real_mtls_large_source_and_shard_streams_are_exact_and_restart_safe() {
             .unwrap(),
         ShardSealOutcome::Created
     );
-    assert_eq!(
-        transport
-            .put_shard(NodeId(1), &address, &first, Cursor::new(shards[0].clone()),)
-            .await
-            .unwrap(),
-        ShardSealOutcome::AlreadyPresent
-    );
+    for _ in 0..4 {
+        assert_eq!(
+            transport
+                .put_shard(NodeId(1), &address, &first, Cursor::new(shards[0].clone()),)
+                .await
+                .unwrap(),
+            ShardSealOutcome::AlreadyPresent
+        );
+    }
     assert_eq!(
         collect_content(
             transport
