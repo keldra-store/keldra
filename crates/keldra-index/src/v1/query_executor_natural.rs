@@ -151,6 +151,7 @@ async fn scan_equal_partition_pages<L: QueryArtifactLoader + 'static, X: QueryPa
             pages.push(
                 scan_equal_partition_page(
                     loader,
+                    partition_executor,
                     manifest,
                     membership_recipe,
                     field_recipe,
@@ -178,6 +179,7 @@ async fn scan_equal_partition_pages<L: QueryArtifactLoader + 'static, X: QueryPa
                 pages.push(
                     scan_equal_partition_page(
                         loader,
+                        &super::super::SerialQueryPartitionExecutor,
                         manifest,
                         membership_recipe,
                         field_recipe,
@@ -210,6 +212,7 @@ async fn scan_equal_partition_pages<L: QueryArtifactLoader + 'static, X: QueryPa
             Box::pin(async move {
                 scan_equal_partition_page(
                     &mut loader,
+                    &super::super::SerialQueryPartitionExecutor,
                     &manifest,
                     membership_recipe,
                     field_recipe,
@@ -239,8 +242,9 @@ async fn scan_equal_partition_pages<L: QueryArtifactLoader + 'static, X: QueryPa
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn scan_equal_partition_page<L: QueryArtifactLoader>(
+async fn scan_equal_partition_page<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     membership_recipe: super::RecipeIdentity,
     field_recipe: super::RecipeIdentity,
@@ -253,6 +257,7 @@ async fn scan_equal_partition_page<L: QueryArtifactLoader>(
 ) -> Result<PartitionCandidatePage, IndexError> {
     let (postings, truncated) = load_bounded_equal_postings(
         loader,
+        executor,
         manifest,
         field_recipe,
         value,
@@ -276,6 +281,7 @@ async fn scan_equal_partition_page<L: QueryArtifactLoader>(
     )?;
     let presence = load_latest_gates_for_keys(
         loader,
+        executor,
         manifest,
         field_recipe,
         QueryBlockKind::Presence,
@@ -287,6 +293,7 @@ async fn scan_equal_partition_page<L: QueryArtifactLoader>(
     .await?;
     let membership = load_latest_gates_for_keys(
         loader,
+        executor,
         manifest,
         membership_recipe,
         QueryBlockKind::Gate,
@@ -351,8 +358,12 @@ async fn scan_equal_partition_page<L: QueryArtifactLoader>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
+async fn load_bounded_equal_postings<
+    L: QueryArtifactLoader + 'static,
+    X: QueryPartitionExecutor,
+>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     recipe: super::RecipeIdentity,
     value: &ScalarValue,
@@ -366,6 +377,12 @@ async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
     for (run, descriptor) in manifest.matching_blocks(QueryBlockKind::TermDictionary, recipe) {
         let (entries, entry_bytes) = load_selected_terms(
             loader,
+            executor,
+            manifest
+                .runs
+                .get(run)
+                .ok_or(IndexError::Integrity)?
+                .physical_catalog_generation,
             descriptor,
             std::slice::from_ref(value),
             None,
@@ -419,8 +436,18 @@ async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
         .ok_or(IndexError::OffsetOverflow)?;
     budget.reserve_heap(credits, source_bytes)?;
     let mut heap = BinaryHeap::new();
-    for (source_index, source) in sources.iter_mut().enumerate() {
-        refill_posting_source(loader, source, block_limits, credits, budget).await?;
+    let initial_sources = (0..sources.len()).collect();
+    refill_posting_sources(
+        loader,
+        executor,
+        &mut sources,
+        initial_sources,
+        block_limits,
+        credits,
+        budget,
+    )
+    .await?;
+    for (source_index, source) in sources.iter().enumerate() {
         if let Some(posting) = source.buffered.front() {
             heap.push(Reverse((posting.document, source_index)));
         }
@@ -441,7 +468,8 @@ async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
         }
 
         let mut selected = None::<(usize, QueryPosting)>;
-        for source_index in same_document_sources {
+        let mut refill = Vec::new();
+        for source_index in same_document_sources.iter().copied() {
             let source = sources.get_mut(source_index).ok_or(IndexError::Integrity)?;
             let posting = source.buffered.pop_front().ok_or(IndexError::Integrity)?;
             if posting.document != document {
@@ -455,9 +483,21 @@ async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
                 selected = Some((source.run, posting));
             }
             if source.buffered.is_empty() {
-                refill_posting_source(loader, source, block_limits, credits, budget).await?;
+                refill.push(source_index);
             }
-            if let Some(next) = source.buffered.front() {
+        }
+        refill_posting_sources(
+            loader,
+            executor,
+            &mut sources,
+            refill,
+            block_limits,
+            credits,
+            budget,
+        )
+        .await?;
+        for source_index in same_document_sources {
+            if let Some(next) = sources[source_index].buffered.front() {
                 heap.push(Reverse((next.document, source_index)));
             }
         }
@@ -481,6 +521,107 @@ async fn load_bounded_equal_postings<L: QueryArtifactLoader>(
     Ok((newest, truncated))
 }
 
+struct PostingChunk {
+    buffered: VecDeque<QueryPosting>,
+    resume: Option<StableDocumentKey>,
+    exhausted: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refill_posting_sources<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
+    loader: &mut L,
+    executor: &X,
+    sources: &mut [PostingSource<'_>],
+    indexes: Vec<usize>,
+    block_limits: QueryBlockLimits,
+    credits: &mut QueryBlockCredits,
+    budget: &mut Budget,
+) -> Result<(), IndexError> {
+    let indexes = indexes
+        .into_iter()
+        .filter(|index| {
+            sources
+                .get(*index)
+                .is_some_and(|source| !source.exhausted && source.buffered.is_empty())
+        })
+        .collect::<Vec<_>>();
+    let mut chunks = Vec::with_capacity(indexes.len());
+    if indexes.len() > 1 && executor.maximum_parallelism() > 1 {
+        let mut jobs = Vec::with_capacity(indexes.len());
+        for source_index in indexes.iter().copied() {
+            let source = sources.get(source_index).ok_or(IndexError::Integrity)?;
+            let Some(mut task_loader) = loader.try_fork_query_loader()? else {
+                jobs.clear();
+                break;
+            };
+            let descriptor = (*source.descriptor).clone();
+            let generation = source.generation;
+            let minimum = source.minimum_document;
+            let maximum = source.maximum_document;
+            let resume = source.resume;
+            let (mut task_budget, mut task_credits) = budget.try_fork_query(credits)?;
+            let task_executor = executor.clone();
+            jobs.push((
+                source_index,
+                Box::pin(async move {
+                    load_posting_chunk(
+                        &mut task_loader,
+                        &task_executor,
+                        generation,
+                        &descriptor,
+                        minimum,
+                        maximum,
+                        resume,
+                        block_limits,
+                        &mut task_credits,
+                        &mut task_budget,
+                    )
+                    .await
+                }) as QueryPartitionJob<_>,
+            ));
+        }
+        if jobs.len() == indexes.len() {
+            chunks = executor.execute_ordered(jobs).await?;
+        }
+    }
+    if chunks.is_empty() && !indexes.is_empty() {
+        for source_index in indexes.iter().copied() {
+            let source = sources.get(source_index).ok_or(IndexError::Integrity)?;
+            chunks.push((
+                source_index,
+                load_posting_chunk(
+                    loader,
+                    executor,
+                    source.generation,
+                    source.descriptor,
+                    source.minimum_document,
+                    source.maximum_document,
+                    source.resume,
+                    block_limits,
+                    credits,
+                    budget,
+                )
+                .await?,
+            ));
+        }
+    }
+    if chunks.len() != indexes.len()
+        || chunks
+            .iter()
+            .zip(&indexes)
+            .any(|((actual, _), expected)| actual != expected)
+    {
+        return Err(IndexError::Integrity);
+    }
+    for (source_index, chunk) in chunks {
+        let source = sources.get_mut(source_index).ok_or(IndexError::Integrity)?;
+        source.buffered = chunk.buffered;
+        source.resume = chunk.resume;
+        source.exhausted = chunk.exhausted;
+    }
+    Ok(())
+}
+
 struct PostingSource<'a> {
     run: usize,
     generation: [u8; 32],
@@ -493,54 +634,62 @@ struct PostingSource<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn refill_posting_source<L: QueryArtifactLoader>(
+async fn load_posting_chunk<L: QueryArtifactLoader, X: QueryPartitionExecutor>(
     loader: &mut L,
-    source: &mut PostingSource<'_>,
+    executor: &X,
+    generation: [u8; 32],
+    descriptor: &QueryBlockDescriptor,
+    minimum_document: StableDocumentKey,
+    maximum_document: StableDocumentKey,
+    mut resume: Option<StableDocumentKey>,
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<(), IndexError> {
-    if source.exhausted || !source.buffered.is_empty() {
-        return Ok(());
-    }
+) -> Result<PostingChunk, IndexError> {
     let encoded_bytes =
-        usize::try_from(source.descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
+        usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
     let block = super::load_decoded_block(
         loader,
-        source.generation,
-        source.descriptor,
+        executor,
+        generation,
+        descriptor,
         block_limits,
         credits,
         budget,
     )
     .await?;
-    let minimum = source
-        .resume
-        .filter(|minimum| source.minimum_document <= *minimum)
-        .unwrap_or(source.minimum_document);
-    let mut exhausted = true;
-    for record in block.records_from(&minimum.bytes()) {
-        let posting = decode_posting(record)?;
-        if posting.document < source.minimum_document || posting.document > source.maximum_document
-        {
-            return Err(IndexError::Integrity);
-        }
-        if source
-            .resume
-            .is_none_or(|minimum| posting.document > minimum)
-        {
-            source.resume = Some(posting.document);
-            budget.reserve_heap(credits, posting_buffer_bytes())?;
-            source.buffered.push_back(posting);
-            if source.buffered.len() == POSTING_SOURCE_CHUNK {
-                exhausted = false;
-                break;
+    let mut cpu_budget = budget.clone();
+    let mut cpu_credits = credits.try_fork_query()?;
+    executor
+        .run_cpu(Box::new(move || {
+            let minimum = resume
+                .filter(|minimum| minimum_document <= *minimum)
+                .unwrap_or(minimum_document);
+            let mut buffered = VecDeque::new();
+            let mut exhausted = true;
+            for record in block.records_from(&minimum.bytes()) {
+                let posting = decode_posting(record)?;
+                if posting.document < minimum_document || posting.document > maximum_document {
+                    return Err(IndexError::Integrity);
+                }
+                if resume.is_none_or(|minimum| posting.document > minimum) {
+                    resume = Some(posting.document);
+                    cpu_budget.reserve_heap(&mut cpu_credits, posting_buffer_bytes())?;
+                    buffered.push_back(posting);
+                    if buffered.len() == POSTING_SOURCE_CHUNK {
+                        exhausted = false;
+                        break;
+                    }
+                }
             }
-        }
-    }
-    source.exhausted = exhausted;
-    credits.release_loaded_block(encoded_bytes)?;
-    Ok(())
+            cpu_credits.release_loaded_block(encoded_bytes)?;
+            Ok(PostingChunk {
+                buffered,
+                resume,
+                exhausted,
+            })
+        }))
+        .await
 }
 
 const fn posting_entry_bytes() -> usize {
@@ -554,6 +703,7 @@ const fn posting_buffer_bytes() -> usize {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll, Wake, Waker};
 
     use bytes::Bytes;
@@ -563,8 +713,9 @@ mod tests {
     use crate::v1::{
         ArtifactPackReference, ArtifactPackTable, ProjectionPartitionIdentity,
         ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot, QueryArtifactLoad,
-        QueryBlockRecord, QueryMemoryPermit, QueryPostingShard, QueryRootCutProof, QueryTermEntry,
-        RecipeIdentity, encode_posting, encode_query_block, encode_term_entry,
+        QueryBlockRecord, QueryExecutionLimits, QueryMemoryPermit, QueryPostingShard,
+        QueryRootCutProof, QueryTermEntry, RecipeIdentity, encode_posting, encode_query_block,
+        encode_term_entry,
     };
 
     struct Permit(usize);
@@ -606,6 +757,60 @@ mod tests {
             block: Arc<super::super::DecodedQueryBlock>,
         ) {
             self.decoded.insert(request.hash, block);
+        }
+    }
+
+    #[derive(Clone)]
+    struct ForkLoader {
+        artifacts: Arc<BTreeMap<[u8; 32], Bytes>>,
+    }
+
+    impl QueryArtifactLoader for ForkLoader {
+        fn load_query_artifact(
+            &mut self,
+            request: QueryArtifactLoad,
+        ) -> impl std::future::Future<Output = Result<Bytes, IndexError>> + Send {
+            let value = self.artifacts.get(&request.hash).cloned();
+            async move { value.ok_or(IndexError::Integrity) }
+        }
+
+        fn try_fork_query_loader(&self) -> Result<Option<Self>, IndexError> {
+            Ok(Some(self.clone()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingExecutor(Arc<AtomicUsize>);
+
+    impl QueryPartitionExecutor for RecordingExecutor {
+        fn maximum_parallelism(&self) -> usize {
+            4
+        }
+
+        async fn execute_ordered<K, O>(
+            &self,
+            jobs: Vec<(K, QueryPartitionJob<O>)>,
+        ) -> Result<Vec<(K, O)>, IndexError>
+        where
+            K: Copy + Ord + Send + 'static,
+            O: Send + 'static,
+        {
+            self.0.fetch_add(jobs.len(), Ordering::AcqRel);
+            let mut outcomes = Vec::with_capacity(jobs.len());
+            for (key, job) in jobs.into_iter().rev() {
+                outcomes.push((key, job.await));
+            }
+            super::super::super::query_parallel::resolve_query_partition_results(outcomes)
+        }
+
+        async fn run_cpu<O>(
+            &self,
+            job: super::super::super::query_parallel::QueryCpuJob<O>,
+        ) -> Result<O, IndexError>
+        where
+            O: Send + 'static,
+        {
+            job()
         }
     }
 
@@ -771,6 +976,7 @@ mod tests {
             let mut budget = Budget::new(super::super::QueryExecutionLimits::default_for_memory());
             let (page, truncated) = ready(load_bounded_equal_postings(
                 &mut loader,
+                &super::super::SerialQueryPartitionExecutor,
                 &manifest,
                 recipe,
                 &value,
@@ -786,6 +992,113 @@ mod tests {
             resume = page.keys().next_back().copied();
         }
         assert_eq!(loader.loads[&posting.descriptor.hash], 1);
-        assert_eq!(loader.loads[&dictionary.descriptor.hash], 3);
+        assert_eq!(loader.loads[&dictionary.descriptor.hash], 1);
+    }
+
+    #[test]
+    fn independent_natural_posting_sources_refill_through_the_bounded_executor() {
+        let block_limits = QueryBlockLimits::default_for_memory();
+        let recipe = RecipeIdentity::new([13; 32]).unwrap();
+        let documents = [
+            StableDocumentKey::from_bytes([1; 32]).unwrap(),
+            StableDocumentKey::from_bytes([2; 32]).unwrap(),
+        ];
+        let mut encoding_credits =
+            QueryBlockCredits::from_query_permit(Box::new(Permit(1024 * 1024))).unwrap();
+        let blocks = documents.map(|document| {
+            encode_query_block(
+                QueryBlockKind::Posting,
+                recipe,
+                &[encode_posting(QueryPosting {
+                    document,
+                    material_source_version: 1,
+                    live: true,
+                    position_block_hash: None,
+                    positions: 0,
+                })
+                .unwrap()],
+                block_limits,
+                &mut encoding_credits,
+            )
+            .unwrap()
+        });
+        let descriptors = blocks.each_ref().map(|encoded| {
+            let pack_table = Arc::new(
+                ArtifactPackTable::new(vec![ArtifactPackReference {
+                    ordinal: 0,
+                    canonical_path: "_keldra/index-projections/v1/test/packs/0".into(),
+                    object_version: 1,
+                    hash: encoded.descriptor.hash,
+                    length: encoded.descriptor.encoded_bytes,
+                }])
+                .unwrap(),
+            );
+            super::super::QueryBlockDescriptor {
+                kind: encoded.descriptor.kind,
+                recipe: encoded.descriptor.recipe,
+                minimum_key: encoded.descriptor.minimum_key.clone(),
+                maximum_key: encoded.descriptor.maximum_key.clone(),
+                hash: encoded.descriptor.hash,
+                encoded_bytes: encoded.descriptor.encoded_bytes,
+                records: encoded.descriptor.records,
+                locator: crate::v1::ArtifactPackLocator {
+                    ordinal: 0,
+                    offset: 0,
+                    encoded_bytes: encoded.descriptor.encoded_bytes,
+                    logical_bytes: encoded.descriptor.encoded_bytes,
+                    checksum: encoded.descriptor.hash,
+                },
+                pack_table,
+            }
+        });
+        let mut loader = ForkLoader {
+            artifacts: Arc::new(
+                [
+                    (
+                        blocks[0].descriptor.hash,
+                        Bytes::from(blocks[0].bytes.clone()),
+                    ),
+                    (
+                        blocks[1].descriptor.hash,
+                        Bytes::from(blocks[1].bytes.clone()),
+                    ),
+                ]
+                .into(),
+            ),
+        };
+        let mut sources = descriptors
+            .iter()
+            .enumerate()
+            .map(|(index, descriptor)| PostingSource {
+                run: index,
+                generation: [4; 32],
+                descriptor,
+                minimum_document: documents[index],
+                maximum_document: documents[index],
+                resume: None,
+                buffered: VecDeque::new(),
+                exhausted: false,
+            })
+            .collect::<Vec<_>>();
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let executor = RecordingExecutor(submitted.clone());
+        let mut query_credits =
+            QueryBlockCredits::from_query_permit(Box::new(Permit(1024 * 1024))).unwrap();
+        let mut query_budget = Budget::new(QueryExecutionLimits::default_for_memory());
+
+        ready(refill_posting_sources(
+            &mut loader,
+            &executor,
+            &mut sources,
+            vec![0, 1],
+            block_limits,
+            &mut query_credits,
+            &mut query_budget,
+        ))
+        .unwrap();
+
+        assert_eq!(submitted.load(Ordering::Acquire), 2);
+        assert_eq!(sources[0].buffered.front().unwrap().document, documents[0]);
+        assert_eq!(sources[1].buffered.front().unwrap().document, documents[1]);
     }
 }

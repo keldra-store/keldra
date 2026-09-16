@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use crate::IndexError;
+use bytes::Bytes;
 
 use super::{ProjectionPartitionIdentity, ProjectionQueryStreamRoot};
 
@@ -47,7 +48,9 @@ pub enum QueryRunPage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedQueryRunPage {
     pub hash: [u8; 32],
-    pub bytes: Vec<u8>,
+    /// One immutable allocation shared by compaction overlays, retry state,
+    /// and durable staging. Cloning a page never copies its encoded body.
+    pub bytes: Bytes,
     summary: QueryRunChild,
 }
 
@@ -698,7 +701,7 @@ fn encode_page(page: QueryRunPage) -> Result<EncodedQueryRunPage, IndexError> {
     let summary = summarize_page(&page, hash, bytes.len())?;
     Ok(EncodedQueryRunPage {
         hash,
-        bytes,
+        bytes: Bytes::from(bytes),
         summary,
     })
 }
@@ -872,7 +875,7 @@ mod tests {
             assert!(reads.get() <= 2);
             assert!(prepared.pages.len() <= 3);
             for page in prepared.pages {
-                store.insert(page.hash, page.bytes);
+                store.insert(page.hash, page.bytes.to_vec());
             }
             root = Some(prepared.root);
         }
@@ -972,7 +975,7 @@ mod tests {
             )
             .unwrap();
             for page in prepared.pages {
-                store.insert(page.hash, page.bytes);
+                store.insert(page.hash, page.bytes.to_vec());
             }
             root = Some(prepared.root);
         }
@@ -1016,7 +1019,7 @@ mod tests {
             "only two leaves and their root change"
         );
         for page in spliced.pages {
-            store.insert(page.hash, page.bytes);
+            store.insert(page.hash, page.bytes.to_vec());
         }
         assert!(matches!(
             splice_compacted_query_runs(spliced.root, &plan, output, |hash| {
@@ -1113,7 +1116,7 @@ mod tests {
         )
         .unwrap();
         for page in appended.pages {
-            store.insert(page.hash, page.bytes);
+            store.insert(page.hash, page.bytes.to_vec());
         }
         let rebased = splice_compacted_query_runs(appended.root, &plan, valid, |hash| {
             store.get(&hash).cloned().ok_or(IndexError::Integrity)

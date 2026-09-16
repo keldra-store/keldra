@@ -300,13 +300,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
                 "routed index definition changed before execution",
             ));
         }
-        validate_query_kind(&request.definition, &request.query)?;
         let result_policy = result_authorization_policy(&request.definition)?;
-        validate_routed_subject(
-            &caller,
-            &result_policy,
-            request.authorization_subject.as_ref(),
-        )?;
         let definition_key = definition_object_key(&caller, &request.definition)?;
         let admission = self
             .authorization
@@ -319,6 +313,12 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
             )
             .await?;
         require_requested_authorization(&request, &admission)?;
+        validate_routed_subject(
+            &caller,
+            &result_policy,
+            request.authorization_subject.as_ref(),
+        )?;
+        validate_query_kind(&request.definition, &request.query)?;
         if request
             .resume
             .as_ref()

@@ -110,7 +110,11 @@ mod tests {
         ProjectionPartitionIdentity::new([1; 32], 7, [2; 32], producer, 3, placement_index).unwrap()
     }
 
-    fn root(partition: ProjectionPartitionIdentity, next_offset: u64) -> PinnedPartitionQueryRoot {
+    fn root(
+        partition: ProjectionPartitionIdentity,
+        next_offset: u64,
+        through_atomic_position: u64,
+    ) -> PinnedPartitionQueryRoot {
         let root = ProjectionQueryStreamRoot {
             stream_root_hash: [partition.producer_node as u8; 32],
             stream_root_encoded_bytes: 1,
@@ -119,7 +123,7 @@ mod tests {
             last_sequence: 1,
             source_start_offset: 0,
             next_offset,
-            through_atomic_position: 9,
+            through_atomic_position,
         };
         PinnedPartitionQueryRoot {
             partition,
@@ -127,7 +131,7 @@ mod tests {
             root,
             cut_proof: QueryRootCutProof {
                 common_cut: QueryCommonCut {
-                    through_atomic_position: 9,
+                    through_atomic_position,
                 },
                 selected_stream_root_hash: root.stream_root_hash,
                 next_newer_through_atomic_position: None,
@@ -137,10 +141,13 @@ mod tests {
     }
 
     fn pinned(atomic: u64, roots: Vec<PinnedPartitionQueryRoot>) -> PinnedRootVector {
+        let cut = QueryCommonCut {
+            through_atomic_position: atomic,
+        };
+        let identity = keldra_index::v1::query_snapshot_identity(cut, &roots).unwrap();
         PinnedRootVector {
-            cut: QueryCommonCut {
-                through_atomic_position: atomic,
-            },
+            identity,
+            cut,
             generation_hashes: roots
                 .iter()
                 .map(|root| [root.partition.producer_node as u8; 32])
@@ -192,7 +199,7 @@ mod tests {
     fn reports_the_background_monitors_bucket_routed_lag() {
         let first = partition(4, 5);
         let second = partition(6, 7);
-        let pinned = pinned(0, vec![root(first, 8), root(second, 12)]);
+        let pinned = pinned(0, vec![root(first, 8, 0), root(second, 12, 0)]);
         let observed = BTreeMap::from([(first, 20), (second, 20)]);
 
         let freshness = freshness(
@@ -218,7 +225,7 @@ mod tests {
     fn does_not_manufacture_zero_lag_when_an_observation_is_missing() {
         let first = partition(4, 5);
         let second = partition(6, 7);
-        let pinned = pinned(9, vec![root(first, 8), root(second, 12)]);
+        let pinned = pinned(9, vec![root(first, 8, 9), root(second, 12, 9)]);
 
         let freshness = freshness(
             &request(),
@@ -237,7 +244,7 @@ mod tests {
     #[test]
     fn stale_monitor_observation_never_precedes_the_durable_root() {
         let selected = partition(4, 5);
-        let pinned = pinned(9, vec![root(selected, 12)]);
+        let pinned = pinned(9, vec![root(selected, 12, 9)]);
 
         let freshness = freshness(
             &request(),

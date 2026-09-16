@@ -2,11 +2,13 @@ use super::*;
 use crate::typed_json::{AggregateOperation, Cardinality, FieldCapabilities, FieldType};
 use crate::v1::{
     ArtifactPackLocator, ArtifactPackReference, ArtifactPackTable, CatalogOrdinalRange,
-    EncodedQueryBlock,
+    EncodedQueryBlock, QueryPoint, QueryPostingShard, encode_document_gate, encode_point,
+    encode_posting, encode_query_block, encode_term_entry,
 };
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 struct Permit(usize);
@@ -37,6 +39,130 @@ impl QueryArtifactLoader for Loader {
 struct NoopWake;
 impl Wake for NoopWake {
     fn wake(self: Arc<Self>) {}
+}
+
+struct CancellationLeadership(Arc<AtomicBool>);
+
+impl Drop for CancellationLeadership {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+struct CancellationLoader {
+    leading: Arc<AtomicBool>,
+}
+
+impl QueryArtifactLoader for CancellationLoader {
+    fn load_query_artifact(
+        &mut self,
+        _request: QueryArtifactLoad,
+    ) -> impl std::future::Future<Output = Result<Bytes, IndexError>> + Send {
+        std::future::pending()
+    }
+
+    fn coordinate_query_block_population(
+        &mut self,
+        _generation: [u8; 32],
+        _request: QueryArtifactLoad,
+    ) -> impl std::future::Future<Output = Result<QueryPopulation, IndexError>> + Send {
+        let leading = self.leading.clone();
+        async move {
+            if leading
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(IndexError::Integrity);
+            }
+            Ok(QueryPopulation::Lead(Box::new(CancellationLeadership(
+                leading,
+            ))))
+        }
+    }
+
+    fn coordinate_query_run_population(
+        &mut self,
+        _request: QueryArtifactLoad,
+    ) -> impl std::future::Future<Output = Result<QueryPopulation, IndexError>> + Send {
+        let leading = self.leading.clone();
+        async move {
+            if leading
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(IndexError::Integrity);
+            }
+            Ok(QueryPopulation::Lead(Box::new(CancellationLeadership(
+                leading,
+            ))))
+        }
+    }
+}
+
+async fn hold_run_population(
+    loader: &mut CancellationLoader,
+    request: QueryArtifactLoad,
+) -> Result<(), IndexError> {
+    let _leadership = match loader.coordinate_query_run_population(request).await? {
+        QueryPopulation::Completed => return Err(IndexError::Integrity),
+        QueryPopulation::Lead(leadership) => leadership,
+    };
+    std::future::pending().await
+}
+
+#[derive(Clone)]
+struct ForkLoader {
+    artifacts: Arc<BTreeMap<[u8; 32], Bytes>>,
+}
+
+impl QueryArtifactLoader for ForkLoader {
+    fn load_query_artifact(
+        &mut self,
+        request: QueryArtifactLoad,
+    ) -> impl std::future::Future<Output = Result<Bytes, IndexError>> + Send {
+        let value = self.artifacts.get(&request.hash).cloned();
+        async move { value.ok_or(IndexError::Integrity) }
+    }
+
+    fn try_fork_query_loader(&self) -> Result<Option<Self>, IndexError> {
+        Ok(Some(self.clone()))
+    }
+}
+
+#[derive(Clone)]
+struct RecordingExecutor {
+    submitted: Arc<AtomicUsize>,
+    cpu_submitted: Arc<AtomicUsize>,
+}
+
+impl QueryPartitionExecutor for RecordingExecutor {
+    fn maximum_parallelism(&self) -> usize {
+        4
+    }
+
+    async fn execute_ordered<K, O>(
+        &self,
+        jobs: Vec<(K, QueryPartitionJob<O>)>,
+    ) -> Result<Vec<(K, O)>, IndexError>
+    where
+        K: Copy + Ord + Send + 'static,
+        O: Send + 'static,
+    {
+        self.submitted.fetch_add(jobs.len(), Ordering::AcqRel);
+        let mut outcomes = Vec::with_capacity(jobs.len());
+        for (key, job) in jobs.into_iter().rev() {
+            outcomes.push((key, job.await));
+        }
+        super::super::resolve_query_partition_results(outcomes)
+    }
+
+    async fn run_cpu<O>(&self, job: super::super::QueryCpuJob<O>) -> Result<O, IndexError>
+    where
+        O: Send + 'static,
+    {
+        self.cpu_submitted.fetch_add(1, Ordering::AcqRel);
+        job()
+    }
 }
 fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
     let waker = Waker::from(Arc::new(NoopWake));
@@ -78,6 +204,56 @@ fn bound_block(encoded: &EncodedQueryBlock) -> QueryBlockDescriptor {
             checksum: encoded.descriptor.hash,
         },
         pack_table: pack_table.clone(),
+    }
+}
+
+fn manifest_with_run_blocks(
+    partition: ProjectionPartitionIdentity,
+    blocks: &[&EncodedQueryBlock],
+) -> PartitionManifest {
+    let runs = blocks
+        .iter()
+        .enumerate()
+        .map(|(ordinal, encoded)| {
+            let sequence = u64::try_from(blocks.len() - ordinal).unwrap();
+            Arc::new(ProjectionQueryRunDescriptor {
+                partition,
+                physical_catalog_generation: [4; 32],
+                sequence,
+                source_start_offset: sequence,
+                next_offset: sequence + 1,
+                through_atomic_position: 20,
+                pack_table: Arc::new(ArtifactPackTable::empty()),
+                blocks: vec![bound_block(encoded)],
+            })
+        })
+        .collect();
+    PartitionManifest {
+        view: PartitionView {
+            pin: PinnedPartitionQueryRoot {
+                partition,
+                physical_catalog_generation: [4; 32],
+                root: ProjectionQueryStreamRoot {
+                    stream_root_hash: [7; 32],
+                    stream_root_encoded_bytes: 1,
+                    run_count: blocks.len() as u64,
+                    first_sequence: 1,
+                    last_sequence: blocks.len() as u64,
+                    source_start_offset: 1,
+                    next_offset: blocks.len() as u64 + 1,
+                    through_atomic_position: 20,
+                },
+                cut_proof: QueryRootCutProof {
+                    common_cut: QueryCommonCut {
+                        through_atomic_position: 20,
+                    },
+                    selected_stream_root_hash: [7; 32],
+                    next_newer_through_atomic_position: None,
+                },
+                handoff_lineage_id: [8; 32],
+            },
+        },
+        runs,
     }
 }
 
@@ -237,7 +413,7 @@ fn logical_heap_limit_does_not_report_query_credit_exhaustion() {
 }
 
 #[test]
-fn sequential_block_scans_reuse_transient_heap_credits() {
+fn sequential_decoded_block_scans_reuse_transient_credits_without_record_copies() {
     let limits = QueryBlockLimits::default_for_memory();
     let recipe = RecipeIdentity::new([3; 32]).unwrap();
     let records = (0..64u32)
@@ -261,28 +437,382 @@ fn sequential_block_scans_reuse_transient_heap_credits() {
         artifacts: [(hash, Bytes::from(encoded.bytes))].into(),
         payload_loads: 0,
     };
-    let resident_bytes = encoded.descriptor.records as usize * std::mem::size_of::<OwnedRecord>()
-        + encoded.descriptor.encoded_bytes as usize;
-    let admitted = resident_bytes + encoded.descriptor.encoded_bytes as usize * 2;
+    let admitted = encoded.descriptor.encoded_bytes as usize * 3;
     let mut credits = credits(admitted);
     let initial = credits.remaining();
     let mut budget = budget();
 
     for _ in 0..64 {
-        let (loaded, charged) = ready(load_block(
+        let loaded = ready(load_decoded_block(
             &mut loader,
+            &SerialQueryPartitionExecutor,
+            [7; 32],
             &descriptor,
             limits,
             &mut credits,
             &mut budget,
         ))
         .unwrap();
-        assert_eq!(loaded.len(), records.len());
+        assert_eq!(loaded.records().count(), records.len());
+        credits
+            .release_loaded_block(loaded.encoded_bytes())
+            .unwrap();
         drop(loaded);
-        budget.release_heap(&mut credits, charged).unwrap();
         assert_eq!(credits.remaining(), initial);
         assert_eq!(budget.heap_bytes(), 0);
     }
+}
+
+#[test]
+fn dropping_block_execution_releases_single_flight_while_loader_is_retained() {
+    let limits = QueryBlockLimits::default_for_memory();
+    let recipe = RecipeIdentity::new([3; 32]).unwrap();
+    let records = vec![super::super::QueryBlockRecord {
+        key: vec![1],
+        value: vec![2],
+    }];
+    let mut encoding_credits = credits(64 * 1024);
+    let encoded = encode_query_block(
+        QueryBlockKind::Point,
+        recipe,
+        &records,
+        limits,
+        &mut encoding_credits,
+    )
+    .unwrap();
+    let descriptor = bound_block(&encoded);
+    let leading = Arc::new(AtomicBool::new(false));
+    let mut loader = CancellationLoader {
+        leading: leading.clone(),
+    };
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+
+    for _ in 0..2 {
+        let mut query_credits = credits(64 * 1024);
+        let mut query_budget = budget();
+        let mut execution = Box::pin(load_decoded_block(
+            &mut loader,
+            &SerialQueryPartitionExecutor,
+            [7; 32],
+            &descriptor,
+            limits,
+            &mut query_credits,
+            &mut query_budget,
+        ));
+        assert!(matches!(
+            execution.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        assert!(leading.load(Ordering::Acquire));
+        drop(execution);
+        assert!(!leading.load(Ordering::Acquire));
+    }
+    let request = QueryArtifactLoad::direct(QueryArtifactKind::Run, [8; 32], 1);
+    for _ in 0..2 {
+        let mut execution = Box::pin(hold_run_population(&mut loader, request.clone()));
+        assert!(matches!(
+            execution.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        assert!(leading.load(Ordering::Acquire));
+        drop(execution);
+        assert!(!leading.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn one_partition_dispatches_independent_gate_blocks_and_merges_in_run_order() {
+    let limits = QueryBlockLimits::default_for_memory();
+    let recipe = RecipeIdentity::new([3; 32]).unwrap();
+    let document = StableDocumentKey::from_bytes([5; 32]).unwrap();
+    let gate = |version, live| {
+        encode_document_gate(QueryDocumentGate {
+            document,
+            material_source_version: version,
+            current_source_version: version,
+            live,
+            source_path: Some("objects/source.json".into()),
+            canonical_source_path: None,
+            result_path: Some("objects/result.json".into()),
+            result_version: version,
+        })
+        .unwrap()
+    };
+    let mut encoding_credits = credits(1024 * 1024);
+    let newest = encode_query_block(
+        QueryBlockKind::Gate,
+        recipe,
+        &[gate(2, true)],
+        limits,
+        &mut encoding_credits,
+    )
+    .unwrap();
+    let older = encode_query_block(
+        QueryBlockKind::Gate,
+        recipe,
+        &[gate(1, false)],
+        limits,
+        &mut encoding_credits,
+    )
+    .unwrap();
+    let partition = partition(1);
+    let run = |sequence, encoded: &EncodedQueryBlock| {
+        Arc::new(ProjectionQueryRunDescriptor {
+            partition,
+            physical_catalog_generation: [4; 32],
+            sequence,
+            source_start_offset: sequence,
+            next_offset: sequence + 1,
+            through_atomic_position: 20,
+            pack_table: Arc::new(ArtifactPackTable::empty()),
+            blocks: vec![bound_block(encoded)],
+        })
+    };
+    let manifest = PartitionManifest {
+        view: PartitionView {
+            pin: PinnedPartitionQueryRoot {
+                partition,
+                physical_catalog_generation: [4; 32],
+                root: ProjectionQueryStreamRoot {
+                    stream_root_hash: [7; 32],
+                    stream_root_encoded_bytes: 1,
+                    run_count: 2,
+                    first_sequence: 1,
+                    last_sequence: 2,
+                    source_start_offset: 1,
+                    next_offset: 3,
+                    through_atomic_position: 20,
+                },
+                cut_proof: QueryRootCutProof {
+                    common_cut: QueryCommonCut {
+                        through_atomic_position: 20,
+                    },
+                    selected_stream_root_hash: [7; 32],
+                    next_newer_through_atomic_position: None,
+                },
+                handoff_lineage_id: [8; 32],
+            },
+        },
+        runs: vec![run(2, &newest), run(1, &older)],
+    };
+    let mut loader = ForkLoader {
+        artifacts: Arc::new(
+            [
+                (newest.descriptor.hash, Bytes::from(newest.bytes)),
+                (older.descriptor.hash, Bytes::from(older.bytes)),
+            ]
+            .into(),
+        ),
+    };
+    let submitted = Arc::new(AtomicUsize::new(0));
+    let executor = RecordingExecutor {
+        submitted: submitted.clone(),
+        cpu_submitted: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut query_credits = credits(1024 * 1024);
+    let mut query_budget = budget();
+
+    let gates = ready(load_latest_gates(
+        &mut loader,
+        &executor,
+        &manifest,
+        recipe,
+        QueryBlockKind::Gate,
+        limits,
+        &mut query_credits,
+        &mut query_budget,
+    ))
+    .unwrap();
+
+    assert_eq!(submitted.load(Ordering::Acquire), 2);
+    assert_eq!(gates.len(), 1);
+    assert_eq!(gates[&document].material_source_version, 2);
+    assert!(gates[&document].live);
+}
+
+#[test]
+fn one_partition_dispatches_independent_range_blocks_and_merges_in_run_order() {
+    let limits = QueryBlockLimits::default_for_memory();
+    let recipe = RecipeIdentity::new([13; 32]).unwrap();
+    let document = StableDocumentKey::from_bytes([15; 32]).unwrap();
+    let point = |version, live| {
+        encode_point(&QueryPoint {
+            value: ScalarValue::Signed(42),
+            document,
+            material_source_version: version,
+            live,
+        })
+        .unwrap()
+    };
+    let mut encoding_credits = credits(1024 * 1024);
+    let newest = encode_query_block(
+        QueryBlockKind::Point,
+        recipe,
+        &[point(2, true)],
+        limits,
+        &mut encoding_credits,
+    )
+    .unwrap();
+    let older = encode_query_block(
+        QueryBlockKind::Point,
+        recipe,
+        &[point(1, false)],
+        limits,
+        &mut encoding_credits,
+    )
+    .unwrap();
+    let manifest = manifest_with_run_blocks(partition(1), &[&newest, &older]);
+    let mut loader = ForkLoader {
+        artifacts: Arc::new(
+            [
+                (newest.descriptor.hash, Bytes::from(newest.bytes)),
+                (older.descriptor.hash, Bytes::from(older.bytes)),
+            ]
+            .into(),
+        ),
+    };
+    let submitted = Arc::new(AtomicUsize::new(0));
+    let executor = RecordingExecutor {
+        submitted: submitted.clone(),
+        cpu_submitted: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut query_credits = credits(1024 * 1024);
+    let mut query_budget = budget();
+
+    let matches = ready(seek_range(
+        &mut loader,
+        &executor,
+        &manifest,
+        recipe,
+        None,
+        None,
+        limits,
+        &mut query_credits,
+        &mut query_budget,
+    ))
+    .unwrap();
+
+    assert_eq!(submitted.load(Ordering::Acquire), 2);
+    assert_eq!(matches, [(document, 2)].into());
+}
+
+#[test]
+fn one_partition_dispatches_independent_full_text_posting_blocks() {
+    let limits = QueryBlockLimits::default_for_memory();
+    let recipe = RecipeIdentity::new([23; 32]).unwrap();
+    let document = StableDocumentKey::from_bytes([25; 32]).unwrap();
+    let term = ScalarValue::String("parallel".into());
+    let mut encoding_credits = credits(1024 * 1024);
+    let posting = |version, live, credits: &mut QueryBlockCredits| {
+        encode_query_block(
+            QueryBlockKind::Posting,
+            recipe,
+            &[encode_posting(QueryPosting {
+                document,
+                material_source_version: version,
+                live,
+                position_block_hash: None,
+                positions: 0,
+            })
+            .unwrap()],
+            limits,
+            credits,
+        )
+        .unwrap()
+    };
+    let newest_posting = posting(2, true, &mut encoding_credits);
+    let older_posting = posting(1, false, &mut encoding_credits);
+    let dictionary = |posting: &EncodedQueryBlock, credits: &mut QueryBlockCredits| {
+        encode_query_block(
+            QueryBlockKind::TermDictionary,
+            recipe,
+            &[encode_term_entry(&QueryTermEntry {
+                term: term.clone(),
+                posting_shards: vec![QueryPostingShard {
+                    posting_block_hash: posting.descriptor.hash,
+                    posting_records: posting.descriptor.records,
+                    minimum_document: document,
+                    maximum_document: document,
+                }],
+            })
+            .unwrap()],
+            limits,
+            credits,
+        )
+        .unwrap()
+    };
+    let newest_dictionary = dictionary(&newest_posting, &mut encoding_credits);
+    let older_dictionary = dictionary(&older_posting, &mut encoding_credits);
+    let partition = partition(1);
+    let run = |sequence, dictionary: &EncodedQueryBlock, posting: &EncodedQueryBlock| {
+        Arc::new(ProjectionQueryRunDescriptor {
+            partition,
+            physical_catalog_generation: [4; 32],
+            sequence,
+            source_start_offset: sequence,
+            next_offset: sequence + 1,
+            through_atomic_position: 20,
+            pack_table: Arc::new(ArtifactPackTable::empty()),
+            blocks: vec![bound_block(dictionary), bound_block(posting)],
+        })
+    };
+    let mut manifest =
+        manifest_with_run_blocks(partition, &[&newest_dictionary, &older_dictionary]);
+    manifest.runs = vec![
+        run(2, &newest_dictionary, &newest_posting),
+        run(1, &older_dictionary, &older_posting),
+    ];
+    let mut loader = ForkLoader {
+        artifacts: Arc::new(
+            [
+                (
+                    newest_posting.descriptor.hash,
+                    Bytes::from(newest_posting.bytes),
+                ),
+                (
+                    older_posting.descriptor.hash,
+                    Bytes::from(older_posting.bytes),
+                ),
+                (
+                    newest_dictionary.descriptor.hash,
+                    Bytes::from(newest_dictionary.bytes),
+                ),
+                (
+                    older_dictionary.descriptor.hash,
+                    Bytes::from(older_dictionary.bytes),
+                ),
+            ]
+            .into(),
+        ),
+    };
+    let submitted = Arc::new(AtomicUsize::new(0));
+    let cpu_submitted = Arc::new(AtomicUsize::new(0));
+    let executor = RecordingExecutor {
+        submitted: submitted.clone(),
+        cpu_submitted: cpu_submitted.clone(),
+    };
+    let mut query_credits = credits(1024 * 1024);
+    let mut query_budget = budget();
+
+    let postings = ready(seek_term_postings(
+        &mut loader,
+        &executor,
+        &manifest,
+        recipe,
+        std::slice::from_ref(&term),
+        None,
+        None,
+        limits,
+        &mut query_credits,
+        &mut query_budget,
+    ))
+    .unwrap();
+
+    assert_eq!(submitted.load(Ordering::Acquire), 4);
+    assert_eq!(cpu_submitted.load(Ordering::Acquire), 8);
+    assert_eq!(postings[&term][&document].1.material_source_version, 2);
+    assert!(postings[&term][&document].1.live);
 }
 
 #[test]

@@ -1218,7 +1218,7 @@ mod tests {
                 .unwrap();
             root = Some(append.root);
             for page in append.pages {
-                pages.insert(page.hash, page.bytes);
+                pages.insert(page.hash, page.bytes.to_vec());
             }
         }
         let root = root.unwrap();

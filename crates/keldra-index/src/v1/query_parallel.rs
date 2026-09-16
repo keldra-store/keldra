@@ -17,6 +17,10 @@ use super::{
 pub type QueryPartitionJob<O> =
     Pin<Box<dyn Future<Output = Result<O, IndexError>> + Send + 'static>>;
 
+/// One owned synchronous query CPU unit. Runtime implementations execute it on
+/// Keldra's shared bounded CPU pool rather than a Tokio scheduler worker.
+pub type QueryCpuJob<O> = Box<dyn FnOnce() -> Result<O, IndexError> + Send + 'static>;
+
 /// Executes already-independent partition jobs under a runtime-owned bound.
 ///
 /// Implementations must await every admitted job, including after one job
@@ -24,7 +28,7 @@ pub type QueryPartitionJob<O> =
 /// return successful results in ascending key order. Use
 /// [`resolve_query_partition_results`] after concurrent execution to apply the
 /// canonical ordering and deterministic error-selection rule.
-pub trait QueryPartitionExecutor: Send + Sync {
+pub trait QueryPartitionExecutor: Clone + Send + Sync + 'static {
     fn maximum_parallelism(&self) -> usize;
 
     fn execute_ordered<K, O>(
@@ -33,6 +37,10 @@ pub trait QueryPartitionExecutor: Send + Sync {
     ) -> impl Future<Output = Result<Vec<(K, O)>, IndexError>> + Send
     where
         K: Copy + Ord + Send + 'static,
+        O: Send + 'static;
+
+    fn run_cpu<O>(&self, job: QueryCpuJob<O>) -> impl Future<Output = Result<O, IndexError>> + Send
+    where
         O: Send + 'static;
 }
 
@@ -59,6 +67,13 @@ impl QueryPartitionExecutor for SerialQueryPartitionExecutor {
             outcomes.push((key, job.await));
         }
         resolve_query_partition_results(outcomes)
+    }
+
+    async fn run_cpu<O>(&self, job: QueryCpuJob<O>) -> Result<O, IndexError>
+    where
+        O: Send + 'static,
+    {
+        job()
     }
 }
 

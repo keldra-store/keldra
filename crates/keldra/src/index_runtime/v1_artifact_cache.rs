@@ -42,6 +42,14 @@ impl From<&BlobRef> for BlobKey {
 enum CacheKey {
     Path(Key),
     Blob(BlobKey),
+    QueryRun(BlobKey),
+    QueryBlock(QueryBlockKey),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct QueryBlockKey {
+    generation: [u8; 32],
+    block: BlobKey,
 }
 
 struct State {
@@ -51,20 +59,26 @@ struct State {
     // path without allocating another owned copy.
     entries: HashMap<Authority, HashMap<Arc<str>, HashMap<([u8; 32], Option<u64>), Bytes>>>,
     blobs: HashMap<BlobKey, CachedBlob>,
+    query_runs: HashMap<BlobKey, CachedQueryRun>,
+    query_blocks: HashMap<QueryBlockKey, CachedQueryBlock>,
+    query_run_loading: HashMap<BlobKey, tokio::sync::watch::Sender<bool>>,
+    query_block_loading: HashMap<QueryBlockKey, tokio::sync::watch::Sender<bool>>,
     loading: HashMap<Key, tokio::sync::watch::Sender<bool>>,
     fifo: VecDeque<CacheKey>,
 }
 
 struct CachedBlob {
     bytes: Bytes,
-    query_run: Option<Arc<ProjectionQueryRunDescriptor>>,
-    query_block: Option<CachedQueryBlock>,
+}
+
+struct CachedQueryRun {
+    descriptor: Arc<ProjectionQueryRunDescriptor>,
     resident_bytes: usize,
 }
 
 struct CachedQueryBlock {
-    generation: [u8; 32],
     block: Arc<DecodedQueryBlock>,
+    resident_bytes: usize,
 }
 
 impl Default for State {
@@ -74,6 +88,10 @@ impl Default for State {
             bytes: 0,
             entries: HashMap::new(),
             blobs: HashMap::new(),
+            query_runs: HashMap::new(),
+            query_blocks: HashMap::new(),
+            query_run_loading: HashMap::new(),
+            query_block_loading: HashMap::new(),
             loading: HashMap::new(),
             fifo: VecDeque::new(),
         }
@@ -112,7 +130,111 @@ enum PathLoad {
     Lead(PathLoadGuard),
 }
 
+#[derive(Clone, Copy)]
+enum DecodeKey {
+    Run(BlobKey),
+    Block(QueryBlockKey),
+}
+
+pub(super) struct DecodeLoadGuard {
+    cache: ImmutableArtifactCache,
+    key: Option<DecodeKey>,
+}
+
+impl Drop for DecodeLoadGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let mut state = self
+            .cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let completed = match key {
+            DecodeKey::Run(key) => state.query_run_loading.remove(&key),
+            DecodeKey::Block(key) => state.query_block_loading.remove(&key),
+        };
+        if let Some(completed) = completed {
+            completed.send_replace(true);
+        }
+    }
+}
+
+pub(super) enum DecodePopulation {
+    Completed,
+    Lead(DecodeLoadGuard),
+}
+
 impl ImmutableArtifactCache {
+    pub(super) async fn coordinate_query_run(
+        &self,
+        blob: &BlobRef,
+    ) -> Result<DecodePopulation, Status> {
+        let key = BlobKey::from(blob);
+        let wait = {
+            let mut state = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(completed) = state.query_run_loading.get(&key) {
+                Some(completed.subscribe())
+            } else {
+                let (completed, _) = tokio::sync::watch::channel(false);
+                state.query_run_loading.insert(key, completed);
+                None
+            }
+        };
+        self.finish_decode_coordination(DecodeKey::Run(key), wait)
+            .await
+    }
+
+    pub(super) async fn coordinate_query_block(
+        &self,
+        blob: &BlobRef,
+        generation: [u8; 32],
+    ) -> Result<DecodePopulation, Status> {
+        let key = QueryBlockKey {
+            generation,
+            block: BlobKey::from(blob),
+        };
+        let wait = {
+            let mut state = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(completed) = state.query_block_loading.get(&key) {
+                Some(completed.subscribe())
+            } else {
+                let (completed, _) = tokio::sync::watch::channel(false);
+                state.query_block_loading.insert(key, completed);
+                None
+            }
+        };
+        self.finish_decode_coordination(DecodeKey::Block(key), wait)
+            .await
+    }
+
+    async fn finish_decode_coordination(
+        &self,
+        key: DecodeKey,
+        wait: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<DecodePopulation, Status> {
+        if let Some(mut completed) = wait {
+            if !*completed.borrow() {
+                completed
+                    .changed()
+                    .await
+                    .map_err(|_| Status::internal("v1 decoded artifact load coordinator closed"))?;
+            }
+            Ok(DecodePopulation::Completed)
+        } else {
+            Ok(DecodePopulation::Lead(DecodeLoadGuard {
+                cache: self.clone(),
+                key: Some(key),
+            }))
+        }
+    }
     /// Coalesce simultaneous misses for one exact immutable object identity.
     ///
     /// Projection lanes commonly seek different records through the same
@@ -340,16 +462,7 @@ impl ImmutableArtifactCache {
             return;
         }
         state.bytes += bytes.len();
-        let resident_bytes = bytes.len();
-        state.blobs.insert(
-            key,
-            CachedBlob {
-                bytes,
-                query_run: None,
-                query_block: None,
-                resident_bytes,
-            },
-        );
+        state.blobs.insert(key, CachedBlob { bytes });
         state.fifo.push_back(CacheKey::Blob(key));
         Self::evict_to_capacity(&mut state);
     }
@@ -363,15 +476,15 @@ impl ImmutableArtifactCache {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(cached) = state.blobs.get(&BlobKey::from(blob)) else {
-            return Ok(None);
-        };
-        if cached.bytes.len() > maximum_bytes || cached.bytes.len() as u64 != blob.length {
+        if blob.length > maximum_bytes as u64 {
             return Err(Status::data_loss(
                 "v1 projection artifact violates its exact byte bound",
             ));
         }
-        Ok(cached.query_run.clone())
+        Ok(state
+            .query_runs
+            .get(&BlobKey::from(blob))
+            .map(|cached| cached.descriptor.clone()))
     }
 
     pub(super) fn insert_query_run(
@@ -384,16 +497,22 @@ impl ImmutableArtifactCache {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(cached) = state.blobs.get_mut(&key) else {
-            return;
-        };
-        if cached.query_run.is_some() {
+        if state.query_runs.contains_key(&key) {
             return;
         }
         let descriptor_bytes = resident_query_run_bytes(&descriptor);
-        cached.resident_bytes = cached.resident_bytes.saturating_add(descriptor_bytes);
-        cached.query_run = Some(descriptor);
+        if descriptor_bytes > state.capacity_bytes {
+            return;
+        }
+        state.query_runs.insert(
+            key,
+            CachedQueryRun {
+                descriptor,
+                resident_bytes: descriptor_bytes,
+            },
+        );
         state.bytes = state.bytes.saturating_add(descriptor_bytes);
+        state.fifo.push_back(CacheKey::QueryRun(key));
         Self::evict_to_capacity(&mut state);
     }
 
@@ -407,19 +526,19 @@ impl ImmutableArtifactCache {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(cached) = state.blobs.get(&BlobKey::from(blob)) else {
-            return Ok(None);
-        };
-        if cached.bytes.len() > maximum_bytes || cached.bytes.len() as u64 != blob.length {
+        if blob.length > maximum_bytes as u64 {
             return Err(Status::data_loss(
                 "v1 projection artifact violates its exact byte bound",
             ));
         }
-        Ok(cached
-            .query_block
-            .as_ref()
-            .filter(|block| block.generation == generation)
-            .map(|block| block.block.clone()))
+        let key = QueryBlockKey {
+            generation,
+            block: BlobKey::from(blob),
+        };
+        Ok(state
+            .query_blocks
+            .get(&key)
+            .map(|cached| cached.block.clone()))
     }
 
     pub(super) fn insert_query_block(
@@ -428,38 +547,38 @@ impl ImmutableArtifactCache {
         generation: [u8; 32],
         block: Arc<DecodedQueryBlock>,
     ) {
-        let key = BlobKey::from(blob);
+        let key = QueryBlockKey {
+            generation,
+            block: BlobKey::from(blob),
+        };
         let mut state = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(cached) = state.blobs.get_mut(&key) else {
+        let Ok(encoded_bytes) = usize::try_from(blob.length) else {
             return;
         };
-        if !block.matches_content(blob.hash, cached.bytes.len()) {
-            return;
-        }
-        let index_bytes = block.resident_index_bytes();
-        let replaced_bytes = cached
-            .query_block
-            .as_ref()
-            .map_or(0, |cached| cached.block.resident_index_bytes());
-        if cached
-            .query_block
-            .as_ref()
-            .is_some_and(|cached| cached.generation == generation)
+        if !block.matches_content(blob.hash, encoded_bytes) || state.query_blocks.contains_key(&key)
         {
             return;
         }
-        cached.resident_bytes = cached
-            .resident_bytes
-            .saturating_sub(replaced_bytes)
-            .saturating_add(index_bytes);
-        cached.query_block = Some(CachedQueryBlock { generation, block });
-        state.bytes = state
-            .bytes
-            .saturating_sub(replaced_bytes)
-            .saturating_add(index_bytes);
+        // Packed children are right-sized before decode, so their retained
+        // allocation is exactly the child length rather than the whole pack.
+        let resident_bytes = block
+            .resident_index_bytes()
+            .saturating_add(block.encoded_bytes());
+        if resident_bytes > state.capacity_bytes {
+            return;
+        }
+        state.query_blocks.insert(
+            key,
+            CachedQueryBlock {
+                block,
+                resident_bytes,
+            },
+        );
+        state.bytes = state.bytes.saturating_add(resident_bytes);
+        state.fifo.push_back(CacheKey::QueryBlock(key));
         Self::evict_to_capacity(&mut state);
     }
 
@@ -495,6 +614,14 @@ impl ImmutableArtifactCache {
                 }
                 CacheKey::Blob(oldest) => state
                     .blobs
+                    .remove(&oldest)
+                    .map_or(0, |evicted| evicted.bytes.len()),
+                CacheKey::QueryRun(oldest) => state
+                    .query_runs
+                    .remove(&oldest)
+                    .map_or(0, |evicted| evicted.resident_bytes),
+                CacheKey::QueryBlock(oldest) => state
+                    .query_blocks
                     .remove(&oldest)
                     .map_or(0, |evicted| evicted.resident_bytes),
             };
@@ -692,6 +819,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_decoded_block_population_has_one_leader() {
+        let cache = ImmutableArtifactCache::default();
+        let blob = BlobRef {
+            hash: [11; 32],
+            length: 128,
+        };
+        let leader = match cache.coordinate_query_block(&blob, [12; 32]).await.unwrap() {
+            DecodePopulation::Lead(guard) => guard,
+            DecodePopulation::Completed => panic!("first population must lead"),
+        };
+        let waiter = {
+            let cache = cache.clone();
+            let blob = blob.clone();
+            tokio::spawn(async move { cache.coordinate_query_block(&blob, [12; 32]).await })
+        };
+        tokio::task::yield_now().await;
+        drop(leader);
+        assert!(matches!(
+            waiter.await.unwrap().unwrap(),
+            DecodePopulation::Completed
+        ));
+        assert!(matches!(
+            cache.coordinate_query_block(&blob, [12; 32]).await.unwrap(),
+            DecodePopulation::Lead(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_decoded_run_population_has_one_leader() {
+        let cache = ImmutableArtifactCache::default();
+        let blob = BlobRef {
+            hash: [13; 32],
+            length: 256,
+        };
+        let leader = match cache.coordinate_query_run(&blob).await.unwrap() {
+            DecodePopulation::Lead(guard) => guard,
+            DecodePopulation::Completed => panic!("first population must lead"),
+        };
+        let waiter = {
+            let cache = cache.clone();
+            let blob = blob.clone();
+            tokio::spawn(async move { cache.coordinate_query_run(&blob).await })
+        };
+        tokio::task::yield_now().await;
+        drop(leader);
+        assert!(matches!(
+            waiter.await.unwrap().unwrap(),
+            DecodePopulation::Completed
+        ));
+    }
+
+    #[tokio::test]
     async fn loaded_path_bytes_must_fit_the_callers_exact_bound() {
         let cache = ImmutableArtifactCache::default();
 
@@ -845,13 +1024,12 @@ mod tests {
     }
 
     #[test]
-    fn decoded_query_runs_are_reference_counted_beside_their_blob() {
+    fn decoded_query_runs_are_keyed_by_their_own_identity_not_raw_blob_residency() {
         let cache = ImmutableArtifactCache::default();
         let blob = BlobRef {
             hash: [9; 32],
             length: 8,
         };
-        cache.insert_blob(&blob, Bytes::from_static(b"artifact"));
         let descriptor = Arc::new(ProjectionQueryRunDescriptor {
             partition: keldra_index::v1::ProjectionPartitionIdentity::new(
                 [1; 32], 2, [3; 32], 4, 5, 6,

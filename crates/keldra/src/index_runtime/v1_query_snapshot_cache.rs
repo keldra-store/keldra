@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 use keldra_index::IndexError;
 use keldra_index::v1::{
     LogicalProjectionBinding, PinnedPartitionQueryRoot, QueryRecipeCatalogProof,
-    QuerySnapshotIdentity, ValidatedQuerySnapshot, query_snapshot_identity,
+    QuerySnapshotIdentity, ValidatedQuerySnapshot,
 };
 
 use super::cursor::QueryPositionRoot;
@@ -76,7 +76,7 @@ impl V1QuerySnapshotCache {
         catalog_lineage: &[[u8; 32]],
         recipe_catalog_proofs: &[QueryRecipeCatalogProof],
     ) -> Result<Option<Arc<CachedRuntimeQuerySnapshot>>, IndexError> {
-        let identity = query_snapshot_identity(pinned.cut, &pinned.roots)?;
+        let identity = pinned.identity;
         Ok(self.get_matching(
             identity,
             logical,
@@ -573,6 +573,7 @@ mod tests {
         assert_eq!(admission.calls, 1);
 
         let pinned = PinnedRootVector {
+            identity: snapshot.identity(),
             cut,
             roots: vec![pin],
             generation_hashes: vec![[7; 32]],

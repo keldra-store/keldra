@@ -11,14 +11,13 @@ use keldra_atomic_program::MAX_OBJECT_PATH_BYTES;
 use keldra_consensus::DecisionRaft;
 use keldra_index::IndexError;
 use keldra_index::typed_json::{AggregateOperation, FieldSchema, FieldType, ScalarValue};
-#[cfg(test)]
 use keldra_index::v1::QuerySnapshotIdentity;
 use keldra_index::v1::{
     AuthorizedQueryCandidate, LogicalFieldBinding, LogicalProjectionBinding,
     MAX_QUERY_CANDIDATE_ADMISSION_BATCH, MAX_QUERY_PARTITIONS, PinnedPartitionQueryRoot,
     ProjectionCatalogActivation, ProjectionFamilyPartitionDirectory, ProjectionGenerationHeader,
     ProjectionPartitionIdentity, QueryAdmissionContext, QueryBlockCredits, QueryBlockLimits,
-    QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits, QueryFieldBinding,
+    QueryCandidateAdmission, QueryCommonCut, QueryCpuJob, QueryExecutionLimits, QueryFieldBinding,
     QueryMemoryPermit, QueryPartitionExecutor, QueryPartitionJob, QueryPublicValueEncoder,
     QueryRootCutProof, RecipeIdentity, StableDocumentKey, TypedJsonQueryRequest,
     ValidatedQuerySnapshot, decode_projection_generation_header,
@@ -179,7 +178,7 @@ impl V1LocalIndexQueryExecutor {
         } else {
             let pinned = loop {
                 let pinned = self
-                    .pin_root_vector(&request, &recipe, continuation.as_ref())
+                    .pin_root_vector(&request, Arc::clone(&recipe), continuation.as_ref())
                     .await?;
                 if request.resume.is_some()
                     || requirement_is_covered(&pinned, request.required_freshness.as_ref())
@@ -201,8 +200,7 @@ impl V1LocalIndexQueryExecutor {
                 }
             };
             if let Some(expected) = continuation.as_ref().map(|position| position.snapshot)
-                && query_snapshot_identity(pinned.cut, &pinned.roots).map_err(index_status)?
-                    != expected
+                && pinned.identity != expected
             {
                 return Err(Status::failed_precondition(
                     "v1 query continuation snapshot is no longer retained",
@@ -283,6 +281,7 @@ impl V1LocalIndexQueryExecutor {
                 request.definition.bucket.clone(),
                 request.tenant_id,
                 request.bucket_id,
+                self.query_scheduler.clone(),
             );
             let mut admission = RuntimeCandidateAdmission {
                 visibility: request.candidate_visibility.clone(),
@@ -423,7 +422,7 @@ impl V1LocalIndexQueryExecutor {
     ) -> Result<
         (
             LogicalProjectionBinding,
-            PhysicalCatalogRecipe,
+            Arc<PhysicalCatalogRecipe>,
             keldra_index::typed_json::TypedJsonSchema,
             ProjectionCatalogActivation,
         ),
@@ -510,7 +509,7 @@ impl V1LocalIndexQueryExecutor {
     async fn pin_root_vector(
         &self,
         request: &LocalIndexQueryRequest,
-        recipe: &PhysicalCatalogRecipe,
+        recipe: Arc<PhysicalCatalogRecipe>,
         continuation: Option<&QueryPosition>,
     ) -> Result<PinnedRootVector, Status> {
         let (directory, directory_version) = self
@@ -534,7 +533,7 @@ impl V1LocalIndexQueryExecutor {
             return Err(Status::unavailable("v1 family directory has no partitions"));
         }
         let newest = self
-            .load_newest_partition_roots(request, recipe, &directory)
+            .load_newest_partition_roots(request, &recipe, &directory)
             .await?;
         let requested_cut = request.resume.as_ref().map(|cursor| cursor.commit_revision);
         let cut = requested_cut.unwrap_or_else(|| {
@@ -642,8 +641,11 @@ impl V1LocalIndexQueryExecutor {
                 .map(|(_, outcome)| outcome)
                 .collect::<Result<Vec<_>, Status>>()?
         };
-        let (roots, generation_hashes) = exact.into_iter().unzip();
+        let (roots, generation_hashes): (Vec<PinnedPartitionQueryRoot>, Vec<[u8; 32]>) =
+            exact.into_iter().unzip();
+        let identity = query_snapshot_identity(common_cut, &roots).map_err(index_status)?;
         Ok(PinnedRootVector {
+            identity,
             cut: common_cut,
             roots,
             generation_hashes,
@@ -895,6 +897,7 @@ impl LocalIndexQueryExecutor for V1LocalIndexQueryExecutor {
 
 #[derive(Clone)]
 struct PinnedRootVector {
+    identity: QuerySnapshotIdentity,
     cut: QueryCommonCut,
     roots: Vec<PinnedPartitionQueryRoot>,
     generation_hashes: Vec<[u8; 32]>,
@@ -952,6 +955,13 @@ impl QueryPartitionExecutor for IndexQueryScheduler {
             .await
             .map_err(|error| IndexError::Io(error.to_string()))?;
         resolve_query_partition_results(outcomes)
+    }
+
+    async fn run_cpu<O>(&self, job: QueryCpuJob<O>) -> Result<O, IndexError>
+    where
+        O: Send + 'static,
+    {
+        IndexQueryScheduler::run_cpu(self, job).await
     }
 }
 
@@ -1449,6 +1459,7 @@ mod tests {
         let successor = root(partition(6, 7), 12);
         assert_eq!(predecessor.handoff_lineage_id, successor.handoff_lineage_id);
         let pinned = PinnedRootVector {
+            identity: QuerySnapshotIdentity::from_bytes([9; 32]).unwrap(),
             cut: QueryCommonCut {
                 through_atomic_position: 9,
             },
@@ -1479,6 +1490,7 @@ mod tests {
         let values = vec![authorized(1, "a"), authorized(2, "b"), authorized(3, "c")];
         let snapshot = QuerySnapshotIdentity::from_bytes([9; 32]).unwrap();
         let pinned = PinnedRootVector {
+            identity: snapshot,
             cut: QueryCommonCut {
                 through_atomic_position: 9,
             },
@@ -1517,6 +1529,7 @@ mod tests {
         genesis_root.root.through_atomic_position = 0;
         genesis_root.cut_proof.common_cut.through_atomic_position = 0;
         let pinned = PinnedRootVector {
+            identity: snapshot,
             cut: QueryCommonCut {
                 through_atomic_position: 0,
             },
@@ -1564,6 +1577,7 @@ mod tests {
         first.cut_proof.next_newer_through_atomic_position = Some(10);
         let second = root(partition(6, 7), 12);
         let pinned = PinnedRootVector {
+            identity: snapshot,
             cut: QueryCommonCut {
                 through_atomic_position: 9,
             },
@@ -1608,6 +1622,7 @@ mod tests {
     #[test]
     fn snapshot_reuse_rejects_a_different_generation_with_the_same_query_root() {
         let pinned = PinnedRootVector {
+            identity: QuerySnapshotIdentity::from_bytes([9; 32]).unwrap(),
             cut: QueryCommonCut {
                 through_atomic_position: 9,
             },
@@ -1637,6 +1652,7 @@ mod tests {
     fn query_position_rejects_truncation_and_trailing_bytes() {
         let snapshot = QuerySnapshotIdentity::from_bytes([9; 32]).unwrap();
         let pinned = PinnedRootVector {
+            identity: snapshot,
             cut: QueryCommonCut {
                 through_atomic_position: 9,
             },

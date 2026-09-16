@@ -13,8 +13,8 @@ use crate::typed_json::{
 use super::{
     ArtifactPackReference, DecodedQueryBlock, LogicalProjectionBinding,
     MAX_QUERY_DOCUMENT_PATH_BYTES, ProjectionPartitionIdentity, ProjectionQueryRunDescriptor,
-    ProjectionQueryStreamRoot, QueryBlockCredits, QueryBlockCursor, QueryBlockDescriptor,
-    QueryBlockKind, QueryBlockLimits, QueryDocumentGate, QueryPosting, QueryRecipeCatalogProof,
+    ProjectionQueryStreamRoot, QueryBlockCredits, QueryBlockDescriptor, QueryBlockKind,
+    QueryBlockLimits, QueryDocumentGate, QueryPoint, QueryPosting, QueryRecipeCatalogProof,
     QueryRunChild, QueryRunPage, QueryRunReference, QueryTermEntry, RecipeIdentity,
     StableDocumentKey, decode_doc_value, decode_document_gate, decode_point, decode_positions,
     decode_posting, decode_projection_query_run, decode_query_run_page, decode_term_entry,
@@ -34,15 +34,28 @@ use authorization::{authorize_selected_candidates, resident_authorized_candidate
 #[path = "query_executor_budget.rs"]
 mod budget;
 use budget::Budget;
+#[path = "query_executor_candidates.rs"]
+mod candidates;
+use candidates::{
+    AlignedGates, candidate_is_current, resident_gate_dynamic_bytes, select_handoff_candidate,
+};
 #[path = "query_executor_general.rs"]
 mod general;
 use general::execute_general_query;
 #[path = "query_executor_natural.rs"]
 mod natural;
+#[path = "query_executor_parallel_blocks.rs"]
+mod parallel_blocks;
 use super::query_parallel::{
-    QueryPartitionExecutor, SerialQueryPartitionExecutor, execute_typed_json_query_with_executor,
+    QueryPartitionExecutor, QueryPartitionJob, SerialQueryPartitionExecutor,
+    execute_typed_json_query_with_executor,
 };
 use natural::execute_bounded_natural_equal;
+use parallel_blocks::{
+    PostingBlockWork, decode_gate_block, decode_position_block, decode_posting_block,
+    decode_range_block, load_decoded_block, point_descriptor_overlaps, posting_entry_bytes,
+    resident_point_entry_bytes,
+};
 #[path = "query_executor_snapshot.rs"]
 mod snapshot;
 use snapshot::{
@@ -218,6 +231,26 @@ pub trait QueryArtifactLoader: Send {
     ) {
     }
 
+    /// Join or lead population of one decoded immutable run. Leadership is an
+    /// execution-future-local lease: dropping the query future drops the lease
+    /// and wakes waiters even when the loader itself remains alive.
+    fn coordinate_query_run_population(
+        &mut self,
+        _request: QueryArtifactLoad,
+    ) -> impl std::future::Future<Output = Result<QueryPopulation, IndexError>> + Send {
+        async { Ok(QueryPopulation::Lead(Box::new(()))) }
+    }
+
+    /// Equivalent single-flight coordination for a generation-bound decoded
+    /// query block.
+    fn coordinate_query_block_population(
+        &mut self,
+        _generation: [u8; 32],
+        _request: QueryArtifactLoad,
+    ) -> impl std::future::Future<Output = Result<QueryPopulation, IndexError>> + Send {
+        async { Ok(QueryPopulation::Lead(Box::new(()))) }
+    }
+
     /// Fork a query-local handle for independent partition work.
     ///
     /// A returned handle must address the same immutable artifact authority and
@@ -230,6 +263,21 @@ pub trait QueryArtifactLoader: Send {
     {
         Ok(None)
     }
+}
+
+/// Cancellation-safe ownership of one decoded-artifact population attempt.
+///
+/// Implementations release leadership and wake waiters from `Drop`.
+pub trait QueryPopulationGuard: Send {}
+
+impl<T: Send> QueryPopulationGuard for T {}
+
+/// Result of joining the single-flight population for one decoded artifact.
+pub enum QueryPopulation {
+    /// Another attempt completed; the caller must retry its cache lookup.
+    Completed,
+    /// This attempt owns population while the returned lease remains alive.
+    Lead(Box<dyn QueryPopulationGuard>),
 }
 
 pub(super) fn matching_run_blocks(
@@ -380,6 +428,7 @@ pub async fn execute_typed_json_query_with_cursor_and_executor<
         for pin in pins.iter().copied() {
             let (manifest, resident_bytes, index_bytes) = load_partition_manifest(
                 loader,
+                partition_executor,
                 PartitionView { pin },
                 &request.catalog_lineage,
                 &request.recipe_catalog_proofs,
@@ -471,8 +520,9 @@ pub async fn execute_typed_json_query_with_cursor_and_executor<
     ))
 }
 
-async fn load_latest_gates<L: QueryArtifactLoader>(
+async fn load_latest_gates<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     kind: QueryBlockKind,
@@ -480,29 +530,101 @@ async fn load_latest_gates<L: QueryArtifactLoader>(
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
 ) -> Result<BTreeMap<StableDocumentKey, QueryDocumentGate>, IndexError> {
+    let blocks = manifest
+        .matching_blocks(kind, recipe)
+        .enumerate()
+        .map(|(ordinal, (run, descriptor))| {
+            Ok((
+                ordinal,
+                manifest
+                    .runs
+                    .get(run)
+                    .ok_or(IndexError::Integrity)?
+                    .physical_catalog_generation,
+                descriptor.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, IndexError>>()?;
     let mut gates = BTreeMap::new();
-    for (_, descriptor) in manifest.matching_blocks(kind, recipe) {
-        let (records, record_bytes) =
-            load_block(loader, descriptor, block_limits, credits, budget).await?;
-        for record in records {
-            let gate = decode_document_gate(record.as_ref())?;
-            if (kind == QueryBlockKind::Gate) != gate.source_path.is_some() {
-                return Err(IndexError::Integrity);
-            }
-            if !gates.contains_key(&gate.document) {
-                budget.reserve_heap(credits, resident_gate_bytes(&gate)?)?;
+    let mut decoded = Vec::with_capacity(blocks.len());
+    let can_parallel = blocks.len() > 1 && executor.maximum_parallelism() > 1;
+    if can_parallel {
+        let mut jobs = Vec::with_capacity(blocks.len());
+        for (ordinal, generation, descriptor) in &blocks {
+            let Some(mut task_loader) = loader.try_fork_query_loader()? else {
+                jobs.clear();
+                break;
+            };
+            let (mut task_budget, mut task_credits) = budget.try_fork_query(credits)?;
+            let descriptor = (*descriptor).clone();
+            let ordinal = *ordinal;
+            let generation = *generation;
+            let task_executor = executor.clone();
+            jobs.push((
+                ordinal,
+                Box::pin(async move {
+                    decode_gate_block(
+                        &mut task_loader,
+                        &task_executor,
+                        generation,
+                        &descriptor,
+                        kind,
+                        block_limits,
+                        &mut task_credits,
+                        &mut task_budget,
+                    )
+                    .await
+                }) as QueryPartitionJob<_>,
+            ));
+        }
+        if jobs.len() == blocks.len() {
+            decoded = executor.execute_ordered(jobs).await?;
+        }
+    }
+    if decoded.is_empty() && !blocks.is_empty() {
+        for (ordinal, generation, descriptor) in &blocks {
+            decoded.push((
+                *ordinal,
+                decode_gate_block(
+                    loader,
+                    executor,
+                    *generation,
+                    descriptor,
+                    kind,
+                    block_limits,
+                    credits,
+                    budget,
+                )
+                .await?,
+            ));
+        }
+    }
+    if decoded.len() != blocks.len()
+        || decoded
+            .iter()
+            .enumerate()
+            .any(|(expected, (actual, _))| expected != *actual)
+    {
+        return Err(IndexError::Integrity);
+    }
+    for (_, block_gates) in decoded {
+        for gate in block_gates {
+            let bytes = resident_gate_bytes(&gate)?;
+            if gates.contains_key(&gate.document) {
+                budget.release_heap(credits, bytes)?;
+            } else {
                 gates.insert(gate.document, gate);
             }
         }
-        budget.release_heap(credits, record_bytes)?;
     }
     budget.candidates(gates.len())?;
     Ok(gates)
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
+async fn load_latest_gates_for_keys<L: QueryArtifactLoader, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     kind: QueryBlockKind,
@@ -562,6 +684,7 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
             .physical_catalog_generation;
         let block = load_decoded_block(
             loader,
+            executor,
             generation,
             descriptor,
             block_limits,
@@ -624,63 +747,10 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader>(
     })
 }
 
-#[derive(Default)]
-struct AlignedGates {
-    gates: Vec<Option<QueryDocumentGate>>,
-    resident_bytes: usize,
-}
-
-impl AlignedGates {
-    fn into_parts(self) -> (Vec<Option<QueryDocumentGate>>, usize) {
-        (self.gates, self.resident_bytes)
-    }
-}
-
-fn resident_gate_dynamic_bytes(gate: &QueryDocumentGate) -> Result<usize, IndexError> {
-    resident_gate_bytes(gate)?
-        .checked_sub(
-            std::mem::size_of::<StableDocumentKey>()
-                .saturating_add(std::mem::size_of::<QueryDocumentGate>()),
-        )
-        .ok_or(IndexError::Integrity)
-}
-
-async fn load_decoded_block<L: QueryArtifactLoader>(
-    loader: &mut L,
-    generation: [u8; 32],
-    descriptor: &QueryBlockDescriptor,
-    block_limits: QueryBlockLimits,
-    credits: &mut QueryBlockCredits,
-    budget: &mut Budget,
-) -> Result<Arc<DecodedQueryBlock>, IndexError> {
-    let encoded_bytes =
-        usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-    let request = QueryArtifactLoad::packed(descriptor)?;
-    if let Some(block) = loader.cached_query_block(generation, request.clone())? {
-        if !block.matches_descriptor(descriptor) {
-            return Err(IndexError::Integrity);
-        }
-        budget.load(QueryArtifactKind::Block, encoded_bytes)?;
-        credits.reserve_loaded_block(encoded_bytes, block_limits.maximum_loaded_blocks)?;
-        return Ok(block);
-    }
-
-    let bytes = load_exact_pre_admitted(loader, request.clone(), credits, budget).await?;
-    credits.release(bytes.len())?;
-    let block = Arc::new(DecodedQueryBlock::from_verified_content(
-        descriptor,
-        bytes,
-        block_limits,
-        credits,
-    )?);
-    loader.cache_query_block(generation, request, block.clone());
-    credits.reserve_loaded_block(encoded_bytes, block_limits.maximum_loaded_blocks)?;
-    Ok(block)
-}
-
 #[allow(clippy::too_many_arguments)]
-fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
+fn evaluate_predicate<'a, L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
     loader: &'a mut L,
+    executor: &'a X,
     manifest: &'a PartitionManifest,
     universe: &'a BTreeMap<StableDocumentKey, QueryDocumentGate>,
     contracts: &'a BTreeMap<FieldId, QueryFieldBinding>,
@@ -706,6 +776,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
                 })?;
                 let mut output = evaluate_predicate(
                     loader,
+                    executor,
                     manifest,
                     universe,
                     contracts,
@@ -720,6 +791,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
                 for child in children {
                     let next = evaluate_predicate(
                         loader,
+                        executor,
                         manifest,
                         universe,
                         contracts,
@@ -752,6 +824,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
                 for child in children {
                     let next = evaluate_predicate(
                         loader,
+                        executor,
                         manifest,
                         universe,
                         contracts,
@@ -783,6 +856,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
             Predicate::Not(child) => {
                 let excluded = evaluate_predicate(
                     loader,
+                    executor,
                     manifest,
                     universe,
                     contracts,
@@ -821,6 +895,7 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
             leaf => {
                 evaluate_leaf(
                     loader,
+                    executor,
                     manifest,
                     universe,
                     contracts,
@@ -840,8 +915,9 @@ fn evaluate_predicate<'a, L: QueryArtifactLoader + 'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn evaluate_leaf<L: QueryArtifactLoader>(
+async fn evaluate_leaf<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     universe: &BTreeMap<StableDocumentKey, QueryDocumentGate>,
     contracts: &BTreeMap<FieldId, QueryFieldBinding>,
@@ -861,6 +937,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
     if matches!(predicate, Predicate::Exists { .. }) {
         let presence = load_latest_gates(
             loader,
+            executor,
             manifest,
             binding.recipe,
             QueryBlockKind::Presence,
@@ -882,6 +959,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
             Some(
                 load_latest_gates_for_keys(
                     loader,
+                    executor,
                     manifest,
                     membership_recipe,
                     QueryBlockKind::Gate,
@@ -934,6 +1012,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
         Predicate::Equal { value, .. } => {
             seek_terms(
                 loader,
+                executor,
                 manifest,
                 binding.recipe,
                 std::slice::from_ref(value),
@@ -948,6 +1027,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
         Predicate::In { values, .. } => {
             seek_terms(
                 loader,
+                executor,
                 manifest,
                 binding.recipe,
                 values,
@@ -962,6 +1042,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
         Predicate::Prefix { prefix, .. } => {
             seek_terms(
                 loader,
+                executor,
                 manifest,
                 binding.recipe,
                 &[],
@@ -985,6 +1066,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
             }
             let postings = seek_term_postings(
                 loader,
+                executor,
                 manifest,
                 binding.recipe,
                 &terms,
@@ -1027,6 +1109,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
                     .saturating_mul(std::mem::size_of::<StableDocumentKey>());
                 verify_phrase(
                     loader,
+                    executor,
                     manifest,
                     binding.recipe,
                     &terms,
@@ -1046,6 +1129,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
         Predicate::Range { lower, upper, .. } => {
             seek_range(
                 loader,
+                executor,
                 manifest,
                 binding.recipe,
                 lower.as_ref(),
@@ -1073,6 +1157,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
     )?;
     let presence = load_latest_gates_for_keys(
         loader,
+        executor,
         manifest,
         binding.recipe,
         QueryBlockKind::Presence,
@@ -1086,6 +1171,7 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
         Some(
             load_latest_gates_for_keys(
                 loader,
+                executor,
                 manifest,
                 membership_recipe,
                 QueryBlockKind::Gate,
@@ -1140,80 +1226,10 @@ async fn evaluate_leaf<L: QueryArtifactLoader>(
     Ok(candidates.into_keys().collect())
 }
 
-fn candidate_is_current(
-    membership: Option<&QueryDocumentGate>,
-    presence: Option<&QueryDocumentGate>,
-    candidate_material_version: u64,
-) -> bool {
-    membership.is_some_and(|gate| gate.live)
-        && presence.is_some_and(|gate| {
-            gate.live && candidate_material_version <= gate.material_source_version
-        })
-}
-
-fn select_handoff_candidate(
-    selected: &mut BTreeMap<StableDocumentKey, QueryAdmissionCandidate>,
-    incoming: QueryAdmissionCandidate,
-    credits: &mut QueryBlockCredits,
-    budget: &mut Budget,
-) -> Result<(), IndexError> {
-    use std::collections::btree_map::Entry;
-    match selected.entry(incoming.document) {
-        Entry::Vacant(entry) => {
-            budget.reserve_heap(credits, resident_selected_candidate_bytes(&incoming)?)?;
-            entry.insert(incoming);
-        }
-        Entry::Occupied(mut entry) => {
-            let current = entry.get().clone();
-            if current.handoff_lineage_id != incoming.handoff_lineage_id {
-                return Err(IndexError::Integrity);
-            }
-            match incoming
-                .covered_through_source_position
-                .cmp(&current.covered_through_source_position)
-            {
-                Ordering::Greater => {
-                    replace_selected_candidate_charge(credits, budget, &current, &incoming)?;
-                    entry.insert(incoming);
-                }
-                Ordering::Equal
-                    if incoming.material_source_version != current.material_source_version
-                        || incoming.current_source_version != current.current_source_version
-                        || incoming.source_path != current.source_path
-                        || incoming.result_path != current.result_path
-                        || incoming.result_version != current.result_version =>
-                {
-                    return Err(IndexError::Integrity);
-                }
-                Ordering::Equal if incoming.partition < current.partition => {
-                    replace_selected_candidate_charge(credits, budget, &current, &incoming)?;
-                    entry.insert(incoming);
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-fn replace_selected_candidate_charge(
-    credits: &mut QueryBlockCredits,
-    budget: &mut Budget,
-    current: &QueryAdmissionCandidate,
-    incoming: &QueryAdmissionCandidate,
-) -> Result<(), IndexError> {
-    let current = resident_selected_candidate_bytes(current)?;
-    let incoming = resident_selected_candidate_bytes(incoming)?;
-    if incoming > current {
-        budget.reserve_heap(credits, incoming - current)
-    } else {
-        budget.release_heap(credits, current - incoming)
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-async fn seek_terms<L: QueryArtifactLoader>(
+async fn seek_terms<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     exact: &[ScalarValue],
@@ -1225,6 +1241,7 @@ async fn seek_terms<L: QueryArtifactLoader>(
 ) -> Result<BTreeMap<StableDocumentKey, u64>, IndexError> {
     let newest = seek_term_postings(
         loader,
+        executor,
         manifest,
         recipe,
         exact,
@@ -1255,8 +1272,9 @@ async fn seek_terms<L: QueryArtifactLoader>(
 type TermPostingMap = BTreeMap<ScalarValue, BTreeMap<StableDocumentKey, (usize, QueryPosting)>>;
 
 #[allow(clippy::too_many_arguments)]
-async fn seek_term_postings<L: QueryArtifactLoader>(
+async fn seek_term_postings<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     exact: &[ScalarValue],
@@ -1267,19 +1285,119 @@ async fn seek_term_postings<L: QueryArtifactLoader>(
     budget: &mut Budget,
 ) -> Result<TermPostingMap, IndexError> {
     let mut newest = TermPostingMap::new();
-    for (run, descriptor) in manifest.matching_blocks(QueryBlockKind::TermDictionary, recipe) {
-        let (entries, entry_bytes) = load_selected_terms(
-            loader,
-            descriptor,
-            exact,
-            prefix,
-            block_limits,
-            credits,
-            budget,
-        )
-        .await?;
+    let mut work = Vec::new();
+    let mut selected_term_bytes = 0usize;
+    let dictionaries = manifest
+        .matching_blocks(QueryBlockKind::TermDictionary, recipe)
+        .enumerate()
+        .map(|(ordinal, (run, descriptor))| {
+            Ok((
+                ordinal,
+                run,
+                manifest
+                    .runs
+                    .get(run)
+                    .ok_or(IndexError::Integrity)?
+                    .physical_catalog_generation,
+                descriptor.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, IndexError>>()?;
+    let mut selected_terms = Vec::with_capacity(dictionaries.len());
+    if dictionaries.len() > 1 && executor.maximum_parallelism() > 1 {
+        let parallel_exact = Arc::<[ScalarValue]>::from(exact);
+        let parallel_prefix = prefix.map(Arc::<str>::from);
+        let parallel_input_bytes = parallel_exact
+            .iter()
+            .try_fold(
+                parallel_exact
+                    .len()
+                    .checked_mul(std::mem::size_of::<ScalarValue>())
+                    .ok_or(IndexError::OffsetOverflow)?,
+                |bytes, value| {
+                    bytes
+                        .checked_add(resident_scalar_bytes(value))
+                        .ok_or(IndexError::OffsetOverflow)
+                },
+            )?
+            .checked_add(parallel_prefix.as_ref().map_or(0, |value| value.len()))
+            .ok_or(IndexError::OffsetOverflow)?;
+        let parallel_input_charge = budget.reserve_heap_scoped(credits, parallel_input_bytes)?;
+        let mut jobs = Vec::with_capacity(dictionaries.len());
+        for (ordinal, _, generation, descriptor) in &dictionaries {
+            let Some(mut task_loader) = loader.try_fork_query_loader()? else {
+                jobs.clear();
+                break;
+            };
+            let exact = parallel_exact.clone();
+            let prefix = parallel_prefix.clone();
+            let descriptor = (*descriptor).clone();
+            let generation = *generation;
+            let ordinal = *ordinal;
+            let (mut task_budget, mut task_credits) = budget.try_fork_query(credits)?;
+            let task_executor = executor.clone();
+            jobs.push((
+                ordinal,
+                Box::pin(async move {
+                    load_selected_terms(
+                        &mut task_loader,
+                        &task_executor,
+                        generation,
+                        &descriptor,
+                        exact.as_ref(),
+                        prefix.as_deref(),
+                        block_limits,
+                        &mut task_credits,
+                        &mut task_budget,
+                    )
+                    .await
+                }) as QueryPartitionJob<_>,
+            ));
+        }
+        if jobs.len() == dictionaries.len() {
+            selected_terms = executor.execute_ordered(jobs).await?;
+        }
+        drop(parallel_exact);
+        drop(parallel_prefix);
+        parallel_input_charge.release()?;
+    }
+    if selected_terms.is_empty() && !dictionaries.is_empty() {
+        for (ordinal, _, generation, descriptor) in &dictionaries {
+            selected_terms.push((
+                *ordinal,
+                load_selected_terms(
+                    loader,
+                    executor,
+                    *generation,
+                    descriptor,
+                    exact,
+                    prefix,
+                    block_limits,
+                    credits,
+                    budget,
+                )
+                .await?,
+            ));
+        }
+    }
+    if selected_terms.len() != dictionaries.len()
+        || selected_terms
+            .iter()
+            .enumerate()
+            .any(|(expected, (actual, _))| dictionaries[expected].0 != *actual)
+    {
+        return Err(IndexError::Integrity);
+    }
+    for (ordinal, (entries, entry_bytes)) in selected_terms {
+        let (_, run, _, _) = dictionaries.get(ordinal).ok_or(IndexError::Integrity)?;
+        let run = *run;
+        selected_term_bytes = selected_term_bytes
+            .checked_add(entry_bytes)
+            .ok_or(IndexError::OffsetOverflow)?;
         for entry in entries {
-            let term = newest.entry(entry.term).or_default();
+            if !newest.contains_key(&entry.term) {
+                newest.insert(entry.term.clone(), BTreeMap::new());
+            }
             for shard in entry.posting_shards {
                 if minimum_document_exclusive
                     .is_some_and(|minimum| shard.maximum_document <= minimum)
@@ -1298,60 +1416,108 @@ async fn seek_term_postings<L: QueryArtifactLoader>(
                 {
                     return Err(IndexError::Integrity);
                 }
-                let bytes = load_exact_pre_admitted(
-                    loader,
-                    QueryArtifactLoad::packed(posting_descriptor)?,
-                    credits,
-                    budget,
-                )
-                .await?;
-                credits.release(bytes.len())?;
-                let mut cursor = QueryBlockCursor::from_verified_content(
-                    posting_descriptor,
-                    &bytes,
-                    block_limits,
-                    credits,
-                )?;
-                let mut next = match minimum_document_exclusive {
-                    Some(minimum) if shard.minimum_document <= minimum => {
-                        cursor.seek_to(&minimum.bytes())?
-                    }
-                    _ => cursor.next()?,
-                };
-                while let Some(record) = next {
-                    let posting = decode_posting(record)?;
-                    if posting.document < shard.minimum_document
-                        || posting.document > shard.maximum_document
-                    {
-                        return Err(IndexError::Integrity);
-                    }
-                    if minimum_document_exclusive.is_none_or(|minimum| posting.document > minimum)
-                        && !term.contains_key(&posting.document)
-                    {
-                        budget.reserve_heap(
-                            credits,
-                            std::mem::size_of::<StableDocumentKey>()
-                                + std::mem::size_of::<QueryPosting>(),
-                        )?;
-                        term.insert(posting.document, (run, posting));
-                    }
-                    next = cursor.next()?;
-                }
-                drop(cursor);
-                credits.release_loaded_block(bytes.len())?;
+                work.push(PostingBlockWork {
+                    term: entry.term.clone(),
+                    run,
+                    generation: manifest
+                        .runs
+                        .get(run)
+                        .ok_or(IndexError::Integrity)?
+                        .physical_catalog_generation,
+                    descriptor: posting_descriptor.clone(),
+                    minimum_document: shard.minimum_document,
+                    maximum_document: shard.maximum_document,
+                });
             }
             if newest.len() > budget.limits().maximum_expanded_terms {
                 return resource(newest.len(), budget.limits().maximum_expanded_terms);
             }
         }
-        budget.release_heap(credits, entry_bytes)?;
     }
+    let mut decoded = Vec::with_capacity(work.len());
+    if work.len() > 1 && executor.maximum_parallelism() > 1 {
+        let mut jobs = Vec::with_capacity(work.len());
+        for (ordinal, item) in work.iter().enumerate() {
+            let Some(mut task_loader) = loader.try_fork_query_loader()? else {
+                jobs.clear();
+                break;
+            };
+            let descriptor = item.descriptor.clone();
+            let generation = item.generation;
+            let minimum = item.minimum_document;
+            let maximum = item.maximum_document;
+            let (mut task_budget, mut task_credits) = budget.try_fork_query(credits)?;
+            let task_executor = executor.clone();
+            jobs.push((
+                ordinal,
+                Box::pin(async move {
+                    decode_posting_block(
+                        &mut task_loader,
+                        &task_executor,
+                        generation,
+                        &descriptor,
+                        minimum,
+                        maximum,
+                        minimum_document_exclusive,
+                        block_limits,
+                        &mut task_credits,
+                        &mut task_budget,
+                    )
+                    .await
+                }) as QueryPartitionJob<_>,
+            ));
+        }
+        if jobs.len() == work.len() {
+            decoded = executor.execute_ordered(jobs).await?;
+        }
+    }
+    if decoded.is_empty() && !work.is_empty() {
+        for (ordinal, item) in work.iter().enumerate() {
+            decoded.push((
+                ordinal,
+                decode_posting_block(
+                    loader,
+                    executor,
+                    item.generation,
+                    &item.descriptor,
+                    item.minimum_document,
+                    item.maximum_document,
+                    minimum_document_exclusive,
+                    block_limits,
+                    credits,
+                    budget,
+                )
+                .await?,
+            ));
+        }
+    }
+    if decoded.len() != work.len()
+        || decoded
+            .iter()
+            .enumerate()
+            .any(|(expected, (actual, _))| expected != *actual)
+    {
+        return Err(IndexError::Integrity);
+    }
+    for (ordinal, postings) in decoded {
+        let item = work.get(ordinal).ok_or(IndexError::Integrity)?;
+        let term = newest.get_mut(&item.term).ok_or(IndexError::Integrity)?;
+        for posting in postings {
+            if term.contains_key(&posting.document) {
+                budget.release_heap(credits, posting_entry_bytes())?;
+            } else {
+                term.insert(posting.document, (item.run, posting));
+            }
+        }
+    }
+    budget.release_heap(credits, selected_term_bytes)?;
     Ok(newest)
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn seek_range<L: QueryArtifactLoader>(
+async fn seek_range<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     lower: Option<&RangeBound>,
@@ -1371,28 +1537,97 @@ async fn seek_range<L: QueryArtifactLoader>(
             Ok::<_, IndexError>(key)
         })
         .transpose()?;
-    for (_, descriptor) in manifest.matching_blocks(QueryBlockKind::Point, recipe) {
-        if !point_descriptor_overlaps(descriptor, lower_key.as_deref(), upper_key.as_deref()) {
-            continue;
+    let blocks = manifest
+        .matching_blocks(QueryBlockKind::Point, recipe)
+        .enumerate()
+        .filter(|(_, (_, descriptor))| {
+            point_descriptor_overlaps(descriptor, lower_key.as_deref(), upper_key.as_deref())
+        })
+        .map(|(ordinal, (run, descriptor))| {
+            Ok((
+                ordinal,
+                manifest
+                    .runs
+                    .get(run)
+                    .ok_or(IndexError::Integrity)?
+                    .physical_catalog_generation,
+                descriptor.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, IndexError>>()?;
+    let mut decoded = Vec::with_capacity(blocks.len());
+    if blocks.len() > 1 && executor.maximum_parallelism() > 1 {
+        let mut jobs = Vec::with_capacity(blocks.len());
+        for (ordinal, generation, descriptor) in &blocks {
+            let Some(mut task_loader) = loader.try_fork_query_loader()? else {
+                jobs.clear();
+                break;
+            };
+            let (mut task_budget, mut task_credits) = budget.try_fork_query(credits)?;
+            let lower = lower.cloned();
+            let upper = upper.cloned();
+            let descriptor = (*descriptor).clone();
+            let generation = *generation;
+            let ordinal = *ordinal;
+            let task_executor = executor.clone();
+            jobs.push((
+                ordinal,
+                Box::pin(async move {
+                    decode_range_block(
+                        &mut task_loader,
+                        &task_executor,
+                        generation,
+                        &descriptor,
+                        lower.as_ref(),
+                        upper.as_ref(),
+                        block_limits,
+                        &mut task_credits,
+                        &mut task_budget,
+                    )
+                    .await
+                }) as QueryPartitionJob<_>,
+            ));
         }
-        let (records, record_bytes) =
-            load_block(loader, descriptor, block_limits, credits, budget).await?;
-        for record in records {
-            let point = decode_point(record.as_ref())?;
-            if in_range(&point.value, lower, upper) {
-                let key = (point.value, point.document);
-                if !newest.contains_key(&key) {
-                    budget.reserve_heap(
-                        credits,
-                        std::mem::size_of::<(ScalarValue, StableDocumentKey)>()
-                            + std::mem::size_of::<(bool, u64)>()
-                            + resident_scalar_bytes(&key.0),
-                    )?;
-                    newest.insert(key, (point.live, point.material_source_version));
-                }
+        if jobs.len() == blocks.len() {
+            decoded = executor.execute_ordered(jobs).await?;
+        }
+    }
+    if decoded.is_empty() && !blocks.is_empty() {
+        for (ordinal, generation, descriptor) in &blocks {
+            decoded.push((
+                *ordinal,
+                decode_range_block(
+                    loader,
+                    executor,
+                    *generation,
+                    descriptor,
+                    lower,
+                    upper,
+                    block_limits,
+                    credits,
+                    budget,
+                )
+                .await?,
+            ));
+        }
+    }
+    if decoded.len() != blocks.len()
+        || decoded
+            .iter()
+            .enumerate()
+            .any(|(expected, (actual, _))| blocks[expected].0 != *actual)
+    {
+        return Err(IndexError::Integrity);
+    }
+    for (_, points) in decoded {
+        for point in points {
+            let key = (point.value, point.document);
+            if newest.contains_key(&key) {
+                budget.release_heap(credits, resident_point_entry_bytes(&key.0))?;
+            } else {
+                newest.insert(key, (point.live, point.material_source_version));
             }
         }
-        budget.release_heap(credits, record_bytes)?;
     }
     let mut output = BTreeMap::<StableDocumentKey, u64>::new();
     for ((_, key), (live, version)) in newest {
@@ -1407,24 +1642,10 @@ async fn seek_range<L: QueryArtifactLoader>(
     Ok(output)
 }
 
-fn point_descriptor_overlaps(
-    descriptor: &QueryBlockDescriptor,
-    lower: Option<&[u8]>,
-    upper: Option<&[u8]>,
-) -> bool {
-    lower.is_none_or(|key| descriptor.maximum_key.as_slice() >= key)
-        && upper.is_none_or(|key| descriptor.minimum_key.as_slice() <= key)
-}
-
-fn in_range(value: &ScalarValue, lower: Option<&RangeBound>, upper: Option<&RangeBound>) -> bool {
-    lower.is_none_or(|bound| value > &bound.value || bound.inclusive && value == &bound.value)
-        && upper
-            .is_none_or(|bound| value < &bound.value || bound.inclusive && value == &bound.value)
-}
-
 #[allow(clippy::too_many_arguments)]
-async fn verify_phrase<L: QueryArtifactLoader>(
+async fn verify_phrase<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     terms: &[ScalarValue],
@@ -1436,6 +1657,7 @@ async fn verify_phrase<L: QueryArtifactLoader>(
 ) -> Result<(), IndexError> {
     let mut positions = BTreeMap::<(ScalarValue, StableDocumentKey), Vec<u32>>::new();
     let mut resident_positions = 0usize;
+    let mut work = Vec::new();
     for term in terms {
         let mut by_block = BTreeMap::<(usize, [u8; 32]), Vec<StableDocumentKey>>::new();
         for (document, (run, posting)) in postings.get(term).into_iter().flatten() {
@@ -1448,42 +1670,89 @@ async fn verify_phrase<L: QueryArtifactLoader>(
         for ((run, hash), documents) in by_block {
             let descriptor =
                 manifest.find_run_block(run, hash, QueryBlockKind::Position, recipe)?;
-            let bytes = load_exact_pre_admitted(
-                loader,
-                QueryArtifactLoad::packed(descriptor)?,
-                credits,
-                budget,
-            )
-            .await?;
-            credits.release(bytes.len())?;
-            let mut cursor =
-                QueryBlockCursor::from_verified_content(descriptor, &bytes, block_limits, credits)?;
-            for document in documents {
-                if let Some(record) = cursor.seek_to(&document.bytes())? {
-                    let decoded = decode_positions(record, block_limits)?;
-                    if decoded.document != document {
-                        return Err(IndexError::Integrity);
-                    }
-                    let decoded = decoded.positions;
-                    let resident = std::mem::size_of::<(ScalarValue, StableDocumentKey)>()
-                        .checked_add(std::mem::size_of::<Vec<u32>>())
-                        .and_then(|bytes| bytes.checked_add(resident_scalar_bytes(term)))
-                        .and_then(|bytes| {
-                            decoded
-                                .len()
-                                .checked_mul(std::mem::size_of::<u32>())
-                                .and_then(|positions| bytes.checked_add(positions))
-                        })
-                        .ok_or(IndexError::OffsetOverflow)?;
-                    budget.reserve_heap(credits, resident)?;
-                    resident_positions = resident_positions
-                        .checked_add(resident)
-                        .ok_or(IndexError::OffsetOverflow)?;
-                    positions.insert((term.clone(), document), decoded);
-                }
+            work.push((
+                term.clone(),
+                manifest
+                    .runs
+                    .get(run)
+                    .ok_or(IndexError::Integrity)?
+                    .physical_catalog_generation,
+                descriptor.clone(),
+                documents,
+            ));
+        }
+    }
+    let mut decoded = Vec::with_capacity(work.len());
+    if work.len() > 1 && executor.maximum_parallelism() > 1 {
+        let mut jobs = Vec::with_capacity(work.len());
+        for (ordinal, (term, generation, descriptor, documents)) in work.iter().enumerate() {
+            let Some(mut task_loader) = loader.try_fork_query_loader()? else {
+                jobs.clear();
+                break;
+            };
+            let term = term.clone();
+            let generation = *generation;
+            let descriptor = (*descriptor).clone();
+            let documents = documents.clone();
+            let (mut task_budget, mut task_credits) = budget.try_fork_query(credits)?;
+            let task_executor = executor.clone();
+            jobs.push((
+                ordinal,
+                Box::pin(async move {
+                    decode_position_block(
+                        &mut task_loader,
+                        &task_executor,
+                        generation,
+                        &descriptor,
+                        &term,
+                        &documents,
+                        block_limits,
+                        &mut task_credits,
+                        &mut task_budget,
+                    )
+                    .await
+                }) as QueryPartitionJob<_>,
+            ));
+        }
+        if jobs.len() == work.len() {
+            decoded = executor.execute_ordered(jobs).await?;
+        }
+    }
+    if decoded.is_empty() && !work.is_empty() {
+        for (ordinal, (term, generation, descriptor, documents)) in work.iter().enumerate() {
+            decoded.push((
+                ordinal,
+                decode_position_block(
+                    loader,
+                    executor,
+                    *generation,
+                    descriptor,
+                    term,
+                    documents,
+                    block_limits,
+                    credits,
+                    budget,
+                )
+                .await?,
+            ));
+        }
+    }
+    if decoded.len() != work.len()
+        || decoded
+            .iter()
+            .enumerate()
+            .any(|(expected, (actual, _))| expected != *actual)
+    {
+        return Err(IndexError::Integrity);
+    }
+    for (_, block_positions) in decoded {
+        for (key, values, resident) in block_positions {
+            if positions.insert(key, values).is_some() {
+                return Err(IndexError::Integrity);
             }
-            drop(cursor);
-            credits.release_loaded_block(bytes.len())?;
+            resident_positions = resident_positions
+                .checked_add(resident)
+                .ok_or(IndexError::OffsetOverflow)?;
         }
     }
     candidates.retain(|key| {
@@ -1504,61 +1773,11 @@ async fn verify_phrase<L: QueryArtifactLoader>(
     Ok(())
 }
 
-struct OwnedRecord {
-    key: Vec<u8>,
-    value: Vec<u8>,
-}
-
-impl OwnedRecord {
-    fn as_ref(&self) -> super::QueryBlockRecordRef<'_> {
-        super::QueryBlockRecordRef {
-            key: &self.key,
-            value: &self.value,
-        }
-    }
-}
-
-async fn load_block<L: QueryArtifactLoader>(
-    loader: &mut L,
-    descriptor: &QueryBlockDescriptor,
-    limits: QueryBlockLimits,
-    credits: &mut QueryBlockCredits,
-    budget: &mut Budget,
-) -> Result<(Vec<OwnedRecord>, usize), IndexError> {
-    let maximum = usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-    let bytes = load_exact_pre_admitted(
-        loader,
-        QueryArtifactLoad::packed(descriptor)?,
-        credits,
-        budget,
-    )
-    .await?;
-    if bytes.len() != maximum {
-        credits.release(bytes.len())?;
-        return Err(IndexError::Integrity);
-    }
-    credits.release(bytes.len())?;
-    let mut cursor = QueryBlockCursor::from_verified_content(descriptor, &bytes, limits, credits)?;
-    let resident_bytes = (descriptor.records as usize)
-        .checked_mul(std::mem::size_of::<OwnedRecord>())
-        .and_then(|bytes| bytes.checked_add(maximum))
-        .ok_or(IndexError::OffsetOverflow)?;
-    budget.reserve_heap(credits, resident_bytes)?;
-    let mut output = Vec::with_capacity(descriptor.records as usize);
-    while let Some(record) = cursor.next()? {
-        output.push(OwnedRecord {
-            key: record.key.to_vec(),
-            value: record.value.to_vec(),
-        });
-    }
-    drop(cursor);
-    credits.release_loaded_block(bytes.len())?;
-    Ok((output, resident_bytes))
-}
-
 #[allow(clippy::too_many_arguments)]
-async fn load_selected_terms<L: QueryArtifactLoader>(
+async fn load_selected_terms<L: QueryArtifactLoader, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
+    generation: [u8; 32],
     descriptor: &QueryBlockDescriptor,
     exact: &[ScalarValue],
     prefix: Option<&str>,
@@ -1592,58 +1811,57 @@ async fn load_selected_terms<L: QueryArtifactLoader>(
     if !relevant {
         return Ok((Vec::new(), 0));
     }
-    let maximum = usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-    let bytes = load_exact_pre_admitted(
-        loader,
-        QueryArtifactLoad::packed(descriptor)?,
-        credits,
-        budget,
+    let block = load_decoded_block(
+        loader, executor, generation, descriptor, limits, credits, budget,
     )
     .await?;
-    if bytes.len() != maximum {
-        credits.release(bytes.len())?;
-        return Err(IndexError::Integrity);
-    }
-    credits.release(bytes.len())?;
-    let mut cursor = QueryBlockCursor::from_verified_content(descriptor, &bytes, limits, credits)?;
-    let resident_bytes = (descriptor.records as usize)
-        .checked_mul(std::mem::size_of::<QueryTermEntry>())
-        .and_then(|bytes| bytes.checked_add(maximum))
-        .ok_or(IndexError::OffsetOverflow)?;
-    budget.reserve_heap(credits, resident_bytes)?;
-    let mut output = Vec::new();
-    for (term, key) in exact.iter().zip(&exact_keys) {
-        if let Some(record) = cursor.seek_to(key)? {
-            let entry = decode_term_entry(record, limits)?;
-            if entry.term == *term {
-                output.push(entry);
+    let exact = exact.to_vec();
+    let prefix = prefix.map(str::to_owned);
+    let records = descriptor.records as usize;
+    let mut cpu_budget = budget.clone();
+    let mut cpu_credits = credits.try_fork_query()?;
+    executor
+        .run_cpu(Box::new(move || {
+            // Decoded terms own scalar strings and posting-shard vectors. Keep
+            // the encoded size as a conservative bound for those allocations.
+            let resident_bytes = records
+                .checked_mul(std::mem::size_of::<QueryTermEntry>())
+                .and_then(|bytes| bytes.checked_add(block.encoded_bytes()))
+                .ok_or(IndexError::OffsetOverflow)?;
+            cpu_budget.reserve_heap(&mut cpu_credits, resident_bytes)?;
+            let mut output = Vec::new();
+            for (term, key) in exact.iter().zip(&exact_keys) {
+                if let Some(record) = block.records_from(key).next() {
+                    let entry = decode_term_entry(record, limits)?;
+                    if entry.term == *term {
+                        output.push(entry);
+                    }
+                }
             }
-        }
-    }
-    if let (Some(prefix), Some(start)) = (prefix, prefix_start) {
-        let mut next = cursor.seek_to(&start)?;
-        while let Some(record) = next {
-            let entry = decode_term_entry(record, limits)?;
-            match &entry.term {
-                ScalarValue::String(term) if term.starts_with(prefix) => output.push(entry),
-                _ => break,
+            if let (Some(prefix), Some(start)) = (prefix.as_deref(), prefix_start) {
+                for record in block.records_from(&start) {
+                    let entry = decode_term_entry(record, limits)?;
+                    match &entry.term {
+                        ScalarValue::String(term) if term.starts_with(prefix) => output.push(entry),
+                        _ => break,
+                    }
+                    if output.len() > cpu_budget.limits().maximum_expanded_terms {
+                        return resource(output.len(), cpu_budget.limits().maximum_expanded_terms);
+                    }
+                }
             }
-            if output.len() > budget.limits().maximum_expanded_terms {
-                return resource(output.len(), budget.limits().maximum_expanded_terms);
-            }
-            next = cursor.next()?;
-        }
-    }
-    output.sort_unstable_by(|left, right| left.term.cmp(&right.term));
-    output.dedup_by(|left, right| left.term == right.term);
-    drop(cursor);
-    credits.release_loaded_block(bytes.len())?;
-    Ok((output, resident_bytes))
+            output.sort_unstable_by(|left, right| left.term.cmp(&right.term));
+            output.dedup_by(|left, right| left.term == right.term);
+            cpu_credits.release_loaded_block(block.encoded_bytes())?;
+            Ok((output, resident_bytes))
+        }))
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn load_candidate_doc_values<L: QueryArtifactLoader>(
+async fn load_candidate_doc_values<L: QueryArtifactLoader, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     recipe: RecipeIdentity,
     candidates: &[QueryCandidate],
@@ -1658,7 +1876,7 @@ async fn load_candidate_doc_values<L: QueryArtifactLoader>(
     budget.reserve_heap(credits, slot_bytes)?;
     let mut resident_bytes = slot_bytes;
     let mut output = vec![None; candidates.len()];
-    for (_, descriptor) in manifest.matching_blocks(QueryBlockKind::DocValue, recipe) {
+    for (run, descriptor) in manifest.matching_blocks(QueryBlockKind::DocValue, recipe) {
         let minimum = StableDocumentKey::from_bytes(
             descriptor
                 .minimum_key
@@ -1679,55 +1897,68 @@ async fn load_candidate_doc_values<L: QueryArtifactLoader>(
         if candidate_start == candidate_end {
             continue;
         }
-        let maximum =
-            usize::try_from(descriptor.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-        let bytes = load_exact_pre_admitted(
+        let block = load_decoded_block(
             loader,
-            QueryArtifactLoad::packed(descriptor)?,
+            executor,
+            manifest
+                .runs
+                .get(run)
+                .ok_or(IndexError::Integrity)?
+                .physical_catalog_generation,
+            descriptor,
+            block_limits,
             credits,
             budget,
         )
         .await?;
-        if bytes.len() != maximum {
-            credits.release(bytes.len())?;
-            return Err(IndexError::Integrity);
-        }
-        credits.release(bytes.len())?;
-        let mut cursor =
-            QueryBlockCursor::from_verified_content(descriptor, &bytes, block_limits, credits)?;
-        for (relative, candidate) in candidates[candidate_start..candidate_end]
-            .iter()
-            .enumerate()
-        {
+        let cpu_candidates = candidates[candidate_start..candidate_end].to_vec();
+        let candidate_bytes = cpu_candidates
+            .len()
+            .checked_mul(std::mem::size_of::<QueryCandidate>())
+            .ok_or(IndexError::OffsetOverflow)?;
+        let candidate_charge = budget.reserve_heap_scoped(credits, candidate_bytes)?;
+        let mut cpu_budget = budget.clone();
+        let mut cpu_credits = credits.try_fork_query()?;
+        let decoded = executor
+            .run_cpu(Box::new(move || {
+                let mut decoded = Vec::new();
+                for (relative, candidate) in cpu_candidates.iter().enumerate() {
+                    if let Some(record) = block.records_from(&candidate.document.bytes()).next() {
+                        let value = decode_doc_value(record, block_limits)?;
+                        if value.document == candidate.document {
+                            let resident = value
+                                .value
+                                .as_ref()
+                                .map(|values| {
+                                    values.iter().try_fold(0usize, |bytes, value| {
+                                        bytes
+                                            .checked_add(resident_scalar_bytes(value))
+                                            .ok_or(IndexError::OffsetOverflow)
+                                    })
+                                })
+                                .transpose()?
+                                .unwrap_or(0);
+                            cpu_budget.reserve_heap(&mut cpu_credits, resident)?;
+                            decoded.push((relative, value.value, resident));
+                        }
+                    }
+                }
+                cpu_credits.release_loaded_block(block.encoded_bytes())?;
+                Ok(decoded)
+            }))
+            .await?;
+        candidate_charge.release()?;
+        for (relative, value, resident) in decoded {
             let output_index = candidate_start + relative;
             if output[output_index].is_some() {
-                continue;
-            }
-            if let Some(record) = cursor.seek_to(&candidate.document.bytes())? {
-                let value = decode_doc_value(record, block_limits)?;
-                if value.document == candidate.document {
-                    let resident = value
-                        .value
-                        .as_ref()
-                        .map(|values| {
-                            values.iter().try_fold(0usize, |bytes, value| {
-                                bytes
-                                    .checked_add(resident_scalar_bytes(value))
-                                    .ok_or(IndexError::OffsetOverflow)
-                            })
-                        })
-                        .transpose()?
-                        .unwrap_or(0);
-                    budget.reserve_heap(credits, resident)?;
-                    resident_bytes = resident_bytes
-                        .checked_add(resident)
-                        .ok_or(IndexError::OffsetOverflow)?;
-                    output[output_index] = Some(value.value);
-                }
+                budget.release_heap(credits, resident)?;
+            } else {
+                resident_bytes = resident_bytes
+                    .checked_add(resident)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                output[output_index] = Some(value);
             }
         }
-        drop(cursor);
-        credits.release_loaded_block(bytes.len())?;
     }
     Ok((output, resident_bytes))
 }

@@ -93,17 +93,17 @@ pub use query_executor::{
     AuthorizedQueryCandidate, ExplicitQuerySearchAfter, MAX_QUERY_CANDIDATE_ADMISSION_BATCH,
     MAX_QUERY_PARTITIONS, PinnedPartitionQueryRoot, QueryAdmissionCandidate, QueryAdmissionContext,
     QueryArtifactKind, QueryArtifactLoad, QueryArtifactLoader, QueryCandidateAdmission,
-    QueryCommonCut, QueryExecutionLimits, QueryFieldBinding, QueryLoadEvidence,
-    QueryPublicValueEncoder, QueryRootCutProof, QuerySnapshotIdentity, ScalarSortKeyValueEncoder,
-    TypedJsonQueryRequest, TypedJsonQueryResult, ValidatedQuerySnapshot, execute_typed_json_query,
-    execute_typed_json_query_with_cursor, execute_typed_json_query_with_cursor_and_executor,
-    query_snapshot_identity,
+    QueryCommonCut, QueryExecutionLimits, QueryFieldBinding, QueryLoadEvidence, QueryPopulation,
+    QueryPopulationGuard, QueryPublicValueEncoder, QueryRootCutProof, QuerySnapshotIdentity,
+    ScalarSortKeyValueEncoder, TypedJsonQueryRequest, TypedJsonQueryResult, ValidatedQuerySnapshot,
+    execute_typed_json_query, execute_typed_json_query_with_cursor,
+    execute_typed_json_query_with_cursor_and_executor, query_snapshot_identity,
 };
 pub use query_gate::{
     MAX_QUERY_DOCUMENT_PATH_BYTES, QueryDocumentGate, decode_document_gate, encode_document_gate,
 };
 pub use query_parallel::{
-    QueryPartitionExecutor, QueryPartitionJob, SerialQueryPartitionExecutor,
+    QueryCpuJob, QueryPartitionExecutor, QueryPartitionJob, SerialQueryPartitionExecutor,
     execute_typed_json_query_with_executor, resolve_query_partition_results,
 };
 pub use query_prepare::{

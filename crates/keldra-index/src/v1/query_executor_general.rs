@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::IndexError;
 
@@ -72,6 +73,38 @@ pub(super) async fn execute_general_query<
     groups.sort_unstable_by_key(|group| group.key);
     let width = partition_executor.maximum_parallelism().max(1);
     for group_batch in groups.chunks(width) {
+        if let [group] = group_batch {
+            let selected = scan_group(
+                loader,
+                partition_executor,
+                &group.manifests,
+                request,
+                contracts,
+                block_limits,
+                credits,
+                budget,
+            )
+            .await?;
+            process_selected(
+                loader,
+                admission,
+                partition_executor,
+                common_cut,
+                manifests,
+                request,
+                contracts,
+                &needed_values,
+                selected,
+                public_value_encoder,
+                block_limits,
+                credits,
+                budget,
+                &mut reducers,
+                &mut collector,
+            )
+            .await?;
+            continue;
+        }
         let mut jobs = Vec::with_capacity(group_batch.len());
         let mut can_fork = true;
         for group in group_batch {
@@ -92,6 +125,7 @@ pub(super) async fn execute_general_query<
                 Box::pin(async move {
                     scan_group(
                         &mut task_loader,
+                        &SerialQueryPartitionExecutor,
                         &manifests,
                         &request,
                         &contracts,
@@ -112,6 +146,7 @@ pub(super) async fn execute_general_query<
                     group.key,
                     scan_group(
                         loader,
+                        &SerialQueryPartitionExecutor,
                         &group.manifests,
                         request,
                         contracts,
@@ -128,6 +163,7 @@ pub(super) async fn execute_general_query<
             process_selected(
                 loader,
                 admission,
+                partition_executor,
                 common_cut,
                 manifests,
                 request,
@@ -162,8 +198,9 @@ fn clone_manifest(manifest: &PartitionManifest) -> PartitionManifest {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn scan_group<L: QueryArtifactLoader>(
+async fn scan_group<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifests: &[PartitionManifest],
     request: &TypedJsonQueryRequest,
     contracts: &BTreeMap<FieldId, QueryFieldBinding>,
@@ -175,6 +212,7 @@ async fn scan_group<L: QueryArtifactLoader>(
     for manifest in manifests {
         scan_manifest(
             loader,
+            executor,
             manifest,
             request,
             contracts,
@@ -189,8 +227,9 @@ async fn scan_group<L: QueryArtifactLoader>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn scan_manifest<L: QueryArtifactLoader>(
+async fn scan_manifest<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     request: &TypedJsonQueryRequest,
     contracts: &BTreeMap<FieldId, QueryFieldBinding>,
@@ -207,6 +246,7 @@ async fn scan_manifest<L: QueryArtifactLoader>(
     let mut gates = if needs_universe {
         load_latest_gates(
             loader,
+            executor,
             manifest,
             request.logical.membership,
             QueryBlockKind::Gate,
@@ -221,6 +261,7 @@ async fn scan_manifest<L: QueryArtifactLoader>(
     let mut keys = if let Some(predicate) = request.predicate.as_ref() {
         evaluate_predicate(
             loader,
+            executor,
             manifest,
             &gates,
             contracts,
@@ -252,6 +293,7 @@ async fn scan_manifest<L: QueryArtifactLoader>(
     if !needs_universe {
         let aligned = load_latest_gates_for_keys(
             loader,
+            executor,
             manifest,
             request.logical.membership,
             QueryBlockKind::Gate,
@@ -329,12 +371,14 @@ fn add_live_gate(
 
 #[allow(clippy::too_many_arguments)]
 async fn process_selected<
-    L: QueryArtifactLoader,
+    L: QueryArtifactLoader + 'static,
     A: QueryCandidateAdmission,
     E: QueryPublicValueEncoder,
+    X: QueryPartitionExecutor,
 >(
     loader: &mut L,
     admission: &mut A,
+    executor: &X,
     common_cut: QueryCommonCut,
     manifests: &[PartitionManifest],
     request: &TypedJsonQueryRequest,
@@ -391,6 +435,7 @@ async fn process_selected<
                 .ok_or(IndexError::Integrity)?;
             process_partition_batch(
                 loader,
+                executor,
                 manifest,
                 &candidates[start..end],
                 &mut authorized,
@@ -415,8 +460,13 @@ async fn process_selected<
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_partition_batch<L: QueryArtifactLoader, E: QueryPublicValueEncoder>(
+async fn process_partition_batch<
+    L: QueryArtifactLoader + 'static,
+    E: QueryPublicValueEncoder,
+    X: QueryPartitionExecutor,
+>(
     loader: &mut L,
+    executor: &X,
     manifest: &PartitionManifest,
     candidates: &[QueryCandidate],
     authorized: &mut BTreeMap<
@@ -441,17 +491,74 @@ async fn process_partition_batch<L: QueryArtifactLoader, E: QueryPublicValueEnco
         .ok_or(IndexError::OffsetOverflow)?;
     budget.reserve_heap(credits, metadata)?;
     let mut columns = PartitionValueColumns::new(needed_values.to_vec(), metadata);
-    for recipe in needed_values {
-        let (loaded, bytes) = load_candidate_doc_values(
-            loader,
-            manifest,
-            *recipe,
-            candidates,
-            block_limits,
-            credits,
-            budget,
-        )
-        .await?;
+    let mut loaded_columns = Vec::with_capacity(needed_values.len());
+    if needed_values.len() > 1 && executor.maximum_parallelism() > 1 {
+        let candidate_copy_bytes = candidates
+            .len()
+            .checked_mul(std::mem::size_of::<QueryCandidate>())
+            .ok_or(IndexError::OffsetOverflow)?;
+        let candidate_copy_charge = budget.reserve_heap_scoped(credits, candidate_copy_bytes)?;
+        let parallel_candidates = Arc::<[QueryCandidate]>::from(candidates);
+        let mut jobs = Vec::with_capacity(needed_values.len());
+        for (ordinal, recipe) in needed_values.iter().copied().enumerate() {
+            let Some(mut task_loader) = loader.try_fork_query_loader()? else {
+                jobs.clear();
+                break;
+            };
+            let manifest = clone_manifest(manifest);
+            let candidates = parallel_candidates.clone();
+            let (mut task_budget, mut task_credits) = budget.try_fork_query(credits)?;
+            let task_executor = executor.clone();
+            jobs.push((
+                ordinal,
+                Box::pin(async move {
+                    load_candidate_doc_values(
+                        &mut task_loader,
+                        &task_executor,
+                        &manifest,
+                        recipe,
+                        candidates.as_ref(),
+                        block_limits,
+                        &mut task_credits,
+                        &mut task_budget,
+                    )
+                    .await
+                }) as QueryPartitionJob<_>,
+            ));
+        }
+        if jobs.len() == needed_values.len() {
+            loaded_columns = executor.execute_ordered(jobs).await?;
+        }
+        drop(parallel_candidates);
+        candidate_copy_charge.release()?;
+    }
+    if loaded_columns.is_empty() && !needed_values.is_empty() {
+        for (ordinal, recipe) in needed_values.iter().copied().enumerate() {
+            loaded_columns.push((
+                ordinal,
+                load_candidate_doc_values(
+                    loader,
+                    executor,
+                    manifest,
+                    recipe,
+                    candidates,
+                    block_limits,
+                    credits,
+                    budget,
+                )
+                .await?,
+            ));
+        }
+    }
+    if loaded_columns.len() != needed_values.len()
+        || loaded_columns
+            .iter()
+            .enumerate()
+            .any(|(expected, (actual, _))| expected != *actual)
+    {
+        return Err(IndexError::Integrity);
+    }
+    for (_, (loaded, bytes)) in loaded_columns {
         columns.push(loaded, bytes)?;
     }
     for (row, candidate) in candidates.iter().copied().enumerate() {

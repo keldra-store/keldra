@@ -4,8 +4,10 @@
 //! index definition. Unrelated subtrees are validated and discarded through a
 //! fixed-size input buffer, so their size does not become index-builder memory.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read};
+use std::sync::Arc;
 
 use keldra_index::IndexError;
 use keldra_index::typed_json::ScalarValue;
@@ -63,18 +65,28 @@ pub(crate) enum ProjectedJson {
 /// compatible schema without reading or parsing the payload again.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectedScalarPointers {
-    fields: BTreeMap<String, SelectedScalarField>,
+    plan: Arc<CompiledScalarProjectionPlan>,
+    fields: Vec<Option<SelectedScalarField>>,
 }
 
 impl ProjectedScalarPointers {
     pub(crate) fn get(&self, pointer: &str) -> Option<&SelectedScalarField> {
-        self.fields.get(pointer)
+        self.plan
+            .pointers
+            .binary_search_by(|candidate| candidate.as_str().cmp(pointer))
+            .ok()
+            .and_then(|ordinal| self.fields.get(ordinal))
+            .and_then(Option::as_ref)
     }
 
     pub(crate) fn resident_bytes(&self) -> Result<usize, IndexError> {
-        self.fields
-            .iter()
-            .try_fold(std::mem::size_of::<Self>(), |bytes, (pointer, selected)| {
+        self.fields.iter().flatten().try_fold(
+            std::mem::size_of::<Self>().saturating_add(
+                self.fields
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Option<SelectedScalarField>>()),
+            ),
+            |bytes, selected| {
                 let values = selected
                     .values
                     .capacity()
@@ -96,17 +108,118 @@ impl ProjectedScalarPointers {
                     })
                 })?;
                 bytes
-                    .checked_add(std::mem::size_of::<(String, SelectedScalarField)>())
-                    .and_then(|total| total.checked_add(3 * std::mem::size_of::<usize>()))
-                    .and_then(|total| total.checked_add(pointer.capacity()))
-                    .and_then(|total| total.checked_add(values))
+                    .checked_add(values)
                     .and_then(|total| total.checked_add(strings))
                     .ok_or_else(|| {
                         IndexError::InvalidDefinition(
                             "shared scalar projection size exceeds this platform".into(),
                         )
                     })
-            })
+            },
+        )
+    }
+}
+
+/// Immutable parser plan compiled once for one sorted union of JSON pointers.
+///
+/// Selected documents retain ordinal-aligned values; neither synthetic field
+/// names nor ordered maps are rebuilt for each payload.
+pub(crate) struct CompiledScalarProjectionPlan {
+    pointers: Arc<[String]>,
+    targets: Arc<[ProjectionTarget]>,
+    floor_bytes: usize,
+    resident_guard: Option<Arc<dyn std::fmt::Debug + Send + Sync>>,
+}
+
+impl std::fmt::Debug for CompiledScalarProjectionPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompiledScalarProjectionPlan")
+            .field("pointers", &self.pointers)
+            .field("targets", &self.targets)
+            .field("floor_bytes", &self.floor_bytes)
+            .finish()
+    }
+}
+
+impl PartialEq for CompiledScalarProjectionPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.pointers == other.pointers
+            && self.targets == other.targets
+            && self.floor_bytes == other.floor_bytes
+    }
+}
+
+impl Eq for CompiledScalarProjectionPlan {}
+
+impl CompiledScalarProjectionPlan {
+    pub(crate) fn compile(pointers: Arc<[String]>) -> Result<Arc<Self>, IndexError> {
+        let mut previous: Option<&str> = None;
+        let mut floor_bytes = 0usize;
+        let mut targets = Vec::with_capacity(pointers.len());
+        for pointer in pointers.iter() {
+            if previous.is_some_and(|previous| previous >= pointer.as_str()) {
+                return Err(IndexError::InvalidDefinition(
+                    "shared scalar projection pointers must be sorted and unique".into(),
+                ));
+            }
+            previous = Some(pointer);
+            floor_bytes = checked_add(
+                floor_bytes,
+                checked_add(MAP_ENTRY_FLOOR_BYTES, pointer_floor(pointer)?)?,
+            )?;
+            targets.push(target(None, pointer, TargetKind::Scalar)?);
+        }
+        Ok(Arc::new(Self {
+            pointers,
+            targets: Arc::from(targets),
+            floor_bytes,
+            resident_guard: None,
+        }))
+    }
+
+    pub(crate) fn set_resident_guard(&mut self, guard: Arc<dyn std::fmt::Debug + Send + Sync>) {
+        self.resident_guard = Some(guard);
+    }
+
+    pub(crate) fn pointers(&self) -> &[String] {
+        &self.pointers
+    }
+
+    /// Resident bytes owned uniquely by the compiled descriptor.
+    ///
+    /// The pointer slice is deliberately excluded: the catalog/router that
+    /// owns that `Arc<[String]>` charges it once, while compiled plans and hot
+    /// values only retain shared `Arc` handles to it.
+    pub(crate) fn descriptor_resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            // One Arc allocation header for the plan and one for its compiled
+            // target slice. Pointer-slice allocation belongs to the selector
+            // owner and is intentionally not included here.
+            .saturating_add(4 * std::mem::size_of::<usize>())
+            .saturating_add(
+                self.targets
+                    .iter()
+                    .map(|target| {
+                        std::mem::size_of::<ProjectionTarget>()
+                            + target
+                                .tokens
+                                .iter()
+                                .map(|token| std::mem::size_of::<String>() + token.capacity())
+                                .sum::<usize>()
+                    })
+                    .sum::<usize>(),
+            )
+    }
+
+    pub(crate) fn selection_floor_bytes(&self) -> usize {
+        self.floor_bytes
+    }
+
+    pub(crate) fn scratch_resident_bytes(&self) -> usize {
+        self.targets
+            .len()
+            .saturating_mul(std::mem::size_of::<SelectedValue>() + std::mem::size_of::<usize>())
     }
 }
 
@@ -116,44 +229,108 @@ pub(crate) fn project_scalar_pointers(
     pointers: &[String],
     max_selected_bytes: usize,
 ) -> Result<Option<ProjectedScalarPointers>, IndexError> {
-    let mut unique = BTreeSet::new();
-    if pointers.is_empty()
-        || pointers
-            .iter()
-            .any(|pointer| !unique.insert(pointer.as_str()))
-    {
+    let unique = pointers.iter().cloned().collect::<BTreeSet<_>>();
+    if pointers.is_empty() || unique.len() != pointers.len() {
         return Err(IndexError::InvalidDefinition(
             "shared scalar projection pointers must be non-empty and unique".into(),
         ));
     }
-    let fields = pointers
-        .iter()
-        .enumerate()
-        .map(|(ordinal, pointer)| (format!("shared_{ordinal}"), pointer.clone()))
-        .collect::<Vec<_>>();
-    let names = fields
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
-    let Some(ProjectedJson::Scalars(selected)) = project_json(
-        source,
-        &ProjectionSelection::Scalars(fields),
-        max_selected_bytes,
-    )?
-    else {
-        return Ok(None);
+    let pointers = unique.into_iter().collect::<Vec<_>>();
+    let plan = CompiledScalarProjectionPlan::compile(Arc::from(pointers))?;
+    project_compiled_scalar_pointers(source, plan, max_selected_bytes)
+}
+
+pub(crate) fn project_compiled_scalar_pointers(
+    source: &mut dyn Read,
+    plan: Arc<CompiledScalarProjectionPlan>,
+    max_selected_bytes: usize,
+) -> Result<Option<ProjectedScalarPointers>, IndexError> {
+    thread_local! {
+        /// One bounded parser workspace per projection worker. It is cleared
+        /// between payloads and never carries selected values or authority
+        /// across documents/catalog generations.
+        static SCRATCH: RefCell<ScalarProjectionScratch> = RefCell::new(ScalarProjectionScratch::default());
+    }
+    SCRATCH.with(|scratch| {
+        project_compiled_scalar_pointers_with_scratch(
+            source,
+            plan,
+            max_selected_bytes,
+            &mut scratch.borrow_mut(),
+        )
+    })
+}
+
+#[derive(Default)]
+struct ScalarProjectionScratch {
+    slots: Vec<SelectedValue>,
+    candidates: Vec<usize>,
+}
+
+fn project_compiled_scalar_pointers_with_scratch(
+    source: &mut dyn Read,
+    plan: Arc<CompiledScalarProjectionPlan>,
+    max_selected_bytes: usize,
+    scratch: &mut ScalarProjectionScratch,
+) -> Result<Option<ProjectedScalarPointers>, IndexError> {
+    let ScalarProjectionScratch { slots, candidates } = scratch;
+    slots.clear();
+    candidates.clear();
+    if plan.floor_bytes > max_selected_bytes {
+        return Err(IndexError::ResourceLimit {
+            needed: plan.floor_bytes,
+            limit: max_selected_bytes,
+        });
+    }
+    slots.resize_with(plan.targets.len(), || SelectedValue::Missing);
+    candidates.extend(0..plan.targets.len());
+    let mut budget = SelectedBudget {
+        used: plan.floor_bytes,
+        limit: max_selected_bytes,
     };
-    let mapped = pointers
-        .iter()
-        .zip(names)
-        .filter_map(|(pointer, name)| {
-            selected
-                .get(&name)
-                .cloned()
-                .map(|value| (pointer.clone(), value))
-        })
-        .collect();
-    Ok(Some(ProjectedScalarPointers { fields: mapped }))
+    let parsed = {
+        let mut parser = ProjectionParser {
+            input: Input::new(source),
+            targets: &plan.targets,
+            slots,
+            budget: &mut budget,
+        };
+        parser
+            .skip_whitespace()
+            .and_then(|()| parser.parse_value(candidates, 0, &[]))
+            .and_then(|()| parser.skip_whitespace())
+            .and_then(|()| {
+                if parser.input.peek()?.is_none() {
+                    Ok(())
+                } else {
+                    Err(ProjectionFailure::Malformed)
+                }
+            })
+    };
+    let result = match parsed {
+        Ok(()) => Ok(Some(ProjectedScalarPointers {
+            plan,
+            fields: slots
+                .iter_mut()
+                .map(|slot| std::mem::replace(slot, SelectedValue::Missing))
+                .map(|slot| match slot {
+                    SelectedValue::Scalars(field)
+                        if field.from_array || !field.values.is_empty() =>
+                    {
+                        Some(field)
+                    }
+                    _ => None,
+                })
+                .collect(),
+        })),
+        Err(ProjectionFailure::Malformed) => Ok(None),
+        Err(ProjectionFailure::Index(error)) => Err(error),
+    };
+    // Never retain selected strings/numbers or candidate ordinals across an
+    // error boundary. Capacity is reusable, but every value is document-local.
+    slots.clear();
+    candidates.clear();
+    result
 }
 
 /// Returns the fixed bytes a projection needs before it can retain source
@@ -332,14 +509,14 @@ fn pointer_floor(pointer: &str) -> Result<usize, IndexError> {
     )
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ProjectionTarget {
     name: Option<String>,
     tokens: Vec<String>,
     kind: TargetKind,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TargetKind {
     Scalar,
     String,
@@ -1345,6 +1522,105 @@ mod tests {
                 "bounded".into()
             )])))
         );
+    }
+
+    #[test]
+    fn compiled_scalar_plan_is_reused_with_ordinal_aligned_values() {
+        let plan = CompiledScalarProjectionPlan::compile(Arc::from(vec![
+            "/a".to_owned(),
+            "/z".to_owned(),
+        ]))
+        .unwrap();
+        let mut first = Cursor::new(br#"{"z":9,"a":"first"}"#);
+        let projected = project_compiled_scalar_pointers(&mut first, Arc::clone(&plan), 4_096)
+            .unwrap()
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&projected.plan, &plan));
+        assert_eq!(
+            projected.get("/a").unwrap().values,
+            [ScalarValue::String("first".into())]
+        );
+        assert_eq!(
+            projected.get("/z").unwrap().values,
+            [ScalarValue::Unsigned(9)]
+        );
+
+        let mut second = Cursor::new(br#"{"a":"second"}"#);
+        let projected = project_compiled_scalar_pointers(&mut second, Arc::clone(&plan), 4_096)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&projected.plan, &plan));
+        assert!(projected.get("/z").is_none());
+    }
+
+    #[test]
+    fn compiled_plan_charges_descriptors_but_not_shared_selector_storage() {
+        let plan = CompiledScalarProjectionPlan::compile(Arc::from(vec![
+            "/nested/first".to_owned(),
+            "/nested/second".to_owned(),
+        ]))
+        .unwrap();
+        let expected = std::mem::size_of::<CompiledScalarProjectionPlan>()
+            .saturating_add(4 * std::mem::size_of::<usize>())
+            .saturating_add(
+                plan.targets
+                    .iter()
+                    .map(|target| {
+                        std::mem::size_of::<ProjectionTarget>()
+                            + target
+                                .tokens
+                                .iter()
+                                .map(|token| std::mem::size_of::<String>() + token.capacity())
+                                .sum::<usize>()
+                    })
+                    .sum::<usize>(),
+            );
+
+        assert_eq!(plan.descriptor_resident_bytes(), expected);
+        assert!(
+            plan.pointers
+                .iter()
+                .map(|pointer| std::mem::size_of::<String>() + pointer.capacity())
+                .sum::<usize>()
+                > 0,
+            "the excluded selector allocation must be non-empty"
+        );
+    }
+
+    #[test]
+    fn compiled_scalar_scratch_drops_partial_values_after_malformed_input() {
+        let plan =
+            CompiledScalarProjectionPlan::compile(Arc::from(vec!["/value".to_owned()])).unwrap();
+        let mut malformed = Cursor::new(br#"{"value":"must-not-survive""#);
+        assert!(
+            project_compiled_scalar_pointers(&mut malformed, Arc::clone(&plan), 4_096)
+                .unwrap()
+                .is_none()
+        );
+        let mut valid = Cursor::new(br#"{"other":true}"#);
+        let projected = project_compiled_scalar_pointers(&mut valid, plan, 4_096)
+            .unwrap()
+            .unwrap();
+        assert!(projected.get("/value").is_none());
+    }
+
+    #[test]
+    fn compiled_scalar_scratch_is_empty_after_floor_resource_rejection() {
+        let plan =
+            CompiledScalarProjectionPlan::compile(Arc::from(vec!["/value".to_owned()])).unwrap();
+        let mut scratch = ScalarProjectionScratch {
+            slots: vec![SelectedValue::String("stale".into())],
+            candidates: vec![99],
+        };
+        let mut input = Cursor::new(br#"{"value":"new"}"#);
+
+        let error =
+            project_compiled_scalar_pointers_with_scratch(&mut input, plan, 0, &mut scratch)
+                .unwrap_err();
+        assert!(matches!(error, IndexError::ResourceLimit { .. }));
+        assert!(scratch.slots.is_empty());
+        assert!(scratch.candidates.is_empty());
     }
 
     #[test]

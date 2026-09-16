@@ -9,9 +9,9 @@ use super::{
     Budget, LogicalProjectionBinding, PinnedPartitionQueryRoot, ProjectionQueryRunDescriptor,
     ProjectionQueryStreamRoot, QueryArtifactKind, QueryArtifactLoad, QueryArtifactLoader,
     QueryBlockCredits, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryCommonCut,
-    QueryRecipeCatalogProof, QueryRunChild, QueryRunPage, QueryRunReference, RecipeIdentity,
-    TypedJsonQueryRequest, decode_projection_query_run, decode_query_run_page, page_summary,
-    resource,
+    QueryPartitionExecutor, QueryPopulation, QueryRecipeCatalogProof, QueryRunChild, QueryRunPage,
+    QueryRunReference, RecipeIdentity, TypedJsonQueryRequest, decode_projection_query_run,
+    decode_query_run_page, page_summary, resource,
 };
 
 /// Content identity of one immutable, validated root-vector search snapshot.
@@ -143,9 +143,10 @@ impl QueryRunStream {
         }
     }
 
-    async fn next<L: QueryArtifactLoader>(
+    async fn next<L: QueryArtifactLoader, X: QueryPartitionExecutor>(
         &mut self,
         loader: &mut L,
+        executor: &X,
         credits: &mut QueryBlockCredits,
         budget: &mut Budget,
     ) -> Result<Option<QueryRunReference>, IndexError> {
@@ -186,9 +187,12 @@ impl QueryRunStream {
             )
             .await?;
             budget.reserve_heap(credits, bytes.len())?;
-            let page = decode_query_run_page(&bytes)?;
-            credits.release(bytes.len())?;
-            if page_summary(expected.hash, &page, bytes.len())? != expected {
+            let loaded_bytes = bytes.len();
+            let page = executor
+                .run_cpu(Box::new(move || decode_query_run_page(&bytes)))
+                .await?;
+            credits.release(loaded_bytes)?;
+            if page_summary(expected.hash, &page, loaded_bytes)? != expected {
                 return Err(IndexError::Integrity);
             }
             match page {
@@ -199,8 +203,9 @@ impl QueryRunStream {
     }
 }
 
-async fn load_next_descriptor<L: QueryArtifactLoader>(
+async fn load_next_descriptor<L: QueryArtifactLoader, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     view: &PartitionView,
     catalog_lineage: &[[u8; 32]],
     recipe_catalog_proofs: &[QueryRecipeCatalogProof],
@@ -209,7 +214,7 @@ async fn load_next_descriptor<L: QueryArtifactLoader>(
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
 ) -> Result<Option<(Arc<ProjectionQueryRunDescriptor>, usize)>, IndexError> {
-    let Some(reference) = stream.next(loader, credits, budget).await? else {
+    let Some(reference) = stream.next(loader, executor, credits, budget).await? else {
         return Ok(None);
     };
     let encoded_bytes =
@@ -218,32 +223,55 @@ async fn load_next_descriptor<L: QueryArtifactLoader>(
         return resource(encoded_bytes, block_limits.maximum_run_descriptor_bytes);
     }
     let request = QueryArtifactLoad::direct(QueryArtifactKind::Run, reference.hash, encoded_bytes);
-    if let Some(descriptor) = loader.cached_projection_query_run(request.clone())? {
-        // Only descriptors produced by the validated decoder enter this
-        // cache. Preserve logical load evidence, but do not repeat its full
-        // structural validation on every query page.
-        budget.load(request.kind, request.encoded_bytes)?;
-        validate_loaded_descriptor(
-            view,
-            catalog_lineage,
-            recipe_catalog_proofs,
-            &reference,
-            &descriptor,
-        )?;
-        return Ok(Some((descriptor, 0)));
+    loop {
+        if let Some(descriptor) = loader.cached_projection_query_run(request.clone())? {
+            // Only descriptors produced by the validated decoder enter this
+            // cache. Preserve logical load evidence, but do not repeat its full
+            // structural validation on every query page.
+            budget.load(request.kind, request.encoded_bytes)?;
+            validate_loaded_descriptor(
+                view,
+                catalog_lineage,
+                recipe_catalog_proofs,
+                &reference,
+                &descriptor,
+            )?;
+            return Ok(Some((descriptor, 0)));
+        }
+        let _leadership = match loader
+            .coordinate_query_run_population(request.clone())
+            .await?
+        {
+            QueryPopulation::Completed => continue,
+            QueryPopulation::Lead(leadership) => leadership,
+        };
+        let populated = async {
+            let bytes = load_exact_pre_admitted(loader, request.clone(), credits, budget).await?;
+            let loaded_bytes = bytes.len();
+            let mut decode_credits = credits.try_fork_query()?;
+            let descriptor = executor
+                .run_cpu(Box::new(move || {
+                    Ok(Arc::new(decode_projection_query_run(
+                        &bytes,
+                        block_limits,
+                        &mut decode_credits,
+                    )?))
+                }))
+                .await?;
+            credits.release(loaded_bytes)?;
+            validate_loaded_descriptor(
+                view,
+                catalog_lineage,
+                recipe_catalog_proofs,
+                &reference,
+                &descriptor,
+            )?;
+            loader.cache_projection_query_run(request.clone(), descriptor.clone());
+            Ok(Some((descriptor, loaded_bytes)))
+        }
+        .await;
+        return populated;
     }
-    let bytes = load_exact_pre_admitted(loader, request.clone(), credits, budget).await?;
-    let descriptor = Arc::new(decode_projection_query_run(&bytes, block_limits, credits)?);
-    credits.release(bytes.len())?;
-    validate_loaded_descriptor(
-        view,
-        catalog_lineage,
-        recipe_catalog_proofs,
-        &reference,
-        &descriptor,
-    )?;
-    loader.cache_projection_query_run(request, descriptor.clone());
-    Ok(Some((descriptor, bytes.len())))
 }
 
 fn validate_loaded_descriptor(
@@ -283,8 +311,9 @@ fn validate_loaded_descriptor(
     Ok(())
 }
 
-pub(super) async fn load_partition_manifest<L: QueryArtifactLoader>(
+pub(super) async fn load_partition_manifest<L: QueryArtifactLoader, X: QueryPartitionExecutor>(
     loader: &mut L,
+    executor: &X,
     view: PartitionView,
     catalog_lineage: &[[u8; 32]],
     recipe_catalog_proofs: &[QueryRecipeCatalogProof],
@@ -297,6 +326,7 @@ pub(super) async fn load_partition_manifest<L: QueryArtifactLoader>(
     let mut resident_bytes = 0usize;
     while let Some((run, run_bytes)) = load_next_descriptor(
         loader,
+        executor,
         &view,
         catalog_lineage,
         recipe_catalog_proofs,
