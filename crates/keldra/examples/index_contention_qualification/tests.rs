@@ -545,7 +545,7 @@ async fn visibility_failures_preserve_transport_vs_lag_classification() {
     assert_eq!(report.visibility_probe_failures.len(), 3);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn fixed_rate_records_every_schedule_and_queue_admission_miss() {
     let (job_tx, mut job_rx) = mpsc::channel(2);
     let started = Instant::now();
@@ -567,7 +567,7 @@ async fn fixed_rate_records_every_schedule_and_queue_admission_miss() {
     assert_eq!(job_rx.recv().await.unwrap().sequence, 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn fixed_rate_does_not_dispatch_schedules_after_deadline() {
     let (job_tx, mut job_rx) = mpsc::channel(16);
     let deadline = Instant::now() - Duration::from_millis(1);
