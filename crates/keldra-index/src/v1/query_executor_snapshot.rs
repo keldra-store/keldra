@@ -219,9 +219,7 @@ async fn load_next_descriptor<L: QueryArtifactLoader, X: QueryPartitionExecutor>
     };
     let encoded_bytes =
         usize::try_from(reference.encoded_bytes).map_err(|_| IndexError::Integrity)?;
-    if encoded_bytes > block_limits.maximum_run_descriptor_bytes {
-        return resource(encoded_bytes, block_limits.maximum_run_descriptor_bytes);
-    }
+    check_run_descriptor_bytes(encoded_bytes, block_limits)?;
     let request = QueryArtifactLoad::direct(QueryArtifactKind::Run, reference.hash, encoded_bytes);
     loop {
         if let Some(descriptor) = loader.cached_projection_query_run(request.clone())? {
@@ -271,6 +269,42 @@ async fn load_next_descriptor<L: QueryArtifactLoader, X: QueryPartitionExecutor>
         }
         .await;
         return populated;
+    }
+}
+
+fn check_run_descriptor_bytes(
+    encoded_bytes: usize,
+    limits: QueryBlockLimits,
+) -> Result<(), IndexError> {
+    if encoded_bytes > limits.maximum_run_descriptor_bytes {
+        return resource(encoded_bytes, limits.maximum_run_descriptor_bytes);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod configured_descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn reader_precheck_accepts_configured_producer_bound_and_rejects_cap_plus_one() {
+        let observed_rebuild_bytes = 71_385_275;
+        assert!(
+            check_run_descriptor_bytes(
+                observed_rebuild_bytes,
+                QueryBlockLimits::default_for_memory()
+            )
+            .is_err()
+        );
+        let configured = QueryBlockLimits::for_query_memory(4 * 1024 * 1024 * 1024);
+        assert!(check_run_descriptor_bytes(observed_rebuild_bytes, configured).is_ok());
+        assert!(
+            check_run_descriptor_bytes(configured.maximum_run_descriptor_bytes, configured).is_ok()
+        );
+        assert!(
+            matches!(check_run_descriptor_bytes(configured.maximum_run_descriptor_bytes + 1, configured),
+            Err(IndexError::ResourceLimit { needed, limit }) if needed == limit + 1)
+        );
     }
 }
 

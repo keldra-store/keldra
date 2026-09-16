@@ -22,6 +22,7 @@ use super::cpu::IndexCpuPool;
 use super::v1_parallel::run_bounded_ordered;
 use super::v1_publication::{LoadedV1ProjectionGeneration, V1ProjectionPublisher};
 
+#[cfg(test)]
 const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
 fn component_output_run_limit(maximum_unmerged_bytes: usize) -> usize {
@@ -411,7 +412,7 @@ impl V1ProjectionPublisher {
             let physical_generation = loaded.generation.physical_catalog_generation;
             let compacted = cpu
                 .submit(move || {
-                    let limits = QueryBlockLimits::default_for_memory();
+                    let limits = query_access.publisher.query_block_limits();
                     let fan_in = maximum_runs
                         .min(QUERY_RUN_PAGE_FANOUT)
                         .min(limits.maximum_loaded_blocks)
@@ -698,7 +699,7 @@ fn compact_query_stream(
                 bucket_id,
                 projection_query_run_pack_path(partition, hash),
                 hash,
-                MAX_ARTIFACT_BYTES,
+                limits.maximum_run_descriptor_bytes,
             )
         },
         |descriptor| {

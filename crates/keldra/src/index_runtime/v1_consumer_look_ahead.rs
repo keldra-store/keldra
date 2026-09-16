@@ -54,6 +54,7 @@ pub(super) fn start_look_ahead(
     extractor: &V1ProjectionExtractor,
     credits: &IndexingMemoryCredits,
     limits: Limits,
+    query_limits: keldra_index::v1::QueryBlockLimits,
 ) -> Result<(), Status> {
     if !writer.look_ahead_permitted
         || writer.look_ahead.is_some()
@@ -129,7 +130,7 @@ pub(super) fn start_look_ahead(
                 Err(error) if halts_partition(&error) => return Err(error),
                 Err(_) => return Ok(Some(ready)),
             };
-            let query = match keldra_index::v1::query_batches_seal_peak_bytes(window.chunks.values().flat_map(|(_, slots)| slots.iter()).filter_map(|slot| slot.prepared.as_ref().map(|prepared| &prepared.query)), keldra_index::v1::QueryBlockLimits::default_for_memory()).map_err(index_status) {
+            let query = match keldra_index::v1::query_batches_seal_peak_bytes(window.chunks.values().flat_map(|(_, slots)| slots.iter()).filter_map(|slot| slot.prepared.as_ref().map(|prepared| &prepared.query)), query_limits).map_err(index_status) {
                 Ok(query) => query,
                 Err(error) if error.code() == tonic::Code::ResourceExhausted => return Ok(Some(ready)),
                 Err(error) => return Err(error),

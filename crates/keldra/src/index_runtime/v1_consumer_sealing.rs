@@ -164,6 +164,7 @@ pub(super) fn reserve_sealing_progress<'a>(
     incoming: impl IntoIterator<Item = &'a PreparedQueryMutationBatch>,
     sources: impl IntoIterator<Item = (&'a str, &'a [keldra_index::v1::ProjectedDocumentState])>,
     credits: &IndexingMemoryCredits,
+    query_limits: keldra_index::v1::QueryBlockLimits,
 ) -> Result<(), Status> {
     let mut components = 0usize;
     for (path, states) in sources {
@@ -183,7 +184,7 @@ pub(super) fn reserve_sealing_progress<'a>(
         .ok_or_else(|| Status::resource_exhausted("v1 component seal admission overflow"))?;
     let query = keldra_index::v1::query_batches_seal_peak_bytes(
         std::iter::once(&writer.query).chain(incoming),
-        keldra_index::v1::QueryBlockLimits::default_for_memory(),
+        query_limits,
     )
     .map_err(index_status)?;
     let historical_sequence = writer.current.as_ref().map_or(0, |current| {

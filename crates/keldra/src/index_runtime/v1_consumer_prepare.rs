@@ -170,7 +170,7 @@ pub(super) async fn prepare_lane(
     safe_next: u64,
     reader: &ClusterObjectReader,
     extractor: &V1ProjectionExtractor,
-    _publisher: &V1ProjectionPublisher,
+    publisher: &V1ProjectionPublisher,
     credits: &IndexingMemoryCredits,
     limits: Limits,
 ) -> Result<(), Status> {
@@ -239,6 +239,7 @@ pub(super) async fn prepare_lane(
                     .map(|prepared| (mutation.path.as_str(), prepared.current.as_slice()))
             }),
         credits,
+        publisher.query_block_limits(),
     )?;
     writer.look_ahead_progress = None;
     let prepared_count: usize = prepared_chunks

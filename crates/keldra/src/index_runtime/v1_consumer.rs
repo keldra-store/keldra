@@ -1079,6 +1079,7 @@ async fn backfill(
                 .iter()
                 .map(|(path, _, _, _, prepared)| (path.as_str(), prepared.current.as_slice())),
             credits,
+            publisher.query_block_limits(),
         )?;
         for (path, version, baseline_offset, source_bytes, prepared) in prepared_rows {
             merge_query(&mut writer.query, prepared.query)?;
@@ -1444,7 +1445,13 @@ async fn flush(
     writer.pending_projected_encoded_bytes = projected_bytes;
     writer.stage = ProducerStage::Sealing;
     if writer.sealing_progress.is_none() {
-        reserve_sealing_progress(writer, std::iter::empty(), std::iter::empty(), credits)?;
+        reserve_sealing_progress(
+            writer,
+            std::iter::empty(),
+            std::iter::empty(),
+            credits,
+            publisher.query_block_limits(),
+        )?;
     }
     let seal_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.seal_nanos);
     let sealed = writer.accumulator.seal_and_reset().map_err(index_status)?;
@@ -1474,6 +1481,7 @@ async fn flush(
         extractor,
         credits,
         limits,
+        publisher.query_block_limits(),
     )?;
     let generation_build_timer =
         super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.generation_build_nanos);

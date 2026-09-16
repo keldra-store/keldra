@@ -256,24 +256,50 @@ pub fn decode_projection_query_run(
             actual: input.bytes.len() as u64,
         });
     }
+    let pack_wire_start = input.offset;
+    let pack_array_bytes = pack_count
+        .checked_mul(std::mem::size_of::<super::super::ArtifactPackReference>())
+        .ok_or(IndexError::OffsetOverflow)?;
+    // Vec -> Arc<[Reference]> conversion may briefly retain both arrays.
+    // Admit both before the first native allocation; keep only final ownership
+    // charged after the conversion. Arc headers contain two native counters.
+    let arc_header = 2 * std::mem::size_of::<usize>();
+    let pack_metadata_bytes = pack_array_bytes
+        .checked_add(std::mem::size_of::<ArtifactPackTable>())
+        .and_then(|bytes| bytes.checked_add(2 * arc_header))
+        .ok_or(IndexError::OffsetOverflow)?;
+    credits.reserve(
+        pack_metadata_bytes
+            .checked_add(pack_array_bytes)
+            .ok_or(IndexError::OffsetOverflow)?,
+    )?;
     let mut packs = Vec::with_capacity(pack_count);
     for _ in 0..pack_count {
         let ordinal = input.u32()?;
-        let canonical_path = std::str::from_utf8(input.bytes()?)
-            .map_err(|_| IndexError::InvalidFormat("v1 artifact pack path"))?
-            .to_owned();
+        let path = std::str::from_utf8(input.bytes()?)
+            .map_err(|_| IndexError::InvalidFormat("v1 artifact pack path"))?;
+        credits.reserve(
+            path.len()
+                .checked_add(arc_header)
+                .ok_or(IndexError::OffsetOverflow)?,
+        )?;
+        // Construct directly from borrowed wire bytes, with no intermediate
+        // owned String allocation or uncharged String/Arc overlap.
+        let canonical_path = std::sync::Arc::<str>::from(path);
         let object_version = input.u64()?;
         let hash = input.array_32()?;
         let length = input.u64()?;
         packs.push(super::super::ArtifactPackReference {
             ordinal,
-            canonical_path: std::sync::Arc::from(canonical_path),
+            canonical_path,
             object_version,
             hash,
             length,
         });
     }
     let pack_table = std::sync::Arc::new(ArtifactPackTable::new(packs)?);
+    credits.release(pack_array_bytes)?;
+    let pack_wire_bytes = input.offset - pack_wire_start;
     let table_count = input.u32()? as usize;
     if table_count > input.remaining() / 36 {
         return Err(IndexError::Integrity);
@@ -319,7 +345,22 @@ pub fn decode_projection_query_run(
             actual: input.bytes.len() as u64,
         });
     }
-    credits.reserve(bytes.len())?;
+    // Pack metadata is already admitted at native size. The remaining wire
+    // upper bound covers owned keys, while native block descriptors can exceed
+    // their minimum wire representation and need that additional admission.
+    let native_expansion = count
+        .checked_mul(
+            std::mem::size_of::<QueryBlockDescriptor>()
+                .saturating_sub(MINIMUM_DESCRIPTOR_BLOCK_BYTES),
+        )
+        .ok_or(IndexError::OffsetOverflow)?;
+    credits.reserve(
+        bytes
+            .len()
+            .checked_sub(pack_wire_bytes)
+            .and_then(|bytes| bytes.checked_add(native_expansion))
+            .ok_or(IndexError::OffsetOverflow)?,
+    )?;
     let mut blocks = Vec::with_capacity(count);
     for _ in 0..count {
         let kind = QueryBlockKind::decode(input.byte()?)?;

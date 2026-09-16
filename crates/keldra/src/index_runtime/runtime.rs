@@ -137,6 +137,7 @@ pub(crate) async fn start(
         reader.clone(),
         artifact_router.clone(),
         ImmutableArtifactCache::with_working_memory(working_memory.clone()),
+        keldra_index::v1::QueryBlockLimits::for_query_memory(config.query_memory_bytes()),
     );
     let v1_catalog_lifecycle = V1CatalogLifecycleTask::start(
         catalog.clone(),

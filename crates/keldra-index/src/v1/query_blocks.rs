@@ -77,6 +77,23 @@ pub struct QueryBlockLimits {
 }
 
 impl QueryBlockLimits {
+    /// Descriptor precheck follows the configured query share, not currently
+    /// available memory. Actual encoded and decoded allocations still require
+    /// shared credits. Preserve the historically accepted 64 MiB floor for
+    /// smaller configurations; larger shares retain the one-eighth policy.
+    pub const fn for_query_memory(query_memory_bytes: u64) -> Self {
+        let mut limits = Self::default_for_memory();
+        let configured = query_memory_bytes / 8;
+        if configured > limits.maximum_run_descriptor_bytes as u64 {
+            limits.maximum_run_descriptor_bytes = if configured > usize::MAX as u64 {
+                usize::MAX
+            } else {
+                configured as usize
+            };
+        }
+        limits
+    }
+
     pub const fn default_for_memory() -> Self {
         Self {
             maximum_block_bytes: DEFAULT_QUERY_BLOCK_BYTES,

@@ -16,13 +16,12 @@ use keldra_index::v1::{
     AuthorizedQueryCandidate, LogicalFieldBinding, LogicalProjectionBinding,
     MAX_QUERY_CANDIDATE_ADMISSION_BATCH, MAX_QUERY_PARTITIONS, PinnedPartitionQueryRoot,
     ProjectionCatalogActivation, ProjectionFamilyPartitionDirectory, ProjectionGenerationHeader,
-    ProjectionPartitionIdentity, QueryAdmissionContext, QueryBlockCredits, QueryBlockLimits,
-    QueryCandidateAdmission, QueryCommonCut, QueryCpuJob, QueryExecutionLimits, QueryFieldBinding,
-    QueryMemoryPermit, QueryPartitionExecutor, QueryPartitionJob, QueryPublicValueEncoder,
-    QueryRootCutProof, RecipeIdentity, StableDocumentKey, TypedJsonQueryRequest,
-    ValidatedQuerySnapshot, decode_projection_generation_header,
-    execute_typed_json_query_with_cursor_and_executor, projection_generation_path,
-    query_snapshot_identity, resolve_query_partition_results,
+    ProjectionPartitionIdentity, QueryAdmissionContext, QueryBlockCredits, QueryCandidateAdmission,
+    QueryCommonCut, QueryCpuJob, QueryExecutionLimits, QueryFieldBinding, QueryMemoryPermit,
+    QueryPartitionExecutor, QueryPartitionJob, QueryPublicValueEncoder, QueryRootCutProof,
+    RecipeIdentity, StableDocumentKey, TypedJsonQueryRequest, ValidatedQuerySnapshot,
+    decode_projection_generation_header, execute_typed_json_query_with_cursor_and_executor,
+    projection_generation_path, query_snapshot_identity, resolve_query_partition_results,
 };
 use keldra_store::PlacementLogId;
 use tonic::Status;
@@ -302,7 +301,7 @@ impl V1LocalIndexQueryExecutor {
                 explicit_search_after,
                 &RuntimePublicValueEncoder,
                 limits,
-                QueryBlockLimits::default_for_memory(),
+                self.projections.query_block_limits(),
                 &mut credits,
                 &self.query_scheduler,
             )

@@ -67,6 +67,7 @@ pub(crate) struct V1ProjectionPublisher {
     changes: tokio::sync::broadcast::Sender<()>,
     immutable_cache: ImmutableArtifactCache,
     observed_source_next: ObservedSourceProgress,
+    query_block_limits: QueryBlockLimits,
 }
 
 impl V1ProjectionPublisher {
@@ -75,6 +76,7 @@ impl V1ProjectionPublisher {
         reader: ClusterObjectReader,
         artifacts: IndexArtifactRouter,
         immutable_cache: ImmutableArtifactCache,
+        query_block_limits: QueryBlockLimits,
     ) -> Self {
         let (changes, _) = tokio::sync::broadcast::channel(1_024);
         Self {
@@ -84,7 +86,12 @@ impl V1ProjectionPublisher {
             changes,
             immutable_cache,
             observed_source_next: ObservedSourceProgress::default(),
+            query_block_limits,
         }
+    }
+
+    pub(crate) fn query_block_limits(&self) -> QueryBlockLimits {
+        self.query_block_limits
     }
 
     /// Replaces the disposable producer observation used to reject freshness
@@ -321,7 +328,7 @@ impl V1ProjectionPublisher {
             next_offset,
             through_atomic_position,
             query_batch,
-            QueryBlockLimits::default_for_memory(),
+            self.query_block_limits(),
             query_credits,
         )
         .map_err(index_status)?;

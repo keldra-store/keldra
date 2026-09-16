@@ -68,6 +68,19 @@ fn credits(bytes: usize) -> QueryBlockCredits {
     QueryBlockCredits::from_pipeline_permit(permit)
 }
 
+#[test]
+fn descriptor_bound_tracks_configured_query_share_without_lowering_defaults() {
+    let default = QueryBlockLimits::default_for_memory();
+    for configured in [1, 32 * 1024 * 1024, 512 * 1024 * 1024] {
+        assert_eq!(QueryBlockLimits::for_query_memory(configured), default);
+    }
+    let larger = QueryBlockLimits::for_query_memory(4 * 1024 * 1024 * 1024);
+    assert_eq!(larger.maximum_run_descriptor_bytes, 512 * 1024 * 1024);
+    assert_eq!(larger.maximum_block_bytes, default.maximum_block_bytes);
+    assert_eq!(larger.maximum_records, default.maximum_records);
+    assert_eq!(larger.maximum_loaded_blocks, default.maximum_loaded_blocks);
+}
+
 fn recipe() -> RecipeIdentity {
     RecipeIdentity::new([7; 32]).unwrap()
 }
@@ -747,6 +760,81 @@ fn descriptor_is_exact_family_partition_catalog_and_cut_binding() {
         }],
     };
     let encoded = encode_projection_query_run(&descriptor, limits, &mut credits).unwrap();
+    let exact = QueryBlockLimits {
+        maximum_run_descriptor_bytes: encoded.bytes.len(),
+        ..limits
+    };
+    let too_small = QueryBlockLimits {
+        maximum_run_descriptor_bytes: encoded.bytes.len() - 1,
+        ..limits
+    };
+    let remaining = credits.remaining();
+    for error in [
+        encode_projection_query_run(&descriptor, too_small, &mut credits).unwrap_err(),
+        decode_projection_query_run(&encoded.bytes, too_small, &mut credits).unwrap_err(),
+    ] {
+        assert!(matches!(error, IndexError::ResourceLimit { needed, limit }
+            if needed == encoded.bytes.len() && limit + 1 == needed));
+    }
+    assert_eq!(
+        credits.remaining(),
+        remaining,
+        "cap refusal precedes allocation admission"
+    );
+    assert_eq!(
+        encode_projection_query_run(&descriptor, exact, &mut credits)
+            .unwrap()
+            .bytes,
+        encoded.bytes
+    );
+    assert_eq!(
+        decode_projection_query_run(&encoded.bytes, exact, &mut credits).unwrap(),
+        descriptor
+    );
+    // A preserved descriptor precheck floor never grants allocation credits.
+    let mut tiny = self::credits(1);
+    let low_memory_limits = QueryBlockLimits::for_query_memory(1);
+    assert!(encode_projection_query_run(&descriptor, low_memory_limits, &mut tiny).is_err());
+    assert_eq!(tiny.remaining(), 1);
+    let arc_header = 2 * std::mem::size_of::<usize>();
+    let pack_array =
+        descriptor.pack_table.entries().len() * std::mem::size_of::<ArtifactPackReference>();
+    let before_pack_allocation =
+        2 * pack_array + std::mem::size_of::<ArtifactPackTable>() + 2 * arc_header;
+    let mut denied_pack = self::credits(before_pack_allocation - 1);
+    assert!(
+        matches!(decode_projection_query_run(&encoded.bytes, limits, &mut denied_pack),
+        Err(IndexError::ResourceLimit { needed, .. }) if needed == before_pack_allocation)
+    );
+    assert_eq!(
+        denied_pack.remaining(),
+        before_pack_allocation - 1,
+        "native pack array refusal occurs before allocation or any charge"
+    );
+    let path_bytes = descriptor.pack_table.entries()[0].canonical_path.len() + arc_header;
+    let mut denied_path = self::credits(before_pack_allocation + path_bytes - 1);
+    assert!(decode_projection_query_run(&encoded.bytes, limits, &mut denied_path).is_err());
+    assert_eq!(
+        denied_path.remaining(),
+        path_bytes - 1,
+        "path allocation is refused before constructing its owned Arc"
+    );
+    let mut measured = self::credits(128 * 1024);
+    assert_eq!(
+        decode_projection_query_run(&encoded.bytes, limits, &mut measured).unwrap(),
+        descriptor
+    );
+    let final_native_bytes = 128 * 1024 - measured.remaining();
+    let mut exact_native = self::credits(final_native_bytes);
+    assert_eq!(
+        decode_projection_query_run(&encoded.bytes, limits, &mut exact_native).unwrap(),
+        descriptor
+    );
+    assert_eq!(
+        exact_native.remaining(),
+        0,
+        "native final ownership is charged exactly once"
+    );
     let encoded_again = encode_projection_query_run(&descriptor, limits, &mut credits).unwrap();
     assert_eq!(encoded, encoded_again, "root codec must be deterministic");
     assert_eq!(
