@@ -254,6 +254,8 @@ pub(crate) struct LogicalCatalogBinding {
     pub(crate) object_version: u64,
     pub(crate) family: ProjectionFamilyIdentity,
     pub(crate) query_contract: [u8; 32],
+    // Reconstructed from the ordinary definition; never a second authority.
+    pub(crate) explicit_rebuild_at_unix_millis: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +314,9 @@ impl Drop for RecipeResidentLease {
 
 #[derive(Clone)]
 struct CatalogRecipeState {
+    /// Only accepted explicit intents, derived from live ordinary definitions.
+    /// Family-local state keeps ordinary alias loading independent of bucket size.
+    rebuild_intents: BTreeMap<u64, u64>,
     physical: Arc<PhysicalCatalogRecipe>,
     references: usize,
     field_references: BTreeMap<[u8; 32], usize>,
@@ -577,7 +582,9 @@ impl IndexCatalog {
         let backup = CatalogMutationBackup::capture(&state, identity, Some(&binding));
         let mut physical_changed = false;
         let result = (|| {
+            let mut previous_family = None;
             if let Some(previous) = state.bindings.remove(&identity) {
+                previous_family = Some(previous.family);
                 state.resident_bytes = state
                     .resident_bytes
                     .saturating_sub(binding_resident_bytes(&previous)?);
@@ -592,7 +599,12 @@ impl IndexCatalog {
                 .ok_or_else(|| {
                     Status::resource_exhausted("active index catalog resident size overflow")
                 })?;
+            let next_family = binding.family;
             state.bindings.insert(identity, binding);
+            physical_changed |= refresh_family_rebuild_generation(&mut state, next_family)?;
+            if let Some(previous_family) = previous_family.filter(|family| *family != next_family) {
+                physical_changed |= refresh_family_rebuild_generation(&mut state, previous_family)?;
+            }
             mark_catalog_changed(&mut state, physical_changed)?;
             prepare_mutation_commit(&mut state, &backup, &external_recipes)
         })();
@@ -646,6 +658,7 @@ impl IndexCatalog {
                     .saturating_sub(binding_resident_bytes(&previous)?);
                 physical_changed |= remove_recipe_reference(&mut state, &previous)?;
                 remove_query_contract_reference(&mut state, previous.query_contract);
+                physical_changed |= refresh_family_rebuild_generation(&mut state, previous.family)?;
             }
             mark_catalog_changed(&mut state, physical_changed)?;
             prepare_mutation_commit(&mut state, &backup, &external_recipes)
@@ -694,6 +707,7 @@ impl IndexCatalog {
                 .saturating_sub(binding_resident_bytes(&previous)?);
             physical_changed = remove_recipe_reference(&mut state, &previous)?;
             remove_query_contract_reference(&mut state, previous.query_contract);
+            physical_changed |= refresh_family_rebuild_generation(&mut state, previous.family)?;
             mark_catalog_changed(&mut state, physical_changed)?;
             prepare_mutation_commit(&mut state, &backup, &external_recipes)
         })();
@@ -922,6 +936,7 @@ fn compact_binding_without_allocations(definition: &CatalogDefinition) -> Logica
         object_version: definition.object_version,
         family: definition.projection_family_identity(),
         query_contract: query_contract_identity(definition),
+        explicit_rebuild_at_unix_millis: definition.stored.last_explicit_rebuild_at_unix_millis(),
     }
 }
 
@@ -1080,6 +1095,11 @@ fn add_recipe_reference(
                 Status::resource_exhausted("active index catalog resident size overflow")
             })?;
             recipe.references = recipe.references.saturating_add(1);
+            if let Some(accepted_at) = definition.stored.last_explicit_rebuild_at_unix_millis() {
+                recipe
+                    .rebuild_intents
+                    .insert(definition.stored.index_id, accepted_at);
+            }
             let mut fields = recipe.physical.fields.clone();
             let old_fields = fields.len();
             for (fingerprint, field) in definition
@@ -1139,6 +1159,12 @@ fn add_recipe_reference(
             recipe.physical_generation = family_physical_generation(&recipe);
             let physical = track_recipe(&resident_tracker, recipe)?;
             let recipe_state = CatalogRecipeState {
+                rebuild_intents: definition
+                    .stored
+                    .last_explicit_rebuild_at_unix_millis()
+                    .map(|accepted_at| (definition.stored.index_id, accepted_at))
+                    .into_iter()
+                    .collect(),
                 physical,
                 references: 1,
                 field_references: definition
@@ -1189,6 +1215,9 @@ fn remove_recipe_reference(
             let mut fields = recipe.physical.fields.clone();
             let old_fields = fields.len();
             recipe.references -= 1;
+            if binding.explicit_rebuild_at_unix_millis.is_some() {
+                recipe.rebuild_intents.remove(&binding.identity.index_id);
+            }
             for field in field_ids {
                 match recipe.field_references.get_mut(&field) {
                     Some(references) if *references > 1 => *references -= 1,
@@ -1236,6 +1265,12 @@ fn catalog_recipe_state_resident_bytes(recipe: &CatalogRecipeState) -> Option<us
                 .field_references
                 .len()
                 .checked_mul(std::mem::size_of::<([u8; 32], usize)>() + 64)?,
+        )?
+        .checked_add(
+            recipe
+                .rebuild_intents
+                .len()
+                .checked_mul(std::mem::size_of::<(u64, u64)>() + 64)?,
         )
 }
 
@@ -1403,6 +1438,48 @@ fn recipe_selectors(fields: &BTreeMap<[u8; 32], Arc<FieldSchema>>) -> Arc<[Strin
             .into_iter()
             .collect::<Vec<_>>(),
     )
+}
+
+/// Bind explicit rebuilds to the existing physical generation, not the stable
+/// family identity. Aliases rebuild their one shared family together. Removing
+/// an alias with rebuild intent changes this derived generation and may rebuild
+/// the surviving family once; no deleted definition leaves a hidden watermark.
+fn refresh_family_rebuild_generation(
+    state: &mut CatalogState,
+    family: ProjectionFamilyIdentity,
+) -> Result<bool, Status> {
+    let Some(current) = state.recipes.get(&family) else {
+        return Ok(false);
+    };
+    let semantic_generation = family_physical_generation(&current.physical);
+    let mut rebuild_hasher = None;
+    // BTreeMap order is stable logical index ID order within this family.
+    // Ordinary object-version and public field-name changes are not rebuilds.
+    for (index_id, accepted_at) in &current.rebuild_intents {
+        let hasher = rebuild_hasher.get_or_insert_with(|| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"keldra.index.physical-family-explicit-rebuild/v1");
+            hasher.update(&semantic_generation);
+            hasher
+        });
+        hasher.update(&index_id.to_be_bytes());
+        hasher.update(&accepted_at.to_be_bytes());
+    }
+    // Preserve the exact existing generation algorithm for no-rebuild families.
+    let generation =
+        rebuild_hasher.map_or(semantic_generation, |hasher| *hasher.finalize().as_bytes());
+    if generation == current.physical.physical_generation {
+        return Ok(false);
+    }
+    let mut next = clone_physical_recipe(&current.physical, current.physical.fields.clone())?;
+    next.physical_generation = generation;
+    let next = track_recipe(&state.recipe_resident, next)?;
+    state
+        .recipes
+        .get_mut(&family)
+        .expect("checked physical family exists")
+        .physical = next;
+    Ok(true)
 }
 
 fn family_physical_generation(recipe: &PhysicalCatalogRecipe) -> [u8; 32] {

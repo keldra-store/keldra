@@ -104,6 +104,270 @@ fn keyword_field(name: &str, pointer: &str) -> IndexField {
     }
 }
 
+fn explicit_rebuild(
+    mut definition: CatalogDefinition,
+    version: u64,
+    accepted_at: u64,
+) -> CatalogDefinition {
+    definition.stored = definition
+        .stored
+        .with_explicit_rebuild(accepted_at)
+        .unwrap();
+    definition.object_version = version;
+    definition
+}
+
+#[test]
+fn accepted_explicit_rebuild_changes_generation_and_notifies_existing_producer() {
+    let catalog = IndexCatalog::default();
+    let initial = definition(1, 2, 9);
+    let family = initial.projection_family_identity();
+    catalog.upsert(initial.clone()).unwrap();
+    let before = catalog.physical_snapshot().unwrap();
+    let original_generation = before.recipes[0].physical_generation;
+    assert_eq!(
+        original_generation,
+        family_physical_generation(&before.recipes[0])
+    );
+    let mut notices = catalog.subscribe();
+
+    catalog.upsert(explicit_rebuild(initial, 2, 1_000)).unwrap();
+
+    let after = catalog.physical_snapshot().unwrap();
+    assert_eq!(after.recipes.len(), 1);
+    assert_eq!(after.recipes[0].family, family);
+    assert_ne!(after.recipes[0].physical_generation, original_generation);
+    assert!(notices.try_recv().unwrap().physical_changed);
+    assert_eq!(before.recipes[0].physical_generation, original_generation);
+    assert!(!Arc::ptr_eq(&before.recipes[0], &after.recipes[0]));
+}
+
+#[test]
+fn explicit_rebuild_replay_and_restart_derive_the_same_shared_generation() {
+    let first = explicit_rebuild(definition(1, 2, 9), 2, 1_000);
+    let alias = explicit_rebuild(definition(1, 2, 10), 3, 1_000);
+    let catalog = IndexCatalog::default();
+    catalog.upsert(first.clone()).unwrap();
+    catalog.upsert(alias.clone()).unwrap();
+    let before = catalog.physical_snapshot().unwrap();
+    let mut notices = catalog.subscribe();
+
+    catalog.upsert(first.clone()).unwrap();
+    catalog.upsert(alias.clone()).unwrap();
+
+    assert!(notices.try_recv().is_err());
+    assert!(Arc::ptr_eq(&before, &catalog.physical_snapshot().unwrap()));
+    let restarted = IndexCatalog::default();
+    restarted.upsert(alias).unwrap();
+    restarted.upsert(first).unwrap();
+    let after = restarted.physical_snapshot().unwrap();
+    assert_eq!(after.recipes.len(), 1);
+    assert_eq!(
+        after.recipes[0].physical_generation,
+        before.recipes[0].physical_generation
+    );
+}
+
+#[test]
+fn alias_rebuild_replaces_one_shared_family_and_each_alias_intent_matters() {
+    let catalog = IndexCatalog::default();
+    let first = definition(1, 2, 9);
+    let alias = definition(1, 2, 10);
+    catalog.upsert(first.clone()).unwrap();
+    catalog.upsert(alias.clone()).unwrap();
+    let original = catalog.physical_snapshot().unwrap().recipes[0].physical_generation;
+    catalog.upsert(explicit_rebuild(first, 2, 1_000)).unwrap();
+    let first_rebuild = catalog.physical_snapshot().unwrap().recipes[0].physical_generation;
+    assert_ne!(first_rebuild, original);
+
+    // Equal server timestamps on different stable aliases are different intent.
+    catalog.upsert(explicit_rebuild(alias, 2, 1_000)).unwrap();
+    let (_, _, bindings, recipes, _) = catalog.snapshot().unwrap();
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(recipes.len(), 1);
+    assert!(
+        bindings
+            .iter()
+            .all(|binding| binding.family == recipes[0].family)
+    );
+    assert_ne!(recipes[0].physical_generation, first_rebuild);
+    assert_ne!(recipes[0].physical_generation, original);
+}
+
+#[test]
+fn normal_definition_versions_and_public_field_names_preserve_rebuild_intent() {
+    let catalog = IndexCatalog::default();
+    let first = explicit_rebuild(
+        typed_definition(9, vec![keyword_field("old_name", "/value")]),
+        2,
+        1_000,
+    );
+    catalog.upsert(first.clone()).unwrap();
+    let generation = catalog.physical_snapshot().unwrap().recipes[0].physical_generation;
+    let mut new_version = first;
+    new_version.object_version = 3;
+    catalog.upsert(new_version).unwrap();
+    assert_eq!(
+        catalog.physical_snapshot().unwrap().recipes[0].physical_generation,
+        generation
+    );
+
+    let renamed = explicit_rebuild(
+        typed_definition(9, vec![keyword_field("new_name", "/value")]),
+        4,
+        1_000,
+    );
+    catalog.upsert(renamed).unwrap();
+    assert_eq!(
+        catalog.physical_snapshot().unwrap().recipes[0].physical_generation,
+        generation
+    );
+    let mut later = explicit_rebuild(
+        typed_definition(9, vec![keyword_field("new_name", "/value")]),
+        5,
+        3_601_000,
+    );
+    catalog.upsert(later.clone()).unwrap();
+    assert_ne!(
+        catalog.physical_snapshot().unwrap().recipes[0].physical_generation,
+        generation
+    );
+    later.object_version = 6;
+    let repeated = catalog.physical_snapshot().unwrap().recipes[0].physical_generation;
+    catalog.upsert(later).unwrap();
+    assert_eq!(
+        catalog.physical_snapshot().unwrap().recipes[0].physical_generation,
+        repeated
+    );
+}
+
+#[test]
+fn removing_rebuilt_alias_rederives_generation_without_a_hidden_watermark() {
+    let catalog = IndexCatalog::default();
+    let alias = definition(1, 2, 10);
+    catalog.upsert(alias.clone()).unwrap();
+    let original = catalog.physical_snapshot().unwrap().recipes[0].physical_generation;
+    catalog
+        .upsert(explicit_rebuild(definition(1, 2, 9), 2, 1_000))
+        .unwrap();
+    assert_ne!(
+        catalog.physical_snapshot().unwrap().recipes[0].physical_generation,
+        original
+    );
+    let mut notices = catalog.subscribe();
+    // Exercise the synchronous removal used by catalog reconciliation too.
+    catalog.remove(1, 2, 9).unwrap();
+    assert!(notices.try_recv().unwrap().physical_changed);
+    assert_eq!(
+        catalog.physical_snapshot().unwrap().recipes[0].physical_generation,
+        original
+    );
+    let restarted = IndexCatalog::default();
+    restarted.upsert(alias).unwrap();
+    assert_eq!(
+        restarted.physical_snapshot().unwrap().recipes[0].physical_generation,
+        original
+    );
+}
+
+#[tokio::test]
+async fn versioned_alias_delete_rederives_surviving_family_rebuild_generation() {
+    let catalog = IndexCatalog::default();
+    catalog.upsert(definition(1, 2, 10)).unwrap();
+    let original = catalog.physical_snapshot().unwrap().recipes[0].physical_generation;
+    catalog
+        .upsert(explicit_rebuild(definition(1, 2, 9), 2, 1_000))
+        .unwrap();
+    catalog
+        .delete_wait(
+            CatalogIdentity {
+                tenant_id: 1,
+                bucket_id: 2,
+                index_id: 9,
+            },
+            3,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.physical_snapshot().unwrap().recipes[0].physical_generation,
+        original
+    );
+}
+
+#[test]
+fn family_rebuild_map_contains_and_charges_only_nonempty_intents() {
+    let catalog = IndexCatalog::default();
+    for index_id in 1..=128 {
+        catalog.upsert(definition(1, 2, index_id)).unwrap();
+    }
+    {
+        let state = catalog.inner.lock().unwrap();
+        assert_eq!(state.recipes.len(), 1);
+        assert!(
+            state
+                .recipes
+                .values()
+                .next()
+                .unwrap()
+                .rebuild_intents
+                .is_empty()
+        );
+    }
+    catalog
+        .upsert(explicit_rebuild(definition(1, 2, 9), 2, 1_000))
+        .unwrap();
+    let state = catalog.inner.lock().unwrap();
+    let recipe = state.recipes.values().next().unwrap();
+    assert_eq!(recipe.rebuild_intents, BTreeMap::from([(9, 1_000)]));
+    let charged = catalog_recipe_state_resident_bytes(recipe).unwrap();
+    let mut without_intents = recipe.clone();
+    without_intents.rebuild_intents.clear();
+    assert_eq!(
+        charged - catalog_recipe_state_resident_bytes(&without_intents).unwrap(),
+        std::mem::size_of::<(u64, u64)>() + 64
+    );
+}
+
+#[test]
+fn rejected_rebuild_admission_restores_family_intents_binding_and_generation() {
+    let catalog = IndexCatalog::default();
+    catalog
+        .upsert(explicit_rebuild(definition(1, 2, 9), 2, 1_000))
+        .unwrap();
+    catalog.upsert(definition(1, 2, 10)).unwrap();
+    let before = catalog.physical_snapshot().unwrap();
+    let mut notices = catalog.subscribe();
+    let resident_before = {
+        let mut state = catalog.inner.lock().unwrap();
+        let resident = total_resident_bytes(&state).unwrap();
+        state.maximum_bytes = resident;
+        resident
+    };
+
+    let error = catalog
+        .upsert(explicit_rebuild(definition(1, 2, 10), 2, 2_000))
+        .unwrap_err();
+
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(notices.try_recv().is_err());
+    assert!(Arc::ptr_eq(&before, &catalog.physical_snapshot().unwrap()));
+    let state = catalog.inner.lock().unwrap();
+    let recipe = state.recipes.values().next().unwrap();
+    assert_eq!(recipe.rebuild_intents, BTreeMap::from([(9, 1_000)]));
+    let alias = state
+        .bindings
+        .get(&CatalogIdentity {
+            tenant_id: 1,
+            bucket_id: 2,
+            index_id: 10,
+        })
+        .unwrap();
+    assert_eq!(alias.object_version, 1);
+    assert_eq!(alias.explicit_rebuild_at_unix_millis, None);
+    assert_eq!(total_resident_bytes(&state).unwrap(), resident_before);
+}
+
 #[test]
 fn changes_update_active_catalog_without_an_admission_queue() {
     let catalog = IndexCatalog::default();
