@@ -5,10 +5,13 @@ use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::DistributedEvaluationContext;
 use super::mutations::StagedLocalChanges;
-use super::single_node_group_commit::{SingleNodeOperations, SingleNodeOutcomes};
+use super::single_node_group_commit::{
+    GroupConflictRegistrationHandoff, MutationGroupMode, SingleNodeOperations, SingleNodeOutcomes,
+};
 use super::*;
 use crate::model::{CoordinatedObjectMutation, ObjectMutationContext, ObjectMutationGovernance};
 use crate::{BatchOperation, DefinitionMutationIntent, MutationReceipt, PlacementLogId};
+use tokio::sync::Semaphore;
 
 struct PreparedDistributedMutation {
     index: usize,
@@ -60,6 +63,7 @@ impl LaneAuthoritySnapshot {
 #[derive(Clone, Copy, Default)]
 pub(super) struct CoordinatorBatchMetrics {
     pub(super) prepare: std::time::Duration,
+    pub(super) execution_slot_wait: std::time::Duration,
     pub(super) policy_wait: std::time::Duration,
     pub(super) path_wait: std::time::Duration,
     /// Legacy commit-mutex wait, or the first lane-sequence acquisition wait.
@@ -428,20 +432,10 @@ impl Store {
         context: ObjectMutationContext,
         source_journal_admission: SourceJournalAdmission,
     ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
-        let evaluated = self
-            .coordinate_mutation_batch(
-                operations,
-                context,
-                CoordinatorBatchPayloadPreparation::Distributed {
-                    source_journal_admission,
-                },
-            )
-            .await?;
-        if evaluated.receipt_capacity_at.is_some() {
-            Err(MutationError::ReceiptCapacity)
-        } else {
-            Ok(evaluated.outcomes)
-        }
+        self.single_node_group_commit
+            .submit_distributed(self.clone(), operations, context, source_journal_admission)
+            .await
+            .map(|batch| batch.outcomes)
     }
 
     /// Runs the direct local Store compatibility API through the same
@@ -519,21 +513,32 @@ impl Store {
             .await
     }
 
-    pub(super) async fn coordinate_single_node_mutation_group(
+    pub(super) async fn coordinate_mutation_group(
         &self,
         operations: SingleNodeOperations,
         context: ObjectMutationContext,
         request_operation_counts: &[usize],
         source_journal_admission: SourceJournalAdmission,
+        mode: MutationGroupMode,
+        registration_handoff: GroupConflictRegistrationHandoff,
+        execution_slots: Arc<Semaphore>,
     ) -> (Vec<SingleNodeOutcomes>, Option<CoordinatorBatchMetrics>) {
         let total = operations.len();
+        let payload_preparation = match mode {
+            MutationGroupMode::SingleNode => CoordinatorBatchPayloadPreparation::SingleNode {
+                source_journal_admission,
+            },
+            MutationGroupMode::Distributed => CoordinatorBatchPayloadPreparation::Distributed {
+                source_journal_admission,
+            },
+        };
         let evaluated = self
-            .coordinate_mutation_batch(
+            .coordinate_mutation_batch_grouped(
                 operations,
                 context,
-                CoordinatorBatchPayloadPreparation::SingleNode {
-                    source_journal_admission,
-                },
+                payload_preparation,
+                registration_handoff,
+                execution_slots,
             )
             .await;
         let mut evaluated = match evaluated {
@@ -554,7 +559,7 @@ impl Store {
                     .iter()
                     .map(|_| {
                         Err(MutationError::Storage(
-                            "single-node group boundary is inconsistent".into(),
+                            "mutation group boundary is inconsistent".into(),
                         ))
                     })
                     .collect(),
@@ -574,7 +579,14 @@ impl Store {
             } else {
                 responses.push(Ok(SingleNodeMutationBatch {
                     outcomes,
-                    source_journal_settlement: SourceJournalSettlement::CompletedByCoordinator,
+                    source_journal_settlement: match mode {
+                        MutationGroupMode::SingleNode => {
+                            SourceJournalSettlement::CompletedByCoordinator
+                        }
+                        MutationGroupMode::Distributed => {
+                            SourceJournalSettlement::RequiredAfterQuorum
+                        }
+                    },
                 }));
             }
             start = end;
@@ -591,6 +603,44 @@ impl Store {
         )>,
         context: ObjectMutationContext,
         payload_preparation: CoordinatorBatchPayloadPreparation,
+    ) -> Result<CoordinatedBatchEvaluation, MutationError> {
+        self.coordinate_mutation_batch_inner(operations, context, payload_preparation, None, None)
+            .await
+    }
+
+    async fn coordinate_mutation_batch_grouped(
+        &self,
+        operations: Vec<(
+            BatchOperation,
+            ObjectMutationGovernance,
+            Option<DefinitionMutationIntent>,
+        )>,
+        context: ObjectMutationContext,
+        payload_preparation: CoordinatorBatchPayloadPreparation,
+        registration_handoff: GroupConflictRegistrationHandoff,
+        execution_slots: Arc<Semaphore>,
+    ) -> Result<CoordinatedBatchEvaluation, MutationError> {
+        self.coordinate_mutation_batch_inner(
+            operations,
+            context,
+            payload_preparation,
+            Some(registration_handoff),
+            Some(execution_slots),
+        )
+        .await
+    }
+
+    async fn coordinate_mutation_batch_inner(
+        &self,
+        operations: Vec<(
+            BatchOperation,
+            ObjectMutationGovernance,
+            Option<DefinitionMutationIntent>,
+        )>,
+        context: ObjectMutationContext,
+        payload_preparation: CoordinatorBatchPayloadPreparation,
+        mut registration_handoff: Option<GroupConflictRegistrationHandoff>,
+        execution_slots: Option<Arc<Semaphore>>,
     ) -> Result<CoordinatedBatchEvaluation, MutationError> {
         let total_started = std::time::Instant::now();
         if context.serving_fence_term == 0
@@ -678,6 +728,13 @@ impl Store {
         }
         let prepare_duration = prepare_started.elapsed();
 
+        // Preserve caller order before taking any guard that the predecessor
+        // may still need. In particular, holding a policy read guard here while
+        // an earlier group is queued behind a fair policy writer would form a
+        // cycle: writer -> this read guard -> predecessor -> writer.
+        if let Some(handoff) = registration_handoff.as_mut() {
+            handoff.await_predecessor().await;
+        }
         let policy_wait_started = std::time::Instant::now();
         let _policy_guard = self.policy_gate.read().await;
         let policy_wait_duration = policy_wait_started.elapsed();
@@ -733,11 +790,31 @@ impl Store {
             })
             .collect::<Vec<_>>();
         lane_resources.extend(lane_read_cache.predecessor_blob_conflict_resources());
-        let mut mutation_lane = Some(
-            self.mutation_commit_lanes
-                .acquire_with_fence(lane_fence, lane_resources)
-                .await,
-        );
+        let lane_registration = self
+            .mutation_commit_lanes
+            .register_with_fence(lane_fence, lane_resources);
+        if let Some(handoff) = registration_handoff.as_mut() {
+            handoff.complete();
+        }
+        let lane_admission = lane_registration.acquire_conflicts().await;
+        // Preparation and complete conflict registration must not consume this
+        // bounded execution capacity. Otherwise later groups can fill every
+        // permit while waiting for an earlier group that cannot obtain one to
+        // register its resources. Conflict admission also establishes that any
+        // permit holder can make progress rather than waiting on a predecessor
+        // in the ordered registration chain.
+        let (_execution_slot, execution_slot_wait_duration) = match execution_slots {
+            Some(slots) => {
+                let started = std::time::Instant::now();
+                let permit = slots
+                    .acquire_owned()
+                    .await
+                    .expect("mutation group execution semaphore remains open");
+                (Some(permit), started.elapsed())
+            }
+            None => (None, std::time::Duration::ZERO),
+        };
+        let mut mutation_lane = Some(lane_admission.acquire_physical().await);
         let lane_conflict_wait_duration = mutation_lane
             .as_ref()
             .map_or(std::time::Duration::ZERO, |lane| lane.conflict_wait());
@@ -817,9 +894,6 @@ impl Store {
                     .reference_delta_cursor(runtime.projected_watch.source_id)
                     .map_err(|error| MutationError::Storage(error.to_string()))?;
                 self.rearm_caught_up_reference_frontiers(runtime, reference_cursor)?;
-                if reference_cursor < runtime.projected_watch.tail {
-                    return Err(MutationError::SourceJournalCapacity);
-                }
                 let snapshot = LaneAuthoritySnapshot {
                     watch: runtime.reserved_watch,
                     receipts: runtime.reserved_receipts,
@@ -986,15 +1060,9 @@ impl Store {
         let mut lane_settlement_metrics =
             super::mutation_commit_lanes::LaneSettlementMetrics::default();
         if let Some(completion) = lane_completion {
-            let committed = match &persistence {
-                Ok(()) => true,
-                Err(_) => self
-                    .db
-                    .get_cf(self.cf(CF_METADATA)?, completion.key())
-                    .map_err(storage_error)?
-                    .is_some(),
-            };
-            lane_settlement_metrics = self.finish_lane_commit(completion, committed).await?;
+            lane_settlement_metrics = self
+                .finish_lane_commit_cancellation_safe(completion, persistence.is_ok())
+                .await?;
         }
         persistence?;
         let persist_duration = persist_started.elapsed();
@@ -1023,6 +1091,7 @@ impl Store {
             receipt_capacity_at,
             metrics: CoordinatorBatchMetrics {
                 prepare: prepare_duration,
+                execution_slot_wait: execution_slot_wait_duration,
                 policy_wait: policy_wait_duration,
                 path_wait: path_wait_duration,
                 commit_wait: commit_wait_duration,
@@ -1189,22 +1258,14 @@ impl Store {
         context: ObjectMutationContext,
         source_journal_admission: SourceJournalAdmission,
     ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
-        let evaluated = self
-            .coordinate_mutation_batch(
-                requests
-                    .into_iter()
-                    .map(|request| (BatchOperation::Publish(request), governance.clone(), None))
-                    .collect(),
-                context,
-                CoordinatorBatchPayloadPreparation::Distributed {
-                    source_journal_admission,
-                },
-            )
-            .await?;
-        if evaluated.receipt_capacity_at.is_some() {
-            return Err(MutationError::ReceiptCapacity);
-        }
-        Ok(evaluated.outcomes)
+        let operations = requests
+            .into_iter()
+            .map(|request| (BatchOperation::Publish(request), governance.clone(), None))
+            .collect();
+        self.single_node_group_commit
+            .submit_distributed(self.clone(), operations, context, source_journal_admission)
+            .await
+            .map(|batch| batch.outcomes)
     }
 }
 

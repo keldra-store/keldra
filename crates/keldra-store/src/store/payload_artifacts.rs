@@ -354,13 +354,14 @@ fn trusted_local_payload_read_options() -> rocksdb::ReadOptions {
 }
 
 impl Store {
-    pub(super) fn stage_inline_complete_artifact(
+    /// Stages inline bytes whose `BlobRef` was computed from this exact slice
+    /// by the caller's local preparation boundary.
+    pub(super) fn stage_hashed_inline_complete_artifact(
         &self,
         batch: &mut WriteBatch,
         reference: &BlobRef,
         bytes: &[u8],
     ) -> Result<(), MutationError> {
-        validate_complete_artifact(reference, bytes)?;
         let manifest = ArtifactManifest::complete(reference)?;
         if manifest.layout != ArtifactLayout::Inline {
             return Err(artifact_storage(

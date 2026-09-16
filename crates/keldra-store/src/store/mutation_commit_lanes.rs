@@ -6,12 +6,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{
-    Mutex, Notify, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
-    RwLockWriteGuard, Semaphore, mpsc, oneshot,
+    Mutex, Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, RwLockWriteGuard,
+    Semaphore, mpsc, oneshot,
 };
 
 use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
 
+use super::mutation_conflict_scheduler::{
+    MutationConflictAcquisition, MutationConflictGuard, MutationConflictScheduler,
+};
 use super::{
     CF_LOCAL_INVALIDATIONS, CF_METADATA, LOCAL_INVALIDATION_STATUS_KEY,
     MUTATION_RECEIPT_STATUS_KEY, MutationReceiptStatus, PreparedOperation, Store,
@@ -37,7 +40,7 @@ struct LaneProjectionRequest {
 #[derive(Clone)]
 pub(super) struct MutationCommitLanes {
     fence: Arc<RwLock<()>>,
-    conflicts: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    conflicts: MutationConflictScheduler,
     physical_slots: Arc<Semaphore>,
     physical_slots_active: Arc<AtomicUsize>,
     physical_slots_peak: Arc<AtomicUsize>,
@@ -67,14 +70,17 @@ pub(super) struct MutationCommitLanes {
     evaluation_continue: Arc<Semaphore>,
     #[cfg(test)]
     fence_waiters: Arc<AtomicUsize>,
+    #[cfg(test)]
+    pause_next_cancellation_safe_settlement: Arc<AtomicBool>,
+    #[cfg(test)]
+    cancellation_safe_settlement_started: Arc<Semaphore>,
+    #[cfg(test)]
+    cancellation_safe_settlement_continue: Arc<Semaphore>,
 }
 
 pub(super) struct MutationLaneGuard {
     _fence: OwnedRwLockReadGuard<()>,
-    conflicts: Vec<OwnedMutexGuard<()>>,
-    conflict_keys: Vec<Vec<u8>>,
-    conflict_registry:
-        Arc<std::sync::Mutex<BTreeMap<Vec<u8>, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    _conflicts: MutationConflictGuard,
     physical_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     physical_slots_active: Arc<AtomicUsize>,
     physical_slots_peak_since_start: Arc<AtomicUsize>,
@@ -85,22 +91,23 @@ pub(super) struct MutationLaneGuard {
     physical_slot_count: usize,
 }
 
+pub(super) struct MutationLaneRegistration {
+    lanes: MutationCommitLanes,
+    fence: OwnedRwLockReadGuard<()>,
+    conflicts: MutationConflictAcquisition,
+    conflict_started: Instant,
+}
+
+pub(super) struct MutationLaneAdmission {
+    lanes: MutationCommitLanes,
+    fence: OwnedRwLockReadGuard<()>,
+    conflicts: MutationConflictGuard,
+    conflict_wait: Duration,
+}
+
 impl Drop for MutationLaneGuard {
     fn drop(&mut self) {
         self.release_physical_slot();
-        self.conflicts.clear();
-        let mut registry = self
-            .conflict_registry
-            .lock()
-            .expect("mutation conflict registry lock is not poisoned");
-        for key in &self.conflict_keys {
-            if registry
-                .get(key)
-                .is_some_and(|entry| entry.strong_count() == 0)
-            {
-                registry.remove(key);
-            }
-        }
     }
 }
 
@@ -238,7 +245,7 @@ impl MutationCommitLanes {
         let (projection_tx, projection_rx) = mpsc::channel(LANE_PROJECTION_QUEUE_CAPACITY);
         Self {
             fence: Arc::new(RwLock::new(())),
-            conflicts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            conflicts: MutationConflictScheduler::default(),
             physical_slots: Arc::new(Semaphore::new(commit_lanes)),
             physical_slots_active: Arc::new(AtomicUsize::new(0)),
             physical_slots_peak: Arc::new(AtomicUsize::new(0)),
@@ -268,6 +275,12 @@ impl MutationCommitLanes {
             evaluation_continue: Arc::new(Semaphore::new(0)),
             #[cfg(test)]
             fence_waiters: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            pause_next_cancellation_safe_settlement: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            cancellation_safe_settlement_started: Arc::new(Semaphore::new(0)),
+            #[cfg(test)]
+            cancellation_safe_settlement_continue: Arc::new(Semaphore::new(0)),
         }
     }
 
@@ -291,31 +304,28 @@ impl MutationCommitLanes {
         fence: OwnedRwLockReadGuard<()>,
         resources: impl IntoIterator<Item = Vec<u8>>,
     ) -> MutationLaneGuard {
-        let conflict_keys = resources.into_iter().collect::<BTreeSet<_>>();
-        let conflict_locks = {
-            let mut registry = self
-                .conflicts
-                .lock()
-                .expect("mutation conflict registry lock is not poisoned");
-            conflict_keys
-                .iter()
-                .map(|key| {
-                    if let Some(lock) = registry.get(key).and_then(std::sync::Weak::upgrade) {
-                        lock
-                    } else {
-                        let lock = Arc::new(Mutex::new(()));
-                        registry.insert(key.clone(), Arc::downgrade(&lock));
-                        lock
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-        let conflict_started = Instant::now();
-        let mut conflicts = Vec::with_capacity(conflict_locks.len());
-        for lock in conflict_locks {
-            conflicts.push(lock.lock_owned().await);
+        self.register_with_fence(fence, resources).acquire().await
+    }
+
+    pub(super) fn register_with_fence(
+        &self,
+        fence: OwnedRwLockReadGuard<()>,
+        resources: impl IntoIterator<Item = Vec<u8>>,
+    ) -> MutationLaneRegistration {
+        MutationLaneRegistration {
+            lanes: self.clone(),
+            fence,
+            conflicts: self.conflicts.register(resources),
+            conflict_started: Instant::now(),
         }
-        let conflict_wait = conflict_started.elapsed();
+    }
+
+    async fn finish_registered_acquisition(
+        &self,
+        fence: OwnedRwLockReadGuard<()>,
+        conflicts: MutationConflictGuard,
+        conflict_wait: Duration,
+    ) -> MutationLaneGuard {
         let physical_slot_started = Instant::now();
         let physical_slot = self
             .physical_slots
@@ -332,9 +342,7 @@ impl MutationCommitLanes {
             self.physical_slots_peak.load(Ordering::Acquire);
         MutationLaneGuard {
             _fence: fence,
-            conflicts,
-            conflict_keys: conflict_keys.into_iter().collect(),
-            conflict_registry: self.conflicts.clone(),
+            _conflicts: conflicts,
             physical_slot: Some(physical_slot),
             physical_slots_active: self.physical_slots_active.clone(),
             physical_slots_peak_since_start: self.physical_slots_peak.clone(),
@@ -437,6 +445,62 @@ impl MutationCommitLanes {
     #[cfg(test)]
     pub(super) fn waiting_fence_readers(&self) -> usize {
         self.fence_waiters.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_next_cancellation_safe_settlement(&self) {
+        self.pause_next_cancellation_safe_settlement
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) async fn wait_for_cancellation_safe_settlement(&self) {
+        self.cancellation_safe_settlement_started
+            .acquire()
+            .await
+            .expect("cancellation-safe settlement test gate remains open")
+            .forget();
+    }
+
+    #[cfg(test)]
+    pub(super) fn resume_cancellation_safe_settlement(&self) {
+        self.cancellation_safe_settlement_continue.add_permits(1);
+    }
+}
+
+impl MutationLaneRegistration {
+    pub(super) async fn acquire(self) -> MutationLaneGuard {
+        self.acquire_conflicts().await.acquire_physical().await
+    }
+
+    pub(super) async fn acquire_conflicts(self) -> MutationLaneAdmission {
+        let Self {
+            lanes,
+            fence,
+            conflicts,
+            conflict_started,
+        } = self;
+        let conflicts = conflicts.acquire().await;
+        MutationLaneAdmission {
+            lanes,
+            fence,
+            conflicts,
+            conflict_wait: conflict_started.elapsed(),
+        }
+    }
+}
+
+impl MutationLaneAdmission {
+    pub(super) async fn acquire_physical(self) -> MutationLaneGuard {
+        let Self {
+            lanes,
+            fence,
+            conflicts,
+            conflict_wait,
+        } = self;
+        lanes
+            .finish_registered_acquisition(fence, conflicts, conflict_wait)
+            .await
     }
 }
 
@@ -974,6 +1038,24 @@ impl Store {
     ) -> Result<LaneSettlementMetrics, MutationError> {
         let store = self.clone();
         tokio::spawn(async move {
+            #[cfg(test)]
+            if store
+                .mutation_commit_lanes
+                .pause_next_cancellation_safe_settlement
+                .swap(false, Ordering::AcqRel)
+            {
+                store
+                    .mutation_commit_lanes
+                    .cancellation_safe_settlement_started
+                    .add_permits(1);
+                store
+                    .mutation_commit_lanes
+                    .cancellation_safe_settlement_continue
+                    .acquire()
+                    .await
+                    .expect("cancellation-safe settlement test gate remains open")
+                    .forget();
+            }
             let committed = if primary_write_succeeded {
                 true
             } else {

@@ -44,7 +44,7 @@ impl EvaluationSubphaseMetrics {
     pub(super) fn single_node_group() -> Self {
         Self {
             enabled: tracing::enabled!(
-                target: "keldra_store::single_node_group_commit_phases",
+                target: "keldra_store::mutation_group_commit_phases",
                 tracing::Level::INFO
             ),
             ..Self::default()

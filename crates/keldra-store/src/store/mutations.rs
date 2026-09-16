@@ -1351,7 +1351,7 @@ impl Store {
                 _ => unreachable!("only a put materializes inline payload bytes"),
             };
             evaluation_subphases.measure(EvaluationSubphase::InlinePayloadReceiptStage, || {
-                self.stage_inline_complete_artifact(batch, reference, bytes)
+                self.stage_hashed_inline_complete_artifact(batch, reference, bytes)
             })?;
             timing = evaluation_subphases.start();
             pending_inline_payloads.insert(key);

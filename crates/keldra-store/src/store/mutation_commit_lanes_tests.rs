@@ -576,6 +576,69 @@ async fn completion_disambiguation_read_failure_retries_without_losing_the_ticke
 }
 
 #[tokio::test]
+async fn cancelled_direct_caller_cannot_leave_a_durable_ticket_hole() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    store
+        .mutation_commit_lanes
+        .pause_next_cancellation_safe_settlement();
+    let before_write = store.db.latest_sequence_number();
+    let first_key = ObjectKey::new("tenant", "bucket", "objects/cancelled-direct").unwrap();
+    let first = tokio::spawn({
+        let store = store.clone();
+        let key = first_key.clone();
+        async move {
+            store
+                .put(PutRequest {
+                    key,
+                    bytes: b"first".to_vec(),
+                    content_type: Some("application/octet-stream".into()),
+                    mode: PutMode::PutIfAbsent,
+                    command_id: Some("cancelled-direct-first".into()),
+                    durability: Durability::Local,
+                })
+                .await
+        }
+    });
+    store
+        .mutation_commit_lanes
+        .wait_for_cancellation_safe_settlement()
+        .await;
+    assert!(store.db.latest_sequence_number() > before_write);
+
+    first.abort();
+    let _ = first.await;
+    store
+        .mutation_commit_lanes
+        .resume_cancellation_safe_settlement();
+
+    let second_key = ObjectKey::new("tenant", "bucket", "objects/after-cancel").unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        store.put(PutRequest {
+            key: second_key.clone(),
+            bytes: b"second".to_vec(),
+            content_type: Some("application/octet-stream".into()),
+            mode: PutMode::PutIfAbsent,
+            command_id: Some("cancelled-direct-second".into()),
+            durability: Durability::Local,
+        }),
+    )
+    .await
+    .expect("a later direct mutation settles without restarting the Store")
+    .unwrap();
+
+    assert!(store.get(&first_key).await.unwrap().is_some());
+    assert!(store.get(&second_key).await.unwrap().is_some());
+    let runtime = store.mutation_commit_lanes.sequence().await;
+    let runtime = runtime.as_ref().unwrap();
+    assert_eq!(runtime.projected_ticket, runtime.next_ticket);
+    assert!(runtime.completions.is_empty());
+}
+
+#[tokio::test]
 async fn projection_write_releases_sequence_and_merges_newer_runtime_state() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))

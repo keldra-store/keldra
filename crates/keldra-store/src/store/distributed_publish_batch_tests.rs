@@ -41,6 +41,285 @@ fn governed_put(
 }
 
 #[tokio::test]
+async fn same_path_fifo_survives_the_max_group_boundary() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = SingleNodeGroupCommitConfig::new(
+        1,
+        5_000,
+        64 * 1024 * 1024,
+        64,
+        8_000,
+        128 * 1024 * 1024,
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap()
+    .with_commit_lanes(2)
+    .unwrap();
+    let store =
+        Store::open(StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config))
+            .await
+            .unwrap();
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let governance = ObjectMutationGovernance {
+        tenant_id,
+        bucket_id,
+        versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+        policy: store.bucket_policy("tenant", "bucket").unwrap(),
+    };
+    let context = ObjectMutationContext {
+        active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+        serving_fence_term: 1,
+    };
+    store
+        .single_node_group_commit
+        .pause_next_group_registration();
+    let first = tokio::spawn({
+        let store = store.clone();
+        let governance = governance.clone();
+        async move {
+            store
+                .coordinate_single_node_mutation_batch(
+                    vec![governed_put(
+                        "objects/fifo",
+                        "fifo-first",
+                        b"first",
+                        governance,
+                    )],
+                    context,
+                )
+                .await
+        }
+    });
+    store
+        .single_node_group_commit
+        .wait_for_paused_group_registration()
+        .await;
+    // Model later execution work taking every bounded slot after the first
+    // group has arrived but before it registers its complete conflict set. The
+    // first group must reach this point without already holding a slot; under
+    // the former ordering this reservation times out because the paused first
+    // group consumed one permit before registration.
+    let later_execution_capacity = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        store.single_node_group_commit.reserve_all_execution_slots(),
+    )
+    .await
+    .expect("ordered conflict registration must precede execution-slot admission");
+    let mut second = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .coordinate_single_node_mutation_batch(
+                    vec![governed_put(
+                        "objects/fifo",
+                        "fifo-second",
+                        b"second",
+                        governance,
+                    )],
+                    context,
+                )
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut second)
+            .await
+            .is_err(),
+        "a later same-path group cannot pass the earlier unregistered group"
+    );
+    store.single_node_group_commit.resume_group_registration();
+    drop(later_execution_capacity);
+
+    assert!(matches!(first.await.unwrap().as_deref(), Ok([Ok(_)])));
+    assert!(matches!(
+        second.await.unwrap().as_deref(),
+        Ok([Err(MutationError::PreconditionFailed { .. })])
+    ));
+    assert_eq!(
+        store
+            .get(&ObjectKey::new("tenant", "bucket", "objects/fifo").unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .bytes,
+        b"first"
+    );
+}
+
+#[tokio::test]
+async fn successor_waits_for_registration_without_holding_policy_guard() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = SingleNodeGroupCommitConfig::new(
+        1,
+        5_000,
+        64 * 1024 * 1024,
+        64,
+        8_000,
+        128 * 1024 * 1024,
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap()
+    .with_commit_lanes(2)
+    .unwrap();
+    let store =
+        Store::open(StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config))
+            .await
+            .unwrap();
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let governance = ObjectMutationGovernance {
+        tenant_id,
+        bucket_id,
+        versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+        policy: store.bucket_policy("tenant", "bucket").unwrap(),
+    };
+    let context = ObjectMutationContext {
+        active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+        serving_fence_term: 1,
+    };
+    store
+        .single_node_group_commit
+        .pause_next_group_registration();
+    let first = tokio::spawn({
+        let store = store.clone();
+        let governance = governance.clone();
+        async move {
+            store
+                .coordinate_single_node_mutation_batch(
+                    vec![governed_put(
+                        "objects/guard-first",
+                        "guard-first",
+                        b"first",
+                        governance,
+                    )],
+                    context,
+                )
+                .await
+        }
+    });
+    store
+        .single_node_group_commit
+        .wait_for_paused_group_registration()
+        .await;
+    let second = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .coordinate_single_node_mutation_batch(
+                    vec![governed_put(
+                        "objects/guard-second",
+                        "guard-second",
+                        b"second",
+                        governance,
+                    )],
+                    context,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        store
+            .single_node_group_commit
+            .wait_for_registration_predecessor(),
+    )
+    .await
+    .expect("the successor reaches its predecessor handoff");
+
+    let policy_writer = store
+        .policy_gate
+        .try_write()
+        .expect("a registration successor must not hold the policy read guard");
+    drop(policy_writer);
+    store.single_node_group_commit.resume_group_registration();
+
+    assert!(matches!(first.await.unwrap().as_deref(), Ok([Ok(_)])));
+    assert!(matches!(second.await.unwrap().as_deref(), Ok([Ok(_)])));
+}
+
+#[tokio::test]
+async fn distributed_requests_share_the_pre_lane_group_builder() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = SingleNodeGroupCommitConfig::new(
+        5,
+        5_000,
+        64 * 1024 * 1024,
+        64,
+        8_000,
+        128 * 1024 * 1024,
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap()
+    .with_commit_lanes(4)
+    .unwrap();
+    let store =
+        Store::open(StoreOptions::new(temporary.path(), 1).with_single_node_group_commit(config))
+            .await
+            .unwrap();
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let governance = ObjectMutationGovernance {
+        tenant_id,
+        bucket_id,
+        versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+        policy: store.bucket_policy("tenant", "bucket").unwrap(),
+    };
+    let context = ObjectMutationContext {
+        active_placement_log_id: PlacementLogId { term: 1, index: 1 },
+        serving_fence_term: 1,
+    };
+    let blobs = ["a", "b", "c", "d", "e"];
+    let mut staged = Vec::new();
+    for suffix in blobs {
+        staged.push((suffix, store.stage_blob(suffix.as_bytes()).await.unwrap()));
+    }
+    let before = store.db.latest_sequence_number();
+    let call = |suffix: &'static str, blob: BlobRef, governance: ObjectMutationGovernance| {
+        let store = store.clone();
+        async move {
+            store
+                .coordinate_distributed_publish_batch_with_governance(
+                    vec![request(
+                        &format!("objects/distributed-{suffix}"),
+                        &format!("distributed-{suffix}"),
+                        blob,
+                    )],
+                    governance,
+                    context,
+                )
+                .await
+        }
+    };
+    let mut staged = staged.into_iter();
+    let (a_name, a_blob) = staged.next().unwrap();
+    let (b_name, b_blob) = staged.next().unwrap();
+    let (c_name, c_blob) = staged.next().unwrap();
+    let (d_name, d_blob) = staged.next().unwrap();
+    let (e_name, e_blob) = staged.next().unwrap();
+    let (a, b, c, d, e) = tokio::join!(
+        call(a_name, a_blob, governance.clone()),
+        call(b_name, b_blob, governance.clone()),
+        call(c_name, c_blob, governance.clone()),
+        call(d_name, d_blob, governance.clone()),
+        call(e_name, e_blob, governance),
+    );
+
+    for result in [a, b, c, d, e] {
+        assert!(matches!(result.as_deref(), Ok([Ok(_)])));
+    }
+    assert_eq!(
+        store
+            .db
+            .get_updates_since(before)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        1
+    );
+    let status = store.local_watch_status().unwrap();
+    assert!(status.settled_through < status.tail);
+}
+
+#[tokio::test]
 async fn single_node_derived_publish_uses_inline_reference_lane_beyond_journal_limit() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(

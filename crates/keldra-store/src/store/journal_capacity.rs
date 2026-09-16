@@ -143,10 +143,13 @@ impl Store {
     /// deliberately excludes chunked uploads, whose streaming lifecycle stays
     /// on [`Store::stage_derived_progress_blob`].
     #[doc(hidden)]
-    pub async fn stage_derived_progress_inline_blobs(
+    pub async fn stage_derived_progress_inline_blobs<B>(
         &self,
-        blobs: &[Vec<u8>],
-    ) -> Result<Vec<BlobRef>, MutationError> {
+        blobs: &[B],
+    ) -> Result<Vec<BlobRef>, MutationError>
+    where
+        B: AsRef<[u8]>,
+    {
         self.stage_derived_progress_inline_blob_batch(blobs).await
     }
 

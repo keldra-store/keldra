@@ -1,8 +1,8 @@
-//! Bounded cancellation-safe group commit for single-node coordinator calls.
+//! Bounded cancellation-safe request grouping before physical commit lanes.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,11 +27,8 @@ const DEFAULT_MAX_GROUP_DWELL: Duration = Duration::from_micros(250);
 const DEFAULT_COMMIT_LANES: usize = 4;
 const MAX_COMMIT_LANES: usize = 256;
 
-/// Validated bounds and dwell time for single-node mutation group commit.
-///
-/// Queue capacities must cover the largest admitted group. Construction also
-/// rejects values that Tokio's semaphores cannot represent, so a successfully
-/// constructed configuration is safe to install directly in a [`Store`](super::Store).
+/// Validated bounds and dwell time for coordinator mutation group commit.
+/// Queue capacities cover the largest group and remain within Tokio's limits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SingleNodeGroupCommitConfig {
     max_group_requests: usize,
@@ -106,8 +103,7 @@ impl SingleNodeGroupCommitConfig {
         })
     }
 
-    /// Sets the bounded number of independent local commit queues. Requests
-    /// for the same primary exact path are always assigned to the same lane.
+    /// Sets bounded mutation execution concurrency after group conflict registration.
     pub fn with_commit_lanes(mut self, commit_lanes: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(commit_lanes != 0, "commit lanes must be non-zero");
         anyhow::ensure!(
@@ -172,8 +168,11 @@ pub(super) type SingleNodeOperations = Vec<(
     Option<DefinitionMutationIntent>,
 )>;
 
-/// States whether the one-node coordinator has already attempted settlement
-/// for every newly committed source-journal position in this physical group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MutationGroupMode {
+    SingleNode,
+    Distributed,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum SourceJournalSettlement {
@@ -181,7 +180,7 @@ pub enum SourceJournalSettlement {
     RequiredAfterQuorum,
 }
 
-/// Independently receipted results from one logical one-node request, together
+/// Independently receipted results from one logical coordinator request, together
 /// with the settlement responsibility required of the distribution layer.
 #[derive(Debug)]
 #[doc(hidden)]
@@ -196,6 +195,8 @@ pub(super) struct SingleNodeCommitRequest {
     pub(super) operations: SingleNodeOperations,
     pub(super) context: ObjectMutationContext,
     source_journal_admission: SourceJournalAdmission,
+    mode: MutationGroupMode,
+    arrival_ticket: u64,
     enqueued_at: Instant,
     admission_wait: Duration,
     request_slot_wait: Duration,
@@ -246,6 +247,26 @@ impl SingleNodeCommitRequest {
         }
         Some(collected)
     }
+
+    /// Exact object paths whose replica lineage this caller owns after local
+    /// coordination returns. Operations within one request remain together and
+    /// are replicated as one ordered vector. Distinct distributed callers must
+    /// not share a local group when these identities overlap because each
+    /// caller independently owns the subsequent replica RPC.
+    fn distributed_replication_paths(&self) -> BTreeSet<(u64, u64, &str)> {
+        self.operations
+            .iter()
+            .map(|(operation, governance, _)| {
+                let path = match operation {
+                    BatchOperation::Put(request) => request.key.path(),
+                    BatchOperation::Publish(request) => request.key.path(),
+                    BatchOperation::Clone(request) => request.destination.path(),
+                    BatchOperation::Delete(request) => request.key.path(),
+                };
+                (governance.tenant_id, governance.bucket_id, path)
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -253,6 +274,36 @@ struct QueueState {
     requests: VecDeque<SingleNodeCommitRequest>,
     worker_running: bool,
     peak_depth: usize,
+    registration_tail: Option<oneshot::Receiver<()>>,
+}
+
+pub(super) struct GroupConflictRegistrationHandoff {
+    predecessor: Option<oneshot::Receiver<()>>,
+    registered: Option<oneshot::Sender<()>>,
+    #[cfg(test)]
+    predecessor_waiting: Arc<Semaphore>,
+}
+
+impl GroupConflictRegistrationHandoff {
+    pub(super) async fn await_predecessor(&mut self) {
+        if let Some(predecessor) = self.predecessor.take() {
+            #[cfg(test)]
+            self.predecessor_waiting.add_permits(1);
+            let _ = predecessor.await;
+        }
+    }
+
+    pub(super) fn complete(&mut self) {
+        if let Some(registered) = self.registered.take() {
+            let _ = registered.send(());
+        }
+    }
+}
+
+impl Drop for GroupConflictRegistrationHandoff {
+    fn drop(&mut self) {
+        self.complete();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,8 +316,8 @@ enum QueueAction {
     Empty,
     Group {
         requests: Vec<SingleNodeCommitRequest>,
-        lane_queued_requests: usize,
-        lane_peak_queued_requests: usize,
+        shared_queued_requests: usize,
+        shared_peak_queued_requests: usize,
         stop_reason: &'static str,
     },
     WaitUntil(Instant),
@@ -275,13 +326,25 @@ enum QueueAction {
 #[derive(Clone)]
 pub(super) struct SingleNodeGroupCommit {
     config: SingleNodeGroupCommitConfig,
-    states: Arc<Vec<Mutex<QueueState>>>,
-    queue_changed: Arc<Vec<Notify>>,
+    state: Arc<Mutex<QueueState>>,
+    queue_changed: Arc<Notify>,
     queue_slots: Arc<Semaphore>,
     operation_slots: Arc<Semaphore>,
     inline_byte_slots: Arc<Semaphore>,
+    execution_slots: Arc<Semaphore>,
     queued_requests_total: Arc<AtomicUsize>,
     queued_requests_peak: Arc<AtomicUsize>,
+    active_groups: Arc<AtomicUsize>,
+    groups_finished: Arc<Notify>,
+    next_arrival_ticket: Arc<AtomicU64>,
+    #[cfg(test)]
+    pause_registration_ticket: Arc<AtomicU64>,
+    #[cfg(test)]
+    registration_paused: Arc<Semaphore>,
+    #[cfg(test)]
+    registration_continue: Arc<Semaphore>,
+    #[cfg(test)]
+    registration_predecessor_waiting: Arc<Semaphore>,
 }
 
 impl SingleNodeGroupCommit {
@@ -310,19 +373,27 @@ impl SingleNodeGroupCommit {
     }
 
     pub(super) fn new(config: SingleNodeGroupCommitConfig) -> Self {
-        let states = (0..config.commit_lanes)
-            .map(|_| Mutex::new(QueueState::default()))
-            .collect();
-        let queue_changed = (0..config.commit_lanes).map(|_| Notify::new()).collect();
         Self {
             queue_slots: Arc::new(Semaphore::new(config.max_queued_requests)),
             operation_slots: Arc::new(Semaphore::new(config.max_queued_operations)),
             inline_byte_slots: Arc::new(Semaphore::new(config.max_queued_inline_bytes)),
+            execution_slots: Arc::new(Semaphore::new(config.commit_lanes)),
             queued_requests_total: Arc::new(AtomicUsize::new(0)),
             queued_requests_peak: Arc::new(AtomicUsize::new(0)),
+            active_groups: Arc::new(AtomicUsize::new(0)),
+            groups_finished: Arc::new(Notify::new()),
+            next_arrival_ticket: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            pause_registration_ticket: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            registration_paused: Arc::new(Semaphore::new(0)),
+            #[cfg(test)]
+            registration_continue: Arc::new(Semaphore::new(0)),
+            #[cfg(test)]
+            registration_predecessor_waiting: Arc::new(Semaphore::new(0)),
             config,
-            states: Arc::new(states),
-            queue_changed: Arc::new(queue_changed),
+            state: Arc::new(Mutex::new(QueueState::default())),
+            queue_changed: Arc::new(Notify::new()),
         }
     }
 
@@ -330,43 +401,16 @@ impl SingleNodeGroupCommit {
     async fn wait_until_idle(&self) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let mut active = false;
-                for state in self.states.iter() {
-                    active |= state.lock().await.worker_running;
-                }
-                if !active {
+                let notified = self.groups_finished.notified();
+                let worker_running = self.state.lock().await.worker_running;
+                if !worker_running && self.active_groups.load(Ordering::Acquire) == 0 {
                     return;
                 }
-                tokio::task::yield_now().await;
+                notified.await;
             }
         })
         .await
         .expect("single-node group worker must become idle");
-    }
-
-    fn lane_for(&self, operations: &SingleNodeOperations) -> usize {
-        let Some((operation, governance, _)) = operations.first() else {
-            return 0;
-        };
-        let path = match operation {
-            BatchOperation::Put(request) => request.key.path(),
-            BatchOperation::Publish(request) => request.key.path(),
-            BatchOperation::Clone(request) => request.destination.path(),
-            BatchOperation::Delete(request) => request.key.path(),
-        };
-        let mut hash = 0xcbf29ce484222325_u64;
-        for byte in governance
-            .tenant_id
-            .to_be_bytes()
-            .into_iter()
-            .chain(governance.bucket_id.to_be_bytes())
-            .chain(path.bytes())
-        {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        let lane_count = u64::try_from(self.states.len()).expect("lane count fits u64");
-        usize::try_from(hash % lane_count).expect("lane index fits usize")
     }
 
     fn plan_group(&self, requests: &VecDeque<SingleNodeCommitRequest>) -> Option<GroupPlan> {
@@ -375,6 +419,8 @@ impl SingleNodeGroupCommit {
         let mut operations = first.operation_count();
         let mut inline_bytes = first.inline_bytes();
         let context = first.context;
+        let mut distributed_replication_paths = (first.mode == MutationGroupMode::Distributed)
+            .then(|| first.distributed_replication_paths());
         let Some(mut governance) = first.consistent_governance() else {
             return Some(GroupPlan {
                 request_count,
@@ -396,6 +442,23 @@ impl SingleNodeGroupCommit {
             };
             if candidate.source_journal_admission != first.source_journal_admission {
                 break "source_journal_admission";
+            }
+            if candidate.mode != first.mode {
+                break "topology_mode";
+            }
+            let candidate_replication_paths = (first.mode == MutationGroupMode::Distributed)
+                .then(|| candidate.distributed_replication_paths());
+            if candidate_replication_paths
+                .as_ref()
+                .is_some_and(|candidate_paths| {
+                    candidate_paths.iter().any(|path| {
+                        distributed_replication_paths
+                            .as_ref()
+                            .is_some_and(|paths| paths.contains(path))
+                    })
+                })
+            {
+                break "replication_dependency";
             }
             let Some(candidate_governance) = candidate.consistent_governance() else {
                 break "inconsistent_governance";
@@ -423,6 +486,12 @@ impl SingleNodeGroupCommit {
             inline_bytes = inline_bytes.saturating_add(candidate_bytes);
             for (identity, value) in candidate_governance {
                 governance.entry(identity).or_insert(value);
+            }
+            if let (Some(paths), Some(candidate_paths)) = (
+                distributed_replication_paths.as_mut(),
+                candidate_replication_paths,
+            ) {
+                paths.extend(candidate_paths);
             }
             request_count += 1;
         };
@@ -452,9 +521,23 @@ impl SingleNodeGroupCommit {
             .collect::<Vec<_>>();
         QueueAction::Group {
             requests,
-            lane_queued_requests: state.requests.len(),
-            lane_peak_queued_requests: state.peak_depth,
+            shared_queued_requests: state.requests.len(),
+            shared_peak_queued_requests: state.peak_depth,
             stop_reason: plan.stop_reason,
+        }
+    }
+
+    async fn next_registration_handoff(&self) -> GroupConflictRegistrationHandoff {
+        let (registered, tail) = oneshot::channel();
+        let predecessor = {
+            let mut state = self.state.lock().await;
+            state.registration_tail.replace(tail)
+        };
+        GroupConflictRegistrationHandoff {
+            predecessor,
+            registered: Some(registered),
+            #[cfg(test)]
+            predecessor_waiting: self.registration_predecessor_waiting.clone(),
         }
     }
 
@@ -475,6 +558,41 @@ impl SingleNodeGroupCommit {
         context: ObjectMutationContext,
         source_journal_admission: SourceJournalAdmission,
     ) -> SingleNodeOutcomes {
+        self.submit_with_mode(
+            store,
+            operations,
+            context,
+            source_journal_admission,
+            MutationGroupMode::SingleNode,
+        )
+        .await
+    }
+
+    pub(super) async fn submit_distributed(
+        &self,
+        store: Store,
+        operations: SingleNodeOperations,
+        context: ObjectMutationContext,
+        source_journal_admission: SourceJournalAdmission,
+    ) -> SingleNodeOutcomes {
+        self.submit_with_mode(
+            store,
+            operations,
+            context,
+            source_journal_admission,
+            MutationGroupMode::Distributed,
+        )
+        .await
+    }
+
+    async fn submit_with_mode(
+        &self,
+        store: Store,
+        operations: SingleNodeOperations,
+        context: ObjectMutationContext,
+        source_journal_admission: SourceJournalAdmission,
+        mode: MutationGroupMode,
+    ) -> SingleNodeOutcomes {
         let operation_count = operations.len();
         let inline_bytes = operations.iter().fold(0_usize, |total, (operation, _, _)| {
             total.saturating_add(match operation {
@@ -488,7 +606,7 @@ impl SingleNodeGroupCommit {
             || inline_bytes > self.config.max_group_inline_bytes
         {
             return Err(MutationError::InvalidObjectMutation(
-                "single-node commit request exceeds its bounded group admission".into(),
+                "mutation commit request exceeds its bounded group admission".into(),
             ));
         }
         let admission_started = Instant::now();
@@ -498,7 +616,7 @@ impl SingleNodeGroupCommit {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| MutationError::Storage("single-node commit queue closed".into()))?;
+            .map_err(|_| MutationError::Storage("mutation commit queue closed".into()))?;
         let request_slot_wait = request_slot_started.elapsed();
         let operation_slot_started = Instant::now();
         let operation_permit = self
@@ -506,9 +624,7 @@ impl SingleNodeGroupCommit {
             .clone()
             .acquire_many_owned(operation_count as u32)
             .await
-            .map_err(|_| {
-                MutationError::Storage("single-node commit operation queue closed".into())
-            })?;
+            .map_err(|_| MutationError::Storage("mutation commit operation queue closed".into()))?;
         let operation_slot_wait = operation_slot_started.elapsed();
         let inline_byte_slot_started = Instant::now();
         let inline_byte_permit = self
@@ -516,19 +632,27 @@ impl SingleNodeGroupCommit {
             .clone()
             .acquire_many_owned(inline_bytes as u32)
             .await
-            .map_err(|_| MutationError::Storage("single-node commit byte queue closed".into()))?;
+            .map_err(|_| MutationError::Storage("mutation commit byte queue closed".into()))?;
         let inline_byte_slot_wait = inline_byte_slot_started.elapsed();
         let admission_wait = admission_started.elapsed();
         let (response, received) = oneshot::channel();
-        let lane = self.lane_for(&operations);
+        let arrival_ticket = self
+            .next_arrival_ticket
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |ticket| {
+                ticket.checked_add(1)
+            })
+            .map(|ticket| ticket + 1)
+            .map_err(|_| MutationError::Storage("mutation arrival ticket is exhausted".into()))?;
         let enqueue_lock_started = Instant::now();
         let start_worker = {
-            let mut state = self.states[lane].lock().await;
+            let mut state = self.state.lock().await;
             let enqueue_lock_wait = enqueue_lock_started.elapsed();
             let request = SingleNodeCommitRequest {
                 operations,
                 context,
                 source_journal_admission,
+                mode,
+                arrival_ticket,
                 enqueued_at: Instant::now(),
                 admission_wait,
                 request_slot_wait,
@@ -542,22 +666,7 @@ impl SingleNodeGroupCommit {
                     _inline_bytes: inline_byte_permit,
                 },
             };
-            if source_journal_admission == SourceJournalAdmission::DerivedProgress {
-                // Give trusted progress traffic bounded queue priority without
-                // excluding independent ordinary lanes. It may pass only
-                // requests that have not begun; all derived requests retain
-                // FIFO order with one another.
-                let position = state
-                    .requests
-                    .iter()
-                    .position(|queued| {
-                        queued.source_journal_admission != SourceJournalAdmission::DerivedProgress
-                    })
-                    .unwrap_or(state.requests.len());
-                state.requests.insert(position, request);
-            } else {
-                state.requests.push_back(request);
-            }
+            state.requests.push_back(request);
             state.peak_depth = state.peak_depth.max(state.requests.len());
             self.record_enqueued_request();
             if state.worker_running {
@@ -569,38 +678,38 @@ impl SingleNodeGroupCommit {
         };
         if start_worker {
             let queue = self.clone();
-            tokio::spawn(async move { queue.run(store, lane).await });
+            tokio::spawn(async move { queue.run(store).await });
         } else {
-            self.queue_changed[lane].notify_one();
+            self.queue_changed.notify_one();
         }
         received.await.unwrap_or_else(|_| {
             Err(MutationError::Storage(
-                "single-node commit worker stopped before replying".into(),
+                "mutation commit worker stopped before replying".into(),
             ))
         })
     }
 
-    async fn run(self, store: Store, lane: usize) {
+    async fn run(self, store: Store) {
         loop {
             let dwell_started = Instant::now();
-            let (requests, lane_queued_requests, lane_peak_queued_requests, stop_reason) = loop {
-                let notified = self.queue_changed[lane].notified();
+            let (requests, shared_queued_requests, shared_peak_queued_requests, stop_reason) = loop {
+                let notified = self.queue_changed.notified();
                 let action = {
-                    let mut state = self.states[lane].lock().await;
+                    let mut state = self.state.lock().await;
                     self.next_queue_action(&mut state, Instant::now())
                 };
                 match action {
                     QueueAction::Empty => return,
                     QueueAction::Group {
                         requests,
-                        lane_queued_requests,
-                        lane_peak_queued_requests,
+                        shared_queued_requests,
+                        shared_peak_queued_requests,
                         stop_reason,
                     } => {
                         break (
                             requests,
-                            lane_queued_requests,
-                            lane_peak_queued_requests,
+                            shared_queued_requests,
+                            shared_peak_queued_requests,
                             stop_reason,
                         );
                     }
@@ -612,263 +721,311 @@ impl SingleNodeGroupCommit {
                     }
                 }
             };
-            let total_queued_requests = self.record_dequeued_requests(requests.len());
-            let total_peak_queued_requests = self.queued_requests_peak.load(Ordering::Acquire);
-            let dwell_duration = dwell_started.elapsed();
-
-            let request_count = requests.len();
-            let admission_wait_seconds = requests
-                .iter()
-                .map(|request| request.admission_wait.as_secs_f64())
-                .sum::<f64>();
-            let admission_wait_max_seconds = requests
-                .iter()
-                .map(|request| request.admission_wait)
-                .max()
-                .unwrap_or_default()
-                .as_secs_f64();
-            let request_slot_wait_seconds = requests
-                .iter()
-                .map(|request| request.request_slot_wait.as_secs_f64())
-                .sum::<f64>();
-            let operation_slot_wait_seconds = requests
-                .iter()
-                .map(|request| request.operation_slot_wait.as_secs_f64())
-                .sum::<f64>();
-            let inline_byte_slot_wait_seconds = requests
-                .iter()
-                .map(|request| request.inline_byte_slot_wait.as_secs_f64())
-                .sum::<f64>();
-            let enqueue_lock_wait_seconds = requests
-                .iter()
-                .map(|request| request.enqueue_lock_wait.as_secs_f64())
-                .sum::<f64>();
-            let enqueue_to_group_seconds = requests
-                .iter()
-                .map(|request| request.enqueued_at.elapsed().as_secs_f64())
-                .sum::<f64>();
-            let enqueue_to_group_max_seconds = requests
-                .iter()
-                .map(|request| request.enqueued_at.elapsed())
-                .max()
-                .unwrap_or_default()
-                .as_secs_f64();
-            let operation_counts = requests
-                .iter()
-                .map(SingleNodeCommitRequest::operation_count)
-                .collect::<Vec<_>>();
-            let context = requests[0].context;
-            let source_journal_admission = requests[0].source_journal_admission;
-            let mut operations = Vec::with_capacity(operation_counts.iter().sum());
-            let mut replies = Vec::with_capacity(requests.len());
-            let inline_bytes = requests.iter().fold(0_usize, |total, request| {
-                total.saturating_add(request.inline_bytes())
+            let registration_handoff = self.next_registration_handoff().await;
+            self.active_groups.fetch_add(1, Ordering::AcqRel);
+            let queue = self.clone();
+            let group_store = store.clone();
+            tokio::spawn(async move {
+                queue
+                    .execute_group(
+                        group_store,
+                        requests,
+                        shared_queued_requests,
+                        shared_peak_queued_requests,
+                        stop_reason,
+                        dwell_started.elapsed(),
+                        registration_handoff,
+                    )
+                    .await;
+                queue.active_groups.fetch_sub(1, Ordering::AcqRel);
+                queue.groups_finished.notify_one();
             });
-            for request in requests {
-                operations.extend(request.operations);
-                replies.push((request.response, request._queue_permits));
-            }
-            let operation_count = operations.len();
-            let group_execute_started_epoch_milliseconds = unix_milliseconds();
-            let execute_started = std::time::Instant::now();
-            let (results, metrics) = store
-                .coordinate_single_node_mutation_group(
-                    operations,
-                    context,
-                    &operation_counts,
-                    source_journal_admission,
-                )
-                .await;
-            let execute_duration = execute_started.elapsed();
-            let group_execute_ended_epoch_milliseconds = unix_milliseconds();
-            let failed_requests = results.iter().filter(|result| result.is_err()).count();
-            let failed_source_journal_capacity_requests = results
-                .iter()
-                .filter(|result| {
-                    result
-                        .as_ref()
-                        .is_err_and(|error| mutation_capacity_kind(error) == Some("source_journal"))
-                })
-                .count();
-            let failed_receipt_capacity_requests = results
-                .iter()
-                .filter(|result| {
-                    result
-                        .as_ref()
-                        .is_err_and(|error| mutation_capacity_kind(error) == Some("receipt"))
-                })
-                .count();
-            let failed_other_requests = failed_requests
-                .saturating_sub(failed_source_journal_capacity_requests)
-                .saturating_sub(failed_receipt_capacity_requests);
-            let retryable_capacity_attempt_requests = failed_source_journal_capacity_requests
-                .saturating_add(failed_receipt_capacity_requests);
-            let metrics = metrics.unwrap_or_default();
-            let evaluation_uncategorized = metrics
-                .evaluate
-                .saturating_sub(metrics.evaluation_subphases.categorized());
-            tracing::info!(
-                target: "keldra_store::single_node_group_commit_phases",
-                attempts = 1_u64,
-                physical_commits = metrics.physical_commit as u64,
-                commit_lane = lane,
-                request_count,
-                operation_count,
-                inline_bytes,
-                failed_requests,
-                retryable_capacity_attempt_requests,
-                failed_source_journal_capacity_requests,
-                failed_receipt_capacity_requests,
-                failed_other_requests,
-                group_execute_started_epoch_milliseconds,
-                group_execute_ended_epoch_milliseconds,
-                admission_wait_sum_seconds = admission_wait_seconds,
-                admission_wait_max_seconds,
-                request_slot_wait_sum_seconds = request_slot_wait_seconds,
-                operation_slot_wait_sum_seconds = operation_slot_wait_seconds,
-                inline_byte_slot_wait_sum_seconds = inline_byte_slot_wait_seconds,
-                enqueue_lock_wait_sum_seconds = enqueue_lock_wait_seconds,
-                enqueue_to_group_sum_seconds = enqueue_to_group_seconds,
-                enqueue_to_group_max_seconds,
-                dwell_seconds = dwell_duration.as_secs_f64(),
-                execute_seconds = execute_duration.as_secs_f64(),
-                prepare_seconds = metrics.prepare.as_secs_f64(),
-                policy_wait_seconds = metrics.policy_wait.as_secs_f64(),
-                path_wait_seconds = metrics.path_wait.as_secs_f64(),
-                commit_wait_seconds = metrics.commit_wait.as_secs_f64(),
-                lane_fence_wait_seconds = metrics.lane_fence_wait.as_secs_f64(),
-                lane_conflict_lock_wait_seconds = metrics.lane_conflict_wait.as_secs_f64(),
-                physical_slot_wait_seconds = metrics.physical_slot_wait.as_secs_f64(),
-                physical_slots_active_at_acquire = metrics.physical_slots_active_at_acquire,
-                physical_slots_active_before_release = metrics.physical_slots_active_before_release,
-                physical_slots_peak_since_start_at_acquire = metrics
-                    .physical_slots_peak_since_start_at_acquire,
-                physical_slots_peak_since_start_before_release = metrics
-                    .physical_slots_peak_since_start_before_release,
-                physical_slot_count = metrics.physical_slot_count,
-                first_sequence_wait_seconds = metrics.first_sequence_wait.as_secs_f64(),
-                first_sequence_hold_seconds = metrics.first_sequence_hold.as_secs_f64(),
-                authority_retry_snapshot_sequence_wait_seconds = metrics
-                    .authority_retry_snapshot_sequence_wait
-                    .as_secs_f64(),
-                authority_retry_snapshot_sequence_hold_seconds = metrics
-                    .authority_retry_snapshot_sequence_hold
-                    .as_secs_f64(),
-                reservation_sequence_wait_seconds = metrics
-                    .reservation_sequence_wait
-                    .as_secs_f64(),
-                reservation_sequence_hold_seconds = metrics
-                    .reservation_sequence_hold
-                    .as_secs_f64(),
-                locked_setup_seconds = metrics.locked_setup.as_secs_f64(),
-                baseline_prefetch_seconds = metrics.baseline_prefetch.as_secs_f64(),
-                baseline_revalidation_retries = metrics.baseline_revalidation_retries,
-                lane_authority_revalidation_retries = metrics
-                    .lane_authority_revalidation_retries,
-                evaluate_seconds = metrics.evaluate.as_secs_f64(),
-                evaluation_current_precondition_governance_seconds = metrics
-                    .evaluation_subphases
-                    .current_precondition_governance
-                    .as_secs_f64(),
-                evaluation_mutation_planning_seconds = metrics
-                    .evaluation_subphases
-                    .mutation_planning
-                    .as_secs_f64(),
-                evaluation_mutation_construction_validation_seconds = metrics
-                    .evaluation_subphases
-                    .mutation_construction_validation
-                    .as_secs_f64(),
-                evaluation_mutation_construction_validation_operations = metrics
-                    .evaluation_subphases
-                    .mutation_construction_validation_operations,
-                evaluation_durable_record_encoding_seconds = metrics
-                    .evaluation_subphases
-                    .durable_record_encoding
-                    .as_secs_f64(),
-                evaluation_inline_payload_receipt_stage_seconds = metrics
-                    .evaluation_subphases
-                    .inline_payload_receipt_stage
-                    .as_secs_f64(),
-                evaluation_inline_payload_receipt_stage_operations = metrics
-                    .evaluation_subphases
-                    .inline_payload_receipt_stage_operations,
-                evaluation_blob_lifecycle_stage_seconds = metrics
-                    .evaluation_subphases
-                    .blob_lifecycle_stage
-                    .as_secs_f64(),
-                evaluation_object_state_stage_seconds = metrics
-                    .evaluation_subphases
-                    .object_state_stage
-                    .as_secs_f64(),
-                evaluation_coordinator_bookkeeping_seconds = metrics
-                    .evaluation_subphases
-                    .coordinator_bookkeeping
-                    .as_secs_f64(),
-                evaluation_proof_construction_seconds = metrics
-                    .evaluation_subphases
-                    .proof_construction
-                    .as_secs_f64(),
-                evaluation_proof_construction_proofs =
-                    metrics.evaluation_subphases.proof_construction_proofs,
-                evaluation_proof_multi_get_lookup_seconds = metrics
-                    .evaluation_subphases
-                    .proof_multi_get_lookup
-                    .as_secs_f64(),
-                evaluation_proof_multi_get_lookup_proofs =
-                    metrics.evaluation_subphases.proof_multi_get_lookup_proofs,
-                evaluation_proof_validate_encode_stage_seconds = metrics
-                    .evaluation_subphases
-                    .proof_validate_encode_stage
-                    .as_secs_f64(),
-                evaluation_proof_validate_encode_stage_proofs = metrics
-                    .evaluation_subphases
-                    .proof_validate_encode_stage_proofs,
-                evaluation_proof_bookkeeping_seconds = metrics
-                    .evaluation_subphases
-                    .proof_bookkeeping
-                    .as_secs_f64(),
-                evaluation_uncategorized_seconds = evaluation_uncategorized.as_secs_f64(),
-                stage_seconds = metrics.stage.as_secs_f64(),
-                db_write_sync_seconds = metrics.primary_db_write.as_secs_f64(),
-                persistence_and_ordered_settlement_seconds = metrics.persist.as_secs_f64(),
-                primary_db_write_seconds = metrics.primary_db_write.as_secs_f64(),
-                completion_sequence_wait_seconds = metrics.completion_sequence_wait.as_secs_f64(),
-                prior_retry_projection_db_write_seconds = metrics
-                    .prior_retry_projection_db_write
-                    .as_secs_f64(),
-                completion_projection_db_write_seconds = metrics
-                    .completion_projection_db_write
-                    .as_secs_f64(),
-                ordered_frontier_wait_seconds = metrics.ordered_frontier_wait.as_secs_f64(),
-                completion_reorder_depth = metrics.completion_reorder_depth,
-                completion_ticket_lag = metrics.completion_ticket_lag,
-                prior_retry_projection_completions = metrics.prior_retry_projection_completions,
-                completion_projection_completions = metrics.completion_projection_completions,
-                settlement_measured_component_sum_seconds = metrics
-                    .completion_sequence_wait
-                    .saturating_add(metrics.completion_projection_db_write)
-                    .saturating_add(metrics.ordered_frontier_wait)
-                    .as_secs_f64(),
-                settle_seconds = metrics.settle.as_secs_f64(),
-                commit_hold_seconds = metrics.commit_hold.as_secs_f64(),
-                commit_path_composite_seconds = metrics.commit_hold.as_secs_f64(),
-                store_seconds = metrics.total.as_secs_f64(),
-                write_batch_entries = metrics.write_batch_entries,
-                write_batch_bytes = metrics.write_batch_bytes,
-                total_seconds = dwell_duration.saturating_add(execute_duration).as_secs_f64(),
-                queued_requests = lane_queued_requests,
-                lane_queued_requests,
-                lane_peak_queued_requests_since_start = lane_peak_queued_requests,
-                total_queued_requests,
-                total_peak_queued_requests_since_start = total_peak_queued_requests,
-                stop_reason,
-                phase_complete = metrics.total != std::time::Duration::ZERO,
-                physical_commit = metrics.physical_commit,
-                "single-node mutation group completed"
-            );
-            for ((response, _permits), result) in replies.into_iter().zip(results) {
-                let _ = response.send(result);
-            }
+        }
+    }
+
+    async fn execute_group(
+        &self,
+        store: Store,
+        requests: Vec<SingleNodeCommitRequest>,
+        shared_queued_requests: usize,
+        shared_peak_queued_requests: usize,
+        stop_reason: &'static str,
+        dwell_duration: Duration,
+        registration_handoff: GroupConflictRegistrationHandoff,
+    ) {
+        let total_queued_requests = self.record_dequeued_requests(requests.len());
+        let total_peak_queued_requests = self.queued_requests_peak.load(Ordering::Acquire);
+
+        let request_count = requests.len();
+        let first_arrival_ticket = requests.first().map_or(0, |request| request.arrival_ticket);
+        let last_arrival_ticket = requests.last().map_or(0, |request| request.arrival_ticket);
+        #[cfg(test)]
+        if self
+            .pause_registration_ticket
+            .compare_exchange(first_arrival_ticket, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.registration_paused.add_permits(1);
+            self.registration_continue.acquire().await.unwrap().forget();
+        }
+        let admission_wait_seconds = requests
+            .iter()
+            .map(|request| request.admission_wait.as_secs_f64())
+            .sum::<f64>();
+        let admission_wait_max_seconds = requests
+            .iter()
+            .map(|request| request.admission_wait)
+            .max()
+            .unwrap_or_default()
+            .as_secs_f64();
+        let request_slot_wait_seconds = requests
+            .iter()
+            .map(|request| request.request_slot_wait.as_secs_f64())
+            .sum::<f64>();
+        let operation_slot_wait_seconds = requests
+            .iter()
+            .map(|request| request.operation_slot_wait.as_secs_f64())
+            .sum::<f64>();
+        let inline_byte_slot_wait_seconds = requests
+            .iter()
+            .map(|request| request.inline_byte_slot_wait.as_secs_f64())
+            .sum::<f64>();
+        let enqueue_lock_wait_seconds = requests
+            .iter()
+            .map(|request| request.enqueue_lock_wait.as_secs_f64())
+            .sum::<f64>();
+        let enqueue_to_group_seconds = requests
+            .iter()
+            .map(|request| request.enqueued_at.elapsed().as_secs_f64())
+            .sum::<f64>();
+        let enqueue_to_group_max_seconds = requests
+            .iter()
+            .map(|request| request.enqueued_at.elapsed())
+            .max()
+            .unwrap_or_default()
+            .as_secs_f64();
+        let operation_counts = requests
+            .iter()
+            .map(SingleNodeCommitRequest::operation_count)
+            .collect::<Vec<_>>();
+        let context = requests[0].context;
+        let source_journal_admission = requests[0].source_journal_admission;
+        let mode = requests[0].mode;
+        let mut operations = Vec::with_capacity(operation_counts.iter().sum());
+        let mut replies = Vec::with_capacity(requests.len());
+        let inline_bytes = requests.iter().fold(0_usize, |total, request| {
+            total.saturating_add(request.inline_bytes())
+        });
+        for request in requests {
+            operations.extend(request.operations);
+            replies.push((request.response, request._queue_permits));
+        }
+        let operation_count = operations.len();
+        let group_execute_started_epoch_milliseconds = unix_milliseconds();
+        let execute_started = std::time::Instant::now();
+        let (results, metrics) = store
+            .coordinate_mutation_group(
+                operations,
+                context,
+                &operation_counts,
+                source_journal_admission,
+                mode,
+                registration_handoff,
+                self.execution_slots.clone(),
+            )
+            .await;
+        let execute_duration = execute_started.elapsed();
+        let group_execute_ended_epoch_milliseconds = unix_milliseconds();
+        let failed_requests = results.iter().filter(|result| result.is_err()).count();
+        let failed_source_journal_capacity_requests = results
+            .iter()
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .is_err_and(|error| mutation_capacity_kind(error) == Some("source_journal"))
+            })
+            .count();
+        let failed_receipt_capacity_requests = results
+            .iter()
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .is_err_and(|error| mutation_capacity_kind(error) == Some("receipt"))
+            })
+            .count();
+        let failed_other_requests = failed_requests
+            .saturating_sub(failed_source_journal_capacity_requests)
+            .saturating_sub(failed_receipt_capacity_requests);
+        let retryable_capacity_attempt_requests = failed_source_journal_capacity_requests
+            .saturating_add(failed_receipt_capacity_requests);
+        let metrics = metrics.unwrap_or_default();
+        let evaluation_uncategorized = metrics
+            .evaluate
+            .saturating_sub(metrics.evaluation_subphases.categorized());
+        tracing::info!(
+            target: "keldra_store::mutation_group_commit_phases",
+            attempts = 1_u64,
+            physical_commits = metrics.physical_commit as u64,
+            topology_mode = ?mode,
+            first_arrival_ticket,
+            last_arrival_ticket,
+            request_count,
+            operation_count,
+            inline_bytes,
+            failed_requests,
+            retryable_capacity_attempt_requests,
+            failed_source_journal_capacity_requests,
+            failed_receipt_capacity_requests,
+            failed_other_requests,
+            group_execute_started_epoch_milliseconds,
+            group_execute_ended_epoch_milliseconds,
+            admission_wait_sum_seconds = admission_wait_seconds,
+            admission_wait_max_seconds,
+            request_slot_wait_sum_seconds = request_slot_wait_seconds,
+            operation_slot_wait_sum_seconds = operation_slot_wait_seconds,
+            inline_byte_slot_wait_sum_seconds = inline_byte_slot_wait_seconds,
+            enqueue_lock_wait_sum_seconds = enqueue_lock_wait_seconds,
+            enqueue_to_group_sum_seconds = enqueue_to_group_seconds,
+            enqueue_to_group_max_seconds,
+            dwell_seconds = dwell_duration.as_secs_f64(),
+            execution_slot_wait_seconds = metrics.execution_slot_wait.as_secs_f64(),
+            execute_seconds = execute_duration.as_secs_f64(),
+            prepare_seconds = metrics.prepare.as_secs_f64(),
+            policy_wait_seconds = metrics.policy_wait.as_secs_f64(),
+            path_wait_seconds = metrics.path_wait.as_secs_f64(),
+            commit_wait_seconds = metrics.commit_wait.as_secs_f64(),
+            lane_fence_wait_seconds = metrics.lane_fence_wait.as_secs_f64(),
+            lane_conflict_lock_wait_seconds = metrics.lane_conflict_wait.as_secs_f64(),
+            physical_slot_wait_seconds = metrics.physical_slot_wait.as_secs_f64(),
+            physical_slots_active_at_acquire = metrics.physical_slots_active_at_acquire,
+            physical_slots_active_before_release = metrics.physical_slots_active_before_release,
+            physical_slots_peak_since_start_at_acquire = metrics
+                .physical_slots_peak_since_start_at_acquire,
+            physical_slots_peak_since_start_before_release = metrics
+                .physical_slots_peak_since_start_before_release,
+            physical_slot_count = metrics.physical_slot_count,
+            first_sequence_wait_seconds = metrics.first_sequence_wait.as_secs_f64(),
+            first_sequence_hold_seconds = metrics.first_sequence_hold.as_secs_f64(),
+            authority_retry_snapshot_sequence_wait_seconds = metrics
+                .authority_retry_snapshot_sequence_wait
+                .as_secs_f64(),
+            authority_retry_snapshot_sequence_hold_seconds = metrics
+                .authority_retry_snapshot_sequence_hold
+                .as_secs_f64(),
+            reservation_sequence_wait_seconds = metrics
+                .reservation_sequence_wait
+                .as_secs_f64(),
+            reservation_sequence_hold_seconds = metrics
+                .reservation_sequence_hold
+                .as_secs_f64(),
+            locked_setup_seconds = metrics.locked_setup.as_secs_f64(),
+            baseline_prefetch_seconds = metrics.baseline_prefetch.as_secs_f64(),
+            baseline_revalidation_retries = metrics.baseline_revalidation_retries,
+            lane_authority_revalidation_retries = metrics
+                .lane_authority_revalidation_retries,
+            evaluate_seconds = metrics.evaluate.as_secs_f64(),
+            evaluation_current_precondition_governance_seconds = metrics
+                .evaluation_subphases
+                .current_precondition_governance
+                .as_secs_f64(),
+            evaluation_mutation_planning_seconds = metrics
+                .evaluation_subphases
+                .mutation_planning
+                .as_secs_f64(),
+            evaluation_mutation_construction_validation_seconds = metrics
+                .evaluation_subphases
+                .mutation_construction_validation
+                .as_secs_f64(),
+            evaluation_mutation_construction_validation_operations = metrics
+                .evaluation_subphases
+                .mutation_construction_validation_operations,
+            evaluation_durable_record_encoding_seconds = metrics
+                .evaluation_subphases
+                .durable_record_encoding
+                .as_secs_f64(),
+            evaluation_inline_payload_receipt_stage_seconds = metrics
+                .evaluation_subphases
+                .inline_payload_receipt_stage
+                .as_secs_f64(),
+            evaluation_inline_payload_receipt_stage_operations = metrics
+                .evaluation_subphases
+                .inline_payload_receipt_stage_operations,
+            evaluation_blob_lifecycle_stage_seconds = metrics
+                .evaluation_subphases
+                .blob_lifecycle_stage
+                .as_secs_f64(),
+            evaluation_object_state_stage_seconds = metrics
+                .evaluation_subphases
+                .object_state_stage
+                .as_secs_f64(),
+            evaluation_coordinator_bookkeeping_seconds = metrics
+                .evaluation_subphases
+                .coordinator_bookkeeping
+                .as_secs_f64(),
+            evaluation_proof_construction_seconds = metrics
+                .evaluation_subphases
+                .proof_construction
+                .as_secs_f64(),
+            evaluation_proof_construction_proofs =
+                metrics.evaluation_subphases.proof_construction_proofs,
+            evaluation_proof_multi_get_lookup_seconds = metrics
+                .evaluation_subphases
+                .proof_multi_get_lookup
+                .as_secs_f64(),
+            evaluation_proof_multi_get_lookup_proofs =
+                metrics.evaluation_subphases.proof_multi_get_lookup_proofs,
+            evaluation_proof_validate_encode_stage_seconds = metrics
+                .evaluation_subphases
+                .proof_validate_encode_stage
+                .as_secs_f64(),
+            evaluation_proof_validate_encode_stage_proofs = metrics
+                .evaluation_subphases
+                .proof_validate_encode_stage_proofs,
+            evaluation_proof_bookkeeping_seconds = metrics
+                .evaluation_subphases
+                .proof_bookkeeping
+                .as_secs_f64(),
+            evaluation_uncategorized_seconds = evaluation_uncategorized.as_secs_f64(),
+            stage_seconds = metrics.stage.as_secs_f64(),
+            db_write_sync_seconds = metrics.primary_db_write.as_secs_f64(),
+            persistence_and_ordered_settlement_seconds = metrics.persist.as_secs_f64(),
+            primary_db_write_seconds = metrics.primary_db_write.as_secs_f64(),
+            completion_sequence_wait_seconds = metrics.completion_sequence_wait.as_secs_f64(),
+            prior_retry_projection_db_write_seconds = metrics
+                .prior_retry_projection_db_write
+                .as_secs_f64(),
+            completion_projection_db_write_seconds = metrics
+                .completion_projection_db_write
+                .as_secs_f64(),
+            ordered_frontier_wait_seconds = metrics.ordered_frontier_wait.as_secs_f64(),
+            completion_reorder_depth = metrics.completion_reorder_depth,
+            completion_ticket_lag = metrics.completion_ticket_lag,
+            prior_retry_projection_completions = metrics.prior_retry_projection_completions,
+            completion_projection_completions = metrics.completion_projection_completions,
+            settlement_measured_component_sum_seconds = metrics
+                .completion_sequence_wait
+                .saturating_add(metrics.completion_projection_db_write)
+                .saturating_add(metrics.ordered_frontier_wait)
+                .as_secs_f64(),
+            settle_seconds = metrics.settle.as_secs_f64(),
+            commit_hold_seconds = metrics.commit_hold.as_secs_f64(),
+            commit_path_composite_seconds = metrics.commit_hold.as_secs_f64(),
+            store_seconds = metrics.total.as_secs_f64(),
+            write_batch_entries = metrics.write_batch_entries,
+            write_batch_bytes = metrics.write_batch_bytes,
+            total_seconds = dwell_duration.saturating_add(execute_duration).as_secs_f64(),
+            queued_requests = shared_queued_requests,
+            shared_queued_requests,
+            shared_peak_queued_requests_since_start = shared_peak_queued_requests,
+            total_queued_requests,
+            total_peak_queued_requests_since_start = total_peak_queued_requests,
+            stop_reason,
+            phase_complete = metrics.total != std::time::Duration::ZERO,
+            physical_commit = metrics.physical_commit,
+            "mutation group completed"
+        );
+        for ((response, _permits), result) in replies.into_iter().zip(results) {
+            let _ = response.send(result);
         }
     }
 }
@@ -883,115 +1040,17 @@ fn unix_milliseconds() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
+#[path = "single_node_group_commit_test_support.rs"]
+mod test_support;
 
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
     use super::*;
     use crate::{
-        BucketPolicy, DestinationReferenceArtifact, DestinationReferenceDelta, Durability,
-        MutationReceiptRetention, ObjectKey, PlacementLogId, PutMode, PutRequest,
-        ReferenceDeltaBatch, StoreOptions,
+        BucketPolicy, DestinationReferenceArtifact, DestinationReferenceDelta,
+        MutationReceiptRetention, ObjectKey, ReferenceDeltaBatch, StoreOptions,
     };
-
-    fn context(term: u64) -> ObjectMutationContext {
-        ObjectMutationContext {
-            active_placement_log_id: PlacementLogId { term, index: term },
-            serving_fence_term: term,
-        }
-    }
-
-    fn governance(store: &Store) -> ObjectMutationGovernance {
-        let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
-        ObjectMutationGovernance {
-            tenant_id,
-            bucket_id,
-            versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
-            policy: store.bucket_policy("tenant", "bucket").unwrap(),
-        }
-    }
-
-    fn governance_stub() -> ObjectMutationGovernance {
-        ObjectMutationGovernance {
-            tenant_id: 1,
-            bucket_id: 1,
-            versioning: Default::default(),
-            policy: Default::default(),
-        }
-    }
-
-    fn request(
-        path: &str,
-        command: &str,
-        governance: ObjectMutationGovernance,
-    ) -> SingleNodeOperations {
-        vec![(
-            BatchOperation::Put(PutRequest {
-                key: ObjectKey::new("tenant", "bucket", path).unwrap(),
-                bytes: command.as_bytes().to_vec(),
-                content_type: Some("application/octet-stream".into()),
-                mode: PutMode::PutIfAbsent,
-                command_id: Some(command.into()),
-                durability: Durability::Local,
-            }),
-            governance,
-            None,
-        )]
-    }
-
-    fn physical_commits_since(store: &Store, sequence: u64) -> usize {
-        store
-            .db
-            .get_updates_since(sequence)
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
-            .len()
-    }
-
-    fn queued_request(
-        queue: &SingleNodeGroupCommit,
-        operations: SingleNodeOperations,
-        context: ObjectMutationContext,
-        enqueued_at: Instant,
-    ) -> SingleNodeCommitRequest {
-        let operation_count = u32::try_from(operations.len()).unwrap();
-        let inline_bytes = operations
-            .iter()
-            .map(|(operation, _, _)| match operation {
-                BatchOperation::Put(request) => request.bytes.len(),
-                BatchOperation::Publish(_)
-                | BatchOperation::Clone(_)
-                | BatchOperation::Delete(_) => 0,
-            })
-            .sum::<usize>();
-        let (response, received) = oneshot::channel();
-        drop(received);
-        SingleNodeCommitRequest {
-            operations,
-            context,
-            source_journal_admission: SourceJournalAdmission::Bounded,
-            enqueued_at,
-            admission_wait: Duration::ZERO,
-            request_slot_wait: Duration::ZERO,
-            operation_slot_wait: Duration::ZERO,
-            inline_byte_slot_wait: Duration::ZERO,
-            enqueue_lock_wait: Duration::ZERO,
-            response,
-            _queue_permits: QueuePermits {
-                _request: queue.queue_slots.clone().try_acquire_owned().unwrap(),
-                _operations: queue
-                    .operation_slots
-                    .clone()
-                    .try_acquire_many_owned(operation_count)
-                    .unwrap(),
-                _inline_bytes: queue
-                    .inline_byte_slots
-                    .clone()
-                    .try_acquire_many_owned(u32::try_from(inline_bytes).unwrap())
-                    .unwrap(),
-            },
-        }
-    }
 
     #[tokio::test]
     async fn five_requests_share_one_commit_with_primary_settlement() {
@@ -1286,11 +1345,9 @@ mod tests {
             ));
         }
         assert_eq!(store.db.latest_sequence_number(), before);
-        for state in store.single_node_group_commit.states.iter() {
-            let state = state.lock().await;
-            assert!(state.requests.is_empty());
-            assert!(!state.worker_running);
-        }
+        let state = store.single_node_group_commit.state.lock().await;
+        assert!(state.requests.is_empty());
+        assert!(!state.worker_running);
         assert_eq!(
             store
                 .single_node_group_commit
@@ -1321,7 +1378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_primary_path_selects_one_stable_bounded_lane() {
+    async fn one_shared_builder_forms_groups_before_physical_slot_assignment() {
         let queue = SingleNodeGroupCommit::new(
             SingleNodeGroupCommitConfig::default()
                 .with_commit_lanes(4)
@@ -1332,16 +1389,55 @@ mod tests {
             .await
             .unwrap();
         let governance = governance(&store);
-        let first = request("objects/stable", "first", governance.clone());
-        let second = request("objects/stable", "second", governance.clone());
-        assert_eq!(queue.lane_for(&first), queue.lane_for(&second));
+        let enqueued_at = Instant::now();
+        let mut state = QueueState::default();
+        for path in ["objects/a", "objects/b", "objects/c", "objects/d"] {
+            state.requests.push_back(queued_request(
+                &queue,
+                request(path, path, governance.clone()),
+                context(1),
+                enqueued_at,
+            ));
+        }
+        assert!(matches!(
+            queue.next_queue_action(&mut state, enqueued_at + queue.config.max_group_dwell),
+            QueueAction::Group { requests, .. } if requests.len() == 4
+        ));
+        assert_eq!(queue.config.commit_lanes(), 4);
+    }
 
-        let lanes = ["objects/a", "objects/b", "objects/c", "objects/d"]
-            .into_iter()
-            .map(|path| queue.lane_for(&request(path, path, governance.clone())))
-            .collect::<BTreeSet<_>>();
-        assert!(lanes.len() > 1);
-        assert!(lanes.iter().all(|lane| *lane < queue.states.len()));
+    #[tokio::test]
+    async fn distributed_callers_with_one_exact_path_are_separate_groups() {
+        let queue = SingleNodeGroupCommit::new(SingleNodeGroupCommitConfig::default());
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let governance = governance(&store);
+        let enqueued_at = Instant::now();
+        let mut first = queued_request(
+            &queue,
+            request("objects/shared", "first", governance.clone()),
+            context(1),
+            enqueued_at,
+        );
+        first.mode = MutationGroupMode::Distributed;
+        let mut second = queued_request(
+            &queue,
+            request("objects/shared", "second", governance),
+            context(1),
+            enqueued_at,
+        );
+        second.mode = MutationGroupMode::Distributed;
+        let requests = VecDeque::from([first, second]);
+
+        assert_eq!(
+            queue.plan_group(&requests),
+            Some(GroupPlan {
+                request_count: 1,
+                stop_reason: "replication_dependency",
+            })
+        );
     }
 
     #[test]
@@ -1386,7 +1482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_reference_backlog_backpressures_inline_lanes() {
+    async fn deferred_reference_backlog_does_not_jump_inline_lane_frontiers() {
         let temporary = tempfile::tempdir().unwrap();
         let config = SingleNodeGroupCommitConfig::default()
             .with_commit_lanes(1)
@@ -1439,11 +1535,12 @@ mod tests {
             ),
         );
 
-        assert!(matches!(first, Err(MutationError::SourceJournalCapacity)));
-        assert!(matches!(second, Err(MutationError::SourceJournalCapacity)));
-        assert_eq!(physical_commits_since(&store, before_sequence), 0);
+        assert!(matches!(first, Ok(_)));
+        assert!(matches!(second, Ok(_)));
+        assert!(physical_commits_since(&store, before_sequence) > 0);
         let after = store.local_watch_status().unwrap();
-        assert_eq!(after, before);
+        assert!(after.tail > before.tail);
+        assert_eq!(after.settled_through, after.tail);
         assert_eq!(
             store.reference_delta_cursor(after.source_id).unwrap(),
             cursor
@@ -1460,7 +1557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settlement_gap_remains_hidden_without_a_second_coordinator_write() {
+    async fn settlement_gap_remains_hidden_across_later_coordinator_writes() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
@@ -1486,30 +1583,33 @@ mod tests {
             "settlement-gap",
             governance.clone(),
         );
-        let gap_error = store
+        let gap = store
             .coordinate_single_node_mutation_batch_with_settlement(gap_operation, context(1))
             .await
-            .unwrap_err();
-        assert!(matches!(gap_error, MutationError::SourceJournalCapacity));
+            .unwrap();
+        assert!(matches!(gap.outcomes.as_slice(), [Ok(_)]));
         let after_gap = store.local_watch_status().unwrap();
-        assert_eq!(after_gap, before);
+        assert!(after_gap.tail > before.tail);
+        assert_eq!(after_gap.settled_through, before.settled_through);
 
         let operation = request("objects/settlement-retry", "settlement-retry", governance);
         let committed = store
             .coordinate_single_node_mutation_batch_with_settlement(operation.clone(), context(1))
             .await
-            .unwrap_err();
-        assert!(matches!(committed, MutationError::SourceJournalCapacity));
+            .unwrap();
+        assert!(matches!(committed.outcomes.as_slice(), [Ok(_)]));
         let committed_tail = store.local_watch_status().unwrap().tail;
-        assert_eq!(committed_tail, after_gap.tail);
+        assert!(committed_tail > after_gap.tail);
 
         let replay = store
             .coordinate_single_node_mutation_batch_with_settlement(operation, context(1))
             .await
-            .unwrap_err();
-        assert!(matches!(replay, MutationError::SourceJournalCapacity));
+            .unwrap();
+        assert!(matches!(replay.outcomes.as_slice(), [Ok(_)]));
+        assert!(replay.outcomes[0].as_ref().unwrap().receipt.replayed);
         let unsettled = store.local_watch_status().unwrap();
         assert_eq!(unsettled.settled_through, before.settled_through);
+        assert_eq!(unsettled.tail, committed_tail);
 
         let positions = (unsettled.settled_through + 1..=unsettled.tail).collect::<Vec<_>>();
         store
@@ -1774,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_accounting_combines_lanes_without_wrapping() {
+    fn shared_queue_accounting_does_not_wrap() {
         let queue = SingleNodeGroupCommit::new(
             SingleNodeGroupCommitConfig::default()
                 .with_commit_lanes(2)
@@ -1795,10 +1895,9 @@ mod tests {
             .unwrap();
         let queue = store.single_node_group_commit.clone();
         let operations = request("objects/detached", "detached", governance(&store));
-        let lane = queue.lane_for(&operations);
         let enqueued_at = Instant::now();
         {
-            let mut state = queue.states[lane].lock().await;
+            let mut state = queue.state.lock().await;
             state
                 .requests
                 .push_back(queued_request(&queue, operations, context(1), enqueued_at));
@@ -1806,7 +1905,8 @@ mod tests {
             queue.record_enqueued_request();
         }
 
-        queue.clone().run(store.clone(), lane).await;
+        queue.clone().run(store.clone()).await;
+        queue.wait_until_idle().await;
 
         assert!(
             store

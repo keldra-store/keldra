@@ -3,8 +3,8 @@
 //! The cache is populated from one RocksDB snapshot before the ordered commit
 //! section. Legacy commits revalidate its database sequence under their commit
 //! lock. Commit lanes load it while holding the shared lane fence, discover
-//! predecessor conflicts, then refresh stripe-protected values after acquiring
-//! those stripes. The cache is not authoritative state: mutations still enter
+//! predecessor conflicts, then refresh conflict-protected values after atomic
+//! all-or-none admission for that complete resource set. The cache is not authoritative state: mutations still enter
 //! the existing pending maps in input order and share the final `WriteBatch`.
 
 use super::object_alias_registry::decode_registry;
@@ -225,7 +225,7 @@ impl MutationReadCache {
         store.db.latest_sequence_number() == self.sequence_number
     }
 
-    /// Refresh values whose conflict stripes were acquired after the discovery
+    /// Refresh values whose conflict resources were acquired after the discovery
     /// snapshot. Object heads and versions are stable under ordinary path locks
     /// plus the lane fence; only receipt, shared-blob and inline-artifact state
     /// can have changed while this lane waited for those stripes.

@@ -27,6 +27,39 @@ const UPLOAD_IDENTITY_BYTES: usize = 32;
 const BLOB_GC_DUE_PREFIX_BYTES: usize = 2;
 const BLOB_GC_DUE_FIXED_BYTES: usize = BLOB_GC_DUE_PREFIX_BYTES + size_of::<u64>() + 1;
 
+/// Inline bytes whose content identity was established exactly once by the
+/// local staging boundary. The constructor is private so persistence cannot
+/// accidentally accept an unverified caller-supplied reference.
+struct VerifiedInlineBlob<'a> {
+    reference: BlobRef,
+    bytes: &'a [u8],
+}
+
+impl<'a> VerifiedInlineBlob<'a> {
+    fn from_bytes(bytes: &'a [u8]) -> Result<Self, MutationError> {
+        if bytes.len() > PAYLOAD_ARTIFACT_CHUNK_BYTES {
+            return Err(MutationError::Storage(
+                "verified inline blob exceeds the inline payload bound".into(),
+            ));
+        }
+        Ok(Self {
+            reference: blob_reference_for_bytes(bytes),
+            bytes,
+        })
+    }
+
+    fn from_staged(reference: BlobRef, bytes: &'a [u8]) -> Result<Self, MutationError> {
+        // BlobUpload::finish_staged finalized this reference from the upload's
+        // incremental hasher. Only its cheap shape binding remains here.
+        if bytes.len() > PAYLOAD_ARTIFACT_CHUNK_BYTES || reference.length != bytes.len() as u64 {
+            return Err(MutationError::Storage(
+                "staged inline blob contradicts its finalized length".into(),
+            ));
+        }
+        Ok(Self { reference, bytes })
+    }
+}
+
 impl Store {
     #[cfg(test)]
     pub(crate) fn has_pending_upload_install(
@@ -47,10 +80,10 @@ impl Store {
         admission: SourceJournalAdmission,
     ) -> Result<BlobRef, MutationError> {
         if bytes.len() <= PAYLOAD_ARTIFACT_CHUNK_BYTES {
-            let reference = blob_reference_for_bytes(bytes);
+            let verified = VerifiedInlineBlob::from_bytes(bytes)?;
+            let reference = verified.reference.clone();
             self.persist_inline_payload_seal_with_admission(
-                &reference,
-                bytes,
+                verified,
                 now_unix_millis()?,
                 admission,
             )
@@ -63,10 +96,13 @@ impl Store {
             .await
     }
 
-    pub(super) async fn stage_derived_progress_inline_blob_batch(
+    pub(super) async fn stage_derived_progress_inline_blob_batch<B>(
         &self,
-        blobs: &[Vec<u8>],
-    ) -> Result<Vec<BlobRef>, MutationError> {
+        blobs: &[B],
+    ) -> Result<Vec<BlobRef>, MutationError>
+    where
+        B: AsRef<[u8]>,
+    {
         if blobs.len() > MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS {
             return Err(MutationError::Storage(format!(
                 "derived-progress inline blob batch exceeds the {MAX_DERIVED_PROGRESS_INLINE_BATCH_ITEMS}-item bound"
@@ -79,6 +115,7 @@ impl Store {
         let mut logical_bytes = 0_u64;
         let mut references = Vec::with_capacity(blobs.len());
         for bytes in blobs {
+            let bytes = bytes.as_ref();
             if bytes.len() > PAYLOAD_ARTIFACT_CHUNK_BYTES {
                 return Err(MutationError::Storage(
                     "derived-progress inline blob batch contains a chunked payload".into(),
@@ -96,9 +133,7 @@ impl Store {
                     "derived-progress inline blob batch exceeds the {MAX_DERIVED_PROGRESS_INLINE_BATCH_BYTES}-byte bound"
                 )));
             }
-            let reference = blob_reference_for_bytes(bytes);
-            validate_complete_artifact(&reference, bytes)?;
-            references.push(reference);
+            references.push(VerifiedInlineBlob::from_bytes(bytes)?.reference);
         }
 
         let now = now_unix_millis()?;
@@ -173,24 +208,30 @@ impl Store {
         Ok(references)
     }
 
-    fn build_derived_progress_inline_blob_batch(
+    fn build_derived_progress_inline_blob_batch<B>(
         &self,
-        blobs: &[Vec<u8>],
+        blobs: &[B],
         references: &[BlobRef],
         now_unix_millis: u64,
         source_status: WatchJournalStatus,
         reference_cursor: u64,
-    ) -> Result<(WriteBatch, Option<super::mutations::StagedLocalChanges>), MutationError> {
+    ) -> Result<(WriteBatch, Option<super::mutations::StagedLocalChanges>), MutationError>
+    where
+        B: AsRef<[u8]>,
+    {
         let mut batch = WriteBatch::default();
         let mut pending_inline_payloads = BTreeSet::new();
         let mut pending_blob_references = PendingBlobReferences::new();
         let mut changes = Vec::with_capacity(blobs.len());
 
         for (bytes, reference) in blobs.iter().zip(references) {
-            if let Some(artifact_key) =
-                self.prepare_inline_payload_value(reference, bytes, &pending_inline_payloads)?
-            {
-                self.stage_inline_complete_artifact(&mut batch, reference, bytes)?;
+            let bytes = bytes.as_ref();
+            if let Some(artifact_key) = self.prepare_hashed_inline_payload_value(
+                reference,
+                bytes,
+                &pending_inline_payloads,
+            )? {
+                self.stage_hashed_inline_complete_artifact(&mut batch, reference, bytes)?;
                 pending_inline_payloads.insert(artifact_key);
             }
             let state = self
@@ -392,8 +433,7 @@ impl Store {
         let now = now_unix_millis()?;
         if staged.persisted_chunks() == 0 {
             self.persist_inline_payload_seal_with_admission(
-                &reference,
-                staged.final_chunk(),
+                VerifiedInlineBlob::from_staged(reference.clone(), staged.final_chunk())?,
                 now,
                 admission,
             )
@@ -1070,19 +1110,20 @@ impl Store {
 
     async fn persist_inline_payload_seal_with_admission(
         &self,
-        reference: &BlobRef,
-        bytes: &[u8],
+        verified: VerifiedInlineBlob<'_>,
         now_unix_millis: u64,
         admission: SourceJournalAdmission,
     ) -> Result<(), MutationError> {
-        validate_complete_artifact(reference, bytes)?;
+        let VerifiedInlineBlob { reference, bytes } = verified;
+        let reference = &reference;
         let key = blob_reference_key(reference);
         let resources = vec![super::mutation_commit_lanes::blob_conflict_resource(
             reference,
         )];
         self.commit_artifact_lifecycle_lane(resources, admission, |source, cursor| {
             let pending = BTreeSet::new();
-            let artifact_key = self.prepare_inline_payload_value(reference, bytes, &pending)?;
+            let artifact_key =
+                self.prepare_hashed_inline_payload_value(reference, bytes, &pending)?;
             let state = self
                 .prepare_sealed_blob_reservation(reference, now_unix_millis)?
                 .ok_or_else(|| {
@@ -1090,7 +1131,7 @@ impl Store {
                 })?;
             let mut batch = WriteBatch::default();
             if artifact_key.is_some() {
-                self.stage_inline_complete_artifact(&mut batch, reference, bytes)?;
+                self.stage_hashed_inline_complete_artifact(&mut batch, reference, bytes)?;
             }
             let mut references = PendingBlobReferences::new();
             self.stage_blob_reference_update(&mut batch, &mut references, key.clone(), state)?;
@@ -1203,16 +1244,6 @@ impl Store {
                 .map(|state| (key, state))
         };
         Ok((inline_payload, reservation))
-    }
-
-    pub(super) fn prepare_inline_payload_value(
-        &self,
-        reference: &BlobRef,
-        bytes: &[u8],
-        pending: &BTreeSet<Vec<u8>>,
-    ) -> Result<Option<Vec<u8>>, MutationError> {
-        validate_complete_artifact(reference, bytes)?;
-        self.prepare_hashed_inline_payload_value(reference, bytes, pending)
     }
 
     /// Prepares bytes whose reference was computed from this exact immutable

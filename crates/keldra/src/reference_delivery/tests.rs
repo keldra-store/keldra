@@ -1054,7 +1054,10 @@ async fn direct_settlement_is_durable_idempotent_and_strictly_contiguous() {
             .await
             .unwrap()
     );
-    for offset in (first + 1)..=second {
+    // The out-of-order proof for `second` remains queued in the lane runtime.
+    // Supplying the missing positions must advance only through a contiguous
+    // prefix, then consume that already-proven position in the same projection.
+    for offset in (first + 1)..second {
         assert!(
             source
                 .settle_source_journal_position_if_contiguous(status.source_id, offset)
@@ -1062,6 +1065,13 @@ async fn direct_settlement_is_durable_idempotent_and_strictly_contiguous() {
                 .unwrap()
         );
     }
+    assert_eq!(source.local_watch_status().unwrap().settled_through, second);
+    assert!(
+        !source
+            .settle_source_journal_position_if_contiguous(status.source_id, second)
+            .await
+            .unwrap()
+    );
 
     drop(source);
     drop(stores.remove(&NodeId(1)).expect("source store"));

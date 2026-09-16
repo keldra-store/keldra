@@ -1498,6 +1498,7 @@ mod blob_references;
 mod bulk_phases;
 mod commit_lock;
 mod mutation_commit_lanes;
+mod mutation_conflict_scheduler;
 pub(crate) use commit_lock::{CommitLockGuard, OwnedCommitLockGuard};
 pub(crate) mod definition_state;
 mod delete_version;
