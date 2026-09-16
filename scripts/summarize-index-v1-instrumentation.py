@@ -93,7 +93,8 @@ ROCKSDB_REQUIRED_METRICS = (
 GROUP_COMMIT_REQUIRED_FIELDS = (
     "attempts",
     "physical_commits",
-    "commit_lane",
+    "first_arrival_ticket",
+    "last_arrival_ticket",
     "request_count",
     "operation_count",
     "inline_bytes",
@@ -108,6 +109,7 @@ GROUP_COMMIT_REQUIRED_FIELDS = (
     "enqueue_lock_wait_sum_seconds",
     "enqueue_to_group_sum_seconds",
     "enqueue_to_group_max_seconds",
+    "execution_slot_wait_seconds",
     "lane_fence_wait_seconds",
     "lane_conflict_lock_wait_seconds",
     "physical_slot_wait_seconds",
@@ -135,8 +137,8 @@ GROUP_COMMIT_REQUIRED_FIELDS = (
     "completion_projection_completions",
     "settlement_measured_component_sum_seconds",
     "commit_path_composite_seconds",
-    "lane_queued_requests",
-    "lane_peak_queued_requests_since_start",
+    "shared_queued_requests",
+    "shared_peak_queued_requests_since_start",
     "total_queued_requests",
     "total_peak_queued_requests_since_start",
     "phase_complete",
@@ -633,10 +635,13 @@ def group_commit_metrics(start: int, end: int, path: Path) -> dict[str, Any]:
     number = re.compile(r"(?:^|\s)([a-z][a-z0-9_]*)=([0-9.eE+-]+)(?=\s|$)")
     boolean = re.compile(r"(?:^|\s)(phase_complete|physical_commit)=(true|false)(?=\s|$)")
     reason = re.compile(r'(?:^|\s)stop_reason="?([^"\s]+)"?')
+    topology = re.compile(r'(?:^|\s)topology_mode="?([A-Za-z]+)"?')
     all_groups = 0
     contained: list[dict[str, float]] = []
     crossing = 0
     stop_reasons: dict[str, int] = {}
+    topology_modes: dict[str, int] = {}
+    groups_missing_topology_mode = 0
     missing_timestamps = 0
     if not path.is_file():
         return {
@@ -648,7 +653,7 @@ def group_commit_metrics(start: int, end: int, path: Path) -> dict[str, Any]:
         }
     with path.open(encoding="utf-8") as source:
         for line in source:
-            if "single-node mutation group completed" not in line:
+            if "mutation group completed" not in line:
                 continue
             all_groups += 1
             values = {name: float(raw) for name, raw in number.findall(line)}
@@ -663,6 +668,12 @@ def group_commit_metrics(start: int, end: int, path: Path) -> dict[str, Any]:
                 match = reason.search(line)
                 if match:
                     stop_reasons[match.group(1)] = stop_reasons.get(match.group(1), 0) + 1
+                topology_match = topology.search(line)
+                if topology_match:
+                    mode = topology_match.group(1)
+                    topology_modes[mode] = topology_modes.get(mode, 0) + 1
+                else:
+                    groups_missing_topology_mode += 1
             elif begin < end and finish > start:
                 crossing += 1
     fields = sorted({name for group in contained for name in group})
@@ -679,11 +690,13 @@ def group_commit_metrics(start: int, end: int, path: Path) -> dict[str, Any]:
         "fully_contained_group_count": len(contained),
         "window_crossing_group_count": crossing,
         "groups_missing_execution_timestamps": missing_timestamps,
+        "groups_missing_topology_mode": groups_missing_topology_mode,
+        "topology_mode_counts": topology_modes,
         "missing_required_fields": missing,
         "stop_reason_counts": stop_reasons,
         "numeric_field_distributions": distributions,
         "since_start_peak_fields": [
-            "lane_peak_queued_requests_since_start",
+            "shared_peak_queued_requests_since_start",
             "total_peak_queued_requests_since_start",
             "physical_slots_peak_since_start_at_acquire",
             "physical_slots_peak_since_start_before_release",
@@ -693,7 +706,12 @@ def group_commit_metrics(start: int, end: int, path: Path) -> dict[str, Any]:
             "the measurement window; duration sums are concurrent group-seconds, not wall time; "
             "fields named since_start are process-lifetime high-water marks"
         ),
-        "complete": bool(contained) and not missing and missing_timestamps == 0,
+        "complete": (
+            bool(contained)
+            and not missing
+            and missing_timestamps == 0
+            and groups_missing_topology_mode == 0
+        ),
     }
 
 

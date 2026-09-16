@@ -19,7 +19,7 @@ mixed_workload=0
 keep_work="${KELDRA_V1_SCALE_KEEP_WORK:-0}"
 disk_budget_bytes="${KELDRA_V1_SCALE_DISK_BUDGET_BYTES:-214748364800}"
 base_port="${KELDRA_V1_SCALE_PORT:-51051}"
-server_rust_log="${KELDRA_V1_SCALE_RUST_LOG:-warn,keldra::index_runtime::v1_summary=info,keldra::observability::runtime=debug,keldra::single_node_group_commit_config=info,keldra_store::single_node_group_commit_phases=info}"
+server_rust_log="${KELDRA_V1_SCALE_RUST_LOG:-warn,keldra::index_runtime::v1_summary=info,keldra::observability::runtime=debug,keldra::single_node_group_commit_config=info,keldra_store::mutation_group_commit_phases=info}"
 query_rate="${KELDRA_V1_SCALE_QUERY_RATE:-20}"
 visibility_query_rate="${KELDRA_V1_SCALE_VISIBILITY_QUERY_RATE:-${query_rate}}"
 query_max_in_flight="${KELDRA_V1_SCALE_QUERY_MAX_IN_FLIGHT:-32}"

@@ -278,14 +278,17 @@ class InstrumentationTests(unittest.TestCase):
             (root / "server.log").write_text(
                 "1970-01-01T00:00:01.400Z INFO "
                 + " ".join(f"{name}={value}" for name, value in group_values.items())
-                + ' phase_complete=true physical_commit=true stop_reason="max_operations" '
-                + "single-node mutation group completed\n",
+                + ' topology_mode=Distributed phase_complete=true physical_commit=true '
+                + 'stop_reason="max_operations" mutation group completed\n',
                 encoding="utf-8",
             )
             result = MODULE.rocksdb_metrics(1000, 2000, str(output))
         self.assertTrue(result["complete"])
         self.assertEqual(result["measurement_window_maxima"]["keldra_rocksdb_write_stalled"], 1)
         self.assertEqual(result["group_commit"]["fully_contained_group_count"], 1)
+        self.assertEqual(
+            result["group_commit"]["topology_mode_counts"], {"Distributed": 1}
+        )
         self.assertEqual(
             result["group_commit"]["numeric_field_distributions"]["physical_slot_count"]["p99"],
             1,
