@@ -101,6 +101,58 @@ fn authoritative_state_rejects_duplicate_paths() {
 }
 
 #[test]
+fn authority_workers_are_bounded_per_physical_channel() {
+    assert_eq!(
+        verification::authority_worker_count(512, 262_144, 1).unwrap(),
+        32
+    );
+    assert_eq!(
+        verification::authority_worker_count(512, 262_144, 2).unwrap(),
+        64
+    );
+    assert_eq!(
+        verification::authority_worker_count(7, 262_144, 2).unwrap(),
+        7
+    );
+    assert_eq!(verification::authority_worker_count(512, 5, 2).unwrap(), 5);
+    assert_eq!(verification::authority_worker_count(512, 0, 1).unwrap(), 0);
+    assert_eq!(
+        verification::authority_worker_count(512, 1_000, usize::MAX).unwrap(),
+        512
+    );
+    assert!(
+        verification::authority_worker_count(512, 1, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("at least one transport channel")
+    );
+}
+
+#[test]
+fn authority_worker_strides_visit_every_key_exactly_once() {
+    for channel_count in [1usize, 2, 3] {
+        for maximum in [1usize, 7, 32, 512] {
+            for records in [0usize, 1, 31, 32, 33, 63, 65, 97, 257, 262_145] {
+                let workers =
+                    verification::authority_worker_count(maximum, records, channel_count).unwrap();
+                let mut visits = vec![0usize; records];
+                let mut channel_workers = vec![0usize; channel_count];
+                for worker in 0..workers {
+                    channel_workers[worker % channel_count] += 1;
+                    let mut id = worker;
+                    while id < records {
+                        visits[id] += 1;
+                        id = id.checked_add(workers).unwrap();
+                    }
+                }
+                assert!(visits.iter().all(|count| *count == 1));
+                assert!(channel_workers.iter().all(|count| *count <= 32));
+            }
+        }
+    }
+}
+
+#[test]
 fn authoritative_state_requires_every_acknowledged_or_preseeded_path() {
     let authority = (0..3)
         .map(|id| (data::mutable_path(id), id + 1))

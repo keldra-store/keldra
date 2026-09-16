@@ -19,6 +19,25 @@ use tonic::transport::Channel;
 // the harness must not bypass that public pagination contract.
 const FINAL_VERIFICATION_PAGE_SIZE: u32 = 1_000;
 
+// Tiny unary HeadObject request frames share h2's connection-wide framing
+// overhead budget. Channel clones share one connection, so bound terminal
+// authority reads separately from the workload's query concurrency.
+const AUTHORITY_READS_PER_CHANNEL: usize = 32;
+
+pub(super) fn authority_worker_count(
+    query_max_in_flight: usize,
+    mutable_records: usize,
+    channel_count: usize,
+) -> Result<usize> {
+    ensure!(
+        channel_count > 0,
+        "mutable authority reads require at least one transport channel"
+    );
+    Ok(query_max_in_flight
+        .min(mutable_records)
+        .min(channel_count.saturating_mul(AUTHORITY_READS_PER_CHANNEL)))
+}
+
 pub(super) async fn load_authoritative_mutable_state(
     config: &Config,
     channels: &[Channel],
@@ -28,7 +47,8 @@ pub(super) async fn load_authoritative_mutable_state(
     let mut authority = BTreeMap::new();
     let mutable_records = usize::try_from(config.mutable_records)
         .context("configured mutable key count does not fit in memory")?;
-    let worker_count = config.query_max_in_flight.min(mutable_records);
+    let worker_count =
+        authority_worker_count(config.query_max_in_flight, mutable_records, channels.len())?;
     let mut workers = JoinSet::new();
     for worker in 0..worker_count {
         let channel = channels[worker % channels.len()].clone();
