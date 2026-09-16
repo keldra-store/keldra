@@ -138,6 +138,30 @@ impl Store {
             return Ok(());
         }
 
+        if status.retained_entries <= self.watch_retention.max_entries
+            && status.retained_bytes <= self.watch_retention.max_bytes
+        {
+            // Advancing the process-local proof needs no durable mutation when
+            // retention has no work. In particular, an exact-path guard (or a
+            // mutation waiting for it) must not block unrelated delivery on an
+            // exclusive lane fence. A raced advance cannot regress this cut.
+            // If a concurrent append crosses a bound, both its own wakeup and
+            // this proof-advance wakeup let capacity admission retry retention.
+            let previous = self
+                .source_journal_reference_safe_through
+                .fetch_max(offset, std::sync::atomic::Ordering::AcqRel);
+            if offset < previous {
+                record_reference_safe_outcome(ReferenceSafeOutcome::Regressed);
+            } else if offset == previous {
+                record_reference_safe_outcome(ReferenceSafeOutcome::EqualNoop);
+            } else {
+                self.mutation_capacity_notify.notify_waiters();
+                self.notify_local_invalidations();
+                record_reference_safe_outcome(ReferenceSafeOutcome::Advanced);
+            }
+            return Ok(());
+        }
+
         let _commit_guard = self.lock_commit("watch_journal").await;
         let status = self
             .local_watch_status()
@@ -162,13 +186,16 @@ impl Store {
             record_reference_safe_outcome(ReferenceSafeOutcome::EqualNoop);
             return Ok(());
         }
-        let outcome = if offset == current {
+        let previous = self
+            .source_journal_reference_safe_through
+            .fetch_max(offset, std::sync::atomic::Ordering::AcqRel);
+        let outcome = if offset < previous {
+            ReferenceSafeOutcome::Regressed
+        } else if offset == previous {
             ReferenceSafeOutcome::Maintenance
         } else {
             ReferenceSafeOutcome::Advanced
         };
-        self.source_journal_reference_safe_through
-            .store(offset, std::sync::atomic::Ordering::Release);
         self.enforce_local_watch_retention()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         self.mutation_capacity_notify.notify_waiters();
@@ -770,6 +797,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advancing_reference_safe_under_limits_coexists_with_exact_path_guard() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        append_local_change(&store, "guarded").await;
+        let status = store.local_watch_status().unwrap();
+        store
+            .source_journal_reference_safe_through
+            .store(0, std::sync::atomic::Ordering::Release);
+        let sequence = store.db.latest_sequence_number();
+        let notifications = store.watch_notify.subscribe();
+        let key = ObjectKey::new("tenant", "bucket", "reference-safe-guarded").unwrap();
+
+        store
+            .with_ordinary_object_path_lock(&key, || async {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    store.advance_source_journal_reference_safe_through(status.tail),
+                )
+                .await
+                .expect("under-limit proof advancement must not acquire an exclusive lane fence")
+                .unwrap();
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(store.db.latest_sequence_number(), sequence);
+        assert_eq!(
+            store
+                .source_journal_reference_safe_through
+                .load(std::sync::atomic::Ordering::Acquire),
+            status.tail
+        );
+        assert!(notifications.has_changed().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn raced_under_limit_reference_safe_advances_remain_monotonic() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let mut tails = Vec::new();
+        for suffix in ["first", "second", "third"] {
+            append_local_change(&store, suffix).await;
+            tails.push(store.local_watch_status().unwrap().tail);
+        }
+        store
+            .source_journal_reference_safe_through
+            .store(0, std::sync::atomic::Ordering::Release);
+        let sequence = store.db.latest_sequence_number();
+        let commit_guard = store.lock_commit("raced-reference-safe-test").await;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let calls = tails
+            .iter()
+            .copied()
+            .map(|tail| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    store
+                        .advance_source_journal_reference_safe_through(tail)
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            for call in calls {
+                call.await.unwrap().unwrap();
+            }
+        })
+        .await
+        .expect("under-limit advances must not wait for the exclusive commit lock");
+
+        assert_eq!(
+            store
+                .source_journal_reference_safe_through
+                .load(std::sync::atomic::Ordering::Acquire),
+            tails[2]
+        );
+        assert_eq!(store.db.latest_sequence_number(), sequence);
+        drop(commit_guard);
+    }
+
+    #[tokio::test]
     async fn equal_reference_safe_over_limits_still_runs_locked_retention() {
         let temporary = tempfile::tempdir().unwrap();
         let mut store = Store::open(StoreOptions::new(temporary.path(), 1))
@@ -813,7 +927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advancing_reference_safe_rechecks_after_a_raced_advance() {
+    async fn advancing_reference_safe_under_limits_wakes_once_without_commit_lock() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
@@ -824,7 +938,7 @@ mod tests {
             .source_journal_reference_safe_through
             .store(0, std::sync::atomic::Ordering::Release);
         let sequence = store.db.latest_sequence_number();
-        let notifications = store.watch_notify.subscribe();
+        let mut notifications = store.watch_notify.subscribe();
         let commit_guard = store.lock_commit("raced-reference-safe-test").await;
         let call_store = store.clone();
         let call = tokio::spawn(async move {
@@ -832,12 +946,21 @@ mod tests {
                 .advance_source_journal_reference_safe_through(tail)
                 .await
         });
-        tokio::task::yield_now().await;
+        tokio::time::timeout(std::time::Duration::from_millis(250), call)
+            .await
+            .expect("under-limit proof advancement must not wait for the commit lock")
+            .unwrap()
+            .unwrap();
+        assert!(notifications.has_changed().unwrap());
+        notifications.borrow_and_update();
         store
             .source_journal_reference_safe_through
             .store(tail, std::sync::atomic::Ordering::Release);
+        store
+            .advance_source_journal_reference_safe_through(tail)
+            .await
+            .unwrap();
         drop(commit_guard);
-        call.await.unwrap().unwrap();
 
         assert_eq!(
             store

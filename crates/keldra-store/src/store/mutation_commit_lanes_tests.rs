@@ -862,6 +862,177 @@ async fn durable_projection_ahead_of_runtime_does_not_reject_a_lane_reservation(
 }
 
 #[tokio::test]
+async fn contiguous_inline_mutation_reopens_without_reusing_its_durable_ticket() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let first_key = ObjectKey::new("tenant", "bucket", "objects/first-inline").unwrap();
+    let first = store
+        .put(PutRequest {
+            key: first_key.clone(),
+            bytes: b"first-inline".to_vec(),
+            content_type: None,
+            mode: PutMode::PutIfAbsent,
+            command_id: Some("first-inline-command".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+    let first_ticket = store
+        .mutation_commit_lanes
+        .sequence()
+        .await
+        .as_ref()
+        .unwrap()
+        .projected_ticket;
+    assert_eq!(first_ticket, 1);
+    assert_eq!(
+        store
+            .db
+            .get_cf(store.cf(CF_METADATA).unwrap(), LANE_FRONTIER_KEY)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        first_ticket.to_be_bytes().as_slice()
+    );
+    assert!(
+        store
+            .db
+            .get_cf(
+                store.cf(CF_METADATA).unwrap(),
+                lane_completion_key(first_ticket)
+            )
+            .unwrap()
+            .is_none()
+    );
+    let first_watch = store.local_watch_status().unwrap();
+    let first_receipts = store.mutation_receipt_status().unwrap();
+    drop(store);
+
+    let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    {
+        let runtime = reopened.mutation_commit_lanes.sequence().await;
+        let runtime = runtime.as_ref().unwrap();
+        assert_eq!(runtime.projected_ticket, first_ticket);
+        assert_eq!(runtime.next_ticket, first_ticket);
+        assert_eq!(runtime.projected_watch, first_watch);
+        assert_eq!(runtime.projected_receipts, first_receipts);
+    }
+    let object = reopened.get(&first_key).await.unwrap().unwrap();
+    assert_eq!(object.bytes, b"first-inline");
+    let next = reopened
+        .put(PutRequest {
+            key: ObjectKey::new("tenant", "bucket", "objects/next-inline").unwrap(),
+            bytes: b"next-inline".to_vec(),
+            content_type: None,
+            mode: PutMode::PutIfAbsent,
+            command_id: Some("next-inline-command".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+    assert!(next.version > first.version);
+    let runtime = reopened.mutation_commit_lanes.sequence().await;
+    let runtime = runtime.as_ref().unwrap();
+    assert_eq!(runtime.next_ticket, first_ticket + 1);
+    assert_eq!(runtime.projected_ticket, first_ticket + 1);
+    assert!(
+        reopened
+            .db
+            .get_cf(
+                reopened.cf(CF_METADATA).unwrap(),
+                lane_completion_key(runtime.projected_ticket),
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_inline_primary_result_uses_durable_frontier_without_a_marker() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let encoded = encode_local_change(&LocalChange::sequence_gap(1)).unwrap();
+    let mut batch = WriteBatch::default();
+    batch.put_cf(
+        store.cf(CF_LOCAL_INVALIDATIONS).unwrap(),
+        invalidation_key(1),
+        &encoded,
+    );
+    let (completion, projection) = {
+        let mut runtime = store.mutation_commit_lanes.sequence().await;
+        let runtime = runtime.as_mut().unwrap();
+        let mut watch = runtime.reserved_watch;
+        watch.tail = 1;
+        watch.retained_entries += 1;
+        watch.retained_bytes += invalidation_record_bytes(encoded.len());
+        let receipts = runtime.reserved_receipts;
+        let completion = runtime
+            .reserve_with_reference_settlement(
+                watch,
+                receipts,
+                Some(VersionId(91)),
+                true,
+                true,
+                true,
+            )
+            .unwrap();
+        let projection = store
+            .stage_inline_lane_projection(&mut batch, runtime, completion)
+            .unwrap()
+            .expect("the first contiguous completion projects inline");
+        (completion, projection)
+    };
+    store.db.write(batch).unwrap();
+    assert!(
+        store
+            .db
+            .get_cf(store.cf(CF_METADATA).unwrap(), completion.key())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .mutation_commit_lanes
+            .sequence()
+            .await
+            .as_ref()
+            .unwrap()
+            .projected_ticket,
+        0,
+        "the durable primary has not yet published its volatile frontier"
+    );
+
+    store
+        .finish_lane_commit_cancellation_safe_with_inline_projection(
+            completion,
+            Some(projection),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let runtime = store.mutation_commit_lanes.sequence().await;
+    let runtime = runtime.as_ref().unwrap();
+    assert_eq!(runtime.projected_ticket, completion.ticket);
+    assert!(runtime.completions.is_empty());
+    assert_eq!(runtime.projected_high_version, Some(VersionId(91)));
+    assert_eq!(
+        (
+            runtime.projected_watch.tail,
+            runtime.projected_watch.settled_through
+        ),
+        (1, 1)
+    );
+    assert_eq!(store.local_watch_status().unwrap(), runtime.projected_watch);
+}
+
+#[tokio::test]
 async fn restart_closes_abandoned_source_gap_before_later_completion() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
@@ -975,6 +1146,89 @@ async fn physical_slot_metrics_track_current_and_peak_utilization() {
     assert_eq!(first.physical_slots_active(), 1);
     drop(first);
     assert_eq!(lanes.physical_slots_active.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn waited_overwrite_rediscovers_and_excludes_the_new_predecessor_blob() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let request = |bytes: &[u8], command: &str| PutRequest {
+        key: ObjectKey::new("tenant", "bucket", "objects/rediscovered").unwrap(),
+        bytes: bytes.to_vec(),
+        content_type: None,
+        mode: PutMode::Put,
+        command_id: Some(command.into()),
+        durability: Durability::Local,
+    };
+    store.put(request(b"v1", "rediscovery-v1")).await.unwrap();
+    store.mutation_commit_lanes.pause_next_lane_evaluation();
+    let first = tokio::spawn({
+        let store = store.clone();
+        let request = request(b"v2", "rediscovery-v2");
+        async move { store.put(request).await }
+    });
+    store
+        .mutation_commit_lanes
+        .wait_for_paused_lane_evaluation()
+        .await;
+    // Reserve the newly published blob as soon as the first writer releases
+    // it. The next writer initially discovers v1, so only a full head/version
+    // reload and resource rediscovery can make it respect this v2 exclusion.
+    let next_blob = store
+        .mutation_commit_lanes
+        .conflicts
+        .register([blob_conflict_resource(
+            &crate::store::blob_reference_for_bytes(b"v2"),
+        )]);
+    let mut second = tokio::spawn({
+        let store = store.clone();
+        let request = request(b"v3", "rediscovery-v3");
+        async move { store.put(request).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while store.mutation_commit_lanes.conflicts.waiting() != 2 {
+            assert!(!second.is_finished());
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second writer must discover v1 while the first is paused");
+    store.mutation_commit_lanes.resume_paused_lane_evaluation();
+    first.await.unwrap().unwrap();
+    let next_blob = next_blob.acquire().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while store.mutation_commit_lanes.conflicts.waiting() != 1 {
+            assert!(
+                !second.is_finished(),
+                "the second writer omitted its new predecessor blob"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the refreshed writer must requeue for the new predecessor blob");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut second)
+            .await
+            .is_err()
+    );
+    drop(next_blob);
+    tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .get(&ObjectKey::new("tenant", "bucket", "objects/rediscovered").unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .bytes,
+        b"v3"
+    );
 }
 
 #[tokio::test]

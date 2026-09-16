@@ -1263,21 +1263,22 @@ impl Store {
             .head_key(key.path()))
     }
 
-    /// Runs one internal orchestration step while holding the same exact
-    /// logical-path lock used by every ordinary Put/Delete/Publish mutation.
-    /// This does not use the atomic-program lock table and owns no additional
-    /// authority or persistent state.
+    /// Holds the ordinary Put/Delete/Publish conflict guard for one exact path.
+    /// Its released physical permit leaves unrelated group registration free.
     pub async fn with_ordinary_object_path_lock<T, F, Fut>(
         &self,
         key: &ObjectKey,
         operation: F,
-    ) -> T
+    ) -> Result<T, MutationError>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = T>,
     {
-        let _guard = self.ordinary_locks.acquire(&[object_path(key)]).await;
-        operation().await
+        let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
+        let resource = mutation_commit_lanes::object_path_conflict_resource(identity, key.path());
+        let mut guard = self.mutation_commit_lanes.acquire([resource]).await;
+        guard.release_physical_slot();
+        Ok(operation().await)
     }
 
     /// Runs one internal orchestration step while holding the ordinary locks

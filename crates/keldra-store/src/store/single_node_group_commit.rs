@@ -12,6 +12,7 @@ use tokio::time::Instant;
 use super::Store;
 use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_helpers::mutation_capacity_kind;
+use crate::key::{BucketId, BucketIdentity, TenantId};
 use crate::{
     BatchOperation, CoordinatedObjectMutation, DefinitionMutationIntent, MutationError,
     ObjectMutationContext, ObjectMutationGovernance,
@@ -172,6 +173,13 @@ pub(super) type SingleNodeOperations = Vec<(
 pub(super) enum MutationGroupMode {
     SingleNode,
     Distributed,
+    VerifiedDistributedPublish,
+}
+
+impl MutationGroupMode {
+    fn is_distributed(self) -> bool {
+        matches!(self, Self::Distributed | Self::VerifiedDistributedPublish)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
@@ -264,6 +272,29 @@ impl SingleNodeCommitRequest {
                     BatchOperation::Delete(request) => request.key.path(),
                 };
                 (governance.tenant_id, governance.bucket_id, path)
+            })
+            .collect()
+    }
+
+    fn object_conflict_resources(&self) -> BTreeSet<Vec<u8>> {
+        self.operations
+            .iter()
+            .flat_map(|(operation, governance, _)| {
+                let identity = BucketIdentity {
+                    tenant_id: TenantId(governance.tenant_id),
+                    bucket_id: BucketId(governance.bucket_id),
+                };
+                let paths = match operation {
+                    BatchOperation::Clone(request) => {
+                        vec![request.source.path(), request.destination.path()]
+                    }
+                    BatchOperation::Put(request) => vec![request.key.path()],
+                    BatchOperation::Publish(request) => vec![request.key.path()],
+                    BatchOperation::Delete(request) => vec![request.key.path()],
+                };
+                paths.into_iter().map(move |path| {
+                    super::mutation_commit_lanes::object_path_conflict_resource(identity, path)
+                })
             })
             .collect()
     }
@@ -419,7 +450,9 @@ impl SingleNodeGroupCommit {
         let mut operations = first.operation_count();
         let mut inline_bytes = first.inline_bytes();
         let context = first.context;
-        let mut distributed_replication_paths = (first.mode == MutationGroupMode::Distributed)
+        let mut distributed_replication_paths = first
+            .mode
+            .is_distributed()
             .then(|| first.distributed_replication_paths());
         let Some(mut governance) = first.consistent_governance() else {
             return Some(GroupPlan {
@@ -446,7 +479,9 @@ impl SingleNodeGroupCommit {
             if candidate.mode != first.mode {
                 break "topology_mode";
             }
-            let candidate_replication_paths = (first.mode == MutationGroupMode::Distributed)
+            let candidate_replication_paths = first
+                .mode
+                .is_distributed()
                 .then(|| candidate.distributed_replication_paths());
             if candidate_replication_paths
                 .as_ref()
@@ -585,6 +620,23 @@ impl SingleNodeGroupCommit {
         .await
     }
 
+    pub(super) async fn submit_verified_distributed_publish(
+        &self,
+        store: Store,
+        operations: SingleNodeOperations,
+        context: ObjectMutationContext,
+        source_journal_admission: SourceJournalAdmission,
+    ) -> SingleNodeOutcomes {
+        self.submit_with_mode(
+            store,
+            operations,
+            context,
+            source_journal_admission,
+            MutationGroupMode::VerifiedDistributedPublish,
+        )
+        .await
+    }
+
     async fn submit_with_mode(
         &self,
         store: Store,
@@ -692,7 +744,12 @@ impl SingleNodeGroupCommit {
     async fn run(self, store: Store) {
         loop {
             let dwell_started = Instant::now();
-            let (requests, shared_queued_requests, shared_peak_queued_requests, stop_reason) = loop {
+            let (
+                mut requests,
+                mut shared_queued_requests,
+                shared_peak_queued_requests,
+                mut stop_reason,
+            ) = loop {
                 let notified = self.queue_changed.notified();
                 let action = {
                     let mut state = self.state.lock().await;
@@ -721,6 +778,27 @@ impl SingleNodeGroupCommit {
                     }
                 }
             };
+            if let Some(conflict_index) = requests.iter().position(|request| {
+                store
+                    .mutation_commit_lanes
+                    .has_active_conflict(request.object_conflict_resources())
+            }) {
+                // One physical group owns one union conflict set. Do not let a
+                // request already blocked on an exact object path pull an
+                // unrelated request into that wait. Register the blocked head
+                // alone (or stop immediately before a blocked candidate), then
+                // let the run loop dispatch the independent suffix.
+                let split_at = conflict_index.max(1);
+                if split_at < requests.len() {
+                    let deferred = requests.split_off(split_at);
+                    let mut state = self.state.lock().await;
+                    for request in deferred.into_iter().rev() {
+                        state.requests.push_front(request);
+                    }
+                    shared_queued_requests = state.requests.len();
+                    stop_reason = "active_object_conflict";
+                }
+            }
             let registration_handoff = self.next_registration_handoff().await;
             self.active_groups.fetch_add(1, Ordering::AcqRel);
             let queue = self.clone();
@@ -1044,12 +1122,16 @@ fn unix_milliseconds() -> u64 {
 mod test_support;
 
 #[cfg(test)]
+#[path = "single_node_group_commit_planning_tests.rs"]
+mod planning_tests;
+
+#[cfg(test)]
 mod tests {
     use super::test_support::*;
     use super::*;
     use crate::{
-        BucketPolicy, DestinationReferenceArtifact, DestinationReferenceDelta,
-        MutationReceiptRetention, ObjectKey, ReferenceDeltaBatch, StoreOptions,
+        DestinationReferenceArtifact, DestinationReferenceDelta, MutationReceiptRetention,
+        ObjectKey, ReferenceDeltaBatch, StoreOptions,
     };
 
     #[tokio::test]
@@ -1440,6 +1522,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn verified_and_ordinary_distributed_publishes_are_separate_groups() {
+        let queue = SingleNodeGroupCommit::new(SingleNodeGroupCommitConfig::default());
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        let governance = governance(&store);
+        let enqueued_at = Instant::now();
+        let mut ordinary = queued_request(
+            &queue,
+            request("objects/ordinary", "ordinary", governance.clone()),
+            context(1),
+            enqueued_at,
+        );
+        ordinary.mode = MutationGroupMode::Distributed;
+        let mut verified = queued_request(
+            &queue,
+            request("objects/verified", "verified", governance),
+            context(1),
+            enqueued_at,
+        );
+        verified.mode = MutationGroupMode::VerifiedDistributedPublish;
+        let requests = VecDeque::from([ordinary, verified]);
+
+        assert_eq!(
+            queue.plan_group(&requests),
+            Some(GroupPlan {
+                request_count: 1,
+                stop_reason: "topology_mode",
+            })
+        );
+    }
+
     #[test]
     fn group_commit_config_rejects_invalid_lane_counts() {
         assert!(
@@ -1782,109 +1898,6 @@ mod tests {
             store.mutation_receipt_status().unwrap().entries,
             legacy_receipts.entries + 1
         );
-    }
-
-    #[test]
-    fn conflicting_governance_stops_the_current_group() {
-        let queue = SingleNodeGroupCommit::new(SingleNodeGroupCommitConfig::default());
-        let enqueued_at = Instant::now();
-        let mut state = QueueState::default();
-        let first = governance_stub();
-        let mut second = first.clone();
-        second.policy = BucketPolicy {
-            immutable_prefixes: vec!["immutable".into()],
-            ..BucketPolicy::default()
-        };
-        state.requests.push_back(queued_request(
-            &queue,
-            request("objects/first", "first", first),
-            context(1),
-            enqueued_at,
-        ));
-        state.requests.push_back(queued_request(
-            &queue,
-            request("objects/second", "second", second),
-            context(1),
-            enqueued_at,
-        ));
-        assert!(matches!(
-            queue.next_queue_action(&mut state, enqueued_at),
-            QueueAction::Group { requests, stop_reason: "governance", .. }
-                if requests.len() == 1
-        ));
-        assert_eq!(state.requests.len(), 1);
-    }
-
-    #[test]
-    fn incompatible_context_stops_the_current_group() {
-        let queue = SingleNodeGroupCommit::new(SingleNodeGroupCommitConfig::default());
-        let enqueued_at = Instant::now();
-        let mut state = QueueState::default();
-        let governance = governance_stub();
-        state.requests.push_back(queued_request(
-            &queue,
-            request("objects/context-first", "context-first", governance.clone()),
-            context(1),
-            enqueued_at,
-        ));
-        state.requests.push_back(queued_request(
-            &queue,
-            request("objects/context-second", "context-second", governance),
-            context(2),
-            enqueued_at,
-        ));
-        assert!(matches!(
-            queue.next_queue_action(&mut state, enqueued_at),
-            QueueAction::Group { requests, stop_reason: "context", .. }
-                if requests.len() == 1
-        ));
-        assert_eq!(state.requests.len(), 1);
-    }
-
-    #[test]
-    fn derived_progress_is_never_combined_with_an_ordinary_group() {
-        let queue = SingleNodeGroupCommit::new(SingleNodeGroupCommitConfig::default());
-        let enqueued_at = Instant::now();
-        let mut state = QueueState::default();
-        let governance = governance_stub();
-        state.requests.push_back(queued_request(
-            &queue,
-            request("objects/ordinary", "ordinary", governance.clone()),
-            context(1),
-            enqueued_at,
-        ));
-        let mut derived = queued_request(
-            &queue,
-            request("objects/derived", "derived", governance),
-            context(1),
-            enqueued_at,
-        );
-        derived.source_journal_admission = SourceJournalAdmission::DerivedProgress;
-        state.requests.push_back(derived);
-
-        assert!(matches!(
-            queue.next_queue_action(&mut state, enqueued_at),
-            QueueAction::Group {
-                requests,
-                stop_reason: "source_journal_admission",
-                ..
-            } if requests.len() == 1
-        ));
-        assert_eq!(state.requests.len(), 1);
-    }
-
-    #[test]
-    fn shared_queue_accounting_does_not_wrap() {
-        let queue = SingleNodeGroupCommit::new(
-            SingleNodeGroupCommitConfig::default()
-                .with_commit_lanes(2)
-                .unwrap(),
-        );
-        assert_eq!(queue.record_enqueued_request(), 1);
-        assert_eq!(queue.record_enqueued_request(), 2);
-        assert_eq!(queue.record_dequeued_requests(1), 1);
-        assert_eq!(queue.record_dequeued_requests(1), 0);
-        assert_eq!(queue.queued_requests_peak.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test]

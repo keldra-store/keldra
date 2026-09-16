@@ -182,10 +182,13 @@ impl Store {
                             Ok(ObjectMutationGovernance {
                                 tenant_id: identity.tenant_id.0,
                                 bucket_id: identity.bucket_id.0,
-                                versioning: self.bucket_versioning_by_key(&identity.encode())?,
-                                policy: self
-                                    .bucket_policy_by_key(&identity.encode())?
-                                    .unwrap_or_default(),
+                                // The conflict-lane snapshot bulk-prefetches
+                                // both settings under the policy gate. Carry
+                                // only the stable bucket identity to it here;
+                                // point reads would duplicate that work once
+                                // per distinct bucket.
+                                versioning: ObjectVersioning::default(),
+                                policy: BucketPolicy::default(),
                             })
                         })
                         .clone()
@@ -231,10 +234,9 @@ impl Store {
                     for ((index, operation, governance, intent), outcome) in
                         pending.drain(..).zip(outcomes)
                     {
-                        if backpressure
-                            && outcome
-                                .as_ref()
-                                .is_err_and(|error| is_mutation_capacity(error))
+                        if outcome
+                            .as_ref()
+                            .is_err_and(|error| is_mutation_capacity(error))
                         {
                             let capacity = outcome
                                 .as_ref()
@@ -246,7 +248,7 @@ impl Store {
                             } else {
                                 retry_capacity = Some(capacity);
                             }
-                            retry.push((index, operation, governance, intent));
+                            retry.push((index, operation, governance, intent, outcome));
                         } else {
                             completed.insert(index, outcome);
                         }
@@ -259,16 +261,46 @@ impl Store {
                             "one local lane batch returned contradictory capacity authorities"
                                 .into(),
                         );
-                        for (index, _, _, _) in retry.drain(..) {
+                        for (index, _, _, _, _) in retry.drain(..) {
                             completed.insert(index, Err(error.clone()));
                         }
                         break;
                     }
-                    pending = retry;
-                    self.wait_for_capacity_with_metrics(
-                        retry_capacity.expect("a capacity retry names its authority"),
-                    )
-                    .await;
+                    let capacity = retry_capacity.expect("a capacity retry names its authority");
+                    if capacity == "receipt" {
+                        match self.prune_expired_receipts_for_capacity().await {
+                            Ok(true) => {
+                                pending = retry
+                                    .into_iter()
+                                    .map(|(index, operation, governance, intent, _)| {
+                                        (index, operation, governance, intent)
+                                    })
+                                    .collect();
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                for (index, _, _, _, _) in retry {
+                                    completed.insert(index, Err(error.clone()));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if backpressure {
+                        pending = retry
+                            .into_iter()
+                            .map(|(index, operation, governance, intent, _)| {
+                                (index, operation, governance, intent)
+                            })
+                            .collect();
+                        self.wait_for_capacity_with_metrics(capacity).await;
+                    } else {
+                        for (index, _, _, _, outcome) in retry {
+                            completed.insert(index, outcome);
+                        }
+                        break;
+                    }
                 }
                 Err(error) if backpressure && is_mutation_capacity(&error) => {
                     let capacity =
@@ -399,8 +431,8 @@ impl Store {
         governance.validate()?;
         intent.validate().map_err(definition_mutation_error)?;
         let mut outcomes = self
-            .coordinate_distributed_mutation_batch_with_admission(
-                vec![(BatchOperation::Publish(request), governance, Some(intent))],
+            .coordinate_verified_distributed_publish_operations_with_admission(
+                vec![(request, governance, Some(intent))],
                 context,
                 SourceJournalAdmission::Bounded,
             )

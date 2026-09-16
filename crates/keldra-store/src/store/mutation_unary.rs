@@ -64,8 +64,8 @@ impl Store {
         }
         governance.validate()?;
         let mut outcomes = self
-            .coordinate_distributed_mutation_batch_with_admission(
-                vec![(BatchOperation::Publish(request), governance, None)],
+            .coordinate_verified_distributed_publish_operations_with_admission(
+                vec![(request, governance, None)],
                 context,
                 SourceJournalAdmission::Bounded,
             )

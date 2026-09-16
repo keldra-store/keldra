@@ -881,9 +881,10 @@ async fn bulk_wal_contains_one_high_watermark_and_replay_adds_no_write() {
     // Three small raw values, blob lifecycle records, versions, heads, receipts,
     // receipt-expiry indexes, invalidations and bucket journal routes, plus one
     // version watermark, one atomic watch status, the locally-applied reference
-    // cursor and one atomic receipt status. Inline manifests are derived from
-    // the immutable raw value. All metadata moves in this one physical batch.
-    assert_eq!(counter.puts, 28);
+    // cursor, one atomic receipt status and the durable mutation-lane frontier.
+    // Inline manifests are derived from the immutable raw value. All metadata
+    // moves in this one physical batch.
+    assert_eq!(counter.puts, 29);
     assert_eq!(counter.high_watermark_puts, 1);
     assert_eq!(counter.invalidation_metadata_puts, 1);
     assert_eq!(counter.receipt_metadata_puts, 1);

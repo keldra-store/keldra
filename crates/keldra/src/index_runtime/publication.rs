@@ -619,6 +619,7 @@ impl IndexArtifactCoordinator {
                 Ok(outcome)
             })
             .await
+            .map_err(|error| Status::unavailable(error.to_string()))?
     }
 
     async fn publish_unguarded(

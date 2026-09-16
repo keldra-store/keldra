@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 
+pub(super) const MUTEX_ONLY_BLOB_RESOURCE_TAG: u8 = 3;
+
 #[derive(Clone, Default)]
 pub(super) struct MutationConflictScheduler {
     inner: Arc<Mutex<SchedulerState>>,
@@ -33,6 +35,7 @@ struct Waiter {
 
 pub(super) struct MutationConflictGuard {
     scheduler: MutationConflictScheduler,
+    ticket: u64,
     resources: BTreeSet<Vec<u8>>,
 }
 
@@ -138,6 +141,54 @@ impl MutationConflictScheduler {
         schedule_waiters(&mut state);
     }
 
+    fn rediscover(
+        &self,
+        ticket: u64,
+        held: &BTreeSet<Vec<u8>>,
+        resources: BTreeSet<Vec<u8>>,
+    ) -> MutationConflictAcquisition {
+        let (ready, receiver) = oneshot::channel();
+        let mut state = self
+            .inner
+            .lock()
+            .expect("mutation conflict scheduler lock is not poisoned");
+        for resource in held {
+            assert!(state.active.remove(resource));
+        }
+        let position = state
+            .waiting
+            .iter()
+            .position(|waiter| waiter.ticket > ticket)
+            .unwrap_or(state.waiting.len());
+        state.waiting.insert(
+            position,
+            Waiter {
+                ticket,
+                resources,
+                ready,
+            },
+        );
+        schedule_waiters(&mut state);
+        MutationConflictAcquisition {
+            pending: PendingAcquisition {
+                scheduler: self.clone(),
+                ticket,
+                armed: true,
+            },
+            ready: receiver,
+        }
+    }
+
+    pub(super) fn has_active_conflict(&self, resources: impl IntoIterator<Item = Vec<u8>>) -> bool {
+        let state = self
+            .inner
+            .lock()
+            .expect("mutation conflict scheduler lock is not poisoned");
+        resources
+            .into_iter()
+            .any(|resource| state.active.contains(&resource))
+    }
+
     #[cfg(test)]
     pub(super) fn waiting(&self) -> usize {
         self.inner
@@ -162,8 +213,24 @@ impl MutationConflictAcquisition {
         pending.armed = false;
         MutationConflictGuard {
             scheduler: pending.scheduler.clone(),
+            ticket,
             resources,
         }
+    }
+}
+
+impl MutationConflictGuard {
+    pub(super) fn rediscover(
+        mut self,
+        resources: impl IntoIterator<Item = Vec<u8>>,
+    ) -> MutationConflictAcquisition {
+        let acquisition = self.scheduler.rediscover(
+            self.ticket,
+            &self.resources,
+            resources.into_iter().collect(),
+        );
+        self.resources.clear();
+        acquisition
     }
 }
 
@@ -192,7 +259,17 @@ fn schedule_waiters(state: &mut SchedulerState) {
         if intersects(&waiter.resources, &state.active)
             || intersects(&waiter.resources, &earlier_blocked_resources)
         {
-            earlier_blocked_resources.extend(waiter.resources.iter().cloned());
+            // Blob reference bookkeeping needs exclusion, not caller FIFO:
+            // an older waiter blocked on its object path must not reserve an
+            // otherwise idle shared blob against independent objects. Object,
+            // receipt and definition resources retain their ordered position.
+            earlier_blocked_resources.extend(
+                waiter
+                    .resources
+                    .iter()
+                    .filter(|resource| resource.first() != Some(&MUTEX_ONLY_BLOB_RESOURCE_TAG))
+                    .cloned(),
+            );
             retained.push_back(waiter);
             continue;
         }
@@ -277,6 +354,47 @@ mod tests {
         drop(independent_b);
         drop(held_a);
         waiting_a.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_shared_blob_bypasses_an_older_blocked_object_waiter() {
+        let scheduler = MutationConflictScheduler::default();
+        let blob = vec![MUTEX_ONLY_BLOB_RESOURCE_TAG, 42];
+        let held_a = scheduler.acquire([resource("a")]).await;
+        let waiting_a = scheduler.register([resource("a"), blob.clone()]);
+        let independent = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scheduler.acquire([resource("b"), blob.clone()]),
+        )
+        .await
+        .expect("idle blob exclusion must not inherit another object's blocked FIFO");
+        drop(held_a);
+        assert_eq!(
+            scheduler.waiting(),
+            1,
+            "an active blob still excludes all other bookkeeping"
+        );
+        drop(independent);
+        waiting_a.acquire().await;
+    }
+
+    #[tokio::test]
+    async fn rediscovery_retains_object_fifo_without_holding_partial_resources() {
+        let scheduler = MutationConflictScheduler::default();
+        let first = scheduler.acquire([resource("a")]).await;
+        let held_b = scheduler.acquire([resource("b")]).await;
+        let younger = scheduler.register([resource("a")]);
+        let corrected = first.rediscover([resource("a"), resource("b")]);
+        assert_eq!(scheduler.waiting(), 2);
+        drop(held_b);
+        let corrected = corrected.acquire().await;
+        assert_eq!(
+            scheduler.waiting(),
+            1,
+            "rediscovery must retain its older object position"
+        );
+        drop(corrected);
+        younger.acquire().await;
     }
 
     #[tokio::test]

@@ -280,7 +280,8 @@ async fn ordinary_definition_guard_blocks_only_its_exact_path() {
                 entered_sender.send(()).unwrap();
                 release_receiver.await.unwrap();
             })
-            .await;
+            .await
+            .unwrap();
     });
     entered_receiver.await.unwrap();
 

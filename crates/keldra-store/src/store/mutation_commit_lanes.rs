@@ -209,6 +209,19 @@ pub(super) struct LaneCompletion {
     pub(super) visibility_settled: bool,
 }
 
+/// A contiguous lane completion whose durable authorities were folded into the
+/// primary mutation batch. Those authority snapshots also disambiguate an
+/// ambiguous RocksDB result without adding a completion marker to the common
+/// one-WAL path.
+pub(super) struct InlineLaneProjection {
+    base_projected_ticket: u64,
+    projected_ticket: u64,
+    projected_watch: WatchJournalStatus,
+    projected_receipts: MutationReceiptStatus,
+    projected_high_version: Option<VersionId>,
+    inline_reference_safe_through: Option<u64>,
+}
+
 #[derive(Clone)]
 pub(super) struct LaneRuntime {
     pub(super) next_ticket: u64,
@@ -362,6 +375,10 @@ impl MutationCommitLanes {
         self.acquire_with_fence(fence, resources).await
     }
 
+    pub(super) fn has_active_conflict(&self, resources: impl IntoIterator<Item = Vec<u8>>) -> bool {
+        self.conflicts.has_active_conflict(resources)
+    }
+
     pub(super) async fn acquire_exclusive(&self) -> ExclusiveMutationGuard<'static> {
         ExclusiveMutationGuard {
             _fence: ExclusiveFence::Owned {
@@ -491,6 +508,23 @@ impl MutationLaneRegistration {
 }
 
 impl MutationLaneAdmission {
+    pub(super) async fn rediscover(self, resources: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        let Self {
+            lanes,
+            fence,
+            conflicts,
+            conflict_wait,
+        } = self;
+        let started = Instant::now();
+        let conflicts = conflicts.rediscover(resources).acquire().await;
+        Self {
+            lanes,
+            fence,
+            conflicts,
+            conflict_wait: conflict_wait + started.elapsed(),
+        }
+    }
+
     pub(super) async fn acquire_physical(self) -> MutationLaneGuard {
         let Self {
             lanes,
@@ -862,6 +896,69 @@ impl Store {
         Ok(())
     }
 
+    /// Folds the ordered projection into the primary batch when this
+    /// completion has no unprojected predecessor. This preserves one durable
+    /// RocksDB commit for the common group-commit path while later independent
+    /// lanes still use the reorder-safe projector.
+    pub(super) fn stage_inline_lane_projection(
+        &self,
+        batch: &mut WriteBatch,
+        runtime: &LaneRuntime,
+        completion: LaneCompletion,
+    ) -> Result<Option<InlineLaneProjection>, MutationError> {
+        if completion.ticket != runtime.projected_ticket.saturating_add(1)
+            || !runtime.completions.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let base_projected_ticket = runtime.projected_ticket;
+        let mut projected_watch = runtime.projected_watch;
+        let mut projected_receipts = runtime.projected_receipts;
+        let mut projected_high_version = runtime.projected_high_version;
+        self.apply_committed_lane_completion(
+            batch,
+            &mut projected_watch,
+            &mut projected_receipts,
+            &mut projected_high_version,
+            completion,
+        )?;
+        // A completion which changes no projected authority has no existing
+        // durable value that can prove whether an ambiguous write committed.
+        // Keep that uncommon case on the explicit completion-marker path.
+        if projected_watch == runtime.projected_watch
+            && projected_receipts == runtime.projected_receipts
+            && projected_high_version == runtime.projected_high_version
+        {
+            return Ok(None);
+        }
+        let projected = LaneRuntime {
+            next_ticket: completion.ticket,
+            projected_ticket: completion.ticket,
+            reserved_watch: runtime.reserved_watch,
+            reserved_receipts: runtime.reserved_receipts,
+            projected_watch,
+            projected_receipts,
+            projected_high_version,
+            reserved_reference_cursor_safe: runtime.reserved_reference_cursor_safe,
+            reserved_inline_reference_safe: runtime.reserved_inline_reference_safe,
+            completions: BTreeMap::new(),
+            visibility_proofs: BTreeSet::new(),
+            visibility_prefix_proof: None,
+        };
+        self.stage_lane_frontier_projection(batch, &projected)?;
+        Ok(Some(InlineLaneProjection {
+            base_projected_ticket,
+            projected_ticket: completion.ticket,
+            projected_watch,
+            projected_receipts,
+            projected_high_version,
+            inline_reference_safe_through: (completion.inline_reference_safe
+                && completion.first_offset != 0)
+                .then_some(completion.last_offset),
+        }))
+    }
+
     pub(super) async fn finish_lane_commit(
         &self,
         completion: LaneCompletion,
@@ -1036,6 +1133,20 @@ impl Store {
         completion: LaneCompletion,
         primary_write_succeeded: bool,
     ) -> Result<LaneSettlementMetrics, MutationError> {
+        self.finish_lane_commit_cancellation_safe_with_inline_projection(
+            completion,
+            None,
+            primary_write_succeeded,
+        )
+        .await
+    }
+
+    pub(super) async fn finish_lane_commit_cancellation_safe_with_inline_projection(
+        &self,
+        completion: LaneCompletion,
+        inline_projection: Option<InlineLaneProjection>,
+        primary_write_succeeded: bool,
+    ) -> Result<LaneSettlementMetrics, MutationError> {
         let store = self.clone();
         tokio::spawn(async move {
             #[cfg(test)]
@@ -1061,7 +1172,13 @@ impl Store {
             } else {
                 let mut read_failures = 0_u64;
                 loop {
-                    match store.persisted_lane_completion_exists(completion) {
+                    let persisted = match inline_projection.as_ref() {
+                        Some(projection) => {
+                            store.persisted_inline_lane_projection_exists(projection)
+                        }
+                        None => store.persisted_lane_completion_exists(completion),
+                    };
+                    match persisted {
                         Ok(committed) => break committed,
                         Err(error) => {
                             read_failures = read_failures.saturating_add(1);
@@ -1078,12 +1195,55 @@ impl Store {
                     }
                 }
             };
-            store.finish_lane_commit(completion, committed).await
+            if committed && let Some(projection) = inline_projection {
+                store.publish_inline_lane_projection(projection).await
+            } else {
+                store.finish_lane_commit(completion, committed).await
+            }
         })
         .await
         .map_err(|error| {
             MutationError::Storage(format!("mutation lane settlement task failed: {error}"))
         })?
+    }
+
+    async fn publish_inline_lane_projection(
+        &self,
+        projection: InlineLaneProjection,
+    ) -> Result<LaneSettlementMetrics, MutationError> {
+        let has_waiting_completions = {
+            let mut runtime = self.mutation_commit_lanes.sequence().await;
+            let runtime = runtime.as_mut().ok_or_else(|| {
+                MutationError::Storage("mutation lane runtime is not initialized".into())
+            })?;
+            if runtime.projected_ticket != projection.base_projected_ticket {
+                return Err(MutationError::Storage(
+                    "inline mutation lane projection frontier changed before publication".into(),
+                ));
+            }
+            runtime.projected_ticket = projection.projected_ticket;
+            runtime.projected_watch = projection.projected_watch;
+            runtime.projected_receipts = projection.projected_receipts;
+            runtime.projected_high_version = projection.projected_high_version;
+            runtime.reserved_watch.settled_through = projection.projected_watch.settled_through;
+            !runtime.completions.is_empty()
+        };
+        if let Some(reference_safe_through) = projection.inline_reference_safe_through {
+            self.settle_inline_source_changes_through_from_status(
+                projection.projected_watch,
+                reference_safe_through,
+            )?;
+        }
+        self.mutation_commit_lanes.frontier_notify.notify_waiters();
+        self.mutation_capacity_notify.notify_waiters();
+        self.notify_local_invalidations_from_status(projection.projected_watch);
+        if has_waiting_completions {
+            self.request_lane_projection().await?;
+        }
+        Ok(LaneSettlementMetrics {
+            contiguous_projection_completions: 1,
+            ..LaneSettlementMetrics::default()
+        })
     }
 
     fn persisted_lane_completion_exists(
@@ -1104,6 +1264,38 @@ impl Store {
             .get_cf(self.cf(CF_METADATA)?, completion.key())
             .map(|value| value.is_some())
             .map_err(storage_error)
+    }
+
+    fn persisted_inline_lane_projection_exists(
+        &self,
+        projection: &InlineLaneProjection,
+    ) -> Result<bool, MutationError> {
+        let frontier = self
+            .db
+            .get_cf(self.cf(CF_METADATA)?, LANE_FRONTIER_KEY)
+            .map_err(storage_error)?
+            .map(|encoded| {
+                let encoded: [u8; 8] = encoded.as_slice().try_into().map_err(|_| {
+                    MutationError::Storage("mutation lane frontier is malformed".into())
+                })?;
+                Ok(u64::from_be_bytes(encoded))
+            })
+            .transpose()?;
+        let watch = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let receipts = self.mutation_receipt_status()?;
+        let high_version = self
+            .db
+            .get_cf(self.cf(CF_METADATA)?, VERSION_HIGH_WATERMARK_KEY)
+            .map_err(storage_error)?
+            .map(|encoded| serde_json::from_slice::<VersionId>(&encoded))
+            .transpose()
+            .map_err(storage_error)?;
+        Ok(frontier == Some(projection.projected_ticket)
+            && watch == projection.projected_watch
+            && receipts == projection.projected_receipts
+            && high_version == projection.projected_high_version)
     }
 
     pub(super) async fn project_lane_completions(
@@ -1330,6 +1522,8 @@ impl Store {
             let expected = watch.tail.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("lane source frontier is exhausted".into())
             })?;
+            let visibility_contiguous = completion.visibility_settled
+                && watch.settled_through.checked_add(1) == Some(expected);
             if completion.first_offset > expected {
                 self.stage_sequence_gaps(batch, watch, expected, completion.first_offset - 1)?;
             } else if completion.first_offset < expected {
@@ -1349,7 +1543,7 @@ impl Store {
             if completion.reference_cursor_advanced {
                 self.stage_reference_delta_cursor(batch, watch.source_id, watch.tail)?;
             }
-            if completion.visibility_settled {
+            if visibility_contiguous {
                 watch.settled_through = watch.tail;
             }
         }
@@ -1377,6 +1571,8 @@ impl Store {
             let expected = watch.tail.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("lane source frontier is exhausted".into())
             })?;
+            let visibility_contiguous = completion.visibility_settled
+                && watch.settled_through.checked_add(1) == Some(expected);
             if completion.first_offset != expected {
                 return Err(MutationError::Storage(
                     "abandoned lane range is not contiguous".into(),
@@ -1391,7 +1587,7 @@ impl Store {
             if completion.reference_cursor_advanced {
                 self.stage_reference_delta_cursor(batch, watch.source_id, watch.tail)?;
             }
-            if completion.visibility_settled {
+            if visibility_contiguous {
                 watch.settled_through = watch.tail;
             }
         }
@@ -1453,6 +1649,15 @@ impl Store {
             LANE_FRONTIER_KEY,
             runtime.projected_ticket.to_be_bytes(),
         );
+        self.stage_lane_authority_projection(batch, runtime)
+    }
+
+    fn stage_lane_authority_projection(
+        &self,
+        batch: &mut WriteBatch,
+        runtime: &LaneRuntime,
+    ) -> Result<(), MutationError> {
+        let metadata = self.cf(CF_METADATA)?;
         batch.put_cf(
             metadata,
             LOCAL_INVALIDATION_STATUS_KEY,
@@ -1485,10 +1690,7 @@ fn lane_completion_ticket_from_key(key: &[u8]) -> anyhow::Result<u64> {
 
 impl LaneCompletion {
     pub(super) fn key(self) -> Vec<u8> {
-        let mut key = Vec::with_capacity(LANE_COMPLETION_PREFIX.len() + 8);
-        key.extend_from_slice(LANE_COMPLETION_PREFIX);
-        key.extend_from_slice(&self.ticket.to_be_bytes());
-        key
+        lane_completion_key(self.ticket)
     }
 
     pub(super) fn encode(self) -> [u8; LANE_COMPLETION_BYTES] {
@@ -1584,6 +1786,13 @@ impl LaneCompletion {
     }
 }
 
+fn lane_completion_key(ticket: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(LANE_COMPLETION_PREFIX.len() + 8);
+    key.extend_from_slice(LANE_COMPLETION_PREFIX);
+    key.extend_from_slice(&ticket.to_be_bytes());
+    key
+}
+
 pub(super) fn conflict_resources(
     operation: &PreparedOperation,
     definition_intent: Option<DefinitionMutationIntent>,
@@ -1591,15 +1800,7 @@ pub(super) fn conflict_resources(
     let mut resources = operation
         .lock_paths()
         .into_iter()
-        .map(|path| {
-            tagged_resource(
-                1,
-                [
-                    operation.identity().encode().as_slice(),
-                    path.path.as_bytes(),
-                ],
-            )
-        })
+        .map(|path| object_path_conflict_resource(operation.identity(), &path.path))
         .collect::<Vec<_>>();
     if let Some(command_id) = operation.command_id() {
         resources.push(tagged_resource(
@@ -1621,6 +1822,13 @@ pub(super) fn conflict_resources(
         ));
     }
     resources
+}
+
+pub(super) fn object_path_conflict_resource(
+    identity: crate::key::BucketIdentity,
+    exact_path: &str,
+) -> Vec<u8> {
+    tagged_resource(1, [identity.encode().as_slice(), exact_path.as_bytes()])
 }
 
 pub(super) fn replica_conflict_resources(mutation: &crate::ObjectMutation) -> Vec<Vec<u8>> {
@@ -1650,7 +1858,7 @@ pub(super) fn replica_conflict_resources(mutation: &crate::ObjectMutation) -> Ve
 
 pub(super) fn blob_conflict_resource(reference: &crate::BlobRef) -> Vec<u8> {
     tagged_resource(
-        3,
+        super::mutation_conflict_scheduler::MUTEX_ONLY_BLOB_RESOURCE_TAG,
         [
             reference.hash.as_slice(),
             reference.length.to_be_bytes().as_slice(),

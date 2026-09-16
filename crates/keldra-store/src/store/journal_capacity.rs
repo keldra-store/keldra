@@ -218,8 +218,8 @@ impl Store {
         }
         governance.validate()?;
         let mut outcomes = self
-            .coordinate_distributed_mutation_batch_with_admission(
-                vec![(BatchOperation::Publish(request), governance, None)],
+            .coordinate_verified_distributed_publish_operations_with_admission(
+                vec![(request, governance, None)],
                 context,
                 SourceJournalAdmission::DerivedProgress,
             )
@@ -601,7 +601,13 @@ mod tests {
         .await
         .unwrap();
 
-        store.stage_blob(b"capacity filler").await.unwrap();
+        assert!(
+            store
+                .bulk_write(vec![put("filler", "capacity-filler")])
+                .await[0]
+                .result
+                .is_ok()
+        );
         publish_progress(&store, "trusted-progress").await;
         let debt = store.source_journal_runtime_metrics().unwrap();
         assert!(debt.progress_debt_entries() >= 1);

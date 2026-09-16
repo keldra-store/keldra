@@ -119,6 +119,7 @@ pub(super) struct CoordinatorBatchMetrics {
 enum CoordinatorBatchPayloadPreparation {
     Distributed {
         source_journal_admission: SourceJournalAdmission,
+        verified_publish: bool,
     },
     SingleNode {
         source_journal_admission: SourceJournalAdmission,
@@ -189,6 +190,7 @@ impl Store {
         let source_journal_admission = match payload_preparation {
             CoordinatorBatchPayloadPreparation::Distributed {
                 source_journal_admission,
+                ..
             }
             | CoordinatorBatchPayloadPreparation::SingleNode {
                 source_journal_admission,
@@ -215,14 +217,30 @@ impl Store {
         let mut pending_receipts = BTreeMap::new();
         let mut pending_blob_references = PendingBlobReferences::new();
         let mut pending_inline_payloads = BTreeSet::new();
-        let mut policy_cache = bucket_governance
-            .iter()
-            .map(|(identity, governance)| (identity.clone(), Ok(governance.policy.clone())))
-            .collect();
-        let mut versioning_cache = bucket_governance
-            .iter()
-            .map(|(identity, governance)| (identity.clone(), Ok(governance.versioning)))
-            .collect();
+        let settings_are_supplied = !matches!(
+            payload_preparation,
+            CoordinatorBatchPayloadPreparation::DirectLocal {
+                governance_supplied: false,
+                ..
+            }
+        );
+        let mut policy_cache = settings_are_supplied
+            .then(|| {
+                bucket_governance
+                    .iter()
+                    .map(|(identity, governance)| (identity.clone(), Ok(governance.policy.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut versioning_cache = settings_are_supplied
+            .then(|| {
+                bucket_governance
+                    .iter()
+                    .map(|(identity, governance)| (identity.clone(), Ok(governance.versioning)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        read_cache.seed_bucket_settings(&mut policy_cache, &mut versioning_cache);
         let mut pending_changes = Vec::new();
         let mut high_watermark = None;
         let mut evaluated = BTreeMap::new();
@@ -372,6 +390,7 @@ impl Store {
             )?,
             CoordinatorBatchPayloadPreparation::Distributed {
                 source_journal_admission,
+                ..
             } => (!pending_changes.is_empty())
                 .then(|| {
                     self.stage_local_changes_from_status(
@@ -434,6 +453,33 @@ impl Store {
     ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
         self.single_node_group_commit
             .submit_distributed(self.clone(), operations, context, source_journal_admission)
+            .await
+            .map(|batch| batch.outcomes)
+    }
+
+    pub(super) async fn coordinate_verified_distributed_publish_operations_with_admission(
+        &self,
+        publishes: Vec<(
+            PublishRequest,
+            ObjectMutationGovernance,
+            Option<DefinitionMutationIntent>,
+        )>,
+        context: ObjectMutationContext,
+        source_journal_admission: SourceJournalAdmission,
+    ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
+        let operations = publishes
+            .into_iter()
+            .map(|(request, governance, intent)| {
+                (BatchOperation::Publish(request), governance, intent)
+            })
+            .collect();
+        self.single_node_group_commit
+            .submit_verified_distributed_publish(
+                self.clone(),
+                operations,
+                context,
+                source_journal_admission,
+            )
             .await
             .map(|batch| batch.outcomes)
     }
@@ -530,7 +576,14 @@ impl Store {
             },
             MutationGroupMode::Distributed => CoordinatorBatchPayloadPreparation::Distributed {
                 source_journal_admission,
+                verified_publish: false,
             },
+            MutationGroupMode::VerifiedDistributedPublish => {
+                CoordinatorBatchPayloadPreparation::Distributed {
+                    source_journal_admission,
+                    verified_publish: true,
+                }
+            }
         };
         let evaluated = self
             .coordinate_mutation_batch_grouped(
@@ -583,7 +636,8 @@ impl Store {
                         MutationGroupMode::SingleNode => {
                             SourceJournalSettlement::CompletedByCoordinator
                         }
-                        MutationGroupMode::Distributed => {
+                        MutationGroupMode::Distributed
+                        | MutationGroupMode::VerifiedDistributedPublish => {
                             SourceJournalSettlement::RequiredAfterQuorum
                         }
                     },
@@ -704,9 +758,19 @@ impl Store {
             }
             bucket_governance.insert(identity.encode().to_vec(), governance.clone());
             let operation = match payload_preparation {
-                CoordinatorBatchPayloadPreparation::Distributed { .. } => {
-                    self.prepare(operation, identity, true).await
-                }
+                CoordinatorBatchPayloadPreparation::Distributed {
+                    verified_publish: true,
+                    ..
+                } => match operation {
+                    BatchOperation::Publish(request) => {
+                        self.prepare_verified_distributed_publish(request, identity)
+                    }
+                    operation => self.prepare(operation, identity, true).await,
+                },
+                CoordinatorBatchPayloadPreparation::Distributed {
+                    verified_publish: false,
+                    ..
+                } => self.prepare(operation, identity, true).await,
                 CoordinatorBatchPayloadPreparation::SingleNode { .. } => {
                     self.prepare_single_node_coordinated(operation, identity)
                         .await
@@ -738,32 +802,6 @@ impl Store {
         let policy_wait_started = std::time::Instant::now();
         let _policy_guard = self.policy_gate.read().await;
         let policy_wait_duration = policy_wait_started.elapsed();
-        if matches!(
-            payload_preparation,
-            CoordinatorBatchPayloadPreparation::DirectLocal {
-                governance_supplied: false,
-                ..
-            }
-        ) {
-            for (encoded_identity, governance) in &mut bucket_governance {
-                governance.versioning = self.bucket_versioning_by_key(encoded_identity)?;
-                governance.policy = self
-                    .bucket_policy_by_key(encoded_identity)?
-                    .unwrap_or_default();
-                governance.validate()?;
-            }
-        }
-        let path_wait_started = std::time::Instant::now();
-        let _path_guards = self
-            .ordinary_locks
-            .acquire(
-                &prepared
-                    .iter()
-                    .flat_map(|item| item.operation.lock_paths())
-                    .collect::<Vec<_>>(),
-            )
-            .await;
-        let path_wait_duration = path_wait_started.elapsed();
         // Conflict lanes are the mutation authority for every topology. The
         // payload/reference settlement policy differs between local and
         // replicated durability, but neither requires a process-wide commit
@@ -772,9 +810,9 @@ impl Store {
             .iter()
             .map(|item| &item.operation)
             .collect::<Vec<_>>();
-        // The fence must precede the discovery snapshot. Ordinary path locks do
-        // not exclude legacy exclusive writers, and predecessor blob stripes
-        // can only be known from a head/version snapshot protected from them.
+        // The fence excludes legacy writers during discovery. Ordinary lanes
+        // may still change heads while this full resource set waits, so reload
+        // and validate the entire discovery after admission below.
         let (lane_fence, lane_fence_wait_duration) =
             self.mutation_commit_lanes.acquire_fence_measured().await;
         let prefetch_started = std::time::Instant::now();
@@ -788,15 +826,55 @@ impl Store {
                     item.definition_intent,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
         lane_resources.extend(lane_read_cache.predecessor_blob_conflict_resources());
         let lane_registration = self
             .mutation_commit_lanes
-            .register_with_fence(lane_fence, lane_resources);
+            .register_with_fence(lane_fence, lane_resources.iter().cloned());
         if let Some(handoff) = registration_handoff.as_mut() {
             handoff.complete();
         }
-        let lane_admission = lane_registration.acquire_conflicts().await;
+        let mut lane_admission = lane_registration.acquire_conflicts().await;
+        let mut path_wait_duration = std::time::Duration::ZERO;
+        let mut baseline_revalidation_retries = 0_u64;
+        let (_path_guards, lane_admission) = loop {
+            // Register before any exact-path wait so a blocked successor cannot
+            // pin the registration handoff of an unrelated later group.
+            let started = std::time::Instant::now();
+            let path_guards = self
+                .ordinary_locks
+                .acquire(
+                    &prepared
+                        .iter()
+                        .flat_map(|item| item.operation.lock_paths())
+                        .collect::<Vec<_>>(),
+                )
+                .await;
+            path_wait_duration = path_wait_duration.saturating_add(started.elapsed());
+            if lane_read_cache.is_current(self) {
+                break (path_guards, lane_admission);
+            }
+            let started = std::time::Instant::now();
+            let refreshed = MutationReadCache::load(self, &prepared_operations)?;
+            baseline_prefetch_duration =
+                baseline_prefetch_duration.saturating_add(started.elapsed());
+            baseline_revalidation_retries = baseline_revalidation_retries.saturating_add(1);
+            let predecessors = refreshed.predecessor_blob_conflict_resources();
+            if predecessors
+                .iter()
+                .all(|resource| lane_resources.contains(resource))
+            {
+                lane_read_cache = refreshed;
+                break (path_guards, lane_admission);
+            }
+            lane_resources.extend(predecessors);
+            drop(path_guards);
+            // Requeue all-or-none at the original scheduler ticket: preserve
+            // object/receipt ordering without retaining partial conflict guards.
+            lane_admission = lane_admission
+                .rediscover(lane_resources.iter().cloned())
+                .await;
+        };
         // Preparation and complete conflict registration must not consume this
         // bounded execution capacity. Otherwise later groups can fill every
         // permit while waiting for an earlier group that cannot obtain one to
@@ -833,7 +911,6 @@ impl Store {
         let mut first_sequence_wait_duration = std::time::Duration::ZERO;
         let mut prior_projection_metrics =
             super::mutation_commit_lanes::LaneProjectionMetrics::default();
-        let baseline_revalidation_retries = 0_u64;
         let mut lane_authority_revalidation_retries = 0_u64;
         // Reload stripe-protected values so concurrent lanes cannot change
         // them between the discovery snapshot and this lane's atomic write.
@@ -874,7 +951,7 @@ impl Store {
         let mut retry_evaluate_duration = std::time::Duration::ZERO;
         let mut retry_stage_duration = std::time::Duration::ZERO;
         let mut retry_evaluation_subphases = EvaluationSubphaseMetrics::default();
-        let (mut attempt, lane_completion) = loop {
+        let (mut attempt, lane_completion, inline_lane_projection) = loop {
             // Take a short optimistic authority snapshot. Object reads,
             // planning, encoding and proof construction then run concurrently
             // under their exact conflict guards. If another independent lane
@@ -970,7 +1047,7 @@ impl Store {
                 }
             };
             if built.batch.is_empty() {
-                break (built, None);
+                break (built, None, None);
             }
 
             let wait_started = std::time::Instant::now();
@@ -1016,11 +1093,15 @@ impl Store {
                 inline_reference_safe,
                 visibility_settled,
             )?;
-            self.stage_lane_completion(&mut built.batch, completion)?;
+            let inline_projection =
+                self.stage_inline_lane_projection(&mut built.batch, runtime, completion)?;
+            if inline_projection.is_none() {
+                self.stage_lane_completion(&mut built.batch, completion)?;
+            }
             reservation_sequence_hold_duration =
                 reservation_sequence_hold_duration.saturating_add(hold_started.elapsed());
             drop(guard);
-            break (built, Some(completion));
+            break (built, Some(completion), inline_projection);
         };
         let commit_wait_duration = first_sequence_wait_duration;
         let receipt_capacity_at = attempt.receipt_capacity_at;
@@ -1061,7 +1142,11 @@ impl Store {
             super::mutation_commit_lanes::LaneSettlementMetrics::default();
         if let Some(completion) = lane_completion {
             lane_settlement_metrics = self
-                .finish_lane_commit_cancellation_safe(completion, persistence.is_ok())
+                .finish_lane_commit_cancellation_safe_with_inline_projection(
+                    completion,
+                    inline_lane_projection,
+                    persistence.is_ok(),
+                )
                 .await?;
         }
         persistence?;
@@ -1258,14 +1343,16 @@ impl Store {
         context: ObjectMutationContext,
         source_journal_admission: SourceJournalAdmission,
     ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
-        let operations = requests
+        let publishes = requests
             .into_iter()
-            .map(|request| (BatchOperation::Publish(request), governance.clone(), None))
+            .map(|request| (request, governance.clone(), None))
             .collect();
-        self.single_node_group_commit
-            .submit_distributed(self.clone(), operations, context, source_journal_admission)
-            .await
-            .map(|batch| batch.outcomes)
+        self.coordinate_verified_distributed_publish_operations_with_admission(
+            publishes,
+            context,
+            source_journal_admission,
+        )
+        .await
     }
 }
 
