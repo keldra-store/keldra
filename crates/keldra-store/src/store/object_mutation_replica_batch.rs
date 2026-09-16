@@ -588,15 +588,15 @@ mod tests {
             .await
             .unwrap();
         assert!(applied.iter().all(|outcome| !outcome.replayed));
-        assert_eq!(
-            batch
-                .db
-                .get_updates_since(before)
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-                .len(),
-            1
+        let batches = batch
+            .db
+            .get_updates_since(before)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 2);
+        crate::store::mutation_commit_lanes::tests::assert_metadata_only_lane_projection(
+            &batches[1].1,
         );
         for mutation in &mutations {
             assert_eq!(
@@ -620,11 +620,17 @@ mod tests {
                     .unwrap()
             );
         }
+        let replay_sequence = batch.db.latest_sequence_number();
         let replay = batch
             .apply_object_mutation_replica_batch(&mutations)
             .await
             .unwrap();
         assert!(replay.iter().all(|outcome| outcome.replayed));
+        assert_eq!(
+            batch.db.latest_sequence_number(),
+            replay_sequence,
+            "exact replay is still a no-op"
+        );
     }
 
     #[tokio::test]

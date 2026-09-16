@@ -786,8 +786,10 @@ impl Store {
                     visibility_prefix_proof: None,
                 },
             )?;
-            let mut options = WriteOptions::default();
-            options.disable_wal(true);
+            let options = WriteOptions::default();
+            // Recovery projects WAL-backed completion markers. Its deletion
+            // and frontier must also enter the WAL: a later inline mutation
+            // can persist a newer frontier before this memtable is flushed.
             self.db.write_opt(batch, &options)?;
         }
         let reference_cursor = self.reference_delta_cursor(watch.source_id)?;
@@ -1326,9 +1328,11 @@ impl Store {
         let mut options = WriteOptions::default();
         if plan.requires_sync {
             options.set_sync(self.sync_writes);
-        } else {
-            options.disable_wal(true);
         }
+        // Completion markers originate in primary WAL-backed mutation batches.
+        // WAL-less deletion is not replay-safe: a later inline commit can log
+        // a newer frontier while restart resurrects the old marker. Keep this
+        // atomic projection in WAL even when no additional fsync is required.
         #[cfg(test)]
         if self
             .mutation_commit_lanes
@@ -1893,4 +1897,4 @@ fn tagged_resource<'a>(tag: u8, parts: impl IntoIterator<Item = &'a [u8]>) -> Ve
 
 #[cfg(test)]
 #[path = "mutation_commit_lanes_tests.rs"]
-mod tests;
+pub(super) mod tests;

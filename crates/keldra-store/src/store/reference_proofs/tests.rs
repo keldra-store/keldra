@@ -193,6 +193,17 @@ fn wal_batches_since(store: &Store, sequence: u64) -> usize {
         .len()
 }
 
+fn assert_lane_projection_batch(store: &Store, sequence: u64) {
+    let batches = store
+        .db
+        .get_updates_since(sequence)
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(batches.len(), 2);
+    crate::store::mutation_commit_lanes::tests::assert_metadata_only_lane_projection(&batches[1].1);
+}
+
 #[derive(Default)]
 struct WalPuts(Vec<(Vec<u8>, Vec<u8>)>);
 
@@ -330,9 +341,10 @@ async fn source_and_replica_store_exact_evidence_in_the_mutation_batch() {
         }
     );
     let replica_batches = wal_put_batches_since(&replica, replica_sequence);
-    assert_eq!(replica_batches.len(), 1);
+    assert_eq!(replica_batches.len(), 2);
     assert!(replica_batches[0].contains(&head_key));
     assert!(replica_batches[0].contains(&proof_key));
+    assert_lane_projection_batch(&replica, replica_sequence);
     assert_eq!(
         replica
             .read_reference_proof(
@@ -386,7 +398,8 @@ async fn exact_replay_restores_a_missing_proof_and_is_otherwise_a_no_op() {
             .unwrap()
             .replayed
     );
-    assert_eq!(wal_batches_since(&replica, before_restore), 1);
+    assert_eq!(wal_batches_since(&replica, before_restore), 2);
+    assert_lane_projection_batch(&replica, before_restore);
     assert_eq!(
         replica
             .read_reference_proof(proof.source_id, proof.offset())

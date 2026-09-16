@@ -19,6 +19,161 @@ fn status(tail: u64, entries: u64, bytes: u64) -> WatchJournalStatus {
     }
 }
 
+#[derive(Default)]
+struct ReplayLaneMetadata {
+    values: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+pub(in crate::store) fn assert_metadata_only_lane_projection(batch: &WriteBatch) {
+    #[derive(Default)]
+    struct Operations {
+        puts: Vec<(u32, Vec<u8>, Vec<u8>)>,
+        deletes: Vec<(u32, Vec<u8>)>,
+    }
+    impl rocksdb::WriteBatchIteratorCf for Operations {
+        fn put_cf(&mut self, cf: u32, key: &[u8], value: &[u8]) {
+            self.puts.push((cf, key.to_vec(), value.to_vec()));
+        }
+        fn delete_cf(&mut self, cf: u32, key: &[u8]) {
+            self.deletes.push((cf, key.to_vec()));
+        }
+        fn merge_cf(&mut self, _: u32, _: &[u8], _: &[u8]) {
+            panic!("lane projection must not contain merge operations");
+        }
+    }
+    let mut operations = Operations::default();
+    batch.iterate_cf(&mut operations);
+    let mut keys = operations
+        .puts
+        .iter()
+        .map(|(_, key, _)| key.as_slice())
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    let mut expected = vec![
+        LANE_FRONTIER_KEY,
+        LOCAL_INVALIDATION_STATUS_KEY,
+        MUTATION_RECEIPT_STATUS_KEY,
+        VERSION_HIGH_WATERMARK_KEY,
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        keys, expected,
+        "second WAL batch contains precisely projected authorities"
+    );
+    let (metadata_cf, _, frontier) = operations
+        .puts
+        .iter()
+        .find(|(_, key, _)| key == LANE_FRONTIER_KEY)
+        .unwrap();
+    let ticket = u64::from_be_bytes(frontier.as_slice().try_into().unwrap());
+    assert!(operations.puts.iter().all(|(cf, _, _)| cf == metadata_cf));
+    assert_eq!(
+        operations.deletes,
+        vec![(*metadata_cf, lane_completion_key(ticket))],
+        "the same metadata batch must delete exactly the completed lane marker"
+    );
+}
+
+impl rocksdb::WriteBatchIteratorCf for ReplayLaneMetadata {
+    fn put_cf(&mut self, _: u32, key: &[u8], value: &[u8]) {
+        if key == LANE_FRONTIER_KEY || key.starts_with(LANE_COMPLETION_PREFIX) {
+            self.values.insert(key.to_vec(), value.to_vec());
+        }
+    }
+    fn delete_cf(&mut self, _: u32, key: &[u8]) {
+        self.values.remove(key);
+    }
+    fn merge_cf(&mut self, _: u32, _: &[u8], _: &[u8]) {
+        panic!("lane metadata must not use merge operations");
+    }
+}
+
+async fn assert_projection_then_inline_wal_is_replay_safe(recover_at_startup: bool) {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let replay_from = store.db.latest_sequence_number() + 1;
+    let completion = {
+        let mut sequence = store.mutation_commit_lanes.sequence().await;
+        let runtime = sequence.as_mut().unwrap();
+        let watch = runtime.reserved_watch;
+        let receipts = runtime.reserved_receipts;
+        runtime.reserve(watch, receipts, None).unwrap()
+    };
+    let mut batch = WriteBatch::default();
+    store.stage_lane_completion(&mut batch, completion).unwrap();
+    store.db.write(batch).unwrap();
+    if recover_at_startup {
+        // Model a fresh process-local runtime without weakening the production
+        // one-initialization guard. No worker has received a projection here.
+        *store.mutation_commit_lanes.sequence().await = None;
+        store.initialize_mutation_lane_runtime(true).await.unwrap();
+    } else {
+        store.finish_lane_commit(completion, true).await.unwrap();
+    }
+    let key = ObjectKey::new("tenant", "bucket", "objects/after-projection").unwrap();
+    store
+        .put(PutRequest {
+            key: key.clone(),
+            bytes: b"after-projection".to_vec(),
+            content_type: None,
+            mode: PutMode::PutIfAbsent,
+            command_id: Some("after-projection-command".into()),
+            durability: Durability::Local,
+        })
+        .await
+        .unwrap();
+    store.db.flush_wal(true).unwrap();
+    // Replay the actual persisted WAL operations, not the live memtable or a
+    // graceful-close flush. Before the fix this reconstructs marker 1 together
+    // with frontier 2, exactly the state which makes Store::open refuse.
+    let mut replay = ReplayLaneMetadata::default();
+    for entry in store.db.get_updates_since(replay_from).unwrap() {
+        let (_, batch) = entry.unwrap();
+        batch.iterate_cf(&mut replay);
+    }
+    assert_eq!(
+        replay.values.get(LANE_FRONTIER_KEY).unwrap(),
+        &2u64.to_be_bytes().to_vec()
+    );
+    assert!(
+        !replay
+            .values
+            .keys()
+            .any(|key| key.starts_with(LANE_COMPLETION_PREFIX)),
+        "durable frontier must not resurrect a projected completion during WAL replay"
+    );
+    drop(store);
+    let reopened = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.get(&key).await.unwrap().unwrap().bytes,
+        b"after-projection"
+    );
+    assert_eq!(
+        reopened
+            .mutation_commit_lanes
+            .sequence()
+            .await
+            .as_ref()
+            .unwrap()
+            .projected_ticket,
+        2
+    );
+}
+
+#[tokio::test]
+async fn ordinary_completion_projection_then_inline_commit_preserves_wal_replay() {
+    assert_projection_then_inline_wal_is_replay_safe(false).await;
+}
+
+#[tokio::test]
+async fn startup_completion_recovery_then_inline_commit_preserves_wal_replay() {
+    assert_projection_then_inline_wal_is_replay_safe(true).await;
+}
+
 #[test]
 fn completion_encoding_is_fixed_and_rejects_range_mismatch() {
     let completion = LaneCompletion {
