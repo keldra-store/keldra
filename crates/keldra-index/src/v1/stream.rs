@@ -1,4 +1,4 @@
-use super::buffer::{ComponentDeltaCursor, seal_component};
+use super::buffer::{ComponentDeltaCursor, component_run_encoded_bytes, seal_component};
 #[cfg(test)]
 use super::pack_component_deltas;
 use super::{
@@ -882,28 +882,6 @@ pub fn compact_component_runs(
     Ok(output)
 }
 
-/// Exact size of the frozen K1DELTA1 encoding: magic/u16 component/u64 count,
-/// u32 restart interval/count, one u32 offset per 64 records, then key/tag and
-/// optional u64-length-prefixed value bytes. No resident-map accounting here.
-fn component_run_encoded_bytes(
-    component: ComponentIdentity,
-    records: usize,
-    record_bytes: usize,
-) -> Result<usize, IndexError> {
-    let component_bytes = match component {
-        ComponentIdentity::DocumentHead | ComponentIdentity::SourceRecords => 1usize,
-        ComponentIdentity::Membership(_)
-        | ComponentIdentity::Field(_)
-        | ComponentIdentity::Order(_) => 33,
-    };
-    let header = 8usize + 2 + component_bytes + 8 + 4 + 4;
-    records
-        .div_ceil(64)
-        .checked_mul(4)
-        .and_then(|bytes| bytes.checked_add(header))
-        .and_then(|bytes| bytes.checked_add(record_bytes))
-        .ok_or(IndexError::OffsetOverflow)
-}
 pub fn splice_compacted_component_runs<PageBytes>(
     previous: ComponentStreamRoot,
     plan: &ComponentCompactionPlan,

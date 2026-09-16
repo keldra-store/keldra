@@ -15,6 +15,63 @@ fn spine_pages(sequence: u64) -> usize {
     }
 }
 
+// Greedy bounded children have adjacent encoded sizes whose sum exceeds the
+// pack capacity. Resident entry admission also bounds their encoded headers,
+// so at most two extra children per capacity can be emitted. Each extra append
+// path-copies at most two pages per level, including a possible root split.
+pub(super) fn split_component_metadata_bound(
+    resident_bytes: usize,
+    historical_sequence: u64,
+) -> Result<usize, Status> {
+    let extra = resident_bytes / (keldra_index::v1::ARTIFACT_PACK_MAX_BYTES / 2);
+    if extra == 0 {
+        return Ok(0);
+    }
+    let sequence =
+        historical_sequence
+            .checked_add(u64::try_from(extra).map_err(|_| {
+                Status::resource_exhausted("v1 split child count admission overflow")
+            })?)
+            .and_then(|sequence| sequence.checked_add(1))
+            .ok_or_else(|| Status::resource_exhausted("v1 split sequence admission overflow"))?;
+    let pages = extra
+        .checked_mul(spine_pages(sequence))
+        .and_then(|pages| pages.checked_mul(2 * STREAM_PAGE_BYTES))
+        .and_then(|bytes| bytes.checked_mul(3))
+        .ok_or_else(|| Status::resource_exhausted("v1 split metadata admission overflow"))?;
+    // Extra native descriptors, pack references and their serialized paths
+    // coexist with the encoded pages. Production pack paths have fixed widths.
+    let pack_path = "_keldra/index-projections/v1/".len() + 64 + "/artifacts/packs/".len() + 64;
+    let descriptor = std::mem::size_of::<keldra_index::v1::PackedComponentDelta>()
+        + std::mem::size_of::<keldra_index::v1::ComponentSegmentDescriptor>()
+        + std::mem::size_of::<keldra_index::v1::ArtifactPackReference>()
+        + std::mem::size_of::<keldra_index::v1::SealedComponentDelta>()
+        + 2 * pack_path
+        + 256;
+    extra
+        .checked_mul(descriptor)
+        .and_then(|bytes| pages.checked_add(bytes))
+        .ok_or_else(|| Status::resource_exhausted("v1 split descriptor admission overflow"))
+}
+
+pub(super) fn successor_component_sequence_bound(writer: &Writer) -> Result<u64, Status> {
+    let sequence = writer.current.as_ref().map_or(0, |current| {
+        current
+            .generation
+            .roots
+            .iter()
+            .map(|root| root.last_sequence)
+            .max()
+            .unwrap_or(0)
+    });
+    let extra = writer.pending_projected_encoded_bytes
+        / (keldra_index::v1::ARTIFACT_PACK_MAX_BYTES as u64 / 2);
+    sequence
+        .checked_add(extra)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| Status::resource_exhausted("v1 successor split sequence overflow"))
+}
+
 pub(super) fn spine_preload_bound(
     current: Option<&LoadedV1ProjectionGeneration>,
 ) -> Result<usize, Status> {
@@ -76,18 +133,21 @@ pub(super) fn publication_metadata_bound(
         let query_sequence = writer.current.as_ref().map_or(0, |current| {
             current.generation.query_stream_root.last_sequence
         });
+        let successor_sequence = successor_component_sequence_bound(writer)?
+            .checked_add(1)
+            .ok_or_else(|| Status::resource_exhausted("v1 successor append sequence overflow"))?;
         let pages = roots.iter().try_fold(
-            spine_pages(query_sequence.saturating_add(1)),
-            |pages, root| {
+            spine_pages(query_sequence.saturating_add(2)),
+            |pages, _root| {
                 pages
-                    .checked_add(spine_pages(root.last_sequence.saturating_add(1)))
+                    .checked_add(spine_pages(successor_sequence))
                     .ok_or_else(|| {
                         Status::resource_exhausted("v1 successor spine admission overflow")
                     })
             },
         )?;
         pages
-            .checked_add(missing * spine_pages(1))
+            .checked_add(missing * spine_pages(successor_sequence))
             .and_then(|pages| pages.checked_mul(STREAM_PAGE_BYTES))
             .ok_or_else(|| Status::resource_exhausted("v1 successor spine admission overflow"))?
     } else {
@@ -126,7 +186,21 @@ pub(super) fn reserve_sealing_progress<'a>(
         keldra_index::v1::QueryBlockLimits::default_for_memory(),
     )
     .map_err(index_status)?;
-    let metadata = publication_metadata_bound(writer, false)?;
+    let historical_sequence = writer.current.as_ref().map_or(0, |current| {
+        current
+            .generation
+            .roots
+            .iter()
+            .map(|root| root.last_sequence)
+            .max()
+            .unwrap_or(0)
+    });
+    let metadata = publication_metadata_bound(writer, false)?
+        .checked_add(split_component_metadata_bound(
+            pending,
+            historical_sequence,
+        )?)
+        .ok_or_else(|| Status::resource_exhausted("v1 split publication metadata overflow"))?;
     // Three component representations overlap: seal source lease, encoded
     // segments, packed artifact copy. Their wire overhead is below the buffer's
     // explicit 160-byte entry/192-byte component admission. Preloaded pages can
@@ -161,5 +235,20 @@ mod tests {
         assert_eq!(spine_pages(1), 2);
         assert_eq!(spine_pages(128), 9);
         assert_eq!(spine_pages(u64::MAX), 65);
+    }
+
+    #[test]
+    fn split_metadata_admits_each_extra_child_without_a_new_memory_cap() {
+        let half = keldra_index::v1::ARTIFACT_PACK_MAX_BYTES / 2;
+        assert_eq!(split_component_metadata_bound(half - 1, 0).unwrap(), 0);
+        assert!(
+            split_component_metadata_bound(half, 0).unwrap()
+                > 2 * STREAM_PAGE_BYTES * 3 * spine_pages(2)
+        );
+        assert!(
+            split_component_metadata_bound(4 * half, 128).unwrap()
+                >= 4 * 2 * STREAM_PAGE_BYTES * 3 * spine_pages(133)
+        );
+        assert!(split_component_metadata_bound(half, u64::MAX).is_err());
     }
 }

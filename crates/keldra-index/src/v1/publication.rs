@@ -1,6 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use crate::IndexError;
+
+#[cfg(test)]
+#[path = "publication_split_tests.rs"]
+mod split_tests;
 
 use super::{
     ArtifactPackTable, ChargedProjectionDeltaPacks, ComponentStreamRoot,
@@ -17,6 +21,20 @@ struct PreparedProjectionComponents {
     stream_pages: Vec<EncodedComponentStreamPage>,
     generation: ProjectionGeneration,
     pack_credits: ProjectionPackCredits,
+}
+
+enum PublicationStreamPage<T> {
+    Loaded(T),
+    Prepared(bytes::Bytes),
+}
+
+impl<T: AsRef<[u8]>> AsRef<[u8]> for PublicationStreamPage<T> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Loaded(page) => page.as_ref(),
+            Self::Prepared(page) => page.as_ref(),
+        }
+    }
 }
 
 /// Complete immutable payload which must be durable before its generation is
@@ -217,21 +235,28 @@ where
         through_atomic_position,
         &inherited_partitions,
     )?;
-    let mut components = BTreeSet::new();
+    let mut component_ranges = BTreeMap::new();
     for delta in charged_packs.packs.iter().flat_map(|pack| &pack.deltas) {
-        if !components.insert(delta.component) {
+        if delta.minimum_key > delta.maximum_key
+            || component_ranges
+                .get(&delta.component)
+                .is_some_and(|previous_maximum| delta.minimum_key <= *previous_maximum)
+        {
             return Err(IndexError::InvalidDefinition(
-                "projection publication contains duplicate component deltas".into(),
+                "projection publication contains duplicate, overlapping or out-of-order component children".into(),
             ));
         }
+        component_ranges.insert(delta.component, delta.maximum_key);
     }
 
     let (packs, pack_credits) = (charged_packs.packs, charged_packs.credits);
     validate_pack_bindings(&packs, &pack_table)?;
-    let mut stream_pages = Vec::new();
-    let mut replacements = Vec::new();
+    let mut prepared_pages = BTreeMap::new();
+    let mut replacements = BTreeMap::<_, super::ComponentRoot>::new();
     for delta in packs.iter().flat_map(|pack| &pack.deltas) {
-        let previous_root =
+        let previous_root = if let Some(root) = replacements.get(&delta.component) {
+            Some(ComponentStreamRoot::from_component_root(root)?)
+        } else {
             if transition.is_none_or(|transition| transition.retains_component(delta.component)) {
                 previous
                     .and_then(|(generation, _)| generation.root(delta.component))
@@ -239,20 +264,30 @@ where
                     .transpose()?
             } else {
                 None
-            };
+            }
+        };
         let appended = append_component_stream(
             previous_root,
-            |hash| load_stream_page(hash),
+            |hash| match prepared_pages.get(&hash) {
+                Some(page) => Ok(PublicationStreamPage::Prepared(bytes::Bytes::clone(page))),
+                None => load_stream_page(hash).map(PublicationStreamPage::Loaded),
+            },
             delta,
             &pack_table,
             source_start_offset,
             next_offset,
             through_atomic_position,
         )?;
-        replacements.push(appended.root.component_root()?);
-        stream_pages.extend(appended.new_pages);
+        replacements.insert(delta.component, appended.root.component_root()?);
+        for page in appended.new_pages {
+            prepared_pages.insert(page.hash, page.bytes);
+        }
     }
-    replacements.sort_by_key(|root| root.component);
+    let replacements = replacements.into_values().collect();
+    let stream_pages = prepared_pages
+        .into_iter()
+        .map(|(hash, bytes)| EncodedComponentStreamPage { hash, bytes })
+        .collect();
 
     let generation = match previous {
         Some((generation, generation_hash)) => match transition {
@@ -607,11 +642,11 @@ mod tests {
         visit_query_runs_newest,
     };
 
-    fn partition(family_id: [u8; 32]) -> ProjectionPartitionIdentity {
+    pub(super) fn partition(family_id: [u8; 32]) -> ProjectionPartitionIdentity {
         ProjectionPartitionIdentity::new(family_id, 1, [2; 32], 1, 3, 4).unwrap()
     }
 
-    fn sealed(component: ComponentIdentity, byte: u8) -> SealedComponentDelta {
+    pub(super) fn sealed(component: ComponentIdentity, byte: u8) -> SealedComponentDelta {
         if component == ComponentIdentity::SourceRecords {
             let key =
                 StableDocumentKey::derive([11; 32], format!("objects/{byte}").as_str(), 0).unwrap();
@@ -669,7 +704,7 @@ mod tests {
             .collect()
     }
 
-    fn query_credits(bytes: usize) -> QueryBlockCredits {
+    pub(super) fn query_credits(bytes: usize) -> QueryBlockCredits {
         let memory = IndexingMemoryCredits::new(
             bytes,
             IndexingMemoryLimits {
@@ -690,7 +725,7 @@ mod tests {
         )
     }
 
-    fn pack_credits(bytes: usize) -> ProjectionPackCredits {
+    pub(super) fn pack_credits(bytes: usize) -> ProjectionPackCredits {
         let memory = IndexingMemoryCredits::new(
             bytes,
             IndexingMemoryLimits {
@@ -770,7 +805,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prepare_atomic_projection_generation<StreamPageBytes, QueryPageBytes>(
+    pub(super) fn prepare_atomic_projection_generation<StreamPageBytes, QueryPageBytes>(
         partition: ProjectionPartitionIdentity,
         catalog: [u8; 32],
         previous: Option<(&ProjectionGeneration, [u8; 32])>,

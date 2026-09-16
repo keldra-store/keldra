@@ -85,6 +85,10 @@ pub(super) fn start_look_ahead(
         Ok(bytes) => bytes,
         Err(_) => return Ok(()),
     };
+    let successor_sequence = match super::sealing::successor_component_sequence_bound(writer) {
+        Ok(sequence) => sequence,
+        Err(_) => return Ok(()),
+    };
     let Some(mut dispatcher) = writer.dispatcher.take() else {
         return Ok(());
     };
@@ -138,7 +142,11 @@ pub(super) fn start_look_ahead(
                 Err(error) if error.code() == tonic::Code::ResourceExhausted => return Ok(Some(ready)),
                 Err(error) => return Err(error),
             };
-            let Some(peak) = components.checked_mul(3).and_then(|bytes| bytes.checked_add(query)).and_then(|bytes| bytes.checked_add(metadata_peak)) else { return Ok(Some(ready)); };
+            let split_metadata = match super::sealing::split_component_metadata_bound(components, successor_sequence) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(Some(ready)),
+            };
+            let Some(peak) = components.checked_mul(3).and_then(|bytes| bytes.checked_add(query)).and_then(|bytes| bytes.checked_add(metadata_peak)).and_then(|bytes| bytes.checked_add(split_metadata)) else { return Ok(Some(ready)); };
             let Ok(progress) = credits.reserve_progress(peak) else { tracing::debug!(counter.keldra_index_v1_look_ahead_admission_fallbacks = 1, "optional look-ahead output progress admission unavailable"); return Ok(Some(ready)); };
             ready.progress = Some(progress);
             for (metadata, slots) in window.chunks.into_values() {

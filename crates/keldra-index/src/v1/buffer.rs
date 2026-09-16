@@ -18,6 +18,10 @@ const SEGMENT_RESTART_INTERVAL: usize = 64;
 const ENTRY_ACCOUNTING_BYTES: usize = 160;
 const COMPONENT_ACCOUNTING_BYTES: usize = 192;
 
+#[cfg(test)]
+#[path = "buffer_split_tests.rs"]
+mod split_tests;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentDeltaRecord {
     pub stable_key: StableDocumentKey,
@@ -368,10 +372,47 @@ impl ProjectionMutationBuffer {
     }
 
     pub fn seal(self) -> Result<Vec<SealedComponentDelta>, IndexError> {
-        self.components
-            .into_iter()
-            .map(|(component, records)| seal_component(component, records))
-            .collect()
+        let mut output = Vec::new();
+        for (component, records) in self.components {
+            let mut child = BTreeMap::new();
+            let mut encoded_records = 0usize;
+            for (key, value) in records {
+                let record_bytes = 33usize
+                    .checked_add(match &value {
+                        Some(value) => value
+                            .len()
+                            .checked_add(8)
+                            .ok_or(IndexError::OffsetOverflow)?,
+                        None => 0,
+                    })
+                    .ok_or(IndexError::OffsetOverflow)?;
+                let cap = super::ARTIFACT_PACK_MAX_BYTES;
+                let single = component_run_encoded_bytes(component, 1, record_bytes)?;
+                if single > cap {
+                    return Err(IndexError::ResourceLimit {
+                        needed: single,
+                        limit: cap,
+                    });
+                }
+                let combined = encoded_records
+                    .checked_add(record_bytes)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                if !child.is_empty()
+                    && component_run_encoded_bytes(component, child.len() + 1, combined)? > cap
+                {
+                    output.push(seal_component(component, std::mem::take(&mut child))?);
+                    encoded_records = 0;
+                }
+                encoded_records = encoded_records
+                    .checked_add(record_bytes)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                child.insert(key, value);
+            }
+            if !child.is_empty() {
+                output.push(seal_component(component, child)?);
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -529,6 +570,27 @@ pub fn decode_document_head(
         return Err(IndexError::Integrity);
     }
     Ok(head)
+}
+
+/// Exact frozen K1DELTA1 wire size shared by initial sealing and compaction.
+pub(super) fn component_run_encoded_bytes(
+    component: ComponentIdentity,
+    records: usize,
+    record_bytes: usize,
+) -> Result<usize, IndexError> {
+    let component_bytes = match component {
+        ComponentIdentity::DocumentHead | ComponentIdentity::SourceRecords => 1usize,
+        ComponentIdentity::Membership(_)
+        | ComponentIdentity::Field(_)
+        | ComponentIdentity::Order(_) => 33,
+    };
+    let header = SEGMENT_MAGIC.len() + 2 + component_bytes + 8 + 4 + 4;
+    records
+        .div_ceil(SEGMENT_RESTART_INTERVAL)
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(header))
+        .and_then(|bytes| bytes.checked_add(record_bytes))
+        .ok_or(IndexError::OffsetOverflow)
 }
 
 pub(super) fn seal_component(
