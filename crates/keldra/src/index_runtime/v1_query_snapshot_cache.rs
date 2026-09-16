@@ -10,10 +10,15 @@ use keldra_index::v1::{
     QuerySnapshotIdentity, ValidatedQuerySnapshot,
 };
 
+use super::super::v1_artifact_cache::ImmutableArtifactCache;
+use super::super::working_memory::{IndexWorkingMemory, WorkingMemoryReclaimer};
+use super::PinnedRootVector;
+#[cfg(test)]
+use super::QUERY_SNAPSHOT_CACHE_BYTES;
 use super::cursor::QueryPositionRoot;
-use super::{PinnedRootVector, QUERY_SNAPSHOT_CACHE_BYTES};
 
 pub(super) struct CachedRuntimeQuerySnapshot {
+    _memory_lease: Option<Arc<dyn Send + Sync + std::fmt::Debug>>,
     pub(super) pinned: Arc<PinnedRootVector>,
     pub(super) snapshot: Arc<ValidatedQuerySnapshot>,
     resident_bytes: usize,
@@ -22,6 +27,8 @@ pub(super) struct CachedRuntimeQuerySnapshot {
 }
 
 struct QuerySnapshotCacheState {
+    memory: Option<IndexWorkingMemory>,
+    _memory_lease: Option<Arc<dyn Send + Sync + std::fmt::Debug>>,
     resident_bytes: usize,
     clock: u64,
     entry_count: usize,
@@ -36,6 +43,8 @@ const RECENCY_COMPACTION_SLACK: usize = 16;
 impl Default for QuerySnapshotCacheState {
     fn default() -> Self {
         Self {
+            memory: None,
+            _memory_lease: None,
             resident_bytes: std::mem::size_of::<Self>().saturating_add(
                 RECENCY_COMPACTION_SLACK
                     .saturating_mul(std::mem::size_of::<(u64, Weak<CachedRuntimeQuerySnapshot>)>()),
@@ -51,6 +60,7 @@ impl Default for QuerySnapshotCacheState {
 
 #[derive(Clone)]
 pub(super) struct V1QuerySnapshotCache {
+    artifact_cache: Option<ImmutableArtifactCache>,
     state: Arc<Mutex<QuerySnapshotCacheState>>,
     maximum_bytes: usize,
     #[cfg(test)]
@@ -60,15 +70,65 @@ pub(super) struct V1QuerySnapshotCache {
 impl Default for V1QuerySnapshotCache {
     fn default() -> Self {
         Self {
+            artifact_cache: None,
             state: Arc::new(Mutex::new(QuerySnapshotCacheState::default())),
+            #[cfg(test)]
             maximum_bytes: QUERY_SNAPSHOT_CACHE_BYTES,
+            #[cfg(not(test))]
+            maximum_bytes: 0,
             #[cfg(test)]
             deep_size_computations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
 
+impl WorkingMemoryReclaimer for Mutex<QuerySnapshotCacheState> {
+    fn reclaim(&self, needed_bytes: u64) {
+        let mut state = self
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let memory = state.memory.clone();
+        let before = memory.as_ref().map_or(0, IndexWorkingMemory::free_bytes);
+        while state.entry_count != 0 {
+            if memory
+                .as_ref()
+                .is_some_and(|memory| memory.free_bytes().saturating_sub(before) >= needed_bytes)
+            {
+                break;
+            }
+            if !evict_oldest(&mut state) {
+                break;
+            }
+        }
+        compact_recency_if_needed(&mut state);
+        if state.entry_count == 0 {
+            let lease = state._memory_lease.take();
+            *state = QuerySnapshotCacheState::default();
+            state._memory_lease = lease;
+            state.memory = memory;
+        }
+    }
+}
+
 impl V1QuerySnapshotCache {
+    pub(super) fn with_artifact_cache(artifact_cache: ImmutableArtifactCache) -> Self {
+        let Some(memory) = artifact_cache.working_memory() else {
+            return Self::default();
+        };
+        let mut state = QuerySnapshotCacheState::default();
+        state.memory = Some(memory.clone());
+        state._memory_lease = artifact_cache.admit_memory(state.resident_bytes);
+        let state = Arc::new(Mutex::new(state));
+        let reclaimer: Arc<dyn WorkingMemoryReclaimer> = state.clone();
+        memory.register_reclaimer(Arc::downgrade(&reclaimer));
+        Self {
+            artifact_cache: Some(artifact_cache),
+            state,
+            maximum_bytes: usize::try_from(memory.hard_limit()).unwrap_or(usize::MAX),
+            #[cfg(test)]
+            deep_size_computations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
     pub(super) fn get_for_pinned(
         &self,
         pinned: &PinnedRootVector,
@@ -150,10 +210,8 @@ impl V1QuerySnapshotCache {
                 return;
             }
         }
-        // Snapshot accounting deliberately charges shared Arc run descriptors
-        // to every entry. That is conservative and, critically, is evaluated
-        // only on a true miss rather than walking the immutable snapshot on
-        // every query-cache hit.
+        // Size only this snapshot's owned vectors. Shared immutable run/table
+        // allocations have their own final-Arc leases and are charged once.
         #[cfg(test)]
         self.deep_size_computations.fetch_add(1, Ordering::Relaxed);
         let resident_bytes = snapshot
@@ -199,6 +257,36 @@ impl V1QuerySnapshotCache {
         if resident_bytes > self.maximum_bytes {
             return;
         }
+        let mut entry_lease = None;
+        if let Some(cache) = &self.artifact_cache {
+            for run in snapshot.runs() {
+                if !cache.admit_query_run_metadata(run) {
+                    return;
+                }
+            }
+            let snapshot_bytes = snapshot.resident_bytes();
+            if !snapshot.has_memory_lease() {
+                let Some(lease) = cache.admit_memory(snapshot_bytes) else {
+                    return;
+                };
+                snapshot.attach_memory_lease(lease);
+            }
+            let pin_bytes = pinned_resident_bytes(&pinned);
+            if !pinned.memory_lease.is_attached() {
+                let Some(lease) = cache.admit_memory(pin_bytes) else {
+                    return;
+                };
+                pinned.memory_lease.attach(lease);
+            }
+            entry_lease = cache.admit_memory(
+                resident_bytes
+                    .saturating_sub(snapshot_bytes)
+                    .saturating_sub(pin_bytes),
+            );
+            if entry_lease.is_none() {
+                return;
+            }
+        }
         let mut state = self
             .state
             .lock()
@@ -208,6 +296,7 @@ impl V1QuerySnapshotCache {
             return;
         }
         let cached = Arc::new(CachedRuntimeQuerySnapshot {
+            _memory_lease: entry_lease,
             pinned: Arc::new(pinned),
             snapshot,
             resident_bytes,
@@ -223,25 +312,9 @@ impl V1QuerySnapshotCache {
             .push(cached.clone());
         touch(&mut state, &cached, protect);
         while state.resident_bytes > self.maximum_bytes {
-            let oldest = pop_current(&mut state.cold_recency, false);
-            let oldest = match oldest {
-                Some(oldest) => Some(oldest),
-                None => pop_current(&mut state.protected_recency, true),
-            };
-            let Some(oldest) = oldest else {
+            if !evict_oldest(&mut state) {
                 break;
-            };
-            let oldest_identity = oldest.snapshot.identity();
-            let mut remove_bucket = false;
-            if let Some(entries) = state.entries.get_mut(&oldest_identity) {
-                entries.retain(|entry| !Arc::ptr_eq(entry, &oldest));
-                remove_bucket = entries.is_empty();
             }
-            if remove_bucket {
-                state.entries.remove(&oldest_identity);
-            }
-            state.resident_bytes = state.resident_bytes.saturating_sub(oldest.resident_bytes);
-            state.entry_count = state.entry_count.saturating_sub(1);
         }
         compact_recency_if_needed(&mut state);
     }
@@ -249,11 +322,72 @@ impl V1QuerySnapshotCache {
     #[cfg(test)]
     fn with_maximum_bytes(maximum_bytes: usize) -> Self {
         Self {
+            artifact_cache: None,
             state: Arc::new(Mutex::new(QuerySnapshotCacheState::default())),
             maximum_bytes,
             deep_size_computations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
+}
+
+fn evict_oldest(state: &mut QuerySnapshotCacheState) -> bool {
+    let oldest = pop_current(&mut state.cold_recency, false)
+        .or_else(|| pop_current(&mut state.protected_recency, true));
+    let Some(oldest) = oldest else {
+        return false;
+    };
+    let identity = oldest.snapshot.identity();
+    let mut remove_bucket = false;
+    if let Some(entries) = state.entries.get_mut(&identity) {
+        entries.retain(|entry| !Arc::ptr_eq(entry, &oldest));
+        remove_bucket = entries.is_empty();
+    }
+    if remove_bucket {
+        state.entries.remove(&identity);
+    }
+    state.resident_bytes = state.resident_bytes.saturating_sub(oldest.resident_bytes);
+    state.entry_count = state.entry_count.saturating_sub(1);
+    true
+}
+
+fn pinned_resident_bytes(pinned: &PinnedRootVector) -> usize {
+    std::mem::size_of::<PinnedRootVector>()
+        .saturating_add(
+            pinned
+                .roots
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PinnedPartitionQueryRoot>()),
+        )
+        .saturating_add(
+            pinned
+                .generation_hashes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<[u8; 32]>()),
+        )
+        .saturating_add(
+            pinned
+                .directory
+                .entries
+                .capacity()
+                .saturating_mul(std::mem::size_of::<
+                    keldra_index::v1::ProjectionPartitionDirectoryEntry,
+                >()),
+        )
+        .saturating_add(
+            pinned
+                .directory
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .covered_predecessors
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<
+                            keldra_index::v1::ProjectionGenerationReference,
+                        >())
+                })
+                .sum::<usize>(),
+        )
 }
 
 fn exact_entry(
@@ -472,6 +606,7 @@ mod tests {
         .unwrap();
         let (_, blocks) = packed.bind(pack_table.clone()).unwrap();
         let descriptor = ProjectionQueryRunDescriptor {
+            memory_lease: Default::default(),
             partition,
             physical_catalog_generation: [4; 32],
             sequence: 1,
@@ -573,6 +708,7 @@ mod tests {
         assert_eq!(admission.calls, 1);
 
         let pinned = PinnedRootVector {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             identity: snapshot.identity(),
             cut,
             roots: vec![pin],
@@ -726,6 +862,36 @@ mod tests {
                 .get_for_pinned(&newest, &logical, &lineage, &proofs)
                 .unwrap()
                 .is_some()
+        );
+        let memory = super::super::super::working_memory::IndexWorkingMemory::new(
+            16 * 1024 * 1024,
+            [4 * 1024 * 1024, 8 * 1024 * 1024],
+        )
+        .unwrap();
+        let artifacts = ImmutableArtifactCache::with_working_memory(memory.clone());
+        let shared = V1QuerySnapshotCache::with_artifact_cache(artifacts);
+        let before = memory.available();
+        shared.insert(pinned.clone(), snapshot.clone(), false);
+        let shared_hit = shared
+            .get_for_pinned(&pinned, &logical, &lineage, &proofs)
+            .unwrap()
+            .unwrap();
+        let raw_snapshot = shared_hit.snapshot.clone();
+        let raw_pins = shared_hit.pinned.clone();
+        assert!(raw_snapshot.has_memory_lease());
+        assert!(raw_pins.memory_lease.is_attached());
+        assert!(raw_snapshot.runs().all(|run| run.has_memory_lease()));
+        drop(shared_hit);
+        shared.state.reclaim(u64::MAX);
+        assert!(
+            memory.available() < before,
+            "eviction cannot uncharge live extracted Arcs"
+        );
+        assert!(
+            shared
+                .get_for_pinned(&pinned, &logical, &lineage, &proofs)
+                .unwrap()
+                .is_none()
         );
     }
 }

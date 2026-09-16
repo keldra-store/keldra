@@ -17,7 +17,7 @@ use super::{
     QueryDocumentGate, QueryPositions, QueryPosting, QueryPostingShard, QueryTermEntry,
     RecipeIdentity, StableDocumentKey, UnpublishedArtifactPack, encode_doc_value,
     encode_document_gate, encode_point, encode_positions, encode_posting,
-    encode_projection_query_run, encode_query_block, encode_term_entry,
+    encode_projection_query_run, encode_term_entry,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +85,7 @@ impl PreparedQueryBlockPacks {
                     records: block.records,
                     locator,
                     pack_table: pack_table.clone(),
+                    documents: block.documents,
                 })
             })
             .collect::<Result<Vec<_>, IndexError>>()?;
@@ -167,7 +168,7 @@ impl ChargedProjectionQueryRunArtifacts {
     }
 }
 
-/// Convert already typed, sparse old/new field deltas into one query-ready
+/// Convert complete typed field replacements into one query-ready
 /// mini-run. Empty batches deliberately produce an empty-block run descriptor:
 /// it is the durable no-op marker that advances an exact source/atomic cut.
 #[allow(clippy::too_many_arguments)]
@@ -292,12 +293,54 @@ pub fn prepare_projection_query_run(
         }
     }
 
+    let document_slots = grouped
+        .ordinary
+        .values()
+        .map(BTreeMap::len)
+        .chain(grouped.terms.values().map(BTreeMap::len))
+        .try_fold(0usize, |sum, count| {
+            sum.checked_add(count).ok_or(IndexError::OffsetOverflow)
+        })?;
+    let table_scratch = document_slots
+        .checked_mul(80)
+        .and_then(|bytes| bytes.checked_add(size_of::<super::query_blocks::SegmentDocumentTable>()))
+        .ok_or(IndexError::OffsetOverflow)?;
+    credits.reserve(table_scratch)?;
+    let mut document_keys = Vec::with_capacity(document_slots);
+    for ((kind, _), records) in &grouped.ordinary {
+        for (key, record) in records {
+            document_keys.push((
+                super::query_blocks::document_key_for_record(*kind, key)?,
+                u64::from_be_bytes(
+                    record
+                        .value
+                        .get(..8)
+                        .ok_or(IndexError::Integrity)?
+                        .try_into()
+                        .map_err(|_| IndexError::Integrity)?,
+                ),
+            ));
+        }
+    }
+    for documents in grouped.terms.values() {
+        document_keys.extend(
+            documents
+                .values()
+                .map(|term| (term.document, term.material_source_version)),
+        );
+    }
+    let document_table = std::sync::Arc::new(
+        super::query_blocks::SegmentDocumentTable::new_with_versions(document_keys)?,
+    );
+    credits.release(table_scratch)?;
+    credits.reserve(document_table.resident_bytes())?;
     let mut blocks = Vec::new();
     let mut dictionaries = BTreeMap::<RecipeIdentity, Vec<QueryBlockRecord>>::new();
     for ((recipe, term), documents) in grouped.terms {
         let posting_shards = encode_term_shards(
             recipe,
             documents.into_values(),
+            document_table.clone(),
             limits,
             &mut credits,
             &mut blocks,
@@ -322,6 +365,7 @@ pub fn prepare_projection_query_run(
             QueryBlockKind::TermDictionary,
             recipe,
             records,
+            document_table.clone(),
             limits,
             &mut credits,
             &mut blocks,
@@ -332,6 +376,7 @@ pub fn prepare_projection_query_run(
             kind,
             recipe,
             records.into_values(),
+            document_table.clone(),
             limits,
             &mut credits,
             &mut blocks,
@@ -448,6 +493,7 @@ pub(super) fn finish_projection_query_run(
             |block| block.pack_table.clone(),
         ),
         blocks,
+        memory_lease: super::query_blocks::SegmentMemoryLease::default(),
     };
     let run = encode_projection_query_run(&descriptor, limits, &mut credits)?;
     Ok(ChargedProjectionQueryRunArtifacts {
@@ -497,6 +543,7 @@ fn merge_term_delta(
 fn encode_term_shards(
     recipe: RecipeIdentity,
     documents: impl Iterator<Item = super::PreparedQueryTermDelta>,
+    document_table: std::sync::Arc<super::query_blocks::SegmentDocumentTable>,
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     blocks: &mut Vec<EncodedQueryBlock>,
@@ -504,20 +551,20 @@ fn encode_term_shards(
     let mut shards = Vec::new();
     let mut pending = Vec::new();
     let mut pending_position_records = 0usize;
-    let mut posting_bytes = 87usize;
-    let mut position_bytes = 87usize;
+    let mut posting_bytes = 119usize;
+    let mut position_bytes = 119usize;
     for delta in documents {
         let posting_value = if delta.live && !delta.positions.is_empty() {
             46
         } else {
             10
         };
-        let next_posting = block_record_bytes(posting_bytes, pending.len(), 32, posting_value)?;
+        let next_posting = block_record_bytes(posting_bytes, pending.len(), 4, posting_value)?;
         let next_position = if delta.live && !delta.positions.is_empty() {
             block_record_bytes(
                 position_bytes,
                 pending_position_records,
-                32,
+                4,
                 4usize
                     .checked_add(delta.positions.len().saturating_mul(4))
                     .ok_or(IndexError::OffsetOverflow)?,
@@ -530,20 +577,25 @@ fn encode_term_shards(
                 || next_posting > limits.maximum_block_bytes
                 || next_position > limits.maximum_block_bytes)
         {
-            shards.push(encode_term_shard(
-                recipe, &pending, limits, credits, blocks,
+            shards.push(encode_term_shard_with_documents(
+                recipe,
+                &pending,
+                document_table.clone(),
+                limits,
+                credits,
+                blocks,
             )?);
             pending.clear();
             pending_position_records = 0;
-            posting_bytes = 87;
-            position_bytes = 87;
+            posting_bytes = 119;
+            position_bytes = 119;
         }
-        posting_bytes = block_record_bytes(posting_bytes, pending.len(), 32, posting_value)?;
+        posting_bytes = block_record_bytes(posting_bytes, pending.len(), 4, posting_value)?;
         if delta.live && !delta.positions.is_empty() {
             position_bytes = block_record_bytes(
                 position_bytes,
                 pending_position_records,
-                32,
+                4,
                 4usize
                     .checked_add(delta.positions.len().saturating_mul(4))
                     .ok_or(IndexError::OffsetOverflow)?,
@@ -562,8 +614,13 @@ fn encode_term_shards(
         pending.push(delta);
     }
     if !pending.is_empty() {
-        shards.push(encode_term_shard(
-            recipe, &pending, limits, credits, blocks,
+        shards.push(encode_term_shard_with_documents(
+            recipe,
+            &pending,
+            document_table.clone(),
+            limits,
+            credits,
+            blocks,
         )?);
     }
     Ok(shards)
@@ -590,6 +647,25 @@ pub(super) fn encode_term_shard(
     credits: &mut QueryBlockCredits,
     blocks: &mut Vec<EncodedQueryBlock>,
 ) -> Result<QueryPostingShard, IndexError> {
+    let documents = std::sync::Arc::new(
+        super::query_blocks::SegmentDocumentTable::new_with_versions(
+            deltas
+                .iter()
+                .map(|delta| (delta.document, delta.material_source_version)),
+        )?,
+    );
+    credits.reserve(documents.resident_bytes())?;
+    encode_term_shard_with_documents(recipe, deltas, documents, limits, credits, blocks)
+}
+
+fn encode_term_shard_with_documents(
+    recipe: RecipeIdentity,
+    deltas: &[super::PreparedQueryTermDelta],
+    document_table: std::sync::Arc<super::query_blocks::SegmentDocumentTable>,
+    limits: QueryBlockLimits,
+    credits: &mut QueryBlockCredits,
+    blocks: &mut Vec<EncodedQueryBlock>,
+) -> Result<QueryPostingShard, IndexError> {
     let mut positions = Vec::new();
     for delta in deltas
         .iter()
@@ -604,7 +680,14 @@ pub(super) fn encode_term_shard(
     let position_hash = if positions.is_empty() {
         None
     } else {
-        let block = encode_one_block(QueryBlockKind::Position, recipe, positions, limits, credits)?;
+        let block = encode_one_block(
+            QueryBlockKind::Position,
+            recipe,
+            positions,
+            document_table.clone(),
+            limits,
+            credits,
+        )?;
         let hash = block.descriptor.hash;
         push_block(blocks, block, credits)?;
         Some(hash)
@@ -632,7 +715,14 @@ pub(super) fn encode_term_shard(
                 .map_err(|_| IndexError::OffsetOverflow)?,
         })?);
     }
-    let posting = encode_one_block(QueryBlockKind::Posting, recipe, postings, limits, credits)?;
+    let posting = encode_one_block(
+        QueryBlockKind::Posting,
+        recipe,
+        postings,
+        document_table,
+        limits,
+        credits,
+    )?;
     let shard = QueryPostingShard {
         posting_block_hash: posting.descriptor.hash,
         posting_records: posting.descriptor.records,
@@ -682,6 +772,7 @@ fn encode_split_blocks(
     kind: QueryBlockKind,
     recipe: RecipeIdentity,
     records: impl IntoIterator<Item = QueryBlockRecord>,
+    documents: std::sync::Arc<super::query_blocks::SegmentDocumentTable>,
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     output: &mut Vec<EncodedQueryBlock>,
@@ -690,10 +781,19 @@ fn encode_split_blocks(
     records.sort_unstable_by(|left, right| left.key.cmp(&right.key));
     reject_duplicate_records(&records)?;
     let mut pending = Vec::new();
-    let mut encoded_bytes = 87usize;
+    let mut encoded_bytes = 119usize;
     for record in records {
+        let encoded_key_bytes = if kind == QueryBlockKind::TermDictionary {
+            record.key.len()
+        } else {
+            record
+                .key
+                .len()
+                .checked_sub(28)
+                .ok_or(IndexError::Integrity)?
+        };
         let extra = 8usize
-            .checked_add(record.key.len())
+            .checked_add(encoded_key_bytes)
             .and_then(|bytes| bytes.checked_add(record.value.len()))
             .and_then(|bytes| bytes.checked_add(usize::from(pending.len() % 64 == 0) * 4))
             .ok_or(IndexError::OffsetOverflow)?;
@@ -701,10 +801,17 @@ fn encode_split_blocks(
             && (pending.len() == limits.maximum_records
                 || encoded_bytes.saturating_add(extra) > limits.maximum_block_bytes)
         {
-            let block = encode_query_block(kind, recipe, &pending, limits, credits)?;
+            let block = super::query_blocks::encode_query_block_with_documents(
+                kind,
+                recipe,
+                &pending,
+                documents.clone(),
+                limits,
+                credits,
+            )?;
             push_block(output, block, credits)?;
             pending.clear();
-            encoded_bytes = 87;
+            encoded_bytes = 119;
         }
         if encoded_bytes.saturating_add(extra) > limits.maximum_block_bytes {
             return Err(IndexError::ResourceLimit {
@@ -718,7 +825,9 @@ fn encode_split_blocks(
         pending.push(record);
     }
     if !pending.is_empty() {
-        let block = encode_query_block(kind, recipe, &pending, limits, credits)?;
+        let block = super::query_blocks::encode_query_block_with_documents(
+            kind, recipe, &pending, documents, limits, credits,
+        )?;
         push_block(output, block, credits)?;
     }
     Ok(())
@@ -728,12 +837,15 @@ fn encode_one_block(
     kind: QueryBlockKind,
     recipe: RecipeIdentity,
     mut records: Vec<QueryBlockRecord>,
+    documents: std::sync::Arc<super::query_blocks::SegmentDocumentTable>,
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
 ) -> Result<EncodedQueryBlock, IndexError> {
     records.sort_unstable_by(|left, right| left.key.cmp(&right.key));
     reject_duplicate_records(&records)?;
-    encode_query_block(kind, recipe, &records, limits, credits)
+    super::query_blocks::encode_query_block_with_documents(
+        kind, recipe, &records, documents, limits, credits,
+    )
 }
 
 fn reject_duplicate_records(records: &[QueryBlockRecord]) -> Result<(), IndexError> {
@@ -921,26 +1033,15 @@ mod tests {
         let pool = memory(8 * 1024 * 1024);
         let mut reservation = credits(&pool, 8 * 1024 * 1024);
         let field = keyword();
-        let previous = TypedJsonFieldState::from_selected(
-            &field,
-            Some(vec![ScalarValue::String("queued".into())]),
-        )
-        .unwrap();
         let current = TypedJsonFieldState::from_selected(
             &field,
             Some(vec![ScalarValue::String("running".into())]),
         )
         .unwrap();
         let document = StableDocumentKey::from_bytes([9; 32]).unwrap();
-        let delta = prepare_typed_json_field_delta(
-            &field,
-            document,
-            7,
-            Some(&previous),
-            Some(&current),
-            &mut reservation,
-        )
-        .unwrap();
+        let delta =
+            prepare_typed_json_field_delta(&field, document, 7, Some(&current), &mut reservation)
+                .unwrap();
         let recipe = RecipeIdentity::new([7; 32]).unwrap();
         let prepared = prepare_projection_query_run(
             partition(),
@@ -1124,11 +1225,6 @@ mod tests {
             analyzer: Some(Analyzer::UnicodeAlphanumericLowercase),
             date_format: None,
         };
-        let previous = TypedJsonFieldState::from_selected(
-            &field,
-            Some(vec![ScalarValue::String("one two".into())]),
-        )
-        .unwrap();
         let current = TypedJsonFieldState::from_selected(
             &field,
             Some(vec![ScalarValue::String("two one".into())]),
@@ -1137,16 +1233,14 @@ mod tests {
         let pool = memory(8 * 1024 * 1024);
         let mut reservation = credits(&pool, 8 * 1024 * 1024);
         let document = StableDocumentKey::from_bytes([4; 32]).unwrap();
-        let delta = prepare_typed_json_field_delta(
-            &field,
-            document,
+        let delta =
+            prepare_typed_json_field_delta(&field, document, 2, Some(&current), &mut reservation)
+                .unwrap();
+        assert_eq!(
+            delta.terms.len(),
             2,
-            Some(&previous),
-            Some(&current),
-            &mut reservation,
-        )
-        .unwrap();
-        assert_eq!(delta.terms.len(), 4, "old tombstones plus live positions");
+            "complete new positions without old-term subtraction"
+        );
         let prepared = prepare_projection_query_run(
             partition(),
             [8; 32],

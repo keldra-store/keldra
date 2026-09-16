@@ -113,7 +113,7 @@ pub(super) async fn decode_posting_block<L: QueryArtifactLoader, X: QueryPartiti
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<Vec<QueryPosting>, IndexError> {
+) -> Result<Vec<DenseQueryPosting>, IndexError> {
     let block = load_decoded_block(
         loader,
         executor,
@@ -128,19 +128,25 @@ pub(super) async fn decode_posting_block<L: QueryArtifactLoader, X: QueryPartiti
     let mut cpu_credits = credits.try_fork_query()?;
     executor
         .run_cpu(Box::new(move || {
-            let minimum = minimum_document_exclusive
-                .filter(|minimum| minimum_document <= *minimum)
-                .map_or(minimum_document.bytes(), |minimum| minimum.bytes());
             let mut postings = Vec::new();
-            for record in block.records_from(&minimum) {
-                let posting = decode_posting(record)?;
-                if posting.document < minimum_document || posting.document > maximum_document {
+            let minimum = minimum_document_exclusive.map_or_else(
+                || block.documents().lower_bound(minimum_document),
+                |minimum| block.documents().upper_bound(minimum),
+            );
+            let lower = block.documents().lower_bound(minimum_document);
+            let upper = block.documents().upper_bound(maximum_document);
+            let mut cursor = block.posting_cursor()?;
+            let mut next = cursor.advance(minimum.max(lower));
+            while let Some(dense) = next? {
+                if dense.document < lower || dense.document >= upper {
                     return Err(IndexError::Integrity);
                 }
-                if minimum_document_exclusive.is_none_or(|minimum| posting.document > minimum) {
-                    cpu_budget.reserve_heap(&mut cpu_credits, posting_entry_bytes())?;
-                    postings.push(posting);
-                }
+                cpu_budget.reserve_heap(&mut cpu_credits, posting_entry_bytes())?;
+                postings.push(DenseQueryPosting {
+                    documents: block.documents().clone(),
+                    posting: dense,
+                });
+                next = cursor.next();
             }
             cpu_credits.release_loaded_block(block.encoded_bytes())?;
             Ok(postings)
@@ -149,12 +155,13 @@ pub(super) async fn decode_posting_block<L: QueryArtifactLoader, X: QueryPartiti
 }
 
 pub(super) const fn posting_entry_bytes() -> usize {
-    std::mem::size_of::<StableDocumentKey>() + std::mem::size_of::<QueryPosting>()
+    2 * (std::mem::size_of::<StableDocumentKey>() + std::mem::size_of::<DenseQueryPosting>()) + 96
 }
 
 pub(super) fn resident_point_entry_bytes(value: &ScalarValue) -> usize {
-    std::mem::size_of::<(ScalarValue, StableDocumentKey)>()
-        .saturating_add(std::mem::size_of::<(bool, u64)>())
+    (2 * (std::mem::size_of::<(ScalarValue, StableDocumentKey)>()
+        .saturating_add(std::mem::size_of::<(bool, QueryMaterialCandidate)>()))
+        + 96)
         .saturating_add(resident_scalar_bytes(value))
 }
 
@@ -184,7 +191,7 @@ pub(super) async fn decode_range_block<L: QueryArtifactLoader, X: QueryPartition
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<Vec<QueryPoint>, IndexError> {
+) -> Result<Vec<DenseQueryPoint>, IndexError> {
     let block = load_decoded_block(
         loader,
         executor,
@@ -202,12 +209,15 @@ pub(super) async fn decode_range_block<L: QueryArtifactLoader, X: QueryPartition
     executor
         .run_cpu(Box::new(move || {
             let mut points = Vec::new();
-            for record in block.records() {
-                let point = decode_point(record)?;
+            for point in block.points()? {
+                let point = point?;
                 if in_range(&point.value, lower.as_ref(), upper.as_ref()) {
                     cpu_budget
                         .reserve_heap(&mut cpu_credits, resident_point_entry_bytes(&point.value))?;
-                    points.push(point);
+                    points.push(DenseQueryPoint {
+                        documents: block.documents().clone(),
+                        point,
+                    });
                 }
             }
             cpu_credits.release_loaded_block(block.encoded_bytes())?;

@@ -1028,8 +1028,10 @@ mod tests {
 
     #[test]
     fn production_aligned_admission_handles_reordered_thousand_item_completion() {
+        // Each of the thousand concurrent items now admits its 8KiB parser
+        // input plus bounded ordinal/selection scratch, not just JSON bytes.
         let ingress =
-            crate::index_runtime::hot_ingress::HotProjectionIngress::new(4 * 1024 * 1024).unwrap();
+            crate::index_runtime::hot_ingress::HotProjectionIngress::new(64 * 1024 * 1024).unwrap();
         ingress.activate_test_route(1, 2);
         let mut pending = BTreeMap::new();
         // Insert in reverse completion order; the production helper must bind

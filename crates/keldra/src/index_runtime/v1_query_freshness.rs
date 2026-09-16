@@ -146,6 +146,7 @@ mod tests {
         };
         let identity = keldra_index::v1::query_snapshot_identity(cut, &roots).unwrap();
         PinnedRootVector {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             identity,
             cut,
             generation_hashes: roots

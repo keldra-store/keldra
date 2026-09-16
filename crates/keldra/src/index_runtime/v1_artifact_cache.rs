@@ -2,12 +2,18 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use super::working_memory::{
+    IndexWorkingMemory, WorkingMemoryAccount, WorkingMemoryPermit, WorkingMemoryReclaimer,
+};
 use bytes::Bytes;
 use keldra_index::v1::{DecodedQueryBlock, ProjectionQueryRunDescriptor, QueryBlockDescriptor};
 use keldra_store::BlobRef;
 use tonic::Status;
 
+#[cfg(test)]
 const CAPACITY_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(not(test))]
+const CAPACITY_BYTES: usize = 0;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct Authority {
@@ -48,11 +54,12 @@ enum CacheKey {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct QueryBlockKey {
-    generation: [u8; 32],
+    segment_identity: [u8; 32],
     block: BlobKey,
 }
 
 struct State {
+    memory: Option<IndexWorkingMemory>,
     capacity_bytes: usize,
     bytes: usize,
     // Nest by authority and path so hits can compare the caller's borrowed
@@ -84,6 +91,7 @@ struct CachedQueryBlock {
 impl Default for State {
     fn default() -> Self {
         Self {
+            memory: None,
             capacity_bytes: CAPACITY_BYTES,
             bytes: 0,
             entries: HashMap::new(),
@@ -100,6 +108,49 @@ impl Default for State {
 
 #[derive(Clone, Default)]
 pub(super) struct ImmutableArtifactCache(Arc<Mutex<State>>);
+
+struct AccountedBytes {
+    bytes: Bytes,
+    _permit: WorkingMemoryPermit,
+}
+
+impl AsRef<[u8]> for AccountedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+struct ReaderMemoryLease(WorkingMemoryPermit);
+
+impl std::fmt::Debug for ReaderMemoryLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ReaderMemoryLease")
+            .field(&self.0.bytes())
+            .finish()
+    }
+}
+
+impl WorkingMemoryReclaimer for Mutex<State> {
+    fn reclaim(&self, needed_bytes: u64) {
+        let mut state = self
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let memory = state.memory.clone();
+        let before = memory.as_ref().map_or(0, IndexWorkingMemory::free_bytes);
+        while !state.fifo.is_empty() {
+            if memory
+                .as_ref()
+                .is_some_and(|memory| memory.free_bytes().saturating_sub(before) >= needed_bytes)
+            {
+                break;
+            }
+            let capacity = state.capacity_bytes;
+            state.capacity_bytes = state.bytes.saturating_sub(1);
+            ImmutableArtifactCache::evict_to_capacity(&mut state);
+            state.capacity_bytes = capacity;
+        }
+    }
+}
 
 struct PathLoadGuard {
     cache: ImmutableArtifactCache,
@@ -167,6 +218,129 @@ pub(super) enum DecodePopulation {
 }
 
 impl ImmutableArtifactCache {
+    pub(super) fn with_working_memory(memory: IndexWorkingMemory) -> Self {
+        let state = Arc::new(Mutex::new(State {
+            capacity_bytes: usize::try_from(memory.hard_limit()).unwrap_or(usize::MAX),
+            memory: Some(memory.clone()),
+            ..State::default()
+        }));
+        let reclaimer: Arc<dyn WorkingMemoryReclaimer> = state.clone();
+        memory.register_reclaimer(Arc::downgrade(&reclaimer));
+        Self(state)
+    }
+
+    /// Attach the reservation to the shared bytes allocation, not its cache
+    /// entry. Eviction cannot uncharge bytes still held by a reader.
+    pub(super) fn admit_bytes(&self, bytes: Bytes) -> Option<Bytes> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(memory) = state.memory.clone() else {
+            return Some(bytes);
+        };
+        let permit = Self::admit_cache(&mut state, &memory, bytes.len())?;
+        Some(Bytes::from_owner(AccountedBytes {
+            bytes,
+            _permit: permit,
+        }))
+    }
+
+    pub(super) fn working_memory(&self) -> Option<IndexWorkingMemory> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .memory
+            .clone()
+    }
+
+    pub(super) fn range_memory(
+        &self,
+        account: WorkingMemoryAccount,
+    ) -> Option<Arc<dyn crate::payload_read::PayloadRangeMemory>> {
+        self.working_memory()
+            .map(|memory| memory.payload_range_memory(account))
+    }
+
+    pub(super) fn admit_memory(
+        &self,
+        bytes: usize,
+    ) -> Option<Arc<dyn Send + Sync + std::fmt::Debug>> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let memory = state.memory.clone()?;
+        Some(Arc::new(ReaderMemoryLease(Self::admit_cache(
+            &mut state, &memory, bytes,
+        )?)))
+    }
+
+    pub(super) fn admit_query_run_metadata(
+        &self,
+        descriptor: &ProjectionQueryRunDescriptor,
+    ) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::account_query_run(&mut state, descriptor)
+    }
+
+    fn account_query_run(state: &mut State, descriptor: &ProjectionQueryRunDescriptor) -> bool {
+        let Some(memory) = state.memory.clone() else {
+            return true;
+        };
+        for table in std::iter::once(&descriptor.pack_table)
+            .chain(descriptor.blocks.iter().map(|block| &block.pack_table))
+        {
+            if !table.has_memory_lease() {
+                let Some(permit) = Self::admit_cache(state, &memory, table.resident_bytes()) else {
+                    return false;
+                };
+                table.attach_memory_lease(Arc::new(ReaderMemoryLease(permit)));
+            }
+        }
+        for documents in descriptor.blocks.iter().map(|block| &block.documents) {
+            if !documents.has_memory_lease() {
+                let Some(permit) = Self::admit_cache(state, &memory, documents.resident_bytes())
+                else {
+                    return false;
+                };
+                documents.attach_memory_lease(Arc::new(ReaderMemoryLease(permit)));
+            }
+        }
+        if !descriptor.has_memory_lease() {
+            let Some(permit) =
+                Self::admit_cache(state, &memory, resident_query_run_bytes(descriptor))
+            else {
+                return false;
+            };
+            descriptor.attach_memory_lease(Arc::new(ReaderMemoryLease(permit)));
+        }
+        true
+    }
+
+    fn admit_cache(
+        state: &mut State,
+        memory: &IndexWorkingMemory,
+        bytes: usize,
+    ) -> Option<WorkingMemoryPermit> {
+        loop {
+            if let Some(permit) =
+                memory.try_acquire(WorkingMemoryAccount::ReusableCache, bytes as u64)
+            {
+                return Some(permit);
+            }
+            if state.fifo.is_empty() {
+                return None;
+            }
+            let capacity = state.capacity_bytes;
+            state.capacity_bytes = state.bytes.saturating_sub(1);
+            Self::evict_to_capacity(state);
+            state.capacity_bytes = capacity;
+        }
+    }
     pub(super) async fn coordinate_query_run(
         &self,
         blob: &BlobRef,
@@ -192,10 +366,10 @@ impl ImmutableArtifactCache {
     pub(super) async fn coordinate_query_block(
         &self,
         blob: &BlobRef,
-        generation: [u8; 32],
+        segment_identity: [u8; 32],
     ) -> Result<DecodePopulation, Status> {
         let key = QueryBlockKey {
-            generation,
+            segment_identity,
             block: BlobKey::from(blob),
         };
         let wait = {
@@ -277,7 +451,20 @@ impl ImmutableArtifactCache {
                     let load = load
                         .take()
                         .expect("one artifact caller can lead at most once");
-                    let result = load().await;
+                    let mut result = load().await;
+                    let admitted = if let Ok(Some(bytes)) = &result {
+                        self.admit_bytes(bytes.clone())
+                    } else {
+                        None
+                    };
+                    if let Some(bytes) = admitted {
+                        result = Ok(Some(bytes));
+                    } else if matches!(&result, Ok(Some(_))) {
+                        // The caller's query/preparation permit covers its
+                        // active bytes. Do not retain an unaccounted cache copy.
+                        drop(guard);
+                        return result;
+                    }
                     if let Ok(Some(bytes)) = &result {
                         if bytes.len() > maximum_bytes {
                             return Err(Status::data_loss(
@@ -504,6 +691,9 @@ impl ImmutableArtifactCache {
         if descriptor_bytes > state.capacity_bytes {
             return;
         }
+        if !Self::account_query_run(&mut state, &descriptor) {
+            return;
+        }
         state.query_runs.insert(
             key,
             CachedQueryRun {
@@ -519,7 +709,7 @@ impl ImmutableArtifactCache {
     pub(super) fn get_query_block(
         &self,
         blob: &BlobRef,
-        generation: [u8; 32],
+        segment_identity: [u8; 32],
         maximum_bytes: usize,
     ) -> Result<Option<Arc<DecodedQueryBlock>>, Status> {
         let state = self
@@ -532,7 +722,7 @@ impl ImmutableArtifactCache {
             ));
         }
         let key = QueryBlockKey {
-            generation,
+            segment_identity,
             block: BlobKey::from(blob),
         };
         Ok(state
@@ -544,11 +734,11 @@ impl ImmutableArtifactCache {
     pub(super) fn insert_query_block(
         &self,
         blob: &BlobRef,
-        generation: [u8; 32],
+        segment_identity: [u8; 32],
         block: Arc<DecodedQueryBlock>,
     ) {
         let key = QueryBlockKey {
-            generation,
+            segment_identity,
             block: BlobKey::from(blob),
         };
         let mut state = self
@@ -569,6 +759,23 @@ impl ImmutableArtifactCache {
             .saturating_add(block.encoded_bytes());
         if resident_bytes > state.capacity_bytes {
             return;
+        }
+        if let Some(memory) = state.memory.clone() {
+            let documents = block.documents();
+            if !documents.has_memory_lease() {
+                let Some(permit) =
+                    Self::admit_cache(&mut state, &memory, documents.resident_bytes())
+                else {
+                    return;
+                };
+                documents.attach_memory_lease(Arc::new(ReaderMemoryLease(permit)));
+            }
+            if !block.has_memory_lease() {
+                let Some(permit) = Self::admit_cache(&mut state, &memory, resident_bytes) else {
+                    return;
+                };
+                block.attach_memory_lease(Arc::new(ReaderMemoryLease(permit)));
+            }
         }
         state.query_blocks.insert(
             key,
@@ -640,22 +847,6 @@ impl ImmutableArtifactCache {
 
 fn resident_query_run_bytes(descriptor: &ProjectionQueryRunDescriptor) -> usize {
     std::mem::size_of::<ProjectionQueryRunDescriptor>()
-        .saturating_add(std::mem::size_of::<keldra_index::v1::ArtifactPackTable>())
-        .saturating_add(
-            descriptor
-                .pack_table
-                .entries()
-                .len()
-                .saturating_mul(std::mem::size_of::<keldra_index::v1::ArtifactPackReference>()),
-        )
-        .saturating_add(
-            descriptor
-                .pack_table
-                .entries()
-                .iter()
-                .map(|pack| pack.canonical_path.len())
-                .sum::<usize>(),
-        )
         .saturating_add(
             descriptor
                 .blocks
@@ -677,6 +868,89 @@ mod tests {
     use tonic::Code;
 
     use super::*;
+
+    #[test]
+    fn byte_reservation_survives_eviction_until_last_reader_drops() {
+        let memory = IndexWorkingMemory::new(100, [20, 30]).unwrap();
+        let cache = ImmutableArtifactCache::with_working_memory(memory.clone());
+        let bytes = cache.admit_bytes(Bytes::from(vec![1; 40])).unwrap();
+        cache.insert(1, 2, "/segment", [3; 32], Some(4), bytes.clone());
+        drop(bytes);
+        let reader = cache
+            .get(1, 2, "/segment", [3; 32], Some(4), 40)
+            .unwrap()
+            .unwrap();
+        cache.0.reclaim(u64::MAX);
+        assert_eq!(memory.available(), 60);
+        drop(reader);
+        assert_eq!(memory.available(), 100);
+    }
+
+    #[tokio::test]
+    async fn mandatory_query_reclaims_disposable_cache_before_waiting() {
+        let memory = IndexWorkingMemory::new(100, [20, 30]).unwrap();
+        let cache = ImmutableArtifactCache::with_working_memory(memory.clone());
+        let bytes = cache.admit_bytes(Bytes::from(vec![1; 40])).unwrap();
+        cache.insert(1, 2, "/segment", [3; 32], Some(4), bytes);
+        let query = memory
+            .acquire_up_to(WorkingMemoryAccount::Query, 80, 80)
+            .await
+            .unwrap();
+        assert_eq!(query.bytes(), 80);
+        assert_eq!(memory.available(), 20);
+        assert!(
+            cache
+                .get(1, 2, "/segment", [3; 32], Some(4), 40)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_small_query_shortfall_does_not_clear_the_entire_cache() {
+        let memory = IndexWorkingMemory::new(100, [20, 30]).unwrap();
+        let cache = ImmutableArtifactCache::with_working_memory(memory.clone());
+        for (path, hash) in [("/old", [1; 32]), ("/new", [2; 32])] {
+            let bytes = cache.admit_bytes(Bytes::from(vec![1; 40])).unwrap();
+            cache.insert(1, 2, path, hash, Some(4), bytes);
+        }
+        let query = memory
+            .acquire_up_to(WorkingMemoryAccount::Query, 30, 30)
+            .await
+            .unwrap();
+        assert_eq!(query.bytes(), 30);
+        assert!(
+            cache
+                .get(1, 2, "/old", [1; 32], Some(4), 40)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(1, 2, "/new", [2; 32], Some(4), 40)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn shared_configuration_can_retain_artifacts_larger_than_old_64_mib_cap() {
+        let memory =
+            IndexWorkingMemory::new(256 * 1024 * 1024, [32 * 1024 * 1024, 64 * 1024 * 1024])
+                .unwrap();
+        let cache = ImmutableArtifactCache::with_working_memory(memory.clone());
+        let bytes = cache
+            .admit_bytes(Bytes::from(vec![0; 65 * 1024 * 1024]))
+            .unwrap();
+        let count = bytes.len();
+        cache.insert(1, 2, "/segment", [3; 32], Some(4), bytes);
+        assert!(
+            cache
+                .get(1, 2, "/segment", [3; 32], Some(4), count)
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[test]
     fn cached_bytes_are_reference_counted() {
@@ -819,7 +1093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_decoded_block_population_has_one_leader() {
+    async fn decoded_block_population_reuses_segment_identity_and_isolates_other_tables() {
         let cache = ImmutableArtifactCache::default();
         let blob = BlobRef {
             hash: [11; 32],
@@ -829,17 +1103,35 @@ mod tests {
             DecodePopulation::Lead(guard) => guard,
             DecodePopulation::Completed => panic!("first population must lead"),
         };
-        let waiter = {
+        // Published generations are deliberately absent from this key: an
+        // unchanged block bound to the same exact document table shares its
+        // population leader after the owning root advances.
+        let other_table_leader = match cache.coordinate_query_block(&blob, [14; 32]).await.unwrap()
+        {
+            DecodePopulation::Lead(guard) => guard,
+            DecodePopulation::Completed => {
+                panic!("different document table must populate independently")
+            }
+        };
+        let mut waiter = {
             let cache = cache.clone();
             let blob = blob.clone();
             tokio::spawn(async move { cache.coordinate_query_block(&blob, [12; 32]).await })
         };
-        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err()
+        );
+        assert_eq!(cache.0.lock().unwrap().query_block_loading.len(), 2);
         drop(leader);
         assert!(matches!(
             waiter.await.unwrap().unwrap(),
             DecodePopulation::Completed
         ));
+        // Completing the first table must not complete another table's load.
+        assert_eq!(cache.0.lock().unwrap().query_block_loading.len(), 1);
+        drop(other_table_leader);
         assert!(matches!(
             cache.coordinate_query_block(&blob, [12; 32]).await.unwrap(),
             DecodePopulation::Lead(_)
@@ -1031,6 +1323,7 @@ mod tests {
             length: 8,
         };
         let descriptor = Arc::new(ProjectionQueryRunDescriptor {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             partition: keldra_index::v1::ProjectionPartitionIdentity::new(
                 [1; 32], 2, [3; 32], 4, 5, 6,
             )

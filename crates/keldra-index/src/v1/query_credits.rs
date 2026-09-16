@@ -80,6 +80,27 @@ fn lock_ledger(ledger: &Mutex<QueryCreditLedger>) -> MutexGuard<'_, QueryCreditL
 }
 
 impl QueryBlockCredits {
+    /// Publish-phase growth may use the writer's explicitly promised sealing
+    /// headroom, while already-retained prepared bytes keep exact ownership.
+    pub fn enter_sealing(&mut self) -> Result<(), IndexError> {
+        let mut ledger = lock_ledger(&self.ledger);
+        match &mut ledger._permit {
+            QueryCreditPermit::Pipeline { permit, .. } => match permit.enter_sealing()? {
+                super::MemoryAdmission::Admitted => Ok(()),
+                super::MemoryAdmission::ReplayRequired {
+                    needed_bytes,
+                    available_bytes,
+                } => Err(IndexError::ResourceLimit {
+                    needed: needed_bytes,
+                    limit: available_bytes,
+                }),
+            },
+            QueryCreditPermit::Query { .. } => Err(IndexError::InvalidDefinition(
+                "query reader lease cannot enter producer sealing".into(),
+            )),
+        }
+    }
+
     pub fn from_pipeline_permit(permit: IndexingMemoryPermit) -> Self {
         let admitted = permit.bytes();
         Self {
@@ -165,6 +186,11 @@ impl QueryBlockCredits {
         lock_ledger(&self.ledger).remaining
     }
 
+    /// Exact retained permit charge, including already-consumed builder input.
+    pub fn admitted_bytes(&self) -> usize {
+        lock_ledger(&self.ledger).admitted
+    }
+
     /// Total query lease needed by the reservation which exhausted these
     /// credits. Logical execution limits do not populate this retry signal.
     #[doc(hidden)]
@@ -212,6 +238,7 @@ impl QueryBlockCredits {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve_loaded_block_scoped(
         &mut self,
         bytes: usize,

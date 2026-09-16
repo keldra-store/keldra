@@ -403,7 +403,7 @@ fn visit_page_newest_until<PageBytes>(
 where
     PageBytes: AsRef<[u8]>,
 {
-    let (page, actual) = load_page_with_summary(hash, load)?;
+    let (page, actual, _owner) = load_page_with_summary(hash, load)?;
     if expected.is_some_and(|expected| expected != actual) {
         return Err(IndexError::Integrity);
     }
@@ -432,7 +432,7 @@ fn visit_page_newest(
     load: &mut impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
     visit: &mut impl FnMut(QueryRunReference) -> Result<(), IndexError>,
 ) -> Result<(), IndexError> {
-    let (page, actual) = load_page_with_summary(hash, load)?;
+    let (page, actual, _owner) = load_page_with_summary(hash, load)?;
     if expected.is_some_and(|expected| expected != actual) {
         return Err(IndexError::Integrity);
     }
@@ -502,7 +502,7 @@ fn splice_subtree<PageBytes>(
 where
     PageBytes: AsRef<[u8]>,
 {
-    let (page, actual) = load_page_with_summary(hash, load)?;
+    let (page, actual, _owner) = load_page_with_summary(hash, load)?;
     if expected.is_some_and(|expected| expected != actual) {
         return Err(IndexError::Integrity);
     }
@@ -563,18 +563,18 @@ where
 fn load_page_with_summary<PageBytes>(
     hash: [u8; 32],
     load: &mut impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
-) -> Result<(QueryRunPage, QueryRunChild), IndexError>
+) -> Result<(QueryRunPage, QueryRunChild, PageBytes), IndexError>
 where
     PageBytes: AsRef<[u8]>,
 {
-    let bytes = load(hash)?;
-    let bytes = bytes.as_ref();
+    let owner = load(hash)?;
+    let bytes = owner.as_ref();
     if *crate::profiled_blake3_hash!(bytes).as_bytes() != hash {
         return Err(IndexError::Integrity);
     }
     let page = decode_query_run_page(bytes)?;
     let summary = summarize_page(&page, hash, bytes.len())?;
-    Ok((page, summary))
+    Ok((page, summary, owner))
 }
 
 fn root_child(root: ProjectionQueryStreamRoot) -> Result<QueryRunChild, IndexError> {
@@ -604,7 +604,7 @@ fn append_page<PageBytes>(
 where
     PageBytes: AsRef<[u8]>,
 {
-    let (page, actual) = load_page_with_summary(hash, load)?;
+    let (page, actual, _owner) = load_page_with_summary(hash, load)?;
     if expected.is_some_and(|expected| expected != actual) {
         return Err(IndexError::Integrity);
     }
@@ -701,7 +701,7 @@ fn encode_page(page: QueryRunPage) -> Result<EncodedQueryRunPage, IndexError> {
     let summary = summarize_page(&page, hash, bytes.len())?;
     Ok(EncodedQueryRunPage {
         hash,
-        bytes: Bytes::from(bytes),
+        bytes: Bytes::from_owner(bytes.into_boxed_slice()),
         summary,
     })
 }
@@ -958,12 +958,14 @@ mod tests {
         let mut store = BTreeMap::new();
         let mut root = None;
         for sequence in 1..=count {
+            let mut run_hash = [0; 32];
+            run_hash[..8].copy_from_slice(&sequence.to_be_bytes());
             let prepared = append_query_run_path_copy(
                 root,
                 partition(),
                 [6; 32],
                 QueryRunReference {
-                    hash: [sequence as u8; 32],
+                    hash: run_hash,
                     encoded_bytes: 1,
                     sequence,
                     level: 0,
@@ -980,6 +982,114 @@ mod tests {
             root = Some(prepared.root);
         }
         (root.unwrap(), store)
+    }
+
+    #[test]
+    fn lazy_merge_keeps_page_owners_on_stack_and_rebases_over_appended_history() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Owner {
+            bytes: Vec<u8>,
+            live: Arc<AtomicUsize>,
+        }
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.live.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let (mut root, mut store) = build_stream(4_000);
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = AtomicUsize::new(0);
+        let reads = AtomicUsize::new(0);
+        let plan = select_query_run_compaction(
+            root,
+            |hash| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                let count = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                Ok(Owner {
+                    bytes: store.get(&hash).cloned().ok_or(IndexError::Integrity)?,
+                    live: live.clone(),
+                })
+            },
+            QueryRunCompactionLimits {
+                level_trigger: 8,
+                maximum_input_runs: 100,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "parent decoded page must retain its callback owner during child traversal"
+        );
+        assert!(
+            peak.load(Ordering::SeqCst) <= 3,
+            "only the traversal stack may remain resident"
+        );
+        assert!(
+            reads.load(Ordering::SeqCst) < 10,
+            "selection must not preload the whole history"
+        );
+        let newest = *plan.inputs_newest_first().first().unwrap();
+        let output = QueryRunReference {
+            hash: [9; 32],
+            encoded_bytes: 1,
+            sequence: newest.sequence,
+            level: plan.output_level(),
+            source_start_offset: plan.source_start_offset(),
+            next_offset: plan.next_offset(),
+            through_atomic_position: plan.through_atomic_position(),
+        };
+        for sequence in 4_001..=4_020 {
+            let appended = append_query_run_path_copy(
+                Some(root),
+                partition(),
+                [6; 32],
+                QueryRunReference {
+                    hash: [8; 32],
+                    encoded_bytes: 1,
+                    sequence,
+                    level: 0,
+                    source_start_offset: sequence - 1,
+                    next_offset: sequence,
+                    through_atomic_position: sequence,
+                },
+                |hash| store.get(&hash).cloned().ok_or(IndexError::Integrity),
+            )
+            .unwrap();
+            root = appended.root;
+            store.extend(
+                appended
+                    .pages
+                    .into_iter()
+                    .map(|page| (page.hash, page.bytes.to_vec())),
+            );
+        }
+        let mut splice_reads = 0;
+        let spliced = splice_compacted_query_runs(root, &plan, output, |hash| {
+            splice_reads += 1;
+            store.get(&hash).cloned().ok_or(IndexError::Integrity)
+        })
+        .unwrap();
+        assert_eq!(spliced.root.next_offset, 4_020);
+        assert_eq!(spliced.root.through_atomic_position, 4_020);
+        assert_eq!(
+            spliced.root.run_count,
+            4_020 - plan.inputs_newest_first().len() as u64 + 1
+        );
+        assert!(
+            spliced.pages.len() <= splice_reads,
+            "merge never emits more than one rewritten page per loaded page"
+        );
     }
 
     #[test]

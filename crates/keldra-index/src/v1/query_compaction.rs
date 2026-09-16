@@ -4,7 +4,7 @@
 //! Newest records win by their canonical semantic key; tombstones remain so
 //! data in older, unselected levels cannot be resurrected.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 
 use crate::IndexError;
@@ -18,7 +18,7 @@ use super::{
     PreparedQueryTermDelta, ProjectionPartitionIdentity, ProjectionQueryRunArtifacts,
     ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot, QueryBlockCredits, QueryBlockCursor,
     QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryBlockRecord, QueryPostingShard,
-    QueryRunCompactionPlan, QueryRunReference, QueryTermEntry, RecipeIdentity,
+    QueryRunCompactionPlan, QueryRunReference, QueryTermEntry, RecipeIdentity, StableDocumentKey,
     UnpublishedArtifactPack, decode_doc_value, decode_document_gate, decode_point,
     decode_positions, decode_posting, decode_projection_query_run, decode_term_entry,
     encode_query_block, encode_term_entry, splice_compacted_query_runs,
@@ -83,6 +83,29 @@ impl PreparedQueryRunCompaction {
 }
 
 impl ChargedQueryRunCompaction {
+    /// Splice pages retain their accounted allocation owner independently of
+    /// the compaction base, including after publication retries extract them.
+    pub fn retain_splice_page_owner(
+        &mut self,
+        owner: std::sync::Arc<dyn Send + Sync + std::fmt::Debug>,
+    ) {
+        struct OwnedPage {
+            bytes: bytes::Bytes,
+            _owner: std::sync::Arc<dyn Send + Sync + std::fmt::Debug>,
+        }
+        impl AsRef<[u8]> for OwnedPage {
+            fn as_ref(&self) -> &[u8] {
+                self.bytes.as_ref()
+            }
+        }
+        for page in &mut self.splice.pages {
+            page.bytes = bytes::Bytes::from_owner(OwnedPage {
+                bytes: std::mem::take(&mut page.bytes),
+                _owner: owner.clone(),
+            });
+        }
+    }
+
     /// Rebase an already materialized compaction result over a newer stream
     /// root which only appended/rearranged unrelated runs. The splice rejects
     /// the proposal if any selected immutable input is no longer present.
@@ -189,8 +212,25 @@ pub fn prepare_encoded_query_run_compaction(
     }
 
     let mut blocks = Vec::new();
-    merge_ordinary_runs(&runs, limits, &mut credits, &mut load_block, &mut blocks)?;
-    merge_term_runs(&runs, limits, &mut credits, &mut load_block, &mut blocks)?;
+    let visibility = CompactionVisibility::load(&runs, limits, &mut credits, &mut load_block)?;
+    merge_ordinary_runs(
+        &runs,
+        &visibility,
+        limits,
+        &mut credits,
+        &mut load_block,
+        &mut blocks,
+    )?;
+    merge_term_runs(
+        &runs,
+        &visibility,
+        limits,
+        &mut credits,
+        &mut load_block,
+        &mut blocks,
+    )?;
+    credits.release(visibility.charged_bytes)?;
+    drop(visibility);
     let newest = *inputs.first().ok_or(IndexError::Integrity)?;
     let prepared = prepare_projection_query_run_from_blocks(
         partition,
@@ -331,13 +371,14 @@ impl RecordLane {
         let mut cursor = QueryBlockCursor::new(descriptor, &bytes, limits, credits)?;
         while let Some(record) = cursor.next()? {
             validate_ordinary_record(self.kind, record, limits)?;
+            let key = record.canonical_key();
             let charge = size_of::<QueryBlockRecord>()
-                .saturating_add(record.key.len())
+                .saturating_add(key.len())
                 .saturating_add(record.value.len());
             credits.reserve(charge)?;
             self.records.push(Some(OwnedRecord {
                 record: QueryBlockRecord {
-                    key: record.key.to_vec(),
+                    key,
                     value: record.value.to_vec(),
                 },
                 charge,
@@ -364,7 +405,7 @@ impl StreamingBlockWriter {
             recipe,
             records: Vec::new(),
             charge: 0,
-            encoded_bytes: 87,
+            encoded_bytes: 119,
         }
     }
 
@@ -410,7 +451,7 @@ impl StreamingBlockWriter {
         push_block(output, block, credits)?;
         self.records.clear();
         credits.release(std::mem::take(&mut self.charge))?;
-        self.encoded_bytes = 87;
+        self.encoded_bytes = 119;
         Ok(())
     }
 }
@@ -452,8 +493,99 @@ fn validate_ordinary_record(
     Ok(())
 }
 
+/// Only selected-window gates may discard material during a merge. Gates
+/// themselves remain in the output, preventing older unselected runs from
+/// resurrecting a deleted or replaced document.
+#[derive(Default)]
+struct CompactionVisibility {
+    fields: BTreeMap<(RecipeIdentity, StableDocumentKey), (u64, bool)>,
+    charged_bytes: usize,
+}
+
+impl CompactionVisibility {
+    fn load(
+        runs: &[ProjectionQueryRunDescriptor],
+        limits: QueryBlockLimits,
+        credits: &mut QueryBlockCredits,
+        load: &mut impl FnMut(&QueryBlockDescriptor) -> Result<Vec<u8>, IndexError>,
+    ) -> Result<Self, IndexError> {
+        let mut visibility = Self::default();
+        // Runs are newest first; the first field gate is its selected-window
+        // current material. Missing evidence conservatively retains material.
+        for run in runs {
+            for block in run
+                .blocks
+                .iter()
+                .filter(|block| block.kind == QueryBlockKind::Presence)
+            {
+                visit_block(block, limits, credits, load, &mut |record, credits| {
+                    let gate = decode_document_gate(record)?;
+                    let key = (block.recipe, gate.document);
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        visibility.fields.entry(key)
+                    {
+                        // Include B-tree node/allocator overhead, not only the
+                        // material/live tuple. No decoded path strings retained.
+                        let charge = size_of::<(RecipeIdentity, StableDocumentKey)>()
+                            .saturating_add(size_of::<(u64, bool)>())
+                            .saturating_add(64);
+                        credits.reserve(charge)?;
+                        visibility.charged_bytes = visibility
+                            .charged_bytes
+                            .checked_add(charge)
+                            .ok_or(IndexError::OffsetOverflow)?;
+                        entry.insert((gate.material_source_version, gate.live));
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(visibility)
+    }
+
+    fn retains(&self, recipe: RecipeIdentity, document: StableDocumentKey, version: u64) -> bool {
+        self.fields
+            .get(&(recipe, document))
+            .is_none_or(|(current, live)| *live && *current == version)
+    }
+
+    fn retains_record(
+        &self,
+        kind: QueryBlockKind,
+        recipe: RecipeIdentity,
+        record: &QueryBlockRecord,
+    ) -> Result<bool, IndexError> {
+        let borrowed = super::QueryBlockRecordRef {
+            key: &record.key,
+            value: &record.value,
+            document: None,
+        };
+        match kind {
+            QueryBlockKind::Point => {
+                let point = decode_point(borrowed)?;
+                Ok(self.retains(recipe, point.document, point.material_source_version))
+            }
+            QueryBlockKind::DocValue => {
+                let version = record.value.get(..8).ok_or(IndexError::Integrity)?;
+                let version =
+                    u64::from_be_bytes(version.try_into().map_err(|_| IndexError::Integrity)?);
+                let document = StableDocumentKey::from_bytes(
+                    record
+                        .key
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| IndexError::Integrity)?,
+                )?;
+                Ok(self.retains(recipe, document, version))
+            }
+            _ => Ok(true),
+        }
+    }
+}
+
 fn merge_ordinary_runs(
     runs: &[ProjectionQueryRunDescriptor],
+    visibility: &CompactionVisibility,
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     load: &mut impl FnMut(&QueryBlockDescriptor) -> Result<Vec<u8>, IndexError>,
@@ -521,7 +653,11 @@ fn merge_ordinary_runs(
                 }
                 lane.refill(runs, limits, credits, load)?;
             }
-            writer.push(winner, limits, credits, output)?;
+            if visibility.retains_record(kind, recipe, &winner.record)? {
+                writer.push(winner, limits, credits, output)?;
+            } else {
+                credits.release(winner.charge)?;
+            }
             credits.release(minimum.len())?;
         }
         writer.flush(limits, credits, output)?;
@@ -681,8 +817,8 @@ impl TermShardWriter {
             recipe,
             pending: Vec::new(),
             charge: 0,
-            posting_bytes: 87,
-            position_bytes: 87,
+            posting_bytes: 119,
+            position_bytes: 119,
             position_records: 0,
             shards: Vec::new(),
         }
@@ -752,8 +888,8 @@ impl TermShardWriter {
         )?);
         self.pending.clear();
         credits.release(std::mem::take(&mut self.charge))?;
-        self.posting_bytes = 87;
-        self.position_bytes = 87;
+        self.posting_bytes = 119;
+        self.position_bytes = 119;
         self.position_records = 0;
         Ok(())
     }
@@ -775,6 +911,7 @@ fn record_bytes(
 
 fn merge_term_runs(
     runs: &[ProjectionQueryRunDescriptor],
+    visibility: &CompactionVisibility,
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     load: &mut impl FnMut(&QueryBlockDescriptor) -> Result<Vec<u8>, IndexError>,
@@ -828,6 +965,7 @@ fn merge_term_runs(
                     let owned = lane.take_head().ok_or(IndexError::Integrity)?;
                     let entry = decode_term_entry(
                         super::QueryBlockRecordRef {
+                            document: None,
                             key: &owned.record.key,
                             value: &owned.record.value,
                         },
@@ -894,7 +1032,17 @@ fn merge_term_runs(
                     }
                     lane.refill(runs, &term, limits, credits, load)?;
                 }
-                shard_writer.push(winner, limits, credits, output)?;
+                if winner.delta.live
+                    && visibility.retains(
+                        recipe,
+                        winner.delta.document,
+                        winner.delta.material_source_version,
+                    )
+                {
+                    shard_writer.push(winner, limits, credits, output)?;
+                } else {
+                    credits.release(winner.charge)?;
+                }
             }
             shard_writer.flush(limits, credits, output)?;
             let source_charge = postings
@@ -903,6 +1051,10 @@ fn merge_term_runs(
                 .sum::<usize>();
             drop(postings);
             credits.release(source_charge)?;
+            if shard_writer.shards.is_empty() {
+                credits.release(term_key.len())?;
+                continue;
+            }
             let record = encode_term_entry(&QueryTermEntry {
                 term,
                 posting_shards: shard_writer.shards,
@@ -1176,6 +1328,18 @@ mod tests {
         Store,
         Store,
     ) {
+        fixture_with(batch)
+    }
+
+    fn fixture_with(
+        mut make_batch: impl FnMut(u64, bool) -> PreparedQueryMutationBatch,
+    ) -> (
+        ProjectionQueryStreamRoot,
+        QueryRunCompactionPlan,
+        Store,
+        Store,
+        Store,
+    ) {
         let limits = QueryBlockLimits::default_for_memory();
         let mut runs = Store::new();
         let mut blocks = Store::new();
@@ -1191,7 +1355,7 @@ mod tests {
                     sequence - 1,
                     sequence,
                     sequence,
-                    batch(sequence, reordered),
+                    make_batch(sequence, reordered),
                     limits,
                     credits(&memory, 32 * 1024 * 1024),
                 )
@@ -1286,6 +1450,60 @@ mod tests {
         assert_eq!(winner.material_source_version, 2);
         assert_eq!(winner.current_source_version, 2);
         assert!(cursor.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn replacement_merge_removes_old_terms_and_point_values_without_subtraction() {
+        let (root, plan, runs, blocks, pages) = fixture_with(|version, reordered| {
+            let mut replacement = batch(version, reordered);
+            if version == 1 {
+                replacement.fields[0].delta.terms[0].term = ScalarValue::String("old-alpha".into());
+            }
+            replacement
+        });
+        let memory = pool(128 * 1024 * 1024);
+        let compacted = compact_encoded_query_runs(
+            root,
+            &plan,
+            partition(),
+            [4; 32],
+            QueryBlockLimits::default_for_memory(),
+            credits(&memory, 128 * 1024 * 1024),
+            |hash| runs.get(&hash).cloned().ok_or(IndexError::Integrity),
+            |hash| blocks.get(&hash).cloned().ok_or(IndexError::Integrity),
+            |hash| pages.get(&hash).cloned().ok_or(IndexError::Integrity),
+        )
+        .unwrap();
+        let verification_memory = pool(4 * 1024 * 1024);
+        let mut verification = credits(&verification_memory, 4 * 1024 * 1024);
+        let mut point_count = 0;
+        for (descriptor, bytes) in artifact_blocks(compacted.artifacts()) {
+            let mut cursor = QueryBlockCursor::new(
+                &descriptor,
+                &bytes,
+                QueryBlockLimits::default_for_memory(),
+                &mut verification,
+            )
+            .unwrap();
+            while let Some(record) = cursor.next().unwrap() {
+                match descriptor.kind {
+                    QueryBlockKind::Point => {
+                        assert_eq!(decode_point(record).unwrap().material_source_version, 2);
+                        point_count += 1;
+                    }
+                    QueryBlockKind::TermDictionary => {
+                        assert_ne!(
+                            decode_term_entry(record, QueryBlockLimits::default_for_memory())
+                                .unwrap()
+                                .term,
+                            ScalarValue::String("old-alpha".into())
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(point_count, 2);
     }
 
     #[test]

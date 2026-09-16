@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use keldra_consensus::{DecisionRaft, NodeId};
 use keldra_index::v1::{
-    IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryPermit, IndexingMemoryStage,
+    IndexingMemoryCredits, IndexingMemoryPermit, IndexingMemoryStage, IndexingProgressReservation,
     MemoryAdmission, PartitionProjectionAccumulator, PreparedProjectionBatchReservation,
     PreparedProjectionRow, PreparedQueryMutationBatch, ProjectionBatchAdmission,
     ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits,
@@ -25,7 +25,9 @@ use super::events::{IndexBarrier, IndexEventJournal, MAX_INDEX_EVENT_PAGE_BYTES}
 use super::hot_ingress::HotProjectionIngress;
 use super::source::{IndexBuildObject, IndexSourceMutation};
 use super::v1_backfill::open_partition_baseline;
-use super::v1_extractor::{SelectedV1Source, V1ProjectionExtractor, matching_recipes};
+use super::v1_extractor::{
+    SelectedV1Source, V1PreparationSlot, V1ProjectionExtractor, matching_recipes,
+};
 use super::v1_journal_dispatch::{V1OrderedSourceDispatcher, V1SourceDispatch};
 use super::v1_mutation_window::{
     MAX_ADVANCE_SLICE_BYTES, bounded_advance_operations, coalesce_latest_by_source_path,
@@ -43,18 +45,29 @@ use super::v1_source_batch::{ExactMutationRequest, load_exact_mutations};
 
 #[path = "v1_consumer_compaction.rs"]
 mod compaction;
+#[path = "v1_consumer_look_ahead.rs"]
+mod look_ahead;
+#[path = "v1_consumer_mutation_buffer.rs"]
+mod mutation_buffer;
 #[path = "v1_consumer_prepare.rs"]
 mod prepare;
+#[path = "v1_consumer_sealing.rs"]
+mod sealing;
 use compaction::{
     BackgroundCompaction, ensure_background_compaction, publish_finished_background_compaction,
     should_harvest_background_compaction, take_finished_background_compaction,
 };
+use look_ahead::{LookAheadContext, LookAheadTask, finish_look_ahead, start_look_ahead};
+#[cfg(test)]
+use mutation_buffer::queue_mutation_window;
+use mutation_buffer::{mutation_window_needed, prepare_dispatches, prepare_page, queue_mutations};
 #[cfg(test)]
 use prepare::{
     acquire_preparation_construction, preparation_chunk_size, preparation_refill_size,
     selected_mutation_resident_bytes,
 };
 use prepare::{apply_rows, prepare_lane};
+use sealing::{reserve_sealing_progress, spine_preload_bound};
 
 const RETRY: Duration = Duration::from_millis(250);
 const SAFETY_RECONCILE: Duration = Duration::from_secs(30);
@@ -96,7 +109,18 @@ struct Writer {
     partition: ProjectionPartitionIdentity,
     current: Option<LoadedV1ProjectionGeneration>,
     catalog_rebuild_current_version: Option<VersionId>,
-    dispatcher: V1OrderedSourceDispatcher,
+    dispatcher: Option<V1OrderedSourceDispatcher>,
+    look_ahead: Option<LookAheadTask>,
+    look_ahead_context: Option<LookAheadContext>,
+    look_ahead_permitted: bool,
+    look_ahead_progress: Option<IndexingProgressReservation>,
+    look_ahead_prepared: BTreeMap<
+        (u64, u32),
+        (
+            (Mutation, u64, Arc<IndexingMemoryPermit>),
+            V1PreparationSlot,
+        ),
+    >,
     scanned: IndexBarrier,
     accumulator: PartitionProjectionAccumulator,
     baseline: Option<super::v1_backfill::V1PartitionBaseline>,
@@ -105,6 +129,7 @@ struct Writer {
     /// Per-document preparation credits retained until the merged query input
     /// has been consumed into immutable artifacts.
     query_input_credits: Vec<QueryBlockCredits>,
+    sealing_progress: Option<IndexingProgressReservation>,
     since: Option<Instant>,
     source_bytes: u64,
     pending_prepared_rows: u64,
@@ -148,7 +173,6 @@ struct Mutation {
 struct SelectedMutation {
     mutation: Mutation,
     selected: SelectedV1Source,
-    previous: Vec<keldra_index::v1::ProjectedDocumentState>,
     source_bytes: u64,
     _input: keldra_index::v1::IndexingMemoryPermit,
 }
@@ -166,19 +190,9 @@ impl V1IndexProducerTask {
         hot: HotProjectionIngress,
         publisher: V1ProjectionPublisher,
         config: IndexRuntimeConfig,
+        credits: IndexingMemoryCredits,
     ) -> Result<Self, Status> {
         let limits = limits(config)?;
-        let stage_limits = IndexingMemoryLimits {
-            hot_payload_bytes: limits.bytes,
-            worker_scratch_bytes: limits.bytes,
-            prepared_rows_bytes: limits.bytes,
-            replay_input_bytes: limits.bytes,
-            projection_accumulator_bytes: limits.bytes,
-            seal_scratch_bytes: limits.bytes,
-            ordering_catalog_bytes: limits.bytes,
-        };
-        let credits =
-            IndexingMemoryCredits::new(limits.bytes, stage_limits).map_err(index_status)?;
         let mut catalog_changes = catalog.subscribe();
         let mut publication_changes = publisher.subscribe();
         let mut journal_changes = hot.subscribe();
@@ -264,10 +278,11 @@ fn next_reconcile_delay(
 }
 
 fn limits(config: IndexRuntimeConfig) -> Result<Limits, Status> {
-    // Catalog and hot ingress own the other half of the pipeline ceiling.
+    // Every retained stage uses the same accounted pipeline credits; unused
+    // catalog/hot capacity is available to journal preparation and sealing.
     let configured = usize::try_from(config.pipeline_memory_bytes())
         .map_err(|_| Status::invalid_argument("v1 pipeline memory exceeds this platform"))?;
-    let bytes = configured.saturating_div(2).max(1);
+    let bytes = configured.max(1);
     let flush_bytes = usize::try_from(config.flush_bytes())
         .map_err(|_| Status::invalid_argument("v1 flush bytes exceed this platform"))?
         .min(MAX_ADVANCE_SLICE_BYTES)
@@ -975,13 +990,19 @@ async fn open_writer(
         partition,
         current,
         catalog_rebuild_current_version,
-        dispatcher,
+        dispatcher: Some(dispatcher),
+        look_ahead: None,
+        look_ahead_context: None,
+        look_ahead_permitted: false,
+        look_ahead_progress: None,
+        look_ahead_prepared: BTreeMap::new(),
         scanned,
         accumulator,
         baseline: None,
         query: PreparedQueryMutationBatch::default(),
         query_credits,
         query_input_credits: Vec::new(),
+        sealing_progress: None,
         since: None,
         source_bytes: 0,
         pending_prepared_rows: 0,
@@ -1074,7 +1095,7 @@ async fn backfill(
         .await?;
     if !batch.is_empty() {
         let mut rows = Vec::with_capacity(batch.len());
-        let mut previous = BTreeMap::new();
+        let mut prepared_rows = Vec::with_capacity(batch.len());
         let next = batch
             .last()
             .and_then(|item| item.baseline_offset.checked_add(1))
@@ -1090,36 +1111,46 @@ async fn backfill(
                 source_scope(writer.source),
                 &item.selected,
                 &writer.recipe,
-                &[],
                 &mut writer.query_credits,
             )?;
+            prepared_rows.push((
+                path,
+                version,
+                item.baseline_offset,
+                item.source_bytes,
+                prepared,
+            ));
+            let _source_journal_offset = item.source_journal_offset;
+        }
+        reserve_sealing_progress(
+            writer,
+            prepared_rows
+                .iter()
+                .map(|(_, _, _, _, prepared)| &prepared.query),
+            prepared_rows
+                .iter()
+                .map(|(path, _, _, _, prepared)| (path.as_str(), prepared.current.as_slice())),
+            credits,
+        )?;
+        for (path, version, baseline_offset, source_bytes, prepared) in prepared_rows {
             merge_query(&mut writer.query, prepared.query)?;
-            previous.insert(path.clone(), Vec::new());
-            writer.source_bytes = writer.source_bytes.saturating_add(item.source_bytes);
+            writer.source_bytes = writer.source_bytes.saturating_add(source_bytes);
             // Reading the exact journal position is intentional lineage
             // validation even though the accumulator uses dense baseline
             // offsets for this one non-journal initial build.
-            let _source_journal_offset = item.source_journal_offset;
             rows.push(PreparedProjectionRow {
-                source_offset: item.baseline_offset,
+                source_offset: baseline_offset,
                 mutation_ordinal: 0,
                 source_path: path,
                 source_version: version,
                 projected_states: prepared.current,
             });
         }
-        apply_rows(writer, next, rows, previous, credits, limits)?;
+        apply_rows(writer, next, rows, credits, limits)?;
         writer.baseline = Some(baseline);
         return Ok(());
     }
-    apply_rows(
-        writer,
-        captured_next,
-        Vec::new(),
-        BTreeMap::new(),
-        credits,
-        limits,
-    )?;
+    apply_rows(writer, captured_next, Vec::new(), credits, limits)?;
     let node = NodeId(u64::from(writer.source.node_id));
     writer
         .scanned
@@ -1128,6 +1159,9 @@ async fn backfill(
         .ok_or_else(|| Status::data_loss("v1 baseline source cursor is absent"))?
         .next_offset = captured_next;
     writer.pending_next = captured_next;
+    // Dense baseline offsets become a journal checkpoint only at this final
+    // cut. Its first journal window can now prepare during initial staging.
+    writer.look_ahead_permitted = true;
     flush(
         writer,
         physical_catalog_identity,
@@ -1145,7 +1179,7 @@ async fn advance(
     writer: &mut Writer,
     target: &IndexBarrier,
     physical_catalog_identity: [u8; 32],
-    journal: &IndexEventJournal,
+    journal: &Arc<IndexEventJournal>,
     scanner: &super::scanner::ClusterIndexScanner,
     reader: &ClusterObjectReader,
     extractor: &V1ProjectionExtractor,
@@ -1155,6 +1189,10 @@ async fn advance(
     compaction_ready: &Arc<tokio::sync::Notify>,
     limits: Limits,
 ) -> Result<(), Status> {
+    writer.look_ahead_context = Some(LookAheadContext {
+        journal: journal.clone(),
+        target: target.clone(),
+    });
     // Observe a completed readback even when the partition has no next page.
     // An in-flight verifier is deliberately left alone so journal read-ahead
     // and source extraction can overlap it; the next Current CAS gates on it.
@@ -1223,25 +1261,43 @@ async fn advance(
     // configured memory ceiling.
     let read_ahead_pages = journal_read_ahead_pages(limits.parallelism);
     for _ in 0..read_ahead_pages {
+        let ready = finish_look_ahead(writer, target).await?;
+        writer.look_ahead_permitted = false;
         let mut page_present = false;
         // Charge the encoded page, decoded changes, dispatcher output, and
         // mutation clones before reading any of them. This permit is transient;
         // only the coalesced mutation window remains charged after this advance.
         {
-            let _page_memory = credits
-                .acquire(IndexingMemoryStage::ReplayInput, page_memory_bytes)
-                .map_err(|_| Status::resource_exhausted("v1 journal-page memory unavailable"))?;
-            let page_started = Instant::now();
-            let page = journal
-                .next_page(
-                    writer.recipe.family.tenant_id,
-                    writer.recipe.family.bucket_id,
-                    &writer.scanned,
-                    target,
-                    max_page,
+            let _page_memory = if ready.is_none() {
+                Some(
+                    credits
+                        .acquire(IndexingMemoryStage::ReplayInput, page_memory_bytes)
+                        .map_err(|_| {
+                            Status::resource_exhausted("v1 journal-page memory unavailable")
+                        })?,
                 )
-                .await
-                .map_err(event_status)?;
+            } else {
+                None
+            };
+            let page_started = Instant::now();
+            let (page, prepared_dispatches, _look_ahead_memory) = if let Some(ready) = ready {
+                (Some(ready.page), Some(ready.dispatches), Some(ready.memory))
+            } else {
+                (
+                    journal
+                        .next_page(
+                            writer.recipe.family.tenant_id,
+                            writer.recipe.family.bucket_id,
+                            &writer.scanned,
+                            target,
+                            max_page,
+                        )
+                        .await
+                        .map_err(event_status)?,
+                    None,
+                    None,
+                )
+            };
             tracing::debug!(
                 histogram.keldra_index_v1_journal_page_duration_seconds =
                     page_started.elapsed().as_secs_f64(),
@@ -1252,15 +1308,28 @@ async fn advance(
             );
             if let Some(page) = page {
                 page_present = true;
-                let mut dispatches = Vec::new();
-                for change in &page.changes {
-                    let event_source = page.through.sources[&change.node].source;
-                    dispatches.extend(writer.dispatcher.observe(event_source, &change.change)?);
+                let mut dispatches = prepared_dispatches.unwrap_or_default();
+                // A prefetched page was already observed by its owned dispatcher.
+                if _look_ahead_memory.is_none() {
+                    for change in &page.changes {
+                        let event_source = page.through.sources[&change.node].source;
+                        dispatches.extend(
+                            writer
+                                .dispatcher
+                                .as_mut()
+                                .expect("look-ahead dispatcher restored")
+                                .observe(event_source, &change.change)?,
+                        );
+                    }
                 }
                 writer.scanned = page.through;
                 let node = NodeId(u64::from(writer.source.node_id));
                 let proposed = writer.scanned.sources[&node].next_offset;
-                let safe_next = writer.dispatcher.checkpoint_limit(writer.source, proposed);
+                let safe_next = writer
+                    .dispatcher
+                    .as_ref()
+                    .expect("look-ahead dispatcher restored")
+                    .checkpoint_limit(writer.source, proposed);
                 if safe_next > writer.pending_next {
                     let (page_atomic, mutations) = prepare_page(writer, dispatches, safe_next)?;
                     if !writer.pending_mutations.is_empty()
@@ -1311,6 +1380,7 @@ async fn advance(
                         writer.through_atomic = chunk.through_atomic;
                         queue_mutations(writer, chunk.mutations, chunk.next)?;
                         if index + 1 != chunk_count || should_flush(writer, limits) {
+                            writer.look_ahead_permitted = index + 1 == chunk_count;
                             flush(
                                 writer,
                                 physical_catalog_identity,
@@ -1334,6 +1404,7 @@ async fn advance(
         .since
         .is_some_and(|since| since.elapsed() >= limits.flush_age)
     {
+        writer.look_ahead_permitted = true;
         flush(
             writer,
             physical_catalog_identity,
@@ -1356,165 +1427,6 @@ async fn advance(
         ProducerStage::JournalScan
     };
     Ok(())
-}
-
-fn prepare_page(
-    writer: &Writer,
-    dispatches: Vec<V1SourceDispatch>,
-    safe_next: u64,
-) -> Result<(u64, Vec<Mutation>), Status> {
-    let first = writer.pending_next;
-    if safe_next <= first {
-        return Ok((0, Vec::new()));
-    }
-    let mut units = Vec::new();
-    for dispatch in dispatches {
-        let (atomic, mut group) = dispatch_mutations(dispatch)?;
-        group.retain(|mutation| mutation.offset >= first && mutation.offset < safe_next);
-        if !group.is_empty() {
-            units.push((atomic, group));
-        }
-    }
-    coalesce_units(0, units)
-}
-
-fn queue_mutations(
-    writer: &mut Writer,
-    mutations: Vec<Mutation>,
-    safe_next: u64,
-) -> Result<(), Status> {
-    let arms_age = !mutations.is_empty();
-    let needed = mutation_window_needed(
-        &writer.pending_mutations,
-        writer.pending_mutation_bytes,
-        &mutations,
-    )?;
-    if needed > writer.pending_mutation_capacity {
-        return Err(Status::resource_exhausted(format!(
-            "v1 mutation window requires {needed} bytes but admits {}",
-            writer.pending_mutation_capacity
-        )));
-    }
-    match writer.pending_mutation_permit.grow_to(needed.max(1)) {
-        Ok(()) => {}
-        Err(MemoryAdmission::ReplayRequired {
-            needed_bytes,
-            available_bytes,
-        }) => {
-            return Err(Status::resource_exhausted(format!(
-                "v1 mutation window needs {needed_bytes} additional bytes but only {available_bytes} are available"
-            )));
-        }
-        Err(MemoryAdmission::Admitted) => unreachable!(),
-    }
-    apply_mutation_window(
-        &mut writer.pending_mutations,
-        &mut writer.pending_mutation_bytes,
-        &mut writer.pending_operations,
-        &mut writer.pending_next,
-        needed,
-        mutations,
-        safe_next,
-    )?;
-    writer
-        .pending_mutation_permit
-        .shrink_to(needed.max(1))
-        .map_err(index_status)?;
-    if arms_age {
-        writer.since.get_or_insert_with(Instant::now);
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn queue_mutation_window(
-    latest: &mut BTreeMap<String, Mutation>,
-    resident_bytes: &mut usize,
-    observed_operations: &mut u64,
-    next_offset: &mut u64,
-    capacity: usize,
-    mutations: Vec<Mutation>,
-    safe_next: u64,
-) -> Result<(), Status> {
-    let needed = mutation_window_needed(latest, *resident_bytes, &mutations)?;
-    if needed > capacity {
-        return Err(Status::resource_exhausted(format!(
-            "v1 mutation window requires {needed} bytes but admits {}",
-            capacity
-        )));
-    }
-    apply_mutation_window(
-        latest,
-        resident_bytes,
-        observed_operations,
-        next_offset,
-        needed,
-        mutations,
-        safe_next,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_mutation_window(
-    latest: &mut BTreeMap<String, Mutation>,
-    resident_bytes: &mut usize,
-    observed_operations: &mut u64,
-    next_offset: &mut u64,
-    needed: usize,
-    mutations: Vec<Mutation>,
-    safe_next: u64,
-) -> Result<(), Status> {
-    let operations = u64::try_from(mutations.len())
-        .map_err(|_| Status::resource_exhausted("v1 mutation-window operations overflow"))?;
-    for mutation in mutations {
-        let replace = latest.get(&mutation.path).is_none_or(|previous| {
-            (mutation.offset, mutation.ordinal) > (previous.offset, previous.ordinal)
-        });
-        if replace {
-            let mut mutation = mutation;
-            if let Some(previous) = latest.get(&mutation.path) {
-                mutation.predecessor_absent_at_window_start =
-                    previous.predecessor_absent_at_window_start;
-            }
-            latest.insert(mutation.path.clone(), mutation);
-        }
-    }
-    *resident_bytes = needed;
-    *observed_operations = observed_operations.saturating_add(operations);
-    *next_offset = safe_next;
-    Ok(())
-}
-
-fn mutation_window_needed(
-    latest: &BTreeMap<String, Mutation>,
-    resident_bytes: usize,
-    mutations: &[Mutation],
-) -> Result<usize, Status> {
-    mutations
-        .iter()
-        .try_fold(resident_bytes, |mut needed, mutation| {
-            if let Some(previous) = latest.get(&mutation.path) {
-                if (mutation.offset, mutation.ordinal) <= (previous.offset, previous.ordinal) {
-                    return Ok(needed);
-                }
-                needed = needed.saturating_sub(mutation_window_bytes(previous));
-            }
-            needed
-                .checked_add(mutation_window_bytes(mutation))
-                .ok_or_else(|| Status::resource_exhausted("v1 mutation-window size overflow"))
-        })
-}
-
-fn mutation_window_bytes(mutation: &Mutation) -> usize {
-    std::mem::size_of::<Mutation>()
-        .saturating_add(mutation.path.capacity().saturating_mul(2))
-        .saturating_add(
-            mutation
-                .canonical_path
-                .as_ref()
-                .map_or(0, |path| path.capacity()),
-        )
-        .saturating_add(std::mem::size_of::<usize>().saturating_mul(4))
 }
 
 fn should_flush(writer: &Writer, limits: Limits) -> bool {
@@ -1583,6 +1495,9 @@ async fn flush(
         .map_err(|_| Status::resource_exhausted("v1 projected bytes exceed telemetry"))?;
     writer.pending_projected_encoded_bytes = projected_bytes;
     writer.stage = ProducerStage::Sealing;
+    if writer.sealing_progress.is_none() {
+        reserve_sealing_progress(writer, std::iter::empty(), std::iter::empty(), credits)?;
+    }
     let seal_timer = super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.seal_nanos);
     let sealed = writer.accumulator.seal_and_reset().map_err(index_status)?;
     let (sealed, source_permit) = sealed.into_parts();
@@ -1593,15 +1508,25 @@ async fn flush(
     let pack_permit = credits
         .acquire(IndexingMemoryStage::SealScratch, packed.max(1))
         .map_err(|_| Status::resource_exhausted("v1 pack memory unavailable"))?;
-    let preload_bytes = limits.bytes.saturating_div(8).max(1);
+    let preload_bytes = spine_preload_bound(writer.current.as_ref())?;
     let _preload = credits
-        .acquire(IndexingMemoryStage::ReplayInput, preload_bytes)
+        .acquire(IndexingMemoryStage::SealScratch, preload_bytes)
         .map_err(|_| Status::resource_exhausted("v1 spine preload memory unavailable"))?;
     drop(seal_timer);
     let compaction = take_finished_background_compaction(writer, publisher).await?;
     let query = std::mem::take(&mut writer.query);
     let placeholder = empty_query_credits(credits, limits)?;
-    let query_credits = std::mem::replace(&mut writer.query_credits, placeholder);
+    let mut query_credits = std::mem::replace(&mut writer.query_credits, placeholder);
+    query_credits.enter_sealing().map_err(index_status)?;
+    start_look_ahead(
+        writer,
+        next,
+        physical_catalog_identity,
+        reader,
+        extractor,
+        credits,
+        limits,
+    )?;
     let generation_build_timer =
         super::v1_telemetry::V1PipelineTelemetry::start_phase(&telemetry.generation_build_nanos);
     let prepared = if let Some((base, _)) = &compaction {
@@ -1710,6 +1635,9 @@ async fn finish_pending_publication(
     };
     writer.catalog_rebuild_current_version = None;
     writer.current = Some(published);
+    if let Some(look_ahead) = &mut writer.look_ahead {
+        look_ahead.note_publication_finished();
+    }
     writer.post_cas_verification = Some(verification);
     super::v1_telemetry::V1PipelineTelemetry::add(
         &telemetry.prepared_rows,
@@ -1733,6 +1661,7 @@ async fn finish_pending_publication(
     writer.pending_prepared_bytes = 0;
     writer.pending_projected_rows = 0;
     writer.pending_projected_encoded_bytes = 0;
+    writer.sealing_progress = None;
     clear_pending_mutations(writer)?;
     Ok(())
 }
@@ -1805,10 +1734,9 @@ fn merge_query(
     target: &mut PreparedQueryMutationBatch,
     mut source: PreparedQueryMutationBatch,
 ) -> Result<(), Status> {
-    // Preparations in one unpublished window are all relative to the persisted
-    // Current, while the projection accumulator keeps only the newest state.
-    // Mirror that authority here so a document has one gate and one delta per
-    // field recipe in the mini-run.
+    // Preparations carry complete replacements and need no preceding Current
+    // state. Coalesce them in source order so each document contributes only
+    // its newest gate and complete field material to this unpublished run.
     if let Some(incoming) = source.membership.take() {
         match &mut target.membership {
             Some(current) if current.recipe == incoming.recipe => {

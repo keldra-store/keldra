@@ -14,10 +14,9 @@ use super::{
     ArtifactPackReference, DecodedQueryBlock, LogicalProjectionBinding,
     MAX_QUERY_DOCUMENT_PATH_BYTES, ProjectionPartitionIdentity, ProjectionQueryRunDescriptor,
     ProjectionQueryStreamRoot, QueryBlockCredits, QueryBlockDescriptor, QueryBlockKind,
-    QueryBlockLimits, QueryDocumentGate, QueryPoint, QueryPosting, QueryRecipeCatalogProof,
-    QueryRunChild, QueryRunPage, QueryRunReference, QueryTermEntry, RecipeIdentity,
-    StableDocumentKey, decode_doc_value, decode_document_gate, decode_point, decode_positions,
-    decode_posting, decode_projection_query_run, decode_query_run_page, decode_term_entry,
+    QueryBlockLimits, QueryDocumentGate, QueryRecipeCatalogProof, QueryRunChild, QueryRunPage,
+    QueryRunReference, QueryTermEntry, RecipeIdentity, StableDocumentKey, decode_document_gate,
+    decode_positions, decode_projection_query_run, decode_query_run_page, decode_term_entry,
 };
 
 #[path = "query_executor_admission.rs"]
@@ -38,6 +37,13 @@ use budget::Budget;
 mod candidates;
 use candidates::{
     AlignedGates, candidate_is_current, resident_gate_dynamic_bytes, select_handoff_candidate,
+};
+#[path = "query_executor_dense.rs"]
+mod dense;
+use dense::{
+    DenseCandidateSet, DenseQueryPoint, DenseQueryPosting, QueryMaterialCandidate,
+    SegmentCandidateIdentity, candidate_set_bytes, document_key_set_bytes,
+    intersect_term_candidates,
 };
 #[path = "query_executor_general.rs"]
 mod general;
@@ -446,6 +452,7 @@ pub async fn execute_typed_json_query_with_cursor_and_executor<
             manifests.push(manifest);
         }
         Arc::new(ValidatedQuerySnapshot {
+            memory_lease: super::SegmentMemoryLease::default(),
             identity: snapshot_identity,
             common_cut,
             pins: pins.to_vec(),
@@ -747,484 +754,9 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader, X: QueryPartitionExe
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn evaluate_predicate<'a, L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
-    loader: &'a mut L,
-    executor: &'a X,
-    manifest: &'a PartitionManifest,
-    universe: &'a BTreeMap<StableDocumentKey, QueryDocumentGate>,
-    contracts: &'a BTreeMap<FieldId, QueryFieldBinding>,
-    membership_recipe: RecipeIdentity,
-    predicate: &'a Predicate,
-    minimum_document_exclusive: Option<StableDocumentKey>,
-    block_limits: QueryBlockLimits,
-    credits: &'a mut QueryBlockCredits,
-    budget: &'a mut Budget,
-) -> std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = Result<BTreeSet<StableDocumentKey>, IndexError>>
-            + Send
-            + 'a,
-    >,
-> {
-    Box::pin(async move {
-        let result = match predicate {
-            Predicate::And(children) => {
-                let mut children = children.iter();
-                let first = children.next().ok_or_else(|| {
-                    IndexError::InvalidQuery("Boolean predicate requires a child".into())
-                })?;
-                let mut output = evaluate_predicate(
-                    loader,
-                    executor,
-                    manifest,
-                    universe,
-                    contracts,
-                    membership_recipe,
-                    first,
-                    minimum_document_exclusive,
-                    block_limits,
-                    credits,
-                    budget,
-                )
-                .await?;
-                for child in children {
-                    let next = evaluate_predicate(
-                        loader,
-                        executor,
-                        manifest,
-                        universe,
-                        contracts,
-                        membership_recipe,
-                        child,
-                        minimum_document_exclusive,
-                        block_limits,
-                        credits,
-                        budget,
-                    )
-                    .await?;
-                    let before = output.len();
-                    output.retain(|key| next.contains(key));
-                    budget.release_heap(
-                        credits,
-                        before
-                            .saturating_sub(output.len())
-                            .saturating_mul(std::mem::size_of::<StableDocumentKey>()),
-                    )?;
-                    budget.release_heap(
-                        credits,
-                        next.len()
-                            .saturating_mul(std::mem::size_of::<StableDocumentKey>()),
-                    )?;
-                }
-                output
-            }
-            Predicate::Or(children) => {
-                let mut output = BTreeSet::new();
-                for child in children {
-                    let next = evaluate_predicate(
-                        loader,
-                        executor,
-                        manifest,
-                        universe,
-                        contracts,
-                        membership_recipe,
-                        child,
-                        minimum_document_exclusive,
-                        block_limits,
-                        credits,
-                        budget,
-                    )
-                    .await?;
-                    let added = next.iter().filter(|key| !output.contains(*key)).count();
-                    let next_len = next.len();
-                    budget.reserve_heap(
-                        credits,
-                        added
-                            .checked_mul(std::mem::size_of::<StableDocumentKey>())
-                            .ok_or(IndexError::OffsetOverflow)?,
-                    )?;
-                    output.extend(next);
-                    budget.release_heap(
-                        credits,
-                        next_len.saturating_mul(std::mem::size_of::<StableDocumentKey>()),
-                    )?;
-                    budget.candidates(output.len())?;
-                }
-                output
-            }
-            Predicate::Not(child) => {
-                let excluded = evaluate_predicate(
-                    loader,
-                    executor,
-                    manifest,
-                    universe,
-                    contracts,
-                    membership_recipe,
-                    child,
-                    minimum_document_exclusive,
-                    block_limits,
-                    credits,
-                    budget,
-                )
-                .await?;
-                budget.reserve_heap(
-                    credits,
-                    universe
-                        .len()
-                        .checked_mul(std::mem::size_of::<StableDocumentKey>())
-                        .ok_or(IndexError::OffsetOverflow)?,
-                )?;
-                let output = universe
-                    .iter()
-                    .filter_map(|(key, gate)| {
-                        (gate.live
-                            && minimum_document_exclusive.is_none_or(|resume| *key > resume)
-                            && !excluded.contains(key))
-                        .then_some(*key)
-                    })
-                    .collect();
-                budget.release_heap(
-                    credits,
-                    excluded
-                        .len()
-                        .saturating_mul(std::mem::size_of::<StableDocumentKey>()),
-                )?;
-                output
-            }
-            leaf => {
-                evaluate_leaf(
-                    loader,
-                    executor,
-                    manifest,
-                    universe,
-                    contracts,
-                    membership_recipe,
-                    leaf,
-                    minimum_document_exclusive,
-                    block_limits,
-                    credits,
-                    budget,
-                )
-                .await?
-            }
-        };
-        budget.candidates(result.len())?;
-        Ok(result)
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn evaluate_leaf<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
-    loader: &mut L,
-    executor: &X,
-    manifest: &PartitionManifest,
-    universe: &BTreeMap<StableDocumentKey, QueryDocumentGate>,
-    contracts: &BTreeMap<FieldId, QueryFieldBinding>,
-    membership_recipe: RecipeIdentity,
-    predicate: &Predicate,
-    minimum_document_exclusive: Option<StableDocumentKey>,
-    block_limits: QueryBlockLimits,
-    credits: &mut QueryBlockCredits,
-    budget: &mut Budget,
-) -> Result<BTreeSet<StableDocumentKey>, IndexError> {
-    let field_id =
-        leaf_field(predicate).ok_or_else(|| IndexError::InvalidQuery("expected leaf".into()))?;
-    let binding = contracts
-        .get(&field_id)
-        .ok_or_else(|| IndexError::InvalidQuery("query field is not bound".into()))?;
-    validate_leaf_capability(&binding.field, predicate)?;
-    if matches!(predicate, Predicate::Exists { .. }) {
-        let presence = load_latest_gates(
-            loader,
-            executor,
-            manifest,
-            binding.recipe,
-            QueryBlockKind::Presence,
-            block_limits,
-            credits,
-            budget,
-        )
-        .await?;
-        let mut keys = presence
-            .iter()
-            .filter_map(|(key, gate)| gate.live.then_some(*key))
-            .collect::<BTreeSet<_>>();
-        if let Some(resume) = minimum_document_exclusive {
-            let mut resumed = keys.split_off(&resume);
-            resumed.remove(&resume);
-            keys = resumed;
-        }
-        let memberships = if universe.is_empty() {
-            Some(
-                load_latest_gates_for_keys(
-                    loader,
-                    executor,
-                    manifest,
-                    membership_recipe,
-                    QueryBlockKind::Gate,
-                    &keys,
-                    block_limits,
-                    credits,
-                    budget,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        budget.reserve_heap(
-            credits,
-            presence
-                .len()
-                .checked_mul(std::mem::size_of::<StableDocumentKey>())
-                .ok_or(IndexError::OffsetOverflow)?,
-        )?;
-        let presence_bytes = presence.values().try_fold(0usize, |total, gate| {
-            total
-                .checked_add(resident_gate_bytes(gate)?)
-                .ok_or(IndexError::OffsetOverflow)
-        })?;
-        let (output, membership_bytes) = if let Some(memberships) = memberships {
-            let (memberships, membership_bytes) = memberships.into_parts();
-            let output = keys
-                .into_iter()
-                .zip(memberships)
-                .filter_map(|(key, membership)| {
-                    membership
-                        .is_some_and(|membership| membership.live)
-                        .then_some(key)
-                })
-                .collect();
-            (output, membership_bytes)
-        } else {
-            let output = keys
-                .into_iter()
-                .filter(|key| universe.get(key).is_some_and(|membership| membership.live))
-                .collect();
-            (output, 0)
-        };
-        budget.release_heap(credits, presence_bytes)?;
-        budget.release_heap(credits, membership_bytes)?;
-        return Ok(output);
-    }
-    let mut candidates = match predicate {
-        Predicate::Equal { value, .. } => {
-            seek_terms(
-                loader,
-                executor,
-                manifest,
-                binding.recipe,
-                std::slice::from_ref(value),
-                None,
-                minimum_document_exclusive,
-                block_limits,
-                credits,
-                budget,
-            )
-            .await?
-        }
-        Predicate::In { values, .. } => {
-            seek_terms(
-                loader,
-                executor,
-                manifest,
-                binding.recipe,
-                values,
-                None,
-                minimum_document_exclusive,
-                block_limits,
-                credits,
-                budget,
-            )
-            .await?
-        }
-        Predicate::Prefix { prefix, .. } => {
-            seek_terms(
-                loader,
-                executor,
-                manifest,
-                binding.recipe,
-                &[],
-                Some(prefix),
-                minimum_document_exclusive,
-                block_limits,
-                credits,
-                budget,
-            )
-            .await?
-        }
-        Predicate::FullText { text, .. } | Predicate::Phrase { text, .. } => {
-            budget.reserve_heap(credits, text.len())?;
-            let terms = analyze_typed_json_text(text)
-                .into_iter()
-                .map(ScalarValue::String)
-                .collect::<Vec<_>>();
-            if terms.is_empty() {
-                budget.release_heap(credits, text.len())?;
-                return Ok(BTreeSet::new());
-            }
-            let postings = seek_term_postings(
-                loader,
-                executor,
-                manifest,
-                binding.recipe,
-                &terms,
-                None,
-                minimum_document_exclusive,
-                block_limits,
-                credits,
-                budget,
-            )
-            .await?;
-            let mut intersection = None::<BTreeMap<_, _>>;
-            for term in &terms {
-                let found = postings
-                    .get(term)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|(document, (_, posting))| {
-                        posting
-                            .live
-                            .then_some((*document, posting.material_source_version))
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                match &mut intersection {
-                    None => intersection = Some(found),
-                    Some(output) => output.retain(|key, _| found.contains_key(key)),
-                }
-            }
-            let mut found = intersection.unwrap_or_default();
-            if matches!(predicate, Predicate::Phrase { .. }) {
-                budget.reserve_heap(
-                    credits,
-                    found
-                        .len()
-                        .checked_mul(std::mem::size_of::<StableDocumentKey>())
-                        .ok_or(IndexError::OffsetOverflow)?,
-                )?;
-                let mut phrase_candidates: BTreeSet<_> = found.keys().copied().collect();
-                let phrase_candidate_bytes = phrase_candidates
-                    .len()
-                    .saturating_mul(std::mem::size_of::<StableDocumentKey>());
-                verify_phrase(
-                    loader,
-                    executor,
-                    manifest,
-                    binding.recipe,
-                    &terms,
-                    &postings,
-                    &mut phrase_candidates,
-                    block_limits,
-                    credits,
-                    budget,
-                )
-                .await?;
-                found.retain(|key, _| phrase_candidates.contains(key));
-                budget.release_heap(credits, phrase_candidate_bytes)?;
-            }
-            budget.release_heap(credits, text.len())?;
-            found
-        }
-        Predicate::Range { lower, upper, .. } => {
-            seek_range(
-                loader,
-                executor,
-                manifest,
-                binding.recipe,
-                lower.as_ref(),
-                upper.as_ref(),
-                block_limits,
-                credits,
-                budget,
-            )
-            .await?
-        }
-        _ => return Err(IndexError::InvalidQuery("expected Typed JSON leaf".into())),
-    };
-    if let Some(resume) = minimum_document_exclusive {
-        let mut resumed = candidates.split_off(&resume);
-        resumed.remove(&resume);
-        candidates = resumed;
-    }
-    let candidate_keys = candidates.keys().copied().collect::<BTreeSet<_>>();
-    budget.reserve_heap(
-        credits,
-        candidate_keys
-            .len()
-            .checked_mul(std::mem::size_of::<StableDocumentKey>())
-            .ok_or(IndexError::OffsetOverflow)?,
-    )?;
-    let presence = load_latest_gates_for_keys(
-        loader,
-        executor,
-        manifest,
-        binding.recipe,
-        QueryBlockKind::Presence,
-        &candidate_keys,
-        block_limits,
-        credits,
-        budget,
-    )
-    .await?;
-    let memberships = if universe.is_empty() {
-        Some(
-            load_latest_gates_for_keys(
-                loader,
-                executor,
-                manifest,
-                membership_recipe,
-                QueryBlockKind::Gate,
-                &candidate_keys,
-                block_limits,
-                credits,
-                budget,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    let (presence, presence_bytes) = presence.into_parts();
-    let (memberships, membership_bytes) = memberships
-        .map(AlignedGates::into_parts)
-        .map_or((None, 0), |(gates, bytes)| (Some(gates), bytes));
-    if presence.len() != candidates.len()
-        || memberships
-            .as_ref()
-            .is_some_and(|memberships| memberships.len() != candidates.len())
-    {
-        return Err(IndexError::Integrity);
-    }
-    let mut ordinal = 0usize;
-    candidates.retain(|key, material_source_version| {
-        let current = candidate_is_current(
-            memberships
-                .as_ref()
-                .map_or_else(|| universe.get(key), |gates| gates[ordinal].as_ref()),
-            presence[ordinal].as_ref(),
-            *material_source_version,
-        );
-        ordinal += 1;
-        current
-    });
-    budget.release_heap(credits, presence_bytes)?;
-    budget.release_heap(credits, membership_bytes)?;
-    budget.release_heap(
-        credits,
-        candidate_keys
-            .len()
-            .saturating_mul(std::mem::size_of::<StableDocumentKey>()),
-    )?;
-    budget.reserve_heap(
-        credits,
-        candidates
-            .len()
-            .checked_mul(std::mem::size_of::<StableDocumentKey>())
-            .ok_or(IndexError::OffsetOverflow)?,
-    )?;
-    Ok(candidates.into_keys().collect())
-}
+#[path = "query_executor_predicate.rs"]
+mod predicate;
+use predicate::evaluate_predicate;
 
 #[allow(clippy::too_many_arguments)]
 async fn seek_terms<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
@@ -1238,7 +770,7 @@ async fn seek_terms<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<BTreeMap<StableDocumentKey, u64>, IndexError> {
+) -> Result<BTreeMap<StableDocumentKey, QueryMaterialCandidate>, IndexError> {
     let newest = seek_term_postings(
         loader,
         executor,
@@ -1252,24 +784,53 @@ async fn seek_terms<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>
         budget,
     )
     .await?;
-    let mut output = BTreeMap::<StableDocumentKey, u64>::new();
+    let input_bytes = term_posting_map_bytes(&newest)?;
+    let input_count = newest.values().try_fold(0usize, |count, entries| {
+        count
+            .checked_add(entries.len())
+            .ok_or(IndexError::OffsetOverflow)
+    })?;
+    budget.reserve_heap(credits, candidate_set_bytes(input_count)?)?;
+    let mut output = BTreeMap::<StableDocumentKey, QueryMaterialCandidate>::new();
     for postings in newest.into_values() {
         for (key, (_, posting)) in postings {
             if posting.live {
                 output
                     .entry(key)
-                    .and_modify(|version| {
-                        *version = (*version).max(posting.material_source_version)
+                    .and_modify(|candidate| {
+                        if posting.material_source_version > candidate.material_source_version {
+                            *candidate = QueryMaterialCandidate::from(posting.clone());
+                        }
                     })
-                    .or_insert_with(|| posting.material_source_version);
+                    .or_insert_with(|| QueryMaterialCandidate::from(posting));
             }
         }
         budget.candidates(output.len())?;
     }
+    budget.release_heap(
+        credits,
+        candidate_set_bytes(input_count)?
+            .checked_sub(candidate_set_bytes(output.len())?)
+            .ok_or(IndexError::Integrity)?,
+    )?;
+    budget.release_heap(credits, input_bytes)?;
     Ok(output)
 }
 
-type TermPostingMap = BTreeMap<ScalarValue, BTreeMap<StableDocumentKey, (usize, QueryPosting)>>;
+type TermPostingMap =
+    BTreeMap<ScalarValue, BTreeMap<StableDocumentKey, (usize, DenseQueryPosting)>>;
+
+fn term_posting_map_bytes(postings: &TermPostingMap) -> Result<usize, IndexError> {
+    postings.iter().try_fold(0usize, |bytes, (term, entries)| {
+        entries
+            .len()
+            .checked_mul(posting_entry_bytes())
+            .and_then(|entry_bytes| entry_bytes.checked_add(4096))
+            .and_then(|entry_bytes| entry_bytes.checked_add(resident_scalar_bytes(term)))
+            .and_then(|entry_bytes| bytes.checked_add(entry_bytes))
+            .ok_or(IndexError::OffsetOverflow)
+    })
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn seek_term_postings<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
@@ -1396,6 +957,12 @@ async fn seek_term_postings<L: QueryArtifactLoader + 'static, X: QueryPartitionE
             .ok_or(IndexError::OffsetOverflow)?;
         for entry in entries {
             if !newest.contains_key(&entry.term) {
+                budget.reserve_heap(
+                    credits,
+                    4096usize
+                        .checked_add(resident_scalar_bytes(&entry.term))
+                        .ok_or(IndexError::OffsetOverflow)?,
+                )?;
                 newest.insert(entry.term.clone(), BTreeMap::new());
             }
             for shard in entry.posting_shards {
@@ -1503,10 +1070,11 @@ async fn seek_term_postings<L: QueryArtifactLoader + 'static, X: QueryPartitionE
         let item = work.get(ordinal).ok_or(IndexError::Integrity)?;
         let term = newest.get_mut(&item.term).ok_or(IndexError::Integrity)?;
         for posting in postings {
-            if term.contains_key(&posting.document) {
+            let document = posting.document()?;
+            if term.contains_key(&document) {
                 budget.release_heap(credits, posting_entry_bytes())?;
             } else {
-                term.insert(posting.document, (item.run, posting));
+                term.insert(document, (item.run, posting));
             }
         }
     }
@@ -1525,8 +1093,9 @@ async fn seek_range<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<BTreeMap<StableDocumentKey, u64>, IndexError> {
-    let mut newest = BTreeMap::<(ScalarValue, StableDocumentKey), (bool, u64)>::new();
+) -> Result<BTreeMap<StableDocumentKey, QueryMaterialCandidate>, IndexError> {
+    let mut newest =
+        BTreeMap::<(ScalarValue, StableDocumentKey), (bool, QueryMaterialCandidate)>::new();
     let lower_key = lower
         .map(|bound| encode_scalar_sort_key(&bound.value))
         .transpose()?;
@@ -1621,24 +1190,61 @@ async fn seek_range<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>
     }
     for (_, points) in decoded {
         for point in points {
-            let key = (point.value, point.document);
+            let document = point.documents.document(point.point.document)?;
+            let key = (point.point.value, document);
             if newest.contains_key(&key) {
                 budget.release_heap(credits, resident_point_entry_bytes(&key.0))?;
             } else {
-                newest.insert(key, (point.live, point.material_source_version));
+                if newest.is_empty() {
+                    budget.reserve_heap(credits, 2048)?;
+                }
+                newest.insert(
+                    key,
+                    (
+                        point.point.live,
+                        QueryMaterialCandidate {
+                            material_source_version: point.point.material_source_version,
+                            segment: Some(SegmentCandidateIdentity {
+                                documents: point.documents,
+                                local_id: point.point.document,
+                            }),
+                        },
+                    ),
+                );
             }
         }
     }
-    let mut output = BTreeMap::<StableDocumentKey, u64>::new();
-    for ((_, key), (live, version)) in newest {
+    let input_count = newest.len();
+    let input_bytes = newest.keys().try_fold(
+        if input_count == 0 { 0usize } else { 2048usize },
+        |bytes, (value, _)| {
+            bytes
+                .checked_add(resident_point_entry_bytes(value))
+                .ok_or(IndexError::OffsetOverflow)
+        },
+    )?;
+    budget.reserve_heap(credits, candidate_set_bytes(input_count)?)?;
+    let mut output = BTreeMap::<StableDocumentKey, QueryMaterialCandidate>::new();
+    for ((_, key), (live, candidate)) in newest {
         if live {
             output
                 .entry(key)
-                .and_modify(|current| *current = (*current).max(version))
-                .or_insert(version);
+                .and_modify(|current| {
+                    if candidate.material_source_version > current.material_source_version {
+                        *current = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
         }
     }
     budget.candidates(output.len())?;
+    budget.release_heap(
+        credits,
+        candidate_set_bytes(input_count)?
+            .checked_sub(candidate_set_bytes(output.len())?)
+            .ok_or(IndexError::Integrity)?,
+    )?;
+    budget.release_heap(credits, input_bytes)?;
     Ok(output)
 }
 
@@ -1923,9 +1529,12 @@ async fn load_candidate_doc_values<L: QueryArtifactLoader, X: QueryPartitionExec
             .run_cpu(Box::new(move || {
                 let mut decoded = Vec::new();
                 for (relative, candidate) in cpu_candidates.iter().enumerate() {
-                    if let Some(record) = block.records_from(&candidate.document.bytes()).next() {
-                        let value = decode_doc_value(record, block_limits)?;
-                        if value.document == candidate.document {
+                    if let Ok(local) = block.documents().id(candidate.document)
+                        && let Some(value) = block.doc_value(local, block_limits)?
+                    {
+                        if value.document == candidate.document
+                            && value.material_source_version == candidate.material_source_version
+                        {
                             let resident = value
                                 .value
                                 .as_ref()

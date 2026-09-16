@@ -24,6 +24,7 @@ mod query_parallel;
 mod query_prepare;
 #[cfg(test)]
 mod query_run;
+mod query_seal_bound;
 mod query_stream;
 mod read;
 mod stream;
@@ -56,16 +57,16 @@ pub use paths::{
     projection_stream_page_path,
 };
 pub use pipeline::{
-    ChargedPreparedProjectionBatch, ChargedSealedPartitionProjection, IndexingMemoryCredits,
-    IndexingMemoryLimits, IndexingMemoryPermit, IndexingMemoryStage, MemoryAdmission,
-    PartitionProjectionAccumulator, PartitionProjectionCheckpoint, PreparedProjectionBatch,
-    PreparedProjectionBatchError, PreparedProjectionBatchReservation, PreparedProjectionRow,
-    ProjectionBatchAdmission, SealedPartitionProjection,
+    ChargedPreparedProjectionBatch, ChargedSealedPartitionProjection, IndexingMemoryBackend,
+    IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryPermit, IndexingMemoryStage,
+    IndexingProgressReservation, MemoryAdmission, PartitionProjectionAccumulator,
+    PartitionProjectionCheckpoint, PreparedProjectionBatch, PreparedProjectionBatchError,
+    PreparedProjectionBatchReservation, PreparedProjectionRow, ProjectionBatchAdmission,
+    SealedPartitionProjection,
 };
 pub use projected_state::{
     CanonicalRecipeState, DocumentHead, ObjectIdentity, ProjectedDocumentDelta,
     ProjectedDocumentState, RecipeDelta, RecipeIdentity, StableDocumentKey,
-    inherit_projection_preserving_versions,
 };
 pub use publication::{
     AtomicProjectionPublicationCredits, PreparedAtomicProjectionGeneration,
@@ -74,11 +75,13 @@ pub use publication::{
     prepare_projection_generation,
 };
 pub use query_blocks::{
-    DEFAULT_QUERY_BLOCK_BYTES, DecodedQueryBlock, EncodedProjectionQueryRun, EncodedQueryBlock,
-    LogicalQueryBlockDescriptor, PreparedQueryFieldDelta, PreparedQueryTermDelta,
-    ProjectionQueryRunDescriptor, QueryBlockCursor, QueryBlockDescriptor, QueryBlockKind,
-    QueryBlockLimits, QueryBlockRecord, QueryBlockRecordRef, QueryDocValue, QueryPoint,
-    QueryPositions, QueryPosting, QueryPostingShard, QueryTermEntry, decode_point,
+    DEFAULT_QUERY_BLOCK_BYTES, DecodedQueryBlock, DenseSegmentPoint, DenseSegmentPosting,
+    EncodedProjectionQueryRun, EncodedQueryBlock, LogicalQueryBlockDescriptor,
+    PreparedQueryFieldDelta, PreparedQueryTermDelta, ProjectionQueryRunDescriptor,
+    QueryBlockCursor, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryBlockRecord,
+    QueryBlockRecordRef, QueryDocValue, QueryPoint, QueryPositions, QueryPosting,
+    QueryPostingShard, QueryTermEntry, SegmentDocumentId, SegmentDocumentTable,
+    SegmentLiveDocuments, SegmentMemoryLease, SegmentPostingCursor, SegmentReader, decode_point,
     decode_positions, decode_posting, decode_projection_query_run, decode_term_entry, encode_point,
     encode_positions, encode_posting, encode_projection_query_run, encode_query_block,
     encode_term_entry, merge_query_block_records, prepare_typed_json_field_delta, seek_exact_term,
@@ -111,6 +114,7 @@ pub use query_prepare::{
     PreparedQueryMutationBatch, PreparedQueryRecipeDelta, ProjectionQueryRunArtifacts,
     pack_query_blocks, prepare_projection_query_run,
 };
+pub use query_seal_bound::{query_batches_seal_peak_bytes, query_run_seal_peak_bytes};
 pub use query_stream::{
     EncodedQueryRunPage, PreparedQueryRunAppend, PreparedQueryRunSplice, QUERY_RUN_PAGE_FANOUT,
     QueryRunChild, QueryRunCompactionLimits, QueryRunCompactionPlan, QueryRunPage,
@@ -126,8 +130,9 @@ pub use stream::{
     ComponentStreamRoot, EncodedComponentStreamPage, TombstoneCompactionPolicy,
     append_component_delta, append_component_stream, build_component_stream,
     compact_component_runs, component_stream_child_hashes, decode_component_stream,
-    lookup_component_record_in_verified_pack, resolve_component_record_from_verified_artifacts,
-    select_component_compaction, splice_compacted_component_runs,
+    lookup_component_record_in_verified_pack, lookup_component_record_in_verified_segment,
+    resolve_component_record_from_verified_artifacts, select_component_compaction,
+    splice_compacted_component_runs,
 };
 pub use typed_document::{
     PreparedTypedJsonDocument, TypedJsonDocumentInput, TypedJsonSelectedField,

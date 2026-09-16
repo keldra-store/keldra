@@ -616,6 +616,23 @@ pub fn lookup_component_record_in_verified_pack(
         .checked_add(length)
         .ok_or(IndexError::OffsetOverflow)?;
     let bytes = pack.get(start..end).ok_or(IndexError::Integrity)?;
+    lookup_component_record_in_verified_segment(component, descriptor, bytes, stable_key)
+}
+
+/// Lookup in the exact bounded segment range returned by the artifact boundary.
+/// The containing object remains authoritative; callers need not materialize it.
+pub fn lookup_component_record_in_verified_segment(
+    component: ComponentIdentity,
+    descriptor: &ComponentSegmentDescriptor,
+    bytes: &[u8],
+    stable_key: StableDocumentKey,
+) -> Result<ComponentRecordLookup, IndexError> {
+    descriptor.locator.resolve(&descriptor.pack_table)?;
+    if u64::try_from(bytes.len()).map_err(|_| IndexError::OffsetOverflow)?
+        != descriptor.locator.encoded_bytes
+    {
+        return Err(IndexError::Integrity);
+    }
     let mut cursor = ComponentDeltaCursor::new(bytes)?;
     if cursor.component() != component || cursor.record_count() != descriptor.records {
         return Err(IndexError::Integrity);
@@ -1473,7 +1490,7 @@ fn encode_page(
     }
     Ok(EncodedComponentStreamPage {
         hash: *crate::profiled_blake3_hash!(&bytes).as_bytes(),
-        bytes: Bytes::from(bytes),
+        bytes: Bytes::from_owner(bytes.into_boxed_slice()),
     })
 }
 

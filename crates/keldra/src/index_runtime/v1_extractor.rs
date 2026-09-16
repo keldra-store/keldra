@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use keldra_index::v1::{
-    PreparedTypedJsonDocument, ProjectedDocumentState, QueryBlockCredits, RecipeIdentity,
-    TypedJsonDocumentInput, TypedJsonSelectedField, prepare_typed_json_document,
+    PreparedTypedJsonDocument, QueryBlockCredits, RecipeIdentity, TypedJsonDocumentInput,
+    TypedJsonSelectedField, prepare_typed_json_document,
 };
 use keldra_index::{
     IndexError,
@@ -22,7 +22,8 @@ use super::cpu::IndexCpuPool;
 use super::date::parse_millis;
 use super::hot_ingress::HotProjectionIngress;
 use super::json_projection::{
-    CompiledScalarProjectionPlan, ProjectedScalarPointers, project_compiled_scalar_pointers,
+    CompiledScalarProjectionPlan, ProjectedScalarPointers,
+    project_compiled_scalar_pointers_accounted,
 };
 use super::source::{IndexBuildObject, IndexSourceMutation};
 
@@ -37,6 +38,19 @@ pub(crate) struct V1ProjectionExtractor {
 pub(crate) struct SelectedV1Source {
     pub(crate) source: IndexSourceMutation,
     pub(crate) selected: Option<ProjectedScalarPointers>,
+    pub(crate) selection_memory: Option<Arc<keldra_index::v1::IndexingMemoryPermit>>,
+}
+
+/// One reusable batch slot; CPU preparation fills the existing input vector
+/// rather than allocating a second output vector and moving every slot again.
+pub(crate) struct V1PreparationSlot {
+    pub(crate) selected: SelectedV1Source,
+    pub(crate) credits: QueryBlockCredits,
+    pub(crate) prepared: Option<PreparedTypedJsonDocument>,
+    // CPU tasks outlive cancellation of their async submitter. Own the exact
+    // source/workspace permits inside their input slots until execution ends.
+    pub(crate) source_memory: Option<Arc<keldra_index::v1::IndexingMemoryPermit>>,
+    pub(crate) workspace_memory: Option<Arc<keldra_index::v1::IndexingMemoryPermit>>,
 }
 
 impl V1ProjectionExtractor {
@@ -61,6 +75,7 @@ impl V1ProjectionExtractor {
         source: IndexSourceMutation,
         recipes: &[Arc<PhysicalCatalogRecipe>],
         physical_catalog_identity: [u8; 32],
+        memory: &keldra_index::v1::IndexingMemoryCredits,
     ) -> Result<SelectedV1Source, Status> {
         let object = match source {
             IndexSourceMutation::Upsert(object) => object,
@@ -76,6 +91,7 @@ impl V1ProjectionExtractor {
                         canonical_path,
                     },
                     selected: None,
+                    selection_memory: None,
                 });
             }
         };
@@ -97,6 +113,7 @@ impl V1ProjectionExtractor {
             return Ok(SelectedV1Source {
                 source: IndexSourceMutation::Upsert(object),
                 selected: None,
+                selection_memory: None,
             });
         }
         if let Some(selected) = self
@@ -121,20 +138,45 @@ impl V1ProjectionExtractor {
             return Ok(SelectedV1Source {
                 source: IndexSourceMutation::Upsert(object),
                 selected: Some(selected),
+                selection_memory: None,
             });
         }
         super::v1_telemetry::V1PipelineTelemetry::add(&super::v1_telemetry::global().hot_misses, 1);
+        let source_bytes = usize::try_from(object.content_length)
+            .map_err(|_| Status::resource_exhausted("v1 source length exceeds address space"))?;
+        let maximum =
+            projection_plan.source_selection_bound(source_bytes, self.maximum_projection_bytes);
+        let admission = projection_plan.source_parser_admission_bytes(source_bytes, maximum);
+        let selection_memory = Arc::new(
+            memory
+                .acquire(
+                    keldra_index::v1::IndexingMemoryStage::WorkerScratch,
+                    admission.max(1),
+                )
+                .map_err(|_| {
+                    Status::resource_exhausted("v1 source selection memory unavailable")
+                })?,
+        );
         let mut payload = self.open_payload(&object).await?;
-        let maximum = self.maximum_projection_bytes;
         let queued_at = Instant::now();
-        let (selected, cpu, wait) = self
+        let parser_memory = memory.clone();
+        let (selected, cpu, wait, selection_memory) = self
             .cpu
             .submit(move || {
                 let started = Instant::now();
                 let wait = started.saturating_duration_since(queued_at);
-                let selected =
-                    project_compiled_scalar_pointers(&mut payload, projection_plan, maximum)?;
-                Ok::<_, keldra_index::IndexError>((selected, started.elapsed(), wait))
+                let selected = project_compiled_scalar_pointers_accounted(
+                    &mut payload,
+                    projection_plan,
+                    maximum,
+                    &parser_memory,
+                )?;
+                Ok::<_, keldra_index::IndexError>((
+                    selected,
+                    started.elapsed(),
+                    wait,
+                    selection_memory,
+                ))
             })
             .await
             .map_err(|error| Status::internal(error.to_string()))?
@@ -161,6 +203,7 @@ impl V1ProjectionExtractor {
         Ok(SelectedV1Source {
             source: IndexSourceMutation::Upsert(object),
             selected,
+            selection_memory: Some(selection_memory),
         })
     }
 
@@ -179,7 +222,6 @@ impl V1ProjectionExtractor {
         source_scope: [u8; 32],
         selected: &SelectedV1Source,
         recipe: &PhysicalCatalogRecipe,
-        previous: &[ProjectedDocumentState],
         credits: &mut QueryBlockCredits,
     ) -> Result<PreparedTypedJsonDocument, Status> {
         let (path, canonical_source_path, version, result, live) = match &selected.source {
@@ -235,7 +277,6 @@ impl V1ProjectionExtractor {
                     .map_err(index_status)?,
                 fields,
             },
-            previous,
             credits,
         )
         .map_err(|error| object_index_status(&diagnostic_path, error))
@@ -249,29 +290,21 @@ impl V1ProjectionExtractor {
         &self,
         source_scope: [u8; 32],
         recipe: Arc<PhysicalCatalogRecipe>,
-        inputs: Vec<(
-            SelectedV1Source,
-            Vec<ProjectedDocumentState>,
-            QueryBlockCredits,
-        )>,
-    ) -> Result<
-        Vec<(
-            SelectedV1Source,
-            Vec<ProjectedDocumentState>,
-            PreparedTypedJsonDocument,
-            QueryBlockCredits,
-        )>,
-        Status,
-    > {
+        mut inputs: Vec<V1PreparationSlot>,
+    ) -> Result<Vec<V1PreparationSlot>, Status> {
         self.cpu
             .submit(move || {
-                let mut output = Vec::with_capacity(inputs.len());
-                for (selected, previous, mut credits) in inputs {
-                    let prepared =
-                        Self::prepare(source_scope, &selected, &recipe, &previous, &mut credits)?;
-                    output.push((selected, previous, prepared, credits));
+                let allocation = inputs.as_ptr();
+                for slot in &mut inputs {
+                    slot.prepared = Some(Self::prepare(
+                        source_scope,
+                        &slot.selected,
+                        &recipe,
+                        &mut slot.credits,
+                    )?);
                 }
-                Ok(output)
+                debug_assert_eq!(inputs.as_ptr(), allocation);
+                Ok(inputs)
             })
             .await
             .map_err(|error| Status::internal(error.to_string()))?

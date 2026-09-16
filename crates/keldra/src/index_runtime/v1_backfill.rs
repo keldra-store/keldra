@@ -117,11 +117,6 @@ impl V1PartitionBaseline {
         }
         loop {
             if let Some(head) = self.pending.front().cloned() {
-                let construction_memory = credits
-                    .acquire(IndexingMemoryStage::ReplayInput, maximum_selected_bytes)
-                    .map_err(|_| {
-                        Status::resource_exhausted("v1 baseline selection memory unavailable")
-                    })?;
                 let Some((object, source_journal_offset)) = baseline_object(
                     head,
                     self.source,
@@ -156,13 +151,14 @@ impl V1PartitionBaseline {
                     self.pending.pop_front();
                     continue;
                 }
-                let selected = extractor
+                let mut selected = extractor
                     .select(
                         self.recipe.family.tenant_id,
                         self.recipe.family.bucket_id,
                         source,
                         &recipes,
                         physical_catalog_identity,
+                        credits,
                     )
                     .await?;
                 let resident_bytes = selected_resident_bytes(&selected)?;
@@ -171,7 +167,6 @@ impl V1PartitionBaseline {
                         "v1 baseline selection requires {resident_bytes} bytes but its bound is {maximum_selected_bytes}"
                     )));
                 }
-                drop(construction_memory);
                 let memory = credits
                     .acquire(IndexingMemoryStage::ReplayInput, resident_bytes.max(1))
                     .map_err(|_| {
@@ -179,6 +174,7 @@ impl V1PartitionBaseline {
                             "v1 baseline retained selection memory unavailable",
                         )
                     })?;
+                drop(selected.selection_memory.take());
                 let baseline_offset = self.next_baseline_offset;
                 self.next_baseline_offset = self
                     .next_baseline_offset

@@ -5,13 +5,14 @@ use crate::IndexError;
 use crate::typed_json::{Predicate, ScalarValue};
 
 use super::super::query_parallel::QueryPartitionJob;
+use super::DenseQueryPosting;
 use super::admission::resident_selected_candidate_bytes;
 use super::{
     AuthorizedQueryCandidate, Budget, PartitionManifest, QueryAdmissionCandidate,
     QueryArtifactLoader, QueryBlockCredits, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits,
-    QueryCandidateAdmission, QueryCommonCut, QueryPartitionExecutor, QueryPosting,
-    StableDocumentKey, TypedJsonQueryRequest, authorize_selected_candidates, candidate_is_current,
-    decode_posting, load_latest_gates_for_keys, load_selected_terms, select_handoff_candidate,
+    QueryCandidateAdmission, QueryCommonCut, QueryPartitionExecutor, StableDocumentKey,
+    TypedJsonQueryRequest, authorize_selected_candidates, candidate_is_current,
+    load_latest_gates_for_keys, load_selected_terms, select_handoff_candidate,
 };
 
 const POSTING_SOURCE_CHUNK: usize = 32;
@@ -372,7 +373,13 @@ async fn load_bounded_equal_postings<
     block_limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
     budget: &mut Budget,
-) -> Result<(BTreeMap<StableDocumentKey, (usize, QueryPosting)>, bool), IndexError> {
+) -> Result<
+    (
+        BTreeMap<StableDocumentKey, (usize, DenseQueryPosting)>,
+        bool,
+    ),
+    IndexError,
+> {
     let mut sources = Vec::new();
     for (run, descriptor) in manifest.matching_blocks(QueryBlockKind::TermDictionary, recipe) {
         let (entries, entry_bytes) = load_selected_terms(
@@ -449,7 +456,7 @@ async fn load_bounded_equal_postings<
     .await?;
     for (source_index, source) in sources.iter().enumerate() {
         if let Some(posting) = source.buffered.front() {
-            heap.push(Reverse((posting.document, source_index)));
+            heap.push(Reverse((posting.document()?, source_index)));
         }
     }
 
@@ -467,12 +474,12 @@ async fn load_bounded_equal_postings<
             same_document_sources.push(source_index);
         }
 
-        let mut selected = None::<(usize, QueryPosting)>;
+        let mut selected = None::<(usize, DenseQueryPosting)>;
         let mut refill = Vec::new();
         for source_index in same_document_sources.iter().copied() {
             let source = sources.get_mut(source_index).ok_or(IndexError::Integrity)?;
             let posting = source.buffered.pop_front().ok_or(IndexError::Integrity)?;
-            if posting.document != document {
+            if posting.document()? != document {
                 return Err(IndexError::Integrity);
             }
             budget.release_heap(credits, posting_buffer_bytes())?;
@@ -498,7 +505,7 @@ async fn load_bounded_equal_postings<
         .await?;
         for source_index in same_document_sources {
             if let Some(next) = sources[source_index].buffered.front() {
-                heap.push(Reverse((next.document, source_index)));
+                heap.push(Reverse((next.document()?, source_index)));
             }
         }
         let selected = selected.ok_or(IndexError::Integrity)?;
@@ -522,7 +529,7 @@ async fn load_bounded_equal_postings<
 }
 
 struct PostingChunk {
-    buffered: VecDeque<QueryPosting>,
+    buffered: VecDeque<DenseQueryPosting>,
     resume: Option<StableDocumentKey>,
     exhausted: bool,
 }
@@ -629,7 +636,7 @@ struct PostingSource<'a> {
     minimum_document: StableDocumentKey,
     maximum_document: StableDocumentKey,
     resume: Option<StableDocumentKey>,
-    buffered: VecDeque<QueryPosting>,
+    buffered: VecDeque<DenseQueryPosting>,
     exhausted: bool,
 }
 
@@ -662,25 +669,34 @@ async fn load_posting_chunk<L: QueryArtifactLoader, X: QueryPartitionExecutor>(
     let mut cpu_credits = credits.try_fork_query()?;
     executor
         .run_cpu(Box::new(move || {
-            let minimum = resume
-                .filter(|minimum| minimum_document <= *minimum)
-                .unwrap_or(minimum_document);
+            let lower = block.documents().lower_bound(minimum_document);
+            let upper = block.documents().upper_bound(maximum_document);
+            let minimum = resume.map_or(lower, |resume| {
+                block.documents().upper_bound(resume).max(lower)
+            });
             let mut buffered = VecDeque::new();
             let mut exhausted = true;
-            for record in block.records_from(&minimum.bytes()) {
-                let posting = decode_posting(record)?;
-                if posting.document < minimum_document || posting.document > maximum_document {
+            let mut last_document = None;
+            let mut cursor = block.posting_cursor()?;
+            let mut next = cursor.advance(minimum);
+            while let Some(dense) = next? {
+                if dense.document < lower || dense.document >= upper {
                     return Err(IndexError::Integrity);
                 }
-                if resume.is_none_or(|minimum| posting.document > minimum) {
-                    resume = Some(posting.document);
-                    cpu_budget.reserve_heap(&mut cpu_credits, posting_buffer_bytes())?;
-                    buffered.push_back(posting);
-                    if buffered.len() == POSTING_SOURCE_CHUNK {
-                        exhausted = false;
-                        break;
-                    }
+                last_document = Some(dense.document);
+                cpu_budget.reserve_heap(&mut cpu_credits, posting_buffer_bytes())?;
+                buffered.push_back(DenseQueryPosting {
+                    documents: block.documents().clone(),
+                    posting: dense,
+                });
+                if buffered.len() == POSTING_SOURCE_CHUNK {
+                    exhausted = false;
+                    break;
                 }
+                next = cursor.next();
+            }
+            if let Some(last) = last_document {
+                resume = Some(block.documents().document(last)?);
             }
             cpu_credits.release_loaded_block(encoded_bytes)?;
             Ok(PostingChunk {
@@ -693,11 +709,11 @@ async fn load_posting_chunk<L: QueryArtifactLoader, X: QueryPartitionExecutor>(
 }
 
 const fn posting_entry_bytes() -> usize {
-    std::mem::size_of::<StableDocumentKey>() + std::mem::size_of::<QueryPosting>()
+    std::mem::size_of::<StableDocumentKey>() + std::mem::size_of::<DenseQueryPosting>()
 }
 
 const fn posting_buffer_bytes() -> usize {
-    std::mem::size_of::<QueryPosting>()
+    std::mem::size_of::<DenseQueryPosting>()
 }
 
 #[cfg(test)]
@@ -713,7 +729,7 @@ mod tests {
     use crate::v1::{
         ArtifactPackReference, ArtifactPackTable, ProjectionPartitionIdentity,
         ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot, QueryArtifactLoad,
-        QueryBlockRecord, QueryExecutionLimits, QueryMemoryPermit, QueryPostingShard,
+        QueryBlockRecord, QueryExecutionLimits, QueryMemoryPermit, QueryPosting, QueryPostingShard,
         QueryRootCutProof, QueryTermEntry, RecipeIdentity, encode_posting, encode_query_block,
         encode_term_entry,
     };
@@ -918,6 +934,7 @@ mod tests {
                 ))
         });
         let run = Arc::new(ProjectionQueryRunDescriptor {
+            memory_lease: Default::default(),
             partition,
             physical_catalog_generation: [4; 32],
             sequence: 1,
@@ -1041,6 +1058,7 @@ mod tests {
                 hash: encoded.descriptor.hash,
                 encoded_bytes: encoded.descriptor.encoded_bytes,
                 records: encoded.descriptor.records,
+                documents: encoded.descriptor.documents.clone(),
                 locator: crate::v1::ArtifactPackLocator {
                     ordinal: 0,
                     offset: 0,
@@ -1098,7 +1116,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(submitted.load(Ordering::Acquire), 2);
-        assert_eq!(sources[0].buffered.front().unwrap().document, documents[0]);
-        assert_eq!(sources[1].buffered.front().unwrap().document, documents[1]);
+        assert_eq!(
+            sources[0].buffered.front().unwrap().document().unwrap(),
+            documents[0]
+        );
+        assert_eq!(
+            sources[1].buffered.front().unwrap().document().unwrap(),
+            documents[1]
+        );
     }
 }

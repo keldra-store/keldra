@@ -139,9 +139,9 @@ revision, and checkpoints. This lets one stable family directory path describe
 handoff lineage without creating a new partition identity for every catalog
 transition.
 
-**Head delta** advances current source/result identity for stable documents. A
-projection-preserving update needs no new membership, posting, point, doc-value,
-facet, order, text, or vector material.
+**Head delta** advances current source/result identity and liveness for stable
+documents. Every upsert publishes complete indexed material at that source
+version; a head delta cannot make material from an older version current.
 
 **Projection checkpoint** is the greatest contiguous source position fully
 represented by a durable published partition root.
@@ -225,7 +225,7 @@ the journal consumer takes them.
 
 One journal consumer per assigned source partition is the sole ordering and
 checkpoint authority. Preparation may finish out of order, but it never creates
-a second work queue, replay cursor, or checkpoint.
+a second authoritative work queue, replay cursor, or checkpoint.
 
 The pipeline:
 
@@ -244,6 +244,15 @@ resident raw bytes or exact storage rather than stall behind speculative work.
 Publication and checkpoint advancement remain contiguous and exact under the
 placement fence.
 
+One accounted look-ahead page may be prepared while the preceding generation
+is staged and published. It uses the same owned dispatcher and retains exact
+source identities and atomic-unit evidence. Its prepared output is adopted in
+source order only after successful predecessor publication, and its generation
+is built against that newly authoritative Current. Refused speculative
+admission falls back to ordinary preparation; it must not borrow foreground
+sealing promises. Fence/catalog invalidation and cancellation discard the
+speculation without advancing durable checkpoints or source retention.
+
 Atomic-program batches remain indivisible publication units. The pipeline may
 cross a soft memory target to finish one admitted atomic batch, but the public
 hard operation limits remain enforced at ingress.
@@ -251,7 +260,7 @@ hard operation limits remain enforced at ingress.
 The normal complexity of one mutation is:
 
 ```text
-O(route lookup + selected payload bytes + produced terms + changed recipes)
+O(route lookup + selected payload bytes + produced terms + selected recipes)
 ```
 
 It is never proportional to total logical definitions or accumulated
@@ -259,23 +268,35 @@ projection history.
 
 ## 7. Stage-specific memory and CPU control
 
-Each node has one hard indexing memory budget divided into credit pools:
+Each node has one aggregate index working-memory authority. Stage labels
+describe ownership, not independently allocated budgets:
 
 ```text
 extraction input
+catalog and hot-ingress state
 resident payload/prepared-row FIFO
 token/posting worker output
 partition segment accumulators
 encoding/compression scratch
 publication descriptors
+query readers and pinned snapshot metadata
+immutable byte and decoded metadata caches
 compaction workspace
 ```
 
 All resident and transient allocations are conservatively charged before use.
-One stage cannot consume the credits another stage needs to release memory.
-Credits may be dynamically rebalanced inside the hard ceiling, but mandatory
-publication/recovery work cannot be starved by speculative extraction or
-compaction.
+Shared immutable allocations retain their charge until the final owner drops
+them, even after cache eviction. Caches borrow idle aggregate capacity;
+admission reclaims only the measured shortfall, not the entire cache.
+
+Each accumulating writer declares a conservative sealing-progress promise
+derived from its actual native records, block packing and publication
+representations. This promise protects unused headroom without allocating it;
+sealing consumes that headroom and releases the promise after staging.
+Speculative preparation, queries, caches and compaction cannot consume memory
+promised for required publication. Actual bytes and promised headroom are
+reported separately. Reclamation callbacks never run while holding a local
+credit-accounting lock.
 
 The default planning ratio is 256 MiB per configured indexing core, subject to
 an explicit administrator-set total ceiling. The ratio is a qualification and
@@ -296,7 +317,7 @@ the configured journal capacity and ultimately applies authoritative write
 backpressure. Keldra never allocates beyond the memory limit or discards durable
 journal evidence.
 
-## 8. Physical output and HOT-equivalent updates
+## 8. Physical output and full-document replacements
 
 Each partition accumulator produces reusable multi-field segment components:
 
@@ -317,7 +338,8 @@ cause duplicate extraction, tokenization, posting construction, or segment
 publication.
 
 A **projection-preserving update** changes an ordinary source/result version but
-not canonical indexed material. It emits only a compact head delta:
+not its selected values. Like every upsert, it emits a complete replacement
+document together with its head delta:
 
 ```text
 stable_document_key
@@ -328,14 +350,10 @@ material_source_version
 live state
 ```
 
-It never enters field accumulators. A material change emits a head delta plus
-only the changed recipe components. Deletes emit head/membership tombstones.
-Old immutable material is not rewritten synchronously; newest authoritative
-head state wins and partition-local compaction later removes obsolete material.
-
-Canonical projected values are compared exactly. Digests may reject differences
-quickly but digest equality alone cannot authorize a projection-preserving
-decision.
+There is no predecessor-field read, canonical-value comparison or per-term
+subtraction. Deletes emit newer dead head/liveness gates. Old immutable material
+is not rewritten synchronously: exact-current gates exclude it and bounded
+partition-local background merging later removes it.
 
 ## 9. Segment flush and partition publication
 
@@ -375,16 +393,30 @@ ProjectionQueryRun {
 
 The stable-key/material/live gate binds every segment-local document to the
 material version represented by that run and makes an old material version
-ineligible before it can become a hit. A material-changing mutation emits a
-sparse L0 run with removal/tombstone evidence for the old material plus additions
-for the new material; unchanged recipes need no duplicate component. A
-projection-preserving mutation emits only the head delta described above.
+ineligible before it can become a hit. Every upsert emits a complete replacement
+document at its exact new source version, including unchanged indexed fields.
+The same published generation carries the replacement and the identity's new
+liveness/version gates. Deletes publish newer dead gates even when no previous
+projection state is available. Older postings become ineligible through exact
+material-version equality; they require neither old-field reconstruction nor
+per-term subtraction. Background merges remove dead material.
 
-Field-state deltas, extracted values, and document-key comparison runs exist
-only to prepare this output and to decide whether a mutation is
-projection-preserving. They are never opened by a query reader, never scanned
-to discover matching documents, and never a fallback query representation. A
-root cannot claim its checkpoint until every run and head delta for that exact
+There is no legacy reader or migration path: derived indexes rebuild
+from authoritative objects and their replay journal.
+
+Segments use dense local document identifiers with exact object identity/version
+mappings, compact postings, live masks and typed value columns. Their immutable
+reader cores and metadata can be reused across generations. Local document IDs
+have meaning only within their own identity/version table. Boolean operations
+use masks within a table and exact stable-identity/material-version joins across
+different tables; equal local IDs or equal object identities at different
+versions cannot satisfy a conjunction.
+
+Query readers seek bounded object ranges rather than retrieving a containing
+pack for a small lookup. Remote ranges use authenticated, placement-fenced
+complete-copy or intersecting erasure-stripe reads and verify the selected
+child against its published hash. Verified local materializations remain
+disposable caches. A root cannot claim its checkpoint until every run and head delta for that exact
 source/atomic cut is durable and referenced by the root.
 
 One partition root contains:
@@ -450,7 +482,7 @@ For each pinned root, the reader seeks only the matching recipe directories in
 its `ProjectionQueryRun`s. It intersects advanceable postings and membership /
 stable-key live gates, uses points for ranges, and reads declared doc values only
 for order, facets, and aggregates. It may merge a bounded number of run-local
-iterators, but it never broad-scans document-key field-state output. Candidate
+iterators, but it never broad-scans document-key field-state output.
 The immutable gate is part of the same published generation as its postings and
 doc values, so it is the exact liveness/version authority for that pinned cut.
 Query admission must not reload mutable object heads or version descriptors to
@@ -579,6 +611,14 @@ and required flush publication take priority. A failed compaction CAS does not
 invalidate ingestion work or trigger source replay. Cross-partition compaction
 is deferred as an optional read optimization and is never write authority.
 
+Selection and splicing use bounded on-demand access to the existing immutable
+page trees, not whole-history preloads. Visited encoded and decoded pages,
+selected input workspace and generated output retain their actual admission
+owners. Admission grows with the bounded selected work under the node's shared
+budget, rather than using a fixed fraction as a disconnected memory ceiling.
+Rebasing retains needed selected paths and replacement pages, not accumulated
+stale overlays from every preceding attempt.
+
 ## 14. Correctness invariants
 
 1. Ordinary objects remain application-data authority.
@@ -592,8 +632,8 @@ is deferred as an optional read optimization and is never write authority.
    published roots before a replacement durably inherits their coverage.
 7. Equivalent logical definitions share physical work without sharing
    authorization authority.
-8. Projection-preserving updates return the exact current result identity
-   through unchanged indexed material.
+8. Every upsert returns the exact current result identity through indexed
+   material bound to that same source version.
 9. Material changes cannot use stale postings to return an obsolete value.
 10. No query mixes incompatible catalog generations or unpinned partition
     roots.
@@ -620,7 +660,7 @@ Required low-cardinality telemetry includes:
 - accumulator bytes/age, flush reason, fill ratio, and overshoot;
 - segment/head-delta counts, bytes, encode time, durability time, and
   publication time;
-- query-run counts/bytes by LSM level; sparse-L0 removals/additions; recipe
+- query-run counts/bytes by LSM level; replacement/liveness records; recipe
   component counts/bytes for postings, positions, points, doc values, and the
   stable-key/material/live gate;
 - partition checkpoint lag in records, bytes, and wall time;
@@ -677,9 +717,10 @@ misreported as catalog cost.
 ### 16.3 Workload shapes
 
 Run inserts, deletes, projection-preserving updates, material-changing updates,
-and a realistic mixture. Projection-preserving updates must produce head deltas
-and zero field-component work. Large fields and token expansion must remain
-inside charged bounds.
+and a realistic mixture. Every upsert must replace the complete indexed
+document without predecessor reconstruction; deletes must exclude old material
+before and after merging. Large fields and token expansion must remain inside
+charged bounds.
 
 ### 16.4 Sustained and recovery runs
 
@@ -701,8 +742,8 @@ through a selective term/text predicate, numeric range, order, facet, and
 aggregate as applicable. Evidence must bind every claimed root cut to its
 `ProjectionQueryRun`s, show recipe seeks/intersections and bounded
 exact-current candidate validation, and show zero field-state broad-scan or
-field-state fallback attempts. Exercise sparse L0 old-material removals plus
-new-material additions before and after bounded whole-run compaction.
+field-state fallback attempts. Exercise replacement/liveness publication and
+dead-document elimination before and after bounded whole-run compaction.
 
 Every report binds commit and artifact digest, host/topology, corpus hash,
 durability, batch/concurrency, logical and physical recipe counts, offered and

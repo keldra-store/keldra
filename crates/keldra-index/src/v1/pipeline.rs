@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::IndexError;
@@ -62,11 +61,40 @@ pub struct IndexingMemoryCredits {
     inner: Arc<Mutex<IndexingMemoryCreditState>>,
 }
 
+/// Connect retained index allocations to the process-wide memory authority.
+/// Calls are synchronous and run without the credit-pool mutex held. Backends
+/// may reclaim cached values whose permits reenter this same credit pool.
+/// A rejected reservation reports the authority's currently available bytes.
+pub trait IndexingMemoryBackend: std::fmt::Debug + Send + Sync {
+    fn try_reserve(&self, bytes: usize) -> Result<(), usize>;
+    fn release(&self, bytes: usize);
+    fn try_reserve_stage(&self, _stage: IndexingMemoryStage, bytes: usize) -> Result<(), usize> {
+        self.try_reserve(bytes)
+    }
+    fn release_stage(&self, _stage: IndexingMemoryStage, bytes: usize) {
+        self.release(bytes);
+    }
+    fn transfer_stage(
+        &self,
+        _source: IndexingMemoryStage,
+        _destination: IndexingMemoryStage,
+        _bytes: usize,
+    ) -> Result<(), usize> {
+        Ok(())
+    }
+    fn try_reserve_progress(&self, _bytes: usize) -> Result<(), usize> {
+        Ok(())
+    }
+    fn release_progress(&self, _bytes: usize) {}
+}
+
 #[derive(Debug)]
 struct IndexingMemoryCreditState {
+    backend: Option<Arc<dyn IndexingMemoryBackend>>,
     total_limit_bytes: usize,
     stage_limit_bytes: [usize; IndexingMemoryStage::COUNT],
     used_bytes: usize,
+    promised_progress_bytes: usize,
     stage_used_bytes: [usize; IndexingMemoryStage::COUNT],
 }
 
@@ -77,7 +105,85 @@ pub struct IndexingMemoryPermit {
     bytes: usize,
 }
 
+/// Future sealing room, not allocated memory. It protects publication progress
+/// while preparation, queries and caches consume ordinary capacity.
+#[derive(Debug)]
+pub struct IndexingProgressReservation {
+    credits: IndexingMemoryCredits,
+    bytes: usize,
+}
+
+impl IndexingProgressReservation {
+    pub fn grow_to(&mut self, bytes: usize) -> Result<(), MemoryAdmission> {
+        if bytes <= self.bytes {
+            return Ok(());
+        }
+        let additional = bytes - self.bytes;
+        let mut state = self
+            .credits
+            .inner
+            .lock()
+            .expect("indexing memory credit lock poisoned");
+        let unused = state
+            .promised_progress_bytes
+            .saturating_sub(state.stage_used_bytes[IndexingMemoryStage::SealScratch.index()]);
+        let available = state
+            .total_limit_bytes
+            .saturating_sub(state.used_bytes)
+            .saturating_sub(unused)
+            .saturating_add(
+                state.stage_used_bytes[IndexingMemoryStage::SealScratch.index()]
+                    .saturating_sub(state.promised_progress_bytes),
+            );
+        if additional > available {
+            return Err(MemoryAdmission::ReplayRequired {
+                needed_bytes: additional,
+                available_bytes: available,
+            });
+        }
+        state.promised_progress_bytes += additional;
+        let backend = state.backend.clone();
+        drop(state);
+        if let Some(backend) = backend {
+            if let Err(available_bytes) = backend.try_reserve_progress(additional) {
+                self.credits
+                    .inner
+                    .lock()
+                    .expect("indexing memory credit lock poisoned")
+                    .promised_progress_bytes -= additional;
+                return Err(MemoryAdmission::ReplayRequired {
+                    needed_bytes: additional,
+                    available_bytes,
+                });
+            }
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+impl Drop for IndexingProgressReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .credits
+            .inner
+            .lock()
+            .expect("indexing memory credit lock poisoned");
+        state.promised_progress_bytes -= self.bytes;
+        let backend = state.backend.clone();
+        drop(state);
+        if let Some(backend) = backend {
+            backend.release_progress(self.bytes);
+        }
+    }
+}
+
 impl IndexingMemoryPermit {
+    pub fn enter_sealing(&mut self) -> Result<MemoryAdmission, IndexError> {
+        self.credits
+            .clone()
+            .transfer(self, IndexingMemoryStage::SealScratch)
+    }
     /// Exact admission held by this permit. Consumers may subdivide it, but
     /// cannot grow it without returning to `IndexingMemoryCredits`.
     pub const fn bytes(&self) -> usize {
@@ -98,6 +204,14 @@ impl IndexingMemoryPermit {
             .expect("indexing memory credit lock poisoned");
         let stage_index = self.stage.index();
         let total_available = state.total_limit_bytes.saturating_sub(state.used_bytes);
+        let total_available =
+            if self.stage == IndexingMemoryStage::SealScratch {
+                total_available
+            } else {
+                total_available.saturating_sub(state.promised_progress_bytes.saturating_sub(
+                    state.stage_used_bytes[IndexingMemoryStage::SealScratch.index()],
+                ))
+            };
         let stage_available = state.stage_limit_bytes[stage_index]
             .saturating_sub(state.stage_used_bytes[stage_index]);
         let available_bytes = total_available.min(stage_available);
@@ -109,6 +223,23 @@ impl IndexingMemoryPermit {
         }
         state.used_bytes += additional;
         state.stage_used_bytes[stage_index] += additional;
+        let backend = state.backend.clone();
+        drop(state);
+        if let Some(backend) = backend {
+            if let Err(available) = backend.try_reserve_stage(self.stage, additional) {
+                let mut state = self
+                    .credits
+                    .inner
+                    .lock()
+                    .expect("indexing memory credit lock poisoned");
+                state.used_bytes -= additional;
+                state.stage_used_bytes[stage_index] -= additional;
+                return Err(MemoryAdmission::ReplayRequired {
+                    needed_bytes: additional,
+                    available_bytes: available.min(available_bytes),
+                });
+            }
+        }
         self.bytes = bytes;
         Ok(())
     }
@@ -129,7 +260,12 @@ impl IndexingMemoryPermit {
             .expect("indexing memory credit lock poisoned");
         state.used_bytes -= released;
         state.stage_used_bytes[self.stage.index()] -= released;
+        let backend = state.backend.clone();
+        drop(state);
         self.bytes = bytes;
+        if let Some(backend) = backend {
+            backend.release_stage(self.stage, released);
+        }
         Ok(())
     }
 }
@@ -143,6 +279,11 @@ impl Drop for IndexingMemoryPermit {
             .expect("indexing memory credit lock poisoned");
         state.used_bytes -= self.bytes;
         state.stage_used_bytes[self.stage.index()] -= self.bytes;
+        let backend = state.backend.clone();
+        drop(state);
+        if let Some(backend) = backend {
+            backend.release_stage(self.stage, self.bytes);
+        }
     }
 }
 
@@ -186,12 +327,28 @@ impl IndexingMemoryCredits {
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(IndexingMemoryCreditState {
+                backend: None,
                 total_limit_bytes,
                 stage_limit_bytes,
                 used_bytes: 0,
+                promised_progress_bytes: 0,
                 stage_used_bytes: [0; IndexingMemoryStage::COUNT],
             })),
         })
+    }
+
+    pub fn new_with_backend(
+        total_limit_bytes: usize,
+        limits: IndexingMemoryLimits,
+        backend: Arc<dyn IndexingMemoryBackend>,
+    ) -> Result<Self, IndexError> {
+        let credits = Self::new(total_limit_bytes, limits)?;
+        credits
+            .inner
+            .lock()
+            .expect("indexing memory credit lock poisoned")
+            .backend = Some(backend);
+        Ok(credits)
     }
 
     pub fn total_limit_bytes(&self) -> usize {
@@ -199,6 +356,18 @@ impl IndexingMemoryCredits {
             .lock()
             .expect("indexing memory credit lock poisoned")
             .total_limit_bytes
+    }
+
+    pub fn reserve_progress(
+        &self,
+        bytes: usize,
+    ) -> Result<IndexingProgressReservation, MemoryAdmission> {
+        let mut reservation = IndexingProgressReservation {
+            credits: self.clone(),
+            bytes: 0,
+        };
+        reservation.grow_to(bytes)?;
+        Ok(reservation)
     }
 
     pub fn used_bytes(&self) -> usize {
@@ -226,6 +395,14 @@ impl IndexingMemoryCredits {
             .expect("indexing memory credit lock poisoned");
         let stage_index = stage.index();
         let total_available = state.total_limit_bytes.saturating_sub(state.used_bytes);
+        let total_available =
+            if stage == IndexingMemoryStage::SealScratch {
+                total_available
+            } else {
+                total_available.saturating_sub(state.promised_progress_bytes.saturating_sub(
+                    state.stage_used_bytes[IndexingMemoryStage::SealScratch.index()],
+                ))
+            };
         let stage_available = state.stage_limit_bytes[stage_index]
             .saturating_sub(state.stage_used_bytes[stage_index]);
         let available_bytes = total_available.min(stage_available);
@@ -237,7 +414,22 @@ impl IndexingMemoryCredits {
         }
         state.used_bytes += bytes;
         state.stage_used_bytes[stage_index] += bytes;
+        let backend = state.backend.clone();
         drop(state);
+        if let Some(backend) = backend {
+            if let Err(available) = backend.try_reserve_stage(stage, bytes) {
+                let mut state = self
+                    .inner
+                    .lock()
+                    .expect("indexing memory credit lock poisoned");
+                state.used_bytes -= bytes;
+                state.stage_used_bytes[stage_index] -= bytes;
+                return Err(MemoryAdmission::ReplayRequired {
+                    needed_bytes: bytes,
+                    available_bytes: available.min(available_bytes),
+                });
+            }
+        }
         Ok(IndexingMemoryPermit {
             credits: self.clone(),
             stage,
@@ -245,8 +437,9 @@ impl IndexingMemoryCredits {
         })
     }
 
-    /// Move retained bytes between stages without transiently double-charging
-    /// the shared total. The source remains fully charged on failure.
+    /// Move retained bytes without double-charging the global backend. Local
+    /// capacity is conservatively reserved in both stages during the unlocked
+    /// callback; the source remains fully charged on failure.
     pub fn transfer(
         &self,
         permit: &mut IndexingMemoryPermit,
@@ -256,6 +449,9 @@ impl IndexingMemoryCredits {
             return Err(IndexError::InvalidDefinition(
                 "indexing memory permit belongs to another pool".into(),
             ));
+        }
+        if destination == permit.stage {
+            return Ok(MemoryAdmission::Admitted);
         }
         let mut state = self
             .inner
@@ -271,8 +467,45 @@ impl IndexingMemoryCredits {
                 available_bytes: available,
             });
         }
-        state.stage_used_bytes[source_index] -= permit.bytes;
+        if permit.stage == IndexingMemoryStage::SealScratch && destination != permit.stage {
+            let future_sealing = state.stage_used_bytes[source_index].saturating_sub(permit.bytes);
+            let future_unused = state.promised_progress_bytes.saturating_sub(future_sealing);
+            let remaining = state.total_limit_bytes.saturating_sub(state.used_bytes);
+            if future_unused > remaining {
+                return Ok(MemoryAdmission::ReplayRequired {
+                    needed_bytes: future_unused,
+                    available_bytes: remaining,
+                });
+            }
+        }
+        // Keep the source charge until the backend confirms transfer, while
+        // reserving destination capacity against concurrent admissions.
         state.stage_used_bytes[destination_index] += permit.bytes;
+        state.used_bytes += permit.bytes;
+        let backend = state.backend.clone();
+        drop(state);
+        if let Some(backend) = backend {
+            if let Err(available_bytes) =
+                backend.transfer_stage(permit.stage, destination, permit.bytes)
+            {
+                let mut state = self
+                    .inner
+                    .lock()
+                    .expect("indexing memory credit lock poisoned");
+                state.stage_used_bytes[destination_index] -= permit.bytes;
+                state.used_bytes -= permit.bytes;
+                return Ok(MemoryAdmission::ReplayRequired {
+                    needed_bytes: permit.bytes,
+                    available_bytes,
+                });
+            }
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .expect("indexing memory credit lock poisoned");
+        state.stage_used_bytes[source_index] -= permit.bytes;
+        state.used_bytes -= permit.bytes;
         permit.stage = destination;
         Ok(MemoryAdmission::Admitted)
     }
@@ -614,7 +847,6 @@ impl PartitionProjectionAccumulator {
     pub fn apply_batch(
         &mut self,
         charged: ChargedPreparedProjectionBatch,
-        mut previous_by_path: BTreeMap<String, Vec<ProjectedDocumentState>>,
     ) -> Result<ProjectionBatchAdmission, IndexError> {
         let batch = charged.batch;
         if batch.first_offset != self.next_offset {
@@ -626,7 +858,19 @@ impl PartitionProjectionAccumulator {
         let next_offset = batch.next_offset;
         let rows = batch.into_coalesced_rows();
         let coalesced_rows = rows.len();
-        let scratch_bytes = self.buffer_limit_bytes;
+        let scratch_bytes = rows
+            .iter()
+            .try_fold(0usize, |bytes, row| {
+                bytes
+                    .checked_add(
+                        ProjectionMutationBuffer::source_replacement_admission_bytes(
+                            &row.source_path,
+                            &row.projected_states,
+                        )?,
+                    )
+                    .ok_or(IndexError::OffsetOverflow)
+            })?
+            .max(Self::EMPTY_BUFFER_ADMISSION_BYTES);
         let _scratch = match self
             .credits
             .acquire(IndexingMemoryStage::SealScratch, scratch_bytes)
@@ -646,15 +890,11 @@ impl PartitionProjectionAccumulator {
         };
         let mut overlay = ProjectionMutationBuffer::new(self.buffer_limit_bytes)?;
         let applied = rows.into_iter().try_for_each(|row| {
-            let previous = previous_by_path
-                .remove(&row.source_path)
-                .unwrap_or_default();
             overlay.apply_source_states_in_place(
                 self.source_scope,
                 &row.source_path,
                 row.source_version,
                 row.projected_states,
-                previous,
             )
         });
         match applied {
@@ -772,6 +1012,102 @@ mod tests {
         CanonicalRecipeState, ComponentIdentity, DocumentHead, QueryBlockCredits, RecipeIdentity,
         decode_component_delta_segment, decode_document_head,
     };
+
+    #[derive(Debug)]
+    struct TestMemoryBackend {
+        used: Mutex<usize>,
+        limit: usize,
+    }
+
+    impl IndexingMemoryBackend for TestMemoryBackend {
+        fn try_reserve(&self, bytes: usize) -> Result<(), usize> {
+            let mut used = self.used.lock().unwrap();
+            let available = self.limit.saturating_sub(*used);
+            if bytes > available {
+                return Err(available);
+            }
+            *used += bytes;
+            Ok(())
+        }
+        fn release(&self, bytes: usize) {
+            let mut used = self.used.lock().unwrap();
+            *used = used.checked_sub(bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn backend_callbacks_can_reenter_the_credit_pool() {
+        #[derive(Debug)]
+        struct ReentrantBackend(IndexingMemoryCredits);
+        impl IndexingMemoryBackend for ReentrantBackend {
+            fn try_reserve(&self, _: usize) -> Result<(), usize> {
+                let _ = self.0.used_bytes();
+                Ok(())
+            }
+            fn release(&self, _: usize) {
+                let _ = self.0.used_bytes();
+            }
+            fn transfer_stage(
+                &self,
+                _: IndexingMemoryStage,
+                _: IndexingMemoryStage,
+                _: usize,
+            ) -> Result<(), usize> {
+                let _ = self.0.used_bytes();
+                Ok(())
+            }
+            fn try_reserve_progress(&self, _: usize) -> Result<(), usize> {
+                let _ = self.0.used_bytes();
+                Ok(())
+            }
+            fn release_progress(&self, _: usize) {
+                let _ = self.0.used_bytes();
+            }
+        }
+        let pool = credits(200);
+        pool.inner.lock().unwrap().backend = Some(Arc::new(ReentrantBackend(pool.clone())));
+        let mut promise = pool.reserve_progress(30).unwrap();
+        promise.grow_to(40).unwrap();
+        let mut permit = pool.acquire(IndexingMemoryStage::ReplayInput, 20).unwrap();
+        permit.grow_to(30).unwrap();
+        assert_eq!(
+            pool.transfer(&mut permit, IndexingMemoryStage::PreparedRows)
+                .unwrap(),
+            MemoryAdmission::Admitted
+        );
+        permit.shrink_to(10).unwrap();
+        drop(permit);
+        drop(promise);
+        assert_eq!(pool.used_bytes(), 0);
+        // Remove the test-only backend's strong reference to its own pool.
+        pool.inner.lock().unwrap().backend = None;
+    }
+
+    #[test]
+    fn backend_charges_exact_acquire_growth_shrink_and_drop_without_transfer_charge() {
+        let backend = Arc::new(TestMemoryBackend {
+            used: Mutex::new(0),
+            limit: 100,
+        });
+        let pool = credits(200);
+        pool.inner.lock().unwrap().backend = Some(backend.clone());
+        let mut permit = pool.acquire(IndexingMemoryStage::ReplayInput, 40).unwrap();
+        assert_eq!(*backend.used.lock().unwrap(), 40);
+        permit.grow_to(70).unwrap();
+        assert_eq!(*backend.used.lock().unwrap(), 70);
+        assert!(permit.grow_to(101).is_err());
+        assert_eq!(permit.bytes(), 70);
+        assert_eq!(pool.used_bytes(), 70);
+        assert_eq!(*backend.used.lock().unwrap(), 70);
+        pool.transfer(&mut permit, IndexingMemoryStage::PreparedRows)
+            .unwrap();
+        assert_eq!(*backend.used.lock().unwrap(), 70);
+        permit.shrink_to(30).unwrap();
+        assert_eq!(*backend.used.lock().unwrap(), 30);
+        drop(permit);
+        assert_eq!(*backend.used.lock().unwrap(), 0);
+        assert_eq!(pool.used_bytes(), 0);
+    }
 
     fn state(path: &str, version: u64, value: &[u8]) -> ProjectedDocumentState {
         let scope = [9; 32];
@@ -936,9 +1272,7 @@ mod tests {
         let batch =
             PreparedProjectionBatch::new([9; 32], 0, 1, vec![row(0, "objects/a", 1, b"value")])
                 .unwrap();
-        accumulator
-            .apply_batch(charged(&memory, batch), BTreeMap::new())
-            .unwrap();
+        accumulator.apply_batch(charged(&memory, batch)).unwrap();
         assert!(accumulator.buffered_bytes() > 1);
         assert_eq!(
             memory.stage_used_bytes(IndexingMemoryStage::ProjectionAccumulator),
@@ -977,9 +1311,7 @@ mod tests {
                 .unwrap();
 
         assert!(matches!(
-            accumulator
-                .apply_batch(charged(&memory, batch), BTreeMap::new())
-                .unwrap(),
+            accumulator.apply_batch(charged(&memory, batch)).unwrap(),
             ProjectionBatchAdmission::ReplayRequired { from_offset: 7, .. }
         ));
         assert_eq!(accumulator.next_offset(), 7);
@@ -1111,11 +1443,7 @@ mod tests {
         let gap =
             PreparedProjectionBatch::new([9; 32], 11, 12, vec![row(11, "objects/a", 1, b"a")])
                 .unwrap();
-        assert!(
-            accumulator
-                .apply_batch(charged(&memory, gap), BTreeMap::new())
-                .is_err()
-        );
+        assert!(accumulator.apply_batch(charged(&memory, gap)).is_err());
         assert_eq!(accumulator.next_offset(), 10);
 
         let contiguous = PreparedProjectionBatch::new(
@@ -1126,7 +1454,7 @@ mod tests {
         )
         .unwrap();
         accumulator
-            .apply_batch(charged(&memory, contiguous), BTreeMap::new())
+            .apply_batch(charged(&memory, contiguous))
             .unwrap();
         let sealed = accumulator.seal_and_reset().unwrap();
         assert_eq!(sealed.projection.checkpoint.next_offset, 14);
@@ -1145,9 +1473,7 @@ mod tests {
         .unwrap();
         let batch = PreparedProjectionBatch::new([9; 32], 20, 36, Vec::new()).unwrap();
         assert!(matches!(
-            accumulator
-                .apply_batch(charged(&memory, batch), BTreeMap::new())
-                .unwrap(),
+            accumulator.apply_batch(charged(&memory, batch)).unwrap(),
             ProjectionBatchAdmission::Applied {
                 source_rows: 0,
                 coalesced_rows: 0,
@@ -1190,9 +1516,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            accumulator
-                .apply_batch(charged(&memory, batch), BTreeMap::new())
-                .unwrap(),
+            accumulator.apply_batch(charged(&memory, batch)).unwrap(),
             ProjectionBatchAdmission::Applied {
                 source_rows: 3,
                 coalesced_rows: 1,
@@ -1217,8 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_preserving_batch_writes_only_the_compact_head_delta() {
-        let previous = state("objects/a", 7, b"stable");
+    fn replacement_batch_writes_complete_document_and_locator() {
         let memory = credits(256 * 1024);
         let mut accumulator =
             PartitionProjectionAccumulator::new([9; 32], partition(), 0, 64 * 1024, memory.clone())
@@ -1226,12 +1549,7 @@ mod tests {
         let batch =
             PreparedProjectionBatch::new([9; 32], 0, 1, vec![row(0, "objects/a", 8, b"stable")])
                 .unwrap();
-        accumulator
-            .apply_batch(
-                charged(&memory, batch),
-                BTreeMap::from([("objects/a".into(), vec![previous])]),
-            )
-            .unwrap();
+        accumulator.apply_batch(charged(&memory, batch)).unwrap();
         let sealed = accumulator.seal_and_reset().unwrap();
         let sealed = sealed.projection;
         assert_eq!(
@@ -1240,7 +1558,12 @@ mod tests {
                 .iter()
                 .map(|delta| delta.component)
                 .collect::<Vec<_>>(),
-            vec![ComponentIdentity::DocumentHead]
+            vec![
+                ComponentIdentity::DocumentHead,
+                ComponentIdentity::SourceRecords,
+                ComponentIdentity::Membership(RecipeIdentity::new([1; 32]).unwrap()),
+                ComponentIdentity::Field(RecipeIdentity::new([2; 32]).unwrap())
+            ]
         );
         let head = &sealed.deltas[0];
         let decoded = decode_component_delta_segment(&head.bytes).unwrap();
@@ -1251,7 +1574,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(head.source_version, 8);
-        assert_eq!(head.material_source_version, 7);
+        assert_eq!(head.material_source_version, 8);
     }
 
     #[test]
@@ -1270,9 +1593,7 @@ mod tests {
             .collect();
         let batch = PreparedProjectionBatch::new([9; 32], 0, 64, rows).unwrap();
         assert_eq!(accumulator.buffer.clone_count(), 0);
-        accumulator
-            .apply_batch(charged(&memory, batch), BTreeMap::new())
-            .unwrap();
+        accumulator.apply_batch(charged(&memory, batch)).unwrap();
         assert_eq!(accumulator.buffer.clone_count(), 0);
     }
 
@@ -1285,9 +1606,7 @@ mod tests {
         let batch =
             PreparedProjectionBatch::new([9; 32], 0, 1, vec![row(0, "objects/a", 1, b"value")])
                 .unwrap();
-        accumulator
-            .apply_batch(charged(&memory, batch), BTreeMap::new())
-            .unwrap();
+        accumulator.apply_batch(charged(&memory, batch)).unwrap();
         let accumulator_charge = memory.used_bytes();
         let sealed = accumulator.seal_and_reset().unwrap();
         assert_eq!(sealed.projection.checkpoint.next_offset, 1);
@@ -1296,9 +1615,7 @@ mod tests {
         assert_eq!(memory.used_bytes(), 1);
 
         let empty = PreparedProjectionBatch::new([9; 32], 1, 5, Vec::new()).unwrap();
-        accumulator
-            .apply_batch(charged(&memory, empty), BTreeMap::new())
-            .unwrap();
+        accumulator.apply_batch(charged(&memory, empty)).unwrap();
         assert_eq!(
             accumulator
                 .seal_and_reset()

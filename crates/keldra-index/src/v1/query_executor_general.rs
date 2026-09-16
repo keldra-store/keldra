@@ -273,22 +273,21 @@ async fn scan_manifest<L: QueryArtifactLoader + 'static, X: QueryPartitionExecut
             budget,
         )
         .await?
+        .into_document_keys(credits, budget)?
     } else {
-        match_all_live_documents(&gates)
+        budget.reserve_heap(credits, document_key_set_bytes(gates.len())?)?;
+        let keys = match_all_live_documents(&gates);
+        budget.release_heap(
+            credits,
+            document_key_set_bytes(gates.len())?
+                .checked_sub(document_key_set_bytes(keys.len())?)
+                .ok_or(IndexError::Integrity)?,
+        )?;
+        keys
     };
-    let key_bytes = request
-        .predicate
-        .as_ref()
-        .map(|_| {
-            keys.len()
-                .checked_mul(std::mem::size_of::<StableDocumentKey>())
-                .ok_or(IndexError::OffsetOverflow)
-        })
-        .transpose()?;
+    let key_bytes = document_key_set_bytes(keys.len())?;
     if let Some(resume) = request.resume_after_document {
-        let mut resumed = keys.split_off(&resume);
-        resumed.remove(&resume);
-        keys = resumed;
+        keys.retain(|key| *key > resume);
     }
     if !needs_universe {
         let aligned = load_latest_gates_for_keys(
@@ -332,9 +331,8 @@ async fn scan_manifest<L: QueryArtifactLoader + 'static, X: QueryPartitionExecut
         })?;
         budget.release_heap(credits, remaining)?;
     }
-    if let Some(bytes) = key_bytes {
-        budget.release_heap(credits, bytes)?;
-    }
+    drop(gates);
+    budget.release_heap(credits, key_bytes)?;
     Ok(())
 }
 

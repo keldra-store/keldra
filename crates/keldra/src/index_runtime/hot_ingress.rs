@@ -132,6 +132,7 @@ impl HotSlot {
 
 #[derive(Default)]
 struct HotState {
+    shared_permit: Option<Mutex<keldra_index::v1::IndexingMemoryPermit>>,
     /// At most one committed version is retained for one logical object path.
     /// The source journal remains authoritative for both ordering and bytes.
     slots: BTreeMap<HotPathKey, HotSlot>,
@@ -365,6 +366,22 @@ impl Drop for RegisteredHotProjection {
 }
 
 impl HotProjectionIngress {
+    pub(crate) fn with_credits(
+        credits: keldra_index::v1::IndexingMemoryCredits,
+        maximum_bytes: u64,
+    ) -> Result<Self, &'static str> {
+        let ingress = Self::new(maximum_bytes)?;
+        let permit = credits
+            .acquire(keldra_index::v1::IndexingMemoryStage::HotPayload, 0)
+            .map_err(|_| "TypedJson hot ingress shared memory is unavailable")?;
+        ingress
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shared_permit = Some(Mutex::new(permit));
+        Ok(ingress)
+    }
+
     pub(crate) fn new(maximum_bytes: u64) -> Result<Self, &'static str> {
         let maximum_bytes = usize::try_from(maximum_bytes)
             .map_err(|_| "TypedJson hot-ingress memory exceeds this platform")?;
@@ -405,7 +422,7 @@ impl HotProjectionIngress {
             // replacement; in-flight work remains charged by its reservation
             // and its token can no longer publish a stale completion.
             let wake_waiters = clear_incompatible_slots(&mut state, snapshot.identity);
-            if total_bytes(&state).saturating_add(estimated) > self.maximum_bytes {
+            if !reserve_hot(&state, estimated, self.maximum_bytes) {
                 disable_routes(&mut state);
                 emit_hot_resident(&state, self.maximum_bytes);
                 (false, wake_waiters)
@@ -482,7 +499,7 @@ impl HotProjectionIngress {
         disable_routes(&mut state);
         reclaim_retired_selectors(&mut state);
         let additional_charge = compiled_charge.saturating_sub(estimated);
-        if total_bytes(&state).saturating_add(additional_charge) > self.maximum_bytes {
+        if !reserve_hot(&state, additional_charge, self.maximum_bytes) {
             // Destroy the rejected tree while its construction reservation is
             // still held, then return that credit without exposing an
             // unaccounted resident tree to another admission.
@@ -581,7 +598,7 @@ impl HotProjectionIngress {
                 .checked_add(bytes.len())?
                 .checked_add(projection_plan.selection_floor_bytes())?;
             let projection_workspace =
-                projection_limit.checked_add(projection_plan.scratch_resident_bytes())?;
+                projection_plan.source_parser_admission_bytes(bytes.len(), projection_limit);
             let charge =
                 projected_pending_charge(key.path().len(), bytes.len(), projection_workspace)?;
             Some((projection_limit, charge))
@@ -680,9 +697,7 @@ impl HotProjectionIngress {
                 return None;
             }
             evict_retained_until_fits(&mut state, charge, self.maximum_bytes);
-            if charge > self.maximum_bytes
-                || total_bytes(&state).saturating_add(charge) > self.maximum_bytes
-            {
+            if !reserve_hot(&state, charge, self.maximum_bytes) {
                 // This callback will have no token and therefore can never
                 // publish. Cancel existing state now so it cannot outlive a
                 // successful untracked mutation of this path.
@@ -1162,7 +1177,7 @@ impl HotProjectionIngress {
         registered.cleanup_armed = false;
         let additional_charge = charge.saturating_sub(registered.pending.charge);
         evict_retained_until_fits(&mut state, additional_charge, self.maximum_bytes);
-        if total_bytes(&state).saturating_add(additional_charge) > self.maximum_bytes {
+        if !reserve_hot(&state, additional_charge, self.maximum_bytes) {
             drop(selected);
             release_pending_reservation(&mut state, &mut registered.pending);
             if !insert_replay_only(
@@ -1458,6 +1473,13 @@ impl HotProjectionIngress {
             selector_charge,
             projection_plan.descriptor_resident_bytes(),
         );
+        if let Some(permit) = &state.shared_permit {
+            permit
+                .lock()
+                .unwrap()
+                .grow_to(total_bytes(&state).saturating_add(charge))
+                .unwrap();
+        }
         state.router_bytes = state.router_bytes.saturating_add(charge);
         state.compiled_routes.insert(
             (tenant_id, bucket_id),
@@ -1634,7 +1656,7 @@ fn insert_replay_only(
         return false;
     }
     evict_retained_until_fits(state, charge, maximum_bytes);
-    if total_bytes(state).saturating_add(charge) > maximum_bytes {
+    if !reserve_hot(state, charge, maximum_bytes) {
         return false;
     }
     remove_slot(state, &key);
@@ -1858,6 +1880,19 @@ fn disable_routes(state: &mut HotState) {
 }
 
 fn emit_hot_resident(state: &HotState, maximum_bytes: usize) {
+    if let Some(permit) = &state.shared_permit {
+        let mut permit = permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total = total_bytes(state);
+        debug_assert!(
+            total <= permit.bytes(),
+            "hot memory was allocated without shared admission"
+        );
+        if total <= permit.bytes() {
+            let _ = permit.shrink_to(total);
+        }
+    }
     super::v1_telemetry::V1PipelineTelemetry::set(
         &super::v1_telemetry::global().stage_resident_bytes,
         total_bytes(state) as u64,
@@ -1866,6 +1901,29 @@ fn emit_hot_resident(state: &HotState, maximum_bytes: usize) {
         &super::v1_telemetry::global().stage_limit_bytes,
         maximum_bytes as u64,
     );
+}
+
+fn reserve_hot(state: &HotState, additional: usize, maximum_bytes: usize) -> bool {
+    let Some(total) = total_bytes(state).checked_add(additional) else {
+        return false;
+    };
+    if total > maximum_bytes {
+        return false;
+    }
+    if let Some(permit) = &state.shared_permit {
+        let mut permit = permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Reuse released admission before growing; queued readers and in-flight
+        // parser reservations remain included in total_bytes.
+        let current = total_bytes(state);
+        if current < permit.bytes() {
+            let _ = permit.shrink_to(current);
+        }
+        permit.grow_to(total).is_ok()
+    } else {
+        true
+    }
 }
 
 fn emit_rejected(reason: &'static str, payload_bytes: u64) {

@@ -2,7 +2,7 @@ use super::*;
 use crate::typed_json::{Collation, FieldId, FieldType};
 use crate::v1::{
     ArtifactPackReference, IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage,
-    QueryMemoryPermit,
+    QueryMemoryPermit, encode_doc_value,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -90,11 +90,15 @@ fn records() -> Vec<QueryBlockRecord> {
 fn key(byte: u8) -> StableDocumentKey {
     StableDocumentKey::from_bytes([byte; 32]).unwrap()
 }
+fn document(byte: u8) -> StableDocumentKey {
+    key(byte)
+}
 
 fn record_ref(record: &QueryBlockRecord) -> QueryBlockRecordRef<'_> {
     QueryBlockRecordRef {
         key: &record.key,
         value: &record.value,
+        document: None,
     }
 }
 
@@ -115,7 +119,190 @@ fn bound(encoded: &EncodedQueryBlock) -> QueryBlockDescriptor {
             checksum: encoded.descriptor.hash,
         },
         pack_table: test_pack_table(encoded.descriptor.encoded_bytes),
+        documents: encoded.descriptor.documents.clone(),
     }
+}
+
+#[test]
+fn dense_segment_postings_share_identity_table_and_advance_with_liveness() {
+    let documents = Arc::new(
+        SegmentDocumentTable::new_with_versions(
+            [document(1), document(2), document(3)]
+                .into_iter()
+                .map(|document| (document, 7)),
+        )
+        .unwrap(),
+    );
+    let records = [1, 2, 3]
+        .into_iter()
+        .map(|id| {
+            encode_posting(QueryPosting {
+                document: document(id),
+                material_source_version: 7,
+                live: true,
+                position_block_hash: None,
+                positions: 0,
+            })
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let limits = QueryBlockLimits::default_for_memory();
+    let mut credits = credits(1024 * 1024);
+    let encoded = encode_query_block_with_documents(
+        QueryBlockKind::Posting,
+        recipe(),
+        &records,
+        documents.clone(),
+        limits,
+        &mut credits,
+    )
+    .unwrap();
+    // Stable identities exist once in the owning run, never in these postings.
+    assert!(
+        !encoded
+            .bytes
+            .windows(32)
+            .any(|window| window == document(2).bytes())
+    );
+    let descriptor = bound(&encoded);
+    let reader = SegmentReader::from_verified_content(
+        &descriptor,
+        Bytes::from(encoded.bytes),
+        limits,
+        &mut credits,
+    )
+    .unwrap();
+    let mask = reader
+        .live_documents_for_candidates(
+            [
+                SegmentDocumentId(0),
+                SegmentDocumentId(1),
+                SegmentDocumentId(2),
+            ],
+            |key, version| version == 7 && key != document(2),
+        )
+        .unwrap();
+    let mut cursor = reader
+        .posting_cursor()
+        .unwrap()
+        .with_live_documents(&mask)
+        .unwrap();
+    assert_eq!(
+        cursor.next().unwrap().unwrap().document,
+        SegmentDocumentId(0)
+    );
+    assert_eq!(
+        cursor
+            .advance(SegmentDocumentId(1))
+            .unwrap()
+            .unwrap()
+            .document,
+        SegmentDocumentId(2)
+    );
+    assert!(cursor.next().unwrap().is_none());
+    let wrong = Arc::new(SegmentDocumentTable::new([document(9)]).unwrap());
+    assert!(
+        reader
+            .posting_cursor()
+            .unwrap()
+            .with_live_documents(&SegmentLiveDocuments::all_live(wrong))
+            .is_err()
+    );
+}
+
+#[test]
+fn compact_point_keys_round_trip_and_keep_cross_segment_object_identity() {
+    let limits = QueryBlockLimits::default_for_memory();
+    let mut credits = credits(1024 * 1024);
+    let original = encode_point(&QueryPoint {
+        value: ScalarValue::Signed(42),
+        document: document(2),
+        material_source_version: 8,
+        live: true,
+    })
+    .unwrap();
+    let encoded = encode_query_block(
+        QueryBlockKind::Point,
+        recipe(),
+        &[original.clone()],
+        limits,
+        &mut credits,
+    )
+    .unwrap();
+    let descriptor = bound(&encoded);
+    let mut cursor =
+        QueryBlockCursor::new(&descriptor, &encoded.bytes, limits, &mut credits).unwrap();
+    let compact = cursor.next().unwrap().unwrap();
+    assert_eq!(compact.canonical_key(), original.key);
+    assert_eq!(decode_point(compact).unwrap().document, document(2));
+    let mut wrong = descriptor.clone();
+    wrong.documents = Arc::new(SegmentDocumentTable::new([document(3)]).unwrap());
+    assert!(QueryBlockCursor::new(&wrong, &encoded.bytes, limits, &mut credits).is_err());
+}
+
+#[test]
+fn segment_identity_binds_material_version_and_columns_decode_selected_rows() {
+    let first = SegmentDocumentTable::new_with_versions([(key(1), 3)]).unwrap();
+    let second = SegmentDocumentTable::new_with_versions([(key(1), 4)]).unwrap();
+    assert_ne!(first.identity(), second.identity());
+    assert!(SegmentDocumentTable::new_with_versions([(key(1), 3), (key(1), 4)]).is_err());
+    let records = [
+        encode_doc_value(
+            &QueryDocValue {
+                document: key(1),
+                material_source_version: 3,
+                value: Some(vec![ScalarValue::Signed(10)]),
+            },
+            QueryBlockLimits::default_for_memory(),
+        )
+        .unwrap(),
+        encode_doc_value(
+            &QueryDocValue {
+                document: key(2),
+                material_source_version: 3,
+                value: Some(vec![ScalarValue::Signed(20)]),
+            },
+            QueryBlockLimits::default_for_memory(),
+        )
+        .unwrap(),
+    ];
+    let mut memory = credits(1024 * 1024);
+    let limits = QueryBlockLimits::default_for_memory();
+    let encoded = encode_query_block(
+        QueryBlockKind::DocValue,
+        recipe(),
+        &records,
+        limits,
+        &mut memory,
+    )
+    .unwrap();
+    let descriptor = bound(&encoded);
+    let reader = SegmentReader::from_verified_content(
+        &descriptor,
+        Bytes::from(encoded.bytes),
+        limits,
+        &mut memory,
+    )
+    .unwrap();
+    assert_eq!(
+        reader
+            .doc_value(SegmentDocumentId(1), limits)
+            .unwrap()
+            .unwrap()
+            .value,
+        Some(vec![ScalarValue::Signed(20)])
+    );
+    assert!(
+        reader
+            .doc_value(SegmentDocumentId(2), limits)
+            .unwrap()
+            .is_none()
+    );
+    let mask = reader
+        .live_documents_for_candidates([SegmentDocumentId(1)], |_, version| version == 3)
+        .unwrap();
+    assert!(!mask.is_live(SegmentDocumentId(0)));
+    assert!(mask.is_live(SegmentDocumentId(1)));
 }
 
 #[test]
@@ -433,7 +620,7 @@ fn credit_refusal_happens_before_output_allocation() {
     let mut credits = credits(1);
     assert!(matches!(
         encode_query_block(
-            QueryBlockKind::Posting,
+            QueryBlockKind::TermDictionary,
             recipe(),
             &records(),
             limits,
@@ -470,7 +657,7 @@ fn multi_numeric_facet_and_aggregate_preserve_all_values_and_tombstone() {
     .unwrap();
     let mut memory = credits(4096);
     let created =
-        prepare_typed_json_field_delta(&field, key(7), 1, None, Some(&state), &mut memory).unwrap();
+        prepare_typed_json_field_delta(&field, key(7), 1, Some(&state), &mut memory).unwrap();
     assert_eq!(
         created.doc_value.unwrap().value,
         Some(vec![
@@ -480,8 +667,7 @@ fn multi_numeric_facet_and_aggregate_preserve_all_values_and_tombstone() {
         ])
     );
     let mut memory = credits(4096);
-    let deleted =
-        prepare_typed_json_field_delta(&field, key(7), 2, Some(&state), None, &mut memory).unwrap();
+    let deleted = prepare_typed_json_field_delta(&field, key(7), 2, None, &mut memory).unwrap();
     assert_eq!(deleted.doc_value.unwrap().value, None);
 }
 
@@ -523,7 +709,7 @@ fn descriptor_is_exact_family_partition_catalog_and_cut_binding() {
     let limits = QueryBlockLimits::default_for_memory();
     let mut credits = credits(DEFAULT_QUERY_BLOCK_BYTES);
     let block = encode_query_block(
-        QueryBlockKind::Point,
+        QueryBlockKind::TermDictionary,
         recipe(),
         &records(),
         limits,
@@ -540,6 +726,7 @@ fn descriptor_is_exact_family_partition_catalog_and_cut_binding() {
         next_offset: 10,
         through_atomic_position: 11,
         pack_table: pack_table.clone(),
+        memory_lease: SegmentMemoryLease::default(),
         blocks: vec![QueryBlockDescriptor {
             kind: logical.kind,
             recipe: logical.recipe,
@@ -556,6 +743,7 @@ fn descriptor_is_exact_family_partition_catalog_and_cut_binding() {
                 checksum: logical.hash,
             },
             pack_table,
+            documents: logical.documents,
         }],
     };
     let encoded = encode_projection_query_run(&descriptor, limits, &mut credits).unwrap();
@@ -616,7 +804,7 @@ fn run_block_count_is_bounded_by_descriptor_bytes_not_query_concurrency() {
             let mut hash = [0_u8; 32];
             hash[24..].copy_from_slice(&ordinal.saturating_add(1).to_be_bytes());
             QueryBlockDescriptor {
-                kind: QueryBlockKind::Point,
+                kind: QueryBlockKind::TermDictionary,
                 recipe: recipe(),
                 minimum_key: key.clone(),
                 maximum_key: key,
@@ -631,6 +819,7 @@ fn run_block_count_is_bounded_by_descriptor_bytes_not_query_concurrency() {
                     checksum: hash,
                 },
                 pack_table: pack_table.clone(),
+                documents: Arc::new(SegmentDocumentTable::default()),
             }
         })
         .collect();
@@ -643,6 +832,7 @@ fn run_block_count_is_bounded_by_descriptor_bytes_not_query_concurrency() {
         through_atomic_position: 11,
         pack_table,
         blocks,
+        memory_lease: SegmentMemoryLease::default(),
     };
     let mut encode_credits = credits(2 * 1024 * 1024);
     let encoded = encode_projection_query_run(&descriptor, limits, &mut encode_credits)
@@ -673,6 +863,7 @@ fn self_built_run_identity_failure_names_the_exact_invariant() {
         through_atomic_position: 11,
         pack_table: Arc::new(ArtifactPackTable::new(Vec::new()).unwrap()),
         blocks: Vec::new(),
+        memory_lease: SegmentMemoryLease::default(),
     };
     let error = descriptor
         .validate(QueryBlockLimits::default_for_memory())

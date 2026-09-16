@@ -69,6 +69,7 @@ const MIN_QUERY_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
 // This is a logical-work limit, not a conversion of the memory lease.
 const MAX_QUERY_CANDIDATES: usize = 1_000_000;
 const MAX_PREDECESSOR_GENERATION_LOADS: usize = 4_096;
+#[cfg(test)]
 const QUERY_SNAPSHOT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 impl QueryMemoryPermit for IndexQueryMemoryPermit {
@@ -95,13 +96,15 @@ impl V1LocalIndexQueryExecutor {
         memory: IndexQueryMemoryBudget,
         query_scheduler: IndexQueryScheduler,
     ) -> Self {
+        let snapshots =
+            V1QuerySnapshotCache::with_artifact_cache(projections.immutable_cache().clone());
         Self {
             decisions,
             catalog,
             projections,
             memory,
             query_scheduler,
-            snapshots: V1QuerySnapshotCache::default(),
+            snapshots,
         }
     }
 
@@ -281,6 +284,7 @@ impl V1LocalIndexQueryExecutor {
                 request.tenant_id,
                 request.bucket_id,
                 self.query_scheduler.clone(),
+                request.deadline,
             );
             let mut admission = RuntimeCandidateAdmission {
                 visibility: request.candidate_visibility.clone(),
@@ -644,6 +648,7 @@ impl V1LocalIndexQueryExecutor {
             exact.into_iter().unzip();
         let identity = query_snapshot_identity(common_cut, &roots).map_err(index_status)?;
         Ok(PinnedRootVector {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             identity,
             cut: common_cut,
             roots,
@@ -894,14 +899,28 @@ impl LocalIndexQueryExecutor for V1LocalIndexQueryExecutor {
     }
 }
 
-#[derive(Clone)]
 struct PinnedRootVector {
+    memory_lease: keldra_index::v1::SegmentMemoryLease,
     identity: QuerySnapshotIdentity,
     cut: QueryCommonCut,
     roots: Vec<PinnedPartitionQueryRoot>,
     generation_hashes: Vec<[u8; 32]>,
     directory: ProjectionFamilyPartitionDirectory,
     directory_version: keldra_store::VersionId,
+}
+
+impl Clone for PinnedRootVector {
+    fn clone(&self) -> Self {
+        Self {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
+            identity: self.identity,
+            cut: self.cut,
+            roots: self.roots.clone(),
+            generation_hashes: self.generation_hashes.clone(),
+            directory: self.directory.clone(),
+            directory_version: self.directory_version,
+        }
+    }
 }
 
 impl PinnedRootVector {
@@ -1274,6 +1293,8 @@ fn index_status(error: IndexError) -> Status {
             Status::resource_exhausted(error.to_string())
         }
         IndexError::Io(message) => Status::unavailable(message),
+        IndexError::AdmissionDenied(message) => Status::resource_exhausted(message),
+        IndexError::DeadlineExceeded => Status::deadline_exceeded(error.to_string()),
         _ => Status::data_loss(error.to_string()),
     }
 }
@@ -1470,6 +1491,7 @@ mod tests {
         let successor = root(partition(6, 7), 12);
         assert_eq!(predecessor.handoff_lineage_id, successor.handoff_lineage_id);
         let pinned = PinnedRootVector {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             identity: QuerySnapshotIdentity::from_bytes([9; 32]).unwrap(),
             cut: QueryCommonCut {
                 through_atomic_position: 9,
@@ -1501,6 +1523,7 @@ mod tests {
         let values = vec![authorized(1, "a"), authorized(2, "b"), authorized(3, "c")];
         let snapshot = QuerySnapshotIdentity::from_bytes([9; 32]).unwrap();
         let pinned = PinnedRootVector {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             identity: snapshot,
             cut: QueryCommonCut {
                 through_atomic_position: 9,
@@ -1540,6 +1563,7 @@ mod tests {
         genesis_root.root.through_atomic_position = 0;
         genesis_root.cut_proof.common_cut.through_atomic_position = 0;
         let pinned = PinnedRootVector {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             identity: snapshot,
             cut: QueryCommonCut {
                 through_atomic_position: 0,
@@ -1588,6 +1612,7 @@ mod tests {
         first.cut_proof.next_newer_through_atomic_position = Some(10);
         let second = root(partition(6, 7), 12);
         let pinned = PinnedRootVector {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             identity: snapshot,
             cut: QueryCommonCut {
                 through_atomic_position: 9,
@@ -1633,6 +1658,7 @@ mod tests {
     #[test]
     fn snapshot_reuse_rejects_a_different_generation_with_the_same_query_root() {
         let pinned = PinnedRootVector {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             identity: QuerySnapshotIdentity::from_bytes([9; 32]).unwrap(),
             cut: QueryCommonCut {
                 through_atomic_position: 9,
@@ -1663,6 +1689,7 @@ mod tests {
     fn query_position_rejects_truncation_and_trailing_bytes() {
         let snapshot = QuerySnapshotIdentity::from_bytes([9; 32]).unwrap();
         let pinned = PinnedRootVector {
+            memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             identity: snapshot,
             cut: QueryCommonCut {
                 through_atomic_position: 9,

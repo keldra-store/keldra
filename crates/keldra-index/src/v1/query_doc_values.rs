@@ -188,6 +188,7 @@ mod tests {
         QueryBlockRecordRef {
             key: &record.key,
             value: &record.value,
+            document: None,
         }
     }
 

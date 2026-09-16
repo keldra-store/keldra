@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::{
     Child, ComponentCompactionLimits, ComponentCompactionPlan, ComponentSegmentDescriptor,
@@ -6,50 +6,56 @@ use super::{
 };
 use crate::IndexError;
 
-struct PageCache<F> {
-    component: super::ComponentIdentity,
-    load: F,
-    pages: BTreeMap<[u8; 32], (Page, u64)>,
+impl ComponentCompactionPlan {
+    /// Exact immutable inputs selected for this bounded merge.
+    pub fn input_runs(&self) -> &[ComponentSegmentDescriptor] {
+        &self.inputs
+    }
 }
 
-impl<F> PageCache<F> {
+struct PageLoader<F> {
+    component: super::ComponentIdentity,
+    load: F,
+}
+
+/// Retain the callback's accounted allocation owner while decoded pages are
+/// on the traversal stack. There is no history-sized decoded page cache.
+struct LoadedPage<Owner> {
+    page: Page,
+    encoded_bytes: u64,
+    _owner: Owner,
+}
+
+impl<F> PageLoader<F> {
     fn page<PageBytes>(
         &mut self,
         hash: [u8; 32],
         expected: Option<&Child>,
-    ) -> Result<Page, IndexError>
+    ) -> Result<LoadedPage<PageBytes>, IndexError>
     where
         F: FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
         PageBytes: AsRef<[u8]>,
     {
-        if !self.pages.contains_key(&hash) {
-            let bytes = (self.load)(hash)?;
-            let bytes = bytes.as_ref();
-            if *crate::profiled_blake3_hash!(bytes).as_bytes() != hash {
-                return Err(IndexError::Integrity);
-            }
-            let page = decode_page(self.component, bytes)?;
-            match &page {
-                Page::Leaf(segments) => validate_segments(segments)?,
-                Page::Branch(_) => {}
-            }
-            self.pages.insert(hash, (page, bytes.len() as u64));
+        let owner = (self.load)(hash)?;
+        let bytes = owner.as_ref();
+        if *crate::profiled_blake3_hash!(bytes).as_bytes() != hash {
+            return Err(IndexError::Integrity);
         }
-        let (page, encoded_bytes) = self.pages.get(&hash).ok_or(IndexError::Integrity)?;
+        let page = decode_page(self.component, bytes)?;
+        if let Page::Leaf(segments) = &page {
+            validate_segments(segments)?;
+        }
+        let encoded_bytes = bytes.len() as u64;
         if let Some(expected) = expected {
-            let actual = summarize(page, hash, *encoded_bytes)?;
-            if !child_matches(&actual, expected) {
+            if !child_matches(&summarize(&page, hash, encoded_bytes)?, expected) {
                 return Err(IndexError::Integrity);
             }
         }
-        Ok(page.clone())
-    }
-
-    fn encoded_bytes(&self, hash: [u8; 32]) -> Result<u64, IndexError> {
-        self.pages
-            .get(&hash)
-            .map(|(_, bytes)| *bytes)
-            .ok_or(IndexError::Integrity)
+        Ok(LoadedPage {
+            page,
+            encoded_bytes,
+            _owner: owner,
+        })
     }
 }
 
@@ -70,17 +76,12 @@ where
 {
     let limits = limits.validate()?;
     validate_root(previous)?;
-    let mut pages = PageCache {
+    let mut pages = PageLoader {
         component: previous.component,
         load: load_page,
-        pages: BTreeMap::new(),
     };
     let root_page = pages.page(previous.root_hash, None)?;
-    let root = summarize(
-        &root_page,
-        previous.root_hash,
-        pages.encoded_bytes(previous.root_hash)?,
-    )?;
+    let root = summarize(&root_page.page, previous.root_hash, root_page.encoded_bytes)?;
     if root.first_sequence != previous.first_sequence
         || root.last_sequence != previous.last_sequence
         || root.segment_count != previous.segment_count
@@ -188,7 +189,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn collect_level<F, PageBytes>(
-    pages: &mut PageCache<F>,
+    pages: &mut PageLoader<F>,
     hash: [u8; 32],
     expected: Option<&Child>,
     level: u8,
@@ -203,7 +204,8 @@ where
     if output.len() >= maximum {
         return Ok(());
     }
-    match pages.page(hash, expected)? {
+    let loaded = pages.page(hash, expected)?;
+    match loaded.page {
         Page::Leaf(segments) => {
             output.extend(
                 segments
@@ -246,7 +248,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn has_older_overlap<F, PageBytes>(
-    pages: &mut PageCache<F>,
+    pages: &mut PageLoader<F>,
     hash: [u8; 32],
     expected: Option<&Child>,
     before_sequence: u64,
@@ -258,7 +260,8 @@ where
     F: FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
     PageBytes: AsRef<[u8]>,
 {
-    match pages.page(hash, expected)? {
+    let loaded = pages.page(hash, expected)?;
+    match loaded.page {
         Page::Leaf(segments) => Ok(segments.into_iter().any(|segment| {
             segment.sequence < before_sequence
                 && !selected.contains(&segment.sequence)

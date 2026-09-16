@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::IndexError;
 const INDEX_ROUTING_KEY_BYTES: usize = 16 * 1024;
@@ -305,38 +305,27 @@ impl ProjectedDocumentState {
         Ok(bytes)
     }
 
-    /// Compute the exact independently publishable changes from `previous`.
-    ///
-    /// Values are already canonical bytes, so direct equality is the single
-    /// in-memory authority for whether a component write can be skipped.
-    pub fn delta_from(
-        &self,
-        previous: Option<&ProjectedDocumentState>,
-    ) -> Result<ProjectedDocumentDelta, IndexError> {
+    /// Encode complete current components without consulting old field state.
+    pub fn replacement(&self) -> Result<ProjectedDocumentDelta, IndexError> {
         self.validate()?;
-        if let Some(previous) = previous {
-            previous.validate()?;
-            if self.source_scope != previous.source_scope
-                || self.head.stable_key != previous.head.stable_key
-                || self.head.source_path != previous.head.source_path
-                || self.head.source_record != previous.head.source_record
-            {
-                return Err(IndexError::InvalidDefinition(
-                    "projected-state comparison crossed a stable document identity".into(),
-                ));
-            }
-        }
         Ok(ProjectedDocumentDelta {
-            head: (previous.map(|value| &value.head) != Some(&self.head))
-                .then(|| self.head.clone()),
-            memberships: diff_recipe_states(
-                previous.map_or(&[], |value| value.memberships.as_slice()),
-                &self.memberships,
-            ),
-            fields: diff_recipe_states(
-                previous.map_or(&[], |value| value.fields.as_slice()),
-                &self.fields,
-            ),
+            head: Some(self.head.clone()),
+            memberships: self
+                .memberships
+                .iter()
+                .map(|state| RecipeDelta {
+                    recipe: state.recipe,
+                    replacement: Some(state.clone()),
+                })
+                .collect(),
+            fields: self
+                .fields
+                .iter()
+                .map(|state| RecipeDelta {
+                    recipe: state.recipe,
+                    replacement: Some(state.clone()),
+                })
+                .collect(),
         })
     }
 }
@@ -353,38 +342,6 @@ pub struct ProjectedDocumentDelta {
     pub head: Option<DocumentHead>,
     pub memberships: Vec<RecipeDelta>,
     pub fields: Vec<RecipeDelta>,
-}
-
-/// Carry the cache material version across a projection-preserving source
-/// update. Stable keys absent from `previous`, or records whose membership,
-/// indexed field bytes, or physical order changed, retain the incoming exact
-/// source version as their new material version.
-pub fn inherit_projection_preserving_versions(
-    current: &mut [ProjectedDocumentState],
-    previous: &[ProjectedDocumentState],
-) -> Result<(), IndexError> {
-    let mut previous_by_key = BTreeMap::new();
-    for state in previous {
-        state.validate()?;
-        if previous_by_key
-            .insert(state.head.stable_key, state)
-            .is_some()
-        {
-            return Err(IndexError::InvalidDefinition(
-                "preceding projected states contain a duplicate stable key".into(),
-            ));
-        }
-    }
-    for state in current {
-        state.validate()?;
-        if let Some(previous) = previous_by_key.get(&state.head.stable_key) {
-            if state.memberships == previous.memberships && state.fields == previous.fields {
-                state.head.material_source_version = previous.head.material_source_version;
-                state.validate()?;
-            }
-        }
-    }
-    Ok(())
 }
 
 impl ProjectedDocumentDelta {
@@ -416,51 +373,6 @@ fn validate_recipe_states(states: &[CanonicalRecipeState]) -> Result<(), IndexEr
         ));
     }
     Ok(())
-}
-
-fn diff_recipe_states(
-    previous: &[CanonicalRecipeState],
-    current: &[CanonicalRecipeState],
-) -> Vec<RecipeDelta> {
-    let mut output = Vec::new();
-    let (mut left, mut right) = (0, 0);
-    while left < previous.len() || right < current.len() {
-        match (previous.get(left), current.get(right)) {
-            (Some(old), Some(new)) if old.recipe == new.recipe => {
-                if old.value != new.value {
-                    output.push(RecipeDelta {
-                        recipe: new.recipe,
-                        replacement: Some(new.clone()),
-                    });
-                }
-                left += 1;
-                right += 1;
-            }
-            (Some(old), Some(new)) if old.recipe < new.recipe => {
-                output.push(RecipeDelta {
-                    recipe: old.recipe,
-                    replacement: None,
-                });
-                left += 1;
-            }
-            (_, Some(new)) => {
-                output.push(RecipeDelta {
-                    recipe: new.recipe,
-                    replacement: Some(new.clone()),
-                });
-                right += 1;
-            }
-            (Some(old), None) => {
-                output.push(RecipeDelta {
-                    recipe: old.recipe,
-                    replacement: None,
-                });
-                left += 1;
-            }
-            (None, None) => break,
-        }
-    }
-    output
 }
 
 fn validate_path(path: &str) -> Result<(), IndexError> {
@@ -495,39 +407,36 @@ mod tests {
     }
 
     #[test]
-    fn unindexed_update_changes_only_the_exact_document_head() {
-        let old = state(7, &[(2, b"stable"), (3, b"also stable")]);
+    fn unchanged_fields_are_part_of_complete_replacement() {
         let new = state(8, &[(2, b"stable"), (3, b"also stable")]);
-        let delta = new.delta_from(Some(&old)).unwrap();
-        assert!(delta.is_head_only());
+        let delta = new.replacement().unwrap();
+        assert_eq!(delta.fields.len(), 2);
+        assert_eq!(delta.memberships.len(), 1);
         assert_eq!(delta.head.unwrap().source_version, 8);
     }
 
     #[test]
-    fn one_changed_field_does_not_rewrite_unchanged_recipes() {
-        let old = state(7, &[(2, b"old"), (3, b"stable")]);
+    fn one_changed_field_still_replaces_unchanged_recipes() {
         let new = state(8, &[(2, b"new"), (3, b"stable")]);
-        let delta = new.delta_from(Some(&old)).unwrap();
-        assert_eq!(delta.fields.len(), 1);
+        let delta = new.replacement().unwrap();
+        assert_eq!(delta.fields.len(), 2);
         assert_eq!(delta.fields[0].recipe, recipe(2));
         assert_eq!(delta.fields[0].replacement.as_ref().unwrap().value, b"new");
     }
 
     #[test]
-    fn removed_recipe_is_an_explicit_tombstone() {
-        let old = state(7, &[(2, b"old"), (3, b"removed")]);
+    fn replacement_does_not_reconstruct_removed_recipe_tombstones() {
         let new = state(8, &[(2, b"old")]);
-        let delta = new.delta_from(Some(&old)).unwrap();
+        let delta = new.replacement().unwrap();
         assert_eq!(delta.fields.len(), 1);
-        assert_eq!(delta.fields[0].recipe, recipe(3));
-        assert!(delta.fields[0].replacement.is_none());
+        assert_eq!(delta.fields[0].recipe, recipe(2));
+        assert!(delta.fields[0].replacement.is_some());
     }
 
     #[test]
     fn byte_difference_is_detected_without_a_redundant_digest() {
-        let old = state(7, &[(2, b"old")]);
         let new = state(8, &[(2, b"new")]);
-        assert_eq!(new.delta_from(Some(&old)).unwrap().fields.len(), 1);
+        assert_eq!(new.replacement().unwrap().fields.len(), 1);
     }
 
     #[test]

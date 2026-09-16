@@ -196,6 +196,7 @@ mod tests {
             decode_document_gate(QueryBlockRecordRef {
                 key: &encoded.key,
                 value: &encoded.value,
+                document: None,
             })
             .unwrap(),
             expected
@@ -218,6 +219,7 @@ mod tests {
             decode_document_gate(QueryBlockRecordRef {
                 key: &encoded.key,
                 value: &encoded.value,
+                document: None,
             })
             .unwrap(),
             expected

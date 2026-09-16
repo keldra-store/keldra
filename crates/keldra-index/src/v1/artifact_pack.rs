@@ -86,24 +86,46 @@ impl ArtifactPackReference {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactPackTable {
-    entries: Vec<ArtifactPackReference>,
+    entries: Arc<[ArtifactPackReference]>,
+    memory_lease: super::SegmentMemoryLease,
 }
 
 impl ArtifactPackTable {
     pub fn empty() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: Arc::from([]),
+            memory_lease: super::SegmentMemoryLease::default(),
         }
     }
 
     pub fn new(entries: Vec<ArtifactPackReference>) -> Result<Self, IndexError> {
-        let table = Self { entries };
+        let table = Self {
+            entries: Arc::from(entries),
+            memory_lease: super::SegmentMemoryLease::default(),
+        };
         table.validate()?;
         Ok(table)
     }
 
     pub fn entries(&self) -> &[ArtifactPackReference] {
         &self.entries
+    }
+
+    pub fn has_memory_lease(&self) -> bool {
+        self.memory_lease.is_attached()
+    }
+    pub fn attach_memory_lease(&self, lease: Arc<dyn Send + Sync + std::fmt::Debug>) -> bool {
+        self.memory_lease.attach(lease)
+    }
+    pub fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + 2 * std::mem::size_of::<usize>()
+            + self.entries.len() * std::mem::size_of::<ArtifactPackReference>()
+            + self
+                .entries
+                .iter()
+                .map(|entry| entry.canonical_path.len() + 2 * std::mem::size_of::<usize>())
+                .sum::<usize>()
     }
 
     pub fn resolve(&self, ordinal: u32) -> Result<&ArtifactPackReference, IndexError> {

@@ -359,6 +359,7 @@ pub(super) async fn load_partition_manifest<L: QueryArtifactLoader, X: QueryPart
 /// having completed every structural and catalogue-coverage check.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ValidatedQuerySnapshot {
+    pub(super) memory_lease: crate::v1::SegmentMemoryLease,
     pub(super) identity: QuerySnapshotIdentity,
     pub(super) common_cut: QueryCommonCut,
     pub(super) pins: Vec<PinnedPartitionQueryRoot>,
@@ -369,6 +370,17 @@ pub struct ValidatedQuerySnapshot {
 }
 
 impl ValidatedQuerySnapshot {
+    pub fn has_memory_lease(&self) -> bool {
+        self.memory_lease.is_attached()
+    }
+    pub fn attach_memory_lease(&self, lease: Arc<dyn Send + Sync + std::fmt::Debug>) -> bool {
+        self.memory_lease.attach(lease)
+    }
+    pub fn runs(&self) -> impl Iterator<Item = &Arc<ProjectionQueryRunDescriptor>> {
+        self.manifests
+            .iter()
+            .flat_map(|manifest| manifest.runs.iter())
+    }
     pub const fn identity(&self) -> QuerySnapshotIdentity {
         self.identity
     }
@@ -398,7 +410,8 @@ impl ValidatedQuerySnapshot {
             && self.recipe_catalog_proofs == other.recipe_catalog_proofs
     }
 
-    /// Conservative owned-memory accounting for the bounded runtime cache.
+    /// Owned vectors and bindings only. Shared run descriptors, document
+    /// tables and pack tables carry independent allocation-lifetime leases.
     pub fn resident_bytes(&self) -> usize {
         let fixed = std::mem::size_of::<Self>()
             .saturating_add(
@@ -442,26 +455,11 @@ impl ValidatedQuerySnapshot {
         self.manifests.iter().fold(
             fixed.saturating_add(proofs).saturating_add(logical),
             |bytes, manifest| {
-                manifest.runs.iter().fold(
-                    bytes.saturating_add(
-                        manifest.runs.capacity().saturating_mul(std::mem::size_of::<
-                            Arc<ProjectionQueryRunDescriptor>,
-                        >()),
-                    ),
-                    |bytes, run| {
-                        bytes
-                            .saturating_add(std::mem::size_of::<ProjectionQueryRunDescriptor>())
-                            .saturating_add(
-                                run.blocks
-                                    .capacity()
-                                    .saturating_mul(std::mem::size_of::<QueryBlockDescriptor>()),
-                            )
-                            .saturating_add(run.blocks.iter().fold(0usize, |bytes, block| {
-                                bytes
-                                    .saturating_add(block.minimum_key.capacity())
-                                    .saturating_add(block.maximum_key.capacity())
-                            }))
-                    },
+                bytes.saturating_add(
+                    manifest
+                        .runs
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Arc<ProjectionQueryRunDescriptor>>()),
                 )
             },
         )

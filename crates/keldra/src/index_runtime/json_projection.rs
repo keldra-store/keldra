@@ -12,6 +12,10 @@ use std::sync::Arc;
 use keldra_index::IndexError;
 use keldra_index::typed_json::ScalarValue;
 
+#[path = "json_projection_scratch.rs"]
+mod scratch_memory;
+pub(crate) use scratch_memory::project_compiled_scalar_pointers_accounted;
+
 pub(crate) type SelectedScalarFields = BTreeMap<String, SelectedScalarField>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -221,6 +225,43 @@ impl CompiledScalarProjectionPlan {
             .len()
             .saturating_mul(std::mem::size_of::<SelectedValue>() + std::mem::size_of::<usize>())
     }
+
+    /// Scalar plans can select each source scalar at most once per target.
+    /// There are at most source_bytes scalar tokens, each charged 32 bytes;
+    /// decoded string bytes cannot exceed their source representation. This is
+    /// a budget upper bound, not a guessed general-purpose JSON expansion ratio.
+    pub(crate) fn source_selection_bound(&self, source_bytes: usize, maximum: usize) -> usize {
+        self.floor_bytes
+            .saturating_add(
+                self.targets
+                    .len()
+                    .saturating_mul(source_bytes)
+                    .saturating_mul(SCALAR_VALUE_BYTES + 1),
+            )
+            .min(maximum)
+    }
+
+    pub(crate) fn source_parser_admission_bytes(
+        &self,
+        source_bytes: usize,
+        selected: usize,
+    ) -> usize {
+        // Scalar Vec growth can retain capacity below twice its logical charge.
+        // At each recursive level: children, exact targets, collectors and
+        // scalar/string target ordinals; each has at most targets.len() entries.
+        // Object key bytes across a live recursion path are disjoint input.
+        selected
+            .saturating_mul(2)
+            .saturating_add(self.scratch_resident_bytes())
+            .saturating_add(
+                self.targets
+                    .len()
+                    .saturating_mul(MAX_JSON_DEPTH + 1)
+                    .saturating_mul(6 * 2 * std::mem::size_of::<usize>()),
+            )
+            .saturating_add(source_bytes)
+            .saturating_add(INPUT_BUFFER_BYTES + MAX_CAPTURED_NUMBER_BYTES)
+    }
 }
 
 /// Select one union of JSON pointers in a single streaming parser pass.
@@ -245,20 +286,15 @@ pub(crate) fn project_compiled_scalar_pointers(
     plan: Arc<CompiledScalarProjectionPlan>,
     max_selected_bytes: usize,
 ) -> Result<Option<ProjectedScalarPointers>, IndexError> {
-    thread_local! {
-        /// One bounded parser workspace per projection worker. It is cleared
-        /// between payloads and never carries selected values or authority
-        /// across documents/catalog generations.
-        static SCRATCH: RefCell<ScalarProjectionScratch> = RefCell::new(ScalarProjectionScratch::default());
-    }
-    SCRATCH.with(|scratch| {
-        project_compiled_scalar_pointers_with_scratch(
-            source,
-            plan,
-            max_selected_bytes,
-            &mut scratch.borrow_mut(),
-        )
-    })
+    // Callers without indexing-credit ownership (including the separately
+    // admitted hot-ingress path) cannot retain workspace after their admission
+    // ends. Durable producer workers use the accounted reusable variant.
+    project_compiled_scalar_pointers_with_scratch(
+        source,
+        plan,
+        max_selected_bytes,
+        &mut ScalarProjectionScratch::default(),
+    )
 }
 
 #[derive(Default)]
@@ -1494,6 +1530,38 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn source_derived_scalar_budget_covers_actual_streaming_selection_shapes() {
+        let plan = CompiledScalarProjectionPlan::compile(Arc::from(vec![
+            "/a".to_owned(),
+            "/a/0".to_owned(),
+            "/b".to_owned(),
+        ]))
+        .unwrap();
+        for source in [
+            r#"{"a":[0,1,2,3,4,5,6,7],"b":"a\\b\u0041"}"#.to_owned(),
+            format!(
+                r#"{{"a":[{}],"b":"{}"}}"#,
+                "1,".repeat(511) + "1",
+                "x".repeat(4096)
+            ),
+            r#"{"a":null,"b":true}"#.to_owned(),
+        ] {
+            let bound = plan.source_selection_bound(source.len(), usize::MAX);
+            let selected = project_compiled_scalar_pointers(
+                &mut Cursor::new(source.as_bytes()),
+                plan.clone(),
+                bound,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(selected.resident_bytes().unwrap() <= bound);
+            assert!(plan.source_parser_admission_bytes(source.len(), bound) >= bound);
+            assert!(bound < 768 * 1024 * 1024);
+        }
+        assert_eq!(plan.source_selection_bound(4096, 1024), 1024);
+    }
 
     fn project(
         json: impl AsRef<[u8]>,

@@ -28,12 +28,14 @@ use super::hot_ingress::HotProjectionIngress;
 use super::publication::{IndexArtifactCoordinator, IndexArtifactRouter};
 use super::query_budget::IndexQueryMemoryBudget;
 use super::scanner::ClusterIndexScanner;
+use super::v1_artifact_cache::ImmutableArtifactCache;
 use super::v1_catalog_lifecycle::V1CatalogLifecycleTask;
 use super::v1_consumer::V1IndexProducerTask;
 use super::v1_publication::V1ProjectionPublisher;
 use super::v1_query_runtime::V1LocalIndexQueryExecutor;
 use super::v1_retention::V1IndexRetentionTask;
-use super::working_memory::{IndexWorkingMemory, WorkingMemoryAccount, WorkingMemoryPermit};
+use super::working_memory::{IndexWorkingMemory, SharedIndexingMemoryBackend};
+use keldra_index::v1::{IndexingMemoryCredits, IndexingMemoryLimits};
 
 pub(crate) struct RunningIndexRuntime {
     pub(crate) definitions: Arc<dyn IndexDefinitionLister>,
@@ -43,7 +45,6 @@ pub(crate) struct RunningIndexRuntime {
     pub(crate) scanner: ClusterIndexScanner,
     pub(crate) artifact_router: IndexArtifactRouter,
     _definition_coordination: DefinitionCoordinationTask,
-    _pipeline_memory: WorkingMemoryPermit,
     _producer: V1IndexProducerTask,
     _v1_catalog_lifecycle: V1CatalogLifecycleTask,
     _v1_retention: V1IndexRetentionTask,
@@ -82,7 +83,27 @@ pub(crate) async fn start(
         )),
     ));
     let pipeline_memory = config.pipeline_memory_bytes();
-    let catalog = IndexCatalog::with_memory_bytes(pipeline_memory / 4)
+    let working_memory = IndexWorkingMemory::from_config(config)
+        .context("validate aggregate index working-memory budget")?;
+    let pipeline_bytes = usize::try_from(pipeline_memory)
+        .context("index pipeline memory exceeds platform capacity")?;
+    let stage_limits = IndexingMemoryLimits {
+        hot_payload_bytes: pipeline_bytes,
+        worker_scratch_bytes: pipeline_bytes,
+        prepared_rows_bytes: pipeline_bytes,
+        replay_input_bytes: pipeline_bytes,
+        projection_accumulator_bytes: pipeline_bytes,
+        seal_scratch_bytes: pipeline_bytes,
+        ordering_catalog_bytes: pipeline_bytes,
+    };
+    let shared_credits = IndexingMemoryCredits::new_with_backend(
+        pipeline_bytes,
+        stage_limits,
+        Arc::new(SharedIndexingMemoryBackend(working_memory.clone())),
+    )
+    .map_err(anyhow::Error::msg)
+    .context("initialize actual-lifetime shared indexing credits")?;
+    let catalog = IndexCatalog::with_credits(shared_credits.clone(), pipeline_bytes)
         .map_err(anyhow::Error::msg)
         .context("reserve bounded TypedJson ordering-catalog memory")?;
     let definition_coordination = DefinitionCoordinationTask::start(
@@ -111,13 +132,11 @@ pub(crate) async fn start(
         objects.clone(),
         cluster_peers.clone(),
     );
-    let projection_cache_bytes = usize::try_from((pipeline_memory / 8).max(1))
-        .context("bound disposable v1 projection-cache work")?;
     let v1_publisher = V1ProjectionPublisher::new(
         store.clone(),
         reader.clone(),
         artifact_router.clone(),
-        projection_cache_bytes,
+        ImmutableArtifactCache::with_working_memory(working_memory.clone()),
     );
     let v1_catalog_lifecycle = V1CatalogLifecycleTask::start(
         catalog.clone(),
@@ -133,17 +152,7 @@ pub(crate) async fn start(
         derived_checkpoints.clone(),
         v1_publisher.clone(),
     );
-    let working_memory = IndexWorkingMemory::from_config(config)
-        .context("validate aggregate index working-memory budget")?;
-    let pipeline_memory_permit = working_memory
-        .acquire_up_to(
-            WorkingMemoryAccount::IndexingPipeline,
-            pipeline_memory,
-            pipeline_memory,
-        )
-        .await
-        .context("reserve format-v1 indexing pipeline memory")?;
-    let hot_ingress = HotProjectionIngress::new(pipeline_memory / 4)
+    let hot_ingress = HotProjectionIngress::with_credits(shared_credits.clone(), pipeline_memory)
         .map_err(anyhow::Error::msg)
         .context("initialize bounded TypedJson hot ingress")?;
     hot_ingress
@@ -181,6 +190,7 @@ pub(crate) async fn start(
         hot_ingress,
         v1_publisher,
         config,
+        shared_credits,
     )
     .map_err(anyhow::Error::msg)
     .context("start format-v1 index producer")?;
@@ -193,7 +203,6 @@ pub(crate) async fn start(
         scanner,
         artifact_router,
         _definition_coordination: definition_coordination,
-        _pipeline_memory: pipeline_memory_permit,
         _producer: producer,
         _v1_catalog_lifecycle: v1_catalog_lifecycle,
         _v1_retention: v1_retention,

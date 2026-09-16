@@ -28,8 +28,53 @@ pub(super) fn candidate_is_current(
 ) -> bool {
     membership.is_some_and(|gate| gate.live)
         && presence.is_some_and(|gate| {
-            gate.live && candidate_material_version <= gate.material_source_version
+            gate.live && candidate_material_version == gate.material_source_version
         })
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+
+    fn gate(version: u64, live: bool) -> QueryDocumentGate {
+        QueryDocumentGate {
+            document: StableDocumentKey::from_bytes([7; 32]).unwrap(),
+            material_source_version: version,
+            current_source_version: version,
+            live,
+            source_path: Some("objects/a".into()),
+            canonical_source_path: None,
+            result_path: Some("objects/a".into()),
+            result_version: version,
+        }
+    }
+
+    #[test]
+    fn replacement_rejects_old_postings_without_per_term_subtraction() {
+        let membership = gate(2, true);
+        let presence = gate(2, true);
+        assert!(!candidate_is_current(Some(&membership), Some(&presence), 1));
+        assert!(candidate_is_current(Some(&membership), Some(&presence), 2));
+        assert!(!candidate_is_current(Some(&membership), Some(&presence), 3));
+    }
+
+    #[test]
+    fn deletion_and_resurrection_do_not_revive_previous_material() {
+        let dead = gate(2, false);
+        assert!(!candidate_is_current(Some(&dead), Some(&dead), 1));
+        let resurrected = gate(3, true);
+        assert!(!candidate_is_current(
+            Some(&resurrected),
+            Some(&resurrected),
+            1
+        ));
+        assert!(candidate_is_current(
+            Some(&resurrected),
+            Some(&resurrected),
+            3
+        ));
+        assert!(!candidate_is_current(None, Some(&resurrected), 3));
+    }
 }
 
 pub(super) fn select_handoff_candidate(

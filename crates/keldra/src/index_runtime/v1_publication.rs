@@ -10,19 +10,15 @@ use std::time::Instant;
 use bytes::Bytes;
 use keldra_index::v1::{
     ArtifactPackReference, ArtifactPackTable, AtomicProjectionPublicationCredits,
-    CanonicalRecipeState, ComponentIdentity, ComponentRecordLookup, ComponentStreamReverseCursor,
-    ComponentStreamReverseStep, ComponentStreamRoot, PreparedAtomicProjectionGeneration,
-    PreparedQueryMutationBatch, ProjectedDocumentState, ProjectionCatalogActivation,
+    PreparedAtomicProjectionGeneration, PreparedQueryMutationBatch, ProjectionCatalogActivation,
     ProjectionCurrent, ProjectionFamilyPartitionDirectory, ProjectionGeneration,
     ProjectionPackCredits, ProjectionPartitionIdentity, ProjectionQueryRunDescriptor,
-    QueryBlockCredits, QueryBlockLimits, QueryRunPage, StableDocumentKey,
-    component_stream_child_hashes, decode_component_delta_segment, decode_document_head,
+    QueryBlockCredits, QueryBlockLimits, QueryRunPage, component_stream_child_hashes,
     decode_projection_catalog_activation, decode_projection_current,
     decode_projection_family_directory, decode_projection_generation,
-    decode_projection_generation_header, decode_query_run_page, decode_source_records,
+    decode_projection_generation_header, decode_query_run_page,
     encode_projection_catalog_activation, encode_projection_family_directory,
-    lookup_component_record_in_verified_pack, pack_component_deltas,
-    prepare_atomic_projection_generation, prepare_projection_query_run,
+    pack_component_deltas, prepare_atomic_projection_generation, prepare_projection_query_run,
     projection_artifact_routing_id, projection_catalog_activation_path,
     projection_catalog_routing_id, projection_component_page_path, projection_current_path,
     projection_family_directory_path, projection_generation_path, projection_pack_path,
@@ -45,14 +41,12 @@ use super::v1_parallel::run_bounded_ordered;
 mod compaction_publication;
 mod immutable_staging;
 mod physical_packs;
-mod projection_cache_updates;
 mod publication_types;
 #[cfg(test)]
 use immutable_staging::{immutable_stage_windows, immutable_stage_work, inline_window_fits};
-use projection_cache_updates::ProjectionCacheAdvancer;
 use publication_types::{
-    ArtifactBytes, AtomicPublicationPlan, ComponentRecordRequest, ImmutableStageWindow,
-    InlineArtifactIdentity, ObservedSourceProgress, StagedArtifact,
+    ArtifactBytes, AtomicPublicationPlan, ImmutableStageWindow, InlineArtifactIdentity,
+    ObservedSourceProgress, StagedArtifact,
 };
 pub(crate) use publication_types::{
     LoadedV1ProjectionGeneration, PendingV1Publication, V1PostCasVerification,
@@ -73,7 +67,6 @@ pub(crate) struct V1ProjectionPublisher {
     changes: tokio::sync::broadcast::Sender<()>,
     immutable_cache: ImmutableArtifactCache,
     observed_source_next: ObservedSourceProgress,
-    projection_cache_updates: ProjectionCacheAdvancer,
 }
 
 impl V1ProjectionPublisher {
@@ -81,19 +74,16 @@ impl V1ProjectionPublisher {
         store: Store,
         reader: ClusterObjectReader,
         artifacts: IndexArtifactRouter,
-        projection_cache_bytes: usize,
+        immutable_cache: ImmutableArtifactCache,
     ) -> Self {
         let (changes, _) = tokio::sync::broadcast::channel(1_024);
-        let projection_cache_updates =
-            ProjectionCacheAdvancer::start(store.clone(), projection_cache_bytes);
         Self {
             store,
             reader,
             artifacts,
             changes,
-            immutable_cache: ImmutableArtifactCache::default(),
+            immutable_cache,
             observed_source_next: ObservedSourceProgress::default(),
-            projection_cache_updates,
         }
     }
 
@@ -725,13 +715,6 @@ impl V1ProjectionPublisher {
         // method reports the authoritative result.
         let current_cas_duration = current_cas_started.elapsed();
         drop(current_cas_timer);
-        let cache_update = self.projection_cache_updates.admit(
-            projection_state_partition_key(tenant_id, bucket_id, partition),
-            pending.previous_generation_hash,
-            generation_hash,
-            std::mem::take(&mut plan.state_updates),
-        );
-        let cache_admitted = cache_update.is_some();
         tracing::info!(
             histogram.keldra_index_v1_artifact_staging_duration_seconds =
                 staging_duration.as_secs_f64(),
@@ -740,7 +723,6 @@ impl V1ProjectionPublisher {
             histogram.keldra_index_v1_current_cas_duration_seconds =
                 current_cas_duration.as_secs_f64(),
             immutable_artifacts = immutable_artifact_count,
-            cache_admitted,
             "keldra_index_v1_publication_phases"
         );
         let _ = self.changes.send(());
@@ -772,13 +754,11 @@ impl V1ProjectionPublisher {
         let storage_tenant = storage_tenant.to_owned();
         let bucket = bucket.to_owned();
         let expected = loaded.clone();
-        let cache_update = Arc::new(std::sync::Mutex::new(cache_update));
         let verification = V1PostCasVerification::start(move || {
             let publisher = publisher.clone();
             let storage_tenant = storage_tenant.clone();
             let bucket = bucket.clone();
             let expected = expected.clone();
-            let cache_update = Arc::clone(&cache_update);
             async move {
                 let result = async {
                     let verification_started = Instant::now();
@@ -804,26 +784,12 @@ impl V1ProjectionPublisher {
                             "published v1 generation differs from the prepared generation",
                         ));
                     }
-                    let cache_update = cache_update
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
-                    let cache_scheduled = cache_update.is_some_and(|cache_update| {
-                        publisher.projection_cache_updates.schedule(cache_update)
-                    });
-                    if !cache_scheduled {
-                        tracing::info!(
-                            counter.keldra_index_v1_projection_cache_updates_skipped = 1_u64,
-                            "v1 disposable projection cache update skipped at its byte bound or shutdown"
-                        );
-                    }
                     let duration = verification_started.elapsed();
                     drop(verification_timer);
                     tracing::info!(
                         histogram.keldra_index_v1_post_cas_verification_duration_seconds =
                             duration.as_secs_f64(),
                         generation_hash = ?generation_hash,
-                        cache_scheduled,
                         "keldra_index_v1_post_cas_verification"
                     );
                     Ok(())
@@ -967,332 +933,6 @@ impl V1ProjectionPublisher {
             current_object_version: version,
             generation,
         }))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn load_component_record(
-        &self,
-        storage_tenant: &str,
-        bucket: &str,
-        tenant_id: u64,
-        bucket_id: u64,
-        generation: &ProjectionGeneration,
-        component: ComponentIdentity,
-        key: StableDocumentKey,
-    ) -> Result<Option<Vec<u8>>, Status> {
-        let Some(root) = generation.root(component) else {
-            return Ok(None);
-        };
-        let mut cursor = ComponentStreamReverseCursor::for_key(
-            ComponentStreamRoot::from_component_root(root).map_err(index_status)?,
-            key,
-        )
-        .map_err(index_status)?;
-        loop {
-            match cursor.next().map_err(index_status)? {
-                ComponentStreamReverseStep::LoadPage { hash } => {
-                    let path = projection_stream_page_path(generation.partition, hash);
-                    let bytes = self
-                        .read_immutable_object(
-                            storage_tenant,
-                            bucket,
-                            tenant_id,
-                            bucket_id,
-                            &path,
-                            hash,
-                            MAX_STREAM_PAGE_BYTES,
-                        )
-                        .await?
-                        .ok_or_else(|| Status::data_loss("v1 stream page is absent"))?;
-                    // `read_immutable_object` binds the object path to this
-                    // content identity before returning trusted-local bytes.
-                    cursor
-                        .provide_verified_page(hash, &bytes)
-                        .map_err(index_status)?;
-                }
-                ComponentStreamReverseStep::Segment(descriptor) => {
-                    if key < descriptor.minimum_key || key > descriptor.maximum_key {
-                        continue;
-                    }
-                    let pack = descriptor.pack_reference().map_err(index_status)?;
-                    let bytes = self
-                        .read_exact_artifact_pack(
-                            storage_tenant,
-                            bucket,
-                            tenant_id,
-                            bucket_id,
-                            pack,
-                        )
-                        .await?;
-                    match lookup_component_record_in_verified_pack(
-                        component,
-                        &descriptor,
-                        &bytes,
-                        key,
-                    )
-                    .map_err(index_status)?
-                    {
-                        ComponentRecordLookup::Missing => {}
-                        ComponentRecordLookup::Tombstone => return Ok(None),
-                        ComponentRecordLookup::Value(value) => return Ok(Some(value)),
-                    }
-                }
-                ComponentStreamReverseStep::Complete => return Ok(None),
-            }
-        }
-    }
-
-    /// Loads an ordered source-path phase through two generation-gated cache
-    /// batches: source locators first, then all derived heads and components.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn load_source_states_batch(
-        &self,
-        storage_tenant: &str,
-        bucket: &str,
-        tenant_id: u64,
-        bucket_id: u64,
-        current: &LoadedV1ProjectionGeneration,
-        source_scope: [u8; 32],
-        source_paths: &[&str],
-        fallback_parallelism: usize,
-    ) -> Result<Vec<Vec<ProjectedDocumentState>>, Status> {
-        if source_paths.is_empty() {
-            return Ok(Vec::new());
-        }
-        let generation = &current.generation;
-        let locator_requests = source_paths
-            .iter()
-            .map(|source_path| {
-                Ok(ComponentRecordRequest {
-                    component: ComponentIdentity::SourceRecords,
-                    key: StableDocumentKey::derive(source_scope, source_path, 0)
-                        .map_err(index_status)?,
-                })
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-        let encoded_locators = self
-            .load_cached_component_records(
-                storage_tenant,
-                bucket,
-                tenant_id,
-                bucket_id,
-                current,
-                &locator_requests,
-                fallback_parallelism,
-            )
-            .await?;
-        let records = source_paths
-            .iter()
-            .zip(encoded_locators)
-            .map(|(source_path, encoded)| match encoded {
-                Some(encoded) => {
-                    decode_source_records(source_scope, source_path, &encoded).map_err(index_status)
-                }
-                None => Ok(Vec::new()),
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-        let component_recipes = generation
-            .roots
-            .iter()
-            .filter_map(|root| match root.component {
-                ComponentIdentity::Membership(recipe) => Some((true, recipe)),
-                ComponentIdentity::Field(recipe) => Some((false, recipe)),
-                ComponentIdentity::DocumentHead
-                | ComponentIdentity::SourceRecords
-                | ComponentIdentity::Order(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let documents = records
-            .iter()
-            .enumerate()
-            .flat_map(|(source_index, records)| {
-                records.iter().copied().map(move |key| (source_index, key))
-            })
-            .collect::<Vec<_>>();
-        let detail_requests = documents
-            .iter()
-            .flat_map(|(_, key)| {
-                std::iter::once(ComponentRecordRequest {
-                    component: ComponentIdentity::DocumentHead,
-                    key: *key,
-                })
-                .chain(component_recipes.iter().map(|(membership, recipe)| {
-                    ComponentRecordRequest {
-                        component: if *membership {
-                            ComponentIdentity::Membership(*recipe)
-                        } else {
-                            ComponentIdentity::Field(*recipe)
-                        },
-                        key: *key,
-                    }
-                }))
-            })
-            .collect::<Vec<_>>();
-        let details = self
-            .load_cached_component_records(
-                storage_tenant,
-                bucket,
-                tenant_id,
-                bucket_id,
-                current,
-                &detail_requests,
-                fallback_parallelism,
-            )
-            .await?;
-        let mut details = details.into_iter();
-        let mut states = source_paths
-            .iter()
-            .map(|_| Vec::new())
-            .collect::<Vec<Vec<ProjectedDocumentState>>>();
-        for (source_index, key) in documents {
-            let encoded_head = details.next().flatten().ok_or_else(|| {
-                Status::data_loss("v1 source locator names a missing document head")
-            })?;
-            let head =
-                decode_document_head(source_scope, key, &encoded_head).map_err(index_status)?;
-            if head.stable_key != key || head.source_path != source_paths[source_index] {
-                return Err(Status::data_loss(
-                    "v1 source locator, document head, and source scope disagree",
-                ));
-            }
-            let mut memberships = Vec::new();
-            let mut fields = Vec::new();
-            for (membership, recipe) in &component_recipes {
-                let value = details.next().ok_or_else(|| {
-                    Status::data_loss("v1 predecessor detail batch omitted a request")
-                })?;
-                let Some(value) = value else {
-                    continue;
-                };
-                let state = CanonicalRecipeState::new(*recipe, value).map_err(index_status)?;
-                if *membership {
-                    memberships.push(state);
-                } else {
-                    fields.push(state);
-                }
-            }
-            memberships.sort_by_key(|state| state.recipe);
-            fields.sort_by_key(|state| state.recipe);
-            states[source_index].push(
-                ProjectedDocumentState::new(source_scope, head, memberships, fields)
-                    .map_err(index_status)?,
-            );
-        }
-        if details.next().is_some() {
-            return Err(Status::data_loss(
-                "v1 predecessor detail batch returned the wrong result count",
-            ));
-        }
-        for states in &mut states {
-            states.sort_by_key(|state| state.head.source_record);
-        }
-        Ok(states)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn load_cached_component_records(
-        &self,
-        storage_tenant: &str,
-        bucket: &str,
-        tenant_id: u64,
-        bucket_id: u64,
-        current: &LoadedV1ProjectionGeneration,
-        requests: &[ComponentRecordRequest],
-        fallback_parallelism: usize,
-    ) -> Result<Vec<Option<Vec<u8>>>, Status> {
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        let partition_key =
-            projection_state_partition_key(tenant_id, bucket_id, current.generation.partition);
-        let record_keys = requests
-            .iter()
-            .map(|request| projection_state_record_key(request.component, request.key))
-            .collect::<Vec<_>>();
-        let record_key_refs = record_keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let cached = self
-            .store
-            .index_projection_states(
-                &partition_key,
-                current.current.generation_hash,
-                &record_key_refs,
-            )
-            .unwrap_or_else(|_| {
-                std::iter::repeat_with(|| None)
-                    .take(requests.len())
-                    .collect()
-            });
-        let mut values = std::iter::repeat_with(|| None)
-            .take(requests.len())
-            .collect::<Vec<_>>();
-        let mut missed = Vec::new();
-        for (index, (request, cached)) in requests.iter().copied().zip(cached).enumerate() {
-            if let Some(value) = cached {
-                values[index] = Some(value);
-                continue;
-            }
-            missed.push((index, request));
-        }
-        let mut fills = Vec::new();
-        let mut first_failure = None;
-        for missed in missed.chunks(fallback_parallelism.max(1)) {
-            let mut jobs = tokio::task::JoinSet::new();
-            for (index, request) in missed.iter().copied() {
-                let publisher = self.clone();
-                let storage_tenant = storage_tenant.to_owned();
-                let bucket = bucket.to_owned();
-                let generation = current.generation.clone();
-                jobs.spawn(async move {
-                    let value = publisher
-                        .load_component_record(
-                            &storage_tenant,
-                            &bucket,
-                            tenant_id,
-                            bucket_id,
-                            &generation,
-                            request.component,
-                            request.key,
-                        )
-                        .await?;
-                    Ok::<_, Status>((index, value))
-                });
-            }
-            while let Some(result) = jobs.join_next().await {
-                match result {
-                    Ok(Ok((index, value))) => {
-                        fills.push((index, value.clone()));
-                        values[index] = Some(value);
-                    }
-                    Ok(Err(error)) => {
-                        first_failure.get_or_insert(error);
-                    }
-                    Err(error) => {
-                        first_failure.get_or_insert_with(|| {
-                            Status::internal(format!("v1 component load task failed: {error}"))
-                        });
-                    }
-                }
-            }
-        }
-        fills.sort_by_key(|(index, _)| *index);
-        let fill_values = fills
-            .iter()
-            .map(|(index, value)| (record_keys[*index].as_slice(), value.as_deref()))
-            .collect::<Vec<_>>();
-        let _ = self.store.cache_index_projection_states(
-            &partition_key,
-            current.current.generation_hash,
-            &fill_values,
-        );
-        if let Some(error) = first_failure {
-            return Err(error);
-        }
-        values
-            .into_iter()
-            .map(|value| {
-                value.ok_or_else(|| Status::data_loss("v1 component batch omitted a request"))
-            })
-            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1519,6 +1159,11 @@ impl V1ProjectionPublisher {
             self.read_blob_local_first_uncached(blob, maximum_bytes)
                 .await?,
         );
+        let Some(bytes) = self.immutable_cache.admit_bytes(bytes.clone()) else {
+            // This cold allocation remains charged to its requesting query or
+            // producer. Failed cache admission must not retain uncharged bytes.
+            return Ok(bytes);
+        };
         self.immutable_cache.insert_blob(blob, bytes.clone());
         Ok(bytes)
     }
@@ -1615,8 +1260,10 @@ fn plan_atomic_publication(
     previous: Option<&LoadedV1ProjectionGeneration>,
     prepared: PreparedAtomicProjectionGeneration,
 ) -> Result<AtomicPublicationPlan, Status> {
-    let (prepared, publication_credits) = prepared.into_publication_parts();
-    let state_updates = projection_state_updates(&prepared.packs)?;
+    let (payload, mut publication_credits) = prepared.into_publication_parts();
+    // On an early validation error, drop owned payload bytes before the
+    // admission which accounts for them (locals are dropped in reverse order).
+    let prepared = payload;
     let sealed_bytes = prepared
         .packs
         .iter()
@@ -1676,14 +1323,12 @@ fn plan_atomic_publication(
         maximum_loaded_blocks: QueryBlockLimits::default_for_memory().maximum_loaded_blocks,
         maximum_run_descriptor_bytes: prepared.query_run.bytes.len().max(256),
     };
-    let mut validation_credits = keldra_index::v1::QueryBlockCredits::from_query_permit(Box::new(
-        PublicationValidationPermit(prepared.query_run.bytes.len().max(1)),
-    ))
-    .map_err(index_status)?;
+    let validation_credits = publication_credits.query_validation_credits();
+    let validation_start = validation_credits.admitted_bytes() - validation_credits.remaining();
     let query_run = keldra_index::v1::decode_projection_query_run(
         &prepared.query_run.bytes,
         query_limits,
-        &mut validation_credits,
+        validation_credits,
     )
     .map_err(index_status)?;
     if query_run.partition != partition
@@ -1713,6 +1358,22 @@ fn plan_atomic_publication(
             "prepared v1 query stream does not name its exact newest run cut",
         ));
     }
+
+    // Free decoded vectors/tables before making their admission available to
+    // another worker. The original encoded publication remains charged.
+    let source_positions = query_run
+        .next_offset
+        .checked_sub(query_run.source_start_offset)
+        .ok_or_else(|| Status::data_loss("v1 query run source cut moves backwards"))?;
+    drop(query_run);
+    let validation_used = validation_credits.admitted_bytes() - validation_credits.remaining();
+    validation_credits
+        .release(
+            validation_used
+                .checked_sub(validation_start)
+                .ok_or_else(|| Status::data_loss("publication validation credits underflow"))?,
+        )
+        .map_err(index_status)?;
 
     let mut artifacts = BTreeMap::new();
     // Physical packs were published first so their exact ordinary-object
@@ -1766,89 +1427,10 @@ fn plan_atomic_publication(
         current,
         generation,
         sealed_bytes,
-        source_positions: query_run
-            .next_offset
-            .checked_sub(query_run.source_start_offset)
-            .ok_or_else(|| Status::data_loss("v1 query run source cut moves backwards"))?,
-        state_updates,
+        source_positions,
         _publication_credits: Some(publication_credits),
+        _compaction_metadata: None,
     })
-}
-
-fn projection_state_updates(
-    packs: &[keldra_index::v1::SealedProjectionDeltaPack],
-) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, Status> {
-    let mut updates = BTreeMap::new();
-    for pack in packs {
-        for delta in &pack.deltas {
-            let start = usize::try_from(delta.locator.offset)
-                .map_err(|_| Status::data_loss("v1 cached delta offset is unbounded"))?;
-            let length = usize::try_from(delta.locator.encoded_bytes)
-                .map_err(|_| Status::data_loss("v1 cached delta length is unbounded"))?;
-            let end = start
-                .checked_add(length)
-                .ok_or_else(|| Status::data_loss("v1 cached delta range overflows"))?;
-            let encoded = pack
-                .bytes
-                .get(start..end)
-                .ok_or_else(|| Status::data_loss("v1 cached delta range is outside its pack"))?;
-            let decoded = decode_component_delta_segment(encoded).map_err(index_status)?;
-            if decoded.component != delta.component || decoded.records.len() as u64 != delta.records
-            {
-                return Err(Status::data_loss(
-                    "v1 cached delta identity differs from its pack descriptor",
-                ));
-            }
-            for record in decoded.records {
-                let key = projection_state_record_key(delta.component, record.stable_key);
-                if updates.insert(key, record.replacement).is_some() {
-                    return Err(Status::data_loss(
-                        "v1 publication repeats one cached component record",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(updates.into_iter().collect())
-}
-
-fn projection_state_partition_key(
-    tenant_id: u64,
-    bucket_id: u64,
-    partition: ProjectionPartitionIdentity,
-) -> Vec<u8> {
-    let mut key = Vec::with_capacity(51);
-    key.push(1);
-    key.extend_from_slice(&tenant_id.to_be_bytes());
-    key.extend_from_slice(&bucket_id.to_be_bytes());
-    key.extend_from_slice(&partition.family_id);
-    key.extend_from_slice(&partition.source_node.to_be_bytes());
-    key
-}
-
-fn projection_state_record_key(
-    component: ComponentIdentity,
-    stable_key: StableDocumentKey,
-) -> Vec<u8> {
-    let mut key = Vec::with_capacity(65);
-    match component {
-        ComponentIdentity::DocumentHead => key.push(1),
-        ComponentIdentity::Membership(recipe) => {
-            key.push(2);
-            key.extend_from_slice(&recipe.bytes());
-        }
-        ComponentIdentity::Field(recipe) => {
-            key.push(3);
-            key.extend_from_slice(&recipe.bytes());
-        }
-        ComponentIdentity::Order(recipe) => {
-            key.push(4);
-            key.extend_from_slice(&recipe.bytes());
-        }
-        ComponentIdentity::SourceRecords => key.push(6),
-    }
-    key.extend_from_slice(&stable_key.bytes());
-    key
 }
 
 fn require_all_immutable_publications(
@@ -1858,14 +1440,6 @@ fn require_all_immutable_publications(
         outcome?;
     }
     Ok(())
-}
-
-struct PublicationValidationPermit(usize);
-
-impl keldra_index::v1::QueryMemoryPermit for PublicationValidationPermit {
-    fn admitted_bytes(&self) -> usize {
-        self.0
-    }
 }
 
 fn newest_prepared_query_run(

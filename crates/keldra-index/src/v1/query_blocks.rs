@@ -17,6 +17,15 @@ use super::{
     QueryDocumentGate, RecipeIdentity, StableDocumentKey, decode_document_gate,
 };
 
+#[path = "segment_documents.rs"]
+mod segment_documents;
+pub use segment_documents::{
+    SegmentDocumentId, SegmentDocumentTable, SegmentLiveDocuments, SegmentMemoryLease,
+};
+#[path = "segment_postings.rs"]
+mod segment_postings;
+pub use segment_postings::{DenseSegmentPoint, DenseSegmentPosting, SegmentPostingCursor};
+
 #[cfg(test)]
 use super::encode_document_gate;
 
@@ -188,6 +197,7 @@ pub struct QueryBlockDescriptor {
     pub records: u32,
     pub locator: ArtifactPackLocator,
     pub pack_table: std::sync::Arc<ArtifactPackTable>,
+    pub documents: std::sync::Arc<SegmentDocumentTable>,
 }
 
 impl QueryBlockDescriptor {
@@ -211,32 +221,63 @@ pub struct LogicalQueryBlockDescriptor {
     pub hash: [u8; 32],
     pub encoded_bytes: u64,
     pub records: u32,
+    pub documents: std::sync::Arc<SegmentDocumentTable>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryBlockRecordRef<'a> {
     pub key: &'a [u8],
     pub value: &'a [u8],
+    /// Resolved identity for a compact point key (which exposes scalar bytes).
+    pub document: Option<StableDocumentKey>,
+}
+
+impl QueryBlockRecordRef<'_> {
+    pub fn canonical_key(&self) -> Vec<u8> {
+        canonical_record_key(*self)
+    }
+
+    fn compare_key(&self, key: &[u8]) -> std::cmp::Ordering {
+        if let Some(document) = self.document {
+            self.key
+                .iter()
+                .chain(document.bytes().iter())
+                .cmp(key.iter())
+        } else {
+            self.key.cmp(key)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct DecodedQueryBlockRecord {
-    key: Range<usize>,
+    key: DecodedRecordKey,
     value: Range<usize>,
+}
+
+#[derive(Clone, Debug)]
+enum DecodedRecordKey {
+    Bytes(Range<usize>),
+    Document(u32),
+    Point(Range<usize>, u32),
 }
 
 /// Disposable, bounded lookup view over an immutable encoded query block.
 ///
 /// The encoded bytes remain authoritative. This view records only byte ranges,
 /// so repeated queries do not reparse record lengths or copy keys and values.
-pub struct DecodedQueryBlock {
+pub struct SegmentReader {
     bytes: Bytes,
     records: Vec<DecodedQueryBlockRecord>,
     kind: QueryBlockKind,
     recipe: RecipeIdentity,
     hash: [u8; 32],
     record_count: u32,
+    documents: std::sync::Arc<SegmentDocumentTable>,
+    memory_lease: std::sync::OnceLock<std::sync::Arc<dyn Send + Sync + std::fmt::Debug>>,
 }
+
+pub type DecodedQueryBlock = SegmentReader;
 
 impl DecodedQueryBlock {
     pub(crate) fn from_verified_content(
@@ -261,14 +302,30 @@ impl DecodedQueryBlock {
             )?;
             loaded = true;
             while let Some(record) = cursor.next()? {
-                let key_start = (record.key.as_ptr() as usize)
-                    .checked_sub(base)
-                    .ok_or(IndexError::Integrity)?;
+                let key = if descriptor.kind == QueryBlockKind::TermDictionary {
+                    let start = (record.key.as_ptr() as usize)
+                        .checked_sub(base)
+                        .ok_or(IndexError::Integrity)?;
+                    DecodedRecordKey::Bytes(start..start + record.key.len())
+                } else if descriptor.kind == QueryBlockKind::Point {
+                    let start = (record.key.as_ptr() as usize)
+                        .checked_sub(base)
+                        .ok_or(IndexError::Integrity)?;
+                    DecodedRecordKey::Point(
+                        start..start + record.key.len(),
+                        descriptor
+                            .documents
+                            .id(record.document.ok_or(IndexError::Integrity)?)?
+                            .0,
+                    )
+                } else {
+                    DecodedRecordKey::Document(descriptor.documents.id(stable_key(record.key)?)?.0)
+                };
                 let value_start = (record.value.as_ptr() as usize)
                     .checked_sub(base)
                     .ok_or(IndexError::Integrity)?;
                 records.push(DecodedQueryBlockRecord {
-                    key: key_start..key_start + record.key.len(),
+                    key,
                     value: value_start..value_start + record.value.len(),
                 });
             }
@@ -292,11 +349,48 @@ impl DecodedQueryBlock {
             recipe: descriptor.recipe,
             hash: descriptor.hash,
             record_count: descriptor.records,
+            documents: descriptor.documents.clone(),
+            memory_lease: std::sync::OnceLock::new(),
         })
     }
 
     pub fn encoded_bytes(&self) -> usize {
         self.bytes.len()
+    }
+
+    pub fn attach_memory_lease(
+        &self,
+        lease: std::sync::Arc<dyn Send + Sync + std::fmt::Debug>,
+    ) -> bool {
+        self.memory_lease.set(lease).is_ok()
+    }
+    pub fn has_memory_lease(&self) -> bool {
+        self.memory_lease.get().is_some()
+    }
+
+    pub fn documents(&self) -> &std::sync::Arc<SegmentDocumentTable> {
+        &self.documents
+    }
+
+    pub fn live_documents_for_candidates(
+        &self,
+        candidates: impl IntoIterator<Item = SegmentDocumentId>,
+        mut current: impl FnMut(StableDocumentKey, u64) -> bool,
+    ) -> Result<SegmentLiveDocuments, IndexError> {
+        let mut live = SegmentLiveDocuments::none_live(self.documents.clone());
+        for id in candidates {
+            let document = self.documents.document(id)?;
+            let version = self.documents.material_version(id)?;
+            if version == 0 {
+                return Err(IndexError::IntegrityViolation(
+                    "cannot bind liveness to an unversioned segment document".into(),
+                ));
+            }
+            if current(document, version) {
+                live.set_live(id)?;
+            }
+        }
+        Ok(live)
     }
 
     pub fn resident_index_bytes(&self) -> usize {
@@ -313,6 +407,7 @@ impl DecodedQueryBlock {
             && self.hash == descriptor.hash
             && self.record_count == descriptor.records
             && self.bytes.len() as u64 == descriptor.encoded_bytes
+            && self.documents.identity() == descriptor.documents.identity()
     }
 
     pub fn matches_content(&self, hash: [u8; 32], encoded_bytes: usize) -> bool {
@@ -329,17 +424,39 @@ impl DecodedQueryBlock {
     ) -> impl Iterator<Item = QueryBlockRecordRef<'_>> {
         let first = self
             .records
-            .partition_point(|record| &self.bytes[record.key.clone()] < minimum_key);
+            .partition_point(|record| self.record_ref(record).compare_key(minimum_key).is_lt());
         self.records_from_index(first)
     }
 
     fn records_from_index(&self, first: usize) -> impl Iterator<Item = QueryBlockRecordRef<'_>> {
         self.records[first..]
             .iter()
-            .map(|record| QueryBlockRecordRef {
-                key: &self.bytes[record.key.clone()],
-                value: &self.bytes[record.value.clone()],
-            })
+            .map(|record| self.record_ref(record))
+    }
+
+    fn record_ref(&self, record: &DecodedQueryBlockRecord) -> QueryBlockRecordRef<'_> {
+        let (key, document) = match &record.key {
+            DecodedRecordKey::Bytes(range) => (&self.bytes[range.clone()], None),
+            DecodedRecordKey::Document(id) => (
+                self.documents
+                    .key(*id)
+                    .expect("validated local document ID"),
+                None,
+            ),
+            DecodedRecordKey::Point(range, id) => (
+                &self.bytes[range.clone()],
+                Some(
+                    self.documents
+                        .document(SegmentDocumentId(*id))
+                        .expect("validated local document ID"),
+                ),
+            ),
+        };
+        QueryBlockRecordRef {
+            key,
+            value: &self.bytes[record.value.clone()],
+            document,
+        }
     }
 }
 
@@ -358,7 +475,7 @@ pub struct QueryBlockCursor<'a> {
     previous: Option<&'a [u8]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ProjectionQueryRunDescriptor {
     pub partition: ProjectionPartitionIdentity,
     pub physical_catalog_generation: [u8; 32],
@@ -368,6 +485,23 @@ pub struct ProjectionQueryRunDescriptor {
     pub through_atomic_position: u64,
     pub pack_table: std::sync::Arc<ArtifactPackTable>,
     pub blocks: Vec<QueryBlockDescriptor>,
+    pub memory_lease: SegmentMemoryLease,
+}
+
+impl Clone for ProjectionQueryRunDescriptor {
+    fn clone(&self) -> Self {
+        Self {
+            partition: self.partition,
+            physical_catalog_generation: self.physical_catalog_generation,
+            sequence: self.sequence,
+            source_start_offset: self.source_start_offset,
+            next_offset: self.next_offset,
+            through_atomic_position: self.through_atomic_position,
+            pack_table: self.pack_table.clone(),
+            blocks: self.blocks.clone(),
+            memory_lease: SegmentMemoryLease::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -381,153 +515,72 @@ pub struct EncodedProjectionQueryRun {
 /// values are significant, matching Lucene's ordered repeated-field model.
 pub(super) const TEXT_VALUE_POSITION_GAP: u32 = 1;
 
-/// Prepare sparse, query-ready field deltas while selected Typed JSON values
-/// are resident. Old terms/points become tombstones, new values become live
-/// deltas, and field presence is independent of document membership. JSON
-/// pointer extraction intentionally remains outside this storage core.
+/// Prepare a complete field replacement from the new selected values only.
+/// Previous immutable postings are retired by document liveness, never by
+/// reconstructing old fields or subtracting individual terms.
 pub fn prepare_typed_json_field_delta(
     field: &FieldSchema,
     document: StableDocumentKey,
     material_source_version: u64,
-    previous: Option<&TypedJsonFieldState>,
     current: Option<&TypedJsonFieldState>,
-    credits: &mut QueryBlockCredits,
-) -> Result<PreparedQueryFieldDelta, IndexError> {
-    prepare_field_delta(
-        field,
-        document,
-        material_source_version,
-        previous,
-        current,
-        false,
-        credits,
-    )
-}
-
-pub(super) fn prepare_typed_json_material_refresh(
-    field: &FieldSchema,
-    document: StableDocumentKey,
-    material_source_version: u64,
-    previous: Option<&TypedJsonFieldState>,
-    current: &TypedJsonFieldState,
-    credits: &mut QueryBlockCredits,
-) -> Result<PreparedQueryFieldDelta, IndexError> {
-    prepare_field_delta(
-        field,
-        document,
-        material_source_version,
-        previous,
-        Some(current),
-        true,
-        credits,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn prepare_field_delta(
-    field: &FieldSchema,
-    document: StableDocumentKey,
-    material_source_version: u64,
-    previous: Option<&TypedJsonFieldState>,
-    current: Option<&TypedJsonFieldState>,
-    refresh_current: bool,
     credits: &mut QueryBlockCredits,
 ) -> Result<PreparedQueryFieldDelta, IndexError> {
     field.validate()?;
     if material_source_version == 0 {
         return Err(IndexError::InvalidDefinition(
-            "v1 query field delta version is zero".into(),
+            "v1 query field version is zero".into(),
         ));
     }
-    let previous = normalized_state(field, previous)?;
     let current = normalized_state(field, current)?;
-    let estimated = estimate_query_delta_bytes(previous, current)?;
-    credits.reserve(estimated)?;
-
-    let old_values = state_values(previous);
-    let new_values = state_values(current);
+    credits.reserve(estimate_query_delta_bytes(current)?)?;
+    let values = state_values(current);
     let mut terms = Vec::new();
     if field.capabilities.contains(FieldCapabilities::FULL_TEXT) {
-        let old_terms = analyzed_terms(previous)?;
-        let new_terms = analyzed_terms(current)?;
-        for (term, positions) in &old_terms {
-            if new_terms.get(term) != Some(positions) {
-                terms.push(PreparedQueryTermDelta {
-                    term: ScalarValue::String(term.clone()),
-                    document,
-                    material_source_version,
-                    live: false,
-                    positions: Vec::new(),
-                });
-            }
-        }
-        for (term, positions) in &new_terms {
-            if refresh_current || old_terms.get(term) != Some(positions) {
-                terms.push(PreparedQueryTermDelta {
-                    term: ScalarValue::String(term.clone()),
-                    document,
-                    material_source_version,
-                    live: true,
-                    positions: positions.clone(),
-                });
-            }
+        for (term, positions) in analyzed_terms(current)? {
+            terms.push(PreparedQueryTermDelta {
+                term: ScalarValue::String(term),
+                document,
+                material_source_version,
+                live: true,
+                positions,
+            });
         }
     } else if field.capabilities.contains(FieldCapabilities::EXACT)
         || field.capabilities.contains(FieldCapabilities::PREFIX)
     {
-        for value in old_values.difference(&new_values) {
-            terms.push(PreparedQueryTermDelta {
-                term: value.clone(),
-                document,
-                material_source_version,
-                live: false,
-                positions: Vec::new(),
-            });
-        }
-        for value in new_values
-            .iter()
-            .filter(|value| refresh_current || !old_values.contains(*value))
-        {
-            terms.push(PreparedQueryTermDelta {
-                term: value.clone(),
+        terms.extend(values.iter().cloned().map(|term| PreparedQueryTermDelta {
+            term,
+            document,
+            material_source_version,
+            live: true,
+            positions: Vec::new(),
+        }));
+    }
+    let points = if field.capabilities.contains(FieldCapabilities::RANGE) {
+        values
+            .into_iter()
+            .map(|value| QueryPoint {
+                value,
                 document,
                 material_source_version,
                 live: true,
-                positions: Vec::new(),
-            });
-        }
-    }
-
-    let mut points = Vec::new();
-    if field.capabilities.contains(FieldCapabilities::RANGE) {
-        for value in old_values.difference(&new_values) {
-            points.push(QueryPoint {
-                value: value.clone(),
-                document,
-                material_source_version,
-                live: false,
-            });
-        }
-        for value in new_values
-            .iter()
-            .filter(|value| refresh_current || !old_values.contains(*value))
-        {
-            points.push(QueryPoint {
-                value: value.clone(),
-                document,
-                material_source_version,
-                live: true,
-            });
-        }
-    }
-
-    let old_doc_value = doc_values(field, previous)?;
-    let new_doc_value = doc_values(field, current)?;
-    let doc_value = (refresh_current || old_doc_value != new_doc_value).then_some(QueryDocValue {
-        document,
-        material_source_version,
-        value: new_doc_value,
-    });
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let has_values = field.capabilities.contains(FieldCapabilities::ORDER)
+        || field.capabilities.contains(FieldCapabilities::FACET)
+        || field.capabilities.contains(FieldCapabilities::AGGREGATE);
+    let doc_value = if has_values {
+        Some(QueryDocValue {
+            document,
+            material_source_version,
+            value: doc_values(field, current)?,
+        })
+    } else {
+        None
+    };
     Ok(PreparedQueryFieldDelta {
         presence: QueryDocumentGate {
             document,
@@ -618,13 +671,9 @@ fn doc_values(
     }))
 }
 
-fn estimate_query_delta_bytes(
-    previous: Option<&TypedJsonFieldState>,
-    current: Option<&TypedJsonFieldState>,
-) -> Result<usize, IndexError> {
-    [previous, current]
+fn estimate_query_delta_bytes(current: Option<&TypedJsonFieldState>) -> Result<usize, IndexError> {
+    current
         .into_iter()
-        .flatten()
         .flat_map(|state| state.values.iter())
         .try_fold(512usize, |total, value| {
             let scalar = match value {
@@ -770,36 +819,47 @@ pub fn encode_posting(posting: QueryPosting) -> Result<QueryBlockRecord, IndexEr
 
 pub fn decode_posting(record: QueryBlockRecordRef<'_>) -> Result<QueryPosting, IndexError> {
     let document = stable_key(record.key)?;
-    let material_source_version = read_u64(record.value, 0)?;
+    let dense = decode_dense_posting_value(SegmentDocumentId(0), record.value)?;
+    Ok(QueryPosting {
+        document,
+        material_source_version: dense.material_source_version,
+        live: dense.live,
+        position_block_hash: dense.position_block_hash,
+        positions: dense.positions,
+    })
+}
+
+fn decode_dense_posting_value(
+    document: SegmentDocumentId,
+    value: &[u8],
+) -> Result<DenseSegmentPosting, IndexError> {
+    let material_source_version = read_u64(value, 0)?;
     if material_source_version == 0 {
         return Err(IndexError::InvalidFormat("v1 posting version"));
     }
-    let live = match record.value.get(8) {
+    let live = match value.get(8) {
         Some(0) => false,
         Some(1) => true,
         _ => return Err(IndexError::InvalidFormat("v1 posting liveness")),
     };
-    match record.value.get(9) {
-        Some(0) if record.value.len() == 10 => Ok(QueryPosting {
+    match value.get(9) {
+        Some(0) if value.len() == 10 => Ok(DenseSegmentPosting {
             document,
             material_source_version,
             live,
             position_block_hash: None,
             positions: 0,
         }),
-        Some(1) if live && record.value.len() == 46 => {
-            let hash = record.value[10..42]
+        Some(1) if live && value.len() == 46 => {
+            let hash = value[10..42]
                 .try_into()
                 .map_err(|_| IndexError::Integrity)?;
-            let positions = u32::from_be_bytes(
-                record.value[42..]
-                    .try_into()
-                    .map_err(|_| IndexError::Integrity)?,
-            );
+            let positions =
+                u32::from_be_bytes(value[42..].try_into().map_err(|_| IndexError::Integrity)?);
             if hash == [0; 32] || positions == 0 {
                 return Err(IndexError::InvalidFormat("v1 posting positions"));
             }
-            Ok(QueryPosting {
+            Ok(DenseSegmentPosting {
                 document,
                 material_source_version,
                 live,
@@ -826,12 +886,19 @@ pub fn encode_point(point: &QueryPoint) -> Result<QueryBlockRecord, IndexError> 
 
 pub fn decode_point(record: QueryBlockRecordRef<'_>) -> Result<QueryPoint, IndexError> {
     let (value, used) = decode_scalar_sort_key(record.key)?;
-    let document = stable_key(
-        record
-            .key
-            .get(used..)
-            .ok_or(IndexError::InvalidFormat("v1 point key"))?,
-    )?;
+    let document = if let Some(document) = record.document {
+        if used != record.key.len() {
+            return Err(IndexError::InvalidFormat("v1 point key"));
+        }
+        document
+    } else {
+        stable_key(
+            record
+                .key
+                .get(used..)
+                .ok_or(IndexError::InvalidFormat("v1 point key"))?,
+        )?
+    };
     if record.value.len() != 9 {
         return Err(IndexError::InvalidFormat("v1 point record"));
     }
@@ -910,6 +977,55 @@ pub fn encode_query_block(
     limits: QueryBlockLimits,
     credits: &mut QueryBlockCredits,
 ) -> Result<EncodedQueryBlock, IndexError> {
+    let documents = std::sync::Arc::new(document_table_for_records(kind, records)?);
+    encode_query_block_with_documents(kind, recipe, records, documents, limits, credits)
+}
+
+pub(super) fn document_table_for_records(
+    kind: QueryBlockKind,
+    records: &[QueryBlockRecord],
+) -> Result<SegmentDocumentTable, IndexError> {
+    if kind == QueryBlockKind::TermDictionary {
+        return SegmentDocumentTable::new([]);
+    }
+    SegmentDocumentTable::new_with_versions(
+        records
+            .iter()
+            .map(|record| {
+                Ok((
+                    document_key_for_record(kind, &record.key)?,
+                    if kind == QueryBlockKind::Position {
+                        0
+                    } else {
+                        read_u64(&record.value, 0)?
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, IndexError>>()?,
+    )
+}
+
+pub(super) fn document_key_for_record(
+    kind: QueryBlockKind,
+    key: &[u8],
+) -> Result<StableDocumentKey, IndexError> {
+    let key = if kind == QueryBlockKind::Point {
+        let (_, used) = decode_scalar_sort_key(key)?;
+        key.get(used..).ok_or(IndexError::Integrity)?
+    } else {
+        key
+    };
+    stable_key(key)
+}
+
+pub(super) fn encode_query_block_with_documents(
+    kind: QueryBlockKind,
+    recipe: RecipeIdentity,
+    records: &[QueryBlockRecord],
+    documents: std::sync::Arc<SegmentDocumentTable>,
+    limits: QueryBlockLimits,
+    credits: &mut QueryBlockCredits,
+) -> Result<EncodedQueryBlock, IndexError> {
     let limits = limits.validate()?;
     if records.is_empty() || records.len() > limits.maximum_records {
         return Err(IndexError::ResourceLimit {
@@ -918,7 +1034,7 @@ pub fn encode_query_block(
         });
     }
     let restart_count = records.len().div_ceil(QUERY_BLOCK_RESTART_INTERVAL);
-    let mut required: usize = 8 + 2 + 1 + 32 + 4 + 4 + 4;
+    let mut required: usize = 8 + 2 + 1 + 32 + 32 + 4 + 4 + 4;
     required = required
         .checked_add(
             restart_count
@@ -939,7 +1055,13 @@ pub fn encode_query_block(
         }
         required = required
             .checked_add(8)
-            .and_then(|bytes| bytes.checked_add(record.key.len()))
+            .and_then(|bytes| {
+                bytes.checked_add(if kind == QueryBlockKind::TermDictionary {
+                    record.key.len()
+                } else {
+                    record.key.len().checked_sub(28)?
+                })
+            })
             .and_then(|bytes| bytes.checked_add(record.value.len()))
             .ok_or(IndexError::OffsetOverflow)?;
         previous = Some(&record.key);
@@ -956,6 +1078,7 @@ pub fn encode_query_block(
     bytes.extend_from_slice(&BLOCK_FORMAT.to_be_bytes());
     bytes.push(kind as u8);
     bytes.extend_from_slice(&recipe.bytes());
+    bytes.extend_from_slice(&documents.identity());
     put_u32(&mut bytes, records.len())?;
     put_u32(&mut bytes, QUERY_BLOCK_RESTART_INTERVAL)?;
     put_u32(&mut bytes, restart_count)?;
@@ -980,7 +1103,29 @@ pub fn encode_query_block(
                 .ok_or(IndexError::OffsetOverflow)?;
             bytes[target..target + 4].copy_from_slice(&offset.to_be_bytes());
         }
-        put_bytes(&mut bytes, &record.key)?;
+        if kind == QueryBlockKind::TermDictionary {
+            put_bytes(&mut bytes, &record.key)?;
+        } else {
+            let split = record
+                .key
+                .len()
+                .checked_sub(32)
+                .ok_or(IndexError::Integrity)?;
+            if kind != QueryBlockKind::Point && split != 0 {
+                return Err(IndexError::Integrity);
+            }
+            let id = documents.id(stable_key(&record.key[split..])?)?;
+            if kind != QueryBlockKind::Position
+                && documents.material_version(id)? != read_u64(&record.value, 0)?
+            {
+                return Err(IndexError::IntegrityViolation(
+                    "segment document material version does not match field row".into(),
+                ));
+            }
+            put_u32(&mut bytes, split + 4)?;
+            bytes.extend_from_slice(&record.key[..split]);
+            bytes.extend_from_slice(&id.0.to_be_bytes());
+        }
         put_bytes(&mut bytes, &record.value)?;
     }
     if bytes.len() != required {
@@ -994,6 +1139,7 @@ pub fn encode_query_block(
         hash: *crate::profiled_blake3_hash!(&bytes).as_bytes(),
         encoded_bytes: bytes.len() as u64,
         records: u32::try_from(records.len()).map_err(|_| IndexError::OffsetOverflow)?,
+        documents,
     };
     Ok(EncodedQueryBlock { descriptor, bytes })
 }
@@ -1031,6 +1177,7 @@ impl<'a> QueryBlockCursor<'a> {
         if input.u16()? != BLOCK_FORMAT
             || QueryBlockKind::decode(input.byte()?)? != descriptor.kind
             || input.array_32()? != descriptor.recipe.bytes()
+            || input.array_32()? != descriptor.documents.identity()
         {
             return Err(IndexError::InvalidFormat("v1 query block header"));
         }
@@ -1094,12 +1241,12 @@ impl<'a> QueryBlockCursor<'a> {
             bytes: self.bytes,
             offset: self.offset,
         };
-        let key = input.bytes()?;
+        let raw_key = input.bytes()?;
         let value = input.bytes()?;
-        if key.is_empty() || self.previous.is_some_and(|previous| previous >= key) {
+        if raw_key.is_empty() || self.previous.is_some_and(|previous| previous >= raw_key) {
             return Err(IndexError::UnsortedRecords);
         }
-        self.previous = Some(key);
+        self.previous = Some(raw_key);
         self.offset = input.offset;
         self.remaining -= 1;
         self.record_index = self
@@ -1109,7 +1256,7 @@ impl<'a> QueryBlockCursor<'a> {
         if self.remaining == 0 && self.offset != self.bytes.len() {
             return Err(IndexError::InvalidFormat("v1 query block trailing bytes"));
         }
-        Ok(Some(QueryBlockRecordRef { key, value }))
+        Ok(Some(self.resolve_record(raw_key, value)?))
     }
 
     pub fn seek_to(&mut self, key: &[u8]) -> Result<Option<QueryBlockRecordRef<'a>>, IndexError> {
@@ -1117,9 +1264,12 @@ impl<'a> QueryBlockCursor<'a> {
         // document keys arrive in stable order. Keep walking from the current
         // record in that case instead of binary-searching the restart table and
         // decoding the same restart interval again for every key.
-        if self.previous.is_some_and(|previous| previous < key) {
+        if self.previous.is_some_and(|previous| {
+            self.compare_key(previous, key)
+                .is_ok_and(|order| order.is_lt())
+        }) {
             while let Some(record) = self.next()? {
-                if record.key >= key {
+                if record.compare_key(key).is_ge() {
                     return Ok(Some(record));
                 }
             }
@@ -1131,7 +1281,7 @@ impl<'a> QueryBlockCursor<'a> {
             let midpoint = lower + (upper - lower) / 2;
             let offset = restart_offset(self.bytes, self.restart_offsets_start, midpoint)?;
             let record = record_at(self.bytes, self.records_start, offset as usize)?;
-            if record.key <= key {
+            if self.compare_key(record.key, key)?.is_le() {
                 lower = midpoint + 1;
             } else {
                 upper = midpoint;
@@ -1153,7 +1303,7 @@ impl<'a> QueryBlockCursor<'a> {
             .ok_or(IndexError::Integrity)?;
         self.previous = None;
         while let Some(record) = self.next()? {
-            if record.key >= key {
+            if record.compare_key(key).is_ge() {
                 return Ok(Some(record));
             }
         }
@@ -1163,297 +1313,72 @@ impl<'a> QueryBlockCursor<'a> {
     pub const fn descriptor(&self) -> &QueryBlockDescriptor {
         self.descriptor
     }
-}
 
-impl ProjectionQueryRunDescriptor {
-    pub fn validate(&self, limits: QueryBlockLimits) -> Result<(), IndexError> {
-        limits.validate()?;
-        self.partition.validate()?;
-        self.pack_table.validate()?;
-        for (valid, invariant) in [
-            (
-                self.physical_catalog_generation != [0; 32],
-                "physical_catalog_generation",
-            ),
-            (self.sequence != 0, "sequence"),
-            (
-                self.source_start_offset < self.next_offset,
-                "source_offset_range",
-            ),
-        ] {
-            if !valid {
-                return Err(query_run_integrity(self, invariant));
-            }
-        }
-        let mut total_descriptor_key_bytes = 0usize;
-        let mut previous = None::<(&QueryBlockKind, &RecipeIdentity, &[u8], &[u8], &[u8; 32])>;
-        for block in &self.blocks {
-            if block.hash == [0; 32]
-                || block.encoded_bytes == 0
-                || usize::try_from(block.encoded_bytes)
-                    .map_or(true, |bytes| bytes > limits.maximum_block_bytes)
-                || block.records == 0
-                || block.records as usize > limits.maximum_records
-                || block.minimum_key.is_empty()
-                || block.minimum_key > block.maximum_key
-                || block.minimum_key.len() > limits.maximum_key_bytes
-                || block.maximum_key.len() > limits.maximum_key_bytes
-                || block.locator.encoded_bytes != block.encoded_bytes
-                || block.locator.logical_bytes != block.encoded_bytes
-                || block.locator.checksum != block.hash
-            {
-                return Err(IndexError::InvalidDefinition(
-                    "v1 query block descriptor is invalid".into(),
-                ));
-            }
-            if block.pack_table.as_ref() != self.pack_table.as_ref() {
-                return Err(IndexError::Integrity);
-            }
-            block.locator.resolve(&self.pack_table)?;
-            total_descriptor_key_bytes = total_descriptor_key_bytes
-                .checked_add(block.minimum_key.len())
-                .and_then(|bytes| bytes.checked_add(block.maximum_key.len()))
-                .ok_or(IndexError::OffsetOverflow)?;
-            let current = (
-                &block.kind,
-                &block.recipe,
-                block.minimum_key.as_slice(),
-                block.maximum_key.as_slice(),
-                &block.hash,
-            );
-            if previous.is_some_and(|previous| previous >= current) {
-                return Err(IndexError::InvalidDefinition(
-                    "v1 query block descriptors are not canonical order".into(),
-                ));
-            }
-            previous = Some(current);
-        }
-        if total_descriptor_key_bytes > limits.maximum_run_descriptor_bytes {
-            return Err(IndexError::ResourceLimit {
-                needed: total_descriptor_key_bytes,
-                limit: limits.maximum_run_descriptor_bytes,
+    fn resolve_record(
+        &self,
+        raw_key: &'a [u8],
+        value: &'a [u8],
+    ) -> Result<QueryBlockRecordRef<'a>, IndexError> {
+        if self.descriptor.kind == QueryBlockKind::TermDictionary {
+            return Ok(QueryBlockRecordRef {
+                key: raw_key,
+                value,
+                document: None,
             });
         }
-        Ok(())
+        let split = raw_key.len().checked_sub(4).ok_or(IndexError::Integrity)?;
+        let id = read_u32(raw_key, split)?;
+        let key = self.descriptor.documents.key(id)?;
+        if !value.is_empty()
+            && self.descriptor.kind != QueryBlockKind::Position
+            && self
+                .descriptor
+                .documents
+                .material_version(SegmentDocumentId(id))?
+                != read_u64(value, 0)?
+        {
+            return Err(IndexError::Integrity);
+        }
+        if self.descriptor.kind == QueryBlockKind::Point {
+            let scalar = &raw_key[..split];
+            let (_, used) = decode_scalar_sort_key(scalar)?;
+            if used != scalar.len() {
+                return Err(IndexError::Integrity);
+            }
+            Ok(QueryBlockRecordRef {
+                key: scalar,
+                value,
+                document: Some(stable_key(key)?),
+            })
+        } else {
+            if split != 0 {
+                return Err(IndexError::Integrity);
+            }
+            Ok(QueryBlockRecordRef {
+                key,
+                value,
+                document: None,
+            })
+        }
     }
 
-    pub fn matching_blocks<'a>(
-        &'a self,
-        kind: QueryBlockKind,
-        recipe: RecipeIdentity,
-        lower: &[u8],
-        upper: &[u8],
-    ) -> impl Iterator<Item = &'a QueryBlockDescriptor> {
-        self.blocks.iter().filter(move |block| {
-            block.kind == kind
-                && block.recipe == recipe
-                && block.maximum_key.as_slice() >= lower
-                && block.minimum_key.as_slice() <= upper
-        })
+    fn compare_key(&self, raw_key: &'a [u8], key: &[u8]) -> Result<std::cmp::Ordering, IndexError> {
+        let record = self.resolve_record(raw_key, &[])?;
+        Ok(record.compare_key(key))
     }
 }
 
-fn query_run_integrity(run: &ProjectionQueryRunDescriptor, invariant: &str) -> IndexError {
-    let generation = run
-        .physical_catalog_generation
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    IndexError::IntegrityViolation(format!(
-        "projection query run {invariant}; partition={:?}, catalog_generation={generation}, sequence={}, source_range={}..{}, blocks={}",
-        run.partition,
-        run.sequence,
-        run.source_start_offset,
-        run.next_offset,
-        run.blocks.len()
-    ))
+fn canonical_record_key(record: QueryBlockRecordRef<'_>) -> Vec<u8> {
+    let mut key = record.key.to_vec();
+    if let Some(document) = record.document {
+        key.extend_from_slice(&document.bytes());
+    }
+    key
 }
 
-pub fn encode_projection_query_run(
-    descriptor: &ProjectionQueryRunDescriptor,
-    limits: QueryBlockLimits,
-    credits: &mut QueryBlockCredits,
-) -> Result<EncodedProjectionQueryRun, IndexError> {
-    descriptor.validate(limits)?;
-    let mut required: usize = 8 + 2 + 96 + 32 + 8 * 4 + 4 + 4;
-    for pack in descriptor.pack_table.entries() {
-        required = required
-            .checked_add(4 + 4 + pack.canonical_path.len() + 8 + 32 + 8)
-            .ok_or(IndexError::OffsetOverflow)?;
-    }
-    for block in &descriptor.blocks {
-        required = required
-            .checked_add(
-                1 + 32
-                    + 8
-                    + 4
-                    + 4
-                    + block.minimum_key.len()
-                    + 4
-                    + block.maximum_key.len()
-                    + 32
-                    + 4
-                    + 8
-                    + 8
-                    + 8
-                    + 32,
-            )
-            .ok_or(IndexError::OffsetOverflow)?;
-    }
-    if required > limits.maximum_run_descriptor_bytes {
-        return Err(IndexError::ResourceLimit {
-            needed: required,
-            limit: limits.maximum_run_descriptor_bytes,
-        });
-    }
-    credits.reserve(required)?;
-    let mut bytes = Vec::with_capacity(required);
-    bytes.extend_from_slice(RUN_MAGIC);
-    bytes.extend_from_slice(&RUN_FORMAT.to_be_bytes());
-    put_partition(&mut bytes, descriptor.partition);
-    bytes.extend_from_slice(&descriptor.physical_catalog_generation);
-    put_u64(&mut bytes, descriptor.sequence);
-    put_u64(&mut bytes, descriptor.source_start_offset);
-    put_u64(&mut bytes, descriptor.next_offset);
-    put_u64(&mut bytes, descriptor.through_atomic_position);
-    put_u32(&mut bytes, descriptor.pack_table.entries().len())?;
-    for pack in descriptor.pack_table.entries() {
-        put_u32(&mut bytes, pack.ordinal as usize)?;
-        put_bytes(&mut bytes, pack.canonical_path.as_bytes())?;
-        put_u64(&mut bytes, pack.object_version);
-        bytes.extend_from_slice(&pack.hash);
-        put_u64(&mut bytes, pack.length);
-    }
-    put_u32(&mut bytes, descriptor.blocks.len())?;
-    for block in &descriptor.blocks {
-        bytes.push(block.kind as u8);
-        bytes.extend_from_slice(&block.recipe.bytes());
-        put_u64(&mut bytes, block.encoded_bytes);
-        put_u32(&mut bytes, block.records as usize)?;
-        put_bytes(&mut bytes, &block.minimum_key)?;
-        put_bytes(&mut bytes, &block.maximum_key)?;
-        bytes.extend_from_slice(&block.hash);
-        put_u32(&mut bytes, block.locator.ordinal as usize)?;
-        put_u64(&mut bytes, block.locator.offset);
-        put_u64(&mut bytes, block.locator.encoded_bytes);
-        put_u64(&mut bytes, block.locator.logical_bytes);
-        bytes.extend_from_slice(&block.locator.checksum);
-    }
-    if bytes.len() != required {
-        return Err(IndexError::Integrity);
-    }
-    Ok(EncodedProjectionQueryRun {
-        hash: *crate::profiled_blake3_hash!(&bytes).as_bytes(),
-        bytes,
-    })
-}
-
-pub fn decode_projection_query_run(
-    bytes: &[u8],
-    limits: QueryBlockLimits,
-    credits: &mut QueryBlockCredits,
-) -> Result<ProjectionQueryRunDescriptor, IndexError> {
-    let limits = limits.validate()?;
-    if bytes.len() > limits.maximum_run_descriptor_bytes {
-        return Err(IndexError::ResourceLimit {
-            needed: bytes.len(),
-            limit: limits.maximum_run_descriptor_bytes,
-        });
-    }
-    let mut input = BlockInput::new(bytes);
-    input.expect(RUN_MAGIC)?;
-    if input.u16()? != RUN_FORMAT {
-        return Err(IndexError::InvalidFormat("v1 query run format"));
-    }
-    let partition = read_partition(&mut input)?;
-    let physical_catalog_generation = input.array_32()?;
-    let sequence = input.u64()?;
-    let source_start_offset = input.u64()?;
-    let next_offset = input.u64()?;
-    let through_atomic_position = input.u64()?;
-    let pack_count = input.u32()? as usize;
-    const MINIMUM_PACK_REFERENCE_BYTES: usize = 4 + 4 + 1 + 8 + 32 + 8;
-    if pack_count > input.remaining() / MINIMUM_PACK_REFERENCE_BYTES {
-        return Err(IndexError::UnexpectedEof {
-            expected: pack_count
-                .checked_mul(MINIMUM_PACK_REFERENCE_BYTES)
-                .and_then(|size| size.checked_add(input.offset))
-                .ok_or(IndexError::OffsetOverflow)? as u64,
-            actual: input.bytes.len() as u64,
-        });
-    }
-    let mut packs = Vec::with_capacity(pack_count);
-    for _ in 0..pack_count {
-        let ordinal = input.u32()?;
-        let canonical_path = std::str::from_utf8(input.bytes()?)
-            .map_err(|_| IndexError::InvalidFormat("v1 artifact pack path"))?
-            .to_owned();
-        let object_version = input.u64()?;
-        let hash = input.array_32()?;
-        let length = input.u64()?;
-        packs.push(super::ArtifactPackReference {
-            ordinal,
-            canonical_path: std::sync::Arc::from(canonical_path),
-            object_version,
-            hash,
-            length,
-        });
-    }
-    let pack_table = std::sync::Arc::new(ArtifactPackTable::new(packs)?);
-    let count = input.u32()? as usize;
-    const MINIMUM_DESCRIPTOR_BLOCK_BYTES: usize = 1 + 32 + 8 + 4 + 4 + 4 + 32 + 4 + 8 + 8 + 8 + 32;
-    if count > input.remaining() / MINIMUM_DESCRIPTOR_BLOCK_BYTES {
-        return Err(IndexError::UnexpectedEof {
-            expected: count
-                .checked_mul(MINIMUM_DESCRIPTOR_BLOCK_BYTES)
-                .and_then(|size| size.checked_add(input.offset))
-                .ok_or(IndexError::OffsetOverflow)? as u64,
-            actual: input.bytes.len() as u64,
-        });
-    }
-    credits.reserve(bytes.len())?;
-    let mut blocks = Vec::with_capacity(count);
-    for _ in 0..count {
-        let kind = QueryBlockKind::decode(input.byte()?)?;
-        let recipe = RecipeIdentity::new(input.array_32()?)?;
-        let encoded_bytes = input.u64()?;
-        let records = input.u32()?;
-        let minimum_key = input.bytes()?.to_vec();
-        let maximum_key = input.bytes()?.to_vec();
-        let hash = input.array_32()?;
-        let locator = ArtifactPackLocator {
-            ordinal: input.u32()?,
-            offset: input.u64()?,
-            encoded_bytes: input.u64()?,
-            logical_bytes: input.u64()?,
-            checksum: input.array_32()?,
-        };
-        blocks.push(QueryBlockDescriptor {
-            kind,
-            recipe,
-            minimum_key,
-            maximum_key,
-            hash,
-            encoded_bytes,
-            records,
-            locator,
-            pack_table: pack_table.clone(),
-        });
-    }
-    input.finish()?;
-    let descriptor = ProjectionQueryRunDescriptor {
-        partition,
-        physical_catalog_generation,
-        sequence,
-        source_start_offset,
-        next_offset,
-        through_atomic_position,
-        pack_table,
-        blocks,
-    };
-    descriptor.validate(limits)?;
-    Ok(descriptor)
-}
+#[path = "query_run_codec.rs"]
+mod query_run_codec;
+pub use query_run_codec::{decode_projection_query_run, encode_projection_query_run};
 
 pub fn merge_query_block_records(
     kind: QueryBlockKind,
@@ -1484,7 +1409,10 @@ pub fn merge_query_block_records(
     let mut pending = BTreeMap::<Vec<u8>, Vec<usize>>::new();
     for (index, record) in current.iter().enumerate() {
         if let Some(record) = record {
-            pending.entry(record.key.to_vec()).or_default().push(index);
+            pending
+                .entry(canonical_record_key(*record))
+                .or_default()
+                .push(index);
         }
     }
     while let Some((_key, lanes)) = pending.pop_first() {
@@ -1493,7 +1421,10 @@ pub fn merge_query_block_records(
         for index in lanes {
             current[index] = inputs[index].next()?;
             if let Some(record) = current[index] {
-                pending.entry(record.key.to_vec()).or_default().push(index);
+                pending
+                    .entry(canonical_record_key(record))
+                    .or_default()
+                    .push(index);
             }
         }
     }
@@ -1689,7 +1620,11 @@ fn record_at<'a>(
     let mut input = BlockInput { bytes, offset };
     let key = input.bytes()?;
     let value = input.bytes()?;
-    Ok(QueryBlockRecordRef { key, value })
+    Ok(QueryBlockRecordRef {
+        key,
+        value,
+        document: None,
+    })
 }
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());

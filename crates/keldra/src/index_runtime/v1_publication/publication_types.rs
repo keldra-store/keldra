@@ -43,12 +43,6 @@ pub(crate) enum V1PublicationPredecessor<'a> {
     CatalogRebuild(VersionId),
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct ComponentRecordRequest {
-    pub(super) component: ComponentIdentity,
-    pub(super) key: StableDocumentKey,
-}
-
 #[derive(Clone, Debug)]
 pub(super) struct ArtifactBytes {
     pub(super) path: String,
@@ -86,8 +80,8 @@ pub(super) struct AtomicPublicationPlan {
     pub(super) generation: ProjectionGeneration,
     pub(super) sealed_bytes: u64,
     pub(super) source_positions: u64,
-    pub(super) state_updates: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     pub(super) _publication_credits: Option<AtomicProjectionPublicationCredits>,
+    pub(super) _compaction_metadata: Option<keldra_index::v1::IndexingMemoryPermit>,
 }
 
 /// Fully encoded deterministic successor retained across transient staging,
@@ -132,7 +126,7 @@ impl V1PostCasVerification {
     async fn finish_attempt(&mut self) -> Result<(), Status> {
         let result = match self
             .task
-            .take()
+            .as_mut()
             .expect("v1 post-CAS verifier task exists")
             .await
         {
@@ -141,6 +135,9 @@ impl V1PostCasVerification {
                 "v1 post-CAS verifier failed: {error}"
             ))),
         };
+        // Keep ownership installed across the await. Cancelling a caller must
+        // neither detach this task nor erase the mandatory readback obligation.
+        self.task.take();
         if result
             .as_ref()
             .is_err_and(|error| error.code() != tonic::Code::DataLoss)

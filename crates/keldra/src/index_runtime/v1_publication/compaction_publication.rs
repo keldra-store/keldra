@@ -18,6 +18,10 @@ impl V1ProjectionPublisher {
         compaction: V1CompactionBase,
         artifacts: V1CompactionArtifacts,
     ) -> Result<PendingV1Publication, Status> {
+        // Maintenance must use ordinary shared admission, not a source
+        // writer's promised sealing headroom. Retain it through CAS retries.
+        let metadata = compaction
+            .reserve_publication_metadata(metadata_admission_bytes(&compaction.predecessor)?)?;
         let generation = compaction_successor_generation(current, &compaction.predecessor)?;
         let encoded = encode_projection_generation(&generation).map_err(index_status)?;
         let current_record =
@@ -48,8 +52,8 @@ impl V1ProjectionPublisher {
                 generation,
                 sealed_bytes: 0,
                 source_positions: 0,
-                state_updates: Vec::new(),
                 _publication_credits: None,
+                _compaction_metadata: Some(metadata),
             },
             expected_current_version: Some(current.current_object_version),
             previous_generation_hash: Some(current.current.generation_hash),
@@ -58,6 +62,41 @@ impl V1ProjectionPublisher {
             _compaction: Some(artifacts),
         })
     }
+}
+
+/// Count the actual generation shape before allocating successor/control
+/// records. Native root entries use at most 113 wire bytes; directory children
+/// at most 106. The allowance covers Vec growth, temporary leaf/root clones,
+/// paths, B-tree nodes and conversion to the retained artifact vector.
+pub(super) fn metadata_admission_bytes(generation: &ProjectionGeneration) -> Result<usize, Status> {
+    let roots = generation.roots.len();
+    let mut level = roots.div_ceil(keldra_index::v1::COMPONENT_DIRECTORY_FANOUT);
+    let mut pages = level;
+    while level > 1 {
+        level = level.div_ceil(keldra_index::v1::COMPONENT_DIRECTORY_FANOUT);
+        pages = pages.checked_add(level).ok_or_else(metadata_overflow)?;
+    }
+    let root_storage = roots
+        .checked_mul(std::mem::size_of::<keldra_index::v1::ComponentRoot>() + 512)
+        .ok_or_else(metadata_overflow)?;
+    // A native inherited reference is 184 wire bytes plus its fixed Rust
+    // representation; both encoding growth and successor clones coexist.
+    let inherited_storage = generation
+        .inherited_partitions
+        .len()
+        .checked_mul(
+            512 + 2 * std::mem::size_of::<keldra_index::v1::ProjectionGenerationReference>(),
+        )
+        .ok_or_else(metadata_overflow)?;
+    root_storage
+        .checked_add(inherited_storage)
+        .and_then(|bytes| bytes.checked_add(pages.checked_mul(2048)?))
+        .and_then(|bytes| bytes.checked_add(8192))
+        .ok_or_else(metadata_overflow)
+}
+
+fn metadata_overflow() -> Status {
+    Status::resource_exhausted("v1 compaction publication metadata admission overflow")
 }
 
 pub(super) fn compaction_successor_generation(

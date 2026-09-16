@@ -57,6 +57,15 @@ pub struct AtomicProjectionPublicationCredits {
     _packs: ProjectionPackCredits,
 }
 
+impl AtomicProjectionPublicationCredits {
+    /// Charge temporary publisher-side validation to the existing admission,
+    /// including decoded metadata which can be larger than its wire encoding.
+    #[doc(hidden)]
+    pub fn query_validation_credits(&mut self) -> &mut QueryBlockCredits {
+        &mut self._query
+    }
+}
+
 /// Prepared atomic bytes after their opaque memory admission is split out for
 /// explicit lifetime management by the runtime publisher.
 #[derive(Debug)]
@@ -643,7 +652,7 @@ mod tests {
             fields,
         )
         .unwrap();
-        buffer.apply_state(&state, None).unwrap();
+        buffer.apply_state(&state).unwrap();
         buffer
             .seal()
             .unwrap()

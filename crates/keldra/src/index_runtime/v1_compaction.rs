@@ -1,6 +1,6 @@
 //! Bounded format-v1 LSM compaction at the partition Current boundary.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -11,8 +11,7 @@ use keldra_index::v1::{
     ComponentStreamRoot, EncodedComponentStreamPage, IndexingMemoryPermit, PackedComponentDelta,
     ProjectionGeneration, ProjectionPackCredits, ProjectionQueryStreamRoot, QUERY_RUN_PAGE_FANOUT,
     QueryBlockCredits, QueryBlockLimits, QueryRunCompactionLimits, QueryRunCompactionPlan,
-    QueryRunPage, SealedComponentDelta, TombstoneCompactionPolicy, compact_component_runs,
-    component_stream_child_hashes, decode_query_run_page, pack_component_deltas,
+    SealedComponentDelta, TombstoneCompactionPolicy, compact_component_runs, pack_component_deltas,
     prepare_encoded_query_run_compaction, projection_query_run_pack_path,
     projection_query_run_stream_page_path, projection_stream_page_path,
     select_component_compaction, select_query_run_compaction, splice_compacted_component_runs,
@@ -27,10 +26,15 @@ const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PAGE_BYTES: usize = 32 * 1024;
 const MAX_PARALLEL_COMPONENT_COMPACTIONS: usize = 4;
 
+#[path = "v1_compaction_memory.rs"]
+mod memory;
+use memory::{CompactionTreeAccess, admission_error};
+
 pub(crate) struct V1ComponentCompaction {
     pub(crate) packs: ChargedProjectionDeltaPacks,
     pub(crate) pages: Vec<EncodedComponentStreamPage>,
     proposals: Vec<V1ComponentCompactionProposal>,
+    _metadata_permits: Vec<IndexingMemoryPermit>,
 }
 
 struct V1ComponentCompactionProposal {
@@ -40,6 +44,7 @@ struct V1ComponentCompactionProposal {
 }
 
 pub(crate) struct V1CompactionPublication {
+    expected_generation_hash: [u8; 32],
     base: V1CompactionBase,
     artifacts: V1CompactionArtifacts,
 }
@@ -48,7 +53,8 @@ pub(crate) struct V1CompactionBase {
     pub(crate) predecessor: ProjectionGeneration,
     component_overlay: BTreeMap<[u8; 32], Bytes>,
     query_overlay: BTreeMap<[u8; 32], Bytes>,
-    _preload_permit: IndexingMemoryPermit,
+    access: CompactionTreeAccess,
+    cpu: IndexCpuPool,
 }
 
 pub(crate) struct V1CompactionArtifacts {
@@ -57,6 +63,10 @@ pub(crate) struct V1CompactionArtifacts {
 }
 
 impl V1CompactionPublication {
+    pub(crate) fn expected_generation_hash(&self) -> [u8; 32] {
+        self.expected_generation_hash
+    }
+
     pub(crate) fn artifacts(&self) -> &V1CompactionArtifacts {
         &self.artifacts
     }
@@ -70,126 +80,103 @@ impl V1CompactionPublication {
     /// selected inputs has already been replaced by another compaction.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn rebase_onto(
-        &mut self,
+        mut self,
         publisher: &V1ProjectionPublisher,
         storage_tenant: &str,
         bucket: &str,
         tenant_id: u64,
         bucket_id: u64,
         current: &LoadedV1ProjectionGeneration,
-    ) -> Result<bool, Status> {
-        if self.base.predecessor == current.generation {
+    ) -> Result<Option<Self>, Status> {
+        let cpu = self.base.cpu.clone();
+        let current = current.clone();
+        // Every retained allocation travels into the owned native closure;
+        // cancellation cannot uncharge queued or still-running CPU work.
+        let _ = (publisher, storage_tenant, bucket, tenant_id, bucket_id);
+        cpu.submit(move || {
+            if self.rebase_native(&current)? {
+                Ok(Some(self))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+    }
+
+    fn rebase_native(&mut self, current: &LoadedV1ProjectionGeneration) -> Result<bool, Status> {
+        if self.expected_generation_hash == current.current.generation_hash {
             return Ok(true);
         }
-        let maximum_bytes = self.base._preload_permit.bytes();
-        let partition = current.generation.partition;
         let mut rebased = current.generation.clone();
-        let mut resident = self
-            .base
-            .component_overlay
-            .values()
-            .chain(self.base.query_overlay.values())
-            .try_fold(0usize, |total, bytes| total.checked_add(bytes.len()))
-            .ok_or_else(|| Status::resource_exhausted("v1 compaction rebase bytes overflow"))?;
-        if resident > maximum_bytes {
-            return Err(Status::resource_exhausted(
-                "v1 compaction rebase exceeds its retained memory admission",
-            ));
-        }
+        let mut component_overlay = BTreeMap::new();
+        let mut query_overlay = BTreeMap::new();
         if let Some(component) = self.artifacts.component.as_mut() {
+            let mut pages = Vec::new();
             for proposal in &component.proposals {
                 let index = rebased
                     .roots
                     .binary_search_by_key(&proposal.plan.component(), |root| root.component)
-                    .map_err(|_| Status::data_loss("v1 compaction component disappeared"))?;
+                    .map_err(|_| Status::data_loss("compaction component disappeared"))?;
                 let stream = ComponentStreamRoot::from_component_root(&rebased.roots[index])
                     .map_err(index_status)?;
-                load_component_pages(
-                    publisher,
-                    storage_tenant,
-                    bucket,
-                    tenant_id,
-                    bucket_id,
-                    partition,
-                    stream,
-                    maximum_bytes,
-                    &mut resident,
-                    &mut self.base.component_overlay,
-                )
-                .await?;
-                let spliced = match splice_compacted_component_runs(
+                let access = self.base.access.clone().with_output_reservation()?;
+                let mut spliced = match splice_compacted_component_runs(
                     stream,
                     &proposal.plan,
                     &proposal.output,
                     &proposal.pack_table,
-                    |hash| {
-                        self.base
-                            .component_overlay
-                            .get(&hash)
-                            .cloned()
-                            .ok_or(keldra_index::IndexError::Integrity)
-                    },
+                    |hash| access.page(hash, false),
                 ) {
                     Ok(spliced) => spliced,
                     Err(keldra_index::IndexError::StaleProposal) => return Ok(false),
                     Err(error) => return Err(index_status(error)),
                 };
+                access.seal_output(spliced.new_pages.iter().map(|page| page.bytes.len()))?;
+                access.retain_component_pages(&mut spliced.new_pages);
                 rebased.roots[index] = spliced.root.component_root().map_err(index_status)?;
-                for page in spliced.new_pages {
-                    retain_generated_page(
-                        maximum_bytes,
-                        &mut resident,
-                        &mut self.base.component_overlay,
-                        page.hash,
-                        page.bytes.clone(),
-                    )?;
-                    component.pages.push(page);
+                for page in &spliced.new_pages {
+                    component_overlay.insert(page.hash, page.bytes.clone());
                 }
+                pages.extend(spliced.new_pages);
             }
+            component.pages = pages;
         }
         if let Some(query) = self.artifacts.query.as_mut() {
-            load_query_pages(
-                publisher,
-                storage_tenant,
-                bucket,
-                tenant_id,
-                bucket_id,
-                partition,
-                rebased.query_stream_root.stream_root_hash,
-                maximum_bytes,
-                &mut resident,
-                &mut self.base.query_overlay,
-            )
-            .await?;
-            match query.rebase(rebased.query_stream_root, |hash| {
-                self.base
-                    .query_overlay
-                    .get(&hash)
-                    .cloned()
-                    .ok_or(keldra_index::IndexError::Integrity)
-            }) {
+            let access = self.base.access.clone().with_output_reservation()?;
+            match query.rebase(rebased.query_stream_root, |hash| access.page(hash, true)) {
                 Ok(()) => {}
                 Err(keldra_index::IndexError::StaleProposal) => return Ok(false),
                 Err(error) => return Err(index_status(error)),
             }
+            access.seal_output(query.splice().pages.iter().map(|page| page.bytes.len()))?;
+            query.retain_splice_page_owner(access.output_owner());
             rebased.query_stream_root = query.splice().root;
             for page in &query.splice().pages {
-                retain_generated_page(
-                    maximum_bytes,
-                    &mut resident,
-                    &mut self.base.query_overlay,
-                    page.hash,
-                    page.bytes.clone(),
-                )?;
+                query_overlay.insert(page.hash, page.bytes.clone());
             }
         }
         rebased.validate().map_err(index_status)?;
+        // Only pages produced by this exact splice remain. Read authority is
+        // the immutable object tree; previous-generation overlays are dropped.
         self.base.predecessor = rebased;
+        self.base.component_overlay = component_overlay;
+        self.base.query_overlay = query_overlay;
+        self.expected_generation_hash = current.current.generation_hash;
         Ok(true)
     }
 }
 
 impl V1CompactionBase {
+    pub(crate) fn reserve_publication_metadata(
+        &self,
+        bytes: usize,
+    ) -> Result<IndexingMemoryPermit, Status> {
+        self.access
+            .credits
+            .acquire(keldra_index::v1::IndexingMemoryStage::WorkerScratch, bytes)
+            .map_err(|error| index_status(admission_error(error)))
+    }
     pub(crate) fn component_page(&self, hash: &[u8; 32]) -> Option<&Bytes> {
         self.component_overlay.get(hash)
     }
@@ -211,185 +198,95 @@ impl V1ProjectionPublisher {
         cpu: &IndexCpuPool,
         maximum_runs: usize,
         maximum_unmerged_bytes: usize,
-        maximum_preload_bytes: usize,
-        preload_permit: IndexingMemoryPermit,
-        raw_output_permit: IndexingMemoryPermit,
-        component_credits: ProjectionPackCredits,
-        query_credits: QueryBlockCredits,
+        credits: &keldra_index::v1::IndexingMemoryCredits,
     ) -> Result<V1CompactionPublication, Status> {
-        let compaction_started = Instant::now();
-        if preload_permit.bytes() < maximum_preload_bytes {
-            return Err(Status::resource_exhausted(
-                "v1 compaction preload exceeds its admitted memory",
-            ));
-        }
+        let started = Instant::now();
         let partition = loaded.generation.partition;
+        let access = CompactionTreeAccess {
+            publisher: self.clone(),
+            storage_tenant: storage_tenant.to_owned(),
+            bucket: bucket.to_owned(),
+            tenant_id,
+            bucket_id,
+            partition,
+            credits: credits.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            output: None,
+        };
         let component_fan_in = maximum_runs.min(COMPONENT_STREAM_DIRECTORY_FANOUT).max(2);
-        let mut predecessor = loaded.generation.clone();
-        let mut component_pages = BTreeMap::new();
-        let mut eligible = Vec::new();
-        let mut resident = 0usize;
-
-        for root in &loaded.generation.roots {
-            if root.segment_count < maximum_runs as u64
-                && root.encoded_bytes < maximum_unmerged_bytes as u64
-            {
-                continue;
-            }
-            let stream = ComponentStreamRoot::from_component_root(root).map_err(index_status)?;
-            load_component_pages(
-                self,
-                storage_tenant,
-                bucket,
-                tenant_id,
-                bucket_id,
-                partition,
-                stream,
-                maximum_preload_bytes,
-                &mut resident,
-                &mut component_pages,
-            )
-            .await?;
-            eligible.push(stream);
-        }
-
-        // Component roots are independent immutable streams. Split both the
-        // existing pack-input and output ceilings across a bounded number of
-        // jobs, retaining the former aggregate ceilings rather than multiplying
-        // either ceiling by the concurrency width.
-        let eligible_component_count = eligible.len();
-        let (compaction_parallelism, per_job_bytes) =
-            component_compaction_schedule(eligible_component_count, component_credits.remaining())?;
         let component_limits = ComponentCompactionLimits {
             l0_trigger: component_fan_in.min(8),
             maximum_input_runs: component_fan_in,
-            maximum_loaded_pack_bytes: per_job_bytes,
-            maximum_output_run_bytes: maximum_unmerged_bytes.min(per_job_bytes).max(1024),
+            maximum_loaded_pack_bytes: credits.total_limit_bytes(),
+            maximum_output_run_bytes: maximum_unmerged_bytes.min(MAX_ARTIFACT_BYTES).max(1024),
         };
-        let mut component_pages = Arc::new(component_pages);
-        let job_component_pages = Arc::clone(&component_pages);
-        let serial_streams = eligible.clone();
-        let work = eligible
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, stream)| (ordinal, stream))
-            .collect();
-        let publisher = self.clone();
-        let parallel_cpu = cpu.clone();
-        let task_storage_tenant = storage_tenant.to_owned();
-        let task_bucket = bucket.to_owned();
-        let compacted = run_bounded_ordered(work, compaction_parallelism, move |stream| {
-            let publisher = publisher.clone();
-            let cpu = parallel_cpu.clone();
-            let storage_tenant = task_storage_tenant.clone();
-            let bucket = task_bucket.clone();
-            let component_pages = Arc::clone(&job_component_pages);
+        let eligible = loaded
+            .generation
+            .roots
+            .iter()
+            .filter(|root| {
+                root.segment_count >= maximum_runs as u64
+                    || root.encoded_bytes >= maximum_unmerged_bytes as u64
+            })
+            .map(|root| ComponentStreamRoot::from_component_root(root).map_err(index_status))
+            .collect::<Result<Vec<_>, _>>()?;
+        let width = eligible
+            .len()
+            .min(MAX_PARALLEL_COMPONENT_COMPACTIONS)
+            .max(1);
+        let work = eligible.into_iter().enumerate().collect();
+        let job_access = access.clone();
+        let job_cpu = cpu.clone();
+        let outputs = run_bounded_ordered(work, width, move |stream| {
+            let access = job_access.clone();
+            let cpu = job_cpu.clone();
             async move {
-                let runtime = tokio::runtime::Handle::current();
-                let result = cpu
-                    .submit(move || {
-                        compact_component_stream(
-                            &runtime,
-                            &publisher,
-                            &storage_tenant,
-                            &bucket,
-                            tenant_id,
-                            bucket_id,
-                            stream,
-                            &component_pages,
-                            component_limits,
-                        )
-                    })
-                    .await
-                    .map_err(|error| Status::internal(error.to_string()))
-                    .and_then(|result| result);
-                (stream, result)
+                cpu.submit(move || {
+                    compact_component_stream_accounted(&access, stream, component_limits)
+                })
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?
             }
         })
         .await?;
-        let serial_component_limits = ComponentCompactionLimits {
-            l0_trigger: component_fan_in.min(8),
-            maximum_input_runs: component_fan_in,
-            maximum_loaded_pack_bytes: component_credits.remaining(),
-            maximum_output_run_bytes: maximum_unmerged_bytes
-                .min(component_credits.remaining())
-                .max(1024),
-        };
-        let mut selected = Vec::<(ComponentCompactionPlan, ComponentStreamRoot)>::new();
+        let mut plans = Vec::new();
         let mut sealed = Vec::new();
-        if let Some(error) = compacted.iter().find_map(|(_, (_, result))| {
-            result
-                .as_ref()
-                .err()
-                .filter(|error| error.code() != tonic::Code::ResourceExhausted)
-        }) {
-            return Err(error.clone());
-        }
-        let retry_serially = compaction_parallelism > 1
-            && compacted.iter().any(|(_, (_, result))| {
-                result
-                    .as_ref()
-                    .is_err_and(|error| error.code() == tonic::Code::ResourceExhausted)
-            });
-        if retry_serially {
-            // Discard every fair-share result before retrying. The old full
-            // budget must not overlap retained sibling output, or a fallback
-            // intended to preserve progress would exceed the charged ceiling.
-            drop(compacted);
-            for stream in serial_streams {
-                let runtime = tokio::runtime::Handle::current();
-                let publisher = self.clone();
-                let storage_tenant = storage_tenant.to_owned();
-                let bucket = bucket.to_owned();
-                let pages = Arc::clone(&component_pages);
-                let compacted = cpu
-                    .submit(move || {
-                        compact_component_stream(
-                            &runtime,
-                            &publisher,
-                            &storage_tenant,
-                            &bucket,
-                            tenant_id,
-                            bucket_id,
-                            stream,
-                            &pages,
-                            serial_component_limits,
-                        )
-                    })
-                    .await
-                    .map_err(|error| Status::internal(error.to_string()))??;
-                if let Some((plan, output)) = compacted {
-                    selected.push((plan, stream));
-                    sealed.extend(output);
-                }
-            }
-        } else {
-            for (_, (stream, result)) in compacted {
-                if let Some((plan, output)) = result? {
-                    selected.push((plan, stream));
-                    sealed.extend(output);
-                }
+        let mut raw_owners = Vec::new();
+        for (_, output) in outputs {
+            let output = match output {
+                Ok(output) => output,
+                // Publish independently admitted siblings instead of dropping
+                // useful work when their concurrent neighbour lacked scratch.
+                Err(error) if error.code() == tonic::Code::ResourceExhausted => continue,
+                Err(error) => return Err(error),
+            };
+            if let Some((plan, stream, output, permit)) = output {
+                plans.push((plan, stream));
+                sealed.extend(output);
+                raw_owners.push(permit);
             }
         }
-        let raw_output_bytes = sealed.iter().try_fold(0_usize, |total, delta| {
-            total
-                .checked_add(delta.bytes.len())
-                .ok_or_else(|| Status::resource_exhausted("v1 compacted output bytes overflow"))
-        })?;
-        if raw_output_bytes > raw_output_permit.bytes() {
-            return Err(Status::resource_exhausted(
-                "v1 compacted raw output exceeds its admitted memory",
-            ));
-        }
-
-        let compacted_component_count = selected.len();
-        let component = if selected.is_empty() {
-            drop(component_credits);
+        let mut predecessor = loaded.generation.clone();
+        let mut component_overlay = BTreeMap::new();
+        let mut query_overlay = BTreeMap::new();
+        let component = if plans.is_empty() {
             None
         } else {
-            let packs = pack_component_deltas(sealed, component_credits).map_err(index_status)?;
-            drop(raw_output_permit);
-            let pack_table = self
+            let packed_bytes = sealed
+                .iter()
+                .try_fold(0usize, |total, delta| total.checked_add(delta.bytes.len()))
+                .ok_or_else(|| Status::resource_exhausted("compaction output size overflow"))?;
+            // Destination and raw output coexist during packing.
+            let permit = credits
+                .acquire(
+                    keldra_index::v1::IndexingMemoryStage::WorkerScratch,
+                    packed_bytes,
+                )
+                .map_err(|error| index_status(admission_error(error)))?;
+            let packs =
+                pack_component_deltas(sealed, ProjectionPackCredits::from_pipeline_permit(permit))
+                    .map_err(index_status)?;
+            let table = self
                 .publish_component_packs(
                     storage_tenant,
                     bucket,
@@ -399,10 +296,9 @@ impl V1ProjectionPublisher {
                     &packs.packs,
                 )
                 .await?;
-            let mut replacements = Vec::new();
             let mut proposals = Vec::new();
             let mut pages = Vec::new();
-            for (plan, stream) in selected {
+            for (plan, stream) in plans {
                 let output = packs
                     .packs
                     .iter()
@@ -410,253 +306,353 @@ impl V1ProjectionPublisher {
                     .filter(|delta| delta.component == plan.component())
                     .cloned()
                     .collect::<Vec<_>>();
-                let spliced =
-                    splice_compacted_component_runs(stream, &plan, &output, &pack_table, |hash| {
-                        component_pages
-                            .get(&hash)
-                            .cloned()
-                            .ok_or(keldra_index::IndexError::Integrity)
+                let splice_plan = plan.clone();
+                let splice_output = output.clone();
+                let splice_table = table.clone();
+                let splice_access = access.clone();
+                let (spliced, _owner) = cpu
+                    .submit(move || {
+                        let access = splice_access.with_output_reservation()?;
+                        let mut spliced = splice_compacted_component_runs(
+                            stream,
+                            &splice_plan,
+                            &splice_output,
+                            &splice_table,
+                            |hash| access.page(hash, false),
+                        )
+                        .map_err(index_status)?;
+                        access
+                            .seal_output(spliced.new_pages.iter().map(|page| page.bytes.len()))?;
+                        access.retain_component_pages(&mut spliced.new_pages);
+                        Ok::<_, Status>((spliced, access.output_owner()))
                     })
-                    .map_err(index_status)?;
-                replacements.push(spliced.root.component_root().map_err(index_status)?);
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))??;
+                let index = predecessor
+                    .roots
+                    .binary_search_by_key(&plan.component(), |root| root.component)
+                    .map_err(|_| Status::data_loss("compacted component disappeared"))?;
+                predecessor.roots[index] = spliced.root.component_root().map_err(index_status)?;
+                for page in &spliced.new_pages {
+                    component_overlay.insert(page.hash, page.bytes.clone());
+                }
                 pages.extend(spliced.new_pages);
                 proposals.push(V1ComponentCompactionProposal {
                     plan,
                     output,
-                    pack_table: pack_table.clone(),
+                    pack_table: table.clone(),
                 });
             }
-            for replacement in replacements {
-                let index = predecessor
-                    .roots
-                    .binary_search_by_key(&replacement.component, |root| root.component)
-                    .map_err(|_| Status::data_loss("v1 compacted component is absent"))?;
-                predecessor.roots[index] = replacement;
+            let metadata_bytes = proposals
+                .iter()
+                .try_fold(
+                    proposals.capacity() * std::mem::size_of::<V1ComponentCompactionProposal>(),
+                    |total, proposal| {
+                        total
+                            .checked_add(component_plan_resident_bytes(&proposal.plan).ok()?)
+                            .and_then(|value| {
+                                value.checked_add(
+                                    proposal.output.capacity()
+                                        * std::mem::size_of::<PackedComponentDelta>(),
+                                )
+                            })
+                    },
+                )
+                .and_then(|value| value.checked_add(table.resident_bytes()))
+                .and_then(|value| {
+                    value.checked_add(
+                        packs.packs.capacity()
+                            * std::mem::size_of::<keldra_index::v1::SealedProjectionDeltaPack>(),
+                    )
+                })
+                .and_then(|value| {
+                    value.checked_add(
+                        packs
+                            .packs
+                            .iter()
+                            .map(|pack| {
+                                pack.deltas.capacity() * std::mem::size_of::<PackedComponentDelta>()
+                            })
+                            .sum::<usize>(),
+                    )
+                })
+                .ok_or_else(|| Status::resource_exhausted("merge metadata size overflow"))?;
+            // Raw encoded outputs have been consumed. Retain their original
+            // accounted owner only for the proposal/pack metadata now alive.
+            let mut remaining = metadata_bytes;
+            for owner in &mut raw_owners {
+                let charge = remaining.min(owner.bytes());
+                owner.shrink_to(charge).map_err(index_status)?;
+                remaining -= charge;
             }
-            for page in &pages {
-                retain_generated_page(
-                    maximum_preload_bytes,
-                    &mut resident,
-                    Arc::make_mut(&mut component_pages),
-                    page.hash,
-                    page.bytes.clone(),
-                )?;
+            if remaining != 0 {
+                return Err(Status::data_loss(
+                    "merge metadata exceeded construction admission",
+                ));
             }
             Some(V1ComponentCompaction {
                 packs,
                 pages,
                 proposals,
+                _metadata_permits: raw_owners,
             })
         };
-
         let query = if loaded.generation.query_stream_root.run_count >= maximum_runs as u64 {
-            let mut query_pages = BTreeMap::new();
-            load_query_pages(
-                self,
-                storage_tenant,
-                bucket,
-                tenant_id,
-                bucket_id,
-                partition,
-                loaded.generation.query_stream_root.stream_root_hash,
-                maximum_preload_bytes,
-                &mut resident,
-                &mut query_pages,
-            )
-            .await?;
-            let block_limits = QueryBlockLimits::default_for_memory();
-            let query_fan_in = maximum_runs
-                .min(QUERY_RUN_PAGE_FANOUT)
-                .min(block_limits.maximum_loaded_blocks)
-                .max(2);
-            let limits = QueryRunCompactionLimits {
-                level_trigger: query_fan_in.min(8),
-                maximum_input_runs: query_fan_in,
-            };
-            let plan = select_query_run_compaction(
-                loaded.generation.query_stream_root,
-                |hash| {
-                    query_pages
-                        .get(&hash)
-                        .cloned()
-                        .ok_or(keldra_index::IndexError::Integrity)
-                },
-                limits,
-            )
-            .map_err(index_status)?
-            .ok_or_else(|| {
-                Status::resource_exhausted("v1 query LSM has no bounded compaction window")
-            })?;
-            let runtime = tokio::runtime::Handle::current();
-            let publisher = self.clone();
-            let storage_tenant = storage_tenant.to_owned();
-            let bucket = bucket.to_owned();
-            let cpu_query_pages = query_pages.clone();
-            let query_stream_root = loaded.generation.query_stream_root;
-            let physical_catalog_generation = loaded.generation.physical_catalog_generation;
+            let query_access = access.clone();
+            let previous = loaded.generation.query_stream_root;
+            let physical_generation = loaded.generation.physical_catalog_generation;
             let compacted = cpu
                 .submit(move || {
-                    compact_query_stream(
-                        &runtime,
-                        &publisher,
-                        &storage_tenant,
-                        &bucket,
-                        tenant_id,
-                        bucket_id,
-                        query_stream_root,
+                    let limits = QueryBlockLimits::default_for_memory();
+                    let fan_in = maximum_runs
+                        .min(QUERY_RUN_PAGE_FANOUT)
+                        .min(limits.maximum_loaded_blocks)
+                        .max(2);
+                    let candidate_bytes = fan_in
+                        .checked_mul(2 * std::mem::size_of::<keldra_index::v1::QueryRunReference>())
+                        .ok_or_else(|| {
+                            Status::resource_exhausted("query merge candidate bytes overflow")
+                        })?;
+                    let permit = query_access
+                        .credits
+                        .acquire(
+                            keldra_index::v1::IndexingMemoryStage::OrderingCatalog,
+                            candidate_bytes,
+                        )
+                        .map_err(|error| index_status(admission_error(error)))?;
+                    let plan = select_query_run_compaction(
+                        previous,
+                        |hash| query_access.page(hash, true),
+                        QueryRunCompactionLimits {
+                            level_trigger: fan_in.min(8),
+                            maximum_input_runs: fan_in,
+                        },
+                    )
+                    .map_err(index_status)?
+                    .ok_or_else(|| Status::resource_exhausted("no bounded query merge window"))?;
+                    let mut query_credits = QueryBlockCredits::from_growable_pipeline_permit(
+                        permit,
+                        query_access.credits.total_limit_bytes(),
+                    )
+                    .map_err(index_status)?;
+                    query_credits
+                        .reserve(
+                            plan.inputs_newest_first().len()
+                                * 2
+                                * std::mem::size_of::<keldra_index::v1::QueryRunReference>(),
+                        )
+                        .map_err(index_status)?;
+                    let access = query_access.with_output_reservation()?;
+                    let mut compacted = compact_query_stream(
+                        &access.runtime,
+                        &access.publisher,
+                        &access.storage_tenant,
+                        &access.bucket,
+                        access.tenant_id,
+                        access.bucket_id,
+                        previous,
                         plan,
                         partition,
-                        physical_catalog_generation,
-                        block_limits,
+                        physical_generation,
+                        limits,
                         query_credits,
-                        &cpu_query_pages,
-                    )
+                        &access,
+                    )?;
+                    access.seal_output(
+                        compacted.splice().pages.iter().map(|page| page.bytes.len()),
+                    )?;
+                    compacted.retain_splice_page_owner(access.output_owner());
+                    Ok::<_, Status>((compacted, access.output_owner()))
                 })
                 .await
-                .map_err(|error| Status::internal(error.to_string()))??;
-            predecessor.query_stream_root = compacted.splice().root;
-            for page in &compacted.splice().pages {
-                retain_generated_page(
-                    maximum_preload_bytes,
-                    &mut resident,
-                    &mut query_pages,
-                    page.hash,
-                    page.bytes.clone(),
-                )?;
+                .map_err(|error| Status::internal(error.to_string()))?;
+            match compacted {
+                Ok((compacted, owner)) => {
+                    let _owner = owner;
+                    predecessor.query_stream_root = compacted.splice().root;
+                    for page in &compacted.splice().pages {
+                        query_overlay.insert(page.hash, page.bytes.clone());
+                    }
+                    Some(compacted)
+                }
+                Err(error) if error.code() == tonic::Code::ResourceExhausted => None,
+                Err(error) => return Err(error),
             }
-            Some((compacted, query_pages))
         } else {
-            drop(query_credits);
             None
         };
+        if component.is_none() && query.is_none() {
+            return Err(Status::resource_exhausted(
+                "no merge window admitted by shared working memory",
+            ));
+        }
         predecessor.validate().map_err(index_status)?;
-        let (query, query_overlay) = query
-            .map(|(compaction, pages)| (Some(compaction), pages))
-            .unwrap_or_default();
         tracing::info!(
-            histogram.keldra_index_v1_compaction_duration_seconds =
-                compaction_started.elapsed().as_secs_f64(),
-            eligible_component_streams = eligible_component_count,
-            compacted_component_streams = compacted_component_count,
-            component_parallelism = compaction_parallelism,
+            histogram.keldra_index_v1_compaction_duration_seconds = started.elapsed().as_secs_f64(),
+            component_parallelism = width,
             query_compacted = query.is_some(),
             "keldra_index_v1_compaction"
         );
         Ok(V1CompactionPublication {
+            expected_generation_hash: loaded.current.generation_hash,
             base: V1CompactionBase {
                 predecessor,
-                component_overlay: Arc::try_unwrap(component_pages)
-                    .unwrap_or_else(|pages| (*pages).clone()),
+                component_overlay,
                 query_overlay,
-                _preload_permit: preload_permit,
+                access,
+                cpu: cpu.clone(),
             },
             artifacts: V1CompactionArtifacts { component, query },
         })
     }
 }
 
-/// Retain one newly encoded page under the same exact admission as loaded
-/// pages. The page owner and overlay share one `Bytes` allocation; duplicate
-/// content hashes therefore neither allocate nor consume admission twice.
-fn retain_generated_page(
-    maximum_bytes: usize,
-    resident: &mut usize,
-    overlay: &mut BTreeMap<[u8; 32], Bytes>,
-    hash: [u8; 32],
-    bytes: Bytes,
-) -> Result<(), Status> {
-    if let Some(existing) = overlay.get(&hash) {
-        if existing != &bytes {
-            return Err(Status::data_loss(
-                "v1 compaction page hash names conflicting encoded bytes",
-            ));
-        }
-        return Ok(());
-    }
-    let retained = resident
-        .checked_add(bytes.len())
-        .ok_or_else(|| Status::resource_exhausted("v1 compaction retained bytes overflow"))?;
-    if retained > maximum_bytes {
-        return Err(Status::resource_exhausted(
-            "v1 compaction generated pages exceed retained memory admission",
-        ));
-    }
-    overlay.insert(hash, bytes);
-    *resident = retained;
-    Ok(())
-}
-
-fn component_compaction_schedule(
-    eligible: usize,
-    available_bytes: usize,
-) -> Result<(usize, usize), Status> {
-    if eligible != 0 && available_bytes < 1024 {
-        return Err(Status::resource_exhausted(
-            "v1 component compaction has less than its minimum admitted memory",
-        ));
-    }
-    let maximum_memory_jobs = available_bytes.saturating_div(1024).max(1);
-    let parallelism = eligible
-        .min(MAX_PARALLEL_COMPONENT_COMPACTIONS)
-        .min(maximum_memory_jobs)
-        .max(1);
-    let per_job_bytes = available_bytes.saturating_div(parallelism);
-    Ok((parallelism, per_job_bytes))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compact_component_stream(
-    runtime: &tokio::runtime::Handle,
-    publisher: &V1ProjectionPublisher,
-    storage_tenant: &str,
-    bucket: &str,
-    tenant_id: u64,
-    bucket_id: u64,
+fn compact_component_stream_accounted(
+    access: &CompactionTreeAccess,
     stream: ComponentStreamRoot,
-    component_pages: &BTreeMap<[u8; 32], Bytes>,
     limits: ComponentCompactionLimits,
-) -> Result<Option<(ComponentCompactionPlan, Vec<SealedComponentDelta>)>, Status> {
-    let read_failure = Arc::new(Mutex::new(None));
-    let plan = select_component_compaction(
-        stream,
-        |hash| {
-            component_pages
-                .get(&hash)
-                .cloned()
-                .ok_or(keldra_index::IndexError::Integrity)
-        },
-        limits,
-    )
-    .map_err(index_status)?;
+) -> Result<
+    Option<(
+        ComponentCompactionPlan,
+        ComponentStreamRoot,
+        Vec<SealedComponentDelta>,
+        IndexingMemoryPermit,
+    )>,
+    Status,
+> {
+    // Selected descriptors and their single-pack table allocations survive
+    // the traversal stack. Admit the bounded candidate collection before the
+    // selector allocates it; never let escaped table Arcs outlive accounting.
+    let path_bytes = keldra_index::v1::projection_pack_path(access.partition, [0; 32]).len();
+    let candidate_bytes = limits
+        .maximum_input_runs
+        .checked_mul(2)
+        .and_then(|count| {
+            count.checked_mul(
+                std::mem::size_of::<keldra_index::v1::ComponentSegmentDescriptor>()
+                    + std::mem::size_of::<keldra_index::v1::ArtifactPackReference>()
+                    + path_bytes
+                    + 32,
+            )
+        })
+        .ok_or_else(|| Status::resource_exhausted("merge candidate metadata bound overflow"))?;
+    let mut permit = access
+        .credits
+        .acquire(
+            keldra_index::v1::IndexingMemoryStage::WorkerScratch,
+            candidate_bytes,
+        )
+        .map_err(|error| index_status(admission_error(error)))?;
+    let plan = select_component_compaction(stream, |hash| access.page(hash, false), limits)
+        .map_err(index_status)?;
     let Some(plan) = plan else {
         return Ok(None);
     };
+    let mut identities = BTreeSet::new();
+    let mut pack_bytes = 0usize;
+    let mut record_bytes = 0usize;
+    let mut records = 0usize;
+    for run in plan.input_runs() {
+        let reference = run.pack_reference().map_err(index_status)?;
+        if identities.insert((reference.hash, reference.object_version, reference.length)) {
+            pack_bytes = pack_bytes
+                .checked_add(usize::try_from(reference.length).map_err(|_| {
+                    Status::resource_exhausted("merge pack length exceeds platform")
+                })?)
+                .ok_or_else(|| Status::resource_exhausted("merge pack size overflow"))?;
+        }
+        record_bytes =
+            record_bytes
+                .checked_add(usize::try_from(run.locator.encoded_bytes).map_err(|_| {
+                    Status::resource_exhausted("merge record length exceeds platform")
+                })?)
+                .ok_or_else(|| Status::resource_exhausted("merge record size overflow"))?;
+        records =
+            records
+                .checked_add(usize::try_from(run.records).map_err(|_| {
+                    Status::resource_exhausted("merge record count exceeds platform")
+                })?)
+                .ok_or_else(|| Status::resource_exhausted("merge record count overflow"))?;
+    }
+    // Input Bytes and the component cursor's Vec copy can coexist. Resident
+    // replacement-map records use the same 160-byte charge as the native merge;
+    // each record additionally bounds a worst-case standalone encoded header
+    // and restart entry. This is selected-input-sized construction headroom.
+    let needed = pack_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(record_bytes.checked_mul(2)?))
+        .and_then(|value| value.checked_add(records.checked_mul(160 + 119 + 16)?))
+        .and_then(|value| value.checked_add(component_plan_resident_bytes(&plan).ok()?))
+        .ok_or_else(|| Status::resource_exhausted("merge construction bound overflow"))?;
+    permit.grow_to(needed).map_err(|error| {
+        tracing::debug!(
+            counter.keldra_index_v1_compaction_admission_refused_total = 1_u64,
+            "keldra_index_v1_compaction_admission"
+        );
+        index_status(admission_error(error))
+    })?;
+    tracing::debug!(
+        histogram.keldra_index_v1_compaction_selected_input_bytes = pack_bytes as f64,
+        histogram.keldra_index_v1_compaction_selected_fan_in = plan.input_count() as f64,
+        "keldra_index_v1_compaction_selected"
+    );
+    let failures = Arc::new(Mutex::new(None));
     let output = compact_component_runs(
         &plan,
         limits,
         TombstoneCompactionPolicy::Retain,
         |reference| {
             blocking_pack(
-                runtime,
-                &read_failure,
-                publisher,
-                storage_tenant,
-                bucket,
-                tenant_id,
-                bucket_id,
+                &access.runtime,
+                &failures,
+                &access.publisher,
+                &access.storage_tenant,
+                &access.bucket,
+                access.tenant_id,
+                access.bucket_id,
                 reference,
             )
         },
     );
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            return Err(
-                recorded_artifact_failure(&read_failure).unwrap_or_else(|| index_status(error))
-            );
-        }
-    };
-    Ok(Some((plan, output)))
+    let output = output.map_err(|error| {
+        recorded_artifact_failure(&failures).unwrap_or_else(|| index_status(error))
+    })?;
+    let retained = output
+        .iter()
+        .try_fold(
+            output.capacity() * std::mem::size_of::<SealedComponentDelta>(),
+            |total, delta| total.checked_add(delta.bytes.capacity()),
+        )
+        .and_then(|value| value.checked_add(component_plan_resident_bytes(&plan).ok()?))
+        .ok_or_else(|| Status::resource_exhausted("merge retained output size overflow"))?;
+    if retained > permit.bytes() {
+        return Err(Status::data_loss(
+            "component merge exceeded its proven construction bound",
+        ));
+    }
+    permit.shrink_to(retained).map_err(index_status)?;
+    Ok(Some((plan, stream, output, permit)))
+}
+
+fn component_plan_resident_bytes(plan: &ComponentCompactionPlan) -> Result<usize, Status> {
+    let mut tables = BTreeSet::new();
+    plan.input_runs().iter().try_fold(
+        plan.input_count()
+            * 2
+            * std::mem::size_of::<keldra_index::v1::ComponentSegmentDescriptor>(),
+        |total, run| {
+            let heap = if tables.insert(run.pack_table.entries().as_ptr() as usize) {
+                run.pack_table
+                    .resident_bytes()
+                    .saturating_sub(std::mem::size_of::<ArtifactPackTable>())
+            } else {
+                0
+            };
+            total
+                .checked_add(heap)
+                .ok_or_else(|| Status::resource_exhausted("merge plan metadata size overflow"))
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -673,7 +669,7 @@ fn compact_query_stream(
     physical_catalog_generation: [u8; 32],
     limits: QueryBlockLimits,
     credits: QueryBlockCredits,
-    query_pages: &BTreeMap<[u8; 32], Bytes>,
+    access: &CompactionTreeAccess,
 ) -> Result<ChargedQueryRunCompaction, Status> {
     let read_failure = Arc::new(Mutex::new(None));
     let prepared = prepare_encoded_query_run_compaction(
@@ -727,114 +723,8 @@ fn compact_query_stream(
         prepared.packs(),
     ))?;
     prepared
-        .finalize(pack_table, |hash| {
-            query_pages
-                .get(&hash)
-                .cloned()
-                .ok_or(keldra_index::IndexError::Integrity)
-        })
+        .finalize(pack_table, |hash| access.page(hash, true))
         .map_err(index_status)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn load_component_pages(
-    publisher: &V1ProjectionPublisher,
-    storage_tenant: &str,
-    bucket: &str,
-    tenant_id: u64,
-    bucket_id: u64,
-    partition: keldra_index::v1::ProjectionPartitionIdentity,
-    root: ComponentStreamRoot,
-    maximum_bytes: usize,
-    resident: &mut usize,
-    pages: &mut BTreeMap<[u8; 32], Bytes>,
-) -> Result<(), Status> {
-    let mut pending = VecDeque::from([root.root_hash]);
-    while let Some(hash) = pending.pop_front() {
-        if pages.contains_key(&hash) {
-            continue;
-        }
-        let bytes = read_artifact(
-            publisher,
-            storage_tenant,
-            bucket,
-            tenant_id,
-            bucket_id,
-            projection_stream_page_path(partition, hash),
-            hash,
-            MAX_PAGE_BYTES,
-        )
-        .await?;
-        charge_preload(
-            resident,
-            bytes.len(),
-            maximum_bytes,
-            "v1 compaction page preload exceeds memory bound",
-        )?;
-        pending
-            .extend(component_stream_child_hashes(root.component, &bytes).map_err(index_status)?);
-        pages.insert(hash, Bytes::from(bytes));
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn load_query_pages(
-    publisher: &V1ProjectionPublisher,
-    storage_tenant: &str,
-    bucket: &str,
-    tenant_id: u64,
-    bucket_id: u64,
-    partition: keldra_index::v1::ProjectionPartitionIdentity,
-    root: [u8; 32],
-    maximum_bytes: usize,
-    resident: &mut usize,
-    pages: &mut BTreeMap<[u8; 32], Bytes>,
-) -> Result<(), Status> {
-    let mut pending = VecDeque::from([root]);
-    let mut visited = BTreeSet::new();
-    while let Some(hash) = pending.pop_front() {
-        if !visited.insert(hash) {
-            continue;
-        }
-        let bytes = read_artifact(
-            publisher,
-            storage_tenant,
-            bucket,
-            tenant_id,
-            bucket_id,
-            projection_query_run_stream_page_path(partition, hash),
-            hash,
-            MAX_PAGE_BYTES,
-        )
-        .await?;
-        charge_preload(
-            resident,
-            bytes.len(),
-            maximum_bytes,
-            "v1 query compaction page preload exceeds memory bound",
-        )?;
-        if let QueryRunPage::Branch(children) =
-            decode_query_run_page(&bytes).map_err(index_status)?
-        {
-            pending.extend(children.into_iter().map(|child| child.hash));
-        }
-        pages.insert(hash, Bytes::from(bytes));
-    }
-    Ok(())
-}
-
-fn charge_preload(
-    resident: &mut usize,
-    bytes: usize,
-    maximum_bytes: usize,
-    message: &'static str,
-) -> Result<(), Status> {
-    *resident = resident
-        .checked_add(bytes)
-        .filter(|resident| *resident <= maximum_bytes)
-        .ok_or_else(|| Status::resource_exhausted(message))?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -935,24 +825,32 @@ fn blocking_query_block(
     descriptor: &keldra_index::v1::QueryBlockDescriptor,
 ) -> Result<Vec<u8>, keldra_index::IndexError> {
     let pack = descriptor.pack_reference()?;
-    let bytes = blocking_pack(
-        runtime,
-        read_failure,
-        publisher,
-        storage_tenant,
-        bucket,
-        tenant_id,
-        bucket_id,
-        pack,
-    )?;
-    let range = descriptor.locator.range()?;
-    let block = bytes
-        .get(range)
-        .ok_or(keldra_index::IndexError::Integrity)?;
-    if *keldra_index::profiled_blake3_hash!(block).as_bytes() != descriptor.hash {
+    let bytes = runtime
+        .block_on(
+            publisher.read_exact_artifact_pack_range(
+                storage_tenant,
+                bucket,
+                tenant_id,
+                bucket_id,
+                pack,
+                descriptor.locator.offset,
+                descriptor.locator.encoded_bytes,
+                usize::try_from(descriptor.encoded_bytes)
+                    .map_err(|_| keldra_index::IndexError::OffsetOverflow)?,
+                descriptor.hash,
+                None,
+            ),
+        )
+        .map_err(|error| {
+            *read_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
+            keldra_index::IndexError::Io(error.to_string())
+        })?;
+    if *keldra_index::profiled_blake3_hash!(&bytes).as_bytes() != descriptor.hash {
         return Err(keldra_index::IndexError::Integrity);
     }
-    Ok(block.to_vec())
+    Ok(bytes.to_vec())
 }
 
 fn recorded_artifact_failure(read_failure: &Arc<Mutex<Option<Status>>>) -> Option<Status> {
@@ -964,9 +862,12 @@ fn recorded_artifact_failure(read_failure: &Arc<Mutex<Option<Status>>>) -> Optio
 
 pub(super) fn index_status(error: keldra_index::IndexError) -> Status {
     match error {
+        keldra_index::IndexError::DeadlineExceeded => Status::deadline_exceeded(error.to_string()),
+        keldra_index::IndexError::AdmissionDenied(message) => Status::resource_exhausted(message),
         keldra_index::IndexError::ResourceLimit { .. } => {
             Status::resource_exhausted(error.to_string())
         }
+        keldra_index::IndexError::Io(message) => Status::unavailable(message),
         _ => Status::data_loss(error.to_string()),
     }
 }
@@ -993,77 +894,11 @@ mod tests {
     }
 
     #[test]
-    fn component_compaction_schedule_is_bounded_and_preserves_single_job_budget() {
-        assert_eq!(
-            component_compaction_schedule(1, 64 * 1024).unwrap(),
-            (1, 64 * 1024)
-        );
-        assert_eq!(
-            component_compaction_schedule(8, 64 * 1024).unwrap(),
-            (4, 16 * 1024)
-        );
-        assert_eq!(
-            component_compaction_schedule(4, 2 * 1024).unwrap(),
-            (2, 1024)
-        );
-
-        let (parallelism, per_job_bytes) = component_compaction_schedule(8, 64 * 1024).unwrap();
-        assert!(parallelism <= MAX_PARALLEL_COMPONENT_COMPACTIONS);
-        assert!(parallelism * per_job_bytes <= 64 * 1024);
-    }
-
-    #[test]
-    fn component_compaction_schedule_never_manufactures_memory() {
-        let error = component_compaction_schedule(1, 1023).unwrap_err();
-        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(component_compaction_schedule(0, 0).unwrap(), (1, 0));
-    }
-
-    #[test]
     fn recorded_artifact_status_preserves_retryability() {
         let failure = Arc::new(Mutex::new(Some(Status::unavailable("retry"))));
         let recovered = recorded_artifact_failure(&failure).unwrap();
         assert_eq!(recovered.code(), tonic::Code::Unavailable);
         assert!(recorded_artifact_failure(&failure).is_none());
-    }
-
-    #[test]
-    fn preload_charge_is_shared_across_component_and_query_phases() {
-        let mut resident = 0;
-        charge_preload(&mut resident, 600, 1024, "component").unwrap();
-        let error = charge_preload(&mut resident, 425, 1024, "query").unwrap_err();
-        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(resident, 600);
-    }
-
-    #[test]
-    fn generated_page_is_shared_and_charged_once() {
-        let mut resident = 7;
-        let mut overlay = BTreeMap::new();
-        let page = Bytes::from_static(b"generated page");
-        retain_generated_page(64, &mut resident, &mut overlay, [8; 32], page.clone()).unwrap();
-        assert_eq!(resident, 7 + page.len());
-        assert_eq!(overlay[&[8; 32]].as_ptr(), page.as_ptr());
-
-        retain_generated_page(64, &mut resident, &mut overlay, [8; 32], page).unwrap();
-        assert_eq!(resident, 7 + b"generated page".len());
-    }
-
-    #[test]
-    fn generated_page_cannot_exceed_retained_admission() {
-        let mut resident = 7;
-        let mut overlay = BTreeMap::new();
-        let error = retain_generated_page(
-            8,
-            &mut resident,
-            &mut overlay,
-            [8; 32],
-            Bytes::from_static(b"two bytes"),
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(resident, 7);
-        assert!(overlay.is_empty());
     }
 
     fn partition() -> ProjectionPartitionIdentity {

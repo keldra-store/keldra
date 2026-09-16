@@ -2,8 +2,8 @@ use super::*;
 use crate::typed_json::{AggregateOperation, Cardinality, FieldCapabilities, FieldType};
 use crate::v1::{
     ArtifactPackLocator, ArtifactPackReference, ArtifactPackTable, CatalogOrdinalRange,
-    EncodedQueryBlock, QueryPoint, QueryPostingShard, encode_document_gate, encode_point,
-    encode_posting, encode_query_block, encode_term_entry,
+    EncodedQueryBlock, QueryPoint, QueryPosting, QueryPostingShard, SegmentDocumentTable,
+    encode_document_gate, encode_point, encode_posting, encode_query_block, encode_term_entry,
 };
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -196,6 +196,7 @@ fn bound_block(encoded: &EncodedQueryBlock) -> QueryBlockDescriptor {
         hash: encoded.descriptor.hash,
         encoded_bytes: encoded.descriptor.encoded_bytes,
         records: encoded.descriptor.records,
+        documents: encoded.descriptor.documents.clone(),
         locator: ArtifactPackLocator {
             ordinal: 0,
             offset: 0,
@@ -217,6 +218,7 @@ fn manifest_with_run_blocks(
         .map(|(ordinal, encoded)| {
             let sequence = u64::try_from(blocks.len() - ordinal).unwrap();
             Arc::new(ProjectionQueryRunDescriptor {
+                memory_lease: Default::default(),
                 partition,
                 physical_catalog_generation: [4; 32],
                 sequence,
@@ -274,11 +276,18 @@ fn canonical_run_directory_is_searched_without_materializing_an_index() {
     let block = |kind, recipe, key: u8, hash: u8| QueryBlockDescriptor {
         kind,
         recipe,
-        minimum_key: vec![key],
-        maximum_key: vec![key],
+        minimum_key: vec![key; 32],
+        maximum_key: vec![key; 32],
         hash: [hash; 32],
         encoded_bytes: 64,
         records: 1,
+        documents: Arc::new(
+            SegmentDocumentTable::new_with_versions([(
+                StableDocumentKey::from_bytes([key; 32]).unwrap(),
+                1,
+            )])
+            .unwrap(),
+        ),
         locator: ArtifactPackLocator {
             ordinal: 0,
             offset: u64::from(hash.saturating_sub(1)) * 64,
@@ -289,6 +298,7 @@ fn canonical_run_directory_is_searched_without_materializing_an_index() {
         pack_table: pack_table.clone(),
     };
     let run = ProjectionQueryRunDescriptor {
+        memory_lease: Default::default(),
         partition: partition(1),
         physical_catalog_generation: [3; 32],
         sequence: 1,
@@ -416,10 +426,16 @@ fn logical_heap_limit_does_not_report_query_credit_exhaustion() {
 fn sequential_decoded_block_scans_reuse_transient_credits_without_record_copies() {
     let limits = QueryBlockLimits::default_for_memory();
     let recipe = RecipeIdentity::new([3; 32]).unwrap();
+    let document = StableDocumentKey::from_bytes([1; 32]).unwrap();
     let records = (0..64u32)
-        .map(|value| super::super::QueryBlockRecord {
-            key: value.to_be_bytes().to_vec(),
-            value: vec![value as u8; 128],
+        .map(|value| {
+            encode_point(&QueryPoint {
+                value: ScalarValue::Signed(i64::from(value)),
+                document,
+                material_source_version: 1,
+                live: true,
+            })
+            .unwrap()
         })
         .collect::<Vec<_>>();
     let mut encoding_credits = credits(1024 * 1024);
@@ -467,10 +483,15 @@ fn sequential_decoded_block_scans_reuse_transient_credits_without_record_copies(
 fn dropping_block_execution_releases_single_flight_while_loader_is_retained() {
     let limits = QueryBlockLimits::default_for_memory();
     let recipe = RecipeIdentity::new([3; 32]).unwrap();
-    let records = vec![super::super::QueryBlockRecord {
-        key: vec![1],
-        value: vec![2],
-    }];
+    let records = vec![
+        encode_point(&QueryPoint {
+            value: ScalarValue::Signed(1),
+            document: StableDocumentKey::from_bytes([1; 32]).unwrap(),
+            material_source_version: 1,
+            live: true,
+        })
+        .unwrap(),
+    ];
     let mut encoding_credits = credits(64 * 1024);
     let encoded = encode_query_block(
         QueryBlockKind::Point,
@@ -559,6 +580,7 @@ fn one_partition_dispatches_independent_gate_blocks_and_merges_in_run_order() {
     let partition = partition(1);
     let run = |sequence, encoded: &EncodedQueryBlock| {
         Arc::new(ProjectionQueryRunDescriptor {
+            memory_lease: Default::default(),
             partition,
             physical_catalog_generation: [4; 32],
             sequence,
@@ -694,7 +716,13 @@ fn one_partition_dispatches_independent_range_blocks_and_merges_in_run_order() {
     .unwrap();
 
     assert_eq!(submitted.load(Ordering::Acquire), 2);
-    assert_eq!(matches, [(document, 2)].into());
+    assert_eq!(
+        matches
+            .into_iter()
+            .map(|(document, candidate)| (document, candidate.material_source_version))
+            .collect::<BTreeMap<_, _>>(),
+        [(document, 2)].into()
+    );
 }
 
 #[test]
@@ -747,6 +775,7 @@ fn one_partition_dispatches_independent_full_text_posting_blocks() {
     let partition = partition(1);
     let run = |sequence, dictionary: &EncodedQueryBlock, posting: &EncodedQueryBlock| {
         Arc::new(ProjectionQueryRunDescriptor {
+            memory_lease: Default::default(),
             partition,
             physical_catalog_generation: [4; 32],
             sequence,
@@ -918,6 +947,7 @@ fn query_snapshot_binding_distinguishes_logical_definitions_on_the_same_roots() 
     };
     let identity = query_snapshot_identity(cut, &[pin]).unwrap();
     let snapshot = |logical_definition_version| ValidatedQuerySnapshot {
+        memory_lease: crate::v1::SegmentMemoryLease::default(),
         identity,
         common_cut: cut,
         pins: vec![pin],
@@ -1002,6 +1032,7 @@ fn repeated_one_page_queries_reuse_the_validated_snapshot_without_artifact_loads
         result_limit: 10,
     };
     let descriptor = Arc::new(ProjectionQueryRunDescriptor {
+        memory_lease: Default::default(),
         partition: pin.partition,
         physical_catalog_generation: [4; 32],
         sequence: 1,
@@ -1012,6 +1043,7 @@ fn repeated_one_page_queries_reuse_the_validated_snapshot_without_artifact_loads
         blocks: Vec::new(),
     });
     let snapshot = Arc::new(ValidatedQuerySnapshot {
+        memory_lease: crate::v1::SegmentMemoryLease::default(),
         identity: query_snapshot_identity(cut, &[pin]).unwrap(),
         common_cut: cut,
         pins: vec![pin],

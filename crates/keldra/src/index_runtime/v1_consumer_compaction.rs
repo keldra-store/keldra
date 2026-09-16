@@ -8,6 +8,7 @@ use super::*;
 pub(super) struct BackgroundCompaction {
     pub(super) predecessor_generation: [u8; 32],
     task: Option<tokio::task::JoinHandle<Result<V1CompactionPublication, Status>>>,
+    ready: Arc<tokio::sync::Notify>,
 }
 
 impl BackgroundCompaction {
@@ -18,11 +19,14 @@ impl BackgroundCompaction {
     }
 
     pub(super) async fn finish(mut self) -> Result<V1CompactionPublication, Status> {
-        self.task
-            .take()
+        let result = self
+            .task
+            .as_mut()
             .expect("background compaction task exists")
             .await
-            .map_err(|error| Status::internal(format!("v1 compaction task failed: {error}")))?
+            .map_err(|error| Status::internal(format!("v1 compaction task failed: {error}")))?;
+        self.task.take();
+        result
     }
 }
 
@@ -60,8 +64,8 @@ pub(super) async fn take_finished_background_compaction(
         .background_compaction
         .take()
         .expect("finished v1 compaction exists");
-    writer.stage = ProducerStage::Compacting;
     let predecessor_generation = background.predecessor_generation;
+    let ready = Arc::clone(&background.ready);
     let mut prepared = match background.finish().await {
         Ok(prepared) => prepared,
         Err(error) if error.code() != tonic::Code::DataLoss => {
@@ -74,40 +78,151 @@ pub(super) async fn take_finished_background_compaction(
         .current
         .as_ref()
         .expect("compaction requires Current");
-    match prepared
-        .rebase_onto(
-            publisher,
-            &writer.recipe.storage_tenant,
-            &writer.recipe.bucket,
-            writer.recipe.family.tenant_id,
-            writer.recipe.family.bucket_id,
-            current,
-        )
-        .await
-    {
-        Ok(true) => {
-            let (base, artifacts) = prepared.into_parts();
-            if base.predecessor.roots == current.generation.roots
-                && base.predecessor.query_stream_root == current.generation.query_stream_root
-            {
-                tracing::debug!(
-                    ?predecessor_generation,
-                    "no-op v1 compaction proposal discarded"
-                );
-                Ok(None)
-            } else {
-                Ok(Some((base, artifacts)))
+    if needs_background_rebase(
+        prepared.expected_generation_hash(),
+        current.current.generation_hash,
+    ) {
+        // Never load a newer stream tree while holding up source advancement.
+        // Rebase and stage its generated pages under the same retained permits
+        // in the background. Harvest is conditional on that exact generation;
+        // a later source publication causes another background rebase, never
+        // an overwrite of newly appended runs or a change in the source cut.
+        let current = current.clone();
+        let predecessor_generation = current.current.generation_hash;
+        let publisher = publisher.clone();
+        let storage_tenant = writer.recipe.storage_tenant.clone();
+        let bucket = writer.recipe.bucket.clone();
+        let tenant_id = writer.recipe.family.tenant_id;
+        let bucket_id = writer.recipe.family.bucket_id;
+        let partition = writer.partition;
+        let task_ready = Arc::clone(&ready);
+        let task = tokio::spawn(async move {
+            let result = async {
+                let Some(rebased) = prepared
+                    .rebase_onto(
+                        &publisher,
+                        &storage_tenant,
+                        &bucket,
+                        tenant_id,
+                        bucket_id,
+                        &current,
+                    )
+                    .await?
+                else {
+                    return Err(Status::aborted(
+                        "v1 compaction selected inputs were replaced",
+                    ));
+                };
+                prepared = rebased;
+                publisher
+                    .publish_compaction_artifacts(
+                        &storage_tenant,
+                        &bucket,
+                        tenant_id,
+                        bucket_id,
+                        partition,
+                        prepared.artifacts(),
+                    )
+                    .await?;
+                Ok(prepared)
             }
-        }
-        Ok(false) => {
-            tracing::debug!(?predecessor_generation, "stale v1 compaction discarded");
-            Ok(None)
-        }
-        Err(error) if error.code() != tonic::Code::DataLoss => {
-            tracing::warn!(%error, "optional v1 compaction proposal discarded");
-            Ok(None)
-        }
-        Err(error) => Err(error),
+            .await;
+            task_ready.notify_one();
+            result
+        });
+        writer.background_compaction = Some(BackgroundCompaction {
+            predecessor_generation,
+            task: Some(task),
+            ready,
+        });
+        return Ok(None);
+    }
+    let (base, artifacts) = prepared.into_parts();
+    if base.predecessor.roots == current.generation.roots
+        && base.predecessor.query_stream_root == current.generation.query_stream_root
+    {
+        tracing::debug!(
+            ?predecessor_generation,
+            "no-op v1 compaction proposal discarded"
+        );
+        Ok(None)
+    } else {
+        Ok(Some((base, artifacts)))
+    }
+}
+
+fn needs_background_rebase(prepared: [u8; 32], current: [u8; 32]) -> bool {
+    prepared != current
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+
+    #[test]
+    fn harvest_requires_the_exact_generation_prepared_in_background() {
+        assert!(!needs_background_rebase([1; 32], [1; 32]));
+        assert!(needs_background_rebase([1; 32], [2; 32]));
+    }
+
+    #[tokio::test]
+    async fn completed_background_integrity_failure_is_not_reclassified() {
+        let task =
+            tokio::spawn(async { Err(Status::data_loss("component stream root invariant")) });
+        let background = BackgroundCompaction {
+            predecessor_generation: [1; 32],
+            task: Some(task),
+            ready: Arc::new(tokio::sync::Notify::new()),
+        };
+        let error = background.finish().await.err().unwrap();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert_eq!(error.message(), "component stream root invariant");
+    }
+
+    #[tokio::test]
+    async fn cancelling_finish_keeps_the_owned_task_abort_guard() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _sender = sender;
+            std::future::pending::<()>().await;
+            Err(Status::aborted("unreachable"))
+        });
+        let background = BackgroundCompaction {
+            predecessor_generation: [1; 32],
+            task: Some(task),
+            ready: Arc::new(tokio::sync::Notify::new()),
+        };
+        let mut completion = Box::pin(background.finish());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut completion)
+                .await
+                .is_err()
+        );
+        drop(completion);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), receiver)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_partition_ownership_cancels_only_its_compaction_task() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let sender = sender;
+            std::future::pending::<()>().await;
+            drop(sender);
+            Err(Status::aborted("unreachable"))
+        });
+        let background = BackgroundCompaction {
+            predecessor_generation: [1; 32],
+            task: Some(task),
+            ready: Arc::new(tokio::sync::Notify::new()),
+        };
+        drop(background);
+        assert!(receiver.await.is_err());
     }
 }
 
@@ -123,12 +238,17 @@ pub(super) async fn publish_finished_background_compaction(
         .current
         .as_ref()
         .expect("compaction publication requires Current");
-    writer.pending_publication = Some(publisher.prepare_compaction_publication(
+    let publication = match publisher.prepare_compaction_publication(
         writer.partition,
         current,
         base,
         artifacts,
-    )?);
+    ) {
+        Ok(publication) => publication,
+        Err(error) if error.code() == tonic::Code::ResourceExhausted => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    writer.pending_publication = Some(publication);
     writer.stage = ProducerStage::Publishing;
     finish_pending_publication(writer, publisher).await?;
     Ok(true)
@@ -148,19 +268,7 @@ pub(super) fn ensure_background_compaction(
     if writer.background_compaction.is_some() || !generation_needs_compaction(current, limits) {
         return Ok(());
     }
-    let bytes = limits.bytes.saturating_div(8).max(1);
-    let Ok(component_permit) = credits.acquire(IndexingMemoryStage::SealScratch, bytes) else {
-        return Ok(());
-    };
-    let Ok(query_permit) = credits.acquire(IndexingMemoryStage::OrderingCatalog, bytes) else {
-        return Ok(());
-    };
-    let Ok(preload_permit) = credits.acquire(IndexingMemoryStage::ReplayInput, bytes) else {
-        return Ok(());
-    };
-    let Ok(raw_output_permit) = credits.acquire(IndexingMemoryStage::SealScratch, bytes) else {
-        return Ok(());
-    };
+    let credits = credits.clone();
     let publisher = publisher.clone();
     let cpu = cpu.clone();
     let storage_tenant = writer.recipe.storage_tenant.clone();
@@ -175,6 +283,7 @@ pub(super) fn ensure_background_compaction(
     let maximum_unmerged_bytes = usize::try_from(limits.lsm_bytes)
         .map_err(|_| Status::invalid_argument("v1 LSM byte bound exceeds this platform"))?;
     let compaction_ready = Arc::clone(compaction_ready);
+    let ready = Arc::clone(&compaction_ready);
     let task = tokio::spawn(async move {
         let result = publisher
             .prepare_compaction(
@@ -186,11 +295,7 @@ pub(super) fn ensure_background_compaction(
                 &cpu,
                 maximum_runs,
                 maximum_unmerged_bytes,
-                bytes,
-                preload_permit,
-                raw_output_permit,
-                ProjectionPackCredits::from_pipeline_permit(component_permit),
-                QueryBlockCredits::from_pipeline_permit(query_permit),
+                &credits,
             )
             .await;
         let result = match result {
@@ -218,6 +323,7 @@ pub(super) fn ensure_background_compaction(
     writer.background_compaction = Some(BackgroundCompaction {
         predecessor_generation,
         task: Some(task),
+        ready,
     });
     Ok(())
 }

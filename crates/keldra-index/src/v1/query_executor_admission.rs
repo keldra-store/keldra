@@ -192,6 +192,8 @@ pub struct QueryArtifactLoad {
     pub encoded_bytes: usize,
     pub pack: Option<super::ArtifactPackReference>,
     pub pack_offset: u64,
+    /// Immutable segment document mapping, independent of published generation.
+    pub segment_identity: [u8; 32],
 }
 
 impl QueryArtifactLoad {
@@ -202,6 +204,7 @@ impl QueryArtifactLoad {
             encoded_bytes,
             pack: None,
             pack_offset: 0,
+            segment_identity: [0; 32],
         }
     }
 
@@ -213,6 +216,7 @@ impl QueryArtifactLoad {
                 .map_err(|_| crate::IndexError::Integrity)?,
             pack: Some(block.pack_reference()?.clone()),
             pack_offset: block.locator.offset,
+            segment_identity: block.documents.identity(),
         })
     }
 }

@@ -43,9 +43,25 @@ fn selected(value: &str) -> ProjectedScalarPointers {
         .unwrap()
 }
 
+// Successful fast-path tests must fit actual parser input/scratch, not just
+// their tiny JSON payload. Derive capacity from the production admission shape.
+fn admitted_ingress(concurrent: usize) -> HotProjectionIngress {
+    let probe = HotProjectionIngress::new(64 * 1024 * 1024).unwrap();
+    probe.activate_test_route(1, 2);
+    let charge = probe
+        .pending(1, 2, &put(&"x".repeat(128), 100))
+        .unwrap()
+        .charge;
+    let bytes = probe
+        .router_bytes()
+        .saturating_add(charge.saturating_mul(concurrent.max(1)))
+        .saturating_add(pending_state_resident_bytes(concurrent.max(1)));
+    HotProjectionIngress::new(u64::try_from(bytes).unwrap()).unwrap()
+}
+
 #[test]
 fn committed_exact_version_is_consumed_once() {
-    let ingress = HotProjectionIngress::new(4_096).unwrap();
+    let ingress = admitted_ingress(2);
     ingress.activate_test_route(1, 2);
     let pending = ingress.pending(1, 2, &put("a", 100));
     ingress.admit_committed(pending, &receipt(3));
@@ -149,7 +165,7 @@ async fn catalog_replacement_wakes_a_consumer_waiting_on_paused_preparation() {
 
 #[test]
 fn repeated_mutations_retain_only_the_latest_version_per_path() {
-    let ingress = HotProjectionIngress::new(16 * 1_024).unwrap();
+    let ingress = admitted_ingress(2);
     ingress.activate_test_route(1, 2);
     let pending = ingress.pending(1, 2, &put("hot/path", 100));
     ingress.admit_committed(pending, &receipt(1));
@@ -209,7 +225,7 @@ fn superseded_preparation_cannot_publish_after_the_newer_version() {
 
 #[test]
 fn late_older_commit_callback_cannot_replace_newer_ready_state() {
-    let ingress = HotProjectionIngress::new(8 * 1_024).unwrap();
+    let ingress = admitted_ingress(2);
     ingress.activate_test_route(1, 2);
     ingress.admit_committed(ingress.pending(1, 2, &put("same", 100)), &receipt(11));
     ingress.admit_committed(ingress.pending(1, 2, &put("same", 100)), &receipt(10));
@@ -257,7 +273,7 @@ fn consumer_discard_before_commit_callback_rejects_delayed_older_version() {
 
 #[test]
 fn consumed_newer_slot_cannot_be_resurrected_by_older_pending_callback() {
-    let ingress = HotProjectionIngress::new(8 * 1_024).unwrap();
+    let ingress = admitted_ingress(2);
     ingress.activate_test_route(1, 2);
     let older = ingress.pending(1, 2, &put("same", 100)).unwrap();
     let newer = ingress.pending(1, 2, &put("same", 100)).unwrap();
@@ -361,21 +377,26 @@ fn in_flight_payloads_are_reserved_before_their_bytes_are_cloned() {
 
 #[test]
 fn full_budget_falls_back_without_blocking_ingestion() {
-    let maximum_bytes = 4_096;
-    let ingress = HotProjectionIngress::new(maximum_bytes).unwrap();
+    let ingress = admitted_ingress(1);
+    let maximum_bytes = ingress.maximum_bytes;
     ingress.activate_test_route(1, 2);
-    for version in 1..=20 {
+    let last = u64::try_from(maximum_bytes / ENTRY_OVERHEAD_BYTES + 20).unwrap();
+    for version in 1..=last {
         let path = format!("item-{version}");
         let pending = ingress.pending(1, 2, &put(&path, 100));
         ingress.admit_committed(pending, &receipt(version));
     }
     assert!(ingress.take_exact_selected(1, 2, "item-1", 1).is_none());
-    assert!(ingress.take_exact_selected(1, 2, "item-20", 20).is_some());
+    assert!(
+        ingress
+            .take_exact_selected(1, 2, &format!("item-{last}"), last)
+            .is_some()
+    );
     let state = ingress
         .inner
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(u64::try_from(total_bytes(&state)).unwrap() <= maximum_bytes);
+    assert!(total_bytes(&state) <= maximum_bytes);
 }
 
 #[test]
@@ -391,7 +412,7 @@ fn replayed_receipt_is_not_admitted() {
 
 #[test]
 fn production_take_requires_the_global_physical_catalog_identity() {
-    let ingress = HotProjectionIngress::new(4_096).unwrap();
+    let ingress = admitted_ingress(2);
     ingress.activate_test_route(1, 2);
     ingress.admit_committed(ingress.pending(1, 2, &put("a", 100)), &receipt(3));
 
@@ -525,7 +546,7 @@ fn reclaimed_selector_generations_release_unused_vector_capacity() {
 
 #[test]
 fn thousand_item_bulk_admission_stays_aligned_to_exact_committed_receipts() {
-    let ingress = HotProjectionIngress::new(4 * 1024 * 1024).unwrap();
+    let ingress = admitted_ingress(1_000);
     ingress.activate_test_route(1, 2);
     let pending = (0..1_000)
         .map(|index| ingress.pending(1, 2, &put(&format!("objects/{index}"), 100)))

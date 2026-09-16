@@ -7,6 +7,127 @@ use std::task::Poll;
 type StageFuture<'a> = Pin<Box<dyn Future<Output = Result<BlobRef, Status>> + Send + 'a>>;
 
 impl V1ProjectionPublisher {
+    /// Resolve the exact published object version before accessing a range.
+    /// Local values read only intersecting chunks. Missing local values retain
+    /// the ordinary verified peer reconstruction and current-placement fence;
+    /// only the requested range is allocated in the caller's working memory.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn read_exact_artifact_pack_range(
+        &self,
+        storage_tenant: &str,
+        bucket: &str,
+        tenant_id: u64,
+        bucket_id: u64,
+        reference: &ArtifactPackReference,
+        offset: u64,
+        length: u64,
+        maximum_bytes: usize,
+        expected_child_hash: [u8; 32],
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Bytes, Status> {
+        reference.validate().map_err(index_status)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| Status::data_loss("v1 segment range offset overflow"))?;
+        let count = usize::try_from(length).map_err(|_| {
+            Status::resource_exhausted("v1 segment range exceeds platform capacity")
+        })?;
+        if offset > reference.length || end > reference.length {
+            return Err(Status::data_loss(
+                "v1 segment range exceeds its exact object length",
+            ));
+        }
+        if count > maximum_bytes {
+            return Err(Status::resource_exhausted(
+                "v1 segment range exceeds its admitted byte bound",
+            ));
+        }
+        let parsed =
+            keldra_index::v1::parse_projection_artifact_path(reference.canonical_path.as_ref())
+                .map_err(index_status)?;
+        if !matches!(
+            parsed.kind,
+            keldra_index::v1::ProjectionArtifactKind::Pack
+                | keldra_index::v1::ProjectionArtifactKind::QueryRunPack
+        ) || parsed.content_hash != Some(reference.hash)
+        {
+            return Err(Status::data_loss(
+                "v1 segment path differs from its exact content identity",
+            ));
+        }
+        let key = ObjectKey::new(storage_tenant, bucket, reference.canonical_path.as_ref())
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let version = self
+            .reader
+            .exact_version_descriptor_stable(
+                &key,
+                tenant_id,
+                bucket_id,
+                VersionId(reference.object_version),
+            )
+            .await?
+            .ok_or_else(|| Status::data_loss("v1 segment exact object version is absent"))?;
+        let blob = version
+            .blob
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("v1 segment version has no payload"))?;
+        if version.deleted
+            || version.id.0 != reference.object_version
+            || blob.hash != reference.hash
+            || blob.length != reference.length
+        {
+            return Err(Status::data_loss(
+                "v1 segment object version differs from its published identity",
+            ));
+        }
+        let range_account = if deadline.is_some() {
+            super::super::working_memory::WorkingMemoryAccount::Query
+        } else {
+            super::super::working_memory::WorkingMemoryAccount::IndexingPipeline
+        };
+        let range_memory = self
+            .immutable_cache
+            .range_memory(range_account)
+            .ok_or_else(|| Status::internal("v1 segment range has no working-memory authority"))?;
+        // Blocking reads retain their own scratch admission even if the query
+        // deadline cancels this future before the RocksDB call completes.
+        let local_guard = range_memory.try_reserve(count)?;
+        let store = self.store.clone();
+        let local_blob = blob.clone();
+        let (local_result, local_guard) = tokio::task::spawn_blocking(move || {
+            let result = store.read_blob_range_sync(&local_blob, offset, length, maximum_bytes);
+            (result, local_guard)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("join local segment range: {error}")))?;
+        match local_result {
+            Ok(bytes) => {
+                let bytes = Bytes::from(bytes);
+                // The caller's final-range admission owns the returned bytes.
+                drop(local_guard);
+                Ok(bytes)
+            }
+            Err(MutationError::BlobNotFound) => {
+                drop(local_guard);
+                self.reader
+                    .read_verified_blob_range(
+                        blob,
+                        offset,
+                        length,
+                        maximum_bytes,
+                        expected_child_hash,
+                        deadline,
+                        range_memory,
+                    )
+                    .await
+                    .map(Bytes::from)
+            }
+            Err(error) => Err(Status::data_loss(format!(
+                "read local segment range: {error}"
+            ))),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn publish_component_packs(
         &self,

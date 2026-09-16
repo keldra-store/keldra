@@ -10,7 +10,6 @@ use crate::IndexError;
 use super::{
     CanonicalRecipeState, ComponentIdentity, DocumentHead, ProjectedDocumentDelta,
     ProjectedDocumentState, RecipeIdentity, StableDocumentKey,
-    inherit_projection_preserving_versions,
 };
 
 const SEGMENT_MAGIC: &[u8; 8] = b"K1DELTA1";
@@ -107,6 +106,56 @@ impl ProjectionMutationBuffer {
         self.used_bytes
     }
 
+    /// Admission for one complete replacement, without cloning or encoding it.
+    /// Charges component/entry overhead independently, hence remains an upper
+    /// bound when several rows share a component or overwrite the same key.
+    pub fn source_replacement_admission_bytes(
+        path: &str,
+        states: &[ProjectedDocumentState],
+    ) -> Result<usize, IndexError> {
+        let overhead = COMPONENT_ACCOUNTING_BYTES + ENTRY_ACCOUNTING_BYTES;
+        let mut bytes = overhead
+            .checked_add(if states.is_empty() {
+                0
+            } else {
+                40usize
+                    .checked_add(path.len())
+                    .ok_or(IndexError::OffsetOverflow)?
+            })
+            .ok_or(IndexError::OffsetOverflow)?;
+        if states.is_empty() {
+            return bytes
+                .checked_add(overhead)
+                .and_then(|bytes| bytes.checked_add(26 + path.len()))
+                .ok_or(IndexError::OffsetOverflow);
+        }
+        for state in states {
+            let head = 26usize
+                .checked_add(state.head.source_path.len())
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        state
+                            .head
+                            .result
+                            .as_ref()
+                            .map_or(0, |result| 12 + result.path.len()),
+                    )
+                })
+                .ok_or(IndexError::OffsetOverflow)?;
+            bytes = bytes
+                .checked_add(overhead)
+                .and_then(|bytes| bytes.checked_add(head))
+                .ok_or(IndexError::OffsetOverflow)?;
+            for value in state.memberships.iter().chain(&state.fields) {
+                bytes = bytes
+                    .checked_add(overhead)
+                    .and_then(|bytes| bytes.checked_add(value.value.len()))
+                    .ok_or(IndexError::OffsetOverflow)?;
+            }
+        }
+        Ok(bytes)
+    }
+
     pub fn component_count(&self) -> usize {
         self.components.len()
     }
@@ -154,87 +203,60 @@ impl ProjectionMutationBuffer {
         Ok(())
     }
 
-    /// Compares and coalesces one exact projected state into independently
-    /// replaceable physical components. A projection-preserving update emits
-    /// only its current head: the preceding material state remains the
-    /// authoritative comparison basis. Failure leaves the complete buffer
-    /// unchanged.
-    pub fn apply_state(
-        &mut self,
-        state: &ProjectedDocumentState,
-        previous: Option<&ProjectedDocumentState>,
-    ) -> Result<(), IndexError> {
+    /// Emit a complete replacement for one indexed document.
+    pub fn apply_state(&mut self, state: &ProjectedDocumentState) -> Result<(), IndexError> {
         state.validate()?;
-        let stable_key = state.head.stable_key;
-        let delta = state.delta_from(previous)?;
-        self.apply_delta(stable_key, delta, Vec::new())
+        if state.head.source_record != 0
+            || state.head.material_source_version != state.head.source_version
+        {
+            return Err(IndexError::InvalidDefinition(
+                "replacement requires record zero and exact material version".into(),
+            ));
+        }
+        let delta = state.replacement()?;
+        self.apply_delta(state.head.stable_key, delta, Vec::new())
     }
 
-    /// Atomically applies the complete expanded-record result for one exact
-    /// source object and maintains its bounded delete/shrink locator.
-    ///
-    /// The caller loads `previous` through the preceding generation's
-    /// `SourceRecords` entry. This public single-source operation uses one
-    /// transactional clone. Batch callers use a changed-key overlay.
+    /// Apply one complete Typed JSON document or an authoritative deletion.
+    /// Expanded records are not supported by this replacement format.
     pub fn apply_source_states(
         &mut self,
         source_scope: [u8; 32],
         source_path: &str,
         source_version: u64,
         current: Vec<ProjectedDocumentState>,
-        previous: Vec<ProjectedDocumentState>,
     ) -> Result<(), IndexError> {
-        if source_scope == [0; 32] || source_version == 0 {
-            return Err(IndexError::InvalidDefinition(
-                "projected source update has an invalid identity".into(),
-            ));
-        }
         let mut working = self.clone();
-        working.apply_source_states_in_place(
-            source_scope,
-            source_path,
-            source_version,
-            current,
-            previous,
-        )?;
+        working.apply_source_states_in_place(source_scope, source_path, source_version, current)?;
         *self = working;
         Ok(())
     }
 
-    /// Apply one source mutation directly to a caller-owned transaction
-    /// buffer. Partial mutation on failure is intentional: the caller must
-    /// discard the complete transaction buffer.
     pub(crate) fn apply_source_states_in_place(
         &mut self,
         source_scope: [u8; 32],
         source_path: &str,
         source_version: u64,
         current: Vec<ProjectedDocumentState>,
-        previous: Vec<ProjectedDocumentState>,
     ) -> Result<(), IndexError> {
-        if source_scope == [0; 32] || source_version == 0 {
+        if source_scope == [0; 32] || source_version == 0 || current.len() > 1 {
             return Err(IndexError::InvalidDefinition(
-                "projected source update has an invalid identity".into(),
+                "replacement source requires one Typed JSON record".into(),
             ));
         }
-        let mut current = current;
-        inherit_projection_preserving_versions(&mut current, &previous)?;
         let current =
             validate_source_state_set(source_scope, source_path, Some(source_version), current)?;
-        let previous = validate_source_state_set(source_scope, source_path, None, previous)?;
-        for (key, state) in &current {
-            self.apply_state(state, previous.get(key))?;
+        let locator_key = StableDocumentKey::derive(source_scope, source_path, 0)?;
+        for state in current.values() {
+            self.apply_state(state)?;
         }
-        for (key, state) in &previous {
-            if current.contains_key(key) {
-                continue;
-            }
+        if current.is_empty() {
             let deleted = ProjectedDocumentState::new(
                 source_scope,
                 DocumentHead::new(
                     source_scope,
                     source_path.into(),
-                    state.head.source_record,
+                    0,
                     source_version,
                     None,
                     false,
@@ -242,25 +264,21 @@ impl ProjectionMutationBuffer {
                 Vec::new(),
                 Vec::new(),
             )?;
-            self.apply_state(&deleted, Some(state))?;
+            self.apply_state(&deleted)?;
         }
         let current_keys = current.keys().copied().collect::<Vec<_>>();
-        let previous_keys = previous.keys().copied().collect::<Vec<_>>();
-        if current_keys != previous_keys {
-            let locator_key = StableDocumentKey::derive(source_scope, source_path, 0)?;
-            let replacement = (!current_keys.is_empty())
-                .then(|| encode_source_records(source_path, &current_keys))
-                .transpose()?;
-            self.apply_delta(
-                locator_key,
-                ProjectedDocumentDelta {
-                    head: None,
-                    memberships: Vec::new(),
-                    fields: Vec::new(),
-                },
-                vec![(ComponentIdentity::SourceRecords, locator_key, replacement)],
-            )?;
-        }
+        let replacement = (!current_keys.is_empty())
+            .then(|| encode_source_records(source_path, &current_keys))
+            .transpose()?;
+        self.apply_delta(
+            locator_key,
+            ProjectedDocumentDelta {
+                head: None,
+                memberships: Vec::new(),
+                fields: Vec::new(),
+            },
+            vec![(ComponentIdentity::SourceRecords, locator_key, replacement)],
+        )?;
         Ok(())
     }
 
@@ -963,51 +981,46 @@ mod tests {
     }
 
     #[test]
-    fn projection_preserving_update_seals_only_the_head() {
-        let old = state(1, b"stable", b"also stable");
+    fn complete_replacement_seals_all_declared_components() {
         let new = state(2, b"stable", b"also stable");
         let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
-        buffer.apply_state(&new, Some(&old)).unwrap();
+        buffer.apply_state(&new).unwrap();
         let sealed = buffer.seal().unwrap();
-        assert_eq!(sealed.len(), 1);
-        assert_eq!(sealed[0].component, ComponentIdentity::DocumentHead);
-        for segment in sealed {
-            let decoded = decode_component_delta_segment(&segment.bytes).unwrap();
-            assert_eq!(decoded.component, segment.component);
-            assert_eq!(decoded.records.len(), 1);
-        }
+        assert_eq!(sealed.len(), 4);
+        assert!(sealed.iter().all(|segment| segment.records == 1));
     }
 
     #[test]
-    fn complete_projection_preserving_update_keeps_the_cache_material_version() {
-        let previous = vec![state(7, b"stable", b"also stable")];
+    fn replacement_keeps_exact_new_material_version() {
         let current = vec![state(19, b"stable", b"also stable")];
         let key = current[0].head.stable_key;
         let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
         buffer
-            .apply_source_states([9; 32], "objects/a", 19, current, previous)
+            .apply_source_states([9; 32], "objects/a", 19, current)
             .unwrap();
         let sealed = buffer.seal().unwrap();
         let head = sealed
             .iter()
-            .find(|delta| delta.component == ComponentIdentity::DocumentHead)
+            .find(|s| s.component == ComponentIdentity::DocumentHead)
             .unwrap();
         let decoded = decode_component_delta_segment(&head.bytes).unwrap();
-        let replacement = decoded.records[0].replacement.as_deref().unwrap();
-        let head = decode_document_head([9; 32], key, replacement).unwrap();
+        let head = decode_document_head(
+            [9; 32],
+            key,
+            decoded.records[0].replacement.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.material_source_version, 19);
         assert_eq!(head.source_version, 19);
-        assert_eq!(head.material_source_version, 7);
-        assert_eq!(head.stable_key.query_cache_identity(7).unwrap().version, 7);
     }
 
     #[test]
     fn indexed_change_advances_the_cache_material_version() {
-        let previous = vec![state(7, b"old", b"stable")];
         let current = vec![state(19, b"new", b"stable")];
         let key = current[0].head.stable_key;
         let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
         buffer
-            .apply_source_states([9; 32], "objects/a", 19, current, previous)
+            .apply_source_states([9; 32], "objects/a", 19, current)
             .unwrap();
         let sealed = buffer.seal().unwrap();
         let head = sealed
@@ -1025,72 +1038,38 @@ mod tests {
     }
 
     #[test]
-    fn pathological_repeated_unindexed_updates_coalesce_without_field_amplification() {
-        let mut previous = state(1, b"stable", b"also stable");
+    fn repeated_complete_replacements_coalesce_bounded_components() {
         let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
-        for version in 2..=10_001 {
-            let current = state(version, b"stable", b"also stable");
-            buffer.apply_state(&current, Some(&previous)).unwrap();
-            previous = current;
+        for version in 1..=10_001 {
+            buffer
+                .apply_state(&state(version, b"stable", b"also stable"))
+                .unwrap();
         }
-
         let sealed = buffer.seal().unwrap();
-        assert_eq!(
-            sealed
-                .iter()
-                .map(|segment| segment.component)
-                .collect::<Vec<_>>(),
-            vec![ComponentIdentity::DocumentHead,]
-        );
+        assert_eq!(sealed.len(), 4);
         assert!(sealed.iter().all(|segment| segment.records == 1));
-        assert!(sealed.iter().all(|segment| {
-            !matches!(
-                segment.component,
-                ComponentIdentity::Membership(_)
-                    | ComponentIdentity::Field(_)
-                    | ComponentIdentity::Order(_)
-            )
-        }));
-        assert!(
-            sealed
-                .iter()
-                .map(|segment| segment.encoded_bytes)
-                .sum::<u64>()
-                < 1_024,
-            "ten thousand source versions must collapse to one bounded head/state delta"
-        );
     }
 
     #[test]
-    fn later_material_change_compares_against_the_retained_material_state() {
-        let retained = state(1, b"stable", b"also stable");
-        let preserving = state(2, b"stable", b"also stable");
-        let changed = state(3, b"changed", b"also stable");
+    fn later_replacement_overwrites_every_component() {
         let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
-        buffer.apply_state(&preserving, Some(&retained)).unwrap();
-        buffer.apply_state(&changed, Some(&retained)).unwrap();
-        let sealed = buffer.seal().unwrap();
-        assert_eq!(
-            sealed
-                .iter()
-                .map(|segment| segment.component)
-                .collect::<Vec<_>>(),
-            vec![
-                ComponentIdentity::DocumentHead,
-                ComponentIdentity::Field(recipe(2)),
-            ]
-        );
-        let head = sealed
-            .iter()
-            .find(|segment| segment.component == ComponentIdentity::DocumentHead)
+        buffer.apply_state(&state(2, b"stable", b"stable")).unwrap();
+        buffer
+            .apply_state(&state(3, b"changed", b"stable"))
             .unwrap();
-        let decoded = decode_component_delta_segment(&head.bytes).unwrap();
-        let replacement = decoded.records[0].replacement.as_deref().unwrap();
+        let sealed = buffer.seal().unwrap();
+        assert_eq!(sealed.len(), 4);
+        let field = sealed
+            .iter()
+            .find(|s| s.component == ComponentIdentity::Field(recipe(2)))
+            .unwrap();
         assert_eq!(
-            decode_document_head([9; 32], changed.head.stable_key, replacement)
+            decode_component_delta_segment(&field.bytes)
                 .unwrap()
-                .source_version,
-            3
+                .records[0]
+                .replacement
+                .as_deref(),
+            Some(b"changed".as_slice())
         );
     }
 
@@ -1119,31 +1098,16 @@ mod tests {
     }
 
     #[test]
-    fn one_field_change_does_not_seal_the_other_field() {
-        let old = state(1, b"old", b"stable");
-        let new = state(2, b"new", b"stable");
+    fn one_field_change_still_emits_complete_document() {
         let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
-        buffer.apply_state(&new, Some(&old)).unwrap();
+        buffer.apply_state(&state(2, b"new", b"stable")).unwrap();
         let sealed = buffer.seal().unwrap();
-        assert_eq!(sealed.len(), 2);
+        assert_eq!(sealed.len(), 4);
         assert!(
             sealed
                 .iter()
-                .any(|segment| segment.component == ComponentIdentity::DocumentHead)
+                .any(|s| s.component == ComponentIdentity::Field(recipe(3)))
         );
-        assert!(
-            sealed
-                .iter()
-                .any(|segment| segment.component == ComponentIdentity::Field(recipe(2)))
-        );
-        assert!(
-            !sealed
-                .iter()
-                .any(|segment| segment.component == ComponentIdentity::Field(recipe(3)))
-        );
-        for segment in sealed {
-            assert_eq!(decode_component_delta(&segment.bytes).unwrap().len(), 1);
-        }
     }
 
     #[test]
@@ -1151,7 +1115,7 @@ mod tests {
         let state = state(1, &vec![1; 4096], b"small");
         let mut buffer = ProjectionMutationBuffer::new(1024).unwrap();
         assert!(matches!(
-            buffer.apply_state(&state, None),
+            buffer.apply_state(&state),
             Err(IndexError::ResourceLimit { .. })
         ));
         assert!(buffer.is_empty());
@@ -1162,7 +1126,7 @@ mod tests {
     fn delta_decoder_rejects_an_impossible_record_count_before_allocation() {
         let state = state(1, b"a", b"b");
         let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
-        buffer.apply_state(&state, None).unwrap();
+        buffer.apply_state(&state).unwrap();
         let mut bytes = buffer.seal().unwrap().remove(0).bytes;
         let count_offset = SEGMENT_MAGIC.len() + 2 + 1;
         bytes[count_offset..count_offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
@@ -1205,49 +1169,59 @@ mod tests {
     }
 
     #[test]
-    fn complete_source_update_tracks_expansion_and_tombstones_removed_records() {
-        let previous = vec![
-            state_record(1, 0, b"first", b"stable"),
-            state_record(1, 1, b"removed", b"stable"),
-        ];
-        let current = vec![state_record(2, 0, b"first", b"stable")];
-        let current_key = current[0].head.stable_key;
+    fn deletion_without_predecessor_publishes_dead_head_and_locator_tombstone() {
         let mut buffer = ProjectionMutationBuffer::new(64 * 1024).unwrap();
         buffer
-            .apply_source_states([9; 32], "objects/a", 2, current, previous)
+            .apply_source_states([9; 32], "objects/a", 2, Vec::new())
             .unwrap();
         let sealed = buffer.seal().unwrap();
         let locator = sealed
             .iter()
-            .find(|delta| delta.component == ComponentIdentity::SourceRecords)
+            .find(|s| s.component == ComponentIdentity::SourceRecords)
             .unwrap();
-        let locator_records = decode_component_delta(locator.bytes.as_slice()).unwrap();
-        assert_eq!(locator_records.len(), 1);
-        assert_eq!(
-            decode_source_records(
-                [9; 32],
-                "objects/a",
-                locator_records[0].replacement.as_deref().unwrap(),
-            )
-            .unwrap(),
-            vec![current_key]
+        assert!(
+            decode_component_delta_segment(&locator.bytes)
+                .unwrap()
+                .records[0]
+                .replacement
+                .is_none()
         );
-        let membership = sealed
+        let head = sealed
             .iter()
-            .find(|delta| delta.component == ComponentIdentity::Membership(recipe(1)))
+            .find(|s| s.component == ComponentIdentity::DocumentHead)
             .unwrap();
-        let membership = decode_component_delta_segment(&membership.bytes).unwrap();
-        assert_eq!(membership.records.len(), 1);
-        assert!(membership.records[0].replacement.is_none());
+        let decoded = decode_component_delta_segment(&head.bytes).unwrap();
+        let head = decode_document_head(
+            [9; 32],
+            decoded.records[0].stable_key,
+            decoded.records[0].replacement.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert!(!head.live);
+        assert_eq!(head.source_version, 2);
+    }
+
+    #[test]
+    fn expanded_records_are_rejected_without_partial_publication() {
+        let mut buffer = ProjectionMutationBuffer::new(64 * 1024).unwrap();
+        let records = vec![
+            state_record(2, 0, b"a", b"b"),
+            state_record(2, 1, b"c", b"d"),
+        ];
+        assert!(
+            buffer
+                .apply_source_states([9; 32], "objects/a", 2, records)
+                .is_err()
+        );
+        assert!(buffer.is_empty());
     }
 
     #[test]
     fn complete_source_admission_failure_rolls_back_every_component() {
-        let previous = vec![state_record(1, 0, b"old", b"stable")];
         let current = vec![state_record(2, 0, &vec![3; 4096], b"stable")];
         let mut buffer = ProjectionMutationBuffer::new(1024).unwrap();
         assert!(matches!(
-            buffer.apply_source_states([9; 32], "objects/a", 2, current, previous),
+            buffer.apply_source_states([9; 32], "objects/a", 2, current),
             Err(IndexError::ResourceLimit { .. })
         ));
         assert!(buffer.is_empty());

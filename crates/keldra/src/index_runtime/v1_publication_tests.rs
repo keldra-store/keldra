@@ -1,7 +1,6 @@
 use keldra_index::v1::{
-    ArtifactPackReference, ArtifactPackTable, CanonicalRecipeState, DocumentHead,
-    IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage, PreparedQueryMembershipDelta,
-    PreparedQueryMutationBatch, ProjectedDocumentState, ProjectionMutationBuffer,
+    ArtifactPackReference, ArtifactPackTable, IndexingMemoryCredits, IndexingMemoryLimits,
+    IndexingMemoryStage, PreparedQueryMembershipDelta, PreparedQueryMutationBatch,
     ProjectionPackCredits, QueryBlockCredits, QueryBlockLimits, QueryDocumentGate, RecipeIdentity,
     StableDocumentKey, pack_component_deltas,
     prepare_atomic_projection_generation as prepare_atomic_projection_generation_packed,
@@ -10,6 +9,44 @@ use keldra_index::v1::{
 
 use super::*;
 use crate::index_runtime::publication::IndexArtifactOutcome;
+
+#[tokio::test]
+async fn cancelled_readback_wait_retains_the_required_verification_task() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut verification = Some(V1PostCasVerification::start({
+        let entered = entered.clone();
+        let release = release.clone();
+        move || {
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(())
+            }
+        }
+    }));
+    entered.notified().await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            finish_required_post_cas_verification(&mut verification),
+        )
+        .await
+        .is_err()
+    );
+    assert!(verification.as_ref().unwrap().task.is_some());
+    release.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        finish_required_post_cas_verification(&mut verification),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(verification.is_none());
+}
 
 fn partition() -> ProjectionPartitionIdentity {
     ProjectionPartitionIdentity::new([7; 32], 1, [8; 32], 2, 3, 4).unwrap()
@@ -213,70 +250,24 @@ fn artifact_fingerprints(plan: &AtomicPublicationPlan) -> Vec<(String, [u8; 32],
 }
 
 #[test]
-fn prepared_component_deltas_become_exact_keyed_cache_updates() {
-    let scope = [11; 32];
-    let recipe = RecipeIdentity::new([12; 32]).unwrap();
-    let state = ProjectedDocumentState::new(
-        scope,
-        DocumentHead::new(scope, "objects/one".into(), 0, 7, None, true).unwrap(),
-        vec![CanonicalRecipeState::new(recipe, vec![1]).unwrap()],
-        Vec::new(),
+fn publication_validation_charges_decoded_tables_to_existing_admission() {
+    let (payload, mut publication) = prepared(1, 11).into_publication_parts();
+    let credits = publication.query_validation_credits();
+    let initial_used = credits.admitted_bytes() - credits.remaining();
+    let decoded = keldra_index::v1::decode_projection_query_run(
+        &payload.query_run.bytes,
+        QueryBlockLimits::default_for_memory(),
+        credits,
     )
     .unwrap();
-    let stable_key = state.head.stable_key;
-    let mut buffer = ProjectionMutationBuffer::new(1024 * 1024).unwrap();
-    buffer
-        .apply_source_states(scope, "objects/one", 7, vec![state], Vec::new())
-        .unwrap();
-    let (packs, _) = pack_component_deltas(buffer.seal().unwrap(), pack_credits())
-        .unwrap()
-        .into_parts();
-    let updates = projection_state_updates(&packs).unwrap();
-
-    assert!(updates.iter().any(|(key, value)| {
-        *key == projection_state_record_key(ComponentIdentity::DocumentHead, stable_key)
-            && value.is_some()
-    }));
-    assert!(updates.iter().any(|(key, value)| {
-        *key == projection_state_record_key(ComponentIdentity::SourceRecords, stable_key)
-            && value.is_some()
-    }));
-}
-
-#[test]
-fn projection_cache_partition_key_uses_only_stable_logical_identity() {
-    assert_eq!(
-        projection_state_partition_key(1, 2, partition()),
-        projection_state_partition_key(
-            1,
-            2,
-            ProjectionPartitionIdentity::new([7; 32], 1, [9; 32], 3, 30, 40).unwrap()
-        )
+    let temporary = credits.admitted_bytes() - credits.remaining() - initial_used;
+    assert!(
+        temporary > payload.query_run.bytes.len(),
+        "decoded document tables require admission beyond encoded wire bytes"
     );
-    assert_ne!(
-        projection_state_partition_key(1, 2, partition()),
-        projection_state_partition_key(
-            1,
-            2,
-            ProjectionPartitionIdentity::new([6; 32], 1, [8; 32], 2, 3, 4).unwrap()
-        )
-    );
-    assert_ne!(
-        projection_state_partition_key(1, 2, partition()),
-        projection_state_partition_key(
-            1,
-            2,
-            ProjectionPartitionIdentity::new([7; 32], 2, [8; 32], 2, 3, 4).unwrap()
-        )
-    );
-    assert_ne!(
-        projection_state_partition_key(1, 2, partition()),
-        projection_state_partition_key(2, 2, partition())
-    );
-    assert_ne!(
-        projection_state_partition_key(1, 2, partition()),
-        projection_state_partition_key(1, 3, partition())
-    );
+    drop(decoded);
+    credits.release(temporary).unwrap();
+    assert_eq!(credits.admitted_bytes() - credits.remaining(), initial_used);
 }
 
 #[test]
@@ -555,6 +546,25 @@ fn idle_compaction_successor_preserves_cut_and_advances_generation() {
         Some(loaded.current.generation_hash)
     );
     assert_eq!(successor.query_stream_root, compacted.query_stream_root);
+    let bound = compaction_publication::metadata_admission_bytes(&successor).unwrap();
+    let encoded = keldra_index::v1::encode_projection_generation(&successor).unwrap();
+    let retained_wire = encoded.bytes.capacity()
+        + encoded
+            .component_directory
+            .pages
+            .iter()
+            .map(|page| page.bytes.capacity())
+            .sum::<usize>()
+        + keldra_index::v1::encode_projection_current(
+            ProjectionCurrent::new(encoded.hash, &successor).unwrap(),
+        )
+        .unwrap()
+        .capacity();
+    assert!(retained_wire < bound);
+    assert!(
+        bound < 64 * 1024,
+        "small maintenance must not reserve a configured pipeline fraction"
+    );
 }
 
 #[test]

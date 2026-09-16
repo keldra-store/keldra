@@ -1,4 +1,5 @@
 use super::*;
+use keldra_index::v1::IndexingMemoryLimits;
 
 #[test]
 fn integrity_failure_halts_only_the_affected_partition() {
@@ -434,9 +435,9 @@ fn projection_batch_headroom_scales_while_advance_work_remains_bounded() {
         .unwrap();
     let limits = limits(config).unwrap();
 
-    assert_eq!(limits.bytes, 2 * 1024 * 1024 * 1024);
+    assert_eq!(limits.bytes, 4 * 1024 * 1024 * 1024);
     assert_eq!(limits.flush_bytes, MAX_ADVANCE_SLICE_BYTES);
-    assert_eq!(limits.projection_batch_bytes, 512 * 1024 * 1024);
+    assert_eq!(limits.projection_batch_bytes, 1024 * 1024 * 1024);
     assert_eq!(limits.flush_operations, 4_096);
 }
 
@@ -492,6 +493,9 @@ fn rolling_preparation_refills_only_available_bounded_lanes() {
     assert_eq!(preparation_refill_size(1, 0, 4), 1);
     assert_eq!(preparation_refill_size(0, 0, 4), 0);
     assert_eq!(preparation_refill_size(3, 0, 0), 1);
+    assert_eq!(preparation_refill_size(4_096, 0, 16), 16);
+    assert_eq!(preparation_refill_size(4_096, 12, 16), 4);
+    assert_eq!(preparation_refill_size(4_096, 16, 16), 0);
 }
 
 #[test]
@@ -519,13 +523,13 @@ fn preparation_chunk_admits_one_bounded_batch_workspace_before_exact_retention()
     )
     .unwrap();
 
-    let construction = acquire_preparation_construction(&credits, 1_024, 256).unwrap();
-    let expected = 1_024 + 256 * std::mem::size_of::<Mutation>();
+    let construction = acquire_preparation_construction(&credits, 256).unwrap();
+    let expected = 256 * std::mem::size_of::<Mutation>();
     assert_eq!(construction.bytes(), expected);
     assert_eq!(
         credits.stage_used_bytes(IndexingMemoryStage::ReplayInput),
         expected,
-        "a 256-item CPU chunk charges its descriptor vector and one bounded batch workspace, not 256 independent workspaces"
+        "descriptor-only loading does not reserve a configured worker workspace"
     );
     assert!(expected < 256 * 1_024);
     drop(construction);
@@ -1006,9 +1010,10 @@ fn replay_selection_holds_measured_metadata_not_construction_headroom() {
             canonical_path: None,
         },
         selected: None,
+        selection_memory: None,
     };
 
-    let retained = selected_mutation_resident_bytes(&mutation, &selected, &[]).unwrap();
+    let retained = selected_mutation_resident_bytes(&mutation, &selected).unwrap();
 
     assert!(retained < 1024);
     assert!(retained >= std::mem::size_of::<SelectedMutation>());
