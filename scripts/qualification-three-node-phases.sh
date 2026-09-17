@@ -248,7 +248,6 @@ prepare_no_event_membership_cutover_qualification() {
   local bucket="$6"
   local bound="$7"
   local batch=$((bound * 2))
-  local attempt
   local clear_tail
   local fence
   local line
@@ -256,6 +255,7 @@ prepare_no_event_membership_cutover_qualification() {
   local previous_clear_tail=
   local round
   local stable_clear=0
+  local clear_deadline
   if [[ "${node_id}" == "1" ]]; then
     echo "no-event membership cutover source must not be the reconciliation coordinator" >&2
     return 1
@@ -275,9 +275,13 @@ prepare_no_event_membership_cutover_qualification() {
     previous_clear_line=
     previous_clear_tail=
     stable_clear=0
-    for attempt in $(seq 1 45); do
+    # Catch-up duration is not a 45-second performance guarantee. Reuse the
+    # existing bounded handoff wait without relaxing any clear-cut evidence.
+    clear_deadline=$((SECONDS + joining_node_handoff_timeout_seconds))
+    while ((SECONDS < clear_deadline)); do
       line="$(latest_source_journal_sample "${node}")"
-      if source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}"; then
+      if source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}" \
+        && ((SECONDS < clear_deadline)); then
         clear_tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
         if [[ -n "${previous_clear_line}" \
           && "${line}" != "${previous_clear_line}" \
@@ -326,14 +330,15 @@ prepare_no_event_membership_cutover_qualification() {
 refresh_no_event_membership_cutover_tail() {
   local node="$1"
   local bound="$2"
-  local attempt
+  local clear_deadline=$((SECONDS + joining_node_handoff_timeout_seconds))
   local clear_tail
   local line=
   local previous_clear_line=
   local previous_clear_tail=
-  for attempt in $(seq 1 45); do
+  while ((SECONDS < clear_deadline)); do
     line="$(latest_source_journal_sample "${node}")"
-    if source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}"; then
+    if source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}" \
+      && ((SECONDS < clear_deadline)); then
       clear_tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
       if [[ -n "${previous_clear_line}" \
         && "${line}" != "${previous_clear_line}" \
