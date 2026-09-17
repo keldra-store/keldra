@@ -19,6 +19,10 @@ use crate::index_service::{StoredIndexDefinition, definition_path};
 use super::json_projection::CompiledScalarProjectionPlan;
 use super::typed_json_schema::compile_typed_json_schema;
 
+#[path = "catalog_replay_proof.rs"]
+mod replay_proof;
+pub(crate) use replay_proof::CompletedCatalogReplay;
+
 const PROJECTION_FAMILY_DOMAIN: &[u8] = b"keldra.index.projection-family/v1";
 
 /// Stable physical identity for one complete canonical source/schema recipe.
@@ -398,6 +402,7 @@ struct CatalogState {
     generation: u64,
     physical_generation: [u8; 32],
     published_physical: Arc<PhysicalCatalogSnapshot>,
+    completed_replay: Option<Arc<CompletedCatalogReplay>>,
     resident_bytes: usize,
     maximum_bytes: usize,
     recipe_resident: Arc<RecipeResidentTracker>,
@@ -556,6 +561,7 @@ impl IndexCatalog {
                 generation: 1,
                 physical_generation: empty_physical,
                 published_physical,
+                completed_replay: None,
                 resident_bytes: 0,
                 maximum_bytes,
                 recipe_resident,
@@ -612,6 +618,7 @@ impl IndexCatalog {
             backup.restore(&mut state);
             return Err(error);
         }
+        state.completed_replay = None;
         drop(backup);
         drop(state);
         let _ = self.changes.send(CatalogNotice {
@@ -667,6 +674,7 @@ impl IndexCatalog {
             backup.restore(&mut state);
             return Err(error);
         }
+        state.completed_replay = None;
         drop(backup);
         drop(state);
         let _ = self.changes.send(CatalogNotice {
@@ -715,6 +723,7 @@ impl IndexCatalog {
             backup.restore(&mut state);
             return Err(error);
         }
+        state.completed_replay = None;
         drop(backup);
         drop(state);
         let _ = self.changes.send(CatalogNotice {

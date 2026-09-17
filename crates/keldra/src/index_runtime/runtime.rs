@@ -147,7 +147,6 @@ pub(crate) async fn start(
     );
     let v1_retention = V1IndexRetentionTask::start(
         local_node,
-        store.clone(),
         catalog.clone(),
         journal.clone(),
         derived_checkpoints.clone(),

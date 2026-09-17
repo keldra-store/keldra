@@ -14,7 +14,7 @@ use keldra_consensus::NodeId;
 use keldra_index::v1::{
     IndexingMemoryCredits, IndexingMemoryStage, ProjectionFamilyPartitionDirectory,
 };
-use keldra_store::{DefinitionConsumerKind, DerivedConsumerCheckpoint, DerivedConsumerKind, Store};
+use keldra_store::{DerivedConsumerCheckpoint, DerivedConsumerKind};
 use tonic::Status;
 
 use crate::derived_consumer::DerivedCheckpointPublisher;
@@ -26,6 +26,10 @@ use super::v1_publication::V1ProjectionPublisher;
 
 #[path = "v1_retention_atomic.rs"]
 mod atomic;
+
+#[cfg(test)]
+#[path = "v1_retention_readiness_tests.rs"]
+mod readiness_tests;
 
 const RETENTION_SAFETY_INTERVAL: Duration = Duration::from_secs(30);
 const RETENTION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -39,7 +43,6 @@ pub(crate) struct V1IndexRetentionTask {
 impl V1IndexRetentionTask {
     pub(crate) fn start(
         local_node: NodeId,
-        store: Store,
         catalog: IndexCatalog,
         journal: Arc<IndexEventJournal>,
         checkpoints: DerivedCheckpointPublisher,
@@ -60,7 +63,6 @@ impl V1IndexRetentionTask {
                 };
                 if let Err(error) = advance_once(
                     local_node,
-                    &store,
                     &catalog,
                     &journal,
                     &checkpoints,
@@ -88,27 +90,40 @@ impl Drop for V1IndexRetentionTask {
 
 async fn advance_once(
     local_node: NodeId,
-    store: &Store,
     catalog: &IndexCatalog,
     journal: &IndexEventJournal,
     checkpoints: &DerivedCheckpointPublisher,
     projections: &V1ProjectionPublisher,
     credits: &IndexingMemoryCredits,
-    last_reconciled: &mut Option<(u64, super::events::IndexBarrier)>,
+    last_reconciled: &mut Option<(
+        Arc<super::catalog::CompletedCatalogReplay>,
+        super::events::IndexBarrier,
+    )>,
     forced: bool,
 ) -> Result<(), Status> {
     let barrier = journal
         .capture_barrier()
         .await
         .map_err(|error| Status::unavailable(error.to_string()))?;
-    let catalog_snapshot = catalog.physical_snapshot()?;
-    let input = (catalog_snapshot.generation, barrier.clone());
-    if !forced && last_reconciled.as_ref() == Some(&input) {
+    let Some(catalog_snapshot) = catalog.retention_snapshot()? else {
+        // Old durable catalog checkpoints do not prove that this process has
+        // reloaded its ordinary definitions into the transient inventory.
+        return Ok(());
+    };
+    if !forced
+        && last_reconciled.as_ref().is_some_and(|(catalog, target)| {
+            catalog.generation == catalog_snapshot.generation
+                && catalog.barrier == catalog_snapshot.barrier
+                && target == &barrier
+        })
+    {
         return Ok(());
     }
-    let recipes = catalog_snapshot.recipes.as_ref();
+    let input = (catalog_snapshot.clone(), barrier.clone());
+    let recipes = catalog_snapshot.physical.recipes.as_ref();
     for cursor in barrier.sources.values().copied() {
-        let Some(catalog_next) = catalog_checkpoint_limit(store, cursor, barrier.fence).await?
+        let Some(catalog_next) =
+            catalog_checkpoint_limit(&catalog_snapshot, cursor, barrier.fence)?
         else {
             return Ok(());
         };
@@ -117,8 +132,8 @@ async fn advance_once(
             ..cursor
         };
         let next_offset = if recipes.is_empty() {
-            // The durable catalog checkpoint proves the all-source baseline
-            // inventory and replay cut even when that inventory is empty.
+            // This process completed the baseline and all-source replay at
+            // the cut paired with this exact empty inventory snapshot.
             catalog_next
         } else if let Some(next_offset) =
             family_coverage(catalog_cursor, recipes, projections).await?
@@ -162,34 +177,23 @@ async fn advance_once(
     Ok(())
 }
 
-async fn catalog_checkpoint_limit(
-    store: &Store,
+fn catalog_checkpoint_limit(
+    snapshot: &super::catalog::CompletedCatalogReplay,
     cursor: IndexSourceCursor,
     fence: keldra_store::PlacementLogId,
 ) -> Result<Option<u64>, Status> {
-    let store = store.clone();
-    let checkpoint = tokio::task::spawn_blocking(move || {
-        store.definition_checkpoint(
-            DefinitionConsumerKind::V1IndexCatalog,
-            cursor.source.node_id,
-        )
-    })
-    .await
-    .map_err(|error| Status::internal(format!("v1 catalog checkpoint task failed: {error}")))?
-    .map_err(|error| Status::unavailable(error.to_string()))?;
-    let Some(checkpoint) = checkpoint else {
+    if snapshot.barrier.fence != fence {
+        return Ok(None);
+    }
+    let Some(checkpoint) = snapshot
+        .barrier
+        .sources
+        .get(&NodeId(u64::from(cursor.source.node_id)))
+        .filter(|checkpoint| checkpoint.source == cursor.source)
+    else {
         return Ok(None);
     };
-    if checkpoint.consumer_kind != DefinitionConsumerKind::V1IndexCatalog
-        || checkpoint.source_id != cursor.source
-        || checkpoint.observed_fence != fence
-        || checkpoint.next_offset > cursor.next_offset
-    {
-        return Err(Status::data_loss(
-            "v1 catalog checkpoint does not prove the captured source barrier",
-        ));
-    }
-    Ok(Some(checkpoint.next_offset))
+    Ok(Some(checkpoint.next_offset.min(cursor.next_offset)))
 }
 
 /// Return the first uncovered source position across all active families.

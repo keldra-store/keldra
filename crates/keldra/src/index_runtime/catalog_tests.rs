@@ -5,6 +5,148 @@ use keldra_api::v1::{
 
 use super::*;
 
+fn replay_barrier(next: u64) -> super::super::events::IndexBarrier {
+    use super::super::events::{AtomicProgramWatermark, IndexBarrier, IndexSourceCursor};
+    use keldra_consensus::NodeId;
+    use keldra_store::{PlacementLogId, SourceId};
+    IndexBarrier {
+        fence: PlacementLogId { term: 1, index: 12 },
+        atomic: AtomicProgramWatermark::new(None, None, 0),
+        sources: [(
+            NodeId(1),
+            IndexSourceCursor {
+                source: SourceId {
+                    node_id: 1,
+                    source_epoch: [9; 32],
+                },
+                next_offset: next,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+#[tokio::test]
+async fn persisted_catalog_checkpoint_does_not_certify_transient_empty_inventory() {
+    use keldra_store::{DefinitionCheckpoint, DefinitionConsumerKind, Store, StoreOptions};
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(directory.path(), 1))
+        .await
+        .unwrap();
+    let barrier = replay_barrier(52);
+    let cursor = barrier.sources.values().next().unwrap();
+    let checkpoint = DefinitionCheckpoint {
+        consumer_kind: DefinitionConsumerKind::V1IndexCatalog,
+        source_id: cursor.source,
+        next_offset: cursor.next_offset,
+        observed_fence: barrier.fence,
+    };
+    store
+        .apply_definition_assignment_page(&[], &checkpoint)
+        .unwrap();
+    assert_eq!(
+        store
+            .definition_checkpoint(DefinitionConsumerKind::V1IndexCatalog, 1)
+            .unwrap(),
+        Some(checkpoint)
+    );
+    let catalog = IndexCatalog::default();
+    assert!(catalog.physical_snapshot().unwrap().recipes.is_empty());
+    // This is exactly the inventory accessor used by retention, not a
+    // separately mirrored bootstrap boolean.
+    assert!(catalog.retention_snapshot().unwrap().is_none());
+    let generation = catalog.catalog_replay_generation().unwrap();
+    assert!(
+        catalog
+            .complete_catalog_replay(generation, &barrier)
+            .unwrap()
+    );
+    let ready = catalog.retention_snapshot().unwrap().unwrap();
+    assert!(ready.physical.recipes.is_empty());
+    assert_eq!(ready.barrier, barrier);
+    catalog.begin_catalog_replay().unwrap();
+    assert!(catalog.retention_snapshot().unwrap().is_none());
+    // Existing disk state deliberately remains unchanged on a retry epoch.
+    assert_eq!(
+        store
+            .definition_checkpoint(DefinitionConsumerKind::V1IndexCatalog, 1)
+            .unwrap(),
+        Some(checkpoint)
+    );
+}
+
+#[test]
+fn successful_logical_catalog_mutation_invalidates_snapshot_paired_replay_proof() {
+    let catalog = IndexCatalog::default();
+    catalog.upsert(definition(7, 9, 10)).unwrap();
+    let generation = catalog.catalog_replay_generation().unwrap();
+    let barrier = replay_barrier(47);
+    assert!(
+        catalog
+            .complete_catalog_replay(generation, &barrier)
+            .unwrap()
+    );
+    let old = catalog.retention_snapshot().unwrap().unwrap();
+    catalog.upsert(definition(7, 9, 11)).unwrap();
+    // Aliases change logical inventory without necessarily changing the
+    // physical recipe snapshot. The mutable generation is the CAS token.
+    assert!(Arc::ptr_eq(
+        &old.physical,
+        &catalog.physical_snapshot().unwrap()
+    ));
+    assert!(catalog.catalog_replay_generation().unwrap() > generation);
+    assert!(catalog.retention_snapshot().unwrap().is_none());
+    assert!(
+        !catalog
+            .complete_catalog_replay(generation, &replay_barrier(52))
+            .unwrap()
+    );
+    assert!(catalog.retention_snapshot().unwrap().is_none());
+    let new_generation = catalog.catalog_replay_generation().unwrap();
+    assert!(
+        catalog
+            .complete_catalog_replay(new_generation, &replay_barrier(52))
+            .unwrap()
+    );
+    let new = catalog.retention_snapshot().unwrap().unwrap();
+    assert_eq!(new.generation, new_generation);
+    assert_eq!(new.barrier, replay_barrier(52));
+    // Retained old proof owners remain immutable and charged until dropped.
+    assert_eq!(old.generation, generation);
+    assert_eq!(old.barrier, barrier);
+}
+
+#[test]
+fn catalog_replay_proof_rejects_unclear_captured_atomic_barrier_without_losing_old_pair() {
+    use super::super::events::AtomicProgramWatermark;
+    let catalog = IndexCatalog::default();
+    let generation = catalog.catalog_replay_generation().unwrap();
+    let completed = replay_barrier(47);
+    assert!(
+        catalog
+            .complete_catalog_replay(generation, &completed)
+            .unwrap()
+    );
+    let old = catalog.retention_snapshot().unwrap().unwrap();
+    let mut pending = replay_barrier(52);
+    pending.atomic = AtomicProgramWatermark::new(Some(15), Some(14), 1);
+    assert_eq!(
+        catalog
+            .complete_catalog_replay(generation, &pending)
+            .unwrap_err()
+            .code(),
+        tonic::Code::DataLoss
+    );
+    assert!(Arc::ptr_eq(
+        &old,
+        &catalog.retention_snapshot().unwrap().unwrap()
+    ));
+    // The API inspects only its captured completed barrier, not later live
+    // authority, so a new program cannot invalidate an older completed pair.
+    assert_eq!(old.barrier, completed);
+}
+
 fn definition(tenant_id: u64, bucket_id: u64, index_id: u64) -> CatalogDefinition {
     CatalogDefinition::new(
         tenant_id,
@@ -336,6 +478,13 @@ fn rejected_rebuild_admission_restores_family_intents_binding_and_generation() {
         .upsert(explicit_rebuild(definition(1, 2, 9), 2, 1_000))
         .unwrap();
     catalog.upsert(definition(1, 2, 10)).unwrap();
+    let replay_generation = catalog.catalog_replay_generation().unwrap();
+    assert!(
+        catalog
+            .complete_catalog_replay(replay_generation, &replay_barrier(47))
+            .unwrap()
+    );
+    let replay_before = catalog.retention_snapshot().unwrap().unwrap();
     let before = catalog.physical_snapshot().unwrap();
     let mut notices = catalog.subscribe();
     let resident_before = {
@@ -352,6 +501,14 @@ fn rejected_rebuild_admission_restores_family_intents_binding_and_generation() {
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert!(notices.try_recv().is_err());
     assert!(Arc::ptr_eq(&before, &catalog.physical_snapshot().unwrap()));
+    assert!(Arc::ptr_eq(
+        &replay_before,
+        &catalog.retention_snapshot().unwrap().unwrap()
+    ));
+    assert_eq!(
+        catalog.catalog_replay_generation().unwrap(),
+        replay_generation
+    );
     let state = catalog.inner.lock().unwrap();
     let recipe = state.recipes.values().next().unwrap();
     assert_eq!(recipe.rebuild_intents, BTreeMap::from([(9, 1_000)]));

@@ -529,6 +529,7 @@ async fn run_index_catalog_epoch(
     catalog: &IndexCatalog,
     journal: &IndexEventJournal,
 ) -> Result<(), Status> {
+    catalog.begin_catalog_replay()?;
     // Capture before the baseline scan. Every definition committed while the
     // scan is open is therefore either already visible in the scan or replayed
     // idempotently from this exact all-source control-plane cut.
@@ -566,7 +567,9 @@ async fn run_index_catalog_epoch(
         // has completed its baseline inventory and the exact all-source
         // journal suffix through `target`. Retention must never infer that
         // proof from an empty in-memory map.
+        let completed_generation = catalog.catalog_replay_generation()?;
         catalog_checkpoint::persist(&scanner.store, &cursor, replayed_rows, replayed_bytes).await?;
+        catalog.complete_catalog_replay(completed_generation, &cursor)?;
         replayed_rows = 0;
         replayed_bytes = 0;
         tokio::time::sleep(DELIVERY_IDLE_INTERVAL).await;
