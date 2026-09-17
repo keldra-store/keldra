@@ -269,6 +269,31 @@ impl IndexWorkingMemory {
         Ok(())
     }
 
+    /// Mandatory range scratch for an already-admitted query. Unlike a fresh
+    /// or opportunistic admission, this completes work holding an existing
+    /// query lease; refusing solely for a queued sibling prevents progress.
+    /// Only payload-range ownership uses this path. New queries retain FIFO
+    /// admission, and available_for still protects the hard cap and promises.
+    fn try_acquire_active_query_range_scratch(&self, bytes: u64) -> Option<WorkingMemoryPermit> {
+        let account = WorkingMemoryAccount::Query;
+        self.reclaim_for_account(account, bytes);
+        let mut state = lock_state(&self.inner);
+        if bytes > available_for(&self.inner, &state, account) {
+            return None;
+        }
+        state.used += bytes;
+        state.peak = state.peak.max(state.used);
+        state.account_used[account.slot()] += bytes;
+        state.account_peak[account.slot()] =
+            state.account_peak[account.slot()].max(state.account_used[account.slot()]);
+        emit_state(&self.inner, &state, account);
+        Some(WorkingMemoryPermit {
+            inner: self.inner.clone(),
+            account,
+            bytes,
+        })
+    }
+
     pub(crate) fn try_acquire(
         &self,
         account: WorkingMemoryAccount,
@@ -453,14 +478,17 @@ impl crate::payload_read::PayloadRangeMemory for SharedPayloadRangeMemory {
         let bytes = u64::try_from(bytes).map_err(|_| {
             tonic::Status::resource_exhausted("payload range scratch exceeds platform capacity")
         })?;
-        let permit = self
-            .memory
-            .try_acquire(self.account, bytes)
-            .ok_or_else(|| {
-                tonic::Status::resource_exhausted(
-                    "payload range scratch exceeds available shared working memory",
-                )
-            })?;
+        let permit = match self.account {
+            WorkingMemoryAccount::Query => {
+                self.memory.try_acquire_active_query_range_scratch(bytes)
+            }
+            _ => self.memory.try_acquire(self.account, bytes),
+        }
+        .ok_or_else(|| {
+            tonic::Status::resource_exhausted(
+                "payload range scratch exceeds available shared working memory",
+            )
+        })?;
         Ok(Box::new(permit))
     }
 }
@@ -644,6 +672,69 @@ mod tests {
         drop(lease);
         assert_eq!(memory.free_bytes(), 40);
         drop(blocking_owner);
+        assert_eq!(memory.free_bytes(), 100);
+    }
+
+    #[tokio::test]
+    async fn active_query_range_progress_preserves_capacity_promises_and_new_admission_fifo() {
+        let memory = pool(100, 20, 80);
+        memory.try_reserve_progress(10).unwrap();
+        let active = memory
+            .acquire_up_to(WorkingMemoryAccount::Query, 60, 60)
+            .await
+            .unwrap();
+        let sibling = tokio::spawn({
+            let memory = memory.clone();
+            async move {
+                memory
+                    .acquire_up_to(WorkingMemoryAccount::Query, 40, 40)
+                    .await
+            }
+        });
+        loop {
+            if !lock_state(&memory.inner).waiters.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!sibling.is_finished());
+        assert_eq!(memory.free_bytes(), 40);
+        // Generic fresh/opportunistic admission remains blocked by the FIFO
+        // waiter, even when a small fresh request could physically fit.
+        for account in [
+            WorkingMemoryAccount::Query,
+            WorkingMemoryAccount::IndexingPipeline,
+            WorkingMemoryAccount::ReusableCache,
+        ] {
+            assert!(memory.try_acquire(account, 1).is_none());
+        }
+        let ranges = memory.payload_range_memory(WorkingMemoryAccount::Query);
+        let scratch = Arc::new(ranges.try_reserve(20).unwrap());
+        let blocking_owner = scratch.clone();
+        assert_eq!(memory.free_bytes(), 20);
+        // Ten remaining bytes belong to the sealing promise, not scratch.
+        assert_eq!(
+            ranges.try_reserve(11).err().unwrap().code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(memory.free_bytes(), 20);
+        drop(scratch);
+        assert_eq!(
+            memory.free_bytes(),
+            20,
+            "blocking ownership survives caller cancellation"
+        );
+        drop(blocking_owner);
+        assert_eq!(memory.free_bytes(), 40);
+        assert!(
+            !sibling.is_finished(),
+            "scratch does not admit a queued query outside FIFO"
+        );
+        drop(active);
+        let sibling_permit = sibling.await.unwrap().unwrap();
+        assert_eq!(sibling_permit.bytes(), 40);
+        drop(sibling_permit);
+        memory.release_progress(10);
         assert_eq!(memory.free_bytes(), 100);
     }
 
