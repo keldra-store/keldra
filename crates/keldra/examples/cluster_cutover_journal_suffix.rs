@@ -326,7 +326,10 @@ fn validate_page(
             serde_json::from_slice(bytes).map_err(|_| "invalid typed journal change")?;
         next = next.checked_add(1).ok_or("journal offset overflow")?;
         if change.offset() != next || next > target || !is_reserved_artifact_change(&change) {
-            return Err("journal suffix is noncontiguous or contains a non-artifact change".into());
+            return Err(format!(
+                "journal suffix rejected expected_offset={next} target={target} change={change:?}"
+            )
+            .into());
         }
     }
     Ok(next)
@@ -342,6 +345,15 @@ fn is_reserved_artifact_change(change: &LocalChange) -> bool {
         }
         LocalChange::RetainedVersionDeleted(deletion) => {
             deletion.canonical_path.is_none() && artifact_path(&deletion.exact_path)
+        }
+        LocalChange::ContentLifecycleBatchChanged(batch) => {
+            !batch.transitions.is_empty()
+                && batch.transitions.iter().all(|transition| {
+                    transition
+                        .accounting_transition
+                        .as_ref()
+                        .is_some_and(|accounting| artifact_path(&accounting.exact_path))
+                })
         }
         // In particular, never hide an AtomicBatchPublished or a new variant.
         _ => false,
@@ -388,7 +400,10 @@ fn unsigned(suffix: &str) -> TestResult<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keldra_store::{ObjectHeadChange, ObjectHeadChangeKind, VersionId};
+    use keldra_store::{
+        ContentAccountingTransition, ContentLifecycleBatchChanged, ContentLifecycleTransition,
+        ObjectHeadChange, ObjectHeadChangeKind, VersionId,
+    };
 
     fn head(offset: u64, path: &str) -> LocalChange {
         LocalChange::ObjectHead(ObjectHeadChange {
@@ -419,6 +434,26 @@ mod tests {
             oversize_offset: 0,
             oversize_encoded_bytes: 0,
         }
+    }
+
+    fn lifecycle(offset: u64, paths: &[Option<&str>]) -> LocalChange {
+        LocalChange::ContentLifecycleBatchChanged(ContentLifecycleBatchChanged {
+            offset,
+            transitions: paths
+                .iter()
+                .map(|path| ContentLifecycleTransition {
+                    blob_identity: vec![1],
+                    revision: 7,
+                    reference_deltas: Vec::new(),
+                    accounting_transition: path.map(|exact_path| ContentAccountingTransition {
+                        tenant_id: 1,
+                        bucket_id: 1,
+                        exact_path: exact_path.into(),
+                        retained_bytes_removed: 1,
+                    }),
+                })
+                .collect(),
+        })
     }
 
     #[test]
@@ -458,6 +493,16 @@ mod tests {
         assert!(!is_reserved_artifact_change(&LocalChange::SequenceGap(
             keldra_store::SourceSequenceGap { offset: 2 },
         )));
+        assert!(is_reserved_artifact_change(&lifecycle(
+            3,
+            &[Some("_keldra/accounting/7/current")],
+        )));
+        assert!(!is_reserved_artifact_change(&lifecycle(
+            3,
+            &[Some("_keldra/accounting/7/current"), Some("objects/7.json"),],
+        )));
+        assert!(!is_reserved_artifact_change(&lifecycle(3, &[None])));
+        assert!(!is_reserved_artifact_change(&lifecycle(3, &[])));
     }
 
     #[test]
