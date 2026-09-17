@@ -5,6 +5,39 @@ use crate::{
     WatchCursor, WatchScope,
 };
 
+#[test]
+fn physical_projection_retry_kind_allowlist_rejects_every_other_rocksdb_error_kind() {
+    use rocksdb::ErrorKind;
+
+    // Enumerate the pinned RocksDB library's entire taxonomy. Corruption,
+    // malformed writes and unknown errors must never become endless retries.
+    let cases = [
+        (ErrorKind::NotFound, false),
+        (ErrorKind::Corruption, false),
+        (ErrorKind::NotSupported, false),
+        (ErrorKind::InvalidArgument, false),
+        (ErrorKind::IOError, true),
+        (ErrorKind::MergeInProgress, false),
+        (ErrorKind::Incomplete, false),
+        (ErrorKind::ShutdownInProgress, false),
+        (ErrorKind::TimedOut, true),
+        (ErrorKind::Aborted, true),
+        (ErrorKind::Busy, true),
+        (ErrorKind::Expired, false),
+        (ErrorKind::TryAgain, true),
+        (ErrorKind::CompactionTooLarge, false),
+        (ErrorKind::ColumnFamilyDropped, false),
+        (ErrorKind::Unknown, false),
+    ];
+    for (kind, expected) in cases {
+        assert_eq!(
+            LaneProjectionFailure::retryable_write_kind(kind.clone()),
+            expected,
+            "{kind:?}"
+        );
+    }
+}
+
 fn status(tail: u64, entries: u64, bytes: u64) -> WatchJournalStatus {
     WatchJournalStatus {
         source_id: crate::SourceId {
@@ -697,6 +730,7 @@ async fn completion_disambiguation_read_failure_retries_without_losing_the_ticke
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
         .await
         .unwrap();
+    let fence_lease = Arc::new(store.mutation_commit_lanes.acquire_fence().await);
     let completion = {
         let mut runtime = store.mutation_commit_lanes.sequence().await;
         let runtime = runtime.as_mut().unwrap();
@@ -713,7 +747,7 @@ async fn completion_disambiguation_read_failure_retries_without_losing_the_ticke
         .store(true, Ordering::Release);
 
     store
-        .finish_lane_commit_cancellation_safe(completion, false)
+        .finish_lane_commit_cancellation_safe(completion, false, fence_lease)
         .await
         .unwrap();
 
@@ -765,9 +799,32 @@ async fn cancelled_direct_caller_cannot_leave_a_durable_ticket_hole() {
 
     first.abort();
     let _ = first.await;
+    // The durable write has outlived its caller. Its detached settlement must
+    // retain the original lane fence rather than reacquiring behind a queued
+    // exclusive writer, or journal authority could overlap this ticket.
+    let lanes = store.mutation_commit_lanes.clone();
+    let exclusive = lanes.acquire_exclusive();
+    tokio::pin!(exclusive);
+    assert!(
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(exclusive.as_mut(), cx).is_pending())
+        })
+        .await,
+        "cancelled caller's pending settlement must still fence exclusive writers"
+    );
     store
         .mutation_commit_lanes
         .resume_cancellation_safe_settlement();
+    let authority = tokio::time::timeout(Duration::from_secs(2), exclusive)
+        .await
+        .expect("detached settlement finishes and releases its original fence");
+    {
+        let state = store.mutation_commit_lanes.sequence().await;
+        let runtime = state.as_ref().unwrap();
+        assert_eq!(runtime.projected_ticket, runtime.next_ticket);
+        assert!(runtime.completions.is_empty());
+    }
+    drop(authority);
 
     let second_key = ObjectKey::new("tenant", "bucket", "objects/after-cancel").unwrap();
     tokio::time::timeout(
@@ -790,6 +847,146 @@ async fn cancelled_direct_caller_cannot_leave_a_durable_ticket_hole() {
     let runtime = store.mutation_commit_lanes.sequence().await;
     let runtime = runtime.as_ref().unwrap();
     assert_eq!(runtime.projected_ticket, runtime.next_ticket);
+    assert!(runtime.completions.is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_detached_put_retries_physical_projection_failure_before_exclusive_authority() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    // An earlier durable ticket prevents the real put from taking the inline
+    // frontier fast path, deterministically exercising the background write.
+    let earlier = {
+        let mut state = store.mutation_commit_lanes.sequence().await;
+        let runtime = state.as_mut().unwrap();
+        runtime
+            .reserve(runtime.reserved_watch, runtime.reserved_receipts, None)
+            .unwrap()
+    };
+    let mut batch = WriteBatch::default();
+    store.stage_lane_completion(&mut batch, earlier).unwrap();
+    store.db.write(batch).unwrap();
+    store
+        .mutation_commit_lanes
+        .pause_next_cancellation_safe_settlement();
+    let key = ObjectKey::new("tenant", "bucket", "objects/retried-detached").unwrap();
+    let caller = tokio::spawn({
+        let store = store.clone();
+        let key = key.clone();
+        async move {
+            store
+                .put(PutRequest {
+                    key,
+                    bytes: b"durable-before-retry".to_vec(),
+                    content_type: None,
+                    mode: PutMode::PutIfAbsent,
+                    command_id: Some("retried-detached".into()),
+                    durability: Durability::Local,
+                })
+                .await
+        }
+    });
+    store
+        .mutation_commit_lanes
+        .wait_for_cancellation_safe_settlement()
+        .await;
+    let ticket = {
+        let mut state = store.mutation_commit_lanes.sequence().await;
+        let runtime = state.as_mut().unwrap();
+        assert_eq!(runtime.next_ticket, earlier.ticket + 1);
+        assert!(
+            runtime
+                .completions
+                .insert(earlier.ticket, LaneCompletionState::Committed(earlier))
+                .is_none()
+        );
+        runtime.next_ticket
+    };
+    assert!(
+        store
+            .db
+            .get_cf(store.cf(CF_METADATA).unwrap(), lane_completion_key(ticket))
+            .unwrap()
+            .is_some(),
+        "the real put must use a durable completion marker, not inline publication"
+    );
+    store
+        .mutation_commit_lanes
+        .fail_next_projection
+        .store(true, Ordering::Release);
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    let lanes = store.mutation_commit_lanes.clone();
+    let exclusive = lanes.acquire_exclusive();
+    tokio::pin!(exclusive);
+    assert!(
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(exclusive.as_mut(), cx).is_pending())
+        })
+        .await
+    );
+    store
+        .mutation_commit_lanes
+        .resume_cancellation_safe_settlement();
+    let authority = tokio::time::timeout(Duration::from_secs(2), exclusive)
+        .await
+        .expect("detached physical-write retry must drain without reacquiring its fenced lane");
+    assert!(
+        !store
+            .mutation_commit_lanes
+            .fail_next_projection
+            .load(Ordering::Acquire),
+        "the injected physical projection write failure must actually occur"
+    );
+    {
+        let state = store.mutation_commit_lanes.sequence().await;
+        let runtime = state.as_ref().unwrap();
+        assert_eq!(runtime.projected_ticket, ticket);
+        assert_eq!(runtime.next_ticket, ticket);
+        assert!(runtime.completions.is_empty());
+    }
+    for completed in [earlier.ticket, ticket] {
+        assert!(
+            store
+                .db
+                .get_cf(
+                    store.cf(CF_METADATA).unwrap(),
+                    lane_completion_key(completed)
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+    drop(authority);
+    assert_eq!(
+        store.get(&key).await.unwrap().unwrap().bytes,
+        b"durable-before-retry"
+    );
+    let next = ObjectKey::new("tenant", "bucket", "objects/after-detached-retry").unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        store.put(PutRequest {
+            key: next.clone(),
+            bytes: b"after-retry".to_vec(),
+            content_type: None,
+            mode: PutMode::PutIfAbsent,
+            command_id: Some("after-detached-retry".into()),
+            durability: Durability::Local,
+        }),
+    )
+    .await
+    .expect("the next ordinary mutation must settle")
+    .unwrap();
+    assert_eq!(
+        store.get(&next).await.unwrap().unwrap().bytes,
+        b"after-retry"
+    );
+    let state = store.mutation_commit_lanes.sequence().await;
+    let runtime = state.as_ref().unwrap();
+    assert_eq!(runtime.projected_ticket, ticket + 1);
+    assert_eq!(runtime.next_ticket, ticket + 1);
     assert!(runtime.completions.is_empty());
 }
 
@@ -1112,6 +1309,7 @@ async fn ambiguous_inline_primary_result_uses_durable_frontier_without_a_marker(
     let store = Store::open(StoreOptions::new(temporary.path(), 1))
         .await
         .unwrap();
+    let fence_lease = Arc::new(store.mutation_commit_lanes.acquire_fence().await);
     let encoded = encode_local_change(&LocalChange::sequence_gap(1)).unwrap();
     let mut batch = WriteBatch::default();
     batch.put_cf(
@@ -1168,6 +1366,7 @@ async fn ambiguous_inline_primary_result_uses_durable_frontier_without_a_marker(
             completion,
             Some(projection),
             false,
+            fence_lease,
         )
         .await
         .unwrap();
@@ -1441,4 +1640,147 @@ async fn exclusive_fence_waits_for_lane_and_blocks_new_lanes() {
     assert!(!waiting.is_finished());
     drop(exclusive);
     waiting.await.unwrap();
+}
+
+#[tokio::test]
+async fn exclusive_journal_authority_waits_for_projection_without_deadlocking_queued_lane() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let completion = {
+        let mut state = store.mutation_commit_lanes.sequence().await;
+        let runtime = state.as_mut().unwrap();
+        runtime
+            .reserve(runtime.reserved_watch, runtime.reserved_receipts, None)
+            .unwrap()
+    };
+    let mut batch = WriteBatch::default();
+    store.stage_lane_completion(&mut batch, completion).unwrap();
+    store.db.write(batch).unwrap();
+    store
+        .mutation_commit_lanes
+        .pause_next_projection
+        .store(true, Ordering::Release);
+    let projecting = tokio::spawn({
+        let store = store.clone();
+        async move { store.finish_lane_commit(completion, true).await }
+    });
+    store
+        .mutation_commit_lanes
+        .projection_write_completed
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+
+    // Poll the acquisition directly: it must own the exclusive fence but wait
+    // for the paused projection before exposing journal write authority.
+    let lanes = store.mutation_commit_lanes.clone();
+    let exclusive = lanes.acquire_exclusive();
+    tokio::pin!(exclusive);
+    assert!(
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(exclusive.as_mut(), cx).is_pending())
+        })
+        .await
+    );
+    let waiting = tokio::spawn({
+        let lanes = lanes.clone();
+        async move { lanes.acquire([b"queued-after-exclusive".to_vec()]).await }
+    });
+    store
+        .mutation_commit_lanes
+        .projection_publish_continue
+        .add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), projecting)
+        .await
+        .expect("projection must finish without waiting for the exclusive fence")
+        .unwrap()
+        .unwrap();
+    let authority = tokio::time::timeout(Duration::from_secs(1), exclusive)
+        .await
+        .expect("exclusive authority must acquire after projection publication");
+    assert!(
+        !waiting.is_finished(),
+        "new lanes remain fenced during journal authority writes"
+    );
+    drop(authority);
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("queued lane must acquire after exclusive authority drops")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn idle_projection_refreshes_exclusively_pruned_journal_without_resurrecting_counts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let encoded = encode_local_change(&LocalChange::sequence_gap(1)).unwrap();
+    let bytes = invalidation_record_bytes(encoded.len());
+    let completion = {
+        let mut state = store.mutation_commit_lanes.sequence().await;
+        let runtime = state.as_mut().unwrap();
+        let mut watch = runtime.reserved_watch;
+        watch.tail = 1;
+        watch.retained_entries = 1;
+        watch.retained_bytes = bytes;
+        runtime
+            .reserve(watch, runtime.reserved_receipts, None)
+            .unwrap()
+    };
+    let mut batch = WriteBatch::default();
+    batch.put_cf(
+        store.cf(CF_LOCAL_INVALIDATIONS).unwrap(),
+        invalidation_key(1),
+        encoded,
+    );
+    store.stage_lane_completion(&mut batch, completion).unwrap();
+    store.db.write(batch).unwrap();
+    store.finish_lane_commit(completion, true).await.unwrap();
+    let before = store.local_watch_status().unwrap();
+    assert_eq!(
+        (before.tail, before.settled_through, before.retention_floor),
+        (1, 1, 0)
+    );
+    assert_eq!((before.retained_entries, before.retained_bytes), (1, bytes));
+    assert!(store.prune_source_journal_for_capacity().await.unwrap());
+    let pruned = store.local_watch_status().unwrap();
+    assert_eq!(
+        (pruned.tail, pruned.settled_through, pruned.retention_floor),
+        (1, 1, 1)
+    );
+    assert_eq!((pruned.retained_entries, pruned.retained_bytes), (0, 0));
+    {
+        let state = store.mutation_commit_lanes.sequence().await;
+        assert_eq!(
+            state.as_ref().unwrap().projected_watch.retention_floor,
+            0,
+            "the cached authority deliberately remains stale until projection refresh"
+        );
+    }
+    assert_eq!(
+        store.project_lane_completions().await.unwrap().completions,
+        0
+    );
+    {
+        let state = store.mutation_commit_lanes.sequence().await;
+        let runtime = state.as_ref().unwrap();
+        assert_eq!(runtime.projected_watch, pruned);
+        assert_eq!(runtime.reserved_watch, pruned);
+    }
+    assert_eq!(store.local_watch_status().unwrap(), pruned);
+    assert!(
+        store
+            .db
+            .get_cf(
+                store.cf(CF_LOCAL_INVALIDATIONS).unwrap(),
+                invalidation_key(1)
+            )
+            .unwrap()
+            .is_none(),
+        "refresh must not recreate the physically deleted journal row"
+    );
 }

@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{
-    Mutex, Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, RwLockWriteGuard,
-    Semaphore, mpsc, oneshot,
+    Mutex, MutexGuard, Notify, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    RwLock, RwLockWriteGuard, Semaphore, mpsc, oneshot,
 };
 
 use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
@@ -32,9 +32,56 @@ const LANE_COMPLETION_FORMAT: u8 = 1;
 const LANE_COMPLETION_BYTES: usize = 1 + 8 * 7 + 1 + 8 + 3;
 const LANE_PROJECTION_QUEUE_CAPACITY: usize = 1_024;
 
+#[path = "mutation_commit_lane_codec.rs"]
+mod completion_codec;
+#[cfg(test)]
+use completion_codec::lane_completion_key;
+use completion_codec::lane_completion_ticket_from_key;
+
 struct LaneProjectionRequest {
     store: Store,
-    reply: oneshot::Sender<Result<LaneProjectionMetrics, MutationError>>,
+    reply: oneshot::Sender<Result<LaneProjectionMetrics, LaneProjectionFailure>>,
+}
+
+#[derive(Clone)]
+enum LaneProjectionFailure {
+    Write(MutationError),
+    Invariant(MutationError),
+}
+
+impl LaneProjectionFailure {
+    fn retryable_write_kind(kind: rocksdb::ErrorKind) -> bool {
+        matches!(
+            kind,
+            rocksdb::ErrorKind::IOError
+                | rocksdb::ErrorKind::TimedOut
+                | rocksdb::ErrorKind::Aborted
+                | rocksdb::ErrorKind::Busy
+                | rocksdb::ErrorKind::TryAgain
+        )
+    }
+
+    fn from_write_error(error: rocksdb::Error) -> Self {
+        let retryable = Self::retryable_write_kind(error.kind());
+        let error = storage_error(error);
+        if retryable {
+            Self::Write(error)
+        } else {
+            Self::Invariant(error)
+        }
+    }
+
+    fn into_error(self) -> MutationError {
+        match self {
+            Self::Write(error) | Self::Invariant(error) => error,
+        }
+    }
+}
+
+impl From<MutationError> for LaneProjectionFailure {
+    fn from(error: MutationError) -> Self {
+        Self::Invariant(error)
+    }
 }
 
 #[derive(Clone)]
@@ -79,7 +126,7 @@ pub(super) struct MutationCommitLanes {
 }
 
 pub(super) struct MutationLaneGuard {
-    _fence: OwnedRwLockReadGuard<()>,
+    _fence: Arc<OwnedRwLockReadGuard<()>>,
     _conflicts: MutationConflictGuard,
     physical_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     physical_slots_active: Arc<AtomicUsize>,
@@ -112,6 +159,12 @@ impl Drop for MutationLaneGuard {
 }
 
 impl MutationLaneGuard {
+    /// Shares the existing fence with independently owned settlement. This
+    /// does not acquire another reader behind a queued exclusive writer.
+    pub(super) fn settlement_fence_lease(&self) -> Arc<OwnedRwLockReadGuard<()>> {
+        self._fence.clone()
+    }
+
     /// Releases only the bounded physical-commit admission slot. The lane
     /// fence and conflict guards remain held until this guard is dropped, so
     /// ordered settlement cannot overlap a legacy writer or a conflicting
@@ -183,7 +236,14 @@ enum ExclusiveFence<'a> {
     Borrowed { _guard: RwLockWriteGuard<'a, ()> },
 }
 
+enum ExclusiveProjection<'a> {
+    Owned { _guard: OwnedMutexGuard<()> },
+    Borrowed { _guard: MutexGuard<'a, ()> },
+}
+
 pub(super) struct ExclusiveMutationGuard<'a> {
+    // Release projection before the lane fence, after Drop marks authority stale.
+    _projection: ExclusiveProjection<'a>,
     _fence: ExclusiveFence<'a>,
     authorities_stale: Arc<AtomicBool>,
 }
@@ -354,7 +414,7 @@ impl MutationCommitLanes {
         let physical_slots_peak_since_start_at_acquire =
             self.physical_slots_peak.load(Ordering::Acquire);
         MutationLaneGuard {
-            _fence: fence,
+            _fence: Arc::new(fence),
             _conflicts: conflicts,
             physical_slot: Some(physical_slot),
             physical_slots_active: self.physical_slots_active.clone(),
@@ -380,10 +440,11 @@ impl MutationCommitLanes {
     }
 
     pub(super) async fn acquire_exclusive(&self) -> ExclusiveMutationGuard<'static> {
+        let fence = self.fence.clone().write_owned().await;
+        let projection = self.projection.clone().lock_owned().await;
         ExclusiveMutationGuard {
-            _fence: ExclusiveFence::Owned {
-                _guard: self.fence.clone().write_owned().await,
-            },
+            _projection: ExclusiveProjection::Owned { _guard: projection },
+            _fence: ExclusiveFence::Owned { _guard: fence },
             authorities_stale: self.authorities_stale.clone(),
         }
     }
@@ -391,19 +452,21 @@ impl MutationCommitLanes {
     pub(super) fn try_acquire_exclusive(
         &self,
     ) -> Result<ExclusiveMutationGuard<'static>, tokio::sync::TryLockError> {
+        let fence = self.fence.clone().try_write_owned()?;
+        let projection = self.projection.clone().try_lock_owned()?;
         Ok(ExclusiveMutationGuard {
-            _fence: ExclusiveFence::Owned {
-                _guard: self.fence.clone().try_write_owned()?,
-            },
+            _projection: ExclusiveProjection::Owned { _guard: projection },
+            _fence: ExclusiveFence::Owned { _guard: fence },
             authorities_stale: self.authorities_stale.clone(),
         })
     }
 
     pub(super) fn blocking_acquire_exclusive(&self) -> ExclusiveMutationGuard<'_> {
+        let fence = self.fence.blocking_write();
+        let projection = self.projection.blocking_lock();
         ExclusiveMutationGuard {
-            _fence: ExclusiveFence::Borrowed {
-                _guard: self.fence.blocking_write(),
-            },
+            _projection: ExclusiveProjection::Borrowed { _guard: projection },
+            _fence: ExclusiveFence::Borrowed { _guard: fence },
             authorities_stale: self.authorities_stale.clone(),
         }
     }
@@ -845,7 +908,7 @@ impl Store {
                     }
                 }
                 let store = requests[0].store.clone();
-                let result = store.project_lane_completions().await;
+                let result = store.project_lane_completions_classified().await;
                 for (index, request) in requests.into_iter().enumerate() {
                     let response = match &result {
                         Ok(metrics) if index == 0 => Ok(*metrics),
@@ -862,6 +925,14 @@ impl Store {
     pub(super) async fn request_lane_projection(
         &self,
     ) -> Result<LaneProjectionMetrics, MutationError> {
+        self.request_lane_projection_classified()
+            .await
+            .map_err(LaneProjectionFailure::into_error)
+    }
+
+    async fn request_lane_projection_classified(
+        &self,
+    ) -> Result<LaneProjectionMetrics, LaneProjectionFailure> {
         let (reply, response) = oneshot::channel();
         self.mutation_commit_lanes
             .projection_tx
@@ -874,6 +945,28 @@ impl Store {
         response
             .await
             .map_err(|_| MutationError::Storage("mutation lane projector dropped a reply".into()))?
+    }
+
+    async fn request_lane_projection_retrying_writes(
+        &self,
+    ) -> Result<LaneProjectionMetrics, MutationError> {
+        let mut failures = 0_u64;
+        loop {
+            match self.request_lane_projection_classified().await {
+                Ok(metrics) => return Ok(metrics),
+                Err(LaneProjectionFailure::Invariant(error)) => return Err(error),
+                Err(LaneProjectionFailure::Write(error)) => {
+                    failures = failures.saturating_add(1);
+                    if failures == 1 || failures % 100 == 0 {
+                        tracing::warn!(error = %error, failures,
+                            "retrying physical mutation lane projection write");
+                    }
+                    // The independently owned settlement retains its existing
+                    // fence during this wait. No new ticket is inserted.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
     }
 
     fn verify_lane_journal_range(&self, completion: LaneCompletion) -> anyhow::Result<()> {
@@ -961,10 +1054,21 @@ impl Store {
         }))
     }
 
+    #[cfg(test)]
     pub(super) async fn finish_lane_commit(
         &self,
         completion: LaneCompletion,
         committed: bool,
+    ) -> Result<LaneSettlementMetrics, MutationError> {
+        self.finish_lane_commit_inner(completion, committed, false)
+            .await
+    }
+
+    async fn finish_lane_commit_inner(
+        &self,
+        completion: LaneCompletion,
+        committed: bool,
+        retry_projection_writes: bool,
     ) -> Result<LaneSettlementMetrics, MutationError> {
         let completion_sequence_started = Instant::now();
         let mut metrics = LaneSettlementMetrics::default();
@@ -1018,7 +1122,11 @@ impl Store {
             metrics.completion_ticket_lag =
                 completion.ticket.saturating_sub(runtime.projected_ticket);
         }
-        let projection = self.request_lane_projection().await?;
+        let projection = if retry_projection_writes {
+            self.request_lane_projection_retrying_writes().await?
+        } else {
+            self.request_lane_projection().await?
+        };
         metrics.projection_write = projection.write;
         metrics.contiguous_projection_completions = projection.completions;
         let frontier_wait_started = Instant::now();
@@ -1134,11 +1242,13 @@ impl Store {
         &self,
         completion: LaneCompletion,
         primary_write_succeeded: bool,
+        fence_lease: Arc<OwnedRwLockReadGuard<()>>,
     ) -> Result<LaneSettlementMetrics, MutationError> {
         self.finish_lane_commit_cancellation_safe_with_inline_projection(
             completion,
             None,
             primary_write_succeeded,
+            fence_lease,
         )
         .await
     }
@@ -1148,9 +1258,14 @@ impl Store {
         completion: LaneCompletion,
         inline_projection: Option<InlineLaneProjection>,
         primary_write_succeeded: bool,
+        fence_lease: Arc<OwnedRwLockReadGuard<()>>,
     ) -> Result<LaneSettlementMetrics, MutationError> {
         let store = self.clone();
         tokio::spawn(async move {
+            // Caller cancellation may release its lane guard. Keep its exact
+            // existing read fence until durable completion and volatile
+            // frontier publication both finish.
+            let _fence_lease = fence_lease;
             #[cfg(test)]
             if store
                 .mutation_commit_lanes
@@ -1200,7 +1315,9 @@ impl Store {
             if committed && let Some(projection) = inline_projection {
                 store.publish_inline_lane_projection(projection).await
             } else {
-                store.finish_lane_commit(completion, committed).await
+                store
+                    .finish_lane_commit_inner(completion, committed, true)
+                    .await
             }
         })
         .await
@@ -1240,7 +1357,7 @@ impl Store {
         self.mutation_capacity_notify.notify_waiters();
         self.notify_local_invalidations_from_status(projection.projected_watch);
         if has_waiting_completions {
-            self.request_lane_projection().await?;
+            self.request_lane_projection_retrying_writes().await?;
         }
         Ok(LaneSettlementMetrics {
             contiguous_projection_completions: 1,
@@ -1300,9 +1417,18 @@ impl Store {
             && high_version == projection.projected_high_version)
     }
 
+    #[cfg(test)]
     pub(super) async fn project_lane_completions(
         &self,
     ) -> Result<LaneProjectionMetrics, MutationError> {
+        self.project_lane_completions_classified()
+            .await
+            .map_err(LaneProjectionFailure::into_error)
+    }
+
+    async fn project_lane_completions_classified(
+        &self,
+    ) -> Result<LaneProjectionMetrics, LaneProjectionFailure> {
         let projection = self.mutation_commit_lanes.projection.lock().await;
         let result = self.project_lane_completions_inner().await;
         self.mutation_commit_lanes
@@ -1312,12 +1438,18 @@ impl Store {
         result
     }
 
-    async fn project_lane_completions_inner(&self) -> Result<LaneProjectionMetrics, MutationError> {
+    async fn project_lane_completions_inner(
+        &self,
+    ) -> Result<LaneProjectionMetrics, LaneProjectionFailure> {
         let plan = {
-            let runtime = self.mutation_commit_lanes.sequence().await;
-            let runtime = runtime.as_ref().ok_or_else(|| {
+            let mut runtime = self.mutation_commit_lanes.sequence().await;
+            let runtime = runtime.as_mut().ok_or_else(|| {
                 MutationError::Storage("mutation lane runtime is not initialized".into())
             })?;
+            // The projection lock excludes direct authority changes. Rebind
+            // cached frontiers after an exclusive writer before preparing any
+            // status write, including a visibility-only projection.
+            self.refresh_stale_lane_runtime(runtime)?;
             self.plan_lane_completions(runtime)?
         };
         let Some(mut plan) = plan else {
@@ -1339,14 +1471,14 @@ impl Store {
             .fail_next_projection
             .swap(false, Ordering::AcqRel)
         {
-            return Err(MutationError::Storage(
+            return Err(LaneProjectionFailure::Write(MutationError::Storage(
                 "injected mutation lane projection failure".into(),
-            ));
+            )));
         }
         let write_started = Instant::now();
         self.db
             .write_opt(std::mem::take(&mut plan.batch), &options)
-            .map_err(storage_error)?;
+            .map_err(LaneProjectionFailure::from_write_error)?;
         let write = write_started.elapsed();
         #[cfg(test)]
         if self
@@ -1681,120 +1813,6 @@ impl Store {
         }
         Ok(())
     }
-}
-
-fn lane_completion_ticket_from_key(key: &[u8]) -> anyhow::Result<u64> {
-    let suffix = key
-        .strip_prefix(LANE_COMPLETION_PREFIX)
-        .ok_or_else(|| anyhow::anyhow!("mutation lane completion key has the wrong prefix"))?;
-    Ok(u64::from_be_bytes(suffix.try_into().map_err(|_| {
-        anyhow::anyhow!("mutation lane completion key is malformed")
-    })?))
-}
-
-impl LaneCompletion {
-    pub(super) fn key(self) -> Vec<u8> {
-        lane_completion_key(self.ticket)
-    }
-
-    pub(super) fn encode(self) -> [u8; LANE_COMPLETION_BYTES] {
-        let mut encoded = [0_u8; LANE_COMPLETION_BYTES];
-        encoded[0] = LANE_COMPLETION_FORMAT;
-        let values = [
-            self.ticket,
-            self.first_offset,
-            self.last_offset,
-            self.journal_entries,
-            self.journal_bytes,
-            self.receipt_entries,
-            self.receipt_bytes,
-        ];
-        for (index, value) in values.into_iter().enumerate() {
-            let start = 1 + index * 8;
-            encoded[start..start + 8].copy_from_slice(&value.to_be_bytes());
-        }
-        let option = 1 + values.len() * 8;
-        if let Some(version) = self.high_version {
-            encoded[option] = 1;
-            encoded[option + 1..option + 9].copy_from_slice(&version.0.to_be_bytes());
-        }
-        encoded[option + 9] = u8::from(self.reference_cursor_advanced);
-        encoded[option + 10] = u8::from(self.inline_reference_safe);
-        encoded[option + 11] = u8::from(self.visibility_settled);
-        encoded
-    }
-
-    pub(super) fn decode(encoded: &[u8]) -> Result<Self, String> {
-        let encoded: &[u8; LANE_COMPLETION_BYTES] = encoded
-            .try_into()
-            .map_err(|_| "lane completion length is invalid".to_owned())?;
-        if encoded[0] != LANE_COMPLETION_FORMAT {
-            return Err("lane completion format is unsupported".into());
-        }
-        let read = |start: usize| {
-            u64::from_be_bytes(encoded[start..start + 8].try_into().expect("fixed slice"))
-        };
-        let option = 1 + 7 * 8;
-        let high_version = match encoded[option] {
-            0 => None,
-            1 => Some(VersionId(read(option + 1))),
-            _ => return Err("lane completion version marker is invalid".into()),
-        };
-        let reference_cursor_advanced = match encoded[option + 9] {
-            0 => false,
-            1 => true,
-            _ => return Err("lane completion reference-settlement marker is invalid".into()),
-        };
-        let inline_reference_safe = match encoded[option + 10] {
-            0 => false,
-            1 => true,
-            _ => return Err("lane completion inline-reference marker is invalid".into()),
-        };
-        let visibility_settled = match encoded[option + 11] {
-            0 => false,
-            1 => true,
-            _ => return Err("lane completion visibility marker is invalid".into()),
-        };
-        let completion = Self {
-            ticket: read(1),
-            first_offset: read(9),
-            last_offset: read(17),
-            journal_entries: read(25),
-            journal_bytes: read(33),
-            receipt_entries: read(41),
-            receipt_bytes: read(49),
-            high_version,
-            reference_cursor_advanced,
-            inline_reference_safe,
-            visibility_settled,
-        };
-        completion.validate()?;
-        Ok(completion)
-    }
-
-    fn validate(self) -> Result<(), String> {
-        if self.ticket == 0 {
-            return Err("lane completion ticket is zero".into());
-        }
-        let range_entries = if self.first_offset == 0 && self.last_offset == 0 {
-            0
-        } else if self.first_offset == 0 || self.last_offset < self.first_offset {
-            return Err("lane completion source range is invalid".into());
-        } else {
-            self.last_offset - self.first_offset + 1
-        };
-        if range_entries != self.journal_entries {
-            return Err("lane completion source range disagrees with its entry count".into());
-        }
-        Ok(())
-    }
-}
-
-fn lane_completion_key(ticket: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(LANE_COMPLETION_PREFIX.len() + 8);
-    key.extend_from_slice(LANE_COMPLETION_PREFIX);
-    key.extend_from_slice(&ticket.to_be_bytes());
-    key
 }
 
 pub(super) fn conflict_resources(

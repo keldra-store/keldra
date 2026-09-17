@@ -1146,6 +1146,10 @@ impl Store {
                     completion,
                     inline_lane_projection,
                     persistence.is_ok(),
+                    mutation_lane
+                        .as_ref()
+                        .expect("lane completion requires its admitted mutation lane")
+                        .settlement_fence_lease(),
                 )
                 .await?;
         }

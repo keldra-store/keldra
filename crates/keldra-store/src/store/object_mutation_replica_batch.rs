@@ -105,8 +105,12 @@ impl Store {
         };
         lane.release_physical_slot();
         if let Some(completion) = completion {
-            self.finish_lane_commit_cancellation_safe(completion, persistence.is_ok())
-                .await?;
+            self.finish_lane_commit_cancellation_safe(
+                completion,
+                persistence.is_ok(),
+                lane.settlement_fence_lease(),
+            )
+            .await?;
         }
         persistence?;
         Ok(attempt.outcomes)
