@@ -71,27 +71,96 @@ def archive_attestations(path: str, runnable: str, required_values: list[str]) -
         return []
 
     with tarfile.open(path, "r:*") as archive:
-        index = json.load(archive.extractfile("index.json"))
-        all_attestations = [item for item in index.get("manifests", []) if item.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"]
+        members: dict[str, tarfile.TarInfo] = {}
+        for member in archive.getmembers():
+            require(member.name not in members, "archive contains duplicate member paths")
+            members[member.name] = member
+
+        def object_json(data: bytes) -> dict[str, Any]:
+            try:
+                value = json.loads(data)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                fail("archive contains invalid JSON")
+            require(isinstance(value, dict), "archive JSON must be an object")
+            return value
+
+        def read_member(name: str, size: int | None = None) -> bytes:
+            member = members.get(name)
+            require(member is not None and member.isfile(), "archive object is missing or not a regular file")
+            require(size is None or member.size == size, "archive descriptor size changed")
+            source = archive.extractfile(member)
+            require(source is not None, "archive object cannot be read")
+            data = source.read()
+            require(len(data) == member.size, "archive object is truncated")
+            return data
+
+        descriptors: dict[str, tuple[str, int]] = {}
+
+        def descriptor_bytes(descriptor: dict[str, Any]) -> bytes:
+            require(isinstance(descriptor, dict), "archive descriptor is invalid")
+            digest = descriptor.get("digest", "")
+            size = descriptor.get("size")
+            require(isinstance(digest, str) and bool(SHA256.fullmatch(digest)), "archive descriptor digest is invalid")
+            require(type(size) is int and size >= 0, "archive descriptor size is invalid")
+            identity = (descriptor.get("mediaType", ""), size)
+            require(digest not in descriptors or descriptors[digest] == identity, "archive contains conflicting descriptors")
+            descriptors[digest] = identity
+            data = read_member("blobs/sha256/" + digest.removeprefix("sha256:"), size)
+            require("sha256:" + hashlib.sha256(data).hexdigest() == digest, "archive descriptor digest changed")
+            return data
+
+        leaves: list[dict[str, Any]] = []
+        active: set[str] = set()
+        visited: set[str] = set()
+        indexes = {"application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"}
+        manifests = {"application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"}
+
+        def walk(index: dict[str, Any]) -> None:
+            require(index.get("schemaVersion") == 2, "archive index schema is invalid")
+            children = index.get("manifests")
+            require(isinstance(children, list), "archive index manifests are invalid")
+            for descriptor in children:
+                data = descriptor_bytes(descriptor)
+                media_type = descriptor.get("mediaType")
+                if media_type in indexes:
+                    digest = descriptor["digest"]
+                    require(digest not in active, "archive index cycle detected")
+                    if digest in visited:
+                        continue
+                    require(len(active) < 64, "archive index nesting is excessive")
+                    active.add(digest)
+                    nested = object_json(data)
+                    require(nested.get("mediaType", media_type) == media_type, "archive index media type changed")
+                    walk(nested)
+                    active.remove(digest)
+                    visited.add(digest)
+                else:
+                    require(media_type in manifests, "archive index has an unsupported descriptor")
+                    manifest = object_json(data)
+                    require(manifest.get("schemaVersion") == 2 and isinstance(manifest.get("layers"), list), "archive manifest is invalid")
+                    require(manifest.get("mediaType", media_type) == media_type, "archive manifest media type changed")
+                    leaves.append(descriptor)
+
+        walk(object_json(read_member("index.json")))
+        runnable_leaves = [item for item in leaves if item.get("digest") == runnable and item.get("annotations", {}).get("vnd.docker.reference.type") != "attestation-manifest"]
+        require(bool(runnable_leaves), "archive runnable subject is missing")
+        all_attestations = [item for item in leaves if item.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"]
         referenced_attestations = [item for item in all_attestations if item.get("annotations", {}).get("vnd.docker.reference.digest") == runnable]
         require(len(all_attestations) == len(referenced_attestations), "archive attestation references another subject")
         for descriptor in referenced_attestations:
             digest = descriptor.get("digest", "")
-            manifest_bytes = archive.extractfile("blobs/sha256/" + digest.removeprefix("sha256:")).read()
-            require("sha256:" + hashlib.sha256(manifest_bytes).hexdigest() == digest, "attestation manifest digest changed")
-            manifest = json.loads(manifest_bytes)
+            manifest = object_json(descriptor_bytes(descriptor))
             for layer in manifest.get("layers", []):
-                statement_digest = layer.get("digest", "")
-                statement_bytes = archive.extractfile("blobs/sha256/" + statement_digest.removeprefix("sha256:")).read()
-                require("sha256:" + hashlib.sha256(statement_bytes).hexdigest() == statement_digest, "attestation statement digest changed")
-                statement = json.loads(statement_bytes)
+                statement = object_json(descriptor_bytes(layer))
                 require(any(item.get("digest", {}).get("sha256") == subject for item in statement.get("subject", [])), "attestation subject changed")
                 predicate = statement.get("predicateType", "")
                 if predicate.startswith("https://slsa.dev/provenance/"):
                     values = strings(statement)
                     require(all(value in values for value in required_values), "provenance omits an exact build input")
+                    require("provenance" not in found or found["provenance"] == digest, "archive contains conflicting provenance attestations")
                     found["provenance"] = digest
                 elif predicate == "https://spdx.dev/Document":
+                    require("sbom" not in found or found["sbom"] == digest, "archive contains conflicting SBOM attestations")
                     found["sbom"] = digest
     return found
 
