@@ -94,10 +94,13 @@ fn retry_writer(credits: &IndexingMemoryCredits) -> Writer {
         pending_projected_rows: 0,
         pending_projected_encoded_bytes: 0,
         through_atomic: 0,
+        atomic_replay_target: None,
         pending_mutations: BTreeMap::new(),
         pending_mutation_bytes: 0,
         pending_operations: 0,
         pending_next: 12,
+        skipped_proof_next: 12,
+        pending_skipped_ack: false,
         pending_mutation_capacity: 4096,
         pending_mutation_permit: credits
             .acquire(IndexingMemoryStage::ReplayInput, 1)
@@ -1123,6 +1126,143 @@ fn reserved_only_progress_does_not_request_an_empty_current_publication() {
     // The first later matching mutation makes the complete contiguous
     // range, including the skipped control positions, publishable.
     assert!(has_publication_work(true, 1));
+}
+
+#[test]
+fn reopening_one_partition_replays_other_sources_from_their_own_retained_floor() {
+    let credits = retry_credits();
+    let writer = retry_writer(&credits);
+    let mut target = writer.scanned.clone();
+    target.sources.get_mut(&NodeId(1)).unwrap().next_offset = 50;
+    let other = super::super::events::IndexSourceCursor {
+        source: SourceId {
+            node_id: 2,
+            source_epoch: [8; 32],
+        },
+        next_offset: 500,
+    };
+    target.sources.insert(NodeId(2), other);
+    let mut retained = target.clone();
+    retained.sources.get_mut(&NodeId(1)).unwrap().next_offset = 10;
+    retained.sources.get_mut(&NodeId(2)).unwrap().next_offset = 401;
+    let scanned = owned_source_scan_start(&target, &retained, writer.source, 12, true).unwrap();
+    assert_eq!(scanned.sources[&NodeId(1)].next_offset, 12);
+    assert_eq!(scanned.sources[&NodeId(2)].source, other.source);
+    assert_eq!(scanned.sources[&NodeId(2)].next_offset, 401);
+    assert!(owned_source_scan_start(&target, &retained, writer.source, 9, true).is_err());
+    let fresh = owned_source_scan_start(&target, &retained, writer.source, 1, false).unwrap();
+    assert_eq!(fresh.sources[&NodeId(1)].next_offset, 1);
+    assert_eq!(fresh.sources[&NodeId(2)].next_offset, 401);
+    let mut wrong_epoch = writer.source;
+    wrong_epoch.source_epoch = [9; 32];
+    assert!(owned_source_scan_start(&target, &retained, wrong_epoch, 12, true).is_err());
+}
+
+#[test]
+fn atomic_replay_target_remains_fixed_while_writes_extend_the_live_tail() {
+    let credits = retry_credits();
+    let mut writer = retry_writer(&credits);
+    writer.current = Some(loaded_current(
+        writer.recipe.physical_generation,
+        VersionId(3),
+    ));
+    let mut captured = writer.scanned.clone();
+    captured.atomic = super::super::events::AtomicProgramWatermark::new(Some(20), Some(20), 0);
+    atomic_progress::capture_replay_target(&mut writer, &captured, &credits).unwrap();
+    let mut live = captured.clone();
+    live.sources.get_mut(&NodeId(1)).unwrap().next_offset += 10_000;
+    live.atomic = super::super::events::AtomicProgramWatermark::new(Some(30), Some(30), 0);
+    atomic_progress::capture_replay_target(&mut writer, &live, &credits).unwrap();
+    assert_eq!(writer.atomic_replay_target.as_ref().unwrap().0, captured);
+}
+
+#[test]
+fn quiet_partition_atomic_ack_requires_complete_foreign_replay_not_max_observed_cursor() {
+    let credits = retry_credits();
+    let mut writer = retry_writer(&credits);
+    writer.dispatcher = Some(V1OrderedSourceDispatcher::new(
+        writer.scanned.fence,
+        BTreeSet::from([writer.source]),
+        credits
+            .acquire(IndexingMemoryStage::ReplayInput, 1)
+            .unwrap(),
+        64 * 1024,
+    ));
+    writer.current = Some(loaded_current(
+        writer.recipe.physical_generation,
+        VersionId(3),
+    ));
+    writer.through_atomic = 12;
+    let mut target = writer.scanned.clone();
+    target.atomic = super::super::events::AtomicProgramWatermark::new(Some(20), Some(20), 0);
+    let other = super::super::events::IndexSourceCursor {
+        source: SourceId {
+            node_id: 2,
+            source_epoch: [8; 32],
+        },
+        next_offset: 402,
+    };
+    target.sources.insert(NodeId(2), other);
+    let mut before_other = other;
+    before_other.next_offset = 401;
+    writer.scanned.sources.insert(NodeId(2), before_other);
+    assert_eq!(
+        atomic_progress::complete_atomic_replay(&writer, &target).unwrap(),
+        None
+    );
+    let own_before = writer_processed_next(&writer);
+    let progress_before = writer_dispatch_progress(&writer);
+    writer.scanned.sources.insert(NodeId(2), other);
+    assert_eq!(writer_processed_next(&writer), own_before);
+    assert!(should_reschedule_after_advance(
+        ProducerStage::JournalScan,
+        progress_before,
+        writer_dispatch_progress(&writer)
+    ));
+    assert_eq!(
+        atomic_progress::complete_atomic_replay(&writer, &target).unwrap(),
+        Some((20, 12))
+    );
+    writer.pending_prepared_rows = 1;
+    assert_eq!(
+        atomic_progress::complete_atomic_replay(&writer, &target).unwrap(),
+        None
+    );
+    writer.pending_prepared_rows = 0;
+    target.fence.index += 1;
+    assert_eq!(
+        atomic_progress::complete_atomic_replay(&writer, &target).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn admitted_empty_cut_advances_native_checkpoint_without_inventing_rows_or_components() {
+    let credits = retry_credits();
+    let mut writer = retry_writer(&credits);
+    let before = writer.accumulator.next_offset();
+    let limits = Limits {
+        bytes: 1024 * 1024,
+        flush_bytes: 64,
+        projection_batch_bytes: 256,
+        flush_age: Duration::from_secs(1),
+        flush_operations: 64,
+        lsm_runs: 64,
+        lsm_bytes: 1024,
+        parallelism: 1,
+        worker_bytes: 64,
+    };
+    apply_rows(&mut writer, before + 5, Vec::new(), &credits, limits).unwrap();
+    assert_eq!(writer.accumulator.next_offset(), before + 5);
+    assert_eq!(writer.pending_prepared_rows, 0);
+    assert_eq!(writer.pending_projected_rows, 0);
+    assert!(
+        writer.since.is_none(),
+        "only an external proof can arm an empty publication"
+    );
+    let sealed = writer.accumulator.seal_and_reset().unwrap().into_parts().0;
+    assert_eq!(sealed.checkpoint.next_offset, before + 5);
+    assert!(sealed.deltas.is_empty());
 }
 
 #[test]

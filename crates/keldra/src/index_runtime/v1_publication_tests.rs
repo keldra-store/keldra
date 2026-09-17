@@ -481,6 +481,186 @@ fn current_and_query_cut_cannot_be_crossed() {
     assert_eq!(error.code(), tonic::Code::DataLoss);
 }
 
+#[test]
+fn empty_source_cut_successor_preserves_native_live_documents_and_component_roots() {
+    use keldra_index::v1::{
+        DocumentHead, ProjectedDocumentState, ProjectionMutationBuffer, QueryBlockCursor,
+        QueryBlockKind, decode_projection_current, decode_projection_generation,
+        decode_projection_query_run, visit_live_gates, visit_query_runs_newest,
+    };
+
+    let recipe = RecipeIdentity::new([10; 32]).unwrap();
+    let document = StableDocumentKey::derive([11; 32], "objects/one", 0).unwrap();
+    let gate = QueryDocumentGate {
+        document,
+        material_source_version: 1,
+        current_source_version: 1,
+        live: true,
+        source_path: Some("objects/one".into()),
+        canonical_source_path: None,
+        result_path: Some("objects/one".into()),
+        result_version: 1,
+    };
+    let mut buffer = ProjectionMutationBuffer::new(16 * 1024).unwrap();
+    buffer
+        .apply_state(
+            &ProjectedDocumentState::new(
+                [11; 32],
+                DocumentHead::new([11; 32], "objects/one".into(), 0, 1, None, true).unwrap(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let limits = QueryBlockLimits::default_for_memory();
+    let first = prepare_atomic_projection_generation(
+        partition(),
+        [9; 32],
+        None,
+        0,
+        2,
+        11,
+        Vec::new(),
+        buffer.seal().unwrap(),
+        PreparedQueryMutationBatch {
+            membership: Some(PreparedQueryMembershipDelta {
+                recipe,
+                gates: vec![gate.clone()],
+            }),
+            fields: Vec::new(),
+        },
+        limits,
+        query_credits(),
+        pack_credits(),
+        |_| Err::<Vec<u8>, _>(keldra_index::IndexError::Integrity),
+        |_| Err::<Vec<u8>, _>(keldra_index::IndexError::Integrity),
+    )
+    .unwrap();
+    let previous = decode_projection_generation(
+        &first.generation.bytes,
+        &first.generation.component_directory,
+    )
+    .unwrap();
+    assert!(!previous.roots.is_empty());
+    let mut query_pages = first
+        .query_stream_pages
+        .iter()
+        .map(|page| (page.hash, page.bytes.to_vec()))
+        .collect::<BTreeMap<_, _>>();
+    let stream_pages = first
+        .stream_pages
+        .iter()
+        .map(|page| (page.hash, page.bytes.to_vec()))
+        .collect::<BTreeMap<_, _>>();
+    let next = prepare_atomic_projection_generation(
+        partition(),
+        [9; 32],
+        Some((&previous, first.generation.hash)),
+        2,
+        5,
+        11,
+        Vec::new(),
+        Vec::new(),
+        PreparedQueryMutationBatch {
+            membership: None,
+            fields: Vec::new(),
+        },
+        limits,
+        query_credits(),
+        pack_credits(),
+        |hash| {
+            stream_pages
+                .get(&hash)
+                .cloned()
+                .ok_or(keldra_index::IndexError::Integrity)
+        },
+        |hash| {
+            query_pages
+                .get(&hash)
+                .cloned()
+                .ok_or(keldra_index::IndexError::Integrity)
+        },
+    )
+    .unwrap();
+    let reopened =
+        decode_projection_generation(&next.generation.bytes, &next.generation.component_directory)
+            .unwrap();
+    let current = decode_projection_current(&next.current).unwrap();
+    current.validate_against(&reopened).unwrap();
+    assert_eq!(reopened.partition, previous.partition);
+    assert_eq!(reopened.partition, partition());
+    assert_eq!(reopened.roots, previous.roots);
+    assert_eq!(current.next_offset, 5);
+    assert_eq!(current.through_atomic_position, 11);
+    assert_eq!(
+        reopened.previous_generation_hash,
+        Some(first.generation.hash)
+    );
+    assert_eq!(reopened.query_stream_root.run_count, 2);
+    query_pages.extend(
+        next.query_stream_pages
+            .iter()
+            .map(|page| (page.hash, page.bytes.to_vec())),
+    );
+    let mut references = Vec::new();
+    visit_query_runs_newest(
+        reopened.query_stream_root,
+        |hash| {
+            query_pages
+                .get(&hash)
+                .cloned()
+                .ok_or(keldra_index::IndexError::Integrity)
+        },
+        &mut |reference| {
+            references.push(reference);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(references.len(), 2);
+    assert_eq!(references[0].hash, next.query_run.hash);
+    assert_eq!(references[0].source_start_offset, 2);
+    assert_eq!(references[0].next_offset, 5);
+    assert_eq!(references[1].hash, first.query_run.hash);
+    let mut decode_credits = query_credits();
+    let empty_run =
+        decode_projection_query_run(&next.query_run.bytes, limits, &mut decode_credits).unwrap();
+    assert!(empty_run.blocks.is_empty());
+    let live_run =
+        decode_projection_query_run(&first.query_run.bytes, limits, &mut decode_credits).unwrap();
+    let mut cursors = live_run
+        .blocks
+        .iter()
+        .filter(|block| block.kind == QueryBlockKind::Gate)
+        .map(|block| {
+            let pack = first
+                .query_packs
+                .iter()
+                .find(|pack| pack.ordinal == block.locator.ordinal)
+                .unwrap();
+            let start = usize::try_from(block.locator.offset).unwrap();
+            let end = start + usize::try_from(block.locator.encoded_bytes).unwrap();
+            QueryBlockCursor::new(block, &pack.bytes[start..end], limits, &mut decode_credits)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(!cursors.is_empty());
+    let mut live = Vec::new();
+    visit_live_gates(
+        QueryBlockKind::Gate,
+        recipe,
+        &mut cursors,
+        limits,
+        &mut |gate| {
+            live.push(gate);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(live, vec![gate]);
+}
+
 #[tokio::test]
 async fn transient_post_cas_failure_retains_and_retries_mandatory_verification() {
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));

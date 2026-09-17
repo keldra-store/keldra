@@ -43,6 +43,8 @@ use super::v1_publication::{
 };
 use super::v1_source_batch::{ExactMutationRequest, load_exact_mutations};
 
+#[path = "v1_consumer_atomic_progress.rs"]
+mod atomic_progress;
 #[path = "v1_consumer_compaction.rs"]
 mod compaction;
 #[path = "v1_consumer_look_ahead.rs"]
@@ -55,6 +57,8 @@ mod outcome_handling;
 mod prepare;
 #[path = "v1_consumer_sealing.rs"]
 mod sealing;
+#[path = "v1_consumer_skipped_progress.rs"]
+mod skipped_progress;
 use compaction::{
     BackgroundCompaction, ensure_background_compaction, publish_finished_background_compaction,
     should_harvest_background_compaction, take_finished_background_compaction,
@@ -70,6 +74,9 @@ use prepare::{
 };
 use prepare::{apply_rows, prepare_lane};
 use sealing::{reserve_sealing_progress, spine_preload_bound};
+#[cfg(test)]
+pub(super) use skipped_progress::skipped_interval_has_external_change;
+use skipped_progress::{acknowledge_external_skipped_positions, owned_source_scan_start};
 
 const RETRY: Duration = Duration::from_millis(250);
 const SAFETY_RECONCILE: Duration = Duration::from_secs(30);
@@ -139,10 +146,13 @@ struct Writer {
     pending_projected_rows: u64,
     pending_projected_encoded_bytes: u64,
     through_atomic: u64,
+    atomic_replay_target: Option<(IndexBarrier, IndexingMemoryPermit)>,
     pending_mutations: BTreeMap<String, Mutation>,
     pending_mutation_bytes: usize,
     pending_operations: u64,
     pending_next: u64,
+    skipped_proof_next: u64,
+    pending_skipped_ack: bool,
     pending_mutation_capacity: usize,
     pending_mutation_permit: IndexingMemoryPermit,
     background_compaction: Option<BackgroundCompaction>,
@@ -383,6 +393,7 @@ async fn reconcile(
                     recipe.clone(),
                     partition,
                     &target,
+                    journal,
                     publisher,
                     credits,
                     limits,
@@ -498,7 +509,7 @@ async fn reconcile(
             let compaction_ready = Arc::clone(&compaction_ready);
             async move {
                 let _advance = super::v1_telemetry::global().begin_in_flight_advance(STALL_AFTER);
-                let before = writer_processed_next(&writer);
+                let before = writer_dispatch_progress(&writer);
                 let result = advance(
                     &mut writer,
                     &target,
@@ -570,7 +581,11 @@ where
         })?;
         completed_advances = completed_advances.saturating_add(1);
         if result.is_ok()
-            && should_reschedule_after_advance(writer.stage, before, writer_processed_next(&writer))
+            && should_reschedule_after_advance(
+                writer.stage,
+                before,
+                writer_dispatch_progress(&writer),
+            )
         {
             // Requeue at the back so a partition never monopolizes a bounded
             // worker slot while peers are waiting for their first page.
@@ -757,7 +772,9 @@ fn record_lag_telemetry(
         let stage = state.stage;
         state.observe_progress(published_next, processed_next, stage);
         let has_unpublished_projection_work = writer.is_some_and(|writer| {
-            writer.pending_prepared_rows > 0 || !writer.pending_mutations.is_empty()
+            writer.pending_prepared_rows > 0
+                || writer.pending_skipped_ack
+                || !writer.pending_mutations.is_empty()
         });
         let processing_is_behind = state.processed_next < indexable_next;
         let lag = state.observe_lag(
@@ -841,6 +858,16 @@ fn record_lag_telemetry(
     super::v1_telemetry::V1PipelineTelemetry::set(&telemetry.halted_partitions, halted_partitions);
 }
 
+fn writer_dispatch_progress(writer: &Writer) -> u64 {
+    writer
+        .scanned
+        .sources
+        .values()
+        .fold(writer_processed_next(writer), |progress, cursor| {
+            progress.saturating_add(cursor.next_offset)
+        })
+}
+
 fn writer_processed_next(writer: &Writer) -> u64 {
     let scanned_next = writer
         .scanned
@@ -865,6 +892,7 @@ async fn open_writer(
     recipe: Arc<PhysicalCatalogRecipe>,
     partition: ProjectionPartitionIdentity,
     target: &IndexBarrier,
+    journal: &IndexEventJournal,
     publisher: &V1ProjectionPublisher,
     credits: &IndexingMemoryCredits,
     limits: Limits,
@@ -907,10 +935,29 @@ async fn open_writer(
         control,
         control_bytes,
     );
-    let mut scanned = target.clone();
-    for cursor in scanned.sources.values_mut() {
-        cursor.next_offset = cursor.next_offset.min(durable_start);
-    }
+    let replay_metadata_bytes = target
+        .sources
+        .len()
+        .checked_mul(512 + std::mem::size_of::<super::events::IndexSourceCursor>())
+        .and_then(|sources| sources.checked_add(std::mem::size_of::<IndexBarrier>()))
+        .and_then(|barrier| barrier.checked_mul(4))
+        .ok_or_else(|| Status::resource_exhausted("v1 replay metadata memory overflow"))?;
+    let replay_metadata = credits
+        .acquire(IndexingMemoryStage::ReplayInput, replay_metadata_bytes)
+        .map_err(|_| Status::resource_exhausted("v1 replay metadata memory unavailable"))?;
+    let retained_start = journal
+        .retained_replay_start(target)
+        .await
+        .map_err(event_status)?;
+    let scanned = owned_source_scan_start(
+        target,
+        &retained_start,
+        source,
+        durable_start,
+        current.is_some(),
+    )?;
+    drop(retained_start);
+    drop(replay_metadata);
     // Offset zero is the journal sentinel. A fresh empty partition publishes
     // the query-ready no-op range [0, 1), giving activation a real Current
     // without claiming any retained source mutation.
@@ -958,10 +1005,13 @@ async fn open_writer(
         pending_projected_rows: 0,
         pending_projected_encoded_bytes: 0,
         through_atomic,
+        atomic_replay_target: None,
         pending_mutations: BTreeMap::new(),
         pending_mutation_bytes: 0,
         pending_operations: 0,
         pending_next: accumulator_start,
+        skipped_proof_next: durable_start,
+        pending_skipped_ack: false,
         pending_mutation_capacity,
         pending_mutation_permit,
         background_compaction: None,
@@ -1138,6 +1188,12 @@ async fn advance(
     compaction_ready: &Arc<tokio::sync::Notify>,
     limits: Limits,
 ) -> Result<(), Status> {
+    atomic_progress::capture_replay_target(writer, target, credits)?;
+    let captured_target = writer
+        .atomic_replay_target
+        .as_ref()
+        .map(|(target, _)| target.clone());
+    let target = captured_target.as_ref().unwrap_or(target);
     writer.look_ahead_context = Some(LookAheadContext {
         journal: journal.clone(),
         target: target.clone(),
@@ -1154,6 +1210,12 @@ async fn advance(
     }
     if writer.pending_publication.is_some() {
         writer.stage = ProducerStage::Publishing;
+        if writer.atomic_replay_target.is_some() {
+            journal
+                .validate_publication_barrier(target)
+                .await
+                .map_err(event_status)?;
+        }
         finish_pending_publication(writer, publisher).await?;
         return Ok(());
     }
@@ -1181,15 +1243,17 @@ async fn advance(
         compaction_ready,
         limits,
     )?;
-    if should_harvest_background_compaction(
-        writer.current.is_some(),
-        writer.pending_prepared_rows,
-        writer.pending_mutations.is_empty(),
-        writer
-            .background_compaction
-            .as_ref()
-            .is_some_and(BackgroundCompaction::is_finished),
-    ) && publish_finished_background_compaction(writer, publisher).await?
+    if !writer.pending_skipped_ack
+        && should_harvest_background_compaction(
+            writer.current.is_some(),
+            writer.pending_prepared_rows,
+            writer.pending_mutations.is_empty(),
+            writer
+                .background_compaction
+                .as_ref()
+                .is_some_and(BackgroundCompaction::is_finished),
+        )
+        && publish_finished_background_compaction(writer, publisher).await?
     {
         return Ok(());
     }
@@ -1349,6 +1413,25 @@ async fn advance(
             break;
         }
     }
+    acknowledge_external_skipped_positions(writer, target, journal, credits, limits).await?;
+    let atomic_ack = atomic_progress::acknowledge_complete_atomic_cut(
+        writer, target, journal, publisher, credits, limits,
+    )
+    .await?;
+    if atomic_ack && writer.pending_publication.is_some() {
+        finish_pending_publication(writer, publisher).await?;
+    } else if atomic_ack {
+        flush(
+            writer,
+            physical_catalog_identity,
+            reader,
+            extractor,
+            publisher,
+            credits,
+            limits,
+        )
+        .await?;
+    }
     if writer
         .since
         .is_some_and(|since| since.elapsed() >= limits.flush_age)
@@ -1370,11 +1453,21 @@ async fn advance(
         .get(&NodeId(u64::from(writer.source.node_id)))
         .filter(|cursor| cursor.source == writer.source)
         .map_or(0, |cursor| cursor.next_offset);
-    writer.stage = if writer_processed_next(writer) >= target_next {
+    writer.stage = if writer_processed_next(writer) >= target_next
+        && writer.scanned.sources == target.sources
+    {
         ProducerStage::CaughtUp
     } else {
         ProducerStage::JournalScan
     };
+    if writer.scanned.sources == target.sources
+        && writer.current.as_ref().is_some_and(|current| {
+            current.current.through_atomic_position
+                >= target.atomic.finalized_through().unwrap_or(0)
+        })
+    {
+        writer.atomic_replay_target = None;
+    }
     Ok(())
 }
 
@@ -1429,7 +1522,9 @@ async fn flush(
         )
         .await?;
     }
-    if !has_publication_work(writer.current.is_some(), writer.pending_prepared_rows) {
+    if !writer.pending_skipped_ack
+        && !has_publication_work(writer.current.is_some(), writer.pending_prepared_rows)
+    {
         clear_pending_mutations(writer)?;
         writer.since = None;
         return Ok(());
@@ -1614,6 +1709,15 @@ async fn finish_pending_publication(
     writer.since = None;
     writer.source_bytes = 0;
     writer.pending_prepared_rows = 0;
+    writer.pending_skipped_ack = false;
+    writer.skipped_proof_next = writer.skipped_proof_next.max(
+        writer
+            .current
+            .as_ref()
+            .expect("published Current exists")
+            .current
+            .next_offset,
+    );
     writer.pending_prepared_bytes = 0;
     writer.pending_projected_rows = 0;
     writer.pending_projected_encoded_bytes = 0;

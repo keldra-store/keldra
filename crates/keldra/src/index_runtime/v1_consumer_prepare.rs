@@ -656,14 +656,11 @@ pub(super) fn apply_rows(
                     Status::resource_exhausted("v1 projected rows exceed telemetry")
                 })?,
             );
-            // Cursor-only batches are expected for reserved projection and
-            // catalog objects. They advance the in-memory contiguous cut, but
-            // must not arm publication: an empty Current creates another
-            // reserved source event and otherwise feeds itself forever. The
-            // preceding Current remains the conservative durable retention
-            // proof. A later matching mutation publishes one range spanning
-            // every skipped control event; restart safely replays the retained
-            // gap from that preceding Current.
+            // Empty batches do not independently arm publication. Reserved
+            // artifact-only progress would feed Current back into its own
+            // journal forever. The producer may separately arm a durable empty
+            // acknowledgement only after a source-wide external-change proof;
+            // otherwise a later matching mutation publishes the skipped range.
             if source_rows != 0 {
                 writer.since.get_or_insert_with(Instant::now);
             }

@@ -696,6 +696,71 @@ impl IndexEventJournal {
         self
     }
 
+    /// Replay control metadata from every source's own retained boundary.
+    /// A partition's durable data checkpoint is overlaid separately by its owner.
+    pub(crate) async fn retained_replay_start(
+        &self,
+        target: &IndexBarrier,
+    ) -> Result<IndexBarrier, IndexEventError> {
+        let before = self
+            .authority
+            .current()
+            .map_err(IndexEventError::Placement)?;
+        require_authority_covers(target, &before)?;
+        let mut start = target.clone();
+        for source in &before.sources {
+            let status = self.sources.status(source).await?;
+            validate_status(source.node, &status)?;
+            let captured = target
+                .sources
+                .get(&source.node)
+                .ok_or(IndexEventError::IncompleteSources)?;
+            if status.source_id != captured.source
+                || status.settled_through.saturating_add(1) < captured.next_offset
+            {
+                return Err(IndexEventError::SourceEpochChanged(source.node));
+            }
+            let next = status
+                .retention_floor
+                .checked_add(1)
+                .ok_or(IndexEventError::OffsetOverflow(source.node))?;
+            if next > captured.next_offset {
+                return Err(IndexEventError::SourceEpochChanged(source.node));
+            }
+            start
+                .sources
+                .get_mut(&source.node)
+                .ok_or(IndexEventError::IncompleteSources)?
+                .next_offset = next;
+        }
+        // Recheck after all reads: a source may rotate or prune while another
+        // source's status is in flight. Never manufacture a replayable interval.
+        for source in &before.sources {
+            let status = self.sources.status(source).await?;
+            validate_status(source.node, &status)?;
+            let cursor = start
+                .sources
+                .get(&source.node)
+                .ok_or(IndexEventError::IncompleteSources)?;
+            if status.source_id != cursor.source
+                || status.retention_floor >= cursor.next_offset
+                || status.settled_through.saturating_add(1)
+                    < target.sources[&source.node].next_offset
+            {
+                return Err(IndexEventError::SourceEpochChanged(source.node));
+            }
+        }
+        let after = self
+            .authority
+            .current()
+            .map_err(IndexEventError::Placement)?;
+        require_authority_covers(target, &after)?;
+        if before.fence != after.fence || before.sources != after.sources {
+            return Err(IndexEventError::BarrierChanged);
+        }
+        Ok(start)
+    }
+
     pub(crate) async fn capture_barrier(&self) -> Result<IndexBarrier, IndexEventError> {
         let before = self
             .authority

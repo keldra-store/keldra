@@ -152,6 +152,7 @@ pub(crate) async fn start(
         journal.clone(),
         derived_checkpoints.clone(),
         v1_publisher.clone(),
+        shared_credits.clone(),
     );
     let hot_ingress = HotProjectionIngress::with_credits(shared_credits.clone(), pipeline_memory)
         .map_err(anyhow::Error::msg)

@@ -38,6 +38,7 @@ use super::v1_artifact_cache::ImmutableArtifactCache;
 use super::v1_compaction::{V1CompactionArtifacts, V1CompactionBase};
 use super::v1_parallel::run_bounded_ordered;
 
+mod atomic_cut_publication;
 mod compaction_publication;
 mod immutable_staging;
 mod physical_packs;
@@ -586,6 +587,7 @@ impl V1ProjectionPublisher {
             checkpointed_source_positions,
             checkpointed_source_payload_bytes,
             _compaction: compaction,
+            _atomic_cut: None,
         })
     }
 

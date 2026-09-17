@@ -60,6 +60,90 @@ pub struct PreparedQueryRunAppend {
     pub pages: Vec<EncodedQueryRunPage>,
 }
 
+/// Replace only the newest run's atomic acknowledgement without changing
+/// its source interval, sequence, level, or any older immutable reference.
+pub fn replace_latest_query_run_path_copy<PageBytes>(
+    previous: ProjectionQueryStreamRoot,
+    expected: QueryRunReference,
+    replacement: QueryRunReference,
+    mut load: impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+) -> Result<PreparedQueryRunAppend, IndexError>
+where
+    PageBytes: AsRef<[u8]>,
+{
+    previous.validate_at(previous.next_offset, previous.through_atomic_position)?;
+    validate_reference(expected)?;
+    validate_reference(replacement)?;
+    if previous.run_count == 0
+        || expected.sequence != previous.last_sequence
+        || expected.next_offset != previous.next_offset
+        || expected.through_atomic_position != previous.through_atomic_position
+        || replacement.sequence != expected.sequence
+        || replacement.level != expected.level
+        || replacement.source_start_offset != expected.source_start_offset
+        || replacement.next_offset != expected.next_offset
+        || replacement.through_atomic_position < expected.through_atomic_position
+    {
+        return Err(IndexError::Integrity);
+    }
+    let mut pages = Vec::new();
+    let page = replace_latest_page(
+        root_child(previous)?,
+        expected,
+        replacement,
+        &mut load,
+        &mut pages,
+    )?;
+    let summary = page.summary;
+    if summary.run_count != previous.run_count
+        || summary.first_sequence != previous.first_sequence
+        || summary.last_sequence != previous.last_sequence
+        || summary.source_start_offset != previous.source_start_offset
+        || summary.next_offset != previous.next_offset
+        || summary.through_atomic_position != replacement.through_atomic_position
+    {
+        return Err(IndexError::Integrity);
+    }
+    let root = ProjectionQueryStreamRoot {
+        stream_root_hash: summary.hash,
+        stream_root_encoded_bytes: summary.encoded_bytes,
+        through_atomic_position: summary.through_atomic_position,
+        ..previous
+    };
+    root.validate_at(previous.next_offset, replacement.through_atomic_position)?;
+    Ok(PreparedQueryRunAppend { root, pages })
+}
+
+fn replace_latest_page<PageBytes: AsRef<[u8]>>(
+    expected_page: QueryRunChild,
+    expected_run: QueryRunReference,
+    replacement: QueryRunReference,
+    load: &mut impl FnMut([u8; 32]) -> Result<PageBytes, IndexError>,
+    pages: &mut Vec<EncodedQueryRunPage>,
+) -> Result<EncodedQueryRunPage, IndexError> {
+    let (mut page, actual, _owner) = load_page_with_summary(expected_page.hash, load)?;
+    if actual != expected_page {
+        return Err(IndexError::Integrity);
+    }
+    match &mut page {
+        QueryRunPage::Leaf(runs) => {
+            let last = runs.last_mut().ok_or(IndexError::Integrity)?;
+            if *last != expected_run {
+                return Err(IndexError::Integrity);
+            }
+            *last = replacement;
+        }
+        QueryRunPage::Branch(children) => {
+            let last = children.last_mut().ok_or(IndexError::Integrity)?;
+            let next = replace_latest_page(*last, expected_run, replacement, load, pages)?;
+            *last = next.summary;
+        }
+    }
+    let encoded = encode_page(page)?;
+    pages.push(encoded.clone());
+    Ok(encoded)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryRunCompactionLimits {
     /// Number of adjacent runs at one level that makes that level eligible.
@@ -845,6 +929,114 @@ mod tests {
 
     fn partition() -> ProjectionPartitionIdentity {
         ProjectionPartitionIdentity::new([1; 32], 2, [3; 32], 2, 4, 5).unwrap()
+    }
+
+    #[test]
+    fn atomic_replacement_copies_only_right_spine_and_checks_exact_reference() {
+        let mut store = BTreeMap::new();
+        let mut newest = None;
+        let mut references = Vec::new();
+        for sequence in 1..=(QUERY_RUN_PAGE_FANOUT as u64 + 3) {
+            let reference = QueryRunReference {
+                hash: [sequence as u8; 32],
+                encoded_bytes: 100,
+                sequence,
+                level: 2,
+                source_start_offset: sequence - 1,
+                next_offset: sequence,
+                through_atomic_position: sequence,
+            };
+            references.push(reference);
+            newest = Some(reference);
+        }
+        // Native compacted pages may contain nonzero-level references;
+        // fresh append remains restricted to level zero in production.
+        let mut children = Vec::new();
+        for chunk in references.chunks(QUERY_RUN_PAGE_FANOUT) {
+            let page = encode_query_run_page(QueryRunPage::Leaf(chunk.to_vec())).unwrap();
+            children.push(page.summary);
+            store.insert(page.hash, page.bytes.to_vec());
+        }
+        let page = encode_query_run_page(QueryRunPage::Branch(children)).unwrap();
+        let summary = page.summary;
+        store.insert(page.hash, page.bytes.to_vec());
+        let old = ProjectionQueryStreamRoot {
+            stream_root_hash: summary.hash,
+            stream_root_encoded_bytes: summary.encoded_bytes,
+            run_count: summary.run_count,
+            first_sequence: summary.first_sequence,
+            last_sequence: summary.last_sequence,
+            source_start_offset: summary.source_start_offset,
+            next_offset: summary.next_offset,
+            through_atomic_position: summary.through_atomic_position,
+        };
+        let expected = newest.unwrap();
+        let replacement = QueryRunReference {
+            hash: [200; 32],
+            through_atomic_position: 500,
+            ..expected
+        };
+        let copied = replace_latest_query_run_path_copy(old, expected, replacement, |hash| {
+            store.get(&hash).cloned().ok_or(IndexError::Integrity)
+        })
+        .unwrap();
+        assert_eq!(copied.pages.len(), 2);
+        assert_eq!(copied.root.run_count, old.run_count);
+        assert_eq!(copied.root.next_offset, old.next_offset);
+        assert_eq!(copied.root.through_atomic_position, 500);
+        for page in &copied.pages {
+            store.insert(page.hash, page.bytes.to_vec());
+        }
+        let collect = |root| {
+            let mut refs = Vec::new();
+            visit_query_runs_newest(
+                root,
+                |hash| store.get(&hash).cloned().ok_or(IndexError::Integrity),
+                &mut |reference| {
+                    refs.push(reference);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            refs
+        };
+        let old_refs = collect(old);
+        let new_refs = collect(copied.root);
+        assert_eq!(old_refs[0], expected);
+        assert_eq!(new_refs[0], replacement);
+        assert_eq!(old_refs[1..], new_refs[1..]);
+        assert!(
+            replace_latest_query_run_path_copy(
+                old,
+                QueryRunReference {
+                    hash: [201; 32],
+                    ..expected
+                },
+                replacement,
+                |hash| store.get(&hash).cloned().ok_or(IndexError::Integrity)
+            )
+            .is_err()
+        );
+        assert!(
+            replace_latest_query_run_path_copy(
+                old,
+                expected,
+                QueryRunReference {
+                    level: 0,
+                    ..replacement
+                },
+                |hash| store.get(&hash).cloned().ok_or(IndexError::Integrity)
+            )
+            .is_err()
+        );
+        assert!(
+            replace_latest_query_run_path_copy(old, expected, replacement, |hash| {
+                let mut bytes = store.get(&hash).cloned().ok_or(IndexError::Integrity)?;
+                bytes[0] ^= 1;
+                Ok(bytes)
+            })
+            .is_err()
+        );
     }
 
     #[test]

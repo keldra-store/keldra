@@ -60,6 +60,7 @@ impl V1ProjectionPublisher {
             checkpointed_source_positions: 0,
             checkpointed_source_payload_bytes: 0,
             _compaction: Some(artifacts),
+            _atomic_cut: None,
         })
     }
 }

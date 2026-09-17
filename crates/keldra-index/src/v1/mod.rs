@@ -5,6 +5,7 @@
 //! storage-neutral; publication and generation fencing remain runtime duties.
 
 mod artifact_pack;
+mod atomic_cut_ack;
 mod buffer;
 mod codec;
 mod directory;
@@ -30,6 +31,7 @@ mod read;
 mod stream;
 mod typed_document;
 
+pub use atomic_cut_ack::{PreparedAtomicCutAcknowledgement, prepare_atomic_cut_acknowledgement};
 pub use directory::{
     CatalogBaseline, ProjectionCatalogActivation, ProjectionFamilyPartitionDirectory,
     ProjectionPartitionDirectoryEntry, ProjectionPartitionLifecycle,
@@ -119,8 +121,8 @@ pub use query_stream::{
     EncodedQueryRunPage, PreparedQueryRunAppend, PreparedQueryRunSplice, QUERY_RUN_PAGE_FANOUT,
     QueryRunChild, QueryRunCompactionLimits, QueryRunCompactionPlan, QueryRunPage,
     QueryRunReference, append_query_run_path_copy, decode_query_run_page, encode_query_run_page,
-    find_query_run_by_hash, select_query_run_compaction, splice_compacted_query_runs,
-    visit_query_runs_newest,
+    find_query_run_by_hash, replace_latest_query_run_path_copy, select_query_run_compaction,
+    splice_compacted_query_runs, visit_query_runs_newest,
 };
 pub use read::decode_component_records_in_pack;
 pub use stream::{

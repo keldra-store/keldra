@@ -96,6 +96,8 @@ pub(crate) struct PendingV1Publication {
     /// Retains compaction admission until every rebased prerequisite page is
     /// durably included by this publication attempt.
     pub(super) _compaction: Option<V1CompactionArtifacts>,
+    /// Retains ordinary shared metadata admission through staging/CAS retries.
+    pub(super) _atomic_cut: Option<QueryBlockCredits>,
 }
 
 /// Mandatory exact readback for one authoritative Current publication. The

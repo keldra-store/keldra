@@ -27,6 +27,7 @@ impl IndexEventAuthority for MemoryAuthority {
 struct MemorySources {
     journals: Arc<Mutex<BTreeMap<NodeId, (WatchJournalStatus, Vec<LocalChange>)>>>,
     status_reads: Arc<Mutex<Vec<NodeId>>>,
+    status_sequences: Arc<Mutex<BTreeMap<NodeId, VecDeque<WatchJournalStatus>>>>,
     reads: Arc<Mutex<Vec<(NodeId, u64, u64)>>>,
     definition_reads: Arc<Mutex<Vec<(NodeId, keldra_store::DefinitionKind)>>>,
     raw_reads: Arc<Mutex<Vec<NodeId>>>,
@@ -36,6 +37,15 @@ struct MemorySources {
 impl IndexEventSources for MemorySources {
     async fn status(&self, source: &IndexSource) -> Result<WatchJournalStatus, IndexEventError> {
         self.status_reads.lock().unwrap().push(source.node);
+        if let Some(status) = self
+            .status_sequences
+            .lock()
+            .unwrap()
+            .get_mut(&source.node)
+            .and_then(VecDeque::pop_front)
+        {
+            return Ok(status);
+        }
         self.journals
             .lock()
             .unwrap()
@@ -92,7 +102,12 @@ impl IndexEventSources for MemorySources {
             target_offset,
             limit,
             max_bytes,
-            |change| change_bucket(change) == Some((tenant_id, bucket_id)),
+            |change| {
+                change_bucket(change) == Some((tenant_id, bucket_id))
+                    || matches!(change, LocalChange::AtomicBatchPublished(batch)
+                    if batch.mutations.iter().any(|mutation|
+                        mutation.tenant_id == tenant_id && mutation.bucket_id == bucket_id))
+            },
         )
     }
 
@@ -298,6 +313,332 @@ fn journal(
         Arc::new(sources.clone()),
     )
     .with_page_size(1)
+}
+
+#[tokio::test]
+async fn retained_replay_start_uses_source_specific_floors_and_keeps_foreign_finalizers() {
+    use crate::index_runtime::v1_journal_dispatch::{V1OrderedSourceDispatcher, V1SourceDispatch};
+    use keldra_index::v1::{IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage};
+    use keldra_store::{AtomicBatchMutation, AtomicBatchPublished, PreparedBundleHash};
+    use std::collections::BTreeSet;
+
+    let atomic = AtomicProgramWatermark::new(Some(7), Some(7), 0);
+    let sources = MemorySources::default();
+    let mut owned_status = status(1, 12);
+    owned_status.retention_floor = 11;
+    owned_status.retained_entries = 1;
+    let mut other_status = status(2, 401);
+    other_status.retention_floor = 400;
+    other_status.retained_entries = 1;
+    let mut head = change_at_path(1, 12, 1, 2, "items/12");
+    if let LocalChange::ObjectHead(head) = &mut head {
+        head.program_commit_cursor = Some(7);
+    }
+    let finalizer = LocalChange::AtomicBatchPublished(AtomicBatchPublished {
+        offset: 401,
+        cursor: 7,
+        bundle_hash: PreparedBundleHash([7; 32]),
+        mutations: vec![AtomicBatchMutation {
+            tenant_id: 1,
+            bucket_id: 2,
+            exact_path: "items/12".into(),
+            canonical_path: None,
+            path_version: VersionId(12),
+            deleted: false,
+            source_id: source_id(1),
+            source_journal_position: 12,
+        }],
+    });
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (owned_status, vec![head]));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (other_status, vec![finalizer]));
+    let journal = journal(vec![placement(atomic)], &sources);
+    let target = barrier(atomic, 13, 402);
+    let mut start = journal.retained_replay_start(&target).await.unwrap();
+    assert_eq!(start.sources[&NodeId(1)].next_offset, 12);
+    assert_eq!(start.sources[&NodeId(2)].next_offset, 401);
+    assert_eq!(sources.status_reads.lock().unwrap().len(), 4);
+    let bytes = 1024 * 1024;
+    let credits = IndexingMemoryCredits::new(
+        bytes,
+        IndexingMemoryLimits {
+            hot_payload_bytes: bytes,
+            worker_scratch_bytes: bytes,
+            prepared_rows_bytes: bytes,
+            replay_input_bytes: bytes,
+            projection_accumulator_bytes: bytes,
+            seal_scratch_bytes: bytes,
+            ordering_catalog_bytes: bytes,
+        },
+    )
+    .unwrap();
+    let mut dispatcher = V1OrderedSourceDispatcher::new(
+        target.fence,
+        BTreeSet::from([source_id(1)]),
+        credits
+            .acquire(IndexingMemoryStage::ReplayInput, 1)
+            .unwrap(),
+        bytes,
+    );
+    let mut delivered = Vec::new();
+    while let Some(page) = journal
+        .next_page(1, 2, &start, &target, 64 * 1024)
+        .await
+        .unwrap()
+    {
+        for change in &page.changes {
+            delivered.extend(
+                dispatcher
+                    .observe(page.through.sources[&change.node].source, &change.change)
+                    .unwrap(),
+            );
+        }
+        start = page.through;
+    }
+    assert!(
+        matches!(delivered.as_slice(), [V1SourceDispatch::FinalizedAtomic(batch)]
+        if batch.mutations.len() == 1
+        && batch.mutations[0].mutation.source_journal_position == 12)
+    );
+    assert_eq!(start, target);
+}
+
+#[tokio::test]
+async fn retained_replay_start_rejects_epoch_and_placement_changes() {
+    let atomic = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 3), vec![]));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 3), vec![]));
+    let original = placement(atomic);
+    let mut changed = original.clone();
+    changed.fence.index += 1;
+    assert!(
+        journal(vec![original.clone(), changed], &sources)
+            .retained_replay_start(&barrier(atomic, 4, 4))
+            .await
+            .is_err()
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .get_mut(&NodeId(2))
+        .unwrap()
+        .0
+        .source_id
+        .source_epoch = [99; 32];
+    assert!(matches!(
+        journal(vec![original], &sources)
+            .retained_replay_start(&barrier(atomic, 4, 4))
+            .await,
+        Err(IndexEventError::SourceEpochChanged(NodeId(2)))
+    ));
+}
+
+#[tokio::test]
+async fn retained_replay_start_rechecks_pruning_and_epoch_after_all_source_reads() {
+    let atomic = AtomicProgramWatermark::new(None, None, 0);
+    for rotate in [false, true] {
+        let sources = MemorySources::default();
+        sources
+            .journals
+            .lock()
+            .unwrap()
+            .insert(NodeId(1), (status(1, 3), vec![]));
+        sources
+            .journals
+            .lock()
+            .unwrap()
+            .insert(NodeId(2), (status(2, 3), vec![]));
+        let first = status(1, 3);
+        let mut second = first;
+        if rotate {
+            second.source_id.source_epoch = [99; 32];
+        } else {
+            second.retention_floor = 1;
+            second.retained_entries = 2;
+        }
+        sources
+            .status_sequences
+            .lock()
+            .unwrap()
+            .insert(NodeId(1), VecDeque::from([first, second]));
+        assert!(matches!(
+            journal(vec![placement(atomic)], &sources)
+                .retained_replay_start(&barrier(atomic, 4, 4))
+                .await,
+            Err(IndexEventError::SourceEpochChanged(NodeId(1)))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn skipped_cut_source_wide_proof_finds_other_bucket_data_but_not_artifact_feedback() {
+    let atomic = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources.journals.lock().unwrap().insert(
+        NodeId(1),
+        (
+            status(1, 3),
+            vec![
+                change_at_path(1, 1, 1, 2, "_keldra/index-projections/v1/current"),
+                change_at_path(1, 2, 9, 10, "other-bucket/object.json"),
+                change_at_path(1, 3, 1, 2, "_keldra/index-projections/v1/generation"),
+            ],
+        ),
+    );
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let journal = journal(vec![placement(atomic)], &sources);
+    let target = barrier(atomic, 4, 1);
+    assert!(
+        super::super::v1_consumer::skipped_interval_has_external_change(
+            &journal,
+            source_id(1),
+            1,
+            4,
+            &target,
+            4096
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        sources.raw_reads.lock().unwrap().len(),
+        3,
+        "proof spans every bounded page, not only first match"
+    );
+    assert!(
+        !super::super::v1_consumer::skipped_interval_has_external_change(
+            &journal,
+            source_id(1),
+            3,
+            4,
+            &target,
+            4096
+        )
+        .await
+        .unwrap(),
+        "generation/Current feedback cannot arm another empty publication"
+    );
+    assert!(
+        sources
+            .raw_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|node| *node == NodeId(1))
+    );
+}
+
+#[tokio::test]
+async fn skipped_cut_proof_fails_closed_after_pruning_or_source_epoch_change() {
+    let atomic = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    let mut pruned = status(1, 3);
+    pruned.retention_floor = 2;
+    pruned.retained_entries = 1;
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (pruned, vec![change(1, 3)]));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let journal = journal(vec![placement(atomic)], &sources);
+    let target = barrier(atomic, 4, 1);
+    assert!(
+        super::super::v1_consumer::skipped_interval_has_external_change(
+            &journal,
+            source_id(1),
+            1,
+            4,
+            &target,
+            4096
+        )
+        .await
+        .is_err()
+    );
+    let mut wrong_source = source_id(1);
+    wrong_source.source_epoch = [99; 32];
+    assert!(
+        super::super::v1_consumer::skipped_interval_has_external_change(
+            &journal,
+            wrong_source,
+            3,
+            4,
+            &target,
+            4096
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn skipped_cut_proof_refuses_oversized_page_and_changed_placement_fence() {
+    let atomic = AtomicProgramWatermark::new(None, None, 0);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 1), vec![change(1, 1)]));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let target = barrier(atomic, 2, 1);
+    let capped = journal(vec![placement(atomic)], &sources);
+    assert!(
+        super::super::v1_consumer::skipped_interval_has_external_change(
+            &capped,
+            source_id(1),
+            1,
+            2,
+            &target,
+            1
+        )
+        .await
+        .is_err()
+    );
+    let mut changed = placement(atomic);
+    changed.fence.index += 1;
+    let fenced = journal(vec![placement(atomic), changed], &sources);
+    assert!(
+        super::super::v1_consumer::skipped_interval_has_external_change(
+            &fenced,
+            source_id(1),
+            1,
+            2,
+            &target,
+            4096
+        )
+        .await
+        .is_err()
+    );
 }
 
 fn barrier(atomic: AtomicProgramWatermark, node_one_next: u64, node_two_next: u64) -> IndexBarrier {

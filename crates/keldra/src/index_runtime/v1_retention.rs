@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use keldra_consensus::NodeId;
-use keldra_index::v1::ProjectionFamilyPartitionDirectory;
+use keldra_index::v1::{
+    IndexingMemoryCredits, IndexingMemoryStage, ProjectionFamilyPartitionDirectory,
+};
 use keldra_store::{DefinitionConsumerKind, DerivedConsumerCheckpoint, DerivedConsumerKind, Store};
 use tonic::Status;
 
@@ -21,6 +23,9 @@ use super::catalog::IndexCatalog;
 use super::catalog::PhysicalCatalogRecipe;
 use super::events::{IndexEventJournal, IndexSourceCursor};
 use super::v1_publication::V1ProjectionPublisher;
+
+#[path = "v1_retention_atomic.rs"]
+mod atomic;
 
 const RETENTION_SAFETY_INTERVAL: Duration = Duration::from_secs(30);
 const RETENTION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -39,6 +44,7 @@ impl V1IndexRetentionTask {
         journal: Arc<IndexEventJournal>,
         checkpoints: DerivedCheckpointPublisher,
         projections: V1ProjectionPublisher,
+        credits: IndexingMemoryCredits,
     ) -> Self {
         let task = tokio::spawn(async move {
             let mut catalog_changes = catalog.subscribe();
@@ -59,6 +65,7 @@ impl V1IndexRetentionTask {
                     &journal,
                     &checkpoints,
                     &projections,
+                    &credits,
                     &mut last_reconciled,
                     forced,
                 )
@@ -86,6 +93,7 @@ async fn advance_once(
     journal: &IndexEventJournal,
     checkpoints: &DerivedCheckpointPublisher,
     projections: &V1ProjectionPublisher,
+    credits: &IndexingMemoryCredits,
     last_reconciled: &mut Option<(u64, super::events::IndexBarrier)>,
     forced: bool,
 ) -> Result<(), Status> {
@@ -108,29 +116,30 @@ async fn advance_once(
             next_offset: catalog_next,
             ..cursor
         };
-        let mut catalog_barrier = barrier.clone();
-        catalog_barrier
-            .sources
-            .get_mut(&NodeId(u64::from(cursor.source.node_id)))
-            .expect("captured v1 source remains in its barrier")
-            .next_offset = catalog_next;
         let next_offset = if recipes.is_empty() {
             // The durable catalog checkpoint proves the all-source baseline
             // inventory and replay cut even when that inventory is empty.
             catalog_next
-        } else if let Some(next_offset) = family_coverage(
-            catalog_cursor,
-            &catalog_barrier,
-            recipes,
-            journal,
-            projections,
-        )
-        .await?
+        } else if let Some(next_offset) =
+            family_coverage(catalog_cursor, recipes, projections).await?
         {
             next_offset
         } else {
             // Publishing no proof is conservative.  It is required while a
             // new physical family is still backfilling or awaiting activation.
+            return Ok(());
+        };
+        let Some(next_offset) = atomic::cap_before_uncovered_finalizer(
+            journal,
+            &barrier,
+            cursor,
+            next_offset,
+            recipes,
+            projections,
+            credits,
+        )
+        .await?
+        else {
             return Ok(());
         };
         let consumer_node_id = u16::try_from(local_node.0).map_err(|_| {
@@ -187,9 +196,7 @@ async fn catalog_checkpoint_limit(
 /// `None` means a family is not query-visible yet, so retention must stay put.
 async fn family_coverage(
     cursor: IndexSourceCursor,
-    target: &super::events::IndexBarrier,
     recipes: &[Arc<PhysicalCatalogRecipe>],
-    journal: &IndexEventJournal,
     projections: &V1ProjectionPublisher,
 ) -> Result<Option<u64>, Status> {
     let mut covered_through = cursor.next_offset;
@@ -230,43 +237,12 @@ async fn family_coverage(
         else {
             return Ok(None);
         };
-        let family_next =
-            advance_over_irrelevant_suffix(cursor, target, family_next, recipe, journal).await?;
+        // A disposable scan cannot justify pruning beyond restart authority.
+        // The producer durably publishes safe external skipped cuts in Current
+        // before retention may cover them; artifact-only suffixes stay retained.
         covered_through = covered_through.min(family_next);
     }
     Ok(Some(covered_through))
-}
-
-/// A durable Current need not be rewritten merely to acknowledge source
-/// positions which cannot affect its bucket. The routed journal scan is the
-/// proof: an empty result covers the complete bounded interval, so retention
-/// may safely advance through that suffix while the immutable Current remains
-/// unchanged.
-async fn advance_over_irrelevant_suffix(
-    cursor: IndexSourceCursor,
-    target: &super::events::IndexBarrier,
-    family_next: u64,
-    recipe: &PhysicalCatalogRecipe,
-    journal: &IndexEventJournal,
-) -> Result<u64, Status> {
-    if family_next >= cursor.next_offset {
-        return Ok(family_next);
-    }
-    let latest_indexable = journal
-        .routed_index_source_next(
-            recipe.family.tenant_id,
-            recipe.family.bucket_id,
-            cursor.source,
-            family_next,
-            target,
-        )
-        .await
-        .map_err(|error| Status::unavailable(error.to_string()))?;
-    Ok(if latest_indexable == family_next {
-        cursor.next_offset
-    } else {
-        family_next
-    })
 }
 
 async fn live_directory_coverage_for_source(
@@ -275,22 +251,32 @@ async fn live_directory_coverage_for_source(
     directory: &ProjectionFamilyPartitionDirectory,
     projections: &V1ProjectionPublisher,
 ) -> Result<Option<u64>, Status> {
+    Ok(
+        live_directory_cut_for_source(cursor, recipe, directory, projections)
+            .await?
+            .map(|cut| cut.0),
+    )
+}
+
+async fn live_directory_cut_for_source(
+    cursor: IndexSourceCursor,
+    recipe: &PhysicalCatalogRecipe,
+    directory: &ProjectionFamilyPartitionDirectory,
+    projections: &V1ProjectionPublisher,
+) -> Result<Option<(u64, u64)>, Status> {
     directory.validate().map_err(index_status)?;
     let source_node = u64::from(cursor.source.node_id);
-    let source_entries = directory
-        .entries
-        .iter()
-        .filter(|entry| {
-            entry.partition.source_node == source_node
-                && entry.partition.source_epoch == cursor.source.source_epoch
-        })
-        .collect::<Vec<_>>();
-    if source_entries.is_empty() {
+    let source_entries = directory.entries.iter().filter(|entry| {
+        entry.partition.source_node == source_node
+            && entry.partition.source_epoch == cursor.source.source_epoch
+    });
+    if source_entries.clone().next().is_none() {
         return Err(Status::data_loss(
             "v1 family directory has no partition for an ACTIVE source incarnation",
         ));
     }
     let mut next = u64::MAX;
+    let mut atomic = u64::MAX;
     for entry in source_entries {
         let Some(current) = projections
             .load_current(
@@ -320,13 +306,14 @@ async fn live_directory_coverage_for_source(
             }
         }
         next = next.min(current.current.next_offset);
+        atomic = atomic.min(current.current.through_atomic_position);
     }
     if next == 0 || next > cursor.next_offset {
         return Err(Status::data_loss(
             "v1 live partition coverage is outside the captured source barrier",
         ));
     }
-    Ok(Some(next))
+    Ok(Some((next, atomic)))
 }
 
 fn index_status(error: keldra_index::IndexError) -> Status {
