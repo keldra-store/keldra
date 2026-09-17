@@ -115,6 +115,7 @@ qualification_examples=(
   atomic_program_qualification
   authz_leopard_qualification
   cluster_cutover_qualification
+  cluster_cutover_journal_suffix
   personaldb_qualification
   realm_index_qualification
   s3_qualification

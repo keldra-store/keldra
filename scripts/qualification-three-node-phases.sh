@@ -147,25 +147,76 @@ latest_completed_membership_fence() {
 source_journal_sample_is_clear_at_bound() {
   local line="$1"
   local bound="$2"
+  local node="$3"
   local accounting
   local index
   local maximum
   local retained
   local settled
+  local reference
   local tail
   [[ -n "${line}" ]] || return 1
   tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}" || true)"
   settled="$(log_unsigned_field gauge.keldra_source_journal_settled_through "${line}" || true)"
+  reference="$(log_unsigned_field gauge.keldra_source_journal_reference_safe_through "${line}" || true)"
   index="$(log_unsigned_field gauge.keldra_source_journal_index_safe_through "${line}" || true)"
   accounting="$(log_unsigned_field gauge.keldra_source_journal_accounting_safe_through "${line}" || true)"
   retained="$(log_unsigned_field gauge.keldra_source_journal_retained_entries "${line}" || true)"
   maximum="$(log_unsigned_field gauge.keldra_source_journal_max_entries "${line}" || true)"
   [[ -n "${tail}" \
     && "${settled}" == "${tail}" \
-    && "${index}" == "${tail}" \
+    && "${reference}" == "${tail}" \
+    && -n "${index}" \
     && "${accounting}" == "${tail}" \
     && "${retained}" == "${bound}" \
-    && "${maximum}" == "${bound}" ]]
+    && "${maximum}" == "${bound}" ]] || return 1
+  ((index <= tail)) || return 1
+  # Current publication itself appends a derived artifact. Requiring a new
+  # Current for every such suffix would create an endless publication loop.
+  # Do not infer safety from the size of the gap: inspect the complete suffix
+  # through the existing authenticated peer API, under the captured fence.
+  prove_cutover_journal_artifact_suffix "${node}" "${index}" "${tail}"
+}
+
+prove_cutover_journal_artifact_suffix() {
+  local node="$1"
+  local index="$2"
+  local tail="$3"
+  local container
+  local node_id
+  local address
+  local fence
+  local term
+  local fence_index
+  local identity_dir="${KELDRA_QUALIFICATION_DIR}/secrets/cutover-peer"
+  [[ "${node}" =~ ^keldra-([1-3])$ ]] || return 1
+  node_id="${BASH_REMATCH[1]}"
+  container="$(service_container "${node}")"
+  [[ -n "${container}" ]] || return 1
+  # The isolated Compose bridge is reachable from the Debian controller.
+  # Never publish the peer port or substitute unauthenticated transport.
+  address="$(docker inspect "${container}" | jq --exit-status --raw-output '
+    [.[0].NetworkSettings.Networks[].IPAddress | select(length > 0)]
+    | select(length == 1) | .[0]')" || return 1
+  fence="$(latest_completed_membership_fence "${node}" "${node_id}")"
+  term="$(log_unsigned_field membership.term "${fence}" || true)"
+  fence_index="$(log_unsigned_field membership.index "${fence}" || true)"
+  [[ -n "${term}" && -n "${fence_index}" ]] || return 1
+  mkdir -p "${identity_dir}"
+  chmod 0700 "${identity_dir}"
+  docker cp "${container}:/var/lib/keldra/node-identity.json" \
+    "${identity_dir}/${node}.json" >/dev/null || return 1
+  chmod 0600 "${identity_dir}/${node}.json"
+  KELDRA_CUTOVER_JOURNAL_IDENTITY_PATH="${identity_dir}/${node}.json" \
+  KELDRA_CUTOVER_JOURNAL_PEER_ADDRESS="${address}:50052" \
+  KELDRA_CUTOVER_JOURNAL_SOURCE_NODE_ID="${node_id}" \
+  KELDRA_CUTOVER_JOURNAL_EXPECTED_TAIL="${tail}" \
+  KELDRA_CUTOVER_JOURNAL_INDEX_SAFE_THROUGH="${index}" \
+  KELDRA_CUTOVER_JOURNAL_FENCE_TERM="${term}" \
+  KELDRA_CUTOVER_JOURNAL_FENCE_INDEX="${fence_index}" \
+    "${qualification_binaries[cluster_cutover_journal_suffix]}" \
+    >>"${KELDRA_QUALIFICATION_DIR}/artifacts/membership-journal-suffix-${node}.jsonl" \
+    2>>"${KELDRA_QUALIFICATION_DIR}/artifacts/membership-journal-suffix-${node}.stderr"
 }
 
 run_cutover_writes() {
@@ -226,7 +277,7 @@ prepare_no_event_membership_cutover_qualification() {
     stable_clear=0
     for attempt in $(seq 1 45); do
       line="$(latest_source_journal_sample "${node}")"
-      if source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
+      if source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}"; then
         clear_tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
         if [[ -n "${previous_clear_line}" \
           && "${line}" != "${previous_clear_line}" \
@@ -282,7 +333,7 @@ refresh_no_event_membership_cutover_tail() {
   local previous_clear_tail=
   for attempt in $(seq 1 45); do
     line="$(latest_source_journal_sample "${node}")"
-    if source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
+    if source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}"; then
       clear_tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
       if [[ -n "${previous_clear_line}" \
         && "${line}" != "${previous_clear_line}" \
@@ -368,7 +419,7 @@ qualify_no_event_membership_cutover() {
       "${membership_cutover_source_fence_term}" \
       "${membership_cutover_source_fence_index}" 3 || true)"
     [[ -n "${fence}" ]] && line="$(sample_after_log_line "${evidence}" "${fence}")"
-    if source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
+    if source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}"; then
       tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
       if [[ "${tail}" != "${membership_cutover_source_tail}" ]]; then
         echo "${node} appended source events during the intended no-event cutover" >&2
@@ -379,7 +430,7 @@ qualify_no_event_membership_cutover() {
     fi
     sleep 1
   done
-  if ! source_journal_sample_is_clear_at_bound "${line}" "${bound}"; then
+  if ! source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}"; then
     echo "${node} did not prove derived-consumer convergence at its unchanged tail under the new membership fence" >&2
     return 1
   fi
