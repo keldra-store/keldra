@@ -153,6 +153,29 @@ async fn routine_membership_and_checkpoint_writes_do_not_take_the_legacy_commit_
 }
 
 #[tokio::test]
+async fn mandatory_checkpoint_progress_does_not_wait_for_the_global_commit_fence() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    put(&store, "one").await;
+    let source = store.local_watch_status().unwrap().source_id;
+
+    let exclusive = store.mutation_commit_lanes.acquire_exclusive().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        store.apply_derived_consumer_checkpoint(
+            checkpoint(source, DerivedConsumerKind::Index, 1, 2, fence(1)),
+            &[1],
+        ),
+    )
+    .await
+    .expect("checkpoint publication must not wait for the global commit fence")
+    .unwrap();
+    drop(exclusive);
+}
+
+#[tokio::test]
 async fn membership_and_both_checkpoint_kinds_survive_reopen() {
     let temporary = tempfile::tempdir().unwrap();
     let options = StoreOptions::new(temporary.path(), 1);

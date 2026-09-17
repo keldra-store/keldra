@@ -435,6 +435,18 @@ impl MutationCommitLanes {
         self.acquire_with_fence(fence, resources).await
     }
 
+    /// Admits isolated metadata writes that cannot overlap one another but do
+    /// not participate in the object/source-journal authority protected by
+    /// the global commit fence. Keeping mandatory derived-consumer progress
+    /// outside the fair fence prevents a queued exclusive writer from
+    /// starving the checkpoints needed to advance cluster retention.
+    pub(super) async fn acquire_unfenced(
+        &self,
+        resources: impl IntoIterator<Item = Vec<u8>>,
+    ) -> MutationConflictGuard {
+        self.conflicts.acquire(resources).await
+    }
+
     pub(super) fn has_active_conflict(&self, resources: impl IntoIterator<Item = Vec<u8>>) -> bool {
         self.conflicts.has_active_conflict(resources)
     }

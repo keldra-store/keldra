@@ -37,16 +37,15 @@ impl Store {
     ) -> Result<(), DerivedConsumerError> {
         validate_fence(fence)?;
         validate_active_nodes(active_nodes)?;
-        let mut lane = self
+        let _checkpoint_guard = self
             .mutation_commit_lanes
-            .acquire([derived_consumer_conflict_resource()])
+            .acquire_unfenced([derived_consumer_conflict_resource()])
             .await;
         let source = self.local_status()?;
         let mut batch = WriteBatch::default();
         let changed = self.stage_membership(&mut batch, source, fence, active_nodes)?;
         if changed {
             self.write_derived_batch(batch)?;
-            lane.release_physical_slot();
             self.mutation_capacity_notify.notify_waiters();
             self.notify_local_invalidations();
         }
@@ -70,9 +69,9 @@ impl Store {
             return Err(DerivedConsumerError::InactiveConsumer);
         }
 
-        let mut lane = self
+        let _checkpoint_guard = self
             .mutation_commit_lanes
-            .acquire([derived_consumer_conflict_resource()])
+            .acquire_unfenced([derived_consumer_conflict_resource()])
             .await;
         let source = self.local_status()?;
         if checkpoint.source_id != source.source_id {
@@ -135,7 +134,6 @@ impl Store {
         if !batch.is_empty() {
             self.write_derived_batch(batch)?;
         }
-        lane.release_physical_slot();
         let status = self
             .derived_consumer_status()?
             .ok_or_else(|| malformed("derived membership disappeared after checkpoint apply"))?;
