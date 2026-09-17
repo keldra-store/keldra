@@ -571,6 +571,134 @@ async fn independent_lane_evaluation_retries_without_holding_sequence_authority(
 }
 
 #[tokio::test]
+async fn visibility_projection_excludes_a_racing_inline_authority_write() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreOptions::new(temporary.path(), 1))
+        .await
+        .unwrap();
+    let (tenant_id, bucket_id) = store.resolve_bucket_ids("tenant", "bucket").unwrap();
+    let governance = ObjectMutationGovernance {
+        tenant_id,
+        bucket_id,
+        versioning: store.bucket_versioning("tenant", "bucket").unwrap(),
+        policy: store.bucket_policy("tenant", "bucket").unwrap(),
+    };
+    let context = ObjectMutationContext {
+        active_placement_log_id: PlacementLogId { term: 7, index: 9 },
+        serving_fence_term: 7,
+    };
+    let first = store
+        .coordinate_mutation_batch(
+            vec![governed_put(
+                "objects/first",
+                "first-command",
+                b"first",
+                governance.clone(),
+            )],
+            context,
+            CoordinatorBatchPayloadPreparation::Distributed {
+                source_journal_admission: SourceJournalAdmission::Bounded,
+                verified_publish: false,
+            },
+        )
+        .await
+        .unwrap();
+    let mutation = first.outcomes[0]
+        .as_ref()
+        .unwrap()
+        .mutation
+        .as_ref()
+        .unwrap();
+    let source = mutation.stamp.source_id;
+    let first_offset = mutation.stamp.source_journal_position;
+    assert_eq!(store.local_watch_status().unwrap().tail, first_offset);
+
+    store
+        .mutation_commit_lanes
+        .pause_next_projection
+        .store(true, std::sync::atomic::Ordering::Release);
+    let settling = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .settle_lane_source_journal_positions(source, &[first_offset])
+                .await
+        }
+    });
+    store
+        .mutation_commit_lanes
+        .projection_write_completed
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+
+    let second = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .coordinate_mutation_batch(
+                    vec![governed_put(
+                        "objects/second",
+                        "second-command",
+                        b"second",
+                        governance,
+                    )],
+                    context,
+                    CoordinatorBatchPayloadPreparation::Distributed {
+                        source_journal_admission: SourceJournalAdmission::Bounded,
+                        verified_publish: false,
+                    },
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if store
+                .mutation_commit_lanes
+                .sequence()
+                .await
+                .as_ref()
+                .unwrap()
+                .next_ticket
+                == 2
+            {
+                break;
+            }
+            assert!(!second.is_finished());
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the racing lane reserves while visibility publication is paused");
+    assert!(
+        !second.is_finished(),
+        "the racing lane must use a completion marker behind the active projector"
+    );
+
+    store
+        .mutation_commit_lanes
+        .projection_publish_continue
+        .add_permits(1);
+    settling.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert!(second.outcomes[0].is_ok());
+    let second_offset = second.outcomes[0]
+        .as_ref()
+        .unwrap()
+        .mutation
+        .as_ref()
+        .unwrap()
+        .stamp
+        .source_journal_position;
+    let status = store.local_watch_status().unwrap();
+    assert_eq!(status.tail, second_offset);
+    assert!(second_offset > first_offset);
+    assert!(status.settled_through >= first_offset);
+}
+
+#[tokio::test]
 async fn failed_lane_evaluation_does_not_reserve_sequence_authority() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(StoreOptions::new(temporary.path(), 1))

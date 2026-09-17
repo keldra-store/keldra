@@ -280,6 +280,11 @@ pub(super) struct InlineLaneProjection {
     projected_receipts: MutationReceiptStatus,
     projected_high_version: Option<VersionId>,
     inline_reference_safe_through: Option<u64>,
+    /// Serializes this primary-batch authority projection with the background
+    /// projector from planning through durable write and volatile publish.
+    /// Without this lease, a visibility-only background plan can overwrite a
+    /// newer source tail after an inline primary commit.
+    projection_lease: tokio::sync::OwnedMutexGuard<()>,
 }
 
 #[derive(Clone)]
@@ -1018,6 +1023,18 @@ impl Store {
         {
             return Ok(None);
         }
+        let Ok(projection_lease) = self
+            .mutation_commit_lanes
+            .projection
+            .clone()
+            .try_lock_owned()
+        else {
+            // A background projection is already planned from the current
+            // authority snapshot. Persist an ordinary completion marker so it
+            // can absorb this lane after publishing that plan, rather than
+            // racing two whole-value authority writes.
+            return Ok(None);
+        };
 
         let base_projected_ticket = runtime.projected_ticket;
         let mut projected_watch = runtime.projected_watch;
@@ -1063,6 +1080,7 @@ impl Store {
             inline_reference_safe_through: (completion.inline_reference_safe
                 && completion.first_offset != 0)
                 .then_some(completion.last_offset),
+            projection_lease,
         }))
     }
 
@@ -1342,32 +1360,45 @@ impl Store {
         &self,
         projection: InlineLaneProjection,
     ) -> Result<LaneSettlementMetrics, MutationError> {
+        let InlineLaneProjection {
+            base_projected_ticket,
+            projected_ticket,
+            projected_watch,
+            projected_receipts,
+            projected_high_version,
+            inline_reference_safe_through,
+            projection_lease,
+        } = projection;
         let has_waiting_completions = {
             let mut runtime = self.mutation_commit_lanes.sequence().await;
             let runtime = runtime.as_mut().ok_or_else(|| {
                 MutationError::Storage("mutation lane runtime is not initialized".into())
             })?;
-            if runtime.projected_ticket != projection.base_projected_ticket {
+            if runtime.projected_ticket != base_projected_ticket {
                 return Err(MutationError::Storage(
                     "inline mutation lane projection frontier changed before publication".into(),
                 ));
             }
-            runtime.projected_ticket = projection.projected_ticket;
-            runtime.projected_watch = projection.projected_watch;
-            runtime.projected_receipts = projection.projected_receipts;
-            runtime.projected_high_version = projection.projected_high_version;
-            runtime.reserved_watch.settled_through = projection.projected_watch.settled_through;
+            runtime.projected_ticket = projected_ticket;
+            runtime.projected_watch = projected_watch;
+            runtime.projected_receipts = projected_receipts;
+            runtime.projected_high_version = projected_high_version;
+            runtime.reserved_watch.settled_through = projected_watch.settled_through;
             !runtime.completions.is_empty()
         };
-        if let Some(reference_safe_through) = projection.inline_reference_safe_through {
+        if let Some(reference_safe_through) = inline_reference_safe_through {
             self.settle_inline_source_changes_through_from_status(
-                projection.projected_watch,
+                projected_watch,
                 reference_safe_through,
             )?;
         }
         self.mutation_commit_lanes.frontier_notify.notify_waiters();
         self.mutation_capacity_notify.notify_waiters();
-        self.notify_local_invalidations_from_status(projection.projected_watch);
+        self.notify_local_invalidations_from_status(projected_watch);
+        // The durable and volatile projections now agree. Release the shared
+        // authority writer before asking the background projector to fold any
+        // completion markers that accumulated behind this inline commit.
+        drop(projection_lease);
         if has_waiting_completions {
             self.request_lane_projection_retrying_writes().await?;
         }
