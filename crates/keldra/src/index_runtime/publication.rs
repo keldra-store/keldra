@@ -20,8 +20,10 @@ use crate::object_distribution::ObjectDistribution;
 use super::placement::{IndexIdentity, IndexPlacement};
 use super::v1_parallel::run_bounded_ordered;
 
+mod immutable_group;
 mod paths;
 mod v1_batch;
+use immutable_group::ImmutablePublicationGroup;
 use paths::{ArtifactPathKind, parse_artifact_path};
 
 const INDEX_ARTIFACT_CONTENT_TYPE: &str = "application/vnd.keldra.index-artifact";
@@ -879,7 +881,7 @@ impl IndexArtifactRouter {
         let placement = self.objects.current_program_placement()?;
         let fence = placement.fence();
         let mut groups =
-            BTreeMap::<(NodeId, Option<String>), Vec<(usize, IndexArtifactPublish)>>::new();
+            BTreeMap::<ImmutablePublicationGroup, Vec<(usize, IndexArtifactPublish)>>::new();
         for (index, request) in requests.into_iter().enumerate() {
             if request.validate()? != ArtifactPathKind::ProjectionImmutable {
                 return Err(Status::invalid_argument(
@@ -894,26 +896,27 @@ impl IndexArtifactRouter {
                 ArtifactPathKind::ProjectionImmutable,
             )?;
             let key = request.key()?;
-            let target =
-                self.objects
-                    .routing_target_stable(&key, request.tenant_id, request.bucket_id)?;
-            let (coordinator, address) = match target {
-                Some((node, address)) => (node, Some(address)),
-                None => (self.local_node, None),
-            };
-            groups
-                .entry((coordinator, address))
-                .or_default()
-                .push((index, request));
+            let replicas = self.objects.object_replica_group_stable(
+                &placement,
+                &key,
+                request.tenant_id,
+                request.bucket_id,
+            )?;
+            let group =
+                ImmutablePublicationGroup::from_placement(&placement, &replicas, self.local_node)?;
+            groups.entry(group).or_default().push((index, request));
         }
         let count = groups.values().map(Vec::len).sum();
         let mut outcomes = std::iter::repeat_with(|| None)
             .take(count)
             .collect::<Vec<_>>();
         let mut work = Vec::new();
-        for ((coordinator, address), group) in groups {
+        for (route, group) in groups {
             for publication in immutable_publication_work(group)? {
-                work.push((work.len(), (coordinator, address.clone(), publication)));
+                work.push((
+                    work.len(),
+                    (route.coordinator(), route.address().cloned(), publication),
+                ));
             }
         }
         let batch_count = work.len();
