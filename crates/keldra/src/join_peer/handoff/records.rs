@@ -12,7 +12,7 @@ mod authz;
 mod logical;
 mod object;
 
-/// Optional preparation while old owners still admit mutations. Receipt
+/// Optional preparation while old owners still admit mutations. Object/receipt
 /// observations from independently captured pages may be inconclusive.
 pub(super) async fn precopy_all(
     topology: &HandoffTopology,
@@ -33,10 +33,39 @@ pub(super) async fn transfer_all_authoritatively(
     authz::transfer(topology, peers).await
 }
 
-pub(super) async fn replay_object_paths(
+pub(super) async fn precopy_object_paths(
     topology: &HandoffTopology,
     peers: &DataPeerTransport,
     changes: &[LocalChange],
+) -> Result<(), Status> {
+    replay_object_paths(
+        topology,
+        peers,
+        changes,
+        object::ObjectTransferPhase::Precopy,
+    )
+    .await
+}
+
+pub(super) async fn replay_object_paths_authoritatively(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+    changes: &[LocalChange],
+) -> Result<(), Status> {
+    replay_object_paths(
+        topology,
+        peers,
+        changes,
+        object::ObjectTransferPhase::Authoritative,
+    )
+    .await
+}
+
+async fn replay_object_paths(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+    changes: &[LocalChange],
+    phase: object::ObjectTransferPhase,
 ) -> Result<(), Status> {
     let mut paths = BTreeSet::new();
     for change in changes {
@@ -76,7 +105,7 @@ pub(super) async fn replay_object_paths(
         }
     }
     for (tenant_id, bucket_id, exact_path) in paths {
-        object::reconcile_path(topology, peers, tenant_id, bucket_id, &exact_path).await?;
+        object::reconcile_path(topology, peers, tenant_id, bucket_id, &exact_path, phase).await?;
     }
     Ok(())
 }

@@ -27,7 +27,7 @@ enum Identity {
 }
 
 #[derive(Clone, Copy)]
-enum ReceiptTransferPhase {
+pub(super) enum ObjectTransferPhase {
     Precopy,
     Authoritative,
 }
@@ -39,24 +39,30 @@ enum ReceiptTransferSelection {
     Deferred,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PathTransferSelection {
+    Selected(Option<ObjectPathSnapshot>),
+    Deferred,
+}
+
 pub(super) async fn precopy(
     topology: &HandoffTopology,
     peers: &DataPeerTransport,
 ) -> Result<(), Status> {
-    transfer(topology, peers, ReceiptTransferPhase::Precopy).await
+    transfer(topology, peers, ObjectTransferPhase::Precopy).await
 }
 
 pub(super) async fn transfer_authoritatively(
     topology: &HandoffTopology,
     peers: &DataPeerTransport,
 ) -> Result<(), Status> {
-    transfer(topology, peers, ReceiptTransferPhase::Authoritative).await
+    transfer(topology, peers, ObjectTransferPhase::Authoritative).await
 }
 
 async fn transfer(
     topology: &HandoffTopology,
     peers: &DataPeerTransport,
-    receipt_phase: ReceiptTransferPhase,
+    transfer_phase: ObjectTransferPhase,
 ) -> Result<(), Status> {
     let mut sources = topology
         .discovery_endpoints()
@@ -74,7 +80,7 @@ async fn transfer(
                 observed.insert(source.node_id(), record);
             }
         }
-        transfer_identity(topology, peers, observed, receipt_phase).await?;
+        transfer_identity(topology, peers, observed, transfer_phase).await?;
     }
 }
 
@@ -105,7 +111,7 @@ async fn transfer_identity(
     topology: &HandoffTopology,
     peers: &DataPeerTransport,
     observed: BTreeMap<NodeId, ObjectRecordExport>,
-    receipt_phase: ReceiptTransferPhase,
+    transfer_phase: ObjectTransferPhase,
 ) -> Result<(), Status> {
     let selected_identity = observed
         .values()
@@ -141,7 +147,15 @@ async fn transfer_identity(
                     None => Ok(None),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let selected = select_handoff_path_quorum(&candidates, quorum(old.len())?, old.len())?;
+            let PathTransferSelection::Selected(selected) = select_path_for_transfer(
+                &candidates,
+                quorum(old.len())?,
+                old.len(),
+                transfer_phase,
+            )?
+            else {
+                return Ok(());
+            };
             if joining_path_matches(&observed, topology.joining().node_id, selected.as_ref()) {
                 return Ok(());
             }
@@ -167,7 +181,7 @@ async fn transfer_identity(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if let ReceiptTransferSelection::Exact(receipt) =
-                select_receipt_for_transfer(&candidates, quorum(old.len())?, receipt_phase)?
+                select_receipt_for_transfer(&candidates, quorum(old.len())?, transfer_phase)?
             {
                 if joining_receipt_matches(&observed, topology.joining().node_id, &receipt) {
                     return Ok(());
@@ -213,6 +227,7 @@ pub(super) async fn reconcile_path(
     tenant_id: u64,
     bucket_id: u64,
     exact_path: &str,
+    phase: ObjectTransferPhase,
 ) -> Result<(), Status> {
     let placement_key = object_placement_key(tenant_id, bucket_id, exact_path);
     let old = topology.old_replicas(PlacementKind::Object, &placement_key);
@@ -233,7 +248,11 @@ pub(super) async fn reconcile_path(
                 .await?,
         );
     }
-    let selected = select_handoff_path_quorum(&candidates, quorum(old.len())?, old.len())?;
+    let PathTransferSelection::Selected(selected) =
+        select_path_for_transfer(&candidates, quorum(old.len())?, old.len(), phase)?
+    else {
+        return Ok(());
+    };
     repair_joiner_path(
         topology,
         peers,
@@ -296,19 +315,40 @@ fn select_receipt_quorum(
 fn select_receipt_for_transfer(
     observed: &[Option<ObjectMutation>],
     required: usize,
-    phase: ReceiptTransferPhase,
+    phase: ObjectTransferPhase,
 ) -> Result<ReceiptTransferSelection, Status> {
     match select_receipt_quorum(observed, required) {
         Ok(Some(receipt)) => Ok(ReceiptTransferSelection::Exact(receipt)),
         Ok(None) => Ok(ReceiptTransferSelection::Absent),
         Err(error)
-            if matches!(phase, ReceiptTransferPhase::Precopy)
+            if matches!(phase, ObjectTransferPhase::Precopy)
                 && error.code() == tonic::Code::Unavailable =>
         {
             // Pre-copy pages are independent observations while writes
             // continue, not one absence/quorum proof. Install nothing; the
             // mandatory fresh scan after all drains must prove exact quorum.
             Ok(ReceiptTransferSelection::Deferred)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn select_path_for_transfer(
+    observed: &[Option<ObjectPathSnapshot>],
+    required: usize,
+    replica_count: usize,
+    phase: ObjectTransferPhase,
+) -> Result<PathTransferSelection, Status> {
+    match select_handoff_path_quorum(observed, required, replica_count) {
+        Ok(selected) => Ok(PathTransferSelection::Selected(selected)),
+        Err(error)
+            if matches!(phase, ObjectTransferPhase::Precopy)
+                && error.code() == tonic::Code::Unavailable =>
+        {
+            // Independent observations while origins still admit mutations do
+            // not establish authority. Install nothing; the drained final
+            // scan and replay must select from fresh authoritative snapshots.
+            Ok(PathTransferSelection::Deferred)
         }
         Err(error) => Err(error),
     }
@@ -464,12 +504,12 @@ mod tests {
             vec![Some(exact.clone()), Some(conflicting)],
         ] {
             assert_eq!(
-                select_receipt_for_transfer(&observed, 2, ReceiptTransferPhase::Precopy).unwrap(),
+                select_receipt_for_transfer(&observed, 2, ObjectTransferPhase::Precopy).unwrap(),
                 ReceiptTransferSelection::Deferred,
                 "inconclusive preparation must install no receipt"
             );
             assert_eq!(
-                select_receipt_for_transfer(&observed, 2, ReceiptTransferPhase::Authoritative)
+                select_receipt_for_transfer(&observed, 2, ObjectTransferPhase::Authoritative)
                     .unwrap_err()
                     .code(),
                 Code::Unavailable,
@@ -482,8 +522,8 @@ mod tests {
     fn receipt_precopy_and_final_transfer_preserve_exact_quorum_and_absence() {
         let exact = receipt();
         for phase in [
-            ReceiptTransferPhase::Precopy,
-            ReceiptTransferPhase::Authoritative,
+            ObjectTransferPhase::Precopy,
+            ObjectTransferPhase::Authoritative,
         ] {
             assert_eq!(
                 select_receipt_for_transfer(&[Some(exact.clone()), Some(exact.clone())], 2, phase)
@@ -543,7 +583,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            select_receipt_for_transfer(&candidates, 2, ReceiptTransferPhase::Precopy).unwrap(),
+            select_receipt_for_transfer(&candidates, 2, ObjectTransferPhase::Precopy).unwrap(),
             ReceiptTransferSelection::Deferred
         );
         // The final drained pass starts fresh page streams. Both snapshots
@@ -552,7 +592,7 @@ mod tests {
             select_receipt_for_transfer(
                 &[Some(exact.clone()), Some(exact.clone())],
                 2,
-                ReceiptTransferPhase::Authoritative
+                ObjectTransferPhase::Authoritative
             )
             .unwrap(),
             ReceiptTransferSelection::Exact(exact)
@@ -604,6 +644,124 @@ mod tests {
             select_handoff_path_quorum(&[Some(pending), Some(released.clone())], 2, 2).unwrap(),
             Some(released)
         );
+    }
+
+    #[test]
+    fn independently_captured_path_pages_defer_only_before_the_authoritative_scan() {
+        use crate::join_peer::handoff::HandoffEndpoint;
+
+        let older = snapshot();
+        let mut mutation = receipt();
+        mutation.version.id = VersionId(9);
+        mutation.stamp.predecessor_version = Some(VersionId(8));
+        mutation.stamp.source_journal_position = 9;
+        mutation.stamp.mutation_fingerprint = mutation.computed_fingerprint();
+        mutation.validate().unwrap();
+        let mut newer = older.clone();
+        newer.head.version = mutation.version.id;
+        newer.head.mutation_stamp = Some(mutation.stamp);
+        newer.versions = vec![mutation.version];
+        newer.journal_pending_versions = vec![VersionId(9)];
+        older.validate().unwrap();
+        newer.validate().unwrap();
+        let records = [
+            ObjectRecordExport::ExactPath(older.clone()),
+            ObjectRecordExport::ExactPath(newer.clone()),
+        ];
+        let key = records[0].handoff_order_key().unwrap();
+        assert_eq!(records[1].handoff_order_key().unwrap(), key);
+        let mut pages = [
+            MergeSource::<ObjectRecordExport, ObjectRecordCursor>::new(HandoffEndpoint {
+                node_id: NodeId(1),
+                address: "unused".into(),
+            }),
+            MergeSource::<ObjectRecordExport, ObjectRecordCursor>::new(HandoffEndpoint {
+                node_id: NodeId(2),
+                address: "unused".into(),
+            }),
+        ];
+        for (page, record) in pages.iter_mut().zip(records) {
+            page.install_page(vec![record], None, |record| {
+                record
+                    .handoff_order_key()
+                    .map_err(|error| Status::data_loss(error.to_string()))
+            })
+            .unwrap();
+        }
+        let candidates = pages
+            .iter_mut()
+            .map(|page| match page.take_if(&key) {
+                Some(ObjectRecordExport::ExactPath(snapshot)) => Some(snapshot),
+                _ => panic!("path identity must resolve to its independently captured snapshot"),
+            })
+            .collect::<Vec<_>>();
+        // Version 9 is a valid successor of 8, not of the old page's 7. The
+        // optional scan/replay cannot infer an authority from these pages.
+        assert_eq!(
+            select_path_for_transfer(&candidates, 2, 2, ObjectTransferPhase::Precopy).unwrap(),
+            PathTransferSelection::Deferred
+        );
+        assert_eq!(
+            select_path_for_transfer(&candidates, 2, 2, ObjectTransferPhase::Authoritative)
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        assert_eq!(
+            select_handoff_path_quorum(&candidates, 2, 2)
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        let fresh = vec![Some(newer.clone()), Some(newer.clone())];
+        let exact =
+            PathTransferSelection::Selected(Some(release_handoff_retention(newer).unwrap()));
+        assert_eq!(
+            select_path_for_transfer(&fresh, 2, 2, ObjectTransferPhase::Precopy).unwrap(),
+            exact
+        );
+        assert_eq!(
+            select_path_for_transfer(&fresh, 2, 2, ObjectTransferPhase::Authoritative).unwrap(),
+            exact
+        );
+    }
+
+    #[test]
+    fn path_transfer_defers_missing_quorum_but_never_malformed_snapshots() {
+        let valid = snapshot();
+        let missing = [Some(valid.clone()), None];
+        assert_eq!(
+            select_path_for_transfer(&missing, 2, 2, ObjectTransferPhase::Precopy).unwrap(),
+            PathTransferSelection::Deferred
+        );
+        assert_eq!(
+            select_path_for_transfer(&missing, 2, 2, ObjectTransferPhase::Authoritative)
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        let mut malformed = valid;
+        malformed.versions.clear();
+        for phase in [
+            ObjectTransferPhase::Precopy,
+            ObjectTransferPhase::Authoritative,
+        ] {
+            assert_eq!(
+                select_path_for_transfer(
+                    &[Some(malformed.clone()), Some(malformed.clone())],
+                    2,
+                    2,
+                    phase
+                )
+                .unwrap_err()
+                .code(),
+                Code::DataLoss
+            );
+            assert_eq!(
+                select_path_for_transfer(&[None, None], 2, 2, phase).unwrap(),
+                PathTransferSelection::Selected(None)
+            );
+        }
     }
 
     #[test]

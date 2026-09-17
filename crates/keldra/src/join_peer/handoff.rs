@@ -471,7 +471,7 @@ impl JoinActivationGate for TypedAddHandoff {
         let changes = self
             .changes_between(&topology, &peers, &started, &precopy_tail)
             .await?;
-        records::replay_object_paths(&topology, &peers, &changes).await?;
+        records::precopy_object_paths(&topology, &peers, &changes).await?;
         self.require_current(descriptor, transition).await?;
 
         // Close every origin before taking the program commit gate. Otherwise
@@ -496,7 +496,7 @@ impl JoinActivationGate for TypedAddHandoff {
         let final_changes = self
             .changes_between(&topology, &peers, &started, &final_tail)
             .await?;
-        records::replay_object_paths(&topology, &peers, &final_changes).await?;
+        records::replay_object_paths_authoritatively(&topology, &peers, &final_changes).await?;
         payload::transfer_all(&topology, &peers, self.profile, payload_spools).await?;
         let post_payload_tail = self
             .settled_journal_tails(descriptor, transition, &topology, &peers)
