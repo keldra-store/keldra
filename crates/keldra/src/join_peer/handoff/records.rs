@@ -12,11 +12,23 @@ mod authz;
 mod logical;
 mod object;
 
-pub(super) async fn transfer_all(
+/// Optional preparation while old owners still admit mutations. Receipt
+/// observations from independently captured pages may be inconclusive.
+pub(super) async fn precopy_all(
     topology: &HandoffTopology,
     peers: &DataPeerTransport,
 ) -> Result<(), Status> {
-    object::transfer(topology, peers).await?;
+    object::precopy(topology, peers).await?;
+    logical::transfer(topology, peers).await?;
+    authz::transfer(topology, peers).await
+}
+
+/// Required exact transfer after every old-origin mutation drain completes.
+pub(super) async fn transfer_all_authoritatively(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+) -> Result<(), Status> {
+    object::transfer_authoritatively(topology, peers).await?;
     logical::transfer(topology, peers).await?;
     authz::transfer(topology, peers).await
 }

@@ -26,9 +26,37 @@ enum Identity {
     },
 }
 
-pub(super) async fn transfer(
+#[derive(Clone, Copy)]
+enum ReceiptTransferPhase {
+    Precopy,
+    Authoritative,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReceiptTransferSelection {
+    Exact(ObjectMutation),
+    Absent,
+    Deferred,
+}
+
+pub(super) async fn precopy(
     topology: &HandoffTopology,
     peers: &DataPeerTransport,
+) -> Result<(), Status> {
+    transfer(topology, peers, ReceiptTransferPhase::Precopy).await
+}
+
+pub(super) async fn transfer_authoritatively(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+) -> Result<(), Status> {
+    transfer(topology, peers, ReceiptTransferPhase::Authoritative).await
+}
+
+async fn transfer(
+    topology: &HandoffTopology,
+    peers: &DataPeerTransport,
+    receipt_phase: ReceiptTransferPhase,
 ) -> Result<(), Status> {
     let mut sources = topology
         .discovery_endpoints()
@@ -46,7 +74,7 @@ pub(super) async fn transfer(
                 observed.insert(source.node_id(), record);
             }
         }
-        transfer_identity(topology, peers, observed).await?;
+        transfer_identity(topology, peers, observed, receipt_phase).await?;
     }
 }
 
@@ -77,6 +105,7 @@ async fn transfer_identity(
     topology: &HandoffTopology,
     peers: &DataPeerTransport,
     observed: BTreeMap<NodeId, ObjectRecordExport>,
+    receipt_phase: ReceiptTransferPhase,
 ) -> Result<(), Status> {
     let selected_identity = observed
         .values()
@@ -137,7 +166,9 @@ async fn transfer_identity(
                     None => Ok(None),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if let Some(receipt) = select_receipt_quorum(&candidates, quorum(old.len())?)? {
+            if let ReceiptTransferSelection::Exact(receipt) =
+                select_receipt_for_transfer(&candidates, quorum(old.len())?, receipt_phase)?
+            {
                 if joining_receipt_matches(&observed, topology.joining().node_id, &receipt) {
                     return Ok(());
                 }
@@ -260,6 +291,27 @@ fn select_receipt_quorum(
     Err(Status::unavailable(
         "object receipt has no exact old-placement quorum",
     ))
+}
+
+fn select_receipt_for_transfer(
+    observed: &[Option<ObjectMutation>],
+    required: usize,
+    phase: ReceiptTransferPhase,
+) -> Result<ReceiptTransferSelection, Status> {
+    match select_receipt_quorum(observed, required) {
+        Ok(Some(receipt)) => Ok(ReceiptTransferSelection::Exact(receipt)),
+        Ok(None) => Ok(ReceiptTransferSelection::Absent),
+        Err(error)
+            if matches!(phase, ReceiptTransferPhase::Precopy)
+                && error.code() == tonic::Code::Unavailable =>
+        {
+            // Pre-copy pages are independent observations while writes
+            // continue, not one absence/quorum proof. Install nothing; the
+            // mandatory fresh scan after all drains must prove exact quorum.
+            Ok(ReceiptTransferSelection::Deferred)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Selects complete object authority without mistaking replica-local journal
@@ -400,6 +452,111 @@ mod tests {
             definition_transition: None,
             alias_snapshot: None,
         }
+    }
+
+    #[test]
+    fn receipt_precopy_defers_missing_and_conflicting_quorum_but_final_transfer_rejects() {
+        let exact = receipt();
+        let mut conflicting = exact.clone();
+        conflicting.input_fingerprint = [9; 32];
+        for observed in [
+            vec![None, Some(exact.clone())],
+            vec![Some(exact.clone()), Some(conflicting)],
+        ] {
+            assert_eq!(
+                select_receipt_for_transfer(&observed, 2, ReceiptTransferPhase::Precopy).unwrap(),
+                ReceiptTransferSelection::Deferred,
+                "inconclusive preparation must install no receipt"
+            );
+            assert_eq!(
+                select_receipt_for_transfer(&observed, 2, ReceiptTransferPhase::Authoritative)
+                    .unwrap_err()
+                    .code(),
+                Code::Unavailable,
+                "the drained transfer must still require exact old-owner quorum"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_precopy_and_final_transfer_preserve_exact_quorum_and_absence() {
+        let exact = receipt();
+        for phase in [
+            ReceiptTransferPhase::Precopy,
+            ReceiptTransferPhase::Authoritative,
+        ] {
+            assert_eq!(
+                select_receipt_for_transfer(&[Some(exact.clone()), Some(exact.clone())], 2, phase)
+                    .unwrap(),
+                ReceiptTransferSelection::Exact(exact.clone()),
+                "normal exact receipts remain eligible for installation"
+            );
+            assert_eq!(
+                select_receipt_for_transfer(&[None, None], 2, phase).unwrap(),
+                ReceiptTransferSelection::Absent
+            );
+        }
+    }
+
+    #[test]
+    fn independently_captured_receipt_pages_defer_until_fresh_final_scan() {
+        use crate::join_peer::handoff::HandoffEndpoint;
+
+        let mut exact = receipt();
+        exact.stamp.mutation_fingerprint = exact.computed_fingerprint();
+        exact.validate().unwrap();
+        let record = ObjectRecordExport::Receipt(exact.clone());
+        let key = record.handoff_order_key().unwrap();
+        let endpoint = |id| HandoffEndpoint {
+            node_id: NodeId(id),
+            address: "unused".into(),
+        };
+        // Owner 1's page was captured before the concurrent receipt commit;
+        // owner 2's independently captured page sees it after exact replication.
+        let mut old_pages = [
+            MergeSource::<ObjectRecordExport, ObjectRecordCursor>::new(endpoint(1)),
+            MergeSource::<ObjectRecordExport, ObjectRecordCursor>::new(endpoint(2)),
+        ];
+        old_pages[0]
+            .install_page(Vec::new(), None, |record| {
+                record
+                    .handoff_order_key()
+                    .map_err(|error| Status::data_loss(error.to_string()))
+            })
+            .unwrap();
+        old_pages[1]
+            .install_page(vec![record.clone()], None, |record| {
+                record
+                    .handoff_order_key()
+                    .map_err(|error| Status::data_loss(error.to_string()))
+            })
+            .unwrap();
+        assert_eq!(next_key(&old_pages), Some(key.clone()));
+        let candidates = old_pages
+            .iter_mut()
+            .map(|source| match source.take_if(&key) {
+                Some(ObjectRecordExport::Receipt(receipt)) => Some(receipt),
+                None => None,
+                Some(ObjectRecordExport::ExactPath(_)) => {
+                    panic!("receipt key cannot resolve a path")
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            select_receipt_for_transfer(&candidates, 2, ReceiptTransferPhase::Precopy).unwrap(),
+            ReceiptTransferSelection::Deferred
+        );
+        // The final drained pass starts fresh page streams. Both snapshots
+        // contain the exact immutable receipt; no singleton was installed.
+        assert_eq!(
+            select_receipt_for_transfer(
+                &[Some(exact.clone()), Some(exact.clone())],
+                2,
+                ReceiptTransferPhase::Authoritative
+            )
+            .unwrap(),
+            ReceiptTransferSelection::Exact(exact)
+        );
     }
 
     #[test]

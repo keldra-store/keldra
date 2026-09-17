@@ -465,7 +465,7 @@ impl JoinActivationGate for TypedAddHandoff {
         // Pre-copy typed metadata and payload artifacts while normal traffic
         // continues. The final paused scan below remains authoritative and
         // makes this retry-safe without a durable handoff inventory.
-        records::transfer_all(&topology, &peers).await?;
+        records::precopy_all(&topology, &peers).await?;
         payload::transfer_all(&topology, &peers, self.profile, payload_spools.clone()).await?;
         let precopy_tail = self.journal_tails(&topology, &peers).await?;
         let changes = self
@@ -492,7 +492,7 @@ impl JoinActivationGate for TypedAddHandoff {
             .await?;
         self.await_reference_cursors(descriptor, transition, &topology, &peers, &final_tail)
             .await?;
-        records::transfer_all(&topology, &peers).await?;
+        records::transfer_all_authoritatively(&topology, &peers).await?;
         let final_changes = self
             .changes_between(&topology, &peers, &started, &final_tail)
             .await?;
