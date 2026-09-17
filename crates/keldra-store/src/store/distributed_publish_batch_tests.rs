@@ -971,11 +971,161 @@ async fn receipt_capacity_commits_only_the_successful_prefix_before_retry() {
 }
 
 #[tokio::test]
-async fn derived_publication_does_not_consume_full_public_receipt_capacity() {
+async fn derived_origin_and_replica_export_identical_receipts_and_replay_exact_mutations() {
+    for single_node in [false, true] {
+        let origin_dir = tempfile::tempdir().unwrap();
+        let replica_dir = tempfile::tempdir().unwrap();
+        let origin = Store::open(StoreOptions::new(origin_dir.path(), 1))
+            .await
+            .unwrap();
+        let replica = Store::open(StoreOptions::new(replica_dir.path(), 2))
+            .await
+            .unwrap();
+        let (tenant_id, bucket_id) = origin.resolve_bucket_ids("tenant", "bucket").unwrap();
+        let governance = ObjectMutationGovernance {
+            tenant_id,
+            bucket_id,
+            versioning: origin.bucket_versioning("tenant", "bucket").unwrap(),
+            policy: origin.bucket_policy("tenant", "bucket").unwrap(),
+        };
+        let context = ObjectMutationContext {
+            active_placement_log_id: PlacementLogId { term: 1, index: 12 },
+            serving_fence_term: 1,
+        };
+        let blob = origin
+            .stage_derived_progress_blob(b"derived immutable")
+            .await
+            .unwrap();
+        let original = request(
+            "_keldra/index-projections/v1/test/artifacts/packs/one",
+            "derived-original",
+            blob,
+        );
+        let coordinate = |requests, governance| {
+            let origin = origin.clone();
+            async move {
+                if single_node {
+                    origin
+                        .coordinate_single_node_derived_progress_publish_batch_with_governance(
+                            requests, governance, context,
+                        )
+                        .await
+                        .unwrap()
+                        .outcomes
+                } else {
+                    origin
+                        .coordinate_derived_progress_publish_batch_with_governance(
+                            requests, governance, context,
+                        )
+                        .await
+                        .unwrap()
+                }
+            }
+        };
+        let first = coordinate(vec![original.clone()], governance.clone())
+            .await
+            .remove(0)
+            .unwrap();
+        assert!(!first.receipt.replayed);
+        let mutation = first.mutation.unwrap();
+        assert_eq!(
+            first.receipt.replay_guarantee_expires_at_unix_millis,
+            mutation.receipt_expires_at_unix_millis
+        );
+        assert!(
+            !replica
+                .apply_object_mutation_replica(&mutation)
+                .await
+                .unwrap()
+                .replayed
+        );
+        let exported_receipts = |store: &Store| {
+            store
+                .export_object_records(None, 100, 1024 * 1024)
+                .unwrap()
+                .records
+                .into_iter()
+                .filter_map(|record| match record {
+                    crate::ObjectRecordExport::Receipt(value) => Some(value),
+                    crate::ObjectRecordExport::ExactPath(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Exact ObjectMutation equality is the final handoff quorum contract;
+        // no origin/replica stamp, expiry or predecessor normalization is used.
+        assert_eq!(exported_receipts(&origin), vec![mutation.clone()]);
+        assert_eq!(exported_receipts(&replica), vec![mutation.clone()]);
+        let origin_status = origin.mutation_receipt_status().unwrap();
+        let replica_status = replica.mutation_receipt_status().unwrap();
+        let before_command_replay = origin.local_watch_status().unwrap();
+        let replay = coordinate(vec![original.clone()], governance.clone())
+            .await
+            .remove(0)
+            .unwrap();
+        assert!(replay.receipt.replayed);
+        assert_eq!(replay.mutation.as_ref(), Some(&mutation));
+        assert_eq!(replay.receipt.version, mutation.version.id);
+        assert!(
+            replica
+                .apply_object_mutation_replica(replay.mutation.as_ref().unwrap())
+                .await
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(origin.mutation_receipt_status().unwrap(), origin_status);
+        assert_eq!(replica.mutation_receipt_status().unwrap(), replica_status);
+        assert_eq!(
+            origin.local_watch_status().unwrap().tail,
+            before_command_replay.tail
+        );
+        let mut conflicting = original.clone();
+        conflicting.blob = origin
+            .stage_derived_progress_blob(b"conflicting bytes")
+            .await
+            .unwrap();
+        let rejected = coordinate(vec![conflicting], governance.clone())
+            .await
+            .remove(0);
+        assert_eq!(rejected.unwrap_err(), MutationError::IdempotencyConflict);
+        assert_eq!(origin.mutation_receipt_status().unwrap(), origin_status);
+        assert_eq!(
+            origin.local_watch_status().unwrap().tail,
+            before_command_replay.tail
+        );
+        assert_eq!(exported_receipts(&origin), vec![mutation.clone()]);
+        // A new command for already-present identical immutable bytes keeps
+        // the existing content-replay contract: no new stamped mutation exists.
+        let mut fresh_command = original;
+        fresh_command.command_id = Some("derived-fresh-command".into());
+        let before_content_replay = origin.local_watch_status().unwrap();
+        let content_replay = coordinate(vec![fresh_command], governance)
+            .await
+            .remove(0)
+            .unwrap();
+        assert!(content_replay.receipt.replayed);
+        assert_eq!(content_replay.receipt.version, mutation.version.id);
+        assert!(content_replay.mutation.is_none());
+        assert_eq!(
+            content_replay
+                .receipt
+                .replay_guarantee_expires_at_unix_millis,
+            0
+        );
+        assert_eq!(
+            origin.local_watch_status().unwrap().tail,
+            before_content_replay.tail
+        );
+        assert_eq!(origin.mutation_receipt_status().unwrap(), origin_status);
+        assert_eq!(exported_receipts(&origin), exported_receipts(&replica));
+    }
+}
+
+#[tokio::test]
+async fn derived_publication_retains_receipts_and_enforces_the_shared_capacity() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(
         StoreOptions::new(temporary.path(), 1).with_mutation_receipt_retention(
-            MutationReceiptRetention::new(60, 1, 1024 * 1024).unwrap(),
+            MutationReceiptRetention::new(60, 3, 1024 * 1024).unwrap(),
         ),
     )
     .await
@@ -1019,7 +1169,9 @@ async fn derived_publication_does_not_consume_full_public_receipt_capacity() {
         .unwrap();
     assert!(matches!(derived.outcomes.as_slice(), [Ok(_)]));
     let derived_version = derived.outcomes[0].as_ref().unwrap().receipt.version;
-    assert_eq!(store.mutation_receipt_status().unwrap(), full);
+    let after_derived = store.mutation_receipt_status().unwrap();
+    assert_eq!(after_derived.entries, full.entries + 1);
+    assert!(after_derived.bytes > full.bytes);
 
     let replay = store
         .coordinate_single_node_derived_progress_publish_batch_with_governance(
@@ -1030,7 +1182,7 @@ async fn derived_publication_does_not_consume_full_public_receipt_capacity() {
         .await
         .unwrap();
     assert!(replay.outcomes[0].as_ref().unwrap().receipt.replayed);
-    assert_eq!(store.mutation_receipt_status().unwrap(), full);
+    assert_eq!(store.mutation_receipt_status().unwrap(), after_derived);
 
     let current_blob = store
         .stage_derived_progress_blob(b"derived current")
@@ -1047,7 +1199,23 @@ async fn derived_publication_does_not_consume_full_public_receipt_capacity() {
         .await
         .unwrap();
     assert!(matches!(current.outcomes.as_slice(), [Ok(_)]));
-    assert_eq!(store.mutation_receipt_status().unwrap(), full);
+    let at_capacity = store.mutation_receipt_status().unwrap();
+    assert_eq!(at_capacity.entries, 3);
+
+    let rejected = store
+        .coordinate_single_node_derived_progress_publish_batch_with_governance(
+            vec![request(
+                "derived/second",
+                "derived-second",
+                store.stage_derived_progress_blob(b"second").await.unwrap(),
+            )],
+            governance.clone(),
+            context,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(rejected, MutationError::ReceiptCapacity);
+    assert_eq!(store.mutation_receipt_status().unwrap(), at_capacity);
 
     let ordinary_blob = store.stage_blob(b"second ordinary").await.unwrap();
     let error = store
@@ -1059,7 +1227,7 @@ async fn derived_publication_does_not_consume_full_public_receipt_capacity() {
         .await
         .unwrap_err();
     assert_eq!(error, MutationError::ReceiptCapacity);
-    assert_eq!(store.mutation_receipt_status().unwrap(), full);
+    assert_eq!(store.mutation_receipt_status().unwrap(), at_capacity);
 }
 
 #[tokio::test]

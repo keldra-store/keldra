@@ -1,3 +1,4 @@
+use super::journal_capacity::SourceJournalAdmission;
 use super::*;
 use crate::{DefinitionTransition, ObjectAliasSnapshot, ObjectMutation, ObjectMutationContext};
 
@@ -8,10 +9,9 @@ pub(super) struct DistributedEvaluationContext {
     pub(super) source_journal_position: u64,
     pub(super) reference_effects: LocalReferenceEffects,
     pub(super) materialize_inline_payload: bool,
-    /// Trusted one-node derived publication is retryable from its immutable
-    /// object identity and Current CAS, so it must not consume the public
-    /// command-receipt retention budget.
-    pub(super) retain_command_receipt: bool,
+    /// Trusted derived immutable publications may also replay by exact content.
+    /// Their stamped command receipts still match the metadata replicas.
+    pub(super) source_journal_admission: SourceJournalAdmission,
 }
 
 pub(super) struct EvaluatedOperation {

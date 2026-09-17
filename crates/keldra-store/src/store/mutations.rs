@@ -900,11 +900,10 @@ impl Store {
         let mut timing = evaluation_subphases.start();
         let key = operation.key();
         let encoded_key = operation.encoded_head_key();
-        let retain_command_receipt =
-            distributed.is_none_or(|context| context.retain_command_receipt);
-        let receipt_key = retain_command_receipt
-            .then(|| operation.command_id())
-            .flatten()
+        // Stamped origin receipts must retain the exact mutation exported by
+        // replicas: ownership handoff requires their unchanged exact quorum.
+        let receipt_key = operation
+            .command_id()
             .map(|command_id| receipt_key(operation.identity(), command_id));
         if let Some(receipt_key) = receipt_key.as_ref() {
             let existing = match pending_receipts.get(receipt_key) {
@@ -1154,8 +1153,9 @@ impl Store {
             }
             return Err(MutationError::Immutable);
         }
-        if !retain_command_receipt
-            && let (Some(current), Some(existing)) = (current.as_ref(), current_version.as_ref())
+        if distributed.is_some_and(|context| {
+            context.source_journal_admission == SourceJournalAdmission::DerivedProgress
+        }) && let (Some(current), Some(existing)) = (current.as_ref(), current_version.as_ref())
             && let Some(replay) =
                 trusted_derived_put_if_absent_replay(operation, current, existing)?
         {

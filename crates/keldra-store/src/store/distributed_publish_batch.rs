@@ -200,8 +200,6 @@ impl Store {
                 ..
             } => source_journal_admission,
         };
-        let retain_command_receipt =
-            source_journal_admission != SourceJournalAdmission::DerivedProgress;
         let mut next_source_position = source.tail.checked_add(1).ok_or_else(|| {
             MutationError::Storage("local invalidation offset is exhausted".into())
         })?;
@@ -269,7 +267,7 @@ impl Store {
                             payload_preparation,
                             CoordinatorBatchPayloadPreparation::SingleNode { .. }
                         ),
-                        retain_command_receipt,
+                        source_journal_admission,
                     })
                 }
                 CoordinatorBatchPayloadPreparation::DirectLocal { .. } => None,
