@@ -125,6 +125,32 @@ membership_cutover_source_tail=
 membership_cutover_source_fence_term=
 membership_cutover_source_fence_index=
 membership_cutover_source_log_start=
+membership_cutover_source_epoch=
+cutover_verified_proof=
+cutover_verified_source_epoch=
+
+validate_cutover_journal_artifact_proof() {
+  local proof="$1" node_id="$2" start="$3" tail="$4" term="$5" fence_index="$6"
+  cutover_verified_proof=
+  cutover_verified_source_epoch=
+  jq --exit-status --slurp \
+    --argjson node "${node_id}" --argjson start "${start}" --argjson tail "${tail}" \
+    --argjson term "${term}" --argjson fence_index "${fence_index}" '
+      length == 1 and (.[0] |
+        .proof == "complete_reserved_derived_artifact_suffix" and
+        .all_records_are_reserved_derived_artifacts == true and
+        .source_node_id == $node and .index_safe_through == $start and
+        .stable_tail == $tail and .settled_through == $tail and
+        .captured_fence.term == $term and .captured_fence.index == $fence_index and
+        (.source_epoch | type == "array" and length == 32 and
+          all(.[]; type == "number" and floor == . and . >= 0 and . <= 255) and any(.[]; . != 0)) and
+        (.retention_floor_before | type == "number" and floor == . and . >= 0 and . <= $start) and
+        (.retention_floor_after | type == "number" and floor == . and . >= 0 and . <= $start) and
+        .verified_records == ($tail - $start) and $start <= $tail)
+    ' <<<"${proof}" >/dev/null || return 1
+  cutover_verified_proof="${proof}"
+  cutover_verified_source_epoch="$(jq --compact-output '.source_epoch' <<<"${proof}")"
+}
 
 latest_source_journal_sample() {
   service_logs "$1" \
@@ -188,6 +214,7 @@ prove_cutover_journal_artifact_suffix() {
   local fence
   local term
   local fence_index
+  local proof
   local identity_dir="${KELDRA_QUALIFICATION_DIR}/secrets/cutover-peer"
   [[ "${node}" =~ ^keldra-([1-3])$ ]] || return 1
   node_id="${BASH_REMATCH[1]}"
@@ -207,7 +234,7 @@ prove_cutover_journal_artifact_suffix() {
   docker cp "${container}:/var/lib/keldra/node-identity.json" \
     "${identity_dir}/${node}.json" >/dev/null || return 1
   chmod 0600 "${identity_dir}/${node}.json"
-  KELDRA_CUTOVER_JOURNAL_IDENTITY_PATH="${identity_dir}/${node}.json" \
+  proof="$(KELDRA_CUTOVER_JOURNAL_IDENTITY_PATH="${identity_dir}/${node}.json" \
   KELDRA_CUTOVER_JOURNAL_PEER_ADDRESS="${address}:50052" \
   KELDRA_CUTOVER_JOURNAL_SOURCE_NODE_ID="${node_id}" \
   KELDRA_CUTOVER_JOURNAL_EXPECTED_TAIL="${tail}" \
@@ -215,8 +242,9 @@ prove_cutover_journal_artifact_suffix() {
   KELDRA_CUTOVER_JOURNAL_FENCE_TERM="${term}" \
   KELDRA_CUTOVER_JOURNAL_FENCE_INDEX="${fence_index}" \
     "${qualification_binaries[cluster_cutover_journal_suffix]}" \
-    >>"${KELDRA_QUALIFICATION_DIR}/artifacts/membership-journal-suffix-${node}.jsonl" \
-    2>>"${KELDRA_QUALIFICATION_DIR}/artifacts/membership-journal-suffix-${node}.stderr"
+    2>>"${KELDRA_QUALIFICATION_DIR}/artifacts/membership-journal-suffix-${node}.stderr")" || return 1
+  validate_cutover_journal_artifact_proof "${proof}" "${node_id}" "${index}" "${tail}" "${term}" "${fence_index}" || return 1
+  printf '%s\n' "${proof}" >>"${KELDRA_QUALIFICATION_DIR}/artifacts/membership-journal-suffix-${node}.jsonl"
 }
 
 run_cutover_writes() {
@@ -253,6 +281,7 @@ prepare_no_event_membership_cutover_qualification() {
   local line
   local previous_clear_line=
   local previous_clear_tail=
+  local previous_clear_epoch=
   local round
   local stable_clear=0
   local clear_deadline
@@ -274,6 +303,7 @@ prepare_no_event_membership_cutover_qualification() {
     # be a no-event interval.
     previous_clear_line=
     previous_clear_tail=
+    previous_clear_epoch=
     stable_clear=0
     # Catch-up duration is not a 45-second performance guarantee. Reuse the
     # existing bounded handoff wait without relaxing any clear-cut evidence.
@@ -285,7 +315,8 @@ prepare_no_event_membership_cutover_qualification() {
         clear_tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
         if [[ -n "${previous_clear_line}" \
           && "${line}" != "${previous_clear_line}" \
-          && "${clear_tail}" == "${previous_clear_tail}" ]]
+          && "${clear_tail}" == "${previous_clear_tail}" \
+          && "${cutover_verified_source_epoch}" == "${previous_clear_epoch}" ]]
         then
           stable_clear=1
           break
@@ -293,10 +324,12 @@ prepare_no_event_membership_cutover_qualification() {
         if [[ "${line}" != "${previous_clear_line}" ]]; then
           previous_clear_line="${line}"
           previous_clear_tail="${clear_tail}"
+          previous_clear_epoch="${cutover_verified_source_epoch}"
         fi
       else
         previous_clear_line=
         previous_clear_tail=
+        previous_clear_epoch=
       fi
       sleep 1
     done
@@ -310,6 +343,8 @@ prepare_no_event_membership_cutover_qualification() {
   membership_cutover_source_tail="$(
     log_unsigned_field gauge.keldra_source_journal_tail "${line}"
   )"
+  membership_cutover_source_epoch="${cutover_verified_source_epoch}"
+  [[ -n "${membership_cutover_source_epoch}" ]] || return 1
   fence="$(latest_completed_membership_fence "${node}" "${node_id}")"
   membership_cutover_source_fence_term="$(
     log_unsigned_field membership.term "${fence}" || true
@@ -335,6 +370,7 @@ refresh_no_event_membership_cutover_tail() {
   local line=
   local previous_clear_line=
   local previous_clear_tail=
+  local previous_clear_epoch=
   while ((SECONDS < clear_deadline)); do
     line="$(latest_source_journal_sample "${node}")"
     if source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}" \
@@ -342,19 +378,24 @@ refresh_no_event_membership_cutover_tail() {
       clear_tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
       if [[ -n "${previous_clear_line}" \
         && "${line}" != "${previous_clear_line}" \
-        && "${clear_tail}" == "${previous_clear_tail}" ]]
+        && "${clear_tail}" == "${previous_clear_tail}" \
+        && "${cutover_verified_source_epoch}" == "${previous_clear_epoch}" ]]
       then
         membership_cutover_source_tail="${clear_tail}"
+        membership_cutover_source_epoch="${cutover_verified_source_epoch}"
+        [[ -n "${membership_cutover_source_epoch}" ]] || return 1
         echo "[keldra-qualification] refreshed no-event cutover baseline at tail ${membership_cutover_source_tail} after the JOINING-node probe"
         return 0
       fi
       if [[ "${line}" != "${previous_clear_line}" ]]; then
         previous_clear_line="${line}"
         previous_clear_tail="${clear_tail}"
+        previous_clear_epoch="${cutover_verified_source_epoch}"
       fi
     else
       previous_clear_line=
       previous_clear_tail=
+      previous_clear_epoch=
     fi
     sleep 1
   done
@@ -416,6 +457,11 @@ qualify_no_event_membership_cutover() {
   local fence=
   local line=
   local tail
+  local index
+  local proof_start
+  local verified_post_tail=
+  local new_term
+  local new_index
   local attempt
   for attempt in $(seq 1 90); do
     save_log_suffix "${node}" "${membership_cutover_source_log_start}" "${evidence}"
@@ -426,17 +472,26 @@ qualify_no_event_membership_cutover() {
     [[ -n "${fence}" ]] && line="$(sample_after_log_line "${evidence}" "${fence}")"
     if source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}"; then
       tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}")"
-      if [[ "${tail}" != "${membership_cutover_source_tail}" ]]; then
-        echo "${node} appended source events during the intended no-event cutover" >&2
-        echo "pre-cutover tail: ${membership_cutover_source_tail}; post-cutover tail: ${tail}" >&2
-        return 1
+      ((tail >= membership_cutover_source_tail)) || return 1
+      index="$(log_unsigned_field gauge.keldra_source_journal_index_safe_through "${line}")"
+      proof_start="${index}"
+      ((membership_cutover_source_tail < proof_start)) && proof_start="${membership_cutover_source_tail}"
+      # The raw journal also contains legitimate derived publication artifacts.
+      # Prove ALL records since the pre-cutover baseline, not just index lag.
+      if prove_cutover_journal_artifact_suffix "${node}" "${proof_start}" "${tail}"; then
+        new_term="$(log_unsigned_field membership.term "${fence}" || true)"
+        new_index="$(log_unsigned_field membership.index "${fence}" || true)"
+        if validate_cutover_journal_artifact_proof "${cutover_verified_proof}" "${node_id}" "${proof_start}" "${tail}" "${new_term}" "${new_index}" \
+          && [[ "${cutover_verified_source_epoch}" == "${membership_cutover_source_epoch}" ]]; then
+          verified_post_tail="${tail}"
+          break
+        fi
       fi
-      break
     fi
     sleep 1
   done
-  if ! source_journal_sample_is_clear_at_bound "${line}" "${bound}" "${node}"; then
-    echo "${node} did not prove derived-consumer convergence at its unchanged tail under the new membership fence" >&2
+  if [[ -z "${verified_post_tail}" ]]; then
+    echo "${node} did not prove a complete ordinary-event-free cutover interval under the new membership fence" >&2
     return 1
   fi
 
@@ -447,11 +502,11 @@ qualify_no_event_membership_cutover() {
     line="$(latest_source_journal_sample "${node}")"
     tail="$(log_unsigned_field gauge.keldra_source_journal_tail "${line}" || true)"
     [[ -n "${tail}" ]] \
-      && ((tail > membership_cutover_source_tail)) \
+      && ((tail > verified_post_tail)) \
       && break
     sleep 1
   done
-  if [[ -z "${tail}" ]] || ((tail <= membership_cutover_source_tail)); then
+  if [[ -z "${tail}" ]] || ((tail <= verified_post_tail)); then
     echo "${node} did not admit a subsequent ordinary write on its bounded source journal" >&2
     return 1
   fi
@@ -459,5 +514,5 @@ qualify_no_event_membership_cutover() {
   preserve_qualification_log \
     "${evidence}" \
     "/var/tmp/keldra-v1-three-membership-no-event-${qualification_suffix}-${node}.log"
-  echo "[keldra-qualification] cutover advanced derived consumers through source ${node_id} tail ${membership_cutover_source_tail} under the new fence; the next ordinary write advanced it to ${tail}"
+  echo "[keldra-qualification] cutover verified source ${node_id} baseline ${membership_cutover_source_tail} through artifact-only tail ${verified_post_tail} under the new fence; the next ordinary write advanced it to ${tail}"
 }
