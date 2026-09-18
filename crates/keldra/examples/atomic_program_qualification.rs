@@ -121,19 +121,22 @@ async fn main() -> TestResult<()> {
 
     let input = invocation_input(&tenant, &bucket);
     let expected_accounting_bytes = expected_committed_payload_bytes()?;
-    let first_invocation = objects.invoke_program(invocation(
-        &tenant,
-        &bucket,
-        &program_hash,
-        input.clone(),
-        durability,
-    ));
+    let first_invocation = invoke_program_eventually(
+        &mut objects,
+        invocation(
+            &tenant,
+            &bucket,
+            &program_hash,
+            input.clone(),
+            durability,
+        ),
+    );
     let visibility = observe_all_or_nothing(channels.clone(), &token, &tenant, &bucket);
     let accounting_visibility =
         observe_atomic_accounting(&mut accounting, &bucket, expected_accounting_bytes);
     let (first, observed_pairs, accounting_bytes) =
         tokio::join!(first_invocation, visibility, accounting_visibility);
-    let first = first?.into_inner();
+    let first = first?;
     let observed_pairs = observed_pairs?;
     let accounting_bytes = accounting_bytes?;
     if first.replayed {
@@ -332,6 +335,40 @@ fn retryable_index(status: &Status) -> bool {
         status.code(),
         Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::NotFound
     )
+}
+
+async fn invoke_program_eventually(
+    objects: &mut RawClient,
+    request: InvokeProgramRequest,
+) -> TestResult<keldra_storage::v1::InvokeProgramResponse> {
+    let deadline = Instant::now() + REPLICA_WAIT_LIMIT;
+    let mut last = String::new();
+    loop {
+        match objects.invoke_program(request.clone()).await {
+            Ok(response) => return Ok(response.into_inner()),
+            Err(status) if retryable_status(&status) => last = status.to_string(),
+            Err(status) => return Err(status.into()),
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(format!(
+                "idempotent atomic invocation did not complete before the retry deadline: {last}"
+            )));
+        }
+        sleep(REPLICA_POLL_INTERVAL).await;
+    }
+}
+
+fn retryable_status(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled
+    )
+}
+
+fn retryable_error(error: &(dyn Error + Send + Sync)) -> bool {
+    error
+        .downcast_ref::<Status>()
+        .is_some_and(retryable_status)
 }
 
 fn accounting_client(
@@ -639,9 +676,13 @@ async fn observe_all_or_nothing(
 
     loop {
         for (position, client) in clients.iter_mut().enumerate() {
-            match observe_pair(client, tenant, bucket).await? {
-                PairObservation::BothAbsent => {}
-                PairObservation::BothPresent(versions) => complete[position] = Some(versions),
+            match observe_pair(client, tenant, bucket).await {
+                Ok(PairObservation::BothAbsent) => {}
+                Ok(PairObservation::BothPresent(versions)) => {
+                    complete[position] = Some(versions)
+                }
+                Err(error) if retryable_error(error.as_ref()) => {}
+                Err(error) => return Err(error),
             }
         }
         if complete.iter().all(Option::is_some) {
