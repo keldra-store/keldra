@@ -537,10 +537,20 @@ fn oversized_bulk_items_fail_and_replicated_durability_is_preserved() {
 
 #[test]
 fn coordinator_mutation_failures_preserve_cas_and_idempotency_outcomes() {
-    assert_eq!(
-        api_mutation_failure(Status::failed_precondition("stale version")).code,
-        MutationFailureCode::ConditionFailed as i32
-    );
+    let present = api_mutation_failure(crate::object_distribution::mutation_status(
+        MutationError::PreconditionFailed {
+            current: Some(VersionId(41)),
+        },
+    ));
+    assert_eq!(present.code, MutationFailureCode::ConditionFailed as i32);
+    assert_eq!(present.current_version, Some(41));
+
+    let absent = api_mutation_failure(crate::object_distribution::mutation_status(
+        MutationError::PreconditionFailed { current: None },
+    ));
+    assert_eq!(absent.code, MutationFailureCode::ConditionFailed as i32);
+    assert_eq!(absent.current_version, None);
+
     assert_eq!(
         api_mutation_failure(Status::already_exists("command input changed")).code,
         MutationFailureCode::IdempotencyInputMismatch as i32

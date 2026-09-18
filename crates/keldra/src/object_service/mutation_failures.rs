@@ -27,8 +27,18 @@ pub(super) fn api_mutation_failure(error: Status) -> MutationFailure {
     MutationFailure {
         code: code as i32,
         message: error.message().to_owned(),
-        current_version: None,
+        current_version: current_version(&error),
     }
+}
+
+fn current_version(error: &Status) -> Option<u64> {
+    let encoded = error
+        .metadata()
+        .get_bin(crate::object_distribution::CURRENT_VERSION_METADATA)?
+        .to_bytes()
+        .ok()?;
+    let bytes: [u8; 8] = encoded.as_ref().try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
 }
 
 #[cfg(test)]

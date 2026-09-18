@@ -36,6 +36,8 @@ use crate::placement::PlacementKind;
 use crate::reference_delivery::ReferenceRuntimeHandle;
 use crate::serving_fence::ServingAuthority;
 
+pub(crate) const CURRENT_VERSION_METADATA: &str = "keldra-current-version-bin";
+
 struct DistributedMutationBackpressureWait {
     capacity: &'static str,
     started: std::time::Instant,
@@ -1593,8 +1595,12 @@ pub(crate) fn object_placement_key(tenant_id: u64, bucket_id: u64, path: &str) -
     key
 }
 
-fn mutation_status(error: MutationError) -> Status {
-    match error {
+pub(crate) fn mutation_status(error: MutationError) -> Status {
+    let current_version = match &error {
+        MutationError::PreconditionFailed { current } => *current,
+        _ => None,
+    };
+    let mut status = match error {
         MutationError::PreconditionFailed { .. }
         | MutationError::Immutable
         | MutationError::ImmutablePolicyRequired
@@ -1620,7 +1626,14 @@ fn mutation_status(error: MutationError) -> Status {
             Status::resource_exhausted(error.to_string())
         }
         _ => Status::internal(error.to_string()),
+    };
+    if let Some(current_version) = current_version {
+        status.metadata_mut().insert_bin(
+            CURRENT_VERSION_METADATA,
+            tonic::metadata::MetadataValue::from_bytes(&current_version.0.to_be_bytes()),
+        );
     }
+    status
 }
 
 fn mutation_capacity_kind(error: &Status) -> Option<&'static str> {
