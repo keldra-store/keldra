@@ -739,7 +739,14 @@ impl V1LocalIndexQueryExecutor {
             }
             next_newer = Some(header.through_atomic_position);
             let hash = header.previous_generation_hash.ok_or_else(|| {
-                Status::failed_precondition("requested v1 query cut is no longer retained")
+                // A fresh multi-partition pin can race independent Current
+                // publications: one partition may already be newer than the
+                // common cut while another has not reached it yet. With no
+                // retained predecessor there is no exact root vector to pin,
+                // but no client-requested snapshot has been lost either. The
+                // producer will publish the lagging partition at the newer
+                // atomic cut, so expose this as transient unavailability.
+                Status::unavailable("v1 partitions have not reached a retained common query cut")
             })?;
             predecessor_loads.try_admit()?;
             generation_hash = hash;
