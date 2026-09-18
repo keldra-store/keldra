@@ -381,24 +381,42 @@ async fn put_document(
     path: &str,
     command_id: &str,
 ) -> TestResult<()> {
-    let receipt = put_chunks(
-        client,
-        PutHeader {
-            address: Some(ObjectAddress {
-                tenant: tenant.into(),
-                bucket: bucket.into(),
-                path: path.into(),
-            }),
-            content_type: "application/json".into(),
-            command_id: command_id.into(),
-            durability: Durability::Replicated as i32,
-            operation: Some(PutOperationValue::Put(PutOperation {})),
-        },
-        [br#"{"qualified":true}"#.to_vec()],
-    )
-    .await?;
+    let deadline = Instant::now() + WAIT_LIMIT;
+    let receipt = loop {
+        let result = put_chunks(
+            client,
+            PutHeader {
+                address: Some(ObjectAddress {
+                    tenant: tenant.into(),
+                    bucket: bucket.into(),
+                    path: path.into(),
+                }),
+                content_type: "application/json".into(),
+                command_id: command_id.into(),
+                durability: Durability::Replicated as i32,
+                operation: Some(PutOperationValue::Put(PutOperation {})),
+            },
+            [br#"{"qualified":true}"#.to_vec()],
+        )
+        .await;
+        match result {
+            Ok(receipt) => break receipt,
+            Err(status) if retryable(&status) && Instant::now() < deadline => {
+                sleep(POLL_INTERVAL).await;
+            }
+            Err(status) => {
+                return Err(invalid(format!(
+                    "realm index source write for {path} failed with {:?}: {}",
+                    status.code(),
+                    status.message()
+                )));
+            }
+        }
+    };
     if receipt.version == 0 || receipt.deleted {
-        return Err(invalid("realm index source write returned invalid receipt"));
+        return Err(invalid(format!(
+            "realm index source write for {path} returned invalid receipt"
+        )));
     }
     Ok(())
 }
