@@ -365,7 +365,7 @@ fn retryable_status(status: &Status) -> bool {
     )
 }
 
-fn retryable_error(error: &(dyn Error + Send + Sync)) -> bool {
+fn retryable_error(error: &(dyn Error + Send + Sync + 'static)) -> bool {
     error
         .downcast_ref::<Status>()
         .is_some_and(retryable_status)
