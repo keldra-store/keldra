@@ -431,7 +431,8 @@ async fn wait_for_every_endpoint(
     let deadline = Instant::now() + WAIT_LIMIT;
     loop {
         let mut all_match = true;
-        for client in clients.iter_mut() {
+        let mut observations = Vec::with_capacity(clients.len());
+        for (ordinal, client) in clients.iter_mut().enumerate() {
             match client
                 .query_index(query_request(bucket, user, 100, Vec::new()))
                 .await
@@ -447,27 +448,36 @@ async fn wait_for_every_endpoint(
                         .freshness
                         .as_ref()
                         .and_then(|freshness| freshness.result_authorization.as_ref());
-                    if &actual != expected
-                        || !response
+                    let matches = &actual == expected
+                        && response
                             .freshness
                             .as_ref()
                             .is_some_and(|freshness| freshness.initial_build_complete)
-                        || !authorization.is_some_and(|evidence| {
+                        && authorization.is_some_and(|evidence| {
                             evidence.realm == REALM
                                 && evidence.authorization_revision >= minimum_authorization_revision
                                 && evidence.binding_generation != 0
                                 && evidence.schema_ref.as_ref().is_some_and(|schema| {
                                     schema.schema_revision != 0 && !schema.schema_digest.is_empty()
                                 })
-                        })
-                    {
+                        });
+                    observations.push(format!(
+                        "endpoint {}: hits={actual:?}, freshness={:?}",
+                        ordinal + 1,
+                        response.freshness
+                    ));
+                    if !matches {
                         all_match = false;
-                        break;
                     }
                 }
                 Err(status) if retryable(&status) => {
                     all_match = false;
-                    break;
+                    observations.push(format!(
+                        "endpoint {}: {:?}: {}",
+                        ordinal + 1,
+                        status.code(),
+                        status.message()
+                    ));
                 }
                 Err(status) => return Err(status.into()),
             }
@@ -477,7 +487,8 @@ async fn wait_for_every_endpoint(
         }
         if Instant::now() >= deadline {
             return Err(invalid(format!(
-                "realm-filtered query for {user} did not converge to {expected:?} on every endpoint"
+                "realm-filtered query for {user} did not converge to {expected:?} on every endpoint; last observations: {}",
+                observations.join("; ")
             )));
         }
         sleep(POLL_INTERVAL).await;

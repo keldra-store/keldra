@@ -797,6 +797,11 @@ impl IndexServiceRpc for IndexServiceImpl {
             operation = "query_index",
             query.outcome = outcome,
             grpc_status_code = status_code,
+            error.message = result
+                .as_ref()
+                .err()
+                .map(Status::message)
+                .unwrap_or_default(),
             monotonic_counter.keldra_index_query_requests_total = 1_u64,
             monotonic_counter.keldra_index_query_request_failures_total = u64::from(failed),
             monotonic_counter.keldra_index_query_deadlines_exceeded_total =
