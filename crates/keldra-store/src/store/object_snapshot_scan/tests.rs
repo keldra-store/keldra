@@ -285,6 +285,15 @@ async fn ordinary_definition_guard_blocks_only_its_exact_path() {
     });
     entered_receiver.await.unwrap();
 
+    let exclusive_store = store.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+        let _exclusive = exclusive_store
+            .lock_commit("ordinary_definition_guard_test")
+            .await;
+    })
+    .await
+    .expect("an exact-path orchestration guard must not retain the global mutation fence");
+
     let same_store = store.clone();
     let mut same_path = tokio::spawn(async move {
         put_at(&same_store, "definitions/one", b"v2", "one-v2", 3).await;

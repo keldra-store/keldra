@@ -46,7 +46,10 @@ async fn main() -> TestResult<()> {
     let client_secret = required("KELDRA_ACCOUNTING_QUALIFICATION_CLIENT_SECRET")?;
 
     let mut channels = Vec::with_capacity(endpoints.len());
-    eprintln!("[accounting-qualification] phase=connect endpoints={}", endpoints.len());
+    eprintln!(
+        "[accounting-qualification] phase=connect endpoints={}",
+        endpoints.len()
+    );
     for endpoint in &endpoints {
         channels.push(connect_channel(endpoint).await?);
     }

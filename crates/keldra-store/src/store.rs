@@ -1264,7 +1264,12 @@ impl Store {
     }
 
     /// Holds the ordinary Put/Delete/Publish conflict guard for one exact path.
-    /// Its released physical permit leaves unrelated group registration free.
+    ///
+    /// This orchestration guard deliberately does not retain the global
+    /// mutation fence. The guarded operation may publish another object on a
+    /// remote coordinator, whose replica mutations must remain admissible even
+    /// when an exclusive maintenance writer is queued locally. The conflict
+    /// scheduler still serializes this exact path with ordinary mutations.
     pub async fn with_ordinary_object_path_lock<T, F, Fut>(
         &self,
         key: &ObjectKey,
@@ -1276,8 +1281,10 @@ impl Store {
     {
         let identity = self.resolve_bucket_identity(key.tenant(), key.bucket())?;
         let resource = mutation_commit_lanes::object_path_conflict_resource(identity, key.path());
-        let mut guard = self.mutation_commit_lanes.acquire([resource]).await;
-        guard.release_physical_slot();
+        let _guard = self
+            .mutation_commit_lanes
+            .acquire_unfenced([resource])
+            .await;
         Ok(operation().await)
     }
 
