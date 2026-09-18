@@ -423,12 +423,6 @@ async fn activate_if_complete(
     directory: &ProjectionFamilyPartitionDirectory,
     projections: &V1ProjectionPublisher,
 ) -> Result<(), Status> {
-    let baseline = activation_baseline(barrier, directory)?;
-    let required_partitions = directory
-        .entries
-        .iter()
-        .map(|entry| entry.partition)
-        .collect::<Vec<_>>();
     let current = projections
         .load_activation(
             &recipe.storage_tenant,
@@ -446,6 +440,17 @@ async fn activate_if_complete(
         // a replacement activation assembled from a later barrier.
         return Ok(());
     }
+    // Only a generation which has never activated needs a baseline from the
+    // barrier pinned when that generation first appeared. A live directory
+    // can legitimately gain successor or newly joined source partitions after
+    // activation. Requiring those later entries in the historical baseline
+    // wedges this lifecycle and every family reconciled after it.
+    let baseline = activation_baseline(barrier, directory)?;
+    let required_partitions = directory
+        .entries
+        .iter()
+        .map(|entry| entry.partition)
+        .collect::<Vec<_>>();
     let required_atomic_position = barrier.atomic.finalized_through().unwrap_or(0);
     let mut coverage = Vec::with_capacity(directory.entries.len());
     for entry in &directory.entries {
@@ -522,7 +527,7 @@ async fn activate_if_complete(
             recipe.family.tenant_id,
             recipe.family.bucket_id,
             &activation,
-            current.map(|(_, version)| version),
+            None,
         )
         .await?;
     super::v1_telemetry::V1PipelineTelemetry::add(
