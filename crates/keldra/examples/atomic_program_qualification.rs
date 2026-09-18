@@ -669,20 +669,8 @@ async fn observe_pair(
     tenant: &str,
     bucket: &str,
 ) -> TestResult<PairObservation> {
-    let primary = objects
-        .head_object(HeadObjectRequest {
-            address: Some(address(tenant, bucket, TASK_PATH)),
-        })
-        .await?
-        .into_inner()
-        .state;
-    let secondary = objects
-        .head_object(HeadObjectRequest {
-            address: Some(address(tenant, bucket, SECONDARY_PATH)),
-        })
-        .await?
-        .into_inner()
-        .state;
+    let primary = observe_head(objects, tenant, bucket, TASK_PATH).await?;
+    let secondary = observe_head(objects, tenant, bucket, SECONDARY_PATH).await?;
     match (primary, secondary) {
         (Some(ObjectHeadState::NeverExisted(_)), Some(ObjectHeadState::NeverExisted(_))) => {
             Ok(PairObservation::BothAbsent)
@@ -695,10 +683,45 @@ async fn observe_pair(
                 (SECONDARY_PATH.into(), secondary.version),
             ])))
         }
+        (Some(ObjectHeadState::NeverExisted(_)), Some(ObjectHeadState::Present(secondary)))
+            if secondary.version != 0 =>
+        {
+            // These are two independent RPCs. The atomic visibility decision
+            // may linearize after the primary read and before the secondary
+            // read, so confirm the earlier path again after observing the
+            // committed cursor rather than reporting a false partial pair.
+            let primary = observe_head(objects, tenant, bucket, TASK_PATH).await?;
+            match primary {
+                Some(ObjectHeadState::Present(primary)) if primary.version != 0 => {
+                    Ok(PairObservation::BothPresent(BTreeMap::from([
+                        (TASK_PATH.into(), primary.version),
+                        (SECONDARY_PATH.into(), secondary.version),
+                    ])))
+                }
+                primary => Err(invalid(format!(
+                    "public endpoint exposed a partial atomic pair after a causally later re-read: primary={primary:?} secondary={secondary:?}"
+                ))),
+            }
+        }
         (primary, secondary) => Err(invalid(format!(
             "public endpoint exposed a partial atomic pair: primary={primary:?} secondary={secondary:?}"
         ))),
     }
+}
+
+async fn observe_head(
+    objects: &mut RawClient,
+    tenant: &str,
+    bucket: &str,
+    path: &str,
+) -> TestResult<Option<ObjectHeadState>> {
+    Ok(objects
+        .head_object(HeadObjectRequest {
+            address: Some(address(tenant, bucket, path)),
+        })
+        .await?
+        .into_inner()
+        .state)
 }
 
 async fn verify_committed_pair(
