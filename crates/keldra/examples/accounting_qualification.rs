@@ -46,13 +46,16 @@ async fn main() -> TestResult<()> {
     let client_secret = required("KELDRA_ACCOUNTING_QUALIFICATION_CLIENT_SECRET")?;
 
     let mut channels = Vec::with_capacity(endpoints.len());
+    eprintln!("[accounting-qualification] phase=connect endpoints={}", endpoints.len());
     for endpoint in &endpoints {
         channels.push(connect_channel(endpoint).await?);
     }
+    eprintln!("[accounting-qualification] phase=authenticate");
     let token = exchange_client_credentials(channels[0].clone(), client_id, client_secret)
         .await?
         .access_token;
     let mut administrator = administration_client(channels[0].clone(), &token)?;
+    eprintln!("[accounting-qualification] phase=create-bucket");
     administrator
         .create_bucket(CreateBucketRequest {
             bucket: bucket.clone(),
@@ -72,7 +75,9 @@ async fn main() -> TestResult<()> {
         .collect::<Result<Vec<_>, _>>()?;
     let node_count = objects.len();
 
+    eprintln!("[accounting-qualification] phase=enable-bucket");
     let bucket_definition = enable(&mut accounting[0], &bucket, "", "unversioned-bucket").await?;
+    eprintln!("[accounting-qualification] phase=enable-prefix");
     let prefix_definition = enable(
         &mut accounting[0],
         &bucket,
@@ -88,7 +93,9 @@ async fn main() -> TestResult<()> {
     // Do not race the worker's cold current-head baseline. A complete zero
     // rollup proves both definitions have established their journal boundary;
     // every following object transition must then be applied incrementally.
+    eprintln!("[accounting-qualification] phase=baseline-bucket");
     wait_for(&mut accounting, &bucket, "", 0, 0, 0, 0).await?;
+    eprintln!("[accounting-qualification] phase=baseline-prefix");
     wait_for(&mut accounting, &bucket, "billable", 0, 0, 0, 0).await?;
 
     let mut expected_bytes = 0_u64;
@@ -101,6 +108,7 @@ async fn main() -> TestResult<()> {
             bucket: bucket.clone(),
             path: format!("billable/node-{index}.bin"),
         };
+        eprintln!("[accounting-qualification] phase=put index={index}");
         put_chunks(
             &mut objects[index],
             PutHeader {
@@ -114,6 +122,7 @@ async fn main() -> TestResult<()> {
         )
         .await?;
         let reader = (index + 1) % objects.len();
+        eprintln!("[accounting-qualification] phase=read index={index} reader={reader}");
         let returned = read_all(&mut objects[reader], address.clone()).await?;
         if returned != bytes {
             return Err(invalid("GetObject returned different qualification bytes"));
