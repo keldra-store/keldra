@@ -1222,7 +1222,12 @@ impl IndexEventJournal {
         let Some(source) = placement.sources.iter().find(|source| {
             from.sources[&source.node].next_offset < target.sources[&source.node].next_offset
         }) else {
-            if from != target {
+            // The source vector can already be complete while a newly
+            // finalized atomic program advances only the atomic watermark.
+            // Callers promote that proof after the empty scan; treating the
+            // watermark difference as a missing source wedges every derived
+            // consumer before it can acknowledge the atomic cut.
+            if from.sources != target.sources {
                 return Err(IndexEventError::IncompleteSources);
             }
             return Ok(None);
@@ -1364,7 +1369,10 @@ impl IndexEventJournal {
         let Some(source) = placement.sources.iter().find(|source| {
             from.sources[&source.node].next_offset < target.sources[&source.node].next_offset
         }) else {
-            if from != target {
+            // See `next_raw_page`: an atomic-only boundary has no source page
+            // to read. The producer's atomic-cut acknowledgement publishes
+            // the newer watermark after this empty interval is proven.
+            if from.sources != target.sources {
                 return Err(IndexEventError::IncompleteSources);
             }
             return Ok(None);

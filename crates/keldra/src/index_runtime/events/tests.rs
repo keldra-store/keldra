@@ -1229,6 +1229,73 @@ async fn unrelated_bucket_activity_advances_only_the_atomic_proof() {
 }
 
 #[tokio::test]
+async fn atomic_only_boundary_is_a_complete_routed_interval() {
+    let published = AtomicProgramWatermark::new(Some(40), Some(40), 0);
+    let captured = AtomicProgramWatermark::new(Some(42), Some(42), 0);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 0), Vec::new()));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let events = journal(vec![placement(captured)], &sources);
+    let from = barrier(published, 1, 1);
+    let target = barrier(captured, 1, 1);
+
+    assert!(
+        events
+            .next_page(1, 2, &from, &target, MAX_INDEX_EVENT_PAGE_BYTES)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        events
+            .capture_index_bucket_barrier(1, 2, Some(&from))
+            .await
+            .unwrap(),
+        target
+    );
+    assert!(sources.reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn atomic_only_boundary_is_a_complete_raw_interval() {
+    let published = AtomicProgramWatermark::new(Some(40), Some(40), 0);
+    let captured = AtomicProgramWatermark::new(Some(42), Some(42), 0);
+    let sources = MemorySources::default();
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(1), (status(1, 0), Vec::new()));
+    sources
+        .journals
+        .lock()
+        .unwrap()
+        .insert(NodeId(2), (status(2, 0), Vec::new()));
+    let events = journal(vec![placement(captured)], &sources);
+
+    assert!(
+        events
+            .next_raw_page(
+                &barrier(published, 1, 1),
+                &barrier(captured, 1, 1),
+                MAX_INDEX_EVENT_PAGE_BYTES,
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(sources.raw_reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn later_in_progress_program_does_not_invalidate_a_bounded_page() {
     let captured = AtomicProgramWatermark::new(Some(40), Some(40), 0);
     let later_pending = AtomicProgramWatermark::new(Some(41), Some(40), 1);
