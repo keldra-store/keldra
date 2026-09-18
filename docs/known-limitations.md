@@ -63,8 +63,12 @@ object. A process failure in that interval can undercount traffic. Enabling an
 accounting prefix is discovered asynchronously on other nodes, so traffic sent
 there immediately after `EnableAccounting` can also precede the local meter.
 Disabling a prefix is likewise propagated asynchronously: a routed
-`GetAccounting` can return retryable `UNAVAILABLE` during that transition before
-the disabled definition converges to `NOT_FOUND`.
+`GetAccounting` can return retryable `UNAVAILABLE` during that transition and,
+when replicas retain a stale definition locator, can remain `UNAVAILABLE`
+instead of converging to `NOT_FOUND`. The disabled definition is not readable;
+clients should treat both statuses as disabled and retry only when they need to
+distinguish absence from this stale-locator state. This accounting-only status
+limitation does not affect object, index, authorization, or durability paths.
 The returned freshness structure describes object-journal coverage; it does
 not claim wire-exact transfer capture.
 

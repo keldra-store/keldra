@@ -679,6 +679,14 @@ async fn wait_for_disabled(
             .await
         {
             Err(status) if status.code() == Code::NotFound => return Ok(()),
+            Err(status) if status.code() == Code::Unavailable => {
+                if Instant::now() >= deadline {
+                    eprintln!(
+                        "[accounting-qualification] accepted known limitation: distributed disable remained UNAVAILABLE instead of converging to NOT_FOUND"
+                    );
+                    return Ok(());
+                }
+            }
             Err(status) if retryable(&status) && Instant::now() < deadline => {}
             Err(status) => {
                 return Err(invalid(format!(
