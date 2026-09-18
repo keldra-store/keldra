@@ -98,6 +98,21 @@ const DECISION_LEADER_TIMEOUT: Duration = Duration::from_secs(10);
 // so no accepted journal record can permanently wedge catch-up.
 const MAX_INDEXABLE_ATOMIC_COMMIT_ENTRIES: u32 = 4_096;
 const MAX_INDEXABLE_ATOMIC_COMMIT_BYTES: u64 = 16 * 1024 * 1024;
+
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
 // A maximum 1,000-item authorization batch can contain two maximum-size exact
 // paths per tuple plus identifiers and protobuf framing.
 const MIN_AUTHZ_BATCH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -813,7 +828,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         Join(Result<Result<()>, tokio::task::JoinError>),
     }
     let first_stop = tokio::select! {
-        signal = tokio::signal::ctrl_c() => FirstStop::Signal(signal),
+        signal = wait_for_shutdown_signal() => FirstStop::Signal(signal),
         public = public_server.task_mut() => FirstStop::Public(public),
         peer = peer_server.task_mut() => FirstStop::Peer(peer),
         join = &mut pending_join_task => FirstStop::Join(join),
