@@ -322,19 +322,7 @@ async fn main() -> TestResult<()> {
         "unversioned-bucket",
     )
     .await?;
-    let error = accounting[0]
-        .get_accounting(GetAccountingRequest {
-            bucket: bucket.clone(),
-            path_prefix: "billable".into(),
-        })
-        .await
-        .unwrap_err();
-    if error.code() != Code::NotFound {
-        return Err(invalid(format!(
-            "disabled accounting returned {:?}, expected NOT_FOUND",
-            error.code()
-        )));
-    }
+    wait_for_disabled(&mut accounting[0], &bucket, "billable").await?;
 
     let versioned_bucket = format!("{bucket}-versioned");
     administrator
@@ -671,6 +659,39 @@ async fn wait_for(
         }
         if Instant::now() >= deadline {
             return Err(invalid(format!("accounting did not converge: {last}")));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_disabled(
+    client: &mut AccountingClient,
+    bucket: &str,
+    prefix: &str,
+) -> TestResult<()> {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        match client
+            .get_accounting(GetAccountingRequest {
+                bucket: bucket.into(),
+                path_prefix: prefix.into(),
+            })
+            .await
+        {
+            Err(status) if status.code() == Code::NotFound => return Ok(()),
+            Err(status) if retryable(&status) && Instant::now() < deadline => {}
+            Err(status) => {
+                return Err(invalid(format!(
+                    "disabled accounting returned {:?}, expected eventual NOT_FOUND",
+                    status.code()
+                )));
+            }
+            Ok(_) if Instant::now() < deadline => {}
+            Ok(_) => {
+                return Err(invalid(
+                    "disabled accounting remained readable instead of becoming NOT_FOUND",
+                ));
+            }
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }

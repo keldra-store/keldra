@@ -62,6 +62,9 @@ Each node buffers transfer deltas briefly before writing its cumulative source
 object. A process failure in that interval can undercount traffic. Enabling an
 accounting prefix is discovered asynchronously on other nodes, so traffic sent
 there immediately after `EnableAccounting` can also precede the local meter.
+Disabling a prefix is likewise propagated asynchronously: a routed
+`GetAccounting` can return retryable `UNAVAILABLE` during that transition before
+the disabled definition converges to `NOT_FOUND`.
 The returned freshness structure describes object-journal coverage; it does
 not claim wire-exact transfer capture.
 
