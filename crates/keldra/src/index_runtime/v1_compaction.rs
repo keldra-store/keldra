@@ -386,19 +386,12 @@ impl V1ProjectionPublisher {
                     )
                 })
                 .ok_or_else(|| Status::resource_exhausted("merge metadata size overflow"))?;
-            // Raw encoded outputs have been consumed. Retain their original
-            // accounted owner only for the proposal/pack metadata now alive.
-            let mut remaining = metadata_bytes;
-            for owner in &mut raw_owners {
-                let charge = remaining.min(owner.bytes());
-                owner.shrink_to(charge).map_err(index_status)?;
-                remaining -= charge;
-            }
-            if remaining != 0 {
-                return Err(Status::data_loss(
-                    "merge metadata exceeded construction admission",
-                ));
-            }
+            // Raw encoded outputs have been consumed. Their construction
+            // permits become the owners of the proposal/pack metadata. Small
+            // merges can retain more fixed metadata than encoded output, so
+            // explicitly admit that difference instead of treating it as
+            // corruption.
+            retain_component_metadata_admission(&mut raw_owners, metadata_bytes)?;
             Some(V1ComponentCompaction {
                 packs,
                 pages,
@@ -514,6 +507,38 @@ impl V1ProjectionPublisher {
             artifacts: V1CompactionArtifacts { component, query },
         })
     }
+}
+
+fn retain_component_metadata_admission(
+    owners: &mut [IndexingMemoryPermit],
+    metadata_bytes: usize,
+) -> Result<(), Status> {
+    let admitted = owners
+        .iter()
+        .try_fold(0usize, |total, owner| total.checked_add(owner.bytes()));
+    let admitted = admitted
+        .ok_or_else(|| Status::resource_exhausted("merge metadata admission size overflow"))?;
+    if metadata_bytes > admitted {
+        let additional = metadata_bytes - admitted;
+        let owner = owners
+            .last_mut()
+            .ok_or_else(|| Status::internal("merge metadata has no construction owner"))?;
+        let target = owner
+            .bytes()
+            .checked_add(additional)
+            .ok_or_else(|| Status::resource_exhausted("merge metadata admission size overflow"))?;
+        owner
+            .grow_to(target)
+            .map_err(|error| index_status(admission_error(error)))?;
+    }
+    let mut remaining = metadata_bytes;
+    for owner in owners {
+        let charge = remaining.min(owner.bytes());
+        owner.shrink_to(charge).map_err(index_status)?;
+        remaining -= charge;
+    }
+    debug_assert_eq!(remaining, 0);
+    Ok(())
 }
 
 fn compact_component_stream_accounted(
@@ -885,9 +910,10 @@ pub(super) fn index_status(error: keldra_index::IndexError) -> Status {
 mod tests {
     use super::*;
     use keldra_index::v1::{
-        ArtifactPackTable, PreparedQueryMutationBatch, ProjectionCurrent,
-        ProjectionPartitionIdentity, ProjectionQueryStreamRoot, QueryMemoryPermit,
-        QueryRunReference, append_query_run_path_copy, prepare_projection_query_run,
+        ArtifactPackTable, IndexingMemoryCredits, IndexingMemoryLimits, IndexingMemoryStage,
+        PreparedQueryMutationBatch, ProjectionCurrent, ProjectionPartitionIdentity,
+        ProjectionQueryStreamRoot, QueryMemoryPermit, QueryRunReference,
+        append_query_run_path_copy, prepare_projection_query_run,
     };
 
     struct Permit(usize);
@@ -909,6 +935,60 @@ mod tests {
         assert_eq!(component_output_run_limit(MAX_ARTIFACT_BYTES), cap);
         assert_eq!(component_output_run_limit(4 * 1024 * 1024), 4 * 1024 * 1024);
         assert_eq!(component_output_run_limit(1), 1024);
+    }
+
+    fn indexing_credits(bytes: usize) -> IndexingMemoryCredits {
+        IndexingMemoryCredits::new(
+            bytes,
+            IndexingMemoryLimits {
+                hot_payload_bytes: bytes,
+                worker_scratch_bytes: bytes,
+                prepared_rows_bytes: bytes,
+                replay_input_bytes: bytes,
+                projection_accumulator_bytes: bytes,
+                seal_scratch_bytes: bytes,
+                ordering_catalog_bytes: bytes,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn small_component_merge_admits_fixed_metadata_beyond_raw_output() {
+        let credits = indexing_credits(1024);
+        let mut owners = vec![
+            credits
+                .acquire(IndexingMemoryStage::WorkerScratch, 8)
+                .unwrap(),
+        ];
+
+        retain_component_metadata_admission(&mut owners, 256).unwrap();
+
+        assert_eq!(
+            owners
+                .iter()
+                .map(IndexingMemoryPermit::bytes)
+                .sum::<usize>(),
+            256
+        );
+        assert_eq!(credits.used_bytes(), 256);
+        drop(owners);
+        assert_eq!(credits.used_bytes(), 0);
+    }
+
+    #[test]
+    fn component_metadata_pressure_is_retryable_not_corruption() {
+        let credits = indexing_credits(64);
+        let mut owners = vec![
+            credits
+                .acquire(IndexingMemoryStage::WorkerScratch, 8)
+                .unwrap(),
+        ];
+
+        let error = retain_component_metadata_admission(&mut owners, 65).unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(owners[0].bytes(), 8);
     }
 
     #[test]
