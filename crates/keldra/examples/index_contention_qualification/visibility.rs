@@ -3,6 +3,7 @@ use super::{
     bounded_error, data, index_client, marker_query, metrics::Latencies, progress::Counters,
 };
 use anyhow::{Context, Result, anyhow};
+use keldra_storage::v1::IndexVisibilityToken;
 use std::{sync::Arc, time::Duration};
 use tokio::{
     sync::Mutex,
@@ -155,6 +156,7 @@ pub(super) async fn wait_canary(
     bucket: &str,
     index_name: &str,
     canary: Canary,
+    visibility_token: Option<IndexVisibilityToken>,
     poll: Duration,
     request_timeout: Duration,
     observation_timeout: Duration,
@@ -219,7 +221,13 @@ pub(super) async fn wait_canary(
         let rpc_timeout = remaining.min(request_timeout);
         let response = tokio::time::timeout(
             rpc_timeout,
-            marker_query(&mut client, bucket, index_name, canary.id),
+            marker_query(
+                &mut client,
+                bucket,
+                index_name,
+                canary.id,
+                visibility_token.clone(),
+            ),
         )
         .await;
         drop(permit);

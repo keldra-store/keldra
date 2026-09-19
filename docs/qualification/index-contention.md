@@ -199,6 +199,24 @@ Catalog cardinality D250K is qualified separately with
 `scripts/qualify-index-catalog.sh`; the contention matrix does not conflate
 catalog admission/restart cost with sustained projection pipeline activity.
 
+### Selective real-time cost matrix
+
+`scripts/benchmark-selective-realtime.sh` retains the existing STANDARD-only
+contention cell as its baseline, then runs the same fresh-state cell with 30%,
+40%, 50%, 60%, 70%, 80%, 90%, and 100% of `BulkWrite` requests selecting
+`REALTIME`. Selection is deterministic in each repeating group of 100 requests;
+every operation in a selected request uses the same intent. Initial corpus
+writes remain STANDARD and outside the measurement window.
+
+The suite never stops merely because a case fails qualification. It records all
+eight exit states and all available throughput, indexing, latency, correctness,
+CPU, memory, and disk evidence in
+`~/keldra_experiments/results/selective-realtime/<suite-id>/report.json`.
+Its default real-time matrix begins at 30% and advances in ten-point steps to
+100%; fixed-cell resource and duration settings have `KELDRA_V1_REALTIME_SUITE_*`
+overrides. Individual cases continue to use the unchanged SSD runner and its
+fresh-volume, exact-window, authority-verification, and telemetry gates.
+
 ## Historical Docker comparison evidence (continued)
 
 Run the sustained matrix through the same split topology:

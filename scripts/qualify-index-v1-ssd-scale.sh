@@ -28,6 +28,7 @@ query_memory_bytes="${KELDRA_V1_SCALE_QUERY_MEMORY_BYTES:-536870912}"
 # axis. Coupling these made low-core cells client-concurrency tests and could
 # not show whether additional server CPU or memory increased throughput.
 mutation_workers="${KELDRA_V1_SCALE_MUTATION_WORKERS:-64}"
+realtime_request_percent="${KELDRA_V1_SCALE_REALTIME_REQUEST_PERCENT:-0}"
 mutable_records="${KELDRA_V1_SCALE_MUTABLE_RECORDS:-256}"
 preseeded_mutable_records="${KELDRA_V1_SCALE_PRESEEDED_MUTABLE_RECORDS:-256}"
 source_journal_entries="${KELDRA_V1_SCALE_SOURCE_JOURNAL_MAX_ENTRIES:-10000000}"
@@ -96,6 +97,10 @@ case "${experiment_root}" in
 esac
 case "${keep_work}" in 0|1) ;; *) echo "KELDRA_V1_SCALE_KEEP_WORK must be 0 or 1" >&2; exit 2 ;; esac
 case "${profile}" in 0|1) ;; *) echo "KELDRA_V1_SCALE_PROFILE must be 0 or 1" >&2; exit 2 ;; esac
+[[ "${realtime_request_percent}" =~ ^([0-9]|[1-9][0-9]|100)$ ]] || {
+  echo "KELDRA_V1_SCALE_REALTIME_REQUEST_PERCENT must be in 0..=100" >&2
+  exit 2
+}
 if [[ "${profile}" == 1 ]]; then
   [[ -n "${profile_cell}" ]] || {
     echo "KELDRA_V1_SCALE_PROFILE_CELL must name one exact cell when profiling is enabled" >&2
@@ -905,6 +910,7 @@ for definitions in "${definitions_values[@]}"; do
             "KELDRA_INDEX_CONTENTION_MUTATION_WORKERS=${mutation_workers}"
             "KELDRA_INDEX_CONTENTION_MUTATION_BATCH_SIZE=32"
             "KELDRA_INDEX_CONTENTION_MUTATION_QUEUE_DEPTH=$((mutation_workers * 8))"
+            "KELDRA_INDEX_CONTENTION_REALTIME_REQUEST_PERCENT=${realtime_request_percent}"
             "KELDRA_INDEX_CONTENTION_QUERY_RATE=${query_rate}"
             "KELDRA_INDEX_CONTENTION_VISIBILITY_QUERY_RATE=${visibility_query_rate}"
             "KELDRA_INDEX_CONTENTION_QUERY_MAX_IN_FLIGHT=${query_max_in_flight}"

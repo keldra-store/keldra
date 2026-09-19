@@ -112,6 +112,7 @@ pub struct Config {
     pub mutation_batch_size: usize,
     pub mutation_record_bytes: usize,
     pub mutation_queue_depth: usize,
+    pub realtime_request_percent: u8,
     pub target_data_operations_per_second: Option<f64>,
     pub mixed_workload: Option<MixedWorkload>,
     pub query_rate: u64,
@@ -151,6 +152,7 @@ pub struct PublicConfig {
     pub mutation_batch_size: usize,
     pub mutation_record_bytes: usize,
     pub mutation_queue_depth: usize,
+    pub realtime_request_percent: u8,
     pub target_data_operations_per_second: Option<f64>,
     pub mixed_workload: Option<MixedWorkload>,
     pub query_rate_per_second: u64,
@@ -185,6 +187,7 @@ impl Config {
         let mutation_batch_size = number("MUTATION_BATCH_SIZE", 32)?;
         let mutation_record_bytes = number("MUTATION_RECORD_BYTES", 0)?;
         let mutation_queue_depth = number("MUTATION_QUEUE_DEPTH", 32)?;
+        let realtime_request_percent = number("REALTIME_REQUEST_PERCENT", 0_u8)?;
         let target_data_operations_per_second =
             optional_positive("TARGET_DATA_OPERATIONS_PER_SECOND")?;
         let mixed_workload = MixedWorkload::from_env()?;
@@ -203,6 +206,10 @@ impl Config {
             "preseeded mutable records must not exceed mutable records"
         );
         ensure!(mutation_workers > 0 && mutation_batch_size > 0);
+        ensure!(
+            realtime_request_percent <= 100,
+            "REALTIME_REQUEST_PERCENT must be in 0..=100"
+        );
         ensure!(
             mutation_record_bytes <= 64 * 1024 * 1024,
             "mutation record bytes must not exceed 64 MiB"
@@ -278,6 +285,7 @@ impl Config {
             mutation_batch_size,
             mutation_record_bytes,
             mutation_queue_depth,
+            realtime_request_percent,
             target_data_operations_per_second,
             mixed_workload,
             query_rate,
@@ -324,6 +332,7 @@ impl Config {
             mutation_batch_size: self.mutation_batch_size,
             mutation_record_bytes: self.mutation_record_bytes,
             mutation_queue_depth: self.mutation_queue_depth,
+            realtime_request_percent: self.realtime_request_percent,
             target_data_operations_per_second: self.target_data_operations_per_second,
             mixed_workload: self.mixed_workload,
             query_rate_per_second: self.query_rate,

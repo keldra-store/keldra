@@ -452,6 +452,7 @@ async fn paginated_class_query(
                 value.clone(),
                 FINAL_VERIFICATION_PAGE_SIZE,
                 page_token,
+                Vec::new(),
             ),
         )
         .await;

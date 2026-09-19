@@ -14,6 +14,9 @@ mod data;
 mod metrics;
 #[path = "index_contention_qualification/progress.rs"]
 mod progress;
+#[cfg(test)]
+#[path = "index_contention_qualification/realtime_mix_tests.rs"]
+mod realtime_mix_tests;
 #[path = "index_contention_qualification/recipes.rs"]
 mod recipes;
 #[path = "index_contention_qualification/terminal.rs"]
@@ -35,8 +38,9 @@ use keldra_storage::v1::index_query::Query as QueryValue;
 use keldra_storage::v1::index_service_client::IndexServiceClient;
 use keldra_storage::v1::{
     BulkOperation, BulkPutRequest, BulkWriteRequest, CreateBucketRequest, CreateIndexRequest,
-    IndexPredicate, IndexPredicateExpression, IndexPredicateOperator, IndexQuery, ObjectAddress,
-    ObjectVersioning, QueryIndexRequest, QueryIndexResponse, TypedJsonIndexQuery,
+    IndexPredicate, IndexPredicateExpression, IndexPredicateOperator, IndexQuery,
+    IndexVisibilityToken, IndexingIntent, ObjectAddress, ObjectVersioning, QueryIndexRequest,
+    QueryIndexResponse, TypedJsonIndexQuery,
 };
 use keldra_storage::{
     BearerToken, KeywordField, RawClient, TypedJsonIndexBuilder, administration_client,
@@ -141,7 +145,11 @@ struct MutationReport {
     client_queue_enqueued_data_operations: u64,
     fully_successful_batches: u64,
     structurally_valid_batches_with_operation_failures: u64,
+    structurally_valid_realtime_batches: u64,
+    structurally_valid_standard_batches: u64,
     successful_data_operations: u64,
+    successful_realtime_data_operations: u64,
+    successful_standard_data_operations: u64,
     successful_data_operations_in_window: u64,
     successful_data_operations_after_window: u64,
     successful_probe_operations: u64,
@@ -282,6 +290,7 @@ struct MutationJob {
 }
 
 struct MutationResult {
+    realtime_request: bool,
     successful_data_operations: u64,
     successful_probe_operations: u64,
     failed_data_operations: u64,
@@ -293,6 +302,7 @@ struct MutationResult {
     elapsed: Duration,
     completed_at: Instant,
     canary: Option<Canary>,
+    canary_visibility_token: Option<IndexVisibilityToken>,
 }
 
 #[derive(Default)]
@@ -1210,6 +1220,19 @@ async fn run_mutations(
                 record_mutation_failure(&mut report, failure);
             }
             Ok(result) => {
+                if result.realtime_request {
+                    report.structurally_valid_realtime_batches =
+                        report.structurally_valid_realtime_batches.saturating_add(1);
+                    report.successful_realtime_data_operations = report
+                        .successful_realtime_data_operations
+                        .saturating_add(result.successful_data_operations);
+                } else {
+                    report.structurally_valid_standard_batches =
+                        report.structurally_valid_standard_batches.saturating_add(1);
+                    report.successful_standard_data_operations = report
+                        .successful_standard_data_operations
+                        .saturating_add(result.successful_data_operations);
+                }
                 for id in &result.successful_data_ids {
                     let position = usize::try_from(*id)
                         .context("successful mutable record id does not fit in memory")?;
@@ -1288,6 +1311,7 @@ async fn run_mutations(
                         let permits = visibility_permits.clone();
                         let pacer = visibility_pacer.clone();
                         let probe_counters = counters.clone();
+                        let visibility_token = result.canary_visibility_token.clone();
                         visibility_tasks.spawn(async move {
                             let probe_started = Instant::now();
                             let successful_receipt_to_probe_start =
@@ -1299,6 +1323,7 @@ async fn run_mutations(
                                 &bucket,
                                 &name,
                                 canary,
+                                visibility_token,
                                 poll,
                                 request_timeout,
                                 observation_timeout,
@@ -1371,7 +1396,7 @@ async fn run_mutations(
         .filter(|expected| **expected)
         .count() as u64;
     report.failure_diagnostics_definition = "fully_successful_batches, structurally_valid_batches_with_operation_failures, and indeterminate_batches are disjoint terminal outcomes; indeterminate_batches had no structurally valid per-operation response, so their operation outcomes are indeterminate rather than falsely classified as failed; successful and failed operations come from structurally valid responses; successful sibling outcomes in a partial response remain counted; failure_classes retains bounded diagnostics; at most eight distinct classes are retained and failure_occurrences_omitted counts occurrences from additional classes";
-    report.visibility_definition = "successful_receipt_to_probe_start_delay measures local observer queueing; probe_start_to_query_visibility_latency measures globally rate-bounded active polling to the first ordinary-query hit with the exact object_version; successful_receipt_to_query_visibility_latency is their end-to-end sum from successful receipt; sampled probes use non-overwritten object paths, every predetermined successful probe receipt is retained, probes rotate across definitions, observer concurrency and aggregate query start rate are bounded, and polling-resolution delay is included";
+    report.visibility_definition = "successful_receipt_to_probe_start_delay measures local observer queueing; probe_start_to_query_visibility_latency measures globally rate-bounded observation to the first query hit with the exact object_version; REALTIME samples supply their receipt visibility token and STANDARD samples retain ordinary polling; successful_receipt_to_query_visibility_latency is their end-to-end sum from successful receipt; sampled probes use non-overwritten object paths, every predetermined successful probe receipt is retained, probes rotate across definitions, observer concurrency and aggregate query start rate are bounded, and STANDARD polling-resolution delay is included";
     Ok(MutationResponses {
         report,
         visibility_tasks,
@@ -1540,6 +1565,12 @@ async fn execute_mutation(
     job: MutationJob,
 ) -> std::result::Result<MutationResult, MutationRequestFailure> {
     let started = Instant::now();
+    let realtime_request = realtime_request(config.realtime_request_percent, job.sequence);
+    let indexing_intent = if realtime_request {
+        IndexingIntent::Realtime
+    } else {
+        IndexingIntent::Standard
+    };
     let mut operations = Vec::with_capacity(config.mutation_batch_size + 1);
     let mut operation_payload_bytes = Vec::with_capacity(config.mutation_batch_size + 1);
     for offset in 0..config.mutation_batch_size {
@@ -1569,11 +1600,12 @@ async fn execute_mutation(
             ),
         };
         operation_payload_bytes.push(payload.len() as u64);
-        operations.push(put(
+        operations.push(put_with_intent(
             config,
             data::mutable_path(id),
             payload,
             format!("contention-mutation-{}-{offset}", job.sequence),
+            indexing_intent,
         ));
     }
     let sample_eligible = job.sequence % config.visibility_sample_every_batches == 0;
@@ -1598,11 +1630,12 @@ async fn execute_mutation(
     };
     let probe_bytes = marker_payload.len() as u64;
     operation_payload_bytes.push(probe_bytes);
-    operations.push(put(
+    operations.push(put_with_intent(
         config,
         data::marker_path(marker_ordinal),
         marker_payload,
         format!("contention-marker-{}", job.sequence),
+        indexing_intent,
     ));
     let response = match client.bulk_write(BulkWriteRequest { operations }).await {
         Ok(response) => response.into_inner(),
@@ -1626,6 +1659,7 @@ async fn execute_mutation(
         ));
     }
     let mut marker_version = None;
+    let mut marker_visibility_token = None;
     let mut failures = Vec::new();
     let mut seen = vec![false; operation_payload_bytes.len()];
     let mut successful_data_operations = 0_u64;
@@ -1674,8 +1708,18 @@ async fn execute_mutation(
                         ),
                     ));
                 }
+                if realtime_request != receipt.index_visibility.is_some() {
+                    return Err(driver_mutation_failure(
+                        "invalid-visibility-receipt",
+                        format!(
+                            "BulkWrite outcome {index} realtime={realtime_request} visibility_token_present={}",
+                            receipt.index_visibility.is_some()
+                        ),
+                    ));
+                }
                 if index == config.mutation_batch_size {
                     marker_version = Some(receipt.version);
+                    marker_visibility_token = receipt.index_visibility;
                     successful_probe_operations += 1;
                     successful_probe_payload_bytes = successful_probe_payload_bytes
                         .saturating_add(operation_payload_bytes[index]);
@@ -1715,6 +1759,7 @@ async fn execute_mutation(
     }
     let completed_at = Instant::now();
     Ok(MutationResult {
+        realtime_request,
         successful_data_operations,
         successful_probe_operations,
         failed_data_operations,
@@ -1731,6 +1776,7 @@ async fn execute_mutation(
             completed_at,
             sample_eligible,
         }),
+        canary_visibility_token: marker_visibility_token,
     })
 }
 
@@ -1830,6 +1876,16 @@ fn record_query_request_failure(report: &mut QueryPhaseReport, error: &anyhow::E
 }
 
 fn put(config: &Config, path: String, bytes: Vec<u8>, command_id: String) -> BulkOperation {
+    put_with_intent(config, path, bytes, command_id, IndexingIntent::Standard)
+}
+
+fn put_with_intent(
+    config: &Config,
+    path: String,
+    bytes: Vec<u8>,
+    command_id: String,
+    indexing_intent: IndexingIntent,
+) -> BulkOperation {
     BulkOperation {
         operation: Some(BulkOperationValue::Put(BulkPutRequest {
             address: Some(ObjectAddress {
@@ -1841,9 +1897,13 @@ fn put(config: &Config, path: String, bytes: Vec<u8>, command_id: String) -> Bul
             content_type: CONTENT_TYPE.into(),
             command_id,
             durability: configured_durability(config) as i32,
-            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
+            indexing_intent: indexing_intent as i32,
         })),
     }
+}
+
+fn realtime_request(percent: u8, sequence: u64) -> bool {
+    sequence % 100 < u64::from(percent)
 }
 
 async fn stable_query(
@@ -1877,15 +1937,18 @@ async fn marker_query(
     bucket: &str,
     index_name: &str,
     sequence: u64,
+    visibility_token: Option<IndexVisibilityToken>,
 ) -> Result<QueryIndexResponse> {
     let marker_id = data::marker_id(sequence);
-    query(
+    query_page(
         client,
         bucket,
         index_name,
         "probe",
         serde_json::to_vec(&data::marker_probe(marker_id))?,
         1,
+        Vec::new(),
+        visibility_token.into_iter().collect(),
     )
     .await
 }
@@ -1898,7 +1961,17 @@ async fn query(
     value: Vec<u8>,
     limit: u32,
 ) -> Result<QueryIndexResponse> {
-    query_page(client, bucket, index_name, field, value, limit, Vec::new()).await
+    query_page(
+        client,
+        bucket,
+        index_name,
+        field,
+        value,
+        limit,
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1910,6 +1983,7 @@ async fn query_page(
     value: Vec<u8>,
     limit: u32,
     page_token: Vec<u8>,
+    required_visibility_tokens: Vec<IndexVisibilityToken>,
 ) -> Result<QueryIndexResponse> {
     client
         .query_index(QueryIndexRequest {
@@ -1932,7 +2006,7 @@ async fn query_page(
             tenant: String::new(),
             required_freshness: None,
             authorization_subject: None,
-            required_visibility_tokens: Vec::new(),
+            required_visibility_tokens,
         })
         .await
         .map(tonic::Response::into_inner)
