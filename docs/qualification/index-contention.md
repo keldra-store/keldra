@@ -209,7 +209,7 @@ every operation in a selected request uses the same intent. Initial corpus
 writes remain STANDARD and outside the measurement window.
 
 The suite never stops merely because a case fails qualification. It records all
-eight exit states and all available throughput, indexing, latency, correctness,
+nine exit states and all available throughput, indexing, latency, correctness,
 CPU, memory, and disk evidence in
 `~/keldra_experiments/results/selective-realtime/<suite-id>/report.json`.
 Its default real-time matrix begins at 30% and advances in ten-point steps to

@@ -101,6 +101,6 @@ done
 
 jq -s --arg suite_id "${suite_id}" '
   {schema:"keldra.selective-realtime-benchmark.v1",suite_id:$suite_id,
-   expected_runs:8,completed_runs:length,all_runs_recorded:(length == 8),runs:.}
+   expected_runs:9,completed_runs:length,all_runs_recorded:(length == 9),runs:.}
 ' "${rows}" >"${suite_root}/report.json"
 echo "suite_results=${suite_root}"
