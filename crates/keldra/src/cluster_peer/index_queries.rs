@@ -33,8 +33,9 @@ use crate::index_runtime::placement::{IndexIdentity, IndexPlacement};
 use crate::index_service::{
     AuthorizedSnapshotCandidates, ExecutedIndexQuery, IndexAuthorization, IndexCandidateVisibility,
     IndexFreshnessRequirement, IndexPageCursor, IndexQueryAuthorizationEvidence,
-    IndexRealmAuthorizationEvidence, IndexResultAuthorizationPolicy, RequiredIndexSourceCheckpoint,
-    StoredIndexDefinition, definition_path, result_authorization_policy,
+    IndexRealmAuthorizationEvidence, IndexResultAuthorizationPolicy, IndexVisibilityRequirement,
+    RequiredIndexSourceCheckpoint, StoredIndexDefinition, definition_path,
+    result_authorization_policy,
 };
 use crate::logical_name_resolution::LogicalNameResolver;
 use crate::object_service::ObjectServiceImpl;
@@ -42,6 +43,7 @@ use crate::object_service::ObjectServiceImpl;
 const MAX_QUERY_HITS: usize = 1_000;
 const MAX_QUERY_COMPUTATIONS: usize = 32;
 const MAX_FACET_BUCKETS: usize = 1_000;
+const MAX_VISIBILITY_REQUIREMENTS: usize = 1_000;
 /// The peer context represents remaining time as milliseconds in a `u32`.
 /// Public ingress already clamps this to the configured QueryIndex maximum;
 /// this is only the lossless ceiling of the existing one-hop wire field.
@@ -57,6 +59,7 @@ pub(crate) struct RoutedIndexQueryRequest {
     pub(crate) limit: usize,
     pub(crate) resume: Option<IndexPageCursor>,
     pub(crate) required_freshness: Option<IndexFreshnessRequirement>,
+    pub(crate) required_visibility: Vec<IndexVisibilityRequirement>,
     pub(crate) authorization_subject: Option<ObjectRef>,
     pub(crate) system_authorization_revision: u64,
     pub(crate) result_authorization_revision: Option<u64>,
@@ -83,6 +86,7 @@ pub(crate) struct LocalIndexQueryRequest {
     /// freshness even when the query finds no candidates.
     pub(crate) authorization_revision: u64,
     pub(crate) required_freshness: Option<IndexFreshnessRequirement>,
+    pub(crate) required_visibility: Vec<IndexVisibilityRequirement>,
     pub(crate) deadline: tokio::time::Instant,
 }
 
@@ -362,6 +366,7 @@ impl RoutedIndexQueryHandler for AuthorizedIndexQueryHandler {
                 candidate_visibility,
                 authorization_revision,
                 required_freshness: request.required_freshness,
+                required_visibility: request.required_visibility,
                 deadline: call.deadline,
             })
             .await?;
@@ -496,6 +501,11 @@ fn request_to_wire(
             result_authorization_revision: resume_result_authorization_revision,
         }),
         required_freshness: request.required_freshness.map(freshness_to_wire),
+        required_visibility: request
+            .required_visibility
+            .into_iter()
+            .map(visibility_to_wire)
+            .collect(),
         authorization_subject: request
             .authorization_subject
             .as_ref()
@@ -545,6 +555,11 @@ fn request_from_wire(
             .as_ref()
             .map(freshness_from_wire)
             .transpose()?,
+        required_visibility: request
+            .required_visibility
+            .iter()
+            .map(visibility_from_wire)
+            .collect::<Result<Vec<_>, _>>()?,
         authorization_subject: request
             .authorization_subject
             .clone()
@@ -654,6 +669,49 @@ fn validate_request(request: &RoutedIndexQueryRequest) -> Result<(), Status> {
             "routed required freshness cannot be combined with a continuation",
         ));
     }
+    if request.resume.is_some() && !request.required_visibility.is_empty() {
+        return Err(Status::invalid_argument(
+            "routed required visibility cannot be combined with a continuation",
+        ));
+    }
+    if request.required_visibility.len() > MAX_VISIBILITY_REQUIREMENTS {
+        return Err(Status::invalid_argument(
+            "routed index query has too many visibility requirements",
+        ));
+    }
+    for requirement in &request.required_visibility {
+        if requirement.tenant_id != request.tenant_id
+            || requirement.bucket_id != request.bucket_id
+            || requirement.source_node_id == 0
+            || requirement.source_epoch == [0; 32]
+            || requirement.source_journal_position == 0
+            || requirement.source_journal_through_position < requirement.source_journal_position
+            || requirement.active_placement_term == 0
+            || requirement.active_placement_index == 0
+            || requirement.expires_at_unix_millis == 0
+        {
+            return Err(Status::invalid_argument(
+                "routed index visibility requirement is invalid",
+            ));
+        }
+        match (
+            requirement.exact_path.as_deref(),
+            requirement.version,
+            requirement.program_commit_cursor,
+            requirement.atomic_unit_hash,
+        ) {
+            (Some(path), Some(version), None, None) if version != 0 => {
+                ObjectKey::new("validation", &request.definition.bucket, path)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            }
+            (None, None, Some(cursor), Some(hash)) if cursor != 0 && hash != [0; 32] => {}
+            _ => {
+                return Err(Status::invalid_argument(
+                    "routed index visibility identity is invalid",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -712,6 +770,65 @@ fn freshness_from_wire(
     Ok(IndexFreshnessRequirement {
         sources,
         atomic_through: requirement.atomic_through,
+    })
+}
+
+fn visibility_to_wire(
+    requirement: IndexVisibilityRequirement,
+) -> wire::RoutedIndexVisibilityRequirement {
+    wire::RoutedIndexVisibilityRequirement {
+        source_node_id: u32::from(requirement.source_node_id),
+        source_epoch: requirement.source_epoch.to_vec(),
+        source_journal_position: requirement.source_journal_position,
+        source_journal_through_position: requirement.source_journal_through_position,
+        tenant_id: requirement.tenant_id,
+        bucket_id: requirement.bucket_id,
+        exact_path: requirement.exact_path,
+        version: requirement.version,
+        program_commit_cursor: requirement.program_commit_cursor,
+        atomic_unit_hash: requirement
+            .atomic_unit_hash
+            .map_or_else(Vec::new, |hash| hash.to_vec()),
+        active_placement_term: requirement.active_placement_term,
+        active_placement_index: requirement.active_placement_index,
+        expires_at_unix_millis: requirement.expires_at_unix_millis,
+    }
+}
+
+fn visibility_from_wire(
+    requirement: &wire::RoutedIndexVisibilityRequirement,
+) -> Result<IndexVisibilityRequirement, Status> {
+    Ok(IndexVisibilityRequirement {
+        source_node_id: u16::try_from(requirement.source_node_id)
+            .map_err(|_| Status::invalid_argument("routed visibility source node ID is invalid"))?,
+        source_epoch: requirement
+            .source_epoch
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("routed visibility source epoch is invalid"))?,
+        source_journal_position: requirement.source_journal_position,
+        source_journal_through_position: requirement.source_journal_through_position,
+        tenant_id: requirement.tenant_id,
+        bucket_id: requirement.bucket_id,
+        exact_path: requirement.exact_path.clone(),
+        version: requirement.version,
+        program_commit_cursor: requirement.program_commit_cursor,
+        atomic_unit_hash: if requirement.atomic_unit_hash.is_empty() {
+            None
+        } else {
+            Some(
+                requirement
+                    .atomic_unit_hash
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| {
+                        Status::invalid_argument("routed visibility atomic unit hash is invalid")
+                    })?,
+            )
+        },
+        active_placement_term: requirement.active_placement_term,
+        active_placement_index: requirement.active_placement_index,
+        expires_at_unix_millis: requirement.expires_at_unix_millis,
     })
 }
 
@@ -1140,6 +1257,7 @@ mod tests {
                 authorization_revision: 19,
             }),
             required_freshness: None,
+            required_visibility: Vec::new(),
             authorization_subject: None,
             system_authorization_revision: 19,
             result_authorization_revision: None,

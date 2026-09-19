@@ -44,6 +44,7 @@ fn batch(nomination_log_index: u64, id: u8) -> BeginBatch {
         durability_class: DurabilityClass([2; 32]),
         durability_evidence_hash: DurabilityEvidenceHash([id.wrapping_add(4); 32]),
         participant_manifest_hash: ParticipantManifestHash([id.wrapping_add(5); 32]),
+        indexing_intent: keldra_consensus::AtomicIndexingIntent::Standard,
         proposal_at_unix_millis: 1_000 + u64::from(id),
         replay_expires_at_unix_millis: 1_000 + u64::from(id) + ATOMIC_REPLAY_RETENTION_MILLIS,
     }

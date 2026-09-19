@@ -366,6 +366,7 @@ fn typed_query_records_are_canonical_and_round_trip() {
         material_source_version: 6,
         current_source_version: 8,
         live: false,
+        selective_source_position: None,
         source_path: Some("objects/5.json".into()),
         canonical_source_path: None,
         result_path: Some("results/5.json".into()),

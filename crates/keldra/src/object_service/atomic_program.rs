@@ -30,6 +30,7 @@ pub(super) async fn invoke(
     let bearer = OriginalBearer::from_metadata(request.metadata())?;
     let api_request = request.into_inner();
     let durability = durability(api_request.durability)?;
+    let indexing_intent = indexing_intent(api_request.indexing_intent)?;
     let program_address = api_request
         .program
         .clone()
@@ -84,12 +85,13 @@ pub(super) async fn invoke(
                     let canonical_scope = plugin_scope.clone();
                     match run_atomic_program_until(
                         deadline,
-                        service.programs.invoke_distributed(
+                        service.programs.invoke_distributed_with_indexing(
                             program.clone(),
                             expected_program_hash,
                             api_request.invocation_id.clone(),
                             &api_request.input_json,
                             durability_name(durability),
+                            indexing_intent,
                             deadline_remaining(deadline)?,
                             move |dependencies| {
                                 let caller = logical_caller.clone();
@@ -144,12 +146,13 @@ pub(super) async fn invoke(
         let authorization = service.system_authorization().await?;
         run_atomic_program_until(
             deadline,
-            service.programs.invoke(
+            service.programs.invoke_with_indexing(
                 program,
                 expected_program_hash,
                 api_request.invocation_id,
                 &api_request.input_json,
                 durability_name(durability),
+                indexing_intent,
                 |dependency| {
                     authorize_program_dependency_capability(
                         &caller,
@@ -201,6 +204,11 @@ pub(super) async fn invoke(
         output_json,
         replayed: result.replayed,
         replay_guarantee_expires_at: Some(replay_expiration.into()),
+        index_visibility: result
+            .realtime_visibility
+            .as_ref()
+            .map(|evidence| api_program_index_visibility(&service.jwt_manager, &caller, evidence))
+            .transpose()?,
     }))
 }
 

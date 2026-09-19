@@ -317,6 +317,39 @@ pub(crate) trait IndexPageTokenCodec: Send + Sync + 'static {
     ) -> Result<Vec<u8>, Status>;
 }
 
+/// One caller-bound, exact committed mutation whose sparse real-time index
+/// visibility must be present in the snapshot selected for a query.
+///
+/// This is deliberately not a contiguous freshness checkpoint. A query can
+/// satisfy it from either an exact sparse overlay publication or a base root
+/// which has subsequently absorbed the named source position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IndexVisibilityRequirement {
+    pub(crate) source_node_id: u16,
+    pub(crate) source_epoch: [u8; 32],
+    pub(crate) source_journal_position: u64,
+    pub(crate) source_journal_through_position: u64,
+    pub(crate) tenant_id: u64,
+    pub(crate) bucket_id: u64,
+    pub(crate) exact_path: Option<String>,
+    pub(crate) version: Option<u64>,
+    pub(crate) program_commit_cursor: Option<u64>,
+    pub(crate) atomic_unit_hash: Option<[u8; 32]>,
+    pub(crate) active_placement_term: u64,
+    pub(crate) active_placement_index: u64,
+    pub(crate) expires_at_unix_millis: u64,
+}
+
+pub(crate) trait IndexVisibilityTokenCodec: Send + Sync + 'static {
+    fn decode(
+        &self,
+        caller: &Caller,
+        token: &[u8],
+        expected_tenant_id: u64,
+        expected_bucket_id: u64,
+    ) -> Result<IndexVisibilityRequirement, Status>;
+}
+
 #[derive(Clone)]
 pub(crate) struct ExecuteIndexQuery {
     pub(crate) context: IndexRequestContext,
@@ -338,6 +371,7 @@ pub(crate) struct ExecuteIndexQuery {
     /// the exact immutable revision and engine-specific last position.
     pub(crate) resume: Option<IndexPageCursor>,
     pub(crate) required_freshness: Option<IndexFreshnessRequirement>,
+    pub(crate) required_visibility: Vec<IndexVisibilityRequirement>,
 }
 
 #[derive(Clone, Debug)]
@@ -362,5 +396,6 @@ pub(crate) struct IndexServiceDependencies {
     pub(crate) queries: Arc<dyn IndexQueryExecutor>,
     pub(crate) authorization: Arc<dyn IndexAuthorization>,
     pub(crate) page_tokens: Arc<dyn IndexPageTokenCodec>,
+    pub(crate) visibility_tokens: Arc<dyn IndexVisibilityTokenCodec>,
     pub(crate) definition_reader: Arc<dyn IndexDefinitionReader>,
 }

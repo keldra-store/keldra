@@ -152,6 +152,7 @@ fn clone_route_wire_preserves_peer_fence_and_public_request() {
             operation: Some(keldra_api::v1::clone_object_request::Operation::Put(
                 keldra_api::v1::PutOperation {},
             )),
+            indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
         }),
     };
 
@@ -187,6 +188,7 @@ fn link_routes_preserve_peer_fence_and_public_requests() {
             }),
             command_id: "link".into(),
             durability: keldra_api::v1::Durability::Local as i32,
+            indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
         }),
     };
     assert_eq!(
@@ -200,6 +202,7 @@ fn link_routes_preserve_peer_fence_and_public_requests() {
             link: Some(link),
             command_id: "unlink".into(),
             durability: keldra_api::v1::Durability::Local as i32,
+            indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
         }),
     };
     assert_eq!(
@@ -227,6 +230,7 @@ fn built_in_replay_batch_wire_preserves_indices_and_per_item_failures() {
             contract_version: 1,
             invocation_id: vec![1; 32],
             input_fingerprint: vec![2; 32],
+            indexing_intent: 1,
         }],
     };
     assert_eq!(

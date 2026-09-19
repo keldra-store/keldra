@@ -514,6 +514,8 @@ message BuiltInReplayLookup {
   uint32 contract_version = 3;
   bytes invocation_id = 4;
   bytes input_fingerprint = 5;
+  // 0 = STANDARD, 1 = REALTIME. Unknown values are rejected.
+  int32 indexing_intent = 6;
 }
 
 message RouteBuiltInReplayBatchRequest {
@@ -581,6 +583,8 @@ message ProgramCoordinatePathFinalizationRequest {
   uint64 executor_nomination_log_index = 2;
   uint64 commit_cursor = 3;
   bytes stage_json = 4;
+  // 0 = STANDARD, 1 = REALTIME. Unknown values are rejected.
+  int32 indexing_intent = 5;
 }
 
 message ProgramCoordinatedPathFinalization {
@@ -844,6 +848,25 @@ message RoutedIndexFreshnessRequirement {
   optional uint64 atomic_through = 2;
 }
 
+// Ingress-verified exact mutation evidence. The public JWT never crosses the
+// peer boundary; destinations independently authenticate the original bearer
+// and receive only the bounded operands required to pin a satisfying view.
+message RoutedIndexVisibilityRequirement {
+  uint32 source_node_id = 1;
+  bytes source_epoch = 2;
+  uint64 source_journal_position = 3;
+  uint64 tenant_id = 4;
+  uint64 bucket_id = 5;
+  optional string exact_path = 6;
+  optional uint64 version = 7;
+  optional uint64 program_commit_cursor = 8;
+  uint64 active_placement_term = 9;
+  uint64 active_placement_index = 10;
+  uint64 expires_at_unix_millis = 11;
+  uint64 source_journal_through_position = 12;
+  bytes atomic_unit_hash = 13;
+}
+
 // A one-hop request to exactly one current weighted-HRW query replica. No
 // Caller or authorization decision crosses the wire. The original access JWT
 // or fixed anonymous marker is carried in gRPC metadata; the destination
@@ -865,6 +888,7 @@ message RouteIndexQueryRequest {
   optional uint64 result_authorization_revision = 12;
   optional uint64 result_authorization_binding_generation = 13;
   optional keldra.v1.SchemaRef result_authorization_schema_ref = 14;
+  repeated RoutedIndexVisibilityRequirement required_visibility = 15;
 }
 
 // Raw committed-view results. Public page tokens are minted only by public ingress

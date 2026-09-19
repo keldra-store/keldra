@@ -12,7 +12,7 @@ use super::*;
 use crate::key::{BucketId, BucketIdentity, TenantId};
 use crate::{
     BucketPolicy, DeleteRetainedVersionOutcome, DestinationReferenceArtifact,
-    DestinationReferenceDelta, Durability, LocalChange, LogicalRecordCandidate,
+    DestinationReferenceDelta, Durability, IndexingIntent, LocalChange, LogicalRecordCandidate,
     LogicalRecordMutationContext, LogicalRecordValue, ObjectMutationContext,
     ObjectMutationGovernance, ObjectVersioning, PlacementLogId, PutMode, PutRequest,
     ReferenceDeltaBatch, StoreOptions, WatchRetention,
@@ -416,6 +416,12 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(apply_batches.len(), 1);
+    let journal_visibility = store
+        .applied_program_commit()
+        .unwrap()
+        .unwrap()
+        .journal_visibility;
+    assert!(journal_visibility.is_none());
     assert_eq!(
         store.applied_program_commit().unwrap(),
         Some(AppliedProgramCommit {
@@ -426,6 +432,8 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
             participant_manifest_hash: prepared.participant_manifest_hash,
             durability_class: local_commit.durability_class,
             durability_evidence_hash: prepared.durability_evidence_hash,
+            indexing_intent: IndexingIntent::Standard,
+            journal_visibility,
         })
     );
     let marker = store
@@ -447,6 +455,8 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
             "commit_cursor",
             "durability_class",
             "durability_evidence_hash",
+            "indexing_intent",
+            "journal_visibility",
             "participant_manifest_hash",
             "program_hash",
         ])
@@ -860,6 +870,131 @@ async fn apply_is_all_old_or_all_new_and_records_only_the_compact_cursor() {
         Some(StoredValue::Json(json!({"value": 2})))
     );
     assert_eq!(store.applied_program_commit_cursor().unwrap(), Some(2));
+}
+
+#[tokio::test]
+async fn atomic_program_replay_binds_indexing_intent_and_reuses_realtime_evidence() {
+    let (_temporary, store, verified) = configured_store().await;
+    let engine = store.program_engine(&verified).unwrap();
+    let context = InvocationContext::new("tenant").unwrap();
+    let lease = engine
+        .prepare(
+            &context,
+            &invocation("standard-first", ExpectedHead::Absent),
+        )
+        .await
+        .unwrap();
+    let prepared = store.prepare_program_bundle(&lease).await.unwrap();
+    let standard_commit = commit(&prepared, None, 1);
+    let _reservations = commit_prepared_reservations(&store, &prepared, &standard_commit).await;
+    store
+        .apply_program_bundle_with_indexing(
+            lease,
+            &prepared,
+            standard_commit.clone(),
+            mutation_context(),
+            IndexingIntent::Standard,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .recover_program_bundle_with_indexing(
+                standard_commit,
+                mutation_context(),
+                IndexingIntent::Realtime,
+            )
+            .await
+            .unwrap_err(),
+        ProgramStoreError::IndexingIntentConflict { cursor: 1 }
+    );
+
+    let (_temporary, store, verified) = configured_store().await;
+    let engine = store.program_engine(&verified).unwrap();
+    let lease = engine
+        .prepare(
+            &context,
+            &invocation("realtime-first", ExpectedHead::Absent),
+        )
+        .await
+        .unwrap();
+    let prepared = store.prepare_program_bundle(&lease).await.unwrap();
+    let realtime_commit = commit(&prepared, None, 1);
+    let reservations = commit_prepared_reservations(&store, &prepared, &realtime_commit).await;
+    let first = store
+        .apply_program_bundle_with_indexing(
+            lease,
+            &prepared,
+            realtime_commit.clone(),
+            mutation_context(),
+            IndexingIntent::Realtime,
+        )
+        .await
+        .unwrap();
+    let replay = store
+        .recover_program_bundle_with_indexing(
+            realtime_commit.clone(),
+            mutation_context(),
+            IndexingIntent::Realtime,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.realtime_visibility, first.realtime_visibility);
+    assert!(replay.realtime_visibility.is_some());
+    let first_visibility = first.realtime_visibility.clone();
+    for reservation in &reservations {
+        store
+            .release_program_participant(reservation, Some(1))
+            .await
+            .unwrap();
+    }
+    let current = first.published_versions[&counter_path()].version;
+    let second_lease = engine
+        .prepare(
+            &context,
+            &invocation(
+                "realtime-second",
+                ExpectedHead::Version {
+                    version: current.0.to_string(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let second_prepared = store.prepare_program_bundle(&second_lease).await.unwrap();
+    let second_commit = commit(&second_prepared, Some(1), 2);
+    let _reservations =
+        commit_prepared_reservations(&store, &second_prepared, &second_commit).await;
+    store
+        .apply_program_bundle_with_indexing(
+            second_lease,
+            &second_prepared,
+            second_commit,
+            mutation_context(),
+            IndexingIntent::Realtime,
+        )
+        .await
+        .unwrap();
+    let older_replay = store
+        .recover_program_bundle_with_indexing(
+            realtime_commit.clone(),
+            mutation_context(),
+            IndexingIntent::Realtime,
+        )
+        .await
+        .unwrap();
+    assert_eq!(older_replay.realtime_visibility, first_visibility);
+    assert_eq!(
+        store
+            .recover_program_bundle_with_indexing(
+                realtime_commit,
+                mutation_context(),
+                IndexingIntent::Standard,
+            )
+            .await
+            .unwrap_err(),
+        ProgramStoreError::IndexingIntentConflict { cursor: 1 }
+    );
 }
 
 #[tokio::test]
@@ -1525,7 +1660,12 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
     );
 
     let finalized = store
-        .coordinate_program_path_finalization(stage.clone(), 42, mutation_context())
+        .coordinate_program_path_finalization_with_indexing(
+            stage.clone(),
+            42,
+            mutation_context(),
+            IndexingIntent::Realtime,
+        )
         .await
         .unwrap();
     assert_eq!(finalized.mutation.commit_cursor, 42);
@@ -1551,6 +1691,25 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
         proof.mutation,
         crate::ReferenceProofMutation::ProgramPath(finalized.mutation.clone())
     );
+    assert!(
+        store
+            .coordinate_program_path_finalization_with_indexing(
+                stage.clone(),
+                42,
+                mutation_context(),
+                IndexingIntent::Realtime,
+            )
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(
+        store
+            .coordinate_program_path_finalization(stage.clone(), 42, mutation_context())
+            .await
+            .unwrap_err(),
+        ProgramStoreError::IndexingIntentConflict { cursor: 42 }
+    );
 
     let replay = store
         .apply_program_path_finalization_replica(&finalized.mutation, mutation_context())
@@ -1568,14 +1727,34 @@ async fn distributed_path_stage_is_invisible_until_commit_bound_finalization() {
         &[],
     )
     .unwrap();
-    assert!(
-        store
-            .publish_atomic_batch(publication.clone())
-            .await
-            .unwrap()
-    );
+    let first_publication = store
+        .publish_atomic_batch_with_indexing(
+            publication.clone(),
+            IndexingIntent::Realtime,
+            mutation_context(),
+        )
+        .await
+        .unwrap();
+    assert!(first_publication.published);
+    assert!(first_publication.realtime_visibility.is_some());
     let tail = store.local_watch_status().unwrap().tail;
-    assert!(!store.publish_atomic_batch(publication).await.unwrap());
+    let replay = store
+        .publish_atomic_batch_with_indexing(
+            publication.clone(),
+            IndexingIntent::Realtime,
+            mutation_context(),
+        )
+        .await
+        .unwrap();
+    assert!(!replay.published);
+    assert_eq!(
+        replay.realtime_visibility,
+        first_publication.realtime_visibility
+    );
+    assert_eq!(
+        store.publish_atomic_batch(publication).await.unwrap_err(),
+        ProgramStoreError::IndexingIntentConflict { cursor: 42 }
+    );
     assert_eq!(store.local_watch_status().unwrap().tail, tail);
     let published = store.read_local_change(tail).unwrap().unwrap();
     let LocalChange::AtomicBatchPublished(published) = published else {

@@ -261,6 +261,7 @@ async fn execute(
             tenant: String::new(),
             required_freshness: None,
             authorization_subject: None,
+            required_visibility_tokens: Vec::new(),
         }),
     )
     .await

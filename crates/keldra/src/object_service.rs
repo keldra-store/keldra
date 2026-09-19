@@ -16,20 +16,22 @@ use keldra_api::v1::{
     BulkOperation, BulkOutcome, BulkPutIfVersionRequest, BulkPutRequest, BulkWriteRequest,
     BulkWriteResponse, DeleteIfVersionRequest, DeleteRequest as ApiDeleteRequest,
     DeleteVersionRequest, DeleteVersionResponse, DeletedObject, Durability as ApiDurability,
-    GetObjectRequest, HeadObjectRequest, InvokeProgramRequest, InvokeProgramResponse,
-    LinkObjectRequest, ListObjectVersionsRequest, ListObjectsRequest, ListObjectsResponse,
-    MutationFailure, MutationFailureCode, MutationReceipt as ApiMutationReceipt, NeverExisted,
-    ObjectAddress, ObjectChunk, ObjectHead, ObjectVersion, PresentObject, PutHeader,
-    PutRequest as ApiPutRequest, PutToken, ReadFailure, ReadFailureCode, SetBucketPolicyRequest,
-    UnlinkObjectRequest, WatchInvalidation, WatchPrefixRequest, WatchStateHint,
+    GetObjectRequest, HeadObjectRequest, IndexVisibilityToken, IndexingIntent as ApiIndexingIntent,
+    InvokeProgramRequest, InvokeProgramResponse, LinkObjectRequest, ListObjectVersionsRequest,
+    ListObjectsRequest, ListObjectsResponse, MutationFailure, MutationFailureCode,
+    MutationReceipt as ApiMutationReceipt, NeverExisted, ObjectAddress, ObjectChunk, ObjectHead,
+    ObjectVersion, PresentObject, PutHeader, PutRequest as ApiPutRequest, PutToken, ReadFailure,
+    ReadFailureCode, SetBucketPolicyRequest, UnlinkObjectRequest, WatchInvalidation,
+    WatchPrefixRequest, WatchStateHint,
 };
 use keldra_atomic_program::ExpandedProgramPath;
 use keldra_store::{
     AuthzStoreError, BatchOperation, BlobRef, BlobUpload, DeleteRequest as StoreDeleteRequest,
-    DeleteRetainedVersionOutcome, Durability as StoreDurability, InvalidationStateHint,
-    LocalInvalidation, MutationError, MutationReceipt, ObjectKey,
-    ObjectVersioning as StoreObjectVersioning, Precondition, PublishRequest, PutMode,
-    PutRequest as StorePutRequest, Store, Version, VersionId, WatchError, WatchScope,
+    DeleteRetainedVersionOutcome, Durability as StoreDurability,
+    IndexingIntent as StoreIndexingIntent, InvalidationStateHint, LocalInvalidation, MutationError,
+    MutationReceipt, ObjectKey, ObjectVersioning as StoreObjectVersioning, Precondition,
+    PublishRequest, PutMode, PutRequest as StorePutRequest, Store, Version, VersionId, WatchError,
+    WatchScope,
 };
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
@@ -178,6 +180,8 @@ struct CanonicalPutHeader {
     command_id: String,
     durability: TokenDurability,
     operation: TokenPutOperation,
+    #[serde(default)]
+    indexing_intent: TokenIndexingIntent,
     #[serde(deserialize_with = "deserialize_required_option")]
     link: Option<CanonicalLinkBinding>,
 }
@@ -233,6 +237,14 @@ enum TokenDurability {
     Replicated,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenIndexingIntent {
+    #[default]
+    Standard,
+    Realtime,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TokenPutOperation {
@@ -250,6 +262,7 @@ struct PutMetadata {
     command_id: String,
     durability: StoreDurability,
     mode: PutMode,
+    indexing_intent: StoreIndexingIntent,
 }
 
 pub(crate) type GetObjectStream =
@@ -311,6 +324,7 @@ impl ObjectService for ObjectServiceImpl {
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let api_request = request.get_ref().clone();
+        let selected_indexing_intent = indexing_intent(api_request.indexing_intent)?;
         let mutation = delete_request(api_request.clone(), Precondition::Any)?;
         object_path_access::require_key(&path_access, &mutation.key)?;
         require_plugin_key_scope(plugin_scope.as_ref(), &mutation.key)?;
@@ -340,6 +354,7 @@ impl ObjectService for ObjectServiceImpl {
                     link: request.address,
                     command_id: request.command_id,
                     durability: request.durability,
+                    indexing_intent: request.indexing_intent,
                 }),
             )
             .await;
@@ -369,14 +384,19 @@ impl ObjectService for ObjectServiceImpl {
                     .await?
             }
             None => api_receipt(
+                &self.jwt_manager,
+                &caller,
                 run_request_until(
                     deadline,
-                    self.distribution
-                        .mutate_with_governance(BatchOperation::Delete(mutation), governance),
+                    self.distribution.mutate_with_governance_and_indexing(
+                        BatchOperation::Delete(mutation),
+                        governance,
+                        selected_indexing_intent,
+                    ),
                     "delete deadline exceeded",
                 )
                 .await?,
-            ),
+            )?,
         };
         Ok(Response::new(receipt))
     }
@@ -393,6 +413,7 @@ impl ObjectService for ObjectServiceImpl {
         let bearer = OriginalBearer::from_metadata(request.metadata())?;
         let deadline = request_deadline(request.metadata(), self.atomic_program_timeout)?;
         let api_request = request.get_ref().clone();
+        let selected_indexing_intent = indexing_intent(api_request.indexing_intent)?;
         let precondition = Precondition::Version(VersionId(api_request.expected_version));
         let mutation = delete_if_version_request(api_request.clone(), precondition)?;
         object_path_access::require_key(&path_access, &mutation.key)?;
@@ -458,14 +479,19 @@ impl ObjectService for ObjectServiceImpl {
                 }
             }
             None => api_receipt(
+                &self.jwt_manager,
+                &caller,
                 run_request_until(
                     deadline,
-                    self.distribution
-                        .mutate_with_governance(BatchOperation::Delete(mutation), governance),
+                    self.distribution.mutate_with_governance_and_indexing(
+                        BatchOperation::Delete(mutation),
+                        governance,
+                        selected_indexing_intent,
+                    ),
                     "conditional delete deadline exceeded",
                 )
                 .await?,
-            ),
+            )?,
         };
         Ok(Response::new(receipt))
     }
@@ -683,25 +709,33 @@ impl ObjectService for ObjectServiceImpl {
                             .2
                             .push((index, operation, definition_intent));
                     }
-                    None => match batch_operation(operation, self.max_blob_bytes) {
-                        Ok(mutation) => {
-                            if meter_public && let BatchOperation::Put(put) = &mutation {
-                                accounting_inbound.push((
-                                    tenant_id,
-                                    bucket_id,
-                                    put.key.path().to_owned(),
-                                    put.bytes.len() as u64,
+                    None => {
+                        let selected_indexing_intent = bulk_indexing_intent(&operation)?;
+                        match batch_operation(operation, self.max_blob_bytes) {
+                            Ok(mutation) => {
+                                if meter_public && let BatchOperation::Put(put) = &mutation {
+                                    accounting_inbound.push((
+                                        tenant_id,
+                                        bucket_id,
+                                        put.key.path().to_owned(),
+                                        put.bytes.len() as u64,
+                                    ));
+                                }
+                                local.push((
+                                    index,
+                                    mutation,
+                                    definition_intent,
+                                    selected_indexing_intent,
                                 ));
                             }
-                            local.push((index, mutation, definition_intent));
+                            Err(error) => outcomes.push(BulkOutcome {
+                                index: index as u32,
+                                outcome: Some(keldra_api::v1::bulk_outcome::Outcome::Failure(
+                                    api_request_failure(error),
+                                )),
+                            }),
                         }
-                        Err(error) => outcomes.push(BulkOutcome {
-                            index: index as u32,
-                            outcome: Some(keldra_api::v1::bulk_outcome::Outcome::Failure(
-                                api_request_failure(error),
-                            )),
-                        }),
-                    },
+                    }
                 }
             }
             let routing_duration = routing_started.elapsed();
@@ -711,10 +745,15 @@ impl ObjectService for ObjectServiceImpl {
                         (*tenant_id, *bucket_id, path.as_str(), *bytes)
                     },
                 ));
-            let local_indices = local.iter().map(|(index, _, _)| *index).collect::<Vec<_>>();
+            let local_indices = local
+                .iter()
+                .map(|(index, _, _, _)| *index)
+                .collect::<Vec<_>>();
             let local_operations = local
                 .into_iter()
-                .map(|(_, operation, definition_intent)| (operation, definition_intent))
+                .map(|(_, operation, definition_intent, indexing_intent)| {
+                    (operation, definition_intent, indexing_intent)
+                })
                 .collect();
             if peer_routed && !remote.is_empty() {
                 return Err(Status::failed_precondition(
@@ -733,6 +772,8 @@ impl ObjectService for ObjectServiceImpl {
                 bulk::execute_coordinator_groups(
                     self.distribution.clone(),
                     self.cluster_peers.clone(),
+                    self.jwt_manager.clone(),
+                    caller.clone(),
                     local_indices,
                     local_operations,
                     remote,
@@ -1178,6 +1219,10 @@ impl ObjectServiceImpl {
             command_id: metadata.command_id.clone(),
             durability: token_durability(metadata.durability)?,
             operation,
+            indexing_intent: match metadata.indexing_intent {
+                StoreIndexingIntent::Standard => TokenIndexingIntent::Standard,
+                StoreIndexingIntent::Realtime => TokenIndexingIntent::Realtime,
+            },
             link: metadata.link.as_ref().map(|link| CanonicalLinkBinding {
                 path: link.link.path().to_owned(),
                 descriptor_version: link.descriptor_version.0,
@@ -1308,6 +1353,10 @@ impl CanonicalPutHeader {
             command_id: required_command_id(self.command_id.clone())?,
             durability,
             mode,
+            indexing_intent: match self.indexing_intent {
+                TokenIndexingIntent::Standard => StoreIndexingIntent::Standard,
+                TokenIndexingIntent::Realtime => StoreIndexingIntent::Realtime,
+            },
         })
     }
 }
@@ -1509,7 +1558,31 @@ fn put_metadata(request: PutHeader) -> Result<PutMetadata, Status> {
         command_id: required_command_id(request.command_id)?,
         durability: durability(request.durability)?,
         mode,
+        indexing_intent: indexing_intent(request.indexing_intent)?,
     })
+}
+
+fn indexing_intent(value: i32) -> Result<StoreIndexingIntent, Status> {
+    match ApiIndexingIntent::try_from(value) {
+        Ok(ApiIndexingIntent::Standard) => Ok(StoreIndexingIntent::Standard),
+        Ok(ApiIndexingIntent::Realtime) => Ok(StoreIndexingIntent::Realtime),
+        Err(_) => Err(Status::invalid_argument("indexing_intent is invalid")),
+    }
+}
+
+fn bulk_indexing_intent(operation: &BulkOperation) -> Result<StoreIndexingIntent, Status> {
+    use keldra_api::v1::bulk_operation::Operation;
+
+    let value = match operation.operation.as_ref() {
+        Some(Operation::Put(request))
+        | Some(Operation::PutIfAbsent(request))
+        | Some(Operation::PutImmutable(request)) => request.indexing_intent,
+        Some(Operation::PutIfVersion(request)) => request.indexing_intent,
+        Some(Operation::Delete(request)) => request.indexing_intent,
+        Some(Operation::DeleteIfVersion(request)) => request.indexing_intent,
+        None => return Err(Status::invalid_argument("bulk operation is required")),
+    };
+    indexing_intent(value)
 }
 
 fn bulk_put_request(request: BulkPutRequest, mode: PutMode) -> Result<StorePutRequest, Status> {
@@ -1669,15 +1742,18 @@ fn api_delete_version_outcome(outcome: DeleteRetainedVersionOutcome) -> DeleteVe
         DeleteRetainedVersionOutcome::NotFound => DeleteVersionResponse {
             deleted: false,
             replacement_tombstone_version: None,
+            index_visibility: None,
         },
         DeleteRetainedVersionOutcome::DeletedNonCurrent => DeleteVersionResponse {
             deleted: true,
             replacement_tombstone_version: None,
+            index_visibility: None,
         },
         DeleteRetainedVersionOutcome::ReplacedCurrentWithTombstone { version } => {
             DeleteVersionResponse {
                 deleted: true,
                 replacement_tombstone_version: Some(version.0),
+                index_visibility: None,
             }
         }
     }
@@ -1705,19 +1781,89 @@ fn never_existed() -> ObjectHead {
     }
 }
 
-fn api_receipt(receipt: MutationReceipt) -> ApiMutationReceipt {
+fn api_receipt(
+    tokens: &JwtManager,
+    caller: &Caller,
+    receipt: MutationReceipt,
+) -> Result<ApiMutationReceipt, Status> {
     let replay_guarantee_expires_at = UNIX_EPOCH
         .checked_add(Duration::from_millis(
             receipt.replay_guarantee_expires_at_unix_millis,
         ))
         .map(Into::into);
-    ApiMutationReceipt {
+    let index_visibility = receipt
+        .realtime_visibility
+        .as_ref()
+        .map(|evidence| api_index_visibility(tokens, caller, evidence))
+        .transpose()?;
+    Ok(ApiMutationReceipt {
         command_id: receipt.command_id.unwrap_or_default(),
         version: receipt.version.0,
         deleted: receipt.deleted,
         replayed: receipt.replayed,
         replay_guarantee_expires_at,
-    }
+        index_visibility,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn api_program_receipt(
+    tokens: &JwtManager,
+    caller: &Caller,
+    command_id: String,
+    version: VersionId,
+    deleted: bool,
+    replayed: bool,
+    replay_guarantee_expires_at_unix_millis: u64,
+    realtime_visibility: Option<&keldra_store::ProgramJournalVisibility>,
+) -> Result<ApiMutationReceipt, Status> {
+    let replay_guarantee_expires_at = UNIX_EPOCH
+        .checked_add(Duration::from_millis(
+            replay_guarantee_expires_at_unix_millis,
+        ))
+        .map(Into::into);
+    let index_visibility = realtime_visibility
+        .map(|evidence| api_program_index_visibility(tokens, caller, evidence))
+        .transpose()?;
+    Ok(ApiMutationReceipt {
+        command_id,
+        version: version.0,
+        deleted,
+        replayed,
+        replay_guarantee_expires_at,
+        index_visibility,
+    })
+}
+
+fn api_index_visibility(
+    tokens: &JwtManager,
+    caller: &Caller,
+    evidence: &keldra_store::RealtimeVisibilityEvidence,
+) -> Result<IndexVisibilityToken, Status> {
+    let value = crate::index_service::issue_index_visibility_token(tokens, caller, evidence)?;
+    let expires_at = UNIX_EPOCH
+        .checked_add(Duration::from_millis(evidence.expires_at_unix_millis))
+        .ok_or_else(|| Status::internal("index visibility expiry is invalid"))?;
+    Ok(IndexVisibilityToken {
+        value,
+        expires_at: Some(expires_at.into()),
+    })
+}
+
+fn api_program_index_visibility(
+    tokens: &JwtManager,
+    caller: &Caller,
+    evidence: &keldra_store::ProgramJournalVisibility,
+) -> Result<IndexVisibilityToken, Status> {
+    let value =
+        crate::index_service::issue_program_index_visibility_token(tokens, caller, evidence)?;
+    let expires_at = UNIX_EPOCH
+        .checked_add(Duration::from_millis(evidence.expires_at_unix_millis))
+        .ok_or_else(|| Status::internal("index visibility expiry is invalid"))?;
+    Ok(IndexVisibilityToken {
+        value,
+        expires_at: Some(expires_at.into()),
+    })
 }
 
 fn api_address(key: &ObjectKey) -> ObjectAddress {

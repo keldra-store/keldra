@@ -107,7 +107,12 @@ pub(super) fn queued_request(
     let (response, received) = oneshot::channel();
     drop(received);
     SingleNodeCommitRequest {
-        operations,
+        operations: operations
+            .into_iter()
+            .map(|(operation, governance, intent)| {
+                (operation, governance, intent, IndexingIntent::Standard)
+            })
+            .collect(),
         context,
         source_journal_admission: SourceJournalAdmission::Bounded,
         mode: MutationGroupMode::SingleNode,

@@ -295,7 +295,11 @@ fn projection_partition_owner(
     }
     match keldra_index::v1::parse_projection_artifact_path(path) {
         Ok(artifact) => {
-            if artifact.kind != keldra_index::v1::ProjectionArtifactKind::Current {
+            if !matches!(
+                artifact.kind,
+                keldra_index::v1::ProjectionArtifactKind::Current
+                    | keldra_index::v1::ProjectionArtifactKind::RealtimeOverlayCurrent
+            ) {
                 return Ok(None);
             }
             let partition = artifact.partition.ok_or_else(|| {

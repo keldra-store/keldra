@@ -323,10 +323,9 @@ async fn scan_equal_partition_page<L: QueryArtifactLoader + 'static, X: QueryPar
             let candidate = QueryAdmissionCandidate {
                 partition: manifest.view.pin.partition,
                 handoff_lineage_id: manifest.view.pin.handoff_lineage_id,
-                covered_through_source_position: manifest
-                    .view
-                    .pin
-                    .covered_through_source_position()?,
+                covered_through_source_position: gate
+                    .selective_source_position
+                    .unwrap_or(manifest.view.pin.covered_through_source_position()?),
                 document,
                 material_source_version: posting.material_source_version,
                 current_source_version: gate.current_source_version,

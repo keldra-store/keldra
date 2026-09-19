@@ -6,7 +6,8 @@ use super::mutation_prefetch::MutationReadCache;
 use super::mutation_types::DistributedEvaluationContext;
 use super::mutations::StagedLocalChanges;
 use super::single_node_group_commit::{
-    GroupConflictRegistrationHandoff, MutationGroupMode, SingleNodeOperations, SingleNodeOutcomes,
+    GroupConflictRegistrationHandoff, IndexedMutationOperations, MutationGroupMode,
+    SingleNodeOperations, SingleNodeOutcomes,
 };
 use super::*;
 use crate::model::{CoordinatedObjectMutation, ObjectMutationContext, ObjectMutationGovernance};
@@ -17,6 +18,7 @@ struct PreparedDistributedMutation {
     index: usize,
     operation: PreparedOperation,
     definition_intent: Option<DefinitionMutationIntent>,
+    indexing_intent: crate::IndexingIntent,
 }
 
 struct CoordinatedBatchEvaluation {
@@ -145,13 +147,15 @@ impl Store {
         status: WatchJournalStatus,
         reference_cursor: u64,
         source_journal_admission: SourceJournalAdmission,
+        realtime_change_indices: &BTreeSet<usize>,
     ) -> Result<Option<StagedLocalChanges>, MutationError> {
         if changes.is_empty() {
             return Ok(None);
         }
-        self.stage_local_changes_from_status(
+        self.stage_local_changes_from_status_with_realtime(
             batch,
             changes,
+            realtime_change_indices,
             reference_effects,
             source_journal_admission,
             status,
@@ -240,6 +244,7 @@ impl Store {
             .unwrap_or_default();
         read_cache.seed_bucket_settings(&mut policy_cache, &mut versioning_cache);
         let mut pending_changes = Vec::new();
+        let mut realtime_change_indices = BTreeSet::new();
         let mut high_watermark = None;
         let mut evaluated = BTreeMap::new();
         let mut receipt_capacity_at = None;
@@ -272,7 +277,7 @@ impl Store {
                 }
                 CoordinatorBatchPayloadPreparation::DirectLocal { .. } => None,
             };
-            let outcome = self
+            let mut outcome = self
                 .evaluate_operation(
                     &item.operation,
                     &mut batch,
@@ -332,12 +337,60 @@ impl Store {
                         current.max(value.receipt.version)
                     }),
                 );
+                let first_change = pending_changes.len();
                 pending_changes.extend(
                     value.pending_head_changes(
                         item.operation.identity(),
                         item.operation.key().path(),
                     ),
                 );
+                if item.indexing_intent == crate::IndexingIntent::Realtime {
+                    realtime_change_indices.extend(first_change..pending_changes.len());
+                }
+            }
+            let mut realtime_replay_expired = false;
+            if item.indexing_intent == crate::IndexingIntent::Realtime
+                && let Ok(value) = &mut outcome
+                && let Some(mutation) = value.mutation.as_ref()
+            {
+                value.receipt.realtime_visibility =
+                    Some(crate::RealtimeVisibilityEvidence::from_mutation(mutation));
+                if value.receipt.replayed {
+                    if mutation.stamp.source_id != source.source_id
+                        || mutation.stamp.source_journal_position <= source.retention_floor
+                    {
+                        realtime_replay_expired = true;
+                    } else {
+                        for (relative, pending) in value
+                            .pending_head_changes(
+                                item.operation.identity(),
+                                item.operation.key().path(),
+                            )
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let offset = mutation
+                                .stamp
+                                .source_journal_position
+                                .checked_add(relative as u64)
+                                .ok_or_else(|| {
+                                    MutationError::Storage(
+                                        "real-time replay source position is exhausted".into(),
+                                    )
+                                })?;
+                            self.stage_realtime_replay_event(
+                                &mut batch,
+                                mutation.stamp.source_id,
+                                &pending.at_offset(offset),
+                            )?;
+                        }
+                    }
+                }
+            }
+            if realtime_replay_expired {
+                outcome = Err(MutationError::Storage(
+                    "real-time replay source event is no longer retained".into(),
+                ));
             }
             evaluated.insert(
                 item.index,
@@ -385,15 +438,17 @@ impl Store {
                 source,
                 reference_cursor.expect("single-node reference cursor was read"),
                 source_journal_admission,
+                &realtime_change_indices,
             )?,
             CoordinatorBatchPayloadPreparation::Distributed {
                 source_journal_admission,
                 ..
             } => (!pending_changes.is_empty())
                 .then(|| {
-                    self.stage_local_changes_from_status(
+                    self.stage_local_changes_from_status_with_realtime(
                         &mut batch,
                         &pending_changes,
+                        &realtime_change_indices,
                         reference_effects,
                         source_journal_admission,
                         source,
@@ -431,6 +486,29 @@ impl Store {
         )>,
         context: ObjectMutationContext,
     ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
+        self.coordinate_distributed_mutation_batch_with_indexing(
+            operations
+                .into_iter()
+                .map(|(operation, governance, intent)| {
+                    (
+                        operation,
+                        governance,
+                        intent,
+                        crate::IndexingIntent::Standard,
+                    )
+                })
+                .collect(),
+            context,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn coordinate_distributed_mutation_batch_with_indexing(
+        &self,
+        operations: IndexedMutationOperations,
+        context: ObjectMutationContext,
+    ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
         self.coordinate_distributed_mutation_batch_with_admission(
             operations,
             context,
@@ -441,11 +519,7 @@ impl Store {
 
     pub(super) async fn coordinate_distributed_mutation_batch_with_admission(
         &self,
-        operations: Vec<(
-            BatchOperation,
-            ObjectMutationGovernance,
-            Option<DefinitionMutationIntent>,
-        )>,
+        operations: IndexedMutationOperations,
         context: ObjectMutationContext,
         source_journal_admission: SourceJournalAdmission,
     ) -> Result<Vec<Result<CoordinatedObjectMutation, MutationError>>, MutationError> {
@@ -468,7 +542,12 @@ impl Store {
         let operations = publishes
             .into_iter()
             .map(|(request, governance, intent)| {
-                (BatchOperation::Publish(request), governance, intent)
+                (
+                    BatchOperation::Publish(request),
+                    governance,
+                    intent,
+                    crate::IndexingIntent::Standard,
+                )
             })
             .collect();
         self.single_node_group_commit
@@ -498,7 +577,17 @@ impl Store {
     ) -> Result<(Vec<Result<MutationReceipt, MutationError>>, Option<usize>), MutationError> {
         let evaluated = self
             .coordinate_mutation_batch(
-                operations,
+                operations
+                    .into_iter()
+                    .map(|(operation, governance, intent)| {
+                        (
+                            operation,
+                            governance,
+                            intent,
+                            crate::IndexingIntent::Standard,
+                        )
+                    })
+                    .collect(),
                 ObjectMutationContext {
                     active_placement_log_id: PlacementLogId { term: 0, index: 0 },
                     serving_fence_term: 0,
@@ -557,9 +646,26 @@ impl Store {
             .await
     }
 
+    #[doc(hidden)]
+    pub async fn coordinate_single_node_mutation_batch_with_settlement_and_indexing(
+        &self,
+        operations: IndexedMutationOperations,
+        context: ObjectMutationContext,
+    ) -> Result<SingleNodeMutationBatch, MutationError> {
+        if operations.is_empty() {
+            return Ok(SingleNodeMutationBatch {
+                outcomes: Vec::new(),
+                source_journal_settlement: SourceJournalSettlement::CompletedByCoordinator,
+            });
+        }
+        self.single_node_group_commit
+            .submit_indexed(self.clone(), operations, context)
+            .await
+    }
+
     pub(super) async fn coordinate_mutation_group(
         &self,
-        operations: SingleNodeOperations,
+        operations: IndexedMutationOperations,
         context: ObjectMutationContext,
         request_operation_counts: &[usize],
         source_journal_admission: SourceJournalAdmission,
@@ -648,11 +754,7 @@ impl Store {
 
     async fn coordinate_mutation_batch(
         &self,
-        operations: Vec<(
-            BatchOperation,
-            ObjectMutationGovernance,
-            Option<DefinitionMutationIntent>,
-        )>,
+        operations: IndexedMutationOperations,
         context: ObjectMutationContext,
         payload_preparation: CoordinatorBatchPayloadPreparation,
     ) -> Result<CoordinatedBatchEvaluation, MutationError> {
@@ -662,11 +764,7 @@ impl Store {
 
     async fn coordinate_mutation_batch_grouped(
         &self,
-        operations: Vec<(
-            BatchOperation,
-            ObjectMutationGovernance,
-            Option<DefinitionMutationIntent>,
-        )>,
+        operations: IndexedMutationOperations,
         context: ObjectMutationContext,
         payload_preparation: CoordinatorBatchPayloadPreparation,
         registration_handoff: GroupConflictRegistrationHandoff,
@@ -684,11 +782,7 @@ impl Store {
 
     async fn coordinate_mutation_batch_inner(
         &self,
-        operations: Vec<(
-            BatchOperation,
-            ObjectMutationGovernance,
-            Option<DefinitionMutationIntent>,
-        )>,
+        operations: IndexedMutationOperations,
         context: ObjectMutationContext,
         payload_preparation: CoordinatorBatchPayloadPreparation,
         mut registration_handoff: Option<GroupConflictRegistrationHandoff>,
@@ -718,7 +812,7 @@ impl Store {
         let mut early = BTreeMap::new();
         let mut bucket_governance = BTreeMap::<Vec<u8>, ObjectMutationGovernance>::new();
         let prepare_started = std::time::Instant::now();
-        for (index, (operation, governance, definition_intent)) in
+        for (index, (operation, governance, definition_intent, indexing_intent)) in
             operations.into_iter().enumerate()
         {
             let key = match &operation {
@@ -778,11 +872,15 @@ impl Store {
                 }
             };
             match operation {
-                Ok(operation) => prepared.push(PreparedDistributedMutation {
-                    index,
-                    operation,
-                    definition_intent,
-                }),
+                Ok(mut operation) => {
+                    operation.bind_indexing_intent(indexing_intent);
+                    prepared.push(PreparedDistributedMutation {
+                        index,
+                        operation,
+                        definition_intent,
+                        indexing_intent,
+                    })
+                }
                 Err(error) => {
                     early.insert(index, error);
                 }
@@ -1111,6 +1209,11 @@ impl Store {
         evaluation_subphases.accumulate(retry_evaluation_subphases);
         let stage_duration = attempt.stage_duration.saturating_add(retry_stage_duration);
         let mut evaluated = std::mem::take(&mut attempt.evaluated);
+        let committed_realtime_routes = evaluated.values().any(|outcome| {
+            outcome
+                .as_ref()
+                .is_ok_and(|value| value.receipt.realtime_visibility.is_some())
+        });
         let batch = attempt.batch;
         let persist_started = std::time::Instant::now();
         let physical_commit = !batch.is_empty();
@@ -1152,6 +1255,9 @@ impl Store {
                 .await?;
         }
         persistence?;
+        if committed_realtime_routes {
+            self.notify_realtime_journal_routes();
+        }
         let persist_duration = persist_started.elapsed();
         let settle_started = std::time::Instant::now();
         if !pruned_receipts.is_empty() {
@@ -1326,7 +1432,14 @@ impl Store {
         }
         let operations = requests
             .into_iter()
-            .map(|request| (BatchOperation::Publish(request), governance.clone(), None))
+            .map(|request| {
+                (
+                    BatchOperation::Publish(request),
+                    governance.clone(),
+                    None,
+                    crate::IndexingIntent::Standard,
+                )
+            })
             .collect();
         self.single_node_group_commit
             .submit_with_admission(

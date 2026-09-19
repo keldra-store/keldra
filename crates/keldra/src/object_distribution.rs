@@ -18,7 +18,7 @@ use keldra_consensus::{DecisionRaft, MembershipTransitionKind, NodeId, NodeState
 use keldra_store::{
     BatchOperation, BlobRef, CloneRequest, CoordinatedObjectMutation,
     CoordinatedRetainedVersionDelete, DefinitionMutationIntent, DeleteRetainedVersionOutcome,
-    Durability, ErasureProfile, MutationError, MutationReceipt, ObjectKey,
+    Durability, ErasureProfile, IndexingIntent, MutationError, MutationReceipt, ObjectKey,
     ObjectMutationGovernance, PublishRequest, PutRequest, SourceJournalSettlement, Store,
     VersionId,
 };
@@ -231,6 +231,24 @@ impl ObjectDistribution {
             upload_source,
             governance,
             None,
+        )
+        .await
+    }
+
+    pub(crate) async fn publish_from_source_with_governance_and_indexing(
+        &self,
+        request: PublishRequest,
+        upload_source: NodeId,
+        governance: ObjectMutationGovernance,
+        indexing_intent: IndexingIntent,
+    ) -> Result<MutationReceipt, Status> {
+        self.publish_from_source_with_governance_and_admission(
+            request,
+            upload_source,
+            governance,
+            None,
+            indexing_intent,
+            false,
         )
         .await
     }
@@ -496,6 +514,7 @@ impl ObjectDistribution {
             upload_source,
             governance,
             definition_intent,
+            IndexingIntent::Standard,
             false,
         )
         .await
@@ -512,6 +531,7 @@ impl ObjectDistribution {
             upload_source,
             governance,
             None,
+            IndexingIntent::Standard,
             true,
         )
         .await
@@ -523,6 +543,7 @@ impl ObjectDistribution {
         upload_source: NodeId,
         governance: ObjectMutationGovernance,
         definition_intent: Option<DefinitionMutationIntent>,
+        indexing_intent: IndexingIntent,
         derived_progress: bool,
     ) -> Result<MutationReceipt, Status> {
         loop {
@@ -532,6 +553,7 @@ impl ObjectDistribution {
                     upload_source,
                     governance.clone(),
                     definition_intent,
+                    indexing_intent,
                     derived_progress,
                 )
                 .await;
@@ -552,6 +574,7 @@ impl ObjectDistribution {
         upload_source: NodeId,
         governance: ObjectMutationGovernance,
         definition_intent: Option<DefinitionMutationIntent>,
+        indexing_intent: IndexingIntent,
         derived_progress: bool,
     ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
@@ -602,8 +625,13 @@ impl ObjectDistribution {
                 (intent, false) if single_node => {
                     let batch = completion
                         .store
-                        .coordinate_single_node_mutation_batch_with_settlement(
-                            vec![(BatchOperation::Publish(request), governance, intent)],
+                        .coordinate_single_node_mutation_batch_with_settlement_and_indexing(
+                            vec![(
+                                BatchOperation::Publish(request),
+                                governance,
+                                intent,
+                                indexing_intent,
+                            )],
                             context,
                         )
                         .await
@@ -618,23 +646,25 @@ impl ObjectDistribution {
                         .map_err(mutation_status)?;
                     (coordinated, batch.source_journal_settlement)
                 }
-                (Some(intent), false) => {
+                (intent, false) => {
                     let coordinated = completion
                         .store
-                        .coordinate_distributed_definition_publish_with_governance(
-                            request, governance, context, intent,
+                        .coordinate_distributed_mutation_batch_with_indexing(
+                            vec![(
+                                BatchOperation::Publish(request),
+                                governance,
+                                intent,
+                                indexing_intent,
+                            )],
+                            context,
                         )
                         .await
-                        .map_err(mutation_status)?;
-                    (coordinated, SourceJournalSettlement::RequiredAfterQuorum)
-                }
-                (None, false) => {
-                    let coordinated = completion
-                        .store
-                        .coordinate_distributed_publish_with_governance(
-                            request, governance, context,
-                        )
-                        .await
+                        .map_err(mutation_status)?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            Status::data_loss("distributed publication omitted its outcome")
+                        })?
                         .map_err(mutation_status)?;
                     (coordinated, SourceJournalSettlement::RequiredAfterQuorum)
                 }
@@ -757,11 +787,37 @@ impl ObjectDistribution {
             .await
     }
 
+    pub(crate) async fn mutate_with_governance_and_indexing(
+        &self,
+        operation: BatchOperation,
+        governance: ObjectMutationGovernance,
+        indexing_intent: IndexingIntent,
+    ) -> Result<MutationReceipt, Status> {
+        self.mutate_with_governance_and_intents(operation, governance, None, indexing_intent)
+            .await
+    }
+
     pub(crate) async fn mutate_with_governance_and_definition_intent(
         &self,
         operation: BatchOperation,
         governance: ObjectMutationGovernance,
         definition_intent: Option<DefinitionMutationIntent>,
+    ) -> Result<MutationReceipt, Status> {
+        self.mutate_with_governance_and_intents(
+            operation,
+            governance,
+            definition_intent,
+            IndexingIntent::Standard,
+        )
+        .await
+    }
+
+    async fn mutate_with_governance_and_intents(
+        &self,
+        operation: BatchOperation,
+        governance: ObjectMutationGovernance,
+        definition_intent: Option<DefinitionMutationIntent>,
+        indexing_intent: IndexingIntent,
     ) -> Result<MutationReceipt, Status> {
         let hot = self.hot_indexing.get().and_then(|ingress| {
             ingress.pending(governance.tenant_id, governance.bucket_id, &operation)
@@ -772,6 +828,7 @@ impl ObjectDistribution {
                     operation.clone(),
                     governance.clone(),
                     definition_intent,
+                    indexing_intent,
                 )
                 .await;
             if let Err(error) = &result
@@ -790,6 +847,7 @@ impl ObjectDistribution {
         operation: BatchOperation,
         governance: ObjectMutationGovernance,
         definition_intent: Option<DefinitionMutationIntent>,
+        indexing_intent: IndexingIntent,
     ) -> Result<MutationReceipt, Status> {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
@@ -804,11 +862,13 @@ impl ObjectDistribution {
             BatchOperation::Put(request) => {
                 let publish = stage_distributed_put(&self.store, request).await?;
                 return self
-                    .publish_from_source_with_governance_and_definition_intent(
+                    .publish_from_source_with_governance_and_admission(
                         publish,
                         self.local_node,
                         governance,
                         definition_intent,
+                        indexing_intent,
+                        false,
                     )
                     .await;
             }
@@ -843,42 +903,36 @@ impl ObjectDistribution {
         let completion_placement = placement.clone();
         let coordinated = complete_metadata(async move {
             let _permit = permit;
-            let (coordinated, settlement) = match definition_intent {
-                Some(intent) => {
-                    let coordinated = completion
-                        .store
-                        .coordinate_definition_object_mutation_with_governance(
-                            operation, governance, context, intent,
-                        )
-                        .await
-                        .map_err(mutation_status)?;
-                    (coordinated, SourceJournalSettlement::RequiredAfterQuorum)
-                }
-                None if single_node && matches!(&operation, BatchOperation::Clone(_)) => {
-                    let batch = completion
-                        .store
-                        .coordinate_single_node_mutation_batch_with_settlement(
-                            vec![(operation, governance, None)],
-                            context,
-                        )
-                        .await
-                        .map_err(mutation_status)?;
-                    let coordinated = batch
-                        .outcomes
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| Status::data_loss("single-node clone omitted its outcome"))?
-                        .map_err(mutation_status)?;
-                    (coordinated, batch.source_journal_settlement)
-                }
-                None => {
-                    let coordinated = completion
-                        .store
-                        .coordinate_object_mutation_with_governance(operation, governance, context)
-                        .await
-                        .map_err(mutation_status)?;
-                    (coordinated, SourceJournalSettlement::RequiredAfterQuorum)
-                }
+            let (coordinated, settlement) = if single_node {
+                let batch = completion
+                    .store
+                    .coordinate_single_node_mutation_batch_with_settlement_and_indexing(
+                        vec![(operation, governance, definition_intent, indexing_intent)],
+                        context,
+                    )
+                    .await
+                    .map_err(mutation_status)?;
+                let coordinated = batch
+                    .outcomes
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Status::data_loss("single-node mutation omitted its outcome"))?
+                    .map_err(mutation_status)?;
+                (coordinated, batch.source_journal_settlement)
+            } else {
+                let coordinated = completion
+                    .store
+                    .coordinate_distributed_mutation_batch_with_indexing(
+                        vec![(operation, governance, definition_intent, indexing_intent)],
+                        context,
+                    )
+                    .await
+                    .map_err(mutation_status)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Status::data_loss("distributed mutation omitted its outcome"))?
+                    .map_err(mutation_status)?;
+                (coordinated, SourceJournalSettlement::RequiredAfterQuorum)
             };
             completion
                 .replicate(&completion_placement, &group, &coordinated, settlement)
@@ -895,9 +949,37 @@ impl ObjectDistribution {
         version: VersionId,
         governance: ObjectMutationGovernance,
     ) -> Result<DeleteRetainedVersionOutcome, Status> {
+        self.delete_retained_version_with_governance_and_indexing(
+            key,
+            version,
+            governance,
+            IndexingIntent::Standard,
+        )
+        .await
+        .map(|(outcome, _)| outcome)
+    }
+
+    pub(crate) async fn delete_retained_version_with_governance_and_indexing(
+        &self,
+        key: &ObjectKey,
+        version: VersionId,
+        governance: ObjectMutationGovernance,
+        indexing_intent: IndexingIntent,
+    ) -> Result<
+        (
+            DeleteRetainedVersionOutcome,
+            Option<keldra_store::RealtimeVisibilityEvidence>,
+        ),
+        Status,
+    > {
         loop {
             let result = self
-                .delete_retained_version_with_governance_once(key, version, governance.clone())
+                .delete_retained_version_with_governance_once(
+                    key,
+                    version,
+                    governance.clone(),
+                    indexing_intent,
+                )
                 .await;
             if let Err(error) = &result
                 && let Some(capacity) = mutation_capacity_kind(error)
@@ -914,21 +996,29 @@ impl ObjectDistribution {
         key: &ObjectKey,
         version: VersionId,
         governance: ObjectMutationGovernance,
-    ) -> Result<DeleteRetainedVersionOutcome, Status> {
+        indexing_intent: IndexingIntent,
+    ) -> Result<
+        (
+            DeleteRetainedVersionOutcome,
+            Option<keldra_store::RealtimeVisibilityEvidence>,
+        ),
+        Status,
+    > {
         governance.validate().map_err(mutation_status)?;
         let placement = self.placement()?;
         if placement.active_node_ids().len() == 1 {
             let _permit = self.mutation_admission.enter()?;
             return self
                 .store
-                .coordinate_local_retained_version_delete(
+                .coordinate_local_retained_version_delete_with_indexing(
                     key,
                     version,
                     governance,
                     self.serving.mutation_context()?,
+                    indexing_intent,
                 )
                 .await
-                .map(|coordinated| coordinated.outcome)
+                .map(|coordinated| (coordinated.outcome, coordinated.realtime_visibility))
                 .map_err(mutation_status);
         }
         let group =
@@ -955,7 +1045,13 @@ impl ObjectDistribution {
             let _permit = permit;
             let coordinated = completion
                 .store
-                .coordinate_retained_version_delete(&key, version, governance, context)
+                .coordinate_retained_version_delete_with_indexing(
+                    &key,
+                    version,
+                    governance,
+                    context,
+                    indexing_intent,
+                )
                 .await
                 .map_err(mutation_status)?;
             completion
@@ -964,7 +1060,7 @@ impl ObjectDistribution {
             Ok::<_, Status>(coordinated)
         })
         .await?;
-        Ok(coordinated.outcome)
+        Ok((coordinated.outcome, coordinated.realtime_visibility))
     }
 
     pub(crate) fn coordinator(&self, key: &ObjectKey) -> Result<NodeId, Status> {

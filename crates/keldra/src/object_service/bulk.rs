@@ -6,12 +6,14 @@ use std::time::{Duration, Instant};
 use keldra_api::v1::bulk_outcome::Outcome;
 use keldra_api::v1::{BulkOperation, BulkOutcome, BulkWriteRequest};
 use keldra_consensus::NodeId;
-use keldra_store::{BatchOperation, DefinitionMutationIntent, ObjectKey};
+use keldra_store::{BatchOperation, DefinitionMutationIntent, IndexingIntent, ObjectKey};
 use tonic::Status;
+
+use crate::authentication::{Caller, JwtManager};
 
 use super::{
     MAX_CONTENT_TYPE_BYTES, api_mutation_failure, api_receipt, api_request_failure, durability,
-    validate_command_id,
+    indexing_intent, validate_command_id,
 };
 use crate::authorization::ObjectPermission;
 use crate::cluster_peer::ClusterPeerTransport;
@@ -27,49 +29,61 @@ pub(super) fn validate_operation(
 ) -> Result<(ObjectKey, ObjectPermission), Status> {
     use keldra_api::v1::bulk_operation::Operation;
 
-    let (address, command_id, durability_value, content_type_value, payload_bytes, permission) =
-        match operation.operation.as_ref() {
-            Some(Operation::Put(request))
-            | Some(Operation::PutIfAbsent(request))
-            | Some(Operation::PutImmutable(request)) => (
-                request.address.as_ref(),
-                request.command_id.as_str(),
-                request.durability,
-                Some(request.content_type.as_str()),
-                request.bytes.len() as u64,
-                ObjectPermission::Put,
-            ),
-            Some(Operation::PutIfVersion(request)) => (
-                request.address.as_ref(),
-                request.command_id.as_str(),
-                request.durability,
-                Some(request.content_type.as_str()),
-                request.bytes.len() as u64,
-                ObjectPermission::Put,
-            ),
-            Some(Operation::Delete(request)) => (
-                request.address.as_ref(),
-                request.command_id.as_str(),
-                request.durability,
-                None,
-                0,
-                ObjectPermission::Delete,
-            ),
-            Some(Operation::DeleteIfVersion(request)) => (
-                request.address.as_ref(),
-                request.command_id.as_str(),
-                request.durability,
-                None,
-                0,
-                ObjectPermission::Delete,
-            ),
-            None => return Err(Status::invalid_argument("bulk operation is required")),
-        };
+    let (
+        address,
+        command_id,
+        durability_value,
+        indexing_intent_value,
+        content_type_value,
+        payload_bytes,
+        permission,
+    ) = match operation.operation.as_ref() {
+        Some(Operation::Put(request))
+        | Some(Operation::PutIfAbsent(request))
+        | Some(Operation::PutImmutable(request)) => (
+            request.address.as_ref(),
+            request.command_id.as_str(),
+            request.durability,
+            request.indexing_intent,
+            Some(request.content_type.as_str()),
+            request.bytes.len() as u64,
+            ObjectPermission::Put,
+        ),
+        Some(Operation::PutIfVersion(request)) => (
+            request.address.as_ref(),
+            request.command_id.as_str(),
+            request.durability,
+            request.indexing_intent,
+            Some(request.content_type.as_str()),
+            request.bytes.len() as u64,
+            ObjectPermission::Put,
+        ),
+        Some(Operation::Delete(request)) => (
+            request.address.as_ref(),
+            request.command_id.as_str(),
+            request.durability,
+            request.indexing_intent,
+            None,
+            0,
+            ObjectPermission::Delete,
+        ),
+        Some(Operation::DeleteIfVersion(request)) => (
+            request.address.as_ref(),
+            request.command_id.as_str(),
+            request.durability,
+            request.indexing_intent,
+            None,
+            0,
+            ObjectPermission::Delete,
+        ),
+        None => return Err(Status::invalid_argument("bulk operation is required")),
+    };
     let address = address.ok_or_else(|| Status::invalid_argument("object address is required"))?;
     let key = ObjectKey::new(&address.tenant, &address.bucket, &address.path)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     validate_command_id(command_id)?;
     durability(durability_value)?;
+    indexing_intent(indexing_intent_value)?;
     if content_type_value.is_some_and(|value| value.len() > MAX_CONTENT_TYPE_BYTES) {
         return Err(Status::invalid_argument(format!(
             "content_type exceeds {MAX_CONTENT_TYPE_BYTES} UTF-8 bytes"
@@ -151,8 +165,14 @@ pub(super) fn record_dispatch_interruption(
 pub(super) async fn execute_coordinator_groups(
     distribution: ObjectDistribution,
     peers: ClusterPeerTransport,
+    tokens: JwtManager,
+    caller: Caller,
     local_indices: Vec<usize>,
-    local_operations: Vec<(BatchOperation, Option<DefinitionMutationIntent>)>,
+    local_operations: Vec<(
+        BatchOperation,
+        Option<DefinitionMutationIntent>,
+        IndexingIntent,
+    )>,
     remote: BTreeMap<
         Vec<u64>,
         (
@@ -171,20 +191,26 @@ pub(super) async fn execute_coordinator_groups(
         partition_local_operations(local_indices, local_operations, LOCAL_COORDINATOR_LANES)
     {
         let distribution = distribution.clone();
+        let tokens = tokens.clone();
+        let caller = caller.clone();
         tasks.spawn(async move {
             let outcomes = distribution
-                .mutate_many_with_definition_intents(lane_operations)
+                .mutate_many_with_definition_and_indexing_intents(lane_operations)
                 .await
                 .into_iter()
                 .zip(lane_indices)
-                .map(|(result, original_index)| BulkOutcome {
-                    index: original_index as u32,
-                    outcome: Some(match result {
-                        Ok(receipt) => Outcome::Receipt(api_receipt(receipt)),
-                        Err(error) => Outcome::Failure(api_mutation_failure(error)),
-                    }),
+                .map(|(result, original_index)| -> Result<BulkOutcome, Status> {
+                    Ok(BulkOutcome {
+                        index: original_index as u32,
+                        outcome: Some(match result {
+                            Ok(receipt) => {
+                                Outcome::Receipt(api_receipt(&tokens, &caller, receipt)?)
+                            }
+                            Err(error) => Outcome::Failure(api_mutation_failure(error)),
+                        }),
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, Status>(outcomes)
         });
     }
@@ -251,7 +277,11 @@ pub(super) async fn execute_coordinator_groups(
     Ok(outcomes)
 }
 
-type LocalOperation = (BatchOperation, Option<DefinitionMutationIntent>);
+type LocalOperation = (
+    BatchOperation,
+    Option<DefinitionMutationIntent>,
+    IndexingIntent,
+);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum LocalConflictResource {
@@ -346,7 +376,7 @@ fn partition_local_operations(
         .collect::<Vec<_>>();
     let mut parents = (0..operations.len()).collect::<Vec<_>>();
     let mut resource_owner = BTreeMap::<LocalConflictResource, usize>::new();
-    for (operation_index, (operation, intent)) in operations.iter().enumerate() {
+    for (operation_index, (operation, intent, _)) in operations.iter().enumerate() {
         for resource in operation_resources(operation, *intent) {
             if let Some(existing) = resource_owner.get(&resource).copied() {
                 connect_components(&mut parents, operation_index, existing);
@@ -425,6 +455,7 @@ mod tests {
                 durability: keldra_store::Durability::Local,
             }),
             None,
+            IndexingIntent::Standard,
         )
     }
 
@@ -444,6 +475,7 @@ mod tests {
                 durability: keldra_store::Durability::Local,
             }),
             None,
+            IndexingIntent::Standard,
         )
     }
 

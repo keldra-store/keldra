@@ -14,8 +14,8 @@ use super::journal_capacity::SourceJournalAdmission;
 use super::mutation_helpers::mutation_capacity_kind;
 use crate::key::{BucketId, BucketIdentity, TenantId};
 use crate::{
-    BatchOperation, CoordinatedObjectMutation, DefinitionMutationIntent, MutationError,
-    ObjectMutationContext, ObjectMutationGovernance,
+    BatchOperation, CoordinatedObjectMutation, DefinitionMutationIntent, IndexingIntent,
+    MutationError, ObjectMutationContext, ObjectMutationGovernance,
 };
 
 const DEFAULT_MAX_GROUP_REQUESTS: usize = 16;
@@ -168,6 +168,12 @@ pub(super) type SingleNodeOperations = Vec<(
     ObjectMutationGovernance,
     Option<DefinitionMutationIntent>,
 )>;
+pub(super) type IndexedMutationOperations = Vec<(
+    BatchOperation,
+    ObjectMutationGovernance,
+    Option<DefinitionMutationIntent>,
+    IndexingIntent,
+)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MutationGroupMode {
@@ -200,7 +206,7 @@ pub struct SingleNodeMutationBatch {
 pub(super) type SingleNodeOutcomes = Result<SingleNodeMutationBatch, MutationError>;
 
 pub(super) struct SingleNodeCommitRequest {
-    pub(super) operations: SingleNodeOperations,
+    pub(super) operations: IndexedMutationOperations,
     pub(super) context: ObjectMutationContext,
     source_journal_admission: SourceJournalAdmission,
     mode: MutationGroupMode,
@@ -229,7 +235,7 @@ impl SingleNodeCommitRequest {
     fn inline_bytes(&self) -> usize {
         self.operations
             .iter()
-            .fold(0_usize, |total, (operation, _, _)| {
+            .fold(0_usize, |total, (operation, _, _, _)| {
                 total.saturating_add(match operation {
                     BatchOperation::Put(request) => request.bytes.len(),
                     BatchOperation::Publish(_)
@@ -241,7 +247,7 @@ impl SingleNodeCommitRequest {
 
     fn consistent_governance(&self) -> Option<BTreeMap<(u64, u64), ObjectMutationGovernance>> {
         let mut collected = BTreeMap::new();
-        for (_, governance, _) in &self.operations {
+        for (_, governance, _, _) in &self.operations {
             let identity = (governance.tenant_id, governance.bucket_id);
             if collected
                 .get(&identity)
@@ -264,7 +270,7 @@ impl SingleNodeCommitRequest {
     fn distributed_replication_paths(&self) -> BTreeSet<(u64, u64, &str)> {
         self.operations
             .iter()
-            .map(|(operation, governance, _)| {
+            .map(|(operation, governance, _, _)| {
                 let path = match operation {
                     BatchOperation::Put(request) => request.key.path(),
                     BatchOperation::Publish(request) => request.key.path(),
@@ -279,7 +285,7 @@ impl SingleNodeCommitRequest {
     fn object_conflict_resources(&self) -> BTreeSet<Vec<u8>> {
         self.operations
             .iter()
-            .flat_map(|(operation, governance, _)| {
+            .flat_map(|(operation, governance, _, _)| {
                 let identity = BucketIdentity {
                     tenant_id: TenantId(governance.tenant_id),
                     bucket_id: BucketId(governance.bucket_id),
@@ -582,6 +588,25 @@ impl SingleNodeGroupCommit {
         operations: SingleNodeOperations,
         context: ObjectMutationContext,
     ) -> SingleNodeOutcomes {
+        self.submit_indexed(
+            store,
+            operations
+                .into_iter()
+                .map(|(operation, governance, intent)| {
+                    (operation, governance, intent, IndexingIntent::Standard)
+                })
+                .collect(),
+            context,
+        )
+        .await
+    }
+
+    pub(super) async fn submit_indexed(
+        &self,
+        store: Store,
+        operations: IndexedMutationOperations,
+        context: ObjectMutationContext,
+    ) -> SingleNodeOutcomes {
         self.submit_with_admission(store, operations, context, SourceJournalAdmission::Bounded)
             .await
     }
@@ -589,7 +614,7 @@ impl SingleNodeGroupCommit {
     pub(super) async fn submit_with_admission(
         &self,
         store: Store,
-        operations: SingleNodeOperations,
+        operations: IndexedMutationOperations,
         context: ObjectMutationContext,
         source_journal_admission: SourceJournalAdmission,
     ) -> SingleNodeOutcomes {
@@ -606,7 +631,7 @@ impl SingleNodeGroupCommit {
     pub(super) async fn submit_distributed(
         &self,
         store: Store,
-        operations: SingleNodeOperations,
+        operations: IndexedMutationOperations,
         context: ObjectMutationContext,
         source_journal_admission: SourceJournalAdmission,
     ) -> SingleNodeOutcomes {
@@ -623,7 +648,7 @@ impl SingleNodeGroupCommit {
     pub(super) async fn submit_verified_distributed_publish(
         &self,
         store: Store,
-        operations: SingleNodeOperations,
+        operations: IndexedMutationOperations,
         context: ObjectMutationContext,
         source_journal_admission: SourceJournalAdmission,
     ) -> SingleNodeOutcomes {
@@ -640,20 +665,22 @@ impl SingleNodeGroupCommit {
     async fn submit_with_mode(
         &self,
         store: Store,
-        operations: SingleNodeOperations,
+        operations: IndexedMutationOperations,
         context: ObjectMutationContext,
         source_journal_admission: SourceJournalAdmission,
         mode: MutationGroupMode,
     ) -> SingleNodeOutcomes {
         let operation_count = operations.len();
-        let inline_bytes = operations.iter().fold(0_usize, |total, (operation, _, _)| {
-            total.saturating_add(match operation {
-                BatchOperation::Put(request) => request.bytes.len(),
-                BatchOperation::Publish(_)
-                | BatchOperation::Clone(_)
-                | BatchOperation::Delete(_) => 0,
-            })
-        });
+        let inline_bytes = operations
+            .iter()
+            .fold(0_usize, |total, (operation, _, _, _)| {
+                total.saturating_add(match operation {
+                    BatchOperation::Put(request) => request.bytes.len(),
+                    BatchOperation::Publish(_)
+                    | BatchOperation::Clone(_)
+                    | BatchOperation::Delete(_) => 0,
+                })
+            });
         if operation_count > self.config.max_group_operations
             || inline_bytes > self.config.max_group_inline_bytes
         {

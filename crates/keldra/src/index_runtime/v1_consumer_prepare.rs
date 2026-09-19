@@ -20,6 +20,232 @@ pub(super) struct PreparedWindow {
     selection_duration: Duration,
 }
 
+pub(super) struct PreparedRealtimeMicrobatch {
+    pub(super) query: PreparedQueryMutationBatch,
+    pub(super) query_credits: QueryBlockCredits,
+    pub(super) input_credits: Vec<QueryBlockCredits>,
+}
+
+struct SharedRealtimeMutation {
+    source: SourceId,
+    mutation: Mutation,
+    selected: SelectedV1Source,
+    input: Arc<IndexingMemoryPermit>,
+}
+
+/// Read and select one bucket microbatch once, then prepare every physical
+/// family from shared immutable selection facts. The selected projection and
+/// its exact retained permit are `Arc` owned until all bounded fanout tasks
+/// finish, so fanout does not duplicate unaccounted payload-derived memory.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn prepare_realtime_bucket_fanout(
+    mut recipes: Vec<Arc<PhysicalCatalogRecipe>>,
+    mutations: Vec<(SourceId, Mutation)>,
+    reader: &ClusterObjectReader,
+    extractor: &V1ProjectionExtractor,
+    credits: &IndexingMemoryCredits,
+    limits: Limits,
+) -> Result<
+    Vec<(
+        Arc<PhysicalCatalogRecipe>,
+        Option<PreparedRealtimeMicrobatch>,
+    )>,
+    Status,
+> {
+    if recipes.is_empty() {
+        return Ok(Vec::new());
+    }
+    recipes.sort_by_key(|recipe| recipe.family.family_id);
+    let exact_requests = mutations
+        .iter()
+        .map(|(_, mutation)| ExactMutationRequest {
+            path: &mutation.path,
+            canonical_path: mutation.canonical_path.as_deref(),
+            version: mutation.version,
+            deleted: mutation.deleted,
+        })
+        .collect::<Vec<_>>();
+    let exact =
+        load_exact_mutations(reader, &recipes[0], &exact_requests, limits.parallelism).await?;
+    let mut catalog_hasher = blake3::Hasher::new();
+    catalog_hasher.update(b"keldra/v1/realtime-selection-catalog/v1\0");
+    for recipe in &recipes {
+        catalog_hasher.update(&recipe.physical_generation);
+    }
+    let catalog_identity = *catalog_hasher.finalize().as_bytes();
+    let mut shared = Vec::with_capacity(mutations.len());
+    for ((source, mutation), mut exact) in mutations.into_iter().zip(exact) {
+        let content_type = match &exact {
+            IndexSourceMutation::Upsert(object) => object.content_type.as_deref(),
+            IndexSourceMutation::Remove { .. } => None,
+        };
+        let matched = matching_recipes(
+            &recipes,
+            mutation.tenant_id,
+            mutation.bucket_id,
+            &mutation.path,
+            content_type,
+        );
+        if matched.is_empty() {
+            extractor.discard_hot_through(
+                mutation.tenant_id,
+                mutation.bucket_id,
+                &mutation.path,
+                mutation.version,
+            );
+            exact = IndexSourceMutation::Remove {
+                identity: keldra_index::v1::ObjectIdentity {
+                    path: mutation.path.clone(),
+                    version: mutation.version,
+                },
+                canonical_path: mutation.canonical_path.clone(),
+            };
+        }
+        let mut selected = extractor
+            .select(
+                mutation.tenant_id,
+                mutation.bucket_id,
+                exact,
+                if matched.is_empty() {
+                    &recipes
+                } else {
+                    &matched
+                },
+                catalog_identity,
+                credits,
+            )
+            .await?;
+        let retained = selected_mutation_resident_bytes(&mutation, &selected)?;
+        let input = Arc::new(
+            credits
+                .acquire(IndexingMemoryStage::ReplayInput, retained.max(1))
+                .map_err(|_| {
+                    Status::resource_exhausted("real-time shared input memory unavailable")
+                })?,
+        );
+        drop(selected.selection_memory.take());
+        shared.push(Arc::new(SharedRealtimeMutation {
+            source,
+            mutation,
+            selected,
+            input,
+        }));
+    }
+
+    let shared = Arc::new(shared);
+    let mut pending = VecDeque::from(recipes);
+    let mut active = tokio::task::JoinSet::new();
+    let mut output = Vec::new();
+    while !pending.is_empty() || !active.is_empty() {
+        while active.len() < limits.parallelism.max(1) {
+            let Some(recipe) = pending.pop_front() else {
+                break;
+            };
+            let shared = shared.clone();
+            let extractor = extractor.clone();
+            let credits = credits.clone();
+            active.spawn(async move {
+                let prepared = prepare_realtime_family_from_shared(
+                    recipe.clone(),
+                    shared,
+                    &extractor,
+                    &credits,
+                    limits,
+                )
+                .await?;
+                Ok::<_, Status>((recipe, prepared))
+            });
+        }
+        if let Some(joined) = active.join_next().await {
+            output.push(joined.map_err(|error| {
+                Status::internal(format!("real-time family preparation task failed: {error}"))
+            })??);
+        }
+    }
+    output.sort_by_key(|(recipe, _)| recipe.family.family_id);
+    Ok(output)
+}
+
+async fn prepare_realtime_family_from_shared(
+    recipe: Arc<PhysicalCatalogRecipe>,
+    shared: Arc<Vec<Arc<SharedRealtimeMutation>>>,
+    extractor: &V1ProjectionExtractor,
+    credits: &IndexingMemoryCredits,
+    limits: Limits,
+) -> Result<Option<PreparedRealtimeMicrobatch>, Status> {
+    let mut by_source = BTreeMap::<SourceId, Vec<V1PreparationSlot>>::new();
+    let mut metadata = BTreeMap::<SourceId, Vec<Mutation>>::new();
+    for value in shared.iter() {
+        let content_type = match &value.selected.source {
+            IndexSourceMutation::Upsert(object) => object.content_type.as_deref(),
+            IndexSourceMutation::Remove { .. } => None,
+        };
+        let matches = !matching_recipes(
+            std::slice::from_ref(&recipe),
+            value.mutation.tenant_id,
+            value.mutation.bucket_id,
+            &value.mutation.path,
+            content_type,
+        )
+        .is_empty();
+        let mut selected = value.selected.clone();
+        if !matches {
+            selected.source = IndexSourceMutation::Remove {
+                identity: keldra_index::v1::ObjectIdentity {
+                    path: value.mutation.path.clone(),
+                    version: value.mutation.version,
+                },
+                canonical_path: value.mutation.canonical_path.clone(),
+            };
+            selected.selected = None;
+        }
+        metadata
+            .entry(value.source)
+            .or_default()
+            .push(value.mutation.clone());
+        by_source
+            .entry(value.source)
+            .or_default()
+            .push(V1PreparationSlot {
+                selected,
+                credits: super::empty_query_credits(credits, limits)?,
+                prepared: None,
+                source_memory: Some(value.input.clone()),
+                workspace_memory: None,
+            });
+    }
+    let mut query = PreparedQueryMutationBatch::default();
+    let mut input_credits = Vec::new();
+    for (source, slots) in by_source {
+        let mutations = metadata
+            .remove(&source)
+            .ok_or_else(|| Status::internal("missing shared realtime metadata"))?;
+        let prepared = extractor
+            .prepare_batch_owned(source_scope(source), recipe.clone(), slots)
+            .await?;
+        for (mutation, mut slot) in mutations.into_iter().zip(prepared) {
+            let mut document = slot
+                .prepared
+                .take()
+                .ok_or_else(|| Status::internal("realtime family preparation omitted a slot"))?;
+            bind_realtime_source_position(&mut document.query, mutation.offset)
+                .map_err(index_status)?;
+            super::merge_query(&mut query, document.query)?;
+            input_credits.push(slot.credits);
+        }
+    }
+    if query.membership.is_none() && query.fields.is_empty() {
+        return Ok(None);
+    }
+    let mut query_credits = super::empty_query_credits(credits, limits)?;
+    query_credits.enter_sealing().map_err(index_status)?;
+    Ok(Some(PreparedRealtimeMicrobatch {
+        query,
+        query_credits,
+        input_credits,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare_window(
     recipe: Arc<PhysicalCatalogRecipe>,
@@ -334,6 +560,7 @@ mod order_tests {
                 material_source_version: offset,
                 current_source_version: offset,
                 live: true,
+                selective_source_position: None,
                 source_path: Some(path.into()),
                 canonical_source_path: None,
                 result_path: Some(path.into()),

@@ -12,10 +12,10 @@ use keldra_atomic_program::{
     ProgramInvocation,
 };
 use keldra_consensus::{
-    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, AtomicBundleAuthority, BeginBatch,
-    BundleRef, Command, CommitPreparedBatch, CommittedBatch, CommittedInvocation, DecisionRaft,
-    DecisionRaftError, DurabilityClass, DurabilityEvidenceHash, ExecutorNomination,
-    InvocationFingerprint, InvocationId, NodeId, ParticipantManifestHash,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, AtomicBundleAuthority,
+    AtomicIndexingIntent, BeginBatch, BundleRef, Command, CommitPreparedBatch, CommittedBatch,
+    CommittedInvocation, DecisionRaft, DecisionRaftError, DurabilityClass, DurabilityEvidenceHash,
+    ExecutorNomination, InvocationFingerprint, InvocationId, NodeId, ParticipantManifestHash,
     ProgramHash as DecisionProgramHash, ProgramPathHash,
 };
 use keldra_store::{
@@ -120,6 +120,7 @@ pub(crate) struct InvokedProgramResult {
     pub alias_targets: BTreeMap<ObjectPath, ObjectPath>,
     pub replayed: bool,
     pub replay_guarantee_expires_at_unix_millis: u64,
+    pub realtime_visibility: Option<keldra_store::ProgramJournalVisibility>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +130,7 @@ pub(crate) struct BuiltInReplayLookup {
     pub contract_version: u16,
     pub invocation_id: [u8; 32],
     pub input_fingerprint: [u8; 32],
+    pub indexing_intent: keldra_store::IndexingIntent,
 }
 
 /// True only when this node's applied Raft state has no committed atomic batch
@@ -393,6 +395,34 @@ impl ProgramCoordinator {
         L: Fn(&ExpandedProgramPath) -> Result<(), Status>,
         C: Fn(&ExpandedProgramPath) -> Result<(), Status>,
     {
+        self.invoke_with_indexing(
+            program_key,
+            expected_program_hash,
+            invocation_id,
+            input_json,
+            durability_class,
+            keldra_store::IndexingIntent::Standard,
+            authorize_logical,
+            authorize_canonical,
+        )
+        .await
+    }
+
+    pub async fn invoke_with_indexing<L, C>(
+        &self,
+        program_key: ObjectKey,
+        expected_program_hash: [u8; 32],
+        invocation_id: String,
+        input_json: &[u8],
+        durability_class: &str,
+        indexing_intent: keldra_store::IndexingIntent,
+        authorize_logical: L,
+        authorize_canonical: C,
+    ) -> Result<InvokedProgramResult, Status>
+    where
+        L: Fn(&ExpandedProgramPath) -> Result<(), Status>,
+        C: Fn(&ExpandedProgramPath) -> Result<(), Status>,
+    {
         let invocation_hash = invocation_identity(&program_key, &invocation_id);
         let invocation_hash = hex::encode(invocation_hash.0);
         let program_hash = hex::encode(expected_program_hash);
@@ -411,6 +441,7 @@ impl ProgramCoordinator {
                 invocation_id,
                 input_json,
                 durability_class,
+                indexing_intent,
                 authorize_logical,
                 authorize_canonical,
             )
@@ -433,6 +464,7 @@ impl ProgramCoordinator {
         invocation_id: String,
         input_json: &[u8],
         durability_class: &str,
+        indexing_intent: keldra_store::IndexingIntent,
         authorize_logical: L,
         authorize_canonical: C,
     ) -> Result<InvokedProgramResult, Status>
@@ -473,8 +505,9 @@ impl ProgramCoordinator {
             })?
         };
         let program_path_hash = program_path_hash(&program_key);
-        let invocation = ProgramInvocation::from_input(program_path_hash, invocation_id, input)
+        let mut invocation = ProgramInvocation::from_input(program_path_hash, invocation_id, input)
             .map_err(Status::invalid_argument)?;
+        bind_program_indexing_intent(&mut invocation.input_fingerprint, indexing_intent);
         let fingerprint = decode_fingerprint(&invocation.input_fingerprint)?;
         let consensus_invocation_id = invocation_identity(&program_key, &invocation.command_id);
 
@@ -632,6 +665,7 @@ impl ProgramCoordinator {
                     participant_manifest_hash: ParticipantManifestHash(
                         prepared.participant_manifest_hash,
                     ),
+                    indexing_intent: decision_indexing_intent(indexing_intent),
                     proposal_at_unix_millis,
                     replay_expires_at_unix_millis,
                 }))
@@ -700,11 +734,12 @@ impl ProgramCoordinator {
 
             let result = self
                 .store
-                .apply_program_bundle(
+                .apply_program_bundle_with_indexing(
                     lease,
                     &prepared,
                     program_commit(applied_cursor, committed.invocation.committed_batch),
                     mutation_context,
+                    indexing_intent,
                 )
                 .await
                 .map_err(program_store_status)?;
@@ -938,6 +973,20 @@ fn compare_commit_cursors(applied: Option<u64>, consensus: Option<u64>) -> Order
     applied.cmp(&consensus)
 }
 
+fn decision_indexing_intent(intent: keldra_store::IndexingIntent) -> AtomicIndexingIntent {
+    match intent {
+        keldra_store::IndexingIntent::Standard => AtomicIndexingIntent::Standard,
+        keldra_store::IndexingIntent::Realtime => AtomicIndexingIntent::Realtime,
+    }
+}
+
+fn store_indexing_intent(intent: AtomicIndexingIntent) -> keldra_store::IndexingIntent {
+    match intent {
+        AtomicIndexingIntent::Standard => keldra_store::IndexingIntent::Standard,
+        AtomicIndexingIntent::Realtime => keldra_store::IndexingIntent::Realtime,
+    }
+}
+
 fn tagged_hash(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(tag);
@@ -945,6 +994,31 @@ fn tagged_hash(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
         hasher.update(&(part.len() as u64).to_be_bytes());
         hasher.update(part);
     }
+    *hasher.finalize().as_bytes()
+}
+
+pub(super) fn bind_program_indexing_intent(
+    fingerprint: &mut String,
+    indexing_intent: keldra_store::IndexingIntent,
+) {
+    if indexing_intent == keldra_store::IndexingIntent::Realtime {
+        let mut hasher = blake3::Hasher::new_derive_key("keldra.atomic-program.indexing-intent/v1");
+        hasher.update(fingerprint.as_bytes());
+        hasher.update(b"realtime");
+        *fingerprint = hasher.finalize().to_hex().to_string();
+    }
+}
+
+pub(super) fn bind_binary_indexing_intent(
+    fingerprint: [u8; 32],
+    indexing_intent: keldra_store::IndexingIntent,
+) -> [u8; 32] {
+    if indexing_intent == keldra_store::IndexingIntent::Standard {
+        return fingerprint;
+    }
+    let mut hasher = blake3::Hasher::new_derive_key("keldra.atomic-program.indexing-intent/v1");
+    hasher.update(&fingerprint);
+    hasher.update(b"realtime");
     *hasher.finalize().as_bytes()
 }
 
@@ -1056,6 +1130,7 @@ fn invoked_result(
         alias_targets: result.alias_targets,
         replayed,
         replay_guarantee_expires_at_unix_millis: invocation.replay_expires_at_unix_millis,
+        realtime_visibility: result.realtime_visibility,
     }
 }
 
@@ -1190,7 +1265,10 @@ fn program_store_status(error: ProgramStoreError) -> Status {
         ProgramStoreError::ProgramHashMismatch => {
             Status::failed_precondition(format!("PROGRAM_VERSION_MISMATCH: {error}"))
         }
-        ProgramStoreError::CommitCorruption { .. } => Status::already_exists(error.to_string()),
+        ProgramStoreError::CommitCorruption { .. }
+        | ProgramStoreError::IndexingIntentConflict { .. } => {
+            Status::already_exists(error.to_string())
+        }
         ProgramStoreError::ExecutorLocalDurability => {
             Status::unavailable(format!("DURABILITY_UNAVAILABLE: {error}"))
         }

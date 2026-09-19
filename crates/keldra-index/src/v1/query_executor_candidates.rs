@@ -42,6 +42,7 @@ mod replacement_tests {
             material_source_version: version,
             current_source_version: version,
             live,
+            selective_source_position: None,
             source_path: Some("objects/a".into()),
             canonical_source_path: None,
             result_path: Some("objects/a".into()),

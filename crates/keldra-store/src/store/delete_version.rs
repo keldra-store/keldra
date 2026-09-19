@@ -16,12 +16,31 @@ impl Store {
         governance: ObjectMutationGovernance,
         context: ObjectMutationContext,
     ) -> Result<CoordinatedRetainedVersionDelete, MutationError> {
+        self.coordinate_retained_version_delete_with_indexing(
+            key,
+            version_id,
+            governance,
+            context,
+            crate::IndexingIntent::Standard,
+        )
+        .await
+    }
+
+    pub async fn coordinate_retained_version_delete_with_indexing(
+        &self,
+        key: &ObjectKey,
+        version_id: VersionId,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+        indexing_intent: crate::IndexingIntent,
+    ) -> Result<CoordinatedRetainedVersionDelete, MutationError> {
         self.coordinate_retained_version_delete_inner(
             key,
             version_id,
             governance,
             context,
             LocalReferenceEffects::Deferred,
+            indexing_intent,
         )
         .await
     }
@@ -36,12 +55,31 @@ impl Store {
         governance: ObjectMutationGovernance,
         context: ObjectMutationContext,
     ) -> Result<CoordinatedRetainedVersionDelete, MutationError> {
+        self.coordinate_local_retained_version_delete_with_indexing(
+            key,
+            version_id,
+            governance,
+            context,
+            crate::IndexingIntent::Standard,
+        )
+        .await
+    }
+
+    pub async fn coordinate_local_retained_version_delete_with_indexing(
+        &self,
+        key: &ObjectKey,
+        version_id: VersionId,
+        governance: ObjectMutationGovernance,
+        context: ObjectMutationContext,
+        indexing_intent: crate::IndexingIntent,
+    ) -> Result<CoordinatedRetainedVersionDelete, MutationError> {
         self.coordinate_retained_version_delete_inner(
             key,
             version_id,
             governance,
             context,
             LocalReferenceEffects::AppliedInline,
+            indexing_intent,
         )
         .await
     }
@@ -53,6 +91,7 @@ impl Store {
         governance: ObjectMutationGovernance,
         context: ObjectMutationContext,
         reference_effects: LocalReferenceEffects,
+        indexing_intent: crate::IndexingIntent,
     ) -> Result<CoordinatedRetainedVersionDelete, MutationError> {
         governance.validate()?;
         if governance.versioning != ObjectVersioning::Enabled {
@@ -81,6 +120,15 @@ impl Store {
                 return Err(MutationError::Storage(
                     "head references a missing retained version".into(),
                 ));
+            }
+            if let Some(replay) = self.replay_current_retained_version_delete(
+                identity,
+                key,
+                version_id,
+                &expected_head,
+                indexing_intent,
+            )? {
+                return Ok(replay);
             }
             return Ok(not_found());
         };
@@ -208,7 +256,24 @@ impl Store {
                 accounting_transition: None,
             }
         }));
-        self.stage_local_changes(&mut batch, &changes, reference_effects)?;
+        let realtime_head_transition = indexing_intent == crate::IndexingIntent::Realtime
+            && mutation.replacement_tombstone.is_some();
+        let realtime_change_indices = if realtime_head_transition {
+            (0..changes.len()).collect()
+        } else {
+            BTreeSet::new()
+        };
+        self.stage_local_changes_from_status_with_realtime(
+            &mut batch,
+            &changes,
+            &realtime_change_indices,
+            reference_effects,
+            super::journal_capacity::SourceJournalAdmission::Bounded,
+            source,
+            source.tail,
+            reference_effects != LocalReferenceEffects::Deferred,
+            true,
+        )?;
         if reference_effects == LocalReferenceEffects::Deferred {
             self.stage_retained_version_delete_reference_proof(&mut batch, &mutation)?;
         }
@@ -220,8 +285,18 @@ impl Store {
             self.settle_inline_source_changes()?;
         }
         self.notify_local_invalidations();
+        if realtime_head_transition {
+            self.notify_realtime_journal_routes();
+        }
         Ok(CoordinatedRetainedVersionDelete {
             outcome: mutation.outcome(),
+            realtime_visibility: realtime_head_transition.then(|| {
+                let expires_at =
+                    now.saturating_add(self.mutation_receipt_retention.retention_millis());
+                crate::RealtimeVisibilityEvidence::from_retained_version_delete(
+                    &mutation, expires_at,
+                )
+            }),
             mutation: Some(mutation),
         })
     }
@@ -346,6 +421,107 @@ impl Store {
         Ok(())
     }
 
+    fn replay_current_retained_version_delete(
+        &self,
+        identity: BucketIdentity,
+        key: &ObjectKey,
+        deleted_version: VersionId,
+        current: &Head,
+        indexing_intent: crate::IndexingIntent,
+    ) -> Result<Option<CoordinatedRetainedVersionDelete>, MutationError> {
+        if !current.deleted {
+            return Ok(None);
+        }
+        let Some(stamp) = current.mutation_stamp else {
+            return Ok(None);
+        };
+        let Some(current_version) =
+            self.version_metadata_by_identity(identity, key, current.version)?
+        else {
+            return Err(MutationError::Storage(
+                "current retained-delete tombstone descriptor is missing".into(),
+            ));
+        };
+        let encoded = self
+            .db
+            .get_cf(
+                self.cf(CF_LOCAL_INVALIDATIONS)?,
+                invalidation_key(stamp.source_journal_position),
+            )
+            .map_err(storage_error)?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        let decoded = self.decode_local_change_record_with_length(&encoded)?;
+        let crate::LocalChange::RetainedVersionDeleted(change) = decoded.change else {
+            return Ok(None);
+        };
+        if change.tenant_id != identity.tenant_id.0
+            || change.bucket_id != identity.bucket_id.0
+            || change.exact_path != key.path()
+            || change.canonical_path.is_some()
+            || change.deleted_version != deleted_version
+            || change.resulting_head_version != Some(current.version)
+        {
+            return Ok(None);
+        }
+        if decoded.indexing_intent != indexing_intent {
+            return Err(MutationError::IdempotencyConflict);
+        }
+        let mut source_journal_through_position = stamp.source_journal_position;
+        if indexing_intent == crate::IndexingIntent::Realtime {
+            loop {
+                let Some(next) = source_journal_through_position.checked_add(1) else {
+                    break;
+                };
+                let Some(encoded) = self
+                    .db
+                    .get_cf(self.cf(CF_LOCAL_INVALIDATIONS)?, invalidation_key(next))
+                    .map_err(storage_error)?
+                else {
+                    break;
+                };
+                let decoded_alias = self.decode_local_change_record_with_length(&encoded)?;
+                let crate::LocalChange::RetainedVersionDeleted(alias) = decoded_alias.change else {
+                    break;
+                };
+                if decoded_alias.indexing_intent != crate::IndexingIntent::Realtime
+                    || alias.tenant_id != identity.tenant_id.0
+                    || alias.bucket_id != identity.bucket_id.0
+                    || alias.canonical_path.as_deref() != Some(key.path())
+                    || alias.deleted_version != deleted_version
+                    || alias.resulting_head_version != Some(current.version)
+                {
+                    break;
+                }
+                source_journal_through_position = next;
+            }
+        }
+        let realtime_visibility = (indexing_intent == crate::IndexingIntent::Realtime).then(|| {
+            crate::RealtimeVisibilityEvidence {
+                source_id: stamp.source_id,
+                source_journal_position: stamp.source_journal_position,
+                source_journal_through_position,
+                tenant_id: identity.tenant_id.0,
+                bucket_id: identity.bucket_id.0,
+                exact_path: key.path().to_owned(),
+                version: current.version,
+                program_commit_cursor: None,
+                active_placement_log_id: stamp.active_placement_log_id,
+                expires_at_unix_millis: current_version
+                    .committed_at_unix_millis
+                    .saturating_add(self.mutation_receipt_retention.retention_millis()),
+            }
+        });
+        Ok(Some(CoordinatedRetainedVersionDelete {
+            outcome: DeleteRetainedVersionOutcome::ReplacedCurrentWithTombstone {
+                version: current.version,
+            },
+            mutation: None,
+            realtime_visibility,
+        }))
+    }
+
     fn write_retained_version_delete(&self, batch: WriteBatch) -> Result<(), MutationError> {
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
@@ -357,6 +533,7 @@ fn not_found() -> CoordinatedRetainedVersionDelete {
     CoordinatedRetainedVersionDelete {
         outcome: DeleteRetainedVersionOutcome::NotFound,
         mutation: None,
+        realtime_visibility: None,
     }
 }
 
@@ -451,12 +628,22 @@ mod tests {
             serving_fence_term: 4,
         };
         let coordinated = source
-            .coordinate_retained_version_delete(&key(), first.version, governance.clone(), context)
+            .coordinate_retained_version_delete_with_indexing(
+                &key(),
+                first.version,
+                governance.clone(),
+                context,
+                crate::IndexingIntent::Realtime,
+            )
             .await
             .unwrap();
         assert_eq!(
             coordinated.outcome,
             DeleteRetainedVersionOutcome::DeletedNonCurrent
+        );
+        assert!(
+            coordinated.realtime_visibility.is_none(),
+            "deleting a non-current retained version must not claim query visibility"
         );
         let mutation = coordinated.mutation.unwrap();
         let proof = source
@@ -501,15 +688,48 @@ mod tests {
 
         let current = source.head(&key()).unwrap().unwrap().version;
         let coordinated = source
-            .coordinate_retained_version_delete(&key(), current, governance, context)
+            .coordinate_retained_version_delete_with_indexing(
+                &key(),
+                current,
+                governance.clone(),
+                context,
+                crate::IndexingIntent::Realtime,
+            )
             .await
             .unwrap();
+        assert!(coordinated.realtime_visibility.is_some());
+        let replay_evidence = coordinated.realtime_visibility.clone();
         let outcome = coordinated.outcome.clone();
         let DeleteRetainedVersionOutcome::ReplacedCurrentWithTombstone { version } = outcome else {
             panic!("current deletion must install a fresh tombstone")
         };
         assert!(version > current);
         let mutation = coordinated.mutation.unwrap();
+        let replay = source
+            .coordinate_retained_version_delete_with_indexing(
+                &key(),
+                current,
+                governance.clone(),
+                context,
+                crate::IndexingIntent::Realtime,
+            )
+            .await
+            .unwrap();
+        assert!(replay.mutation.is_none());
+        assert_eq!(replay.realtime_visibility, replay_evidence);
+        assert_eq!(
+            source
+                .coordinate_retained_version_delete_with_indexing(
+                    &key(),
+                    current,
+                    governance,
+                    context,
+                    crate::IndexingIntent::Standard,
+                )
+                .await
+                .unwrap_err(),
+            MutationError::IdempotencyConflict
+        );
         let applied = replica
             .apply_retained_version_delete_replica(&mutation)
             .await

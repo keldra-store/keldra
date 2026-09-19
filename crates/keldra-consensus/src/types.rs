@@ -320,6 +320,12 @@ impl SystemBootstrapState {
 /// Object paths, payloads, version descriptors, locks, and the bundle itself
 /// remain outside Raft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AtomicIndexingIntent {
+    Standard,
+    Realtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeginBatch {
     pub executor: NodeId,
     pub nomination_log_index: u64,
@@ -330,6 +336,8 @@ pub struct BeginBatch {
     pub durability_class: DurabilityClass,
     pub durability_evidence_hash: DurabilityEvidenceHash,
     pub participant_manifest_hash: ParticipantManifestHash,
+    /// Index publication lane committed with the invocation.
+    pub indexing_intent: AtomicIndexingIntent,
     /// Executor wall-clock observation committed as data so every Raft apply
     /// prunes the same replay entries.
     pub proposal_at_unix_millis: u64,
@@ -376,6 +384,7 @@ pub struct CommittedBatch {
     pub durability_class: DurabilityClass,
     pub durability_evidence_hash: DurabilityEvidenceHash,
     pub participant_manifest_hash: ParticipantManifestHash,
+    pub indexing_intent: AtomicIndexingIntent,
 }
 
 /// One bounded committed invocation retained for replay independently of the

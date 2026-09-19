@@ -352,7 +352,9 @@ fn add_live_gate(
         QueryAdmissionCandidate {
             partition: view.pin.partition,
             handoff_lineage_id: view.pin.handoff_lineage_id,
-            covered_through_source_position: view.pin.covered_through_source_position()?,
+            covered_through_source_position: gate
+                .selective_source_position
+                .unwrap_or(view.pin.covered_through_source_position()?),
             document,
             material_source_version: gate.material_source_version,
             current_source_version: gate.current_source_version,

@@ -1841,6 +1841,7 @@ fn put(config: &Config, path: String, bytes: Vec<u8>, command_id: String) -> Bul
             content_type: CONTENT_TYPE.into(),
             command_id,
             durability: configured_durability(config) as i32,
+            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
         })),
     }
 }
@@ -1931,6 +1932,7 @@ async fn query_page(
             tenant: String::new(),
             required_freshness: None,
             authorization_subject: None,
+            required_visibility_tokens: Vec::new(),
         })
         .await
         .map(tonic::Response::into_inner)

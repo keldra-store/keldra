@@ -245,6 +245,21 @@ pub enum Durability {
     Replicated,
 }
 
+/// Selects whether a committed object mutation is also enrolled in the
+/// disposable low-latency index projection lane.
+///
+/// The source journal remains authoritative in both modes. `Realtime` only
+/// adds a durable sparse routing marker in the same metadata commit so a
+/// dedicated projection worker can find the selected event without scanning
+/// ordinary indexing traffic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexingIntent {
+    #[default]
+    Standard,
+    Realtime,
+}
+
 #[derive(Clone, Debug)]
 pub struct PutRequest {
     pub key: ObjectKey,
@@ -310,6 +325,71 @@ pub struct MutationReceipt {
     pub replayed: bool,
     /// Zero only for internal callers that deliberately omitted a command ID.
     pub replay_guarantee_expires_at_unix_millis: u64,
+    /// Present only when this request enrolled the mutation in the durable
+    /// real-time projection lane.
+    pub realtime_visibility: Option<RealtimeVisibilityEvidence>,
+}
+
+/// Stable evidence a query can use to wait for one selected mutation without
+/// claiming that every preceding ordinary mutation has been projected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeVisibilityEvidence {
+    pub source_id: SourceId,
+    pub source_journal_position: u64,
+    pub source_journal_through_position: u64,
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+    pub exact_path: String,
+    pub version: VersionId,
+    pub program_commit_cursor: Option<u64>,
+    pub active_placement_log_id: PlacementLogId,
+    pub expires_at_unix_millis: u64,
+}
+
+impl RealtimeVisibilityEvidence {
+    pub fn from_mutation(mutation: &ObjectMutation) -> Self {
+        Self {
+            source_id: mutation.stamp.source_id,
+            source_journal_position: mutation.stamp.source_journal_position,
+            source_journal_through_position: mutation.stamp.source_journal_position.saturating_add(
+                mutation
+                    .alias_snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.registry.aliases.len() as u64),
+            ),
+            tenant_id: mutation.tenant_id,
+            bucket_id: mutation.bucket_id,
+            exact_path: mutation.exact_path.clone(),
+            version: mutation.version.id,
+            program_commit_cursor: mutation.stamp.program_commit_cursor,
+            active_placement_log_id: mutation.stamp.active_placement_log_id,
+            expires_at_unix_millis: mutation.receipt_expires_at_unix_millis,
+        }
+    }
+
+    pub fn from_retained_version_delete(
+        mutation: &RetainedVersionDeleteMutation,
+        expires_at_unix_millis: u64,
+    ) -> Self {
+        Self {
+            source_id: mutation.stamp.source_id,
+            source_journal_position: mutation.stamp.source_journal_position,
+            source_journal_through_position: mutation
+                .stamp
+                .source_journal_position
+                .saturating_add(mutation.alias_paths.len() as u64),
+            tenant_id: mutation.tenant_id,
+            bucket_id: mutation.bucket_id,
+            exact_path: mutation.exact_path.clone(),
+            version: mutation
+                .replacement_tombstone
+                .as_ref()
+                .map_or(mutation.target.id, |replacement| replacement.id),
+            program_commit_cursor: mutation.stamp.program_commit_cursor,
+            active_placement_log_id: mutation.stamp.active_placement_log_id,
+            expires_at_unix_millis,
+        }
+    }
 }
 
 /// Consensus-derived values needed to construct one distributed object
@@ -606,6 +686,7 @@ impl ObjectMutation {
             deleted: self.version.deleted,
             replayed,
             replay_guarantee_expires_at_unix_millis: self.receipt_expires_at_unix_millis,
+            realtime_visibility: None,
         }
     }
 }
@@ -792,6 +873,7 @@ impl RetainedVersionDeleteMutation {
 pub struct CoordinatedRetainedVersionDelete {
     pub outcome: DeleteRetainedVersionOutcome,
     pub mutation: Option<RetainedVersionDeleteMutation>,
+    pub realtime_visibility: Option<RealtimeVisibilityEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -180,6 +180,11 @@ impl ClusterPeerService {
         }
         let store = self.store.clone();
         let commit_cursor = request.get_ref().commit_cursor;
+        let indexing_intent = match request.get_ref().indexing_intent {
+            0 => keldra_store::IndexingIntent::Standard,
+            1 => keldra_store::IndexingIntent::Realtime,
+            _ => return Err(Status::invalid_argument("unknown program indexing intent")),
+        };
         let deadline = Instant::now()
             .checked_add(admitted.timeout)
             .ok_or_else(|| Status::invalid_argument("program deadline overflowed"))?;
@@ -193,7 +198,12 @@ impl ClusterPeerService {
         };
         let coordinated = tokio::time::timeout(remaining(deadline)?, async move {
             store
-                .coordinate_program_path_finalization(stage, commit_cursor, context)
+                .coordinate_program_path_finalization_with_indexing(
+                    stage,
+                    commit_cursor,
+                    context,
+                    indexing_intent,
+                )
                 .await
         })
         .await
@@ -828,6 +838,7 @@ fn program_status(error: ProgramStoreError) -> Status {
         | ProgramStoreError::DurabilityEvidenceMismatch => Status::data_loss(error.to_string()),
         ProgramStoreError::ExecutorLocalDurability
         | ProgramStoreError::OutOfOrderCommit { .. }
+        | ProgramStoreError::IndexingIntentConflict { .. }
         | ProgramStoreError::DurabilityClassMismatch => {
             Status::failed_precondition(error.to_string())
         }

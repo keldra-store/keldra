@@ -24,6 +24,7 @@ fn receipt(version: u64) -> MutationReceipt {
         deleted: false,
         replayed: false,
         replay_guarantee_expires_at_unix_millis: 1,
+        realtime_visibility: None,
     }
 }
 

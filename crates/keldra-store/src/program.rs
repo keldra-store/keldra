@@ -21,7 +21,7 @@ use crate::store::{
 };
 use crate::{
     AccountingHeadTransition, BlobRef, Head, MutationError, ObjectKey, ObjectMutationContext,
-    ReferenceDelta, Store, Version, VersionId,
+    PlacementLogId, ReferenceDelta, Store, Version, VersionId,
 };
 
 mod alias_resolution;
@@ -44,7 +44,7 @@ pub use distributed::{
     ProgramPathMutation, ProgramPathStage, ReplicaProgramPathApplied,
     alias_registry_stages_from_prepared, path_stage_from_prepared,
 };
-pub use publication::SealedAtomicBatchPublication;
+pub use publication::{AtomicBatchPublicationResult, SealedAtomicBatchPublication};
 pub use reservations::{
     BuiltInAliasObservation, BuiltInAliasRegistryAccess, BuiltInObjectTransactionPlan,
     BuiltInReadProof, BuiltInTransactionAssertion, BuiltInVersionWrite, BuiltInWritePayload,
@@ -286,7 +286,42 @@ pub struct AppliedProgramCommit {
     pub participant_manifest_hash: [u8; 32],
     pub durability_class: ProgramDurabilityClassHash,
     pub durability_evidence_hash: ProgramDurabilityEvidenceHash,
+    pub indexing_intent: crate::IndexingIntent,
+    pub journal_visibility: Option<ProgramJournalVisibility>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramJournalVisibility {
+    pub source_id: crate::SourceId,
+    pub atomic_source_journal_position: u64,
+    pub program_commit_cursor: u64,
+    pub atomic_unit_hash: [u8; 32],
+    pub routes: Vec<RealtimeVisibilityRoute>,
+    pub active_placement_log_id: PlacementLogId,
+    pub expires_at_unix_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RealtimeVisibilityRoute {
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredProgramVisibilityReceipt {
+    cursor: u64,
+    bundle_hash: PreparedBundleHash,
+    indexing_intent: crate::IndexingIntent,
+    visibility: Option<ProgramJournalVisibility>,
+}
+
+fn program_visibility_receipt_key(cursor: u64) -> Vec<u8> {
+    let mut key = b"program_visibility_receipt_v1/".to_vec();
+    key.extend_from_slice(&cursor.to_be_bytes());
+    key
+}
+
+const PROGRAM_VISIBILITY_RECEIPT_PREFIX: &[u8] = b"program_visibility_receipt_v1/";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommittedProgramResult {
@@ -294,6 +329,7 @@ pub struct CommittedProgramResult {
     pub published_versions: BTreeMap<ObjectPath, PublishedProgramVersion>,
     pub asserted_versions: BTreeMap<ObjectPath, Version>,
     pub alias_targets: BTreeMap<ObjectPath, ObjectPath>,
+    pub realtime_visibility: Option<ProgramJournalVisibility>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,6 +374,8 @@ pub enum ProgramStoreError {
     },
     #[error("commit cursor {cursor} is already bound to a different prepared bundle")]
     CommitCorruption { cursor: u64 },
+    #[error("program commit {cursor} was already applied with a different indexing intent")]
+    IndexingIntentConflict { cursor: u64 },
     #[error("durability evidence does not bind the committed bundle")]
     DurabilityEvidenceMismatch,
     #[error("durability evidence class does not match the committed durability class")]
@@ -432,6 +470,46 @@ impl VerifiedProgramDefinition {
 }
 
 impl Store {
+    fn stage_program_visibility_receipt(
+        &self,
+        batch: &mut WriteBatch,
+        receipt: StoredProgramVisibilityReceipt,
+        now_unix_millis: u64,
+    ) -> Result<(), ProgramStoreError> {
+        let metadata = self.program_cf(CF_METADATA)?;
+        for item in self.db.iterator_cf(
+            metadata,
+            rocksdb::IteratorMode::From(
+                PROGRAM_VISIBILITY_RECEIPT_PREFIX,
+                rocksdb::Direction::Forward,
+            ),
+        ) {
+            let (key, encoded) = item.map_err(program_storage_error)?;
+            if !key.starts_with(PROGRAM_VISIBILITY_RECEIPT_PREFIX) {
+                break;
+            }
+            let retained: StoredProgramVisibilityReceipt =
+                serde_json::from_slice(&encoded).map_err(program_storage_error)?;
+            if retained
+                .visibility
+                .as_ref()
+                .is_none_or(|visibility| visibility.expires_at_unix_millis <= now_unix_millis)
+            {
+                batch.delete_cf(metadata, key);
+            }
+        }
+        if receipt.indexing_intent == crate::IndexingIntent::Realtime
+            && receipt.visibility.is_some()
+        {
+            batch.put_cf(
+                metadata,
+                program_visibility_receipt_key(receipt.cursor),
+                serde_json::to_vec(&receipt).map_err(program_storage_error)?,
+            );
+        }
+        Ok(())
+    }
+
     /// Constructs an evaluator that necessarily shares this store's path-lock
     /// table and reads its committed snapshot.
     pub fn program_engine(
@@ -794,6 +872,7 @@ fn committed_result(record: &StoredPreparedBundle) -> CommittedProgramResult {
         published_versions,
         asserted_versions: record.asserted_versions(),
         alias_targets: record.alias_targets(),
+        realtime_visibility: None,
     }
 }
 
@@ -909,6 +988,24 @@ impl Store {
         commit: ProgramCommit,
         mutation_context: ObjectMutationContext,
     ) -> Result<CommittedProgramResult, ProgramStoreError> {
+        self.apply_program_bundle_with_indexing(
+            lease,
+            prepared,
+            commit,
+            mutation_context,
+            crate::IndexingIntent::Standard,
+        )
+        .await
+    }
+
+    pub async fn apply_program_bundle_with_indexing(
+        &self,
+        lease: ProgramExecutionLease,
+        prepared: &PreparedProgramBundle,
+        commit: ProgramCommit,
+        mutation_context: ObjectMutationContext,
+        indexing_intent: crate::IndexingIntent,
+    ) -> Result<CommittedProgramResult, ProgramStoreError> {
         let result = async {
             let source = lease.bundle();
             let source_encoded = serde_json::to_vec(source).map_err(program_storage_error)?;
@@ -932,13 +1029,35 @@ impl Store {
                     return Err(ProgramStoreError::PreparedBundleMismatch);
                 }
                 verify_loaded_commit(&loaded, &commit)?;
+                if let Some(receipt) = self.read_program_json::<StoredProgramVisibilityReceipt>(
+                    CF_METADATA,
+                    &program_visibility_receipt_key(commit.commit_cursor),
+                )? {
+                    if receipt.bundle_hash != commit.bundle_ref.hash {
+                        return Err(ProgramStoreError::CommitCorruption {
+                            cursor: commit.commit_cursor,
+                        });
+                    }
+                    if receipt.indexing_intent != indexing_intent {
+                        return Err(ProgramStoreError::IndexingIntentConflict {
+                            cursor: commit.commit_cursor,
+                        });
+                    }
+                    let mut result = committed_result(&loaded.record);
+                    result.realtime_visibility = receipt.visibility;
+                    return Ok(result);
+                }
                 let attempt = if let Some(existing) = self.applied_program_commit()?
                     && existing.commit_cursor == commit.commit_cursor
                 {
-                    self.match_applied_commit(&existing, &commit)?;
-                    Ok(committed_result(&loaded.record))
+                    self.match_applied_commit(&existing, &commit, indexing_intent)?;
+                    let mut result = committed_result(&loaded.record);
+                    if indexing_intent == crate::IndexingIntent::Realtime {
+                        result.realtime_visibility = existing.journal_visibility.clone();
+                    }
+                    Ok(result)
                 } else {
-                    self.apply_prepared_record(&loaded, &commit, mutation_context)
+                    self.apply_prepared_record(&loaded, &commit, mutation_context, indexing_intent)
                 };
                 drop(commit_guard);
                 match attempt {
@@ -960,17 +1079,56 @@ impl Store {
         commit: ProgramCommit,
         mutation_context: ObjectMutationContext,
     ) -> Result<CommittedProgramResult, ProgramStoreError> {
+        self.recover_program_bundle_with_indexing(
+            commit,
+            mutation_context,
+            crate::IndexingIntent::Standard,
+        )
+        .await
+    }
+
+    /// Recovery path for a committed bundle in the ordinary blob plane. The
+    /// indexing intent comes from the authoritative committed invocation and
+    /// must be preserved across executor restart or source-owner handoff.
+    pub async fn recover_program_bundle_with_indexing(
+        &self,
+        commit: ProgramCommit,
+        mutation_context: ObjectMutationContext,
+        indexing_intent: crate::IndexingIntent,
+    ) -> Result<CommittedProgramResult, ProgramStoreError> {
         let _policy_guard = self.policy_gate.read().await;
         if let Some(existing) = self.applied_program_commit()?
             && existing.commit_cursor == commit.commit_cursor
         {
-            self.match_applied_commit(&existing, &commit)?;
-            return self.committed_program_result(commit).await;
+            self.match_applied_commit(&existing, &commit, indexing_intent)?;
+            let mut result = self.committed_program_result(commit).await?;
+            if indexing_intent == crate::IndexingIntent::Realtime {
+                result.realtime_visibility = existing.journal_visibility.clone();
+            }
+            return Ok(result);
         }
         let loaded = self
             .load_prepared_bundle(commit.bundle_ref, commit.durability_evidence_hash)
             .await?;
         verify_loaded_commit(&loaded, &commit)?;
+        if let Some(receipt) = self.read_program_json::<StoredProgramVisibilityReceipt>(
+            CF_METADATA,
+            &program_visibility_receipt_key(commit.commit_cursor),
+        )? {
+            if receipt.bundle_hash != commit.bundle_ref.hash {
+                return Err(ProgramStoreError::CommitCorruption {
+                    cursor: commit.commit_cursor,
+                });
+            }
+            if receipt.indexing_intent != indexing_intent {
+                return Err(ProgramStoreError::IndexingIntentConflict {
+                    cursor: commit.commit_cursor,
+                });
+            }
+            let mut result = committed_result(&loaded.record);
+            result.realtime_visibility = receipt.visibility;
+            return Ok(result);
+        }
         let paths = loaded
             .record
             .preconditions
@@ -988,10 +1146,14 @@ impl Store {
             let attempt = if let Some(existing) = self.applied_program_commit()?
                 && existing.commit_cursor == commit.commit_cursor
             {
-                self.match_applied_commit(&existing, &commit)?;
-                Ok(committed_result(&loaded.record))
+                self.match_applied_commit(&existing, &commit, indexing_intent)?;
+                let mut result = committed_result(&loaded.record);
+                if indexing_intent == crate::IndexingIntent::Realtime {
+                    result.realtime_visibility = existing.journal_visibility.clone();
+                }
+                Ok(result)
             } else {
-                self.apply_prepared_record(&loaded, &commit, mutation_context)
+                self.apply_prepared_record(&loaded, &commit, mutation_context, indexing_intent)
             };
             drop(commit_guard);
             match attempt {
@@ -1014,7 +1176,21 @@ impl Store {
             .load_prepared_bundle(commit.bundle_ref, commit.durability_evidence_hash)
             .await?;
         verify_loaded_commit(&loaded, &commit)?;
-        Ok(committed_result(&loaded.record))
+        let mut result = committed_result(&loaded.record);
+        if let Some(receipt) = self.read_program_json::<StoredProgramVisibilityReceipt>(
+            CF_METADATA,
+            &program_visibility_receipt_key(commit.commit_cursor),
+        )? {
+            if receipt.bundle_hash != commit.bundle_ref.hash {
+                return Err(ProgramStoreError::CommitCorruption {
+                    cursor: commit.commit_cursor,
+                });
+            }
+            if receipt.indexing_intent == crate::IndexingIntent::Realtime {
+                result.realtime_visibility = receipt.visibility;
+            }
+        }
+        Ok(result)
     }
 
     pub fn applied_program_commit(
@@ -1037,7 +1213,15 @@ impl Store {
         &self,
         existing: &AppliedProgramCommit,
         requested: &ProgramCommit,
+        indexing_intent: crate::IndexingIntent,
     ) -> Result<(), ProgramStoreError> {
+        if existing.commit_cursor == requested.commit_cursor
+            && existing.indexing_intent != indexing_intent
+        {
+            return Err(ProgramStoreError::IndexingIntentConflict {
+                cursor: requested.commit_cursor,
+            });
+        }
         if existing.commit_cursor == requested.commit_cursor
             && existing.bundle_ref == requested.bundle_ref
             && existing.program_hash == requested.program_hash
@@ -1129,6 +1313,7 @@ impl Store {
         loaded: &LoadedPreparedBundle,
         commit: &ProgramCommit,
         mutation_context: ObjectMutationContext,
+        indexing_intent: crate::IndexingIntent,
     ) -> Result<CommittedProgramResult, ProgramStoreError> {
         let record = &loaded.record;
         validate_prepared_record(record)?;
@@ -1151,8 +1336,12 @@ impl Store {
         if let Some(existing) = &applied_commit
             && existing.commit_cursor == commit.commit_cursor
         {
-            self.match_applied_commit(existing, commit)?;
-            return Ok(committed_result(record));
+            self.match_applied_commit(existing, commit, indexing_intent)?;
+            let mut result = committed_result(record);
+            if indexing_intent == crate::IndexingIntent::Realtime {
+                result.realtime_visibility = existing.journal_visibility.clone();
+            }
+            return Ok(result);
         }
         let local_predecessor = applied_commit.as_ref().map(|applied| applied.commit_cursor);
         if local_predecessor != commit.previous_commit_cursor {
@@ -1283,16 +1472,7 @@ impl Store {
                 });
             }
         }
-        let result = committed_result(record);
-        let applied = AppliedProgramCommit {
-            commit_cursor: commit.commit_cursor,
-            bundle_ref: commit.bundle_ref,
-            program_hash: record.program_hash,
-            authority: record.authority,
-            participant_manifest_hash: record.participant_manifest_hash()?,
-            durability_class: commit.durability_class,
-            durability_evidence_hash: commit.durability_evidence_hash,
-        };
+        let mut result = committed_result(record);
 
         let journal_status = self
             .local_watch_status()
@@ -1567,6 +1747,65 @@ impl Store {
                 mutations,
             });
         }
+        let journal_visibility = if indexing_intent == crate::IndexingIntent::Realtime {
+            match changes.last() {
+                Some(PendingLocalChange::AtomicBatchPublished {
+                    cursor,
+                    bundle_hash,
+                    mutations,
+                }) => {
+                    let atomic_source_journal_position = journal_status
+                        .tail
+                        .checked_add(changes.len() as u64)
+                        .ok_or_else(|| {
+                            ProgramStoreError::Storage(
+                                "atomic visibility source position is exhausted".into(),
+                            )
+                        })?;
+                    let routes = mutations
+                        .iter()
+                        .map(|mutation| RealtimeVisibilityRoute {
+                            tenant_id: mutation.tenant_id,
+                            bucket_id: mutation.bucket_id,
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    Some(ProgramJournalVisibility {
+                        source_id: journal_status.source_id,
+                        atomic_source_journal_position,
+                        program_commit_cursor: *cursor,
+                        atomic_unit_hash: bundle_hash.0,
+                        routes,
+                        active_placement_log_id: mutation_context.active_placement_log_id,
+                        expires_at_unix_millis: publication_at_unix_millis
+                            .saturating_add(self.mutation_receipt_retention.retention_millis()),
+                    })
+                }
+                Some(_) => {
+                    return Err(ProgramStoreError::Storage(
+                        "atomic program journal omitted its complete publication marker".into(),
+                    ));
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let applied = AppliedProgramCommit {
+            commit_cursor: commit.commit_cursor,
+            bundle_ref: commit.bundle_ref,
+            program_hash: record.program_hash,
+            authority: record.authority,
+            participant_manifest_hash: record.participant_manifest_hash()?,
+            durability_class: commit.durability_class,
+            durability_evidence_hash: commit.durability_evidence_hash,
+            indexing_intent,
+            journal_visibility: journal_visibility.clone(),
+        };
+        if indexing_intent == crate::IndexingIntent::Realtime {
+            result.realtime_visibility = journal_visibility.clone();
+        }
         let bundle_reference = BlobRef::from(loaded.bundle);
         if let Some((reference_key, state)) = self
             .prepare_awaiting_blob_release(
@@ -1584,8 +1823,13 @@ impl Store {
             )
             .map_err(program_mutation_error)?;
         }
-        self.stage_local_changes(&mut batch, &changes, LocalReferenceEffects::AppliedInline)
-            .map_err(program_mutation_error)?;
+        self.stage_local_changes_with_indexing(
+            &mut batch,
+            &changes,
+            LocalReferenceEffects::AppliedInline,
+            indexing_intent,
+        )
+        .map_err(program_mutation_error)?;
         let allocated_high = record.writes.iter().map(|write| write.version.id).max();
         if let Some(allocated) = allocated_high {
             let persisted = self.version_high_watermark()?.unwrap_or(VersionId(0));
@@ -1601,11 +1845,24 @@ impl Store {
             APPLIED_PROGRAM_COMMIT_KEY,
             serde_json::to_vec(&applied).map_err(program_storage_error)?,
         );
+        self.stage_program_visibility_receipt(
+            &mut batch,
+            StoredProgramVisibilityReceipt {
+                cursor: commit.commit_cursor,
+                bundle_hash: commit.bundle_ref.hash,
+                indexing_intent,
+                visibility: journal_visibility.clone(),
+            },
+            publication_at_unix_millis,
+        )?;
         self.write_program_batch(batch)?;
         if !changes.is_empty() {
             self.settle_inline_source_changes()
                 .map_err(program_mutation_error)?;
             self.notify_local_invalidations();
+            if indexing_intent == crate::IndexingIntent::Realtime {
+                self.notify_realtime_journal_routes();
+            }
         }
         if let Some(allocated) = allocated_high {
             self.clock.observe(allocated);

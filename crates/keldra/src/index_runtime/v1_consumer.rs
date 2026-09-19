@@ -12,8 +12,9 @@ use keldra_index::v1::{
     MemoryAdmission, PartitionProjectionAccumulator, PreparedProjectionBatchReservation,
     PreparedProjectionRow, PreparedQueryMutationBatch, ProjectionBatchAdmission,
     ProjectionPackCredits, ProjectionPartitionIdentity, QueryBlockCredits,
+    bind_realtime_source_position,
 };
-use keldra_store::{ObjectHeadChange, ObjectHeadChangeKind, SourceId, VersionId};
+use keldra_store::{ObjectHeadChange, ObjectHeadChangeKind, SourceId, Store, VersionId};
 use tonic::Status;
 
 use crate::cluster_object_read::ClusterObjectReader;
@@ -55,6 +56,8 @@ mod mutation_buffer;
 mod outcome_handling;
 #[path = "v1_consumer_prepare.rs"]
 mod prepare;
+#[path = "v1_realtime_consumer.rs"]
+mod realtime;
 #[path = "v1_consumer_sealing.rs"]
 mod sealing;
 #[path = "v1_consumer_skipped_progress.rs"]
@@ -91,6 +94,7 @@ enum ReconcileOutcome {
 
 pub(crate) struct V1IndexProducerTask {
     task: tokio::task::JoinHandle<()>,
+    _realtime: realtime::RealtimeLaneTask,
 }
 
 impl Drop for V1IndexProducerTask {
@@ -100,7 +104,7 @@ impl Drop for V1IndexProducerTask {
 }
 
 #[derive(Clone, Copy)]
-struct Limits {
+pub(super) struct Limits {
     bytes: usize,
     flush_bytes: usize,
     projection_batch_bytes: usize,
@@ -163,7 +167,7 @@ struct Writer {
 }
 
 #[derive(Clone, Debug)]
-struct Mutation {
+pub(super) struct Mutation {
     offset: u64,
     ordinal: u32,
     tenant_id: u64,
@@ -196,6 +200,7 @@ impl V1IndexProducerTask {
         decisions: DecisionRaft,
         catalog: IndexCatalog,
         journal: Arc<IndexEventJournal>,
+        store: Store,
         scanner: super::scanner::ClusterIndexScanner,
         reader: ClusterObjectReader,
         cpu: super::cpu::IndexCpuPool,
@@ -209,7 +214,20 @@ impl V1IndexProducerTask {
         let mut publication_changes = publisher.subscribe();
         let mut journal_changes = hot.subscribe();
         let compaction_cpu = cpu.clone();
+        let realtime_cpu = cpu.clone();
         let extractor = V1ProjectionExtractor::new(reader.clone(), cpu, hot, limits.worker_bytes);
+        let realtime = realtime::RealtimeLaneTask::start(
+            local_node,
+            decisions.clone(),
+            catalog.clone(),
+            store,
+            reader.clone(),
+            extractor.clone(),
+            publisher.clone(),
+            credits.clone(),
+            limits,
+            realtime_cpu,
+        );
         let lag_observation_epoch = Arc::new(AtomicU64::new(0));
         let lag_observation_active = Arc::new(AtomicBool::new(false));
         let compaction_ready = Arc::new(tokio::sync::Notify::new());
@@ -259,7 +277,10 @@ impl V1IndexProducerTask {
                 }
             }
         });
-        Ok(Self { task })
+        Ok(Self {
+            task,
+            _realtime: realtime,
+        })
     }
 }
 
@@ -1037,7 +1058,7 @@ fn current_for_catalog(
     }
 }
 
-fn empty_query_credits(
+pub(super) fn empty_query_credits(
     credits: &IndexingMemoryCredits,
     limits: Limits,
 ) -> Result<QueryBlockCredits, Status> {
@@ -1771,7 +1792,7 @@ fn dispatch_mutations(dispatch: V1SourceDispatch) -> Result<(u64, Vec<Mutation>)
     }
 }
 
-fn head_mutation(head: ObjectHeadChange, ordinal: u32) -> Mutation {
+pub(super) fn head_mutation(head: ObjectHeadChange, ordinal: u32) -> Mutation {
     let predecessor_absent_at_window_start = head.canonical_path.is_none()
         && head
             .accounting_transition
@@ -1790,7 +1811,7 @@ fn head_mutation(head: ObjectHeadChange, ordinal: u32) -> Mutation {
     }
 }
 
-fn merge_query(
+pub(super) fn merge_query(
     target: &mut PreparedQueryMutationBatch,
     mut source: PreparedQueryMutationBatch,
 ) -> Result<(), Status> {

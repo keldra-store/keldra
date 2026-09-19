@@ -293,7 +293,7 @@ impl Store {
     }
 }
 
-fn project_change_for_route(
+pub(super) fn project_change_for_route(
     route: JournalRoute,
     change: LocalChange,
 ) -> Result<LocalChange, RoutedJournalError> {
@@ -347,7 +347,7 @@ fn project_change_for_route(
     }
 }
 
-fn try_visit_routes_for_change<E>(
+pub(super) fn try_visit_routes_for_change<E>(
     change: &LocalChange,
     mut visit: impl FnMut(JournalRoute) -> Result<(), E>,
 ) -> Result<(), E> {
@@ -419,7 +419,7 @@ pub(crate) fn journal_route_logical_bytes(change: &LocalChange) -> u64 {
     bytes
 }
 
-fn route_matches(route: JournalRoute, change: &LocalChange) -> bool {
+pub(super) fn route_matches(route: JournalRoute, change: &LocalChange) -> bool {
     match (route, change) {
         (
             JournalRoute::Bucket {
@@ -466,7 +466,7 @@ fn route_matches(route: JournalRoute, change: &LocalChange) -> bool {
     }
 }
 
-fn validate_route(route: JournalRoute) -> Result<(), RoutedJournalError> {
+pub(super) fn validate_route(route: JournalRoute) -> Result<(), RoutedJournalError> {
     if let JournalRoute::Bucket {
         tenant_id,
         bucket_id,

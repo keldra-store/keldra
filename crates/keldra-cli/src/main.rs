@@ -17,7 +17,7 @@ use keldra_storage::v1::{
     CloneObjectRequest, ClusterCapabilities, CreateApplicationRequest, CreateBucketRequest,
     DeleteIfVersionRequest, DeleteRequest, DeleteVersionRequest,
     DisableApplicationCredentialRequest, Durability, GetClusterCapabilitiesRequest,
-    GetObjectRequest, HeadObjectRequest, InvokeProgramRequest, LinkObjectRequest,
+    GetObjectRequest, HeadObjectRequest, IndexingIntent, InvokeProgramRequest, LinkObjectRequest,
     ListObjectVersionsRequest, ListObjectsRequest, ObjectVersioning, PrepareNodeRequest,
     ProvisionTenantRequest, PutHeader, PutRequest, RecoverApplicationCredentialRequest,
     RotateApplicationCredentialRequest, SetBucketPolicyRequest, SetBucketPublicReadRequest,
@@ -435,6 +435,7 @@ async fn main() -> Result<()> {
                     command_id,
                     durability: durability.into(),
                     operation: Some(operation),
+                    indexing_intent: IndexingIntent::Standard as i32,
                 },
                 file,
             )
@@ -463,6 +464,7 @@ async fn main() -> Result<()> {
                     command_id,
                     durability: durability.into(),
                     operation: Some(clone_operation(if_absent, if_version)),
+                    indexing_intent: IndexingIntent::Standard as i32,
                 })
                 .await?
                 .into_inner();
@@ -482,6 +484,7 @@ async fn main() -> Result<()> {
                     target: Some(address(tenant, bucket, target_path)),
                     command_id,
                     durability: durability.into(),
+                    indexing_intent: IndexingIntent::Standard as i32,
                 })
                 .await?
                 .into_inner();
@@ -499,6 +502,7 @@ async fn main() -> Result<()> {
                     link: Some(address(tenant, bucket, link_path)),
                     command_id,
                     durability: durability.into(),
+                    indexing_intent: IndexingIntent::Standard as i32,
                 })
                 .await?
                 .into_inner();
@@ -702,6 +706,7 @@ async fn main() -> Result<()> {
                         command_id,
                         durability: durability.into(),
                         expected_version,
+                        indexing_intent: IndexingIntent::Standard as i32,
                     })
                     .await?
                     .into_inner(),
@@ -710,6 +715,7 @@ async fn main() -> Result<()> {
                         address: object_address,
                         command_id,
                         durability: durability.into(),
+                        indexing_intent: IndexingIntent::Standard as i32,
                     })
                     .await?
                     .into_inner(),
@@ -728,6 +734,7 @@ async fn main() -> Result<()> {
                     address: Some(address(tenant, bucket, path)),
                     version,
                     durability: durability.into(),
+                    indexing_intent: IndexingIntent::Standard as i32,
                 })
                 .await?
                 .into_inner();
@@ -806,6 +813,7 @@ async fn main() -> Result<()> {
                     program_hash: parse_hex(&program_hash)?,
                     input_json,
                     durability: durability.into(),
+                    indexing_intent: IndexingIntent::Standard as i32,
                 })
                 .await?
                 .into_inner();

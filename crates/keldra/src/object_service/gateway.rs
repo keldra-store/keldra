@@ -216,6 +216,7 @@ impl GatewayObjectAdapter {
                 address: Some(address(key)),
                 command_id,
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             })?,
         )
         .await
@@ -392,6 +393,7 @@ impl GatewayObjectAdapter {
             command_id,
             durability: durability as i32,
             operation: Some(operation),
+            indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
         };
         let request = if internal {
             identity.internal_request(header)?

@@ -502,6 +502,15 @@ impl ClusterPeerService {
                             Status::invalid_argument("built-in replay fingerprint must be 32 bytes")
                         },
                     )?,
+                    indexing_intent: match lookup.indexing_intent {
+                        0 => keldra_store::IndexingIntent::Standard,
+                        1 => keldra_store::IndexingIntent::Realtime,
+                        _ => {
+                            return Err(Status::invalid_argument(
+                                "unknown built-in replay indexing intent",
+                            ));
+                        }
+                    },
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;

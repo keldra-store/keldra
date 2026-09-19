@@ -38,12 +38,16 @@ impl ProgramCoordinator {
         let state = self.decisions.state().map_err(decision_status)?;
         let mut committed = Vec::with_capacity(lookups.len());
         for lookup in lookups {
+            let input_fingerprint = super::bind_binary_indexing_intent(
+                lookup.input_fingerprint,
+                lookup.indexing_intent,
+            );
             let Some(entry) = state.replay_entry(InvocationId(lookup.invocation_id), replay_clock)
             else {
                 committed.push(None);
                 continue;
             };
-            if entry.input_fingerprint.0 != lookup.input_fingerprint
+            if entry.input_fingerprint.0 != input_fingerprint
                 || entry.committed_batch.authority
                     != (AtomicBundleAuthority::BuiltInObjectTransaction {
                         kind: lookup.authority_kind,
@@ -86,6 +90,7 @@ impl ProgramCoordinator {
         contract_version: u16,
         invocation_id: [u8; 32],
         input_fingerprint: [u8; 32],
+        indexing_intent: keldra_store::IndexingIntent,
     ) -> Result<Option<InvokedProgramResult>, Status> {
         let nomination = self.current_nomination()?;
         if nomination.executor != self.node {
@@ -117,6 +122,8 @@ impl ProgramCoordinator {
         else {
             return Ok(None);
         };
+        let input_fingerprint =
+            super::bind_binary_indexing_intent(input_fingerprint, indexing_intent);
         if committed.input_fingerprint.0 != input_fingerprint
             || committed.committed_batch.authority
                 != (AtomicBundleAuthority::BuiltInObjectTransaction {
@@ -147,8 +154,11 @@ impl ProgramCoordinator {
         invocation_id: [u8; 32],
         input_fingerprint: [u8; 32],
         durability_class: &str,
+        indexing_intent: keldra_store::IndexingIntent,
         budget: Duration,
     ) -> Result<InvokedProgramResult, Status> {
+        let input_fingerprint =
+            super::bind_binary_indexing_intent(input_fingerprint, indexing_intent);
         let nomination = self.current_nomination()?;
         let clustered = self.is_clustered()?;
         if !clustered
@@ -249,6 +259,7 @@ impl ProgramCoordinator {
                 participant_manifest_hash: ParticipantManifestHash(
                     prepared.participant_manifest_hash,
                 ),
+                indexing_intent: decision_indexing_intent(indexing_intent),
                 proposal_at_unix_millis: replay_clock,
                 replay_expires_at_unix_millis,
             }))
@@ -333,17 +344,17 @@ impl ProgramCoordinator {
             .map_err(decision_status)?;
         let committed = expect_batch_committed(committed.result)?;
         let commit_cursor = committed.invocation.committed_batch.commit_cursor;
-        if clustered {
+        let realtime_visibility = if clustered {
             let distributed = self.distributed()?;
             distributed
                 .commit_participants(&reservations, commit_cursor, nomination, budget)
                 .await?;
             let stages = stages.expect("clustered preparation has path stages");
             let finalized = distributed
-                .finalize(&stages, commit_cursor, nomination, budget)
+                .finalize(&stages, commit_cursor, nomination, indexing_intent, budget)
                 .await?;
             self.store
-                .publish_atomic_batch(
+                .publish_atomic_batch_with_indexing(
                     keldra_store::SealedAtomicBatchPublication::from_prepared(
                         commit_cursor,
                         prepared.bundle,
@@ -353,14 +364,17 @@ impl ProgramCoordinator {
                         &finalized.alias_registries,
                     )
                     .map_err(program_store_status)?,
+                    indexing_intent,
+                    mutation_context,
                 )
                 .await
-                .map_err(program_store_status)?;
+                .map_err(program_store_status)?
+                .realtime_visibility
         } else {
             self.commit_local_participants(&reservations, commit_cursor)
                 .await?;
             self.store
-                .recover_program_bundle(
+                .recover_program_bundle_with_indexing(
                     program_commit(
                         self.store
                             .applied_program_commit_cursor()
@@ -368,21 +382,21 @@ impl ProgramCoordinator {
                         committed.invocation.committed_batch,
                     ),
                     mutation_context,
+                    indexing_intent,
                 )
                 .await
                 .map_err(program_store_status)?;
-        }
+            None
+        };
         self.advance_finalized_through(nomination, commit_cursor)
             .await?;
         if clustered {
             self.distributed()?
                 .release_participants(&reservations, Some(commit_cursor), nomination, budget)
                 .await?;
-            Ok(distributed::result_from_record(
-                &record,
-                committed.invocation,
-                false,
-            ))
+            let mut result = distributed::result_from_record(&record, committed.invocation, false);
+            result.realtime_visibility = realtime_visibility;
+            Ok(result)
         } else {
             self.release_local_participants(&reservations, Some(commit_cursor))
                 .await?;

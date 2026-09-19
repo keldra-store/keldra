@@ -138,6 +138,7 @@ fn retained_version_metadata_and_delete_outcomes_preserve_public_semantics() {
         DeleteVersionResponse {
             deleted: false,
             replacement_tombstone_version: None,
+            index_visibility: None,
         }
     );
     assert_eq!(
@@ -145,6 +146,7 @@ fn retained_version_metadata_and_delete_outcomes_preserve_public_semantics() {
         DeleteVersionResponse {
             deleted: true,
             replacement_tombstone_version: None,
+            index_visibility: None,
         }
     );
     assert_eq!(
@@ -154,6 +156,7 @@ fn retained_version_metadata_and_delete_outcomes_preserve_public_semantics() {
         DeleteVersionResponse {
             deleted: true,
             replacement_tombstone_version: Some(12),
+            index_visibility: None,
         }
     );
 }
@@ -410,6 +413,7 @@ fn bulk_limit_accounts_for_every_encoded_operation_byte_without_cloning_payloads
                     content_type: "application/json".into(),
                     command_id: "put-one".into(),
                     durability: ApiDurability::Local as i32,
+                    indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
                 },
             )),
         },
@@ -419,6 +423,7 @@ fn bulk_limit_accounts_for_every_encoded_operation_byte_without_cloning_payloads
                     address: address("two"),
                     command_id: "delete-two".into(),
                     durability: ApiDurability::Local as i32,
+                    indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
                 },
             )),
         },
@@ -526,6 +531,7 @@ fn oversized_bulk_items_fail_and_replicated_durability_is_preserved() {
                 address: address("delete"),
                 command_id: "delete-command".into(),
                 durability: ApiDurability::Replicated as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
         )),
     };
@@ -583,11 +589,29 @@ fn canonical_token_header_preserves_caller_selected_operation() {
         operation: TokenPutOperation::PutIfVersion {
             expected_version: 31,
         },
+        indexing_intent: TokenIndexingIntent::Realtime,
         link: None,
     };
     let metadata = header.to_metadata().unwrap();
     assert_eq!(metadata.mode, PutMode::PutIfVersion(VersionId(31)));
     assert_eq!(metadata.content_type.as_deref(), Some("application/json"));
+    assert_eq!(metadata.indexing_intent, StoreIndexingIntent::Realtime);
+}
+
+#[test]
+fn indexing_intent_maps_exactly_and_rejects_unknown_wire_values() {
+    assert_eq!(
+        indexing_intent(keldra_api::v1::IndexingIntent::Standard as i32).unwrap(),
+        StoreIndexingIntent::Standard
+    );
+    assert_eq!(
+        indexing_intent(keldra_api::v1::IndexingIntent::Realtime as i32).unwrap(),
+        StoreIndexingIntent::Realtime
+    );
+    assert_eq!(
+        indexing_intent(91).unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
 }
 
 #[test]
@@ -600,6 +624,7 @@ fn upload_and_ready_tokens_have_disjoint_strict_phases() {
         command_id: "command".into(),
         durability: TokenDurability::Local,
         operation: TokenPutOperation::Put,
+        indexing_intent: TokenIndexingIntent::Standard,
         link: None,
     };
     let upload = CanonicalPutCapability {

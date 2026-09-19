@@ -6,13 +6,14 @@ mod definition;
 mod listing;
 mod pagination;
 mod service;
+mod visibility;
 
 pub(crate) use boundary::{
     ExecuteIndexQuery, ExecutedIndexQuery, IndexAuthorization, IndexAuthorizationEvidence,
     IndexDefinitionLister, IndexDefinitionScan, IndexDefinitionScanPage, IndexFreshnessRequirement,
     IndexPageCursor, IndexQueryAuthorizationEvidence, IndexQueryExecutor,
     IndexRealmAuthorizationEvidence, IndexResultAuthorizationPolicy, IndexServiceDependencies,
-    ListedIndexDefinition, RequiredIndexSourceCheckpoint,
+    IndexVisibilityRequirement, ListedIndexDefinition, RequiredIndexSourceCheckpoint,
 };
 pub(crate) use candidate_visibility::{
     AuthorizedSnapshotCandidates, CandidateVisibilityEvidence, IndexCandidateIdentity,
@@ -28,3 +29,7 @@ pub(crate) use pagination::{
     INDEX_PAGE_TOKEN_AUDIENCE, INDEX_PAGE_TOKEN_PURPOSE, IndexPageTokenClaims,
 };
 pub(crate) use service::IndexServiceImpl;
+pub(crate) use visibility::{
+    INDEX_VISIBILITY_TOKEN_AUDIENCE, INDEX_VISIBILITY_TOKEN_PURPOSE, IndexVisibilityTokenClaims,
+    issue_index_visibility_token, issue_program_index_visibility_token,
+};

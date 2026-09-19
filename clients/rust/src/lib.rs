@@ -279,6 +279,7 @@ mod tests {
             DeleteVersionResponse {
                 deleted: true,
                 replacement_tombstone_version: Some(10),
+                index_visibility: None,
             }
             .replacement_tombstone_version,
             Some(10)
@@ -314,6 +315,7 @@ mod tests {
             operation: Some(clone_object_request::Operation::PutIfAbsent(
                 PutIfAbsentOperation {},
             )),
+            indexing_intent: super::v1::IndexingIntent::Realtime as i32,
         };
         assert_eq!(request.source_version, 7);
         assert!(matches!(
@@ -338,11 +340,13 @@ mod tests {
             }),
             command_id: "link".into(),
             durability: Durability::Local as i32,
+            indexing_intent: super::v1::IndexingIntent::Realtime as i32,
         };
         let remove = UnlinkObjectRequest {
             link: Some(link),
             command_id: "unlink".into(),
             durability: Durability::Local as i32,
+            indexing_intent: super::v1::IndexingIntent::Standard as i32,
         };
         assert_eq!(create.target.unwrap().path, "target");
         assert_eq!(remove.link.unwrap().path, "alias");

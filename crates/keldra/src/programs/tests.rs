@@ -235,6 +235,7 @@ async fn commit_prepared_for_recovery(
             ),
             durability_evidence_hash: DurabilityEvidenceHash(prepared.durability_evidence_hash.0),
             participant_manifest_hash: ParticipantManifestHash(prepared.participant_manifest_hash),
+            indexing_intent: keldra_consensus::AtomicIndexingIntent::Standard,
             proposal_at_unix_millis,
             replay_expires_at_unix_millis: proposal_at_unix_millis + ATOMIC_REPLAY_RETENTION_MILLIS,
         }))
@@ -854,6 +855,7 @@ fn committed_batch_mapping_retains_every_storage_identity() {
         durability_class: DurabilityClass([5; 32]),
         durability_evidence_hash: DurabilityEvidenceHash([6; 32]),
         participant_manifest_hash: ParticipantManifestHash([7; 32]),
+        indexing_intent: keldra_consensus::AtomicIndexingIntent::Standard,
     };
 
     assert_eq!(
@@ -876,6 +878,21 @@ fn committed_batch_mapping_retains_every_storage_identity() {
 }
 
 #[test]
+fn realtime_indexing_changes_program_idempotency_fingerprint_only_for_realtime() {
+    let original = [7; 32];
+    assert_eq!(
+        bind_binary_indexing_intent(original, keldra_store::IndexingIntent::Standard),
+        original
+    );
+    let realtime = bind_binary_indexing_intent(original, keldra_store::IndexingIntent::Realtime);
+    assert_ne!(realtime, original);
+    assert_eq!(
+        bind_binary_indexing_intent(original, keldra_store::IndexingIntent::Realtime),
+        realtime
+    );
+}
+
+#[test]
 fn prepared_replay_result_must_match_the_committed_invocation() {
     let fingerprint = [9; 32];
     let committed = CommittedBatch {
@@ -894,6 +911,7 @@ fn prepared_replay_result_must_match_the_committed_invocation() {
         durability_class: DurabilityClass([5; 32]),
         durability_evidence_hash: DurabilityEvidenceHash([6; 32]),
         participant_manifest_hash: ParticipantManifestHash([7; 32]),
+        indexing_intent: keldra_consensus::AtomicIndexingIntent::Standard,
     };
     let invocation = CommittedInvocation {
         invocation_id: InvocationId([8; 32]),
@@ -912,6 +930,7 @@ fn prepared_replay_result_must_match_the_committed_invocation() {
         published_versions: BTreeMap::new(),
         asserted_versions: BTreeMap::new(),
         alias_targets: BTreeMap::new(),
+        realtime_visibility: None,
     };
 
     require_result_matches_consensus(&result, invocation).unwrap();

@@ -12,7 +12,9 @@ use super::super::v1_query_compile::CompiledV1Query;
 use super::PinnedRootVector;
 
 const MAGIC: &[u8; 8] = b"K1QPOS01";
-const FORMAT: u16 = 2;
+// Pre-1.0 clean break: this is the sole supported cursor format. There is no
+// legacy decoder or alternate on-disk identity.
+const FORMAT: u16 = 1;
 const FIXED_BYTES: usize = 8 + 2 + 32 + 32 + 1 + 32 + 4 + 4;
 const ROOT_PROOF_BYTES: usize = 8;
 const MAX_ORDER_VALUES: usize = 64;
@@ -22,6 +24,7 @@ const MAX_BYTES: usize = 256 * 1024;
 pub(super) struct QueryPositionRoot {
     pub(super) generation_hash: [u8; 32],
     pub(super) next_newer_through_atomic_position: Option<u64>,
+    pub(super) realtime_overlay_generation_hash: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -275,9 +278,27 @@ pub(super) fn decode_query_position(position: &[u8]) -> Result<QueryPosition, St
                 ));
             }
         };
+        let realtime_overlay_generation_hash = match take(position, &mut offset, 1)?[0] {
+            0 => None,
+            1 => {
+                let hash = take(position, &mut offset, 32)?.try_into().unwrap();
+                if hash == [0; 32] {
+                    return Err(Status::invalid_argument(
+                        "v1 query cursor overlay generation is invalid",
+                    ));
+                }
+                Some(hash)
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "v1 query cursor overlay proof is invalid",
+                ));
+            }
+        };
         roots.push(QueryPositionRoot {
             generation_hash,
             next_newer_through_atomic_position,
+            realtime_overlay_generation_hash,
         });
     }
     if offset != position.len() {
@@ -316,6 +337,7 @@ pub(super) fn encode_query_position(
 ) -> Result<Vec<u8>, Status> {
     if pinned.roots.is_empty()
         || pinned.roots.len() != pinned.generation_hashes.len()
+        || pinned.roots.len() != pinned.overlay_generation_hashes.len()
         || pinned.roots.len() > MAX_QUERY_PARTITIONS
     {
         return Err(Status::resource_exhausted(
@@ -350,7 +372,12 @@ pub(super) fn encode_query_position(
             }
         }
     }
-    for (root, generation_hash) in pinned.roots.iter().zip(&pinned.generation_hashes) {
+    for ((root, generation_hash), overlay_hash) in pinned
+        .roots
+        .iter()
+        .zip(&pinned.generation_hashes)
+        .zip(&pinned.overlay_generation_hashes)
+    {
         if *generation_hash == [0; 32] {
             return Err(Status::data_loss(
                 "v1 query pinned an invalid generation identity",
@@ -361,6 +388,13 @@ pub(super) fn encode_query_position(
             Some(next) => {
                 position.push(1);
                 position.extend_from_slice(&next.to_be_bytes());
+            }
+            None => position.push(0),
+        }
+        match overlay_hash {
+            Some(hash) => {
+                position.push(1);
+                position.extend_from_slice(hash);
             }
             None => position.push(0),
         }

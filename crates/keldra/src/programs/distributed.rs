@@ -85,6 +85,39 @@ impl super::ProgramCoordinator {
         C: Fn(Vec<keldra_atomic_program::ExpandedProgramPath>) -> CFut,
         CFut: std::future::Future<Output = Result<(), Status>>,
     {
+        self.invoke_distributed_with_indexing(
+            program_key,
+            expected_program_hash,
+            invocation_id,
+            input_json,
+            durability_class,
+            keldra_store::IndexingIntent::Standard,
+            budget,
+            authorize_logical,
+            authorize_canonical,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn invoke_distributed_with_indexing<L, LFut, C, CFut>(
+        &self,
+        program_key: keldra_store::ObjectKey,
+        expected_program_hash: [u8; 32],
+        invocation_id: String,
+        input_json: &[u8],
+        durability_class: &str,
+        indexing_intent: keldra_store::IndexingIntent,
+        budget: Duration,
+        authorize_logical: L,
+        authorize_canonical: C,
+    ) -> Result<super::InvokedProgramResult, Status>
+    where
+        L: Fn(Vec<keldra_atomic_program::ExpandedProgramPath>) -> LFut,
+        LFut: std::future::Future<Output = Result<(), Status>>,
+        C: Fn(Vec<keldra_atomic_program::ExpandedProgramPath>) -> CFut,
+        CFut: std::future::Future<Output = Result<(), Status>>,
+    {
         super::validate_program_request(
             &program_key,
             &invocation_id,
@@ -108,8 +141,9 @@ impl super::ProgramCoordinator {
             })?
         };
         let program_path_hash = super::program_path_hash(&program_key);
-        let invocation = ProgramInvocation::from_input(program_path_hash, invocation_id, input)
+        let mut invocation = ProgramInvocation::from_input(program_path_hash, invocation_id, input)
             .map_err(Status::invalid_argument)?;
+        super::bind_program_indexing_intent(&mut invocation.input_fingerprint, indexing_intent);
         let fingerprint = super::decode_fingerprint(&invocation.input_fingerprint)?;
         let consensus_invocation_id =
             super::invocation_identity(&program_key, &invocation.command_id);
@@ -204,6 +238,7 @@ impl super::ProgramCoordinator {
                 participant_manifest_hash: ParticipantManifestHash(
                     prepared.prepared.participant_manifest_hash,
                 ),
+                indexing_intent: super::decision_indexing_intent(indexing_intent),
                 proposal_at_unix_millis,
                 replay_expires_at_unix_millis,
             }))
@@ -285,11 +320,13 @@ impl super::ProgramCoordinator {
                 &stages,
                 committed.invocation.committed_batch.commit_cursor,
                 nomination,
+                indexing_intent,
                 budget,
             )
             .await?;
-        self.store
-            .publish_atomic_batch(
+        let publication = self
+            .store
+            .publish_atomic_batch_with_indexing(
                 SealedAtomicBatchPublication::from_prepared(
                     committed.invocation.committed_batch.commit_cursor,
                     prepared.prepared.bundle,
@@ -299,6 +336,8 @@ impl super::ProgramCoordinator {
                     &finalized.alias_registries,
                 )
                 .map_err(super::program_store_status)?,
+                indexing_intent,
+                distributed.objects.program_mutation_context()?,
             )
             .await
             .map_err(super::program_store_status)?;
@@ -316,11 +355,9 @@ impl super::ProgramCoordinator {
             )
             .await?;
         drop(prepared.lease);
-        Ok(result_from_record(
-            &prepared.record,
-            committed.invocation,
-            false,
-        ))
+        let mut result = result_from_record(&prepared.record, committed.invocation, false);
+        result.realtime_visibility = publication.realtime_visibility;
+        Ok(result)
     }
 
     pub(super) async fn recover_distributed_tail_locked(&self) -> Result<(), Status> {
@@ -447,11 +484,12 @@ impl super::ProgramCoordinator {
                     &stages,
                     invocation.committed_batch.commit_cursor,
                     nomination,
+                    super::store_indexing_intent(invocation.committed_batch.indexing_intent),
                     Duration::from_secs(30),
                 )
                 .await?;
             self.store
-                .publish_atomic_batch(
+                .publish_atomic_batch_with_indexing(
                     SealedAtomicBatchPublication::from_prepared(
                         invocation.committed_batch.commit_cursor,
                         PreparedBundleRef {
@@ -464,6 +502,8 @@ impl super::ProgramCoordinator {
                         &finalized.alias_registries,
                     )
                     .map_err(super::program_store_status)?,
+                    super::store_indexing_intent(invocation.committed_batch.indexing_intent),
+                    distributed.objects.program_mutation_context()?,
                 )
                 .await
                 .map_err(super::program_store_status)?;
@@ -492,7 +532,16 @@ impl super::ProgramCoordinator {
         replayed: bool,
     ) -> Result<super::InvokedProgramResult, Status> {
         let (record, _) = self.distributed()?.recover_record(invocation).await?;
-        Ok(result_from_record(&record, invocation, replayed))
+        let mut result = result_from_record(&record, invocation, replayed);
+        result.realtime_visibility = self
+            .store
+            .atomic_batch_publication_visibility(
+                invocation.committed_batch.commit_cursor,
+                PreparedBundleHash(invocation.committed_batch.bundle_ref.hash),
+                super::store_indexing_intent(invocation.committed_batch.indexing_intent),
+            )
+            .map_err(super::program_store_status)?;
+        Ok(result)
     }
 
     pub(super) fn distributed(&self) -> Result<&DistributedPrograms, Status> {
@@ -1347,6 +1396,7 @@ impl DistributedPrograms {
         stages: &DistributedProgramStages,
         commit_cursor: u64,
         nomination: ExecutorNomination,
+        indexing_intent: keldra_store::IndexingIntent,
         budget: Duration,
     ) -> Result<DistributedProgramFinalizations, Status> {
         let mut paths = Vec::with_capacity(stages.paths.len());
@@ -1355,7 +1405,7 @@ impl DistributedPrograms {
         // replica application is concurrent below.
         for stage in &stages.paths {
             paths.push(
-                self.finalize_path(stage, commit_cursor, nomination, budget)
+                self.finalize_path(stage, commit_cursor, nomination, indexing_intent, budget)
                     .await?,
             );
         }
@@ -1377,6 +1427,7 @@ impl DistributedPrograms {
         stage: &ProgramPathStage,
         commit_cursor: u64,
         nomination: ExecutorNomination,
+        indexing_intent: keldra_store::IndexingIntent,
         budget: Duration,
     ) -> Result<ProgramPathMutation, Status> {
         let placement = self.objects.current_program_placement()?;
@@ -1389,10 +1440,11 @@ impl DistributedPrograms {
         let coordinator = group.coordinator();
         let mutation = if coordinator == self.local_node {
             self.store
-                .coordinate_program_path_finalization(
+                .coordinate_program_path_finalization_with_indexing(
                     stage.clone(),
                     commit_cursor,
                     mutation_context,
+                    indexing_intent,
                 )
                 .await
                 .map_err(super::program_store_status)?
@@ -1411,6 +1463,7 @@ impl DistributedPrograms {
                     nomination.nomination_log_index,
                     commit_cursor,
                     stage,
+                    indexing_intent,
                     budget,
                 )
                 .await?
@@ -1910,6 +1963,7 @@ pub(super) fn result_from_record(
         alias_targets: record.alias_targets(),
         replayed,
         replay_guarantee_expires_at_unix_millis: invocation.replay_expires_at_unix_millis,
+        realtime_visibility: None,
     }
 }
 

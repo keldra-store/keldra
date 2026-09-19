@@ -318,6 +318,7 @@ mod tests {
                             material_source_version: 1,
                             current_source_version: 1,
                             live: true,
+                            selective_source_position: None,
                             source_path: None,
                             canonical_source_path: None,
                             result_path: None,

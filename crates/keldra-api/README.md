@@ -20,3 +20,11 @@ let request = HeadObjectRequest {
 
 assert_eq!(request.address.unwrap().path, "reports/annual.pdf");
 ```
+
+Object mutations default to `IndexingIntent::Standard`. A caller may select
+`IndexingIntent::Realtime` on an individual mutation; its successful receipt
+then carries an opaque, expiring `IndexVisibilityToken`. Supply one or more of
+those tokens in `QueryIndexRequest.required_visibility_tokens` to wait for the
+named mutations without claiming complete-prefix freshness. Mutation RPCs do
+not wait for query visibility, so a later query deadline cannot hide a
+successful durable write.

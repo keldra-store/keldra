@@ -28,6 +28,7 @@ mod query_run;
 mod query_seal_bound;
 mod query_stream;
 mod read;
+mod realtime_overlay;
 mod stream;
 mod typed_document;
 
@@ -55,8 +56,9 @@ pub use paths::{
     projection_artifact_routing_id, projection_catalog_activation_path,
     projection_catalog_routing_id, projection_component_page_path, projection_current_path,
     projection_family_directory_path, projection_generation_path, projection_pack_path,
-    projection_query_run_pack_path, projection_query_run_stream_page_path, projection_routing_id,
-    projection_stream_page_path,
+    projection_query_run_pack_path, projection_query_run_stream_page_path,
+    projection_realtime_overlay_current_path, projection_realtime_overlay_generation_path,
+    projection_routing_id, projection_stream_page_path,
 };
 pub use pipeline::{
     ChargedPreparedProjectionBatch, ChargedSealedPartitionProjection, IndexingMemoryBackend,
@@ -90,19 +92,22 @@ pub use query_blocks::{
     visit_live_gates, visit_live_postings, visit_live_range_points, visit_prefix_terms,
 };
 pub use query_compaction::{
-    ChargedQueryRunCompaction, PreparedQueryRunCompaction, prepare_encoded_query_run_compaction,
+    ChargedQueryRunCompaction, PreparedQueryRunCompaction, PreparedSparseQueryRunCompaction,
+    prepare_encoded_query_run_compaction, prepare_encoded_sparse_query_run_compaction,
 };
 pub use query_credits::{QueryBlockCredits, QueryMemoryPermit};
 pub use query_doc_values::{decode_doc_value, encode_doc_value};
 pub use query_executor::{
     AuthorizedQueryCandidate, ExplicitQuerySearchAfter, MAX_QUERY_CANDIDATE_ADMISSION_BATCH,
-    MAX_QUERY_PARTITIONS, PinnedPartitionQueryRoot, QueryAdmissionCandidate, QueryAdmissionContext,
-    QueryArtifactKind, QueryArtifactLoad, QueryArtifactLoader, QueryCandidateAdmission,
-    QueryCommonCut, QueryExecutionLimits, QueryFieldBinding, QueryLoadEvidence, QueryPopulation,
-    QueryPopulationGuard, QueryPublicValueEncoder, QueryRootCutProof, QuerySnapshotIdentity,
-    ScalarSortKeyValueEncoder, TypedJsonQueryRequest, TypedJsonQueryResult, ValidatedQuerySnapshot,
-    execute_typed_json_query, execute_typed_json_query_with_cursor,
-    execute_typed_json_query_with_cursor_and_executor, query_snapshot_identity,
+    MAX_QUERY_PARTITIONS, PinnedPartitionQueryRoot, PinnedRealtimeOverlayRun,
+    QueryAdmissionCandidate, QueryAdmissionContext, QueryArtifactKind, QueryArtifactLoad,
+    QueryArtifactLoader, QueryCandidateAdmission, QueryCommonCut, QueryExecutionLimits,
+    QueryFieldBinding, QueryLoadEvidence, QueryPopulation, QueryPopulationGuard,
+    QueryPublicValueEncoder, QueryRootCutProof, QuerySnapshotIdentity, ScalarSortKeyValueEncoder,
+    TypedJsonQueryRequest, TypedJsonQueryResult, ValidatedQuerySnapshot, execute_typed_json_query,
+    execute_typed_json_query_with_cursor, execute_typed_json_query_with_cursor_and_executor,
+    execute_typed_json_query_with_realtime_overlays_and_executor, query_snapshot_identity,
+    query_snapshot_identity_with_overlays,
 };
 pub use query_gate::{
     MAX_QUERY_DOCUMENT_PATH_BYTES, QueryDocumentGate, decode_document_gate, encode_document_gate,
@@ -125,6 +130,13 @@ pub use query_stream::{
     splice_compacted_query_runs, visit_query_runs_newest,
 };
 pub use read::decode_component_records_in_pack;
+pub use realtime_overlay::{
+    EncodedRealtimeOverlayGeneration, MAX_REALTIME_OVERLAY_EVIDENCE, MAX_REALTIME_OVERLAY_RUNS,
+    RealtimeOverlayCurrent, RealtimeOverlayEvidence, RealtimeOverlayGeneration, RealtimeOverlayRun,
+    bind_realtime_source_position, decode_realtime_overlay_current,
+    decode_realtime_overlay_generation, encode_realtime_overlay_current,
+    encode_realtime_overlay_generation,
+};
 pub use stream::{
     COMPONENT_STREAM_DIRECTORY_FANOUT, ComponentCompactionLimits, ComponentCompactionPlan,
     ComponentRecordLookup, ComponentSegmentDescriptor, ComponentStreamAppend,

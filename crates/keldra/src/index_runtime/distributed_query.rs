@@ -70,6 +70,7 @@ impl DistributedIndexQueryExecutor {
                     candidate_visibility: local_visibility,
                     authorization_revision: local_authorization_revision,
                     required_freshness: request.required_freshness,
+                    required_visibility: request.required_visibility,
                     deadline: tokio::time::Instant::now()
                         .checked_add(remaining)
                         .ok_or_else(|| {
@@ -94,6 +95,15 @@ impl DistributedIndexQueryExecutor {
 impl IndexQueryExecutor for DistributedIndexQueryExecutor {
     async fn execute(&self, request: ExecuteIndexQuery) -> Result<ExecutedIndexQuery, Status> {
         let placement = self.placement()?;
+        let placement_fence = placement.fence();
+        if request.required_visibility.iter().any(|requirement| {
+            requirement.active_placement_term != placement_fence.term
+                || requirement.active_placement_index != placement_fence.index
+        }) {
+            return Err(Status::failed_precondition(
+                "index visibility token belongs to a superseded placement",
+            ));
+        }
         let identity = IndexIdentity::projection_partition(request.tenant_id, request.bucket_id)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let assignment = IndexPlacement::derive(identity, &placement)
@@ -115,6 +125,7 @@ impl IndexQueryExecutor for DistributedIndexQueryExecutor {
             limit: request.limit,
             resume: request.resume.clone(),
             required_freshness: request.required_freshness.clone(),
+            required_visibility: request.required_visibility.clone(),
             authorization_subject: request.authorization_subject.clone(),
             system_authorization_revision: request.authorization_revision,
             result_authorization_revision: request

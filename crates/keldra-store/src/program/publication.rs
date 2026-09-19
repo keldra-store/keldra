@@ -7,6 +7,14 @@ use super::*;
 struct AtomicBatchPublicationMarker {
     cursor: u64,
     bundle_hash: PreparedBundleHash,
+    indexing_intent: crate::IndexingIntent,
+    journal_visibility: Option<ProgramJournalVisibility>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtomicBatchPublicationResult {
+    pub published: bool,
+    pub realtime_visibility: Option<ProgramJournalVisibility>,
 }
 
 /// A complete atomic delivery unit whose descriptors have been proven to be
@@ -163,30 +171,100 @@ fn validate_alias_registry_finalizations(
 }
 
 impl Store {
+    pub fn atomic_batch_publication_visibility(
+        &self,
+        cursor: u64,
+        bundle_hash: PreparedBundleHash,
+        indexing_intent: crate::IndexingIntent,
+    ) -> Result<Option<ProgramJournalVisibility>, ProgramStoreError> {
+        let Some(existing) = self.read_program_json::<StoredProgramVisibilityReceipt>(
+            CF_METADATA,
+            &program_visibility_receipt_key(cursor),
+        )?
+        else {
+            return Ok(None);
+        };
+        if existing.cursor != cursor || existing.bundle_hash != bundle_hash {
+            return Ok(None);
+        }
+        if existing.indexing_intent != indexing_intent {
+            return Err(ProgramStoreError::IndexingIntentConflict { cursor });
+        }
+        Ok(existing.visibility)
+    }
+
     /// Publish logical aliases and the complete derived-consumer delivery unit
     /// in one synced batch after every distributed physical path is durable.
     pub async fn publish_atomic_batch(
         &self,
         publication: SealedAtomicBatchPublication,
     ) -> Result<bool, ProgramStoreError> {
+        Ok(self
+            .publish_atomic_batch_with_indexing(
+                publication,
+                crate::IndexingIntent::Standard,
+                crate::ObjectMutationContext {
+                    active_placement_log_id: crate::PlacementLogId { term: 0, index: 0 },
+                    serving_fence_term: 0,
+                },
+            )
+            .await?
+            .published)
+    }
+
+    pub async fn publish_atomic_batch_with_indexing(
+        &self,
+        publication: SealedAtomicBatchPublication,
+        indexing_intent: crate::IndexingIntent,
+        mutation_context: crate::ObjectMutationContext,
+    ) -> Result<AtomicBatchPublicationResult, ProgramStoreError> {
         publication.validate_bound()?;
         if publication.mutations.is_empty() && publication.aliases.is_empty() {
-            return Ok(false);
+            return Ok(AtomicBatchPublicationResult {
+                published: false,
+                realtime_visibility: None,
+            });
+        }
+        if indexing_intent == crate::IndexingIntent::Realtime
+            && (mutation_context.active_placement_log_id.term == 0
+                || mutation_context.active_placement_log_id.index == 0
+                || mutation_context.serving_fence_term == 0)
+        {
+            return Err(ProgramStoreError::InvalidBundle(
+                "real-time atomic publication requires non-zero mutation authority".into(),
+            ));
         }
         let cursor = publication.cursor;
         let bundle_hash = publication.bundle_hash;
-        let expected = AtomicBatchPublicationMarker {
-            cursor,
-            bundle_hash,
-        };
+        if let Some(receipt) = self.read_program_json::<StoredProgramVisibilityReceipt>(
+            CF_METADATA,
+            &program_visibility_receipt_key(cursor),
+        )? {
+            if receipt.bundle_hash != bundle_hash {
+                return Err(ProgramStoreError::CommitCorruption { cursor });
+            }
+            if receipt.indexing_intent != indexing_intent {
+                return Err(ProgramStoreError::IndexingIntentConflict { cursor });
+            }
+            return Ok(AtomicBatchPublicationResult {
+                published: false,
+                realtime_visibility: receipt.visibility,
+            });
+        }
         loop {
             let commit_guard = self.lock_commit("atomic_program").await;
             if let Some(existing) = self.read_program_json::<AtomicBatchPublicationMarker>(
                 CF_METADATA,
                 ATOMIC_BATCH_PUBLISHED_KEY,
             )? {
-                if existing == expected {
-                    return Ok(false);
+                if existing.cursor == cursor && existing.bundle_hash == bundle_hash {
+                    if existing.indexing_intent != indexing_intent {
+                        return Err(ProgramStoreError::IndexingIntentConflict { cursor });
+                    }
+                    return Ok(AtomicBatchPublicationResult {
+                        published: false,
+                        realtime_visibility: existing.journal_visibility,
+                    });
                 }
                 if existing.cursor >= cursor {
                     return Err(ProgramStoreError::CommitCorruption { cursor });
@@ -232,11 +310,53 @@ impl Store {
                 bundle_hash,
                 mutations,
             });
+            let journal_visibility = if indexing_intent == crate::IndexingIntent::Realtime {
+                let atomic_source_journal_position = journal
+                    .tail
+                    .checked_add(changes.len() as u64)
+                    .ok_or_else(|| {
+                        ProgramStoreError::Storage(
+                            "atomic visibility source position is exhausted".into(),
+                        )
+                    })?;
+                let routes = match changes.last() {
+                    Some(PendingLocalChange::AtomicBatchPublished { mutations, .. }) => mutations
+                        .iter()
+                        .map(|mutation| RealtimeVisibilityRoute {
+                            tenant_id: mutation.tenant_id,
+                            bucket_id: mutation.bucket_id,
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    _ => unreachable!("atomic publication always ends in its finalizer"),
+                };
+                Some(ProgramJournalVisibility {
+                    source_id: journal.source_id,
+                    atomic_source_journal_position,
+                    program_commit_cursor: cursor,
+                    atomic_unit_hash: bundle_hash.0,
+                    routes,
+                    active_placement_log_id: mutation_context.active_placement_log_id,
+                    expires_at_unix_millis: now_unix_millis()
+                        .map_err(program_mutation_error)?
+                        .saturating_add(self.mutation_receipt_retention.retention_millis()),
+                })
+            } else {
+                None
+            };
+            let expected = AtomicBatchPublicationMarker {
+                cursor,
+                bundle_hash,
+                indexing_intent,
+                journal_visibility: journal_visibility.clone(),
+            };
             let mut batch = WriteBatch::default();
-            let attempt = self.stage_local_changes(
+            let attempt = self.stage_local_changes_with_indexing(
                 &mut batch,
                 &changes,
                 LocalReferenceEffects::NoReferenceEffects,
+                indexing_intent,
             );
             match attempt {
                 Ok(()) => {
@@ -245,9 +365,25 @@ impl Store {
                         ATOMIC_BATCH_PUBLISHED_KEY,
                         serde_json::to_vec(&expected).map_err(program_storage_error)?,
                     );
+                    self.stage_program_visibility_receipt(
+                        &mut batch,
+                        StoredProgramVisibilityReceipt {
+                            cursor,
+                            bundle_hash,
+                            indexing_intent,
+                            visibility: journal_visibility.clone(),
+                        },
+                        now_unix_millis().map_err(program_mutation_error)?,
+                    )?;
                     self.write_program_batch(batch)?;
                     self.notify_local_invalidations();
-                    return Ok(true);
+                    if indexing_intent == crate::IndexingIntent::Realtime {
+                        self.notify_realtime_journal_routes();
+                    }
+                    return Ok(AtomicBatchPublicationResult {
+                        published: true,
+                        realtime_visibility: journal_visibility,
+                    });
                 }
                 Err(MutationError::SourceJournalCapacity) => {
                     drop(commit_guard);

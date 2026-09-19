@@ -604,6 +604,7 @@ pub fn prepare_typed_json_field_delta(
             material_source_version,
             current_source_version: material_source_version,
             live: current.is_some(),
+            selective_source_position: None,
             source_path: None,
             canonical_source_path: None,
             result_path: None,

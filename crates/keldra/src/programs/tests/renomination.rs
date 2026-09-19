@@ -401,6 +401,7 @@ async fn committed_path_recovery_rebinds_to_the_new_executor_without_resealing()
             ),
             durability_evidence_hash: DurabilityEvidenceHash(prepared.durability_evidence_hash.0),
             participant_manifest_hash: ParticipantManifestHash(prepared.participant_manifest_hash),
+            indexing_intent: keldra_consensus::AtomicIndexingIntent::Standard,
             proposal_at_unix_millis: proposed_at,
             replay_expires_at_unix_millis: proposed_at + ATOMIC_REPLAY_RETENTION_MILLIS,
         }))

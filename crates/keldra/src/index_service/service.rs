@@ -48,6 +48,7 @@ use super::{
 const DEFINITION_CONTENT_TYPE: &str = "application/vnd.keldra.index-definition+json";
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_PAGE_LIMIT: usize = 1_000;
+const MAX_VISIBILITY_TOKENS: usize = 1_000;
 const QUERY_HASH_CONTEXT: &[u8] = b"keldra.index/query/v1";
 const EXPLICIT_REBUILD_INTERVAL_MILLIS: u64 = 60 * 60 * 1_000;
 
@@ -318,6 +319,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                             content_type: DEFINITION_CONTENT_TYPE.into(),
                             command_id: request.command_id,
                             durability: Durability::Local as i32,
+                            indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
                         }),
                         DefinitionMutationIntent::new(DefinitionKind::Index, index_id)
                             .map_err(|error| Status::internal(error.to_string()))?,
@@ -367,6 +369,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                             command_id: request.command_id,
                             durability: Durability::Local as i32,
                             expected_version: request.expected_version,
+                            indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
                         }),
                         DefinitionMutationIntent::new(
                             DefinitionKind::Index,
@@ -530,6 +533,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                                 command_id: request.command_id,
                                 durability: Durability::Local as i32,
                                 expected_version: request.expected_version,
+                                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
                             }),
                             DefinitionMutationIntent::new(
                                 DefinitionKind::Index,
@@ -558,6 +562,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                             command_id: request.command_id,
                             durability: Durability::Local as i32,
                             expected_version: request.expected_version,
+                            indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
                         }),
                         DefinitionMutationIntent::new(
                             DefinitionKind::Index,
@@ -632,6 +637,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                             command_id: request.command_id,
                             durability: Durability::Local as i32,
                             expected_version: request.expected_version,
+                            indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
                         }),
                         DefinitionMutationIntent::new(DefinitionKind::Index, locator.definition_id)
                             .map_err(|error| Status::data_loss(error.to_string()))?,
@@ -678,6 +684,28 @@ impl IndexServiceRpc for IndexServiceImpl {
                     .names
                     .resolve_bucket_ids(tenant, &request.bucket)
                     .await?;
+                if request.required_visibility_tokens.len() > MAX_VISIBILITY_TOKENS {
+                    return Err(Status::invalid_argument(
+                        "index query has too many visibility tokens",
+                    ));
+                }
+                let required_visibility = request
+                    .required_visibility_tokens
+                    .iter()
+                    .map(|token| {
+                        if token.value.is_empty() {
+                            return Err(Status::invalid_argument(
+                                "index visibility token must not be empty",
+                            ));
+                        }
+                        self.dependencies.visibility_tokens.decode(
+                            context.caller(),
+                            &token.value,
+                            tenant_id,
+                            bucket_id,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 let result_policy = result_authorization_policy(&loaded.api)?;
                 let authorization_subject =
                     decode_query_authorization_subject(request.authorization_subject)?;
@@ -720,6 +748,11 @@ impl IndexServiceRpc for IndexServiceImpl {
                         "required freshness cannot be combined with a continuation token",
                     ));
                 }
+                if resume.is_some() && !required_visibility.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "required visibility cannot be combined with a continuation token",
+                    ));
+                }
                 if resume.as_ref().is_some_and(|cursor| {
                     cursor.authorization_revision != admission.system_revision
                 }) {
@@ -758,6 +791,7 @@ impl IndexServiceRpc for IndexServiceImpl {
                         authorization_subject: binding.authorization_subject.clone(),
                         resume: resume.clone(),
                         required_freshness,
+                        required_visibility,
                     })
                     .await?;
                 bind_logical_freshness(&mut executed, &loaded.api, &result_policy, &admission);

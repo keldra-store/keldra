@@ -9,7 +9,7 @@ mod codec;
 
 pub(crate) use codec::{
     DecodedLocalChange, decode_local_change, decode_local_change_with_length, encode_local_change,
-    encoded_change_len,
+    encode_local_change_with_indexing, encoded_change_len,
 };
 
 /// Defaults for one source-local invalidation journal.

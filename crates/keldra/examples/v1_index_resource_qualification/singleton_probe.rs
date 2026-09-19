@@ -124,6 +124,7 @@ pub(super) async fn run(state_path: &Path) -> Result<()> {
             tenant: String::new(),
             required_freshness: None,
             authorization_subject: None,
+            required_visibility_tokens: Vec::new(),
         })
         .await
         .context("singleton Typed JSON equality query failed")?

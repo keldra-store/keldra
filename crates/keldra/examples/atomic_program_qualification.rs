@@ -95,6 +95,7 @@ async fn main() -> TestResult<()> {
             command_id: "atomic-program-qualification-program".into(),
             durability: durability as i32,
             operation: Some(PutOperationValue::PutImmutable(PutImmutableOperation {})),
+            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
         },
         [program.into_bytes()],
     )
@@ -123,13 +124,7 @@ async fn main() -> TestResult<()> {
     let expected_accounting_bytes = expected_committed_payload_bytes()?;
     let first_invocation = invoke_program_eventually(
         &mut objects,
-        invocation(
-            &tenant,
-            &bucket,
-            &program_hash,
-            input.clone(),
-            durability,
-        ),
+        invocation(&tenant, &bucket, &program_hash, input.clone(), durability),
     );
     let visibility = observe_all_or_nothing(channels.clone(), &token, &tenant, &bucket);
     let accounting_visibility =
@@ -264,6 +259,7 @@ async fn verify_task_index_eventually(
             atomic_through: Some(atomic_through),
         }),
         authorization_subject: None,
+        required_visibility_tokens: Vec::new(),
     };
     let deadline = Instant::now() + REPLICA_WAIT_LIMIT;
     let expected_sources = clients.len();
@@ -366,9 +362,7 @@ fn retryable_status(status: &Status) -> bool {
 }
 
 fn retryable_error(error: &(dyn Error + Send + Sync + 'static)) -> bool {
-    error
-        .downcast_ref::<Status>()
-        .is_some_and(retryable_status)
+    error.downcast_ref::<Status>().is_some_and(retryable_status)
 }
 
 fn accounting_client(
@@ -596,6 +590,7 @@ fn invocation(
         program_hash: program_hash.to_vec(),
         input_json,
         durability: durability as i32,
+        indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
     }
 }
 
@@ -678,9 +673,7 @@ async fn observe_all_or_nothing(
         for (position, client) in clients.iter_mut().enumerate() {
             match observe_pair(client, tenant, bucket).await {
                 Ok(PairObservation::BothAbsent) => {}
-                Ok(PairObservation::BothPresent(versions)) => {
-                    complete[position] = Some(versions)
-                }
+                Ok(PairObservation::BothPresent(versions)) => complete[position] = Some(versions),
                 Err(error) if retryable_error(error.as_ref()) => {}
                 Err(error) => return Err(error),
             }

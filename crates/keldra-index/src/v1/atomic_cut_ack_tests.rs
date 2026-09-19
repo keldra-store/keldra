@@ -36,6 +36,7 @@ fn atomic_ack_preserves_live_gate_blocks_component_roots_and_old_cut() {
         material_source_version: 11,
         current_source_version: 11,
         live: true,
+        selective_source_position: None,
         source_path: Some("objects/one".into()),
         canonical_source_path: None,
         result_path: Some("objects/one".into()),

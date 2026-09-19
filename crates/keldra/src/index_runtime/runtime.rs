@@ -185,6 +185,7 @@ pub(crate) async fn start(
         decisions.clone(),
         catalog.clone(),
         journal.clone(),
+        store.clone(),
         scanner.clone(),
         reader.clone(),
         cpu,

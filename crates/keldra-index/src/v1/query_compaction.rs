@@ -40,6 +40,47 @@ pub struct PreparedQueryRunCompaction {
     plan: QueryRunCompactionPlan,
 }
 
+#[derive(Debug)]
+pub struct PreparedSparseQueryRunCompaction {
+    prepared: PreparedProjectionQueryRun,
+    sequence: u64,
+    source_start_offset: u64,
+    next_offset: u64,
+    through_atomic_position: u64,
+}
+
+impl PreparedSparseQueryRunCompaction {
+    pub fn packs(&self) -> &[UnpublishedArtifactPack] {
+        self.prepared.packs()
+    }
+
+    pub fn finalize(
+        self,
+        pack_table: ArtifactPackTable,
+    ) -> Result<
+        (
+            ProjectionQueryRunArtifacts,
+            QueryRunReference,
+            QueryBlockCredits,
+        ),
+        IndexError,
+    > {
+        let charged = self.prepared.finalize(pack_table)?;
+        let (artifacts, credits) = charged.into_parts();
+        let reference = QueryRunReference {
+            hash: artifacts.run.hash,
+            encoded_bytes: u64::try_from(artifacts.run.bytes.len())
+                .map_err(|_| IndexError::OffsetOverflow)?,
+            sequence: self.sequence,
+            level: 0,
+            source_start_offset: self.source_start_offset,
+            next_offset: self.next_offset,
+            through_atomic_position: self.through_atomic_position,
+        };
+        Ok((artifacts, reference, credits))
+    }
+}
+
 impl PreparedQueryRunCompaction {
     pub fn packs(&self) -> &[UnpublishedArtifactPack] {
         self.prepared.packs()
@@ -247,6 +288,95 @@ pub fn prepare_encoded_query_run_compaction(
         prepared,
         previous,
         plan: plan.clone(),
+    })
+}
+
+/// Merge a newest-first sparse overlay window without imposing contiguous
+/// prefix semantics. Exact sparse positions remain in document gates and in
+/// overlay evidence; the descriptor interval is only their bounding range.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_encoded_sparse_query_run_compaction(
+    partition: ProjectionPartitionIdentity,
+    physical_catalog_generation: [u8; 32],
+    sequence: u64,
+    source_start_offset: u64,
+    next_offset: u64,
+    through_atomic_position: u64,
+    inputs_newest_first: &[QueryRunReference],
+    limits: QueryBlockLimits,
+    mut credits: QueryBlockCredits,
+    mut load_run: impl FnMut([u8; 32]) -> Result<Vec<u8>, IndexError>,
+    mut load_block: impl FnMut(&QueryBlockDescriptor) -> Result<Vec<u8>, IndexError>,
+) -> Result<PreparedSparseQueryRunCompaction, IndexError> {
+    let limits = limits.validate()?;
+    partition.validate()?;
+    if inputs_newest_first.len() < 2
+        || inputs_newest_first.len() > limits.maximum_loaded_blocks
+        || physical_catalog_generation == [0; 32]
+        || source_start_offset >= next_offset
+    {
+        return invalid("sparse query compaction inputs are invalid");
+    }
+    let mut runs = Vec::with_capacity(inputs_newest_first.len());
+    for reference in inputs_newest_first {
+        let bytes = load_run(reference.hash)?;
+        validate_projection_query_run_fixed(
+            &bytes,
+            reference.hash,
+            partition,
+            physical_catalog_generation,
+            reference.sequence,
+            reference.source_start_offset,
+            reference.next_offset,
+            reference.through_atomic_position,
+            limits,
+        )?;
+        let descriptor = decode_projection_query_run(&bytes, limits, &mut credits)?;
+        validate_descriptor_reference(
+            &descriptor,
+            *reference,
+            partition,
+            physical_catalog_generation,
+        )?;
+        runs.push(descriptor);
+    }
+    let mut blocks = Vec::new();
+    let visibility = CompactionVisibility::load(&runs, limits, &mut credits, &mut load_block)?;
+    merge_ordinary_runs(
+        &runs,
+        &visibility,
+        limits,
+        &mut credits,
+        &mut load_block,
+        &mut blocks,
+    )?;
+    merge_term_runs(
+        &runs,
+        &visibility,
+        limits,
+        &mut credits,
+        &mut load_block,
+        &mut blocks,
+    )?;
+    credits.release(visibility.charged_bytes)?;
+    drop(visibility);
+    let prepared = prepare_projection_query_run_from_blocks(
+        partition,
+        physical_catalog_generation,
+        sequence,
+        source_start_offset,
+        next_offset,
+        through_atomic_position,
+        blocks,
+        limits,
+        credits,
+    )?;
+    Ok(PreparedSparseQueryRunCompaction {
+        prepared,
+        sequence,
+        source_start_offset,
+        next_offset,
+        through_atomic_position,
     })
 }
 
@@ -1257,6 +1387,7 @@ mod tests {
                     material_source_version: version,
                     current_source_version: version,
                     live: true,
+                    selective_source_position: None,
                     source_path: Some("objects/document.json".into()),
                     canonical_source_path: None,
                     result_path: Some("objects/document.json".into()),
@@ -1271,6 +1402,7 @@ mod tests {
                         material_source_version: version,
                         current_source_version: version,
                         live: true,
+                        selective_source_position: None,
                         source_path: None,
                         canonical_source_path: None,
                         result_path: None,

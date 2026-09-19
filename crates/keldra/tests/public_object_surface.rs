@@ -182,6 +182,7 @@ async fn one_node_start_put_accepts_local_and_rejects_replicated_before_upload()
                 command_id: "local-upload-admission".into(),
                 durability: Durability::Local as i32,
                 operation: Some(PutOperationValue::Put(PutOperation {})),
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -198,6 +199,7 @@ async fn one_node_start_put_accepts_local_and_rejects_replicated_before_upload()
                 command_id: "replicated-upload-admission".into(),
                 durability: Durability::Replicated as i32,
                 operation: Some(PutOperationValue::Put(PutOperation {})),
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -253,6 +255,7 @@ async fn one_node_delete_version_accepts_local_and_rejects_replicated_before_mut
                 address: Some(object.clone()),
                 version: first.version,
                 durability: Durability::Replicated as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -270,6 +273,7 @@ async fn one_node_delete_version_accepts_local_and_rejects_replicated_before_mut
                 address: Some(object.clone()),
                 version: first.version,
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -429,6 +433,7 @@ async fn raw_reserved_objects_are_denied_but_trusted_adapters_still_work() {
                     command_id: "raw-reserved-put".into(),
                     durability: Durability::Local as i32,
                     operation: Some(PutOperationValue::Put(PutOperation {})),
+                    indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
                 },
                 token,
             ))
@@ -462,6 +467,7 @@ async fn raw_reserved_objects_are_denied_but_trusted_adapters_still_work() {
                     address: Some(reserved.clone()),
                     command_id: "raw-reserved-delete".into(),
                     durability: Durability::Local as i32,
+                    indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
                 },
                 token,
             ))
@@ -653,6 +659,7 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
                     tenant: String::new(),
                     required_freshness: None,
                     authorization_subject: None,
+                    required_visibility_tokens: Vec::new(),
                 },
                 &denied_token,
             ))
@@ -779,6 +786,126 @@ async fn index_lifecycle_requires_zanzibar_access_to_the_definition_object() {
         .await
         .unwrap_err();
     assert_eq!(rate_limited_after_update.code(), Code::ResourceExhausted);
+
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn realtime_receipts_gate_queries_for_insert_and_delete() {
+    let fixture = Fixture::start().await;
+    let token = fixture.access_token.as_str();
+    let mut indexes = IndexServiceClient::new(fixture.channel.clone());
+    let mut objects = ObjectServiceClient::new(fixture.channel.clone());
+
+    indexes
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket: "objects".into(),
+                name: "selective-realtime".into(),
+                path_prefix: "realtime/".into(),
+                content_type: "application/json".into(),
+                specification: Some(typed_json_specification()),
+                command_id: "create-selective-realtime".into(),
+                result_authorization: Some(application_result_authorization()),
+            },
+            token,
+        ))
+        .await
+        .unwrap();
+
+    let object = address("realtime/one.json");
+    let upload = objects
+        .start_put(authorized(
+            PutHeader {
+                address: Some(object.clone()),
+                content_type: "application/json".into(),
+                command_id: "selective-realtime-put".into(),
+                durability: Durability::Local as i32,
+                operation: Some(PutOperationValue::Put(PutOperation {})),
+                indexing_intent: keldra_api::v1::IndexingIntent::Realtime as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let ready = objects
+        .put(authorized(
+            tokio_stream::iter([PutRequest {
+                token: Some(upload),
+                chunk: br#"{"value":"visible"}"#.to_vec(),
+            }]),
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let inserted = objects
+        .put_end(authorized(ready, token))
+        .await
+        .unwrap()
+        .into_inner();
+    let insert_visibility = inserted
+        .index_visibility
+        .expect("REALTIME put receipt omitted its visibility token");
+
+    let query = |required_visibility_tokens| QueryIndexRequest {
+        bucket: "objects".into(),
+        index_name: "selective-realtime".into(),
+        query: Some(IndexQuery {
+            query: Some(keldra_api::v1::index_query::Query::TypedJson(
+                TypedJsonIndexQuery {
+                    predicate: None,
+                    order: Vec::new(),
+                    facets: Vec::new(),
+                    aggregates: Vec::new(),
+                },
+            )),
+        }),
+        limit: 10,
+        page_token: Vec::new(),
+        tenant: String::new(),
+        required_freshness: None,
+        authorization_subject: None,
+        required_visibility_tokens,
+    };
+    let inserted_page = tokio::time::timeout(
+        Duration::from_secs(30),
+        indexes.query_index(authorized(query(vec![insert_visibility]), token)),
+    )
+    .await
+    .expect("REALTIME insert did not become query-visible")
+    .unwrap()
+    .into_inner();
+    assert_eq!(inserted_page.hits.len(), 1);
+    assert_eq!(inserted_page.hits[0].address.as_ref(), Some(&object));
+    assert_eq!(inserted_page.hits[0].object_version, inserted.version);
+
+    let deleted = objects
+        .delete(authorized(
+            DeleteRequest {
+                address: Some(object),
+                command_id: "selective-realtime-delete".into(),
+                durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Realtime as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let delete_visibility = deleted
+        .index_visibility
+        .expect("REALTIME delete receipt omitted its visibility token");
+    let deleted_page = tokio::time::timeout(
+        Duration::from_secs(30),
+        indexes.query_index(authorized(query(vec![delete_visibility]), token)),
+    )
+    .await
+    .expect("REALTIME delete did not become query-visible")
+    .unwrap()
+    .into_inner();
+    assert!(deleted_page.hits.is_empty());
 
     fixture.stop().await;
 }
@@ -948,6 +1075,7 @@ async fn explicit_put_modes_cas_delete_head_batch_bulk_and_list_work_over_grpc()
                 command_id: "delete-cas-exact".into(),
                 durability: Durability::Local as i32,
                 expected_version: before_delete.version,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -967,6 +1095,7 @@ async fn explicit_put_modes_cas_delete_head_batch_bulk_and_list_work_over_grpc()
                 command_id: "delete-cas-stale".into(),
                 durability: Durability::Local as i32,
                 expected_version: before_delete.version,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -991,6 +1120,7 @@ async fn explicit_put_modes_cas_delete_head_batch_bulk_and_list_work_over_grpc()
                 address: Some(delete_address.clone()),
                 command_id: "delete-unconditional".into(),
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -1028,6 +1158,7 @@ async fn explicit_put_modes_cas_delete_head_batch_bulk_and_list_work_over_grpc()
                 address: Some(batch_deleted_address.clone()),
                 command_id: "batch-deleted-delete".into(),
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -1123,6 +1254,7 @@ async fn explicit_put_modes_cas_delete_head_batch_bulk_and_list_work_over_grpc()
                                 command_id: "bulk-existing-delete".into(),
                                 durability: Durability::Local as i32,
                                 expected_version: bulk_existing.version,
+                                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
                             },
                         )),
                     },
@@ -1184,6 +1316,7 @@ async fn explicit_put_modes_cas_delete_head_batch_bulk_and_list_work_over_grpc()
                 address: Some(address("list/bravo")),
                 command_id: "list-bravo-delete".into(),
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -1359,6 +1492,7 @@ async fn versioned_delete_version_never_resurrects_an_older_payload() {
                 address: Some(object.clone()),
                 version: first.version,
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -1378,6 +1512,7 @@ async fn versioned_delete_version_never_resurrects_an_older_payload() {
                 address: Some(object.clone()),
                 version: second.version,
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -1404,6 +1539,7 @@ async fn versioned_delete_version_never_resurrects_an_older_payload() {
                 address: Some(object.clone()),
                 version: tombstone,
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -1423,6 +1559,7 @@ async fn versioned_delete_version_never_resurrects_an_older_payload() {
                 address: Some(object),
                 version: u64::MAX,
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -1495,6 +1632,7 @@ async fn watch_prefix_streams_present_and_deleted_invalidations_with_checkpoints
                 address: Some(watched.clone()),
                 command_id: "watch-delete".into(),
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             token,
         ))
@@ -1835,6 +1973,7 @@ async fn put_object(
                 command_id: command_id.into(),
                 durability: Durability::Local as i32,
                 operation: Some(operation),
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             access_token,
         ))
@@ -1894,6 +2033,7 @@ fn bulk_put(address: ObjectAddress, bytes: &[u8], command_id: &str) -> BulkPutRe
         content_type: "application/octet-stream".into(),
         command_id: command_id.into(),
         durability: Durability::Local as i32,
+        indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
     }
 }
 

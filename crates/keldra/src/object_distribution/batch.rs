@@ -5,7 +5,8 @@ use std::future::Future;
 
 use keldra_store::{
     BatchOperation, BlobRef, CoordinatedObjectMutation, DefinitionMutationIntent, Durability,
-    MutationReceipt, ObjectMutationGovernance, PublishRequest, SourceJournalSettlement,
+    IndexingIntent, MutationReceipt, ObjectMutationGovernance, PublishRequest,
+    SourceJournalSettlement,
 };
 use tonic::Status;
 
@@ -24,6 +25,7 @@ struct BatchItem {
     operation: BatchOperation,
     governance: ObjectMutationGovernance,
     definition_intent: Option<DefinitionMutationIntent>,
+    indexing_intent: IndexingIntent,
 }
 
 #[derive(Clone)]
@@ -41,7 +43,7 @@ impl ObjectDistribution {
         self.mutate_many_inner(
             operations
                 .into_iter()
-                .map(|operation| (operation, None, None))
+                .map(|operation| (operation, None, None, IndexingIntent::Standard))
                 .collect(),
         )
         .await
@@ -54,7 +56,26 @@ impl ObjectDistribution {
         self.mutate_many_inner(
             operations
                 .into_iter()
-                .map(|(operation, intent)| (operation, intent, None))
+                .map(|(operation, intent)| (operation, intent, None, IndexingIntent::Standard))
+                .collect(),
+        )
+        .await
+    }
+
+    pub(crate) async fn mutate_many_with_definition_and_indexing_intents(
+        &self,
+        operations: Vec<(
+            BatchOperation,
+            Option<DefinitionMutationIntent>,
+            IndexingIntent,
+        )>,
+    ) -> Vec<Result<MutationReceipt, Status>> {
+        self.mutate_many_inner(
+            operations
+                .into_iter()
+                .map(|(operation, definition_intent, indexing_intent)| {
+                    (operation, definition_intent, None, indexing_intent)
+                })
                 .collect(),
         )
         .await
@@ -67,7 +88,9 @@ impl ObjectDistribution {
         self.mutate_many_inner(
             operations
                 .into_iter()
-                .map(|(operation, governance)| (operation, None, Some(governance)))
+                .map(|(operation, governance)| {
+                    (operation, None, Some(governance), IndexingIntent::Standard)
+                })
                 .collect(),
         )
         .await
@@ -79,6 +102,7 @@ impl ObjectDistribution {
             BatchOperation,
             Option<DefinitionMutationIntent>,
             Option<ObjectMutationGovernance>,
+            IndexingIntent,
         )>,
     ) -> Vec<Result<MutationReceipt, Status>> {
         if operations.is_empty() {
@@ -94,7 +118,7 @@ impl ObjectDistribution {
         let mut grouped = BTreeMap::<Vec<u64>, Vec<BatchItem>>::new();
         let mut pending_hot = BTreeMap::<usize, PendingHotProjection>::new();
         let mut outcomes = vec![None; count];
-        for (index, (operation, definition_intent, supplied_governance)) in
+        for (index, (operation, definition_intent, supplied_governance, indexing_intent)) in
             operations.into_iter().enumerate()
         {
             let key = operation_key(&operation);
@@ -142,6 +166,7 @@ impl ObjectDistribution {
                 operation,
                 governance,
                 definition_intent,
+                indexing_intent,
             });
         }
 
@@ -377,6 +402,7 @@ impl ObjectDistribution {
                         item.item.operation.clone(),
                         item.item.governance.clone(),
                         item.item.definition_intent,
+                        item.item.indexing_intent,
                     )
                 })
                 .collect();
@@ -385,7 +411,7 @@ impl ObjectDistribution {
                 let (coordinated, settlement) = if single_node {
                     let batch = completion
                         .store
-                        .coordinate_single_node_mutation_batch_with_settlement(
+                        .coordinate_single_node_mutation_batch_with_settlement_and_indexing(
                             store_operations,
                             context,
                         )
@@ -396,7 +422,10 @@ impl ObjectDistribution {
                     (
                         completion
                             .store
-                            .coordinate_distributed_mutation_batch(store_operations, context)
+                            .coordinate_distributed_mutation_batch_with_indexing(
+                                store_operations,
+                                context,
+                            )
                             .await
                             .map_err(mutation_status)?,
                         SourceJournalSettlement::RequiredAfterQuorum,
@@ -890,6 +919,7 @@ mod tests {
             deleted: false,
             replayed: false,
             replay_guarantee_expires_at_unix_millis: 1,
+            realtime_visibility: None,
         }
     }
 
@@ -909,6 +939,7 @@ mod tests {
                 policy: BucketPolicy::default(),
             },
             definition_intent: None,
+            indexing_intent: IndexingIntent::Standard,
         }
     }
 

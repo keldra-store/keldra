@@ -381,5 +381,6 @@ Detailed accepted decisions remain in:
 
 - `keldra_0009_atomic_programs.md`;
 - `keldra_0010_cluster_distribution.md`;
-- `keldra_0018_integrated_payload_storage.md`; and
-- `keldra_0020_logical_index_catalog_and_shared_physical_projections.md`.
+- `keldra_0018_integrated_payload_storage.md`;
+- `keldra_0020_logical_index_catalog_and_shared_physical_projections.md`; and
+- `keldra_0021_selective_realtime_indexing.md`.

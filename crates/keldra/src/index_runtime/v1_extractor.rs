@@ -35,9 +35,10 @@ pub(crate) struct V1ProjectionExtractor {
     maximum_projection_bytes: usize,
 }
 
+#[derive(Clone)]
 pub(crate) struct SelectedV1Source {
     pub(crate) source: IndexSourceMutation,
-    pub(crate) selected: Option<ProjectedScalarPointers>,
+    pub(crate) selected: Option<Arc<ProjectedScalarPointers>>,
     pub(crate) selection_memory: Option<Arc<keldra_index::v1::IndexingMemoryPermit>>,
 }
 
@@ -137,7 +138,7 @@ impl V1ProjectionExtractor {
             );
             return Ok(SelectedV1Source {
                 source: IndexSourceMutation::Upsert(object),
-                selected: Some(selected),
+                selected: Some(Arc::new(selected)),
                 selection_memory: None,
             });
         }
@@ -202,7 +203,7 @@ impl V1ProjectionExtractor {
         );
         Ok(SelectedV1Source {
             source: IndexSourceMutation::Upsert(object),
-            selected,
+            selected: selected.map(Arc::new),
             selection_memory: Some(selection_memory),
         })
     }

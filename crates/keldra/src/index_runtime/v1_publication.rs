@@ -43,6 +43,7 @@ mod compaction_publication;
 mod immutable_staging;
 mod physical_packs;
 mod publication_types;
+mod realtime_overlay;
 #[cfg(test)]
 use immutable_staging::{immutable_stage_windows, immutable_stage_work, inline_window_fits};
 use publication_types::{

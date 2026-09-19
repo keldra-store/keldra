@@ -23,8 +23,9 @@ use crate::watch::{
     LocalInvalidation, MAX_LOCAL_INVALIDATION_SCAN_RECORDS, ObjectHeadChangeKind,
     OversizeLocalChange, SourceId, WatchCursor, WatchError, WatchJournalStatus, WatchPage,
     WatchRetention, WatchScope, WatchStart, decode_local_change, decode_local_change_with_length,
-    decode_resume_token, decode_watch_journal_status, encode_local_change, encode_resume_token,
-    encode_watch_journal_status, invalidation_key, invalidation_record_bytes, offset_from_key,
+    decode_resume_token, decode_watch_journal_status, encode_local_change,
+    encode_local_change_with_indexing, encode_resume_token, encode_watch_journal_status,
+    invalidation_key, invalidation_record_bytes, offset_from_key,
 };
 use crate::{
     AWAITING_PUBLISH, AccountingHeadTransition, BatchOperation, BatchOutcome, BlobReader, BlobRef,
@@ -112,7 +113,7 @@ pub(crate) const CF_BUCKET_OPTIONS: &str = "bucket_options";
 pub(crate) const CF_NAMES: &str = "names";
 const CF_RECEIPTS: &str = "receipts";
 pub(crate) const CF_POLICIES: &str = "policies";
-const CF_LOCAL_INVALIDATIONS: &str = "local_invalidations";
+pub(crate) const CF_LOCAL_INVALIDATIONS: &str = "local_invalidations";
 pub(crate) const CF_METADATA: &str = "metadata";
 pub(crate) const CF_AUTHZ_TENANTS: &str = "authz_tenants";
 pub(crate) const CF_AUTHZ_SCHEMAS: &str = "authz_schemas";
@@ -125,6 +126,7 @@ pub(crate) const CF_AUTHZ_RECEIPTS: &str = "authz_receipts";
 pub(crate) const CF_CREDENTIALS: &str = "credentials";
 pub(crate) const CF_DEFINITION_STATE: &str = "definition_state";
 pub(crate) const CF_JOURNAL_ROUTES: &str = "journal_routes";
+pub(crate) const CF_REALTIME_JOURNAL_ROUTES: &str = "realtime_journal_routes";
 pub(crate) const CF_OBJECT_ALIAS_REGISTRIES: &str = "object_alias_registries";
 pub(crate) const VERSION_HIGH_WATERMARK_KEY: &[u8] = b"version_high_watermark";
 const INTEGRATED_PAYLOAD_STORAGE_FORMAT_KEY: &[u8] =
@@ -180,6 +182,7 @@ pub(crate) const COLUMN_FAMILIES: &[&str] = &[
     CF_CREDENTIALS,
     CF_DEFINITION_STATE,
     CF_JOURNAL_ROUTES,
+    CF_REALTIME_JOURNAL_ROUTES,
     CF_OBJECT_ALIAS_REGISTRIES,
 ];
 
@@ -260,7 +263,7 @@ impl MutationReceiptRetention {
         })
     }
 
-    fn retention_millis(self) -> u64 {
+    pub(crate) fn retention_millis(self) -> u64 {
         self.retention_seconds * 1_000
     }
 }
@@ -437,6 +440,7 @@ pub struct Store {
     /// when no other writer is active.
     mutation_capacity_notify: Arc<tokio::sync::Notify>,
     watch_notify: tokio::sync::watch::Sender<()>,
+    realtime_journal_notify: tokio::sync::watch::Sender<()>,
     definition_assignment_notify:
         tokio::sync::broadcast::Sender<Vec<crate::DefinitionAssignmentMutation>>,
     #[cfg(test)]
@@ -587,6 +591,23 @@ impl PreparedOperation {
             | Self::Clone { fingerprint, .. }
             | Self::Delete { fingerprint, .. } => *fingerprint,
         }
+    }
+
+    fn bind_indexing_intent(&mut self, intent: crate::IndexingIntent) {
+        if intent == crate::IndexingIntent::Standard {
+            return;
+        }
+        let fingerprint = match self {
+            Self::Put { fingerprint, .. }
+            | Self::Publish { fingerprint, .. }
+            | Self::Clone { fingerprint, .. }
+            | Self::Delete { fingerprint, .. } => fingerprint,
+        };
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"keldra.object-command-indexing-intent.v1");
+        hasher.update(fingerprint);
+        hasher.update(&[1]);
+        *fingerprint = *hasher.finalize().as_bytes();
     }
 
     fn payload_reference(&self) -> Option<&BlobRef> {
@@ -1081,6 +1102,7 @@ impl Store {
             source_journal_progress_debt_peak_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mutation_capacity_notify: Arc::new(tokio::sync::Notify::new()),
             watch_notify: tokio::sync::watch::channel(()).0,
+            realtime_journal_notify: tokio::sync::watch::channel(()).0,
             definition_assignment_notify: tokio::sync::broadcast::channel(
                 DEFINITION_ASSIGNMENT_NOTIFICATION_CAPACITY,
             )
@@ -1096,6 +1118,7 @@ impl Store {
             .initialize_mutation_lane_runtime(existing_database)
             .await?;
         store.start_mutation_lane_projector().await?;
+        let rebuilt_realtime_routes = store.rebuild_realtime_journal_routes()?;
         let durable_floor = store.local_watch_status()?.retention_floor;
         store
             .source_journal_reference_safe_through
@@ -1114,6 +1137,7 @@ impl Store {
             storage.pending_upload_max_bytes = options.pending_upload_max_bytes,
             storage.payload_chunk_bytes = PAYLOAD_ARTIFACT_CHUNK_BYTES,
             storage.payload_blob_min_bytes = PAYLOAD_BLOB_MIN_BYTES,
+            storage.rebuilt_realtime_routes = rebuilt_realtime_routes,
             "opened integrated RocksDB payload storage"
         );
         Ok(store)
@@ -1526,6 +1550,7 @@ mod mutation_types;
 mod mutation_unary;
 mod mutations;
 mod options;
+mod realtime_journal_routes;
 mod single_node_group_commit;
 use mutation_fingerprint::*;
 pub use single_node_group_commit::{

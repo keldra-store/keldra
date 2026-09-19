@@ -14,9 +14,9 @@ use std::io::Read;
 use tonic::{Request, Response, Status};
 
 use super::{
-    ObjectServiceImpl, api_receipt, deadline_remaining, durability, object_key, object_link,
-    plugin_object_scope, request_deadline, require_plugin_key_scope, required_command_id,
-    routed_writes,
+    ObjectServiceImpl, api_program_receipt, deadline_remaining, durability, indexing_intent,
+    object_key, object_link, plugin_object_scope, request_deadline, require_plugin_key_scope,
+    required_command_id, routed_writes,
 };
 use crate::authentication::{Caller, PluginObjectScope};
 use crate::authorization::ObjectPermission;
@@ -38,6 +38,7 @@ pub(super) async fn clone_object(
     let bearer = OriginalBearer::from_metadata(request.metadata())?;
     let deadline = request_deadline(request.metadata(), service.atomic_program_timeout)?;
     let api_request = request.into_inner();
+    let indexing_intent = indexing_intent(api_request.indexing_intent)?;
     let source = object_key(api_request.source.clone())?;
     let destination = object_key(api_request.destination.clone())?;
     if api_request.source_version == 0
@@ -68,6 +69,7 @@ pub(super) async fn clone_object(
         &destination_requested_path,
         mode,
         durability,
+        indexing_intent,
     );
     let governance = service
         .bucket_governance
@@ -103,6 +105,7 @@ pub(super) async fn clone_object(
             1,
             crate::programs::builtin_invocation_identity(1, &command_id),
             fingerprint,
+            indexing_intent,
         )
         .await?
     {
@@ -117,10 +120,11 @@ pub(super) async fn clone_object(
         )
         .await?;
         return clone_result_response(
+            service,
+            &caller,
             result,
             &destination_requested_path,
             &command_id,
-            fingerprint,
         );
     }
 
@@ -405,14 +409,16 @@ pub(super) async fn clone_object(
             crate::programs::builtin_invocation_identity(1, &command_id),
             fingerprint,
             durability_class,
+            indexing_intent,
             deadline_remaining(deadline)?,
         )
         .await?;
     clone_result_response(
+        service,
+        &caller,
         result,
         &destination_requested_path,
         &command_id,
-        fingerprint,
     )
 }
 
@@ -459,10 +465,11 @@ async fn authorize_clone_result_targets(
 }
 
 fn clone_result_response(
+    service: &ObjectServiceImpl,
+    caller: &Caller,
     result: crate::programs::InvokedProgramResult,
     destination_requested: &ObjectPath,
     command_id: &str,
-    fingerprint: [u8; 32],
 ) -> Result<Response<MutationReceipt>, Status> {
     let destination = result
         .alias_targets
@@ -472,14 +479,16 @@ fn clone_result_response(
         .published_versions
         .get(destination)
         .ok_or_else(|| Status::data_loss("Clone published no destination version"))?;
-    Ok(Response::new(api_receipt(keldra_store::MutationReceipt {
-        command_id: Some(command_id.to_owned()),
-        fingerprint,
-        version: published.version,
-        deleted: published.deleted,
-        replayed: result.replayed,
-        replay_guarantee_expires_at_unix_millis: result.replay_guarantee_expires_at_unix_millis,
-    })))
+    Ok(Response::new(api_program_receipt(
+        &service.jwt_manager,
+        caller,
+        command_id.to_owned(),
+        published.version,
+        published.deleted,
+        result.replayed,
+        result.replay_guarantee_expires_at_unix_millis,
+        result.realtime_visibility.as_ref(),
+    )?))
 }
 
 struct CloneAliasProof {
@@ -590,6 +599,7 @@ fn clone_input_fingerprint(
     destination: &ObjectPath,
     mode: PutMode,
     durability: keldra_store::Durability,
+    indexing_intent: keldra_store::IndexingIntent,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("keldra.clone-object/v1");
     for value in [
@@ -604,7 +614,7 @@ fn clone_input_fingerprint(
         hasher.update(value.as_bytes());
     }
     hasher.update(&source_version.to_be_bytes());
-    hasher.update(format!("{mode:?}:{durability:?}").as_bytes());
+    hasher.update(format!("{mode:?}:{durability:?}:{indexing_intent:?}").as_bytes());
     *hasher.finalize().as_bytes()
 }
 

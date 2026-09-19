@@ -145,6 +145,24 @@ Pass the request to `IndexServiceClient::create_index`. Query hits return the
 ordinary object address and exact version; fetch selected source objects with
 `GetObject` or `BatchGet`.
 
+## Request selective real-time visibility
+
+Object mutations use `IndexingIntent::Standard` by default. Set an individual
+mutation to `IndexingIntent::Realtime` when that committed version must enter
+the separately admitted real-time projection lane. A successful receipt then
+contains an opaque `index_visibility` token with a bounded expiry. Preserve the
+token as an opaque value and pass it to
+`QueryIndexRequest.required_visibility_tokens`; do not decode it or reinterpret
+it as complete-prefix freshness.
+
+The mutation RPC returns after the durable object mutation and real-time work
+have been admitted. Waiting for query visibility is deliberately a subsequent
+`QueryIndex` call, so a query deadline cannot obscure a successful object
+write. Multiple receipt tokens can be supplied together, including tokens from
+independent successful `BulkWrite` outcomes. `required_freshness` and visibility
+tokens are complementary: when both are present, the query waits for both at
+the same request deadline.
+
 `TypedJsonIndexBuilder::finish` explicitly selects application result
 authorization. Existing application-scoped queries therefore set
 `QueryIndexRequest.authorization_subject` to `None`. To enforce an end-user

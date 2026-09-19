@@ -598,6 +598,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             queries: index_runtime.queries.clone(),
             authorization: index_authorization,
             page_tokens: Arc::new(config.token_manager.clone()),
+            visibility_tokens: Arc::new(config.token_manager.clone()),
             definition_reader: Arc::new(object_reader.clone()),
         },
         config.atomic_program_timeout,

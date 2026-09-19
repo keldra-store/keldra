@@ -166,9 +166,11 @@ pub(super) async fn put_end(
             command_id: Some(metadata.command_id),
             durability: metadata.durability,
         };
+        let indexing_intent = metadata.indexing_intent;
         if let Some(link) = metadata.link {
             let receipt = object_link::publish_through_link(
                 service,
+                &caller,
                 publish,
                 link,
                 ready.upload_source_node_id,
@@ -176,6 +178,7 @@ pub(super) async fn put_end(
                 token,
                 peer_routed,
                 deadline,
+                indexing_intent,
             )
             .await?;
             return Ok(Response::new(receipt));
@@ -220,17 +223,22 @@ pub(super) async fn put_end(
                 }
             }
             None => api_receipt(
+                &service.jwt_manager,
+                &caller,
                 run_request_until(
                     deadline,
-                    service.distribution.publish_from_source_with_governance(
-                        publish,
-                        keldra_consensus::NodeId(ready.upload_source_node_id),
-                        governance,
-                    ),
+                    service
+                        .distribution
+                        .publish_from_source_with_governance_and_indexing(
+                            publish,
+                            keldra_consensus::NodeId(ready.upload_source_node_id),
+                            governance,
+                            indexing_intent,
+                        ),
                     "put publication deadline exceeded",
                 )
                 .await?,
-            ),
+            )?,
         };
         Ok(Response::new(receipt))
     }

@@ -66,6 +66,7 @@ async fn main() -> TestResult<()> {
             command_id: format!("public-qualification-put-{bucket}"),
             durability: Durability::Local as i32,
             operation: Some(PutOperationValue::Put(PutOperation {})),
+            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
         },
         [CONTENT.to_vec()],
     )
@@ -233,6 +234,7 @@ async fn qualify_anonymous_write_denial(
             command_id: "anonymous-write-must-fail".into(),
             durability: Durability::Local as i32,
             operation: Some(PutOperationValue::Put(PutOperation {})),
+            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
         })
         .await
         .unwrap_err();

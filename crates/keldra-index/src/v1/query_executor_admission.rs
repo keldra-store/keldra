@@ -4,7 +4,7 @@ use crate::IndexError;
 
 use super::{
     MAX_QUERY_DOCUMENT_PATH_BYTES, ProjectionPartitionIdentity, ProjectionQueryStreamRoot,
-    QueryDocumentGate, StableDocumentKey,
+    QueryDocumentGate, QueryRunReference, StableDocumentKey,
 };
 
 pub(super) fn match_all_live_documents(
@@ -66,6 +66,40 @@ impl PinnedPartitionQueryRoot {
             .next_offset
             .checked_sub(1)
             .ok_or(IndexError::Integrity)
+    }
+}
+
+/// One sparse real-time run pinned beside a complete-prefix base root.
+///
+/// `source_position` is the first still-unabsorbed sparse position represented
+/// by this artifact. It is a bound, never a contiguous freshness claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinnedRealtimeOverlayRun {
+    pub partition: ProjectionPartitionIdentity,
+    pub physical_catalog_generation: [u8; 32],
+    pub overlay_generation_hash: [u8; 32],
+    pub source_position: u64,
+    pub atomic_position: u64,
+    pub run: QueryRunReference,
+}
+
+impl PinnedRealtimeOverlayRun {
+    pub(crate) fn validate_against(self, base: PinnedPartitionQueryRoot) -> Result<(), IndexError> {
+        if self.partition != base.partition
+            || self.physical_catalog_generation != base.physical_catalog_generation
+            || self.overlay_generation_hash == [0; 32]
+            || self.source_position < base.root.next_offset
+            || self.run.hash == [0; 32]
+            || self.run.level != 0
+            || self.run.source_start_offset > self.source_position
+            || self.run.next_offset <= self.source_position
+            || self.run.through_atomic_position != self.atomic_position
+        {
+            return Err(IndexError::InvalidQuery(
+                "real-time overlay run is incompatible with its pinned base root".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

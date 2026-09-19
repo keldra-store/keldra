@@ -50,6 +50,7 @@ async fn main() -> TestResult<()> {
                         content_type: "application/octet-stream".into(),
                         command_id,
                         durability: Durability::Local as i32,
+                        indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
                     })),
                 }
             })

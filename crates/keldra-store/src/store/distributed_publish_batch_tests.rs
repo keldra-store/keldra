@@ -1,5 +1,5 @@
 use super::*;
-use crate::PlacementLogId;
+use crate::{IndexingIntent, PlacementLogId};
 
 fn request(path: &str, command: &str, blob: BlobRef) -> PublishRequest {
     PublishRequest {
@@ -38,6 +38,21 @@ fn governed_put(
         governance,
         None,
     )
+}
+
+fn indexed_governed_put(
+    path: &str,
+    command: &str,
+    bytes: &[u8],
+    governance: ObjectMutationGovernance,
+) -> (
+    BatchOperation,
+    ObjectMutationGovernance,
+    Option<DefinitionMutationIntent>,
+    IndexingIntent,
+) {
+    let (operation, governance, definition) = governed_put(path, command, bytes, governance);
+    (operation, governance, definition, IndexingIntent::Standard)
 }
 
 #[tokio::test]
@@ -399,7 +414,7 @@ async fn single_node_derived_publish_uses_inline_reference_lane_beyond_journal_l
 
     let bounded = store
         .coordinate_mutation_batch(
-            vec![governed_put(
+            vec![indexed_governed_put(
                 "objects/bounded",
                 "bounded",
                 b"bounded",
@@ -481,7 +496,7 @@ async fn independent_lane_evaluation_retries_without_holding_sequence_authority(
         async move {
             store
                 .coordinate_mutation_batch(
-                    vec![governed_put(
+                    vec![indexed_governed_put(
                         first_path,
                         "paused-command",
                         b"paused",
@@ -510,7 +525,7 @@ async fn independent_lane_evaluation_retries_without_holding_sequence_authority(
     let independent = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         store.coordinate_mutation_batch(
-            vec![governed_put(
+            vec![indexed_governed_put(
                 &second_path,
                 &second_command,
                 &second_bytes,
@@ -557,7 +572,12 @@ async fn independent_lane_evaluation_retries_without_holding_sequence_authority(
     for (path, command, bytes) in replays {
         let replay = store
             .coordinate_mutation_batch(
-                vec![governed_put(path, command, bytes, governance.clone())],
+                vec![indexed_governed_put(
+                    path,
+                    command,
+                    bytes,
+                    governance.clone(),
+                )],
                 context,
                 CoordinatorBatchPayloadPreparation::SingleNode {
                     source_journal_admission: SourceJournalAdmission::Bounded,
@@ -589,7 +609,7 @@ async fn visibility_projection_excludes_a_racing_inline_authority_write() {
     };
     let first = store
         .coordinate_mutation_batch(
-            vec![governed_put(
+            vec![indexed_governed_put(
                 "objects/first",
                 "first-command",
                 b"first",
@@ -638,7 +658,7 @@ async fn visibility_projection_excludes_a_racing_inline_authority_write() {
         async move {
             store
                 .coordinate_mutation_batch(
-                    vec![governed_put(
+                    vec![indexed_governed_put(
                         "objects/second",
                         "second-command",
                         b"second",
@@ -717,7 +737,7 @@ async fn failed_lane_evaluation_does_not_reserve_sequence_authority() {
     };
     store
         .coordinate_mutation_batch(
-            vec![governed_put(
+            vec![indexed_governed_put(
                 "objects/existing",
                 "create-existing",
                 b"existing",
@@ -741,7 +761,7 @@ async fn failed_lane_evaluation_does_not_reserve_sequence_authority() {
 
     let failed = store
         .coordinate_mutation_batch(
-            vec![governed_put(
+            vec![indexed_governed_put(
                 "objects/existing",
                 "must-not-reserve",
                 b"replacement",

@@ -13,6 +13,8 @@ pub enum ProjectionArtifactKind {
     QueryRunStreamPage,
     Generation,
     Current,
+    RealtimeOverlayGeneration,
+    RealtimeOverlayCurrent,
 }
 
 /// Immutable artifacts are family-scoped. Only a mutable current has a
@@ -81,6 +83,17 @@ pub fn projection_generation_path(
 
 pub fn projection_current_path(partition: ProjectionPartitionIdentity) -> String {
     format!("{}/current", partition_root(partition))
+}
+
+pub fn projection_realtime_overlay_generation_path(
+    partition: ProjectionPartitionIdentity,
+    hash: [u8; 32],
+) -> String {
+    immutable_path(partition.family_id, "realtime-overlay-generations", hash)
+}
+
+pub fn projection_realtime_overlay_current_path(partition: ProjectionPartitionIdentity) -> String {
+    format!("{}/realtime-overlay-current", partition_root(partition))
 }
 
 /// The family directory is stable across physical catalog generations.
@@ -158,7 +171,10 @@ pub fn projection_artifact_routing_id(
         ProjectionArtifactKind::QueryRunPack => b"query-run-pack".as_slice(),
         ProjectionArtifactKind::QueryRunStreamPage => b"query-run-stream-page".as_slice(),
         ProjectionArtifactKind::Generation => b"generation".as_slice(),
-        ProjectionArtifactKind::Current => {
+        ProjectionArtifactKind::RealtimeOverlayGeneration => {
+            b"realtime-overlay-generation".as_slice()
+        }
+        ProjectionArtifactKind::Current | ProjectionArtifactKind::RealtimeOverlayCurrent => {
             return Err(IndexError::InvalidDefinition(
                 "mutable projection current has no artifact routing identity".into(),
             ));
@@ -197,6 +213,7 @@ pub fn parse_projection_artifact_path(path: &str) -> Result<ProjectionArtifactPa
                 "query-run-packs" => ProjectionArtifactKind::QueryRunPack,
                 "query-run-stream-pages" => ProjectionArtifactKind::QueryRunStreamPage,
                 "generations" => ProjectionArtifactKind::Generation,
+                "realtime-overlay-generations" => ProjectionArtifactKind::RealtimeOverlayGeneration,
                 _ => {
                     return Err(IndexError::InvalidDefinition(
                         "projection artifact path class is invalid".into(),
@@ -235,6 +252,34 @@ pub fn parse_projection_artifact_path(path: &str) -> Result<ProjectionArtifactPa
                 family_id: partition.family_id,
                 partition: Some(partition),
                 kind: ProjectionArtifactKind::Current,
+                content_hash: None,
+            })
+        }
+        [
+            "_keldra",
+            "index-projections",
+            "v1",
+            family,
+            "partitions",
+            source_node,
+            source_epoch,
+            producer_node,
+            placement_term,
+            placement_index,
+            "realtime-overlay-current",
+        ] => {
+            let partition = ProjectionPartitionIdentity::new(
+                decode_nonzero_hash(family)?,
+                decode_u64(source_node)?,
+                decode_nonzero_hash(source_epoch)?,
+                decode_u64(producer_node)?,
+                decode_u64(placement_term)?,
+                decode_u64(placement_index)?,
+            )?;
+            Ok(ProjectionArtifactPath {
+                family_id: partition.family_id,
+                partition: Some(partition),
+                kind: ProjectionArtifactKind::RealtimeOverlayCurrent,
                 content_hash: None,
             })
         }

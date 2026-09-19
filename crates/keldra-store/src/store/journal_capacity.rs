@@ -40,6 +40,41 @@ impl SourceJournalAdmission {
 }
 
 impl Store {
+    pub(crate) fn stage_local_changes_with_indexing(
+        &self,
+        batch: &mut WriteBatch,
+        changes: &[PendingLocalChange],
+        reference_effects: LocalReferenceEffects,
+        indexing_intent: crate::IndexingIntent,
+    ) -> Result<(), MutationError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let status = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let cursor = self
+            .reference_delta_cursor(status.source_id)
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let realtime_change_indices = if indexing_intent == crate::IndexingIntent::Realtime {
+            (0..changes.len()).collect()
+        } else {
+            BTreeSet::new()
+        };
+        self.stage_local_changes_from_status_with_realtime(
+            batch,
+            changes,
+            &realtime_change_indices,
+            reference_effects,
+            SourceJournalAdmission::Bounded,
+            status,
+            cursor,
+            reference_effects != LocalReferenceEffects::Deferred,
+            true,
+        )?;
+        Ok(())
+    }
+
     pub(super) fn stage_local_changes_with_admission(
         &self,
         batch: &mut WriteBatch,
@@ -279,15 +314,32 @@ impl Store {
                         "retained local invalidation offset {offset} is missing"
                     ))
                 })?;
-            let pruned_change = self
-                .decode_local_change_record(&encoded)
+            let decoded = self
+                .decode_local_change_record_with_length(&encoded)
                 .map_err(|error| WatchError::Storage(error.to_string()))?;
+            let pruned_change = decoded.change;
             if pruned_change.offset() != offset {
                 return Err(WatchError::Storage(
                     "local change key does not match its stored offset".into(),
                 ));
             }
+            if self
+                .realtime_journal_routes_pending(status.source_id.source_epoch, &pruned_change)
+                .map_err(|error| WatchError::Storage(error.to_string()))?
+            {
+                // A selected event remains authoritative until the real-time
+                // overlay is durably published and the base projection later
+                // acknowledges absorption. Capacity backpressures real-time
+                // writers rather than invalidating a promised token.
+                break;
+            }
             self.stage_journal_route_removal(
+                &mut batch,
+                status.source_id.source_epoch,
+                &pruned_change,
+            )
+            .map_err(|error| WatchError::Storage(error.to_string()))?;
+            self.stage_realtime_journal_route_removal(
                 &mut batch,
                 status.source_id.source_epoch,
                 &pruned_change,
@@ -307,11 +359,21 @@ impl Store {
             status.retention_floor = offset;
             pruned_records += 1;
             status.retained_entries -= 1;
+            let realtime_bytes = if decoded.indexing_intent == crate::IndexingIntent::Realtime {
+                super::realtime_journal_routes::realtime_journal_route_logical_bytes(&pruned_change)
+                    .map_err(|error| WatchError::Storage(error.to_string()))?
+            } else {
+                0
+            };
             status.retained_bytes = status
                 .retained_bytes
-                .checked_sub(invalidation_record_bytes(encoded.len()).saturating_add(
-                    super::journal_routes::journal_route_logical_bytes(&pruned_change),
-                ))
+                .checked_sub(
+                    invalidation_record_bytes(encoded.len())
+                        .saturating_add(super::journal_routes::journal_route_logical_bytes(
+                            &pruned_change,
+                        ))
+                        .saturating_add(realtime_bytes),
+                )
                 .ok_or_else(|| {
                     WatchError::Storage("local invalidation byte accounting is inconsistent".into())
                 })?;

@@ -140,6 +140,7 @@ impl PersonalDbObjects {
                 content_type: "application/octet-stream".into(),
                 command_id,
                 durability: durability as i32,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             }),
         )
         .await
@@ -164,6 +165,7 @@ impl PersonalDbObjects {
                 command_id,
                 durability: durability as i32,
                 expected_version,
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             }),
         )
         .await

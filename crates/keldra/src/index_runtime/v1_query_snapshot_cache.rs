@@ -575,6 +575,7 @@ mod tests {
                 material_source_version: 1,
                 current_source_version: 1,
                 live: true,
+                selective_source_position: None,
                 source_path: Some("objects/source.json".into()),
                 canonical_source_path: None,
                 result_path: Some("objects/result.json".into()),
@@ -712,6 +713,9 @@ mod tests {
             identity: snapshot.identity(),
             cut,
             roots: vec![pin],
+            realtime_runs: Vec::new(),
+            realtime_evidence: Vec::new(),
+            overlay_generation_hashes: vec![None],
             generation_hashes: vec![[7; 32]],
             directory: ProjectionFamilyPartitionDirectory {
                 family_id: [1; 32],
@@ -789,10 +793,12 @@ mod tests {
         let original_cursor_roots = vec![QueryPositionRoot {
             generation_hash: [7; 32],
             next_newer_through_atomic_position: None,
+            realtime_overlay_generation_hash: None,
         }];
         let republished_cursor_roots = vec![QueryPositionRoot {
             generation_hash: [8; 32],
             next_newer_through_atomic_position: None,
+            realtime_overlay_generation_hash: None,
         }];
         assert_eq!(
             cache

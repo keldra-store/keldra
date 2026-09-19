@@ -120,6 +120,7 @@ async fn main() -> TestResult<()> {
                 command_id: format!("accounting-qualification-put-{index}"),
                 durability: Durability::Local as i32,
                 operation: Some(PutOperationValue::Put(PutOperation {})),
+                indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
             },
             [bytes.clone()],
         )
@@ -150,6 +151,7 @@ async fn main() -> TestResult<()> {
                 address: Some(address),
                 command_id: format!("accounting-qualification-delete-{index}"),
                 durability: Durability::Local as i32,
+                indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
             })
             .await?;
     }
@@ -281,6 +283,7 @@ async fn main() -> TestResult<()> {
             address: Some(alias_target),
             command_id: delete_command_id.into(),
             durability: Durability::Local as i32,
+            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
         })
         .await?
         .into_inner();
@@ -391,6 +394,7 @@ async fn main() -> TestResult<()> {
             address: Some(retained_alias.clone()),
             version: first_version,
             durability: Durability::Local as i32,
+            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
         })
         .await?
         .into_inner();
@@ -416,6 +420,7 @@ async fn main() -> TestResult<()> {
             address: Some(retained_target),
             version: second_version,
             durability: Durability::Local as i32,
+            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
         })
         .await?
         .into_inner();
@@ -465,6 +470,7 @@ async fn put_payload(
             command_id: command_id.into(),
             durability: Durability::Local as i32,
             operation: Some(PutOperationValue::Put(PutOperation {})),
+            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
         },
         [bytes.to_vec()],
     )
@@ -485,6 +491,7 @@ async fn link(
             target: Some(target),
             command_id: command_id.into(),
             durability: Durability::Local as i32,
+            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
         })
         .await?
         .into_inner();
@@ -497,6 +504,7 @@ async fn unlink(client: &mut RawClient, alias: ObjectAddress, command_id: &str) 
             link: Some(alias),
             command_id: command_id.into(),
             durability: Durability::Local as i32,
+            indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
         })
         .await?
         .into_inner();

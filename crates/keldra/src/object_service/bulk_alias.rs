@@ -158,6 +158,8 @@ pub(super) async fn prepare_before_live_dispatch(
                     .take()
                     .expect("replay positions originate from pending items");
                 match object_link::bulk_replay_result(
+                    service,
+                    caller,
                     result,
                     &probe.requested,
                     &probe.command_id,
@@ -341,6 +343,7 @@ pub(super) fn replay_probe(
 ) -> Result<Option<AliasReplayProbe>, Status> {
     use keldra_api::v1::bulk_operation::Operation;
 
+    let indexing_intent = super::bulk_indexing_intent(operation)?;
     let (authority_kind, command_id, fingerprint) = match operation.operation.as_ref() {
         Some(Operation::PutIfAbsent(_)) => return Ok(None),
         Some(Operation::Put(request)) | Some(Operation::PutImmutable(request)) => {
@@ -426,6 +429,7 @@ pub(super) fn replay_probe(
                 &command_id,
             ),
             input_fingerprint: fingerprint,
+            indexing_intent,
         },
         requested: requested.clone(),
         command_id,
@@ -528,6 +532,7 @@ async fn execute_one(
     deadline: tokio::time::Instant,
     meter_public: bool,
 ) -> Result<ApiMutationReceipt, Status> {
+    let indexing_intent = super::bulk_indexing_intent(&operation)?;
     match batch_operation(operation, service.max_blob_bytes)? {
         BatchOperation::Put(put) => {
             service
@@ -556,12 +561,14 @@ async fn execute_one(
                 command_id: command_id.clone(),
                 durability: put.durability,
                 mode: put.mode,
+                indexing_intent,
             };
             let upload_token = service.issue_upload_token(caller, &metadata)?;
             let header = require_upload_phase(service.verify_put_token(caller, &upload_token)?)?;
             let ready_token = service.issue_ready_token(caller, header, &blob)?;
             let receipt = object_link::publish_through_link(
                 service,
+                caller,
                 PublishRequest {
                     key: link.target.clone(),
                     blob,
@@ -576,6 +583,7 @@ async fn execute_one(
                 ready_token,
                 false,
                 deadline,
+                indexing_intent,
             )
             .await?;
             Ok(receipt)
@@ -595,6 +603,7 @@ async fn execute_one(
                 delete.precondition,
                 command_id,
                 delete.durability,
+                indexing_intent,
                 bearer,
                 deadline,
             )
@@ -750,6 +759,7 @@ mod tests {
             content_type: "text/plain".into(),
             command_id: "command".into(),
             durability: Durability::Local as i32,
+            indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
         };
         let operation = BulkOperation {
             operation: Some(Operation::Put(request.clone())),

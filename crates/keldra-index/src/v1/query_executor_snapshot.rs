@@ -3,15 +3,15 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::IndexError;
-use crate::v1::{CatalogOrdinalRange, LogicalFieldBinding};
+use crate::v1::{CatalogOrdinalRange, LogicalFieldBinding, ProjectionPartitionIdentity};
 
 use super::{
-    Budget, LogicalProjectionBinding, PinnedPartitionQueryRoot, ProjectionQueryRunDescriptor,
-    ProjectionQueryStreamRoot, QueryArtifactKind, QueryArtifactLoad, QueryArtifactLoader,
-    QueryBlockCredits, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits, QueryCommonCut,
-    QueryPartitionExecutor, QueryPopulation, QueryRecipeCatalogProof, QueryRunChild, QueryRunPage,
-    QueryRunReference, RecipeIdentity, TypedJsonQueryRequest, decode_projection_query_run,
-    decode_query_run_page, page_summary, resource,
+    Budget, LogicalProjectionBinding, PinnedPartitionQueryRoot, PinnedRealtimeOverlayRun,
+    ProjectionQueryRunDescriptor, ProjectionQueryStreamRoot, QueryArtifactKind, QueryArtifactLoad,
+    QueryArtifactLoader, QueryBlockCredits, QueryBlockDescriptor, QueryBlockKind, QueryBlockLimits,
+    QueryCommonCut, QueryPartitionExecutor, QueryPopulation, QueryRecipeCatalogProof,
+    QueryRunChild, QueryRunPage, QueryRunReference, RecipeIdentity, TypedJsonQueryRequest,
+    decode_projection_query_run, decode_query_run_page, page_summary, resource,
 };
 
 /// Content identity of one immutable, validated root-vector search snapshot.
@@ -217,6 +217,37 @@ async fn load_next_descriptor<L: QueryArtifactLoader, X: QueryPartitionExecutor>
     let Some(reference) = stream.next(loader, executor, credits, budget).await? else {
         return Ok(None);
     };
+    load_realtime_overlay_descriptor(
+        loader,
+        executor,
+        view,
+        catalog_lineage,
+        recipe_catalog_proofs,
+        reference,
+        block_limits,
+        credits,
+        budget,
+        false,
+    )
+    .await
+    .map(Some)
+}
+
+pub(super) async fn load_realtime_overlay_descriptor<
+    L: QueryArtifactLoader,
+    X: QueryPartitionExecutor,
+>(
+    loader: &mut L,
+    executor: &X,
+    view: &PartitionView,
+    catalog_lineage: &[[u8; 32]],
+    recipe_catalog_proofs: &[QueryRecipeCatalogProof],
+    reference: QueryRunReference,
+    block_limits: QueryBlockLimits,
+    credits: &mut QueryBlockCredits,
+    budget: &mut Budget,
+    sparse: bool,
+) -> Result<(Arc<ProjectionQueryRunDescriptor>, usize), IndexError> {
     let encoded_bytes =
         usize::try_from(reference.encoded_bytes).map_err(|_| IndexError::Integrity)?;
     check_run_descriptor_bytes(encoded_bytes, block_limits)?;
@@ -233,8 +264,9 @@ async fn load_next_descriptor<L: QueryArtifactLoader, X: QueryPartitionExecutor>
                 recipe_catalog_proofs,
                 &reference,
                 &descriptor,
+                sparse,
             )?;
-            return Ok(Some((descriptor, 0)));
+            return Ok((descriptor, 0));
         }
         let _leadership = match loader
             .coordinate_query_run_population(request.clone())
@@ -263,9 +295,10 @@ async fn load_next_descriptor<L: QueryArtifactLoader, X: QueryPartitionExecutor>
                 recipe_catalog_proofs,
                 &reference,
                 &descriptor,
+                sparse,
             )?;
             loader.cache_projection_query_run(request.clone(), descriptor.clone());
-            Ok(Some((descriptor, loaded_bytes)))
+            Ok((descriptor, loaded_bytes))
         }
         .await;
         return populated;
@@ -314,13 +347,14 @@ fn validate_loaded_descriptor(
     recipe_catalog_proofs: &[QueryRecipeCatalogProof],
     reference: &QueryRunReference,
     descriptor: &ProjectionQueryRunDescriptor,
+    sparse: bool,
 ) -> Result<(), IndexError> {
     if descriptor.partition != view.pin.partition
         || descriptor.sequence != reference.sequence
         || descriptor.source_start_offset != reference.source_start_offset
         || descriptor.next_offset != reference.next_offset
         || descriptor.through_atomic_position != reference.through_atomic_position
-        || descriptor.through_atomic_position > view.pin.root.through_atomic_position
+        || (!sparse && descriptor.through_atomic_position > view.pin.root.through_atomic_position)
     {
         return Err(IndexError::Integrity);
     }
@@ -397,6 +431,7 @@ pub struct ValidatedQuerySnapshot {
     pub(super) identity: QuerySnapshotIdentity,
     pub(super) common_cut: QueryCommonCut,
     pub(super) pins: Vec<PinnedPartitionQueryRoot>,
+    pub(super) realtime_overlays: Vec<PinnedRealtimeOverlayRun>,
     pub(super) logical: LogicalProjectionBinding,
     pub(super) catalog_lineage: Vec<[u8; 32]>,
     pub(super) recipe_catalog_proofs: Vec<QueryRecipeCatalogProof>,
@@ -427,6 +462,10 @@ impl ValidatedQuerySnapshot {
         &self.pins
     }
 
+    pub fn realtime_overlays(&self) -> &[PinnedRealtimeOverlayRun] {
+        &self.realtime_overlays
+    }
+
     pub fn matches_binding(
         &self,
         logical: &LogicalProjectionBinding,
@@ -452,6 +491,11 @@ impl ValidatedQuerySnapshot {
                 self.pins
                     .capacity()
                     .saturating_mul(std::mem::size_of::<PinnedPartitionQueryRoot>()),
+            )
+            .saturating_add(
+                self.realtime_overlays
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PinnedRealtimeOverlayRun>()),
             )
             .saturating_add(
                 self.catalog_lineage
@@ -504,11 +548,13 @@ impl ValidatedQuerySnapshot {
         identity: QuerySnapshotIdentity,
         common_cut: QueryCommonCut,
         pins: &[PinnedPartitionQueryRoot],
+        realtime_overlays: &[PinnedRealtimeOverlayRun],
         request: &TypedJsonQueryRequest,
     ) -> Result<(), IndexError> {
         if self.identity != identity
             || self.common_cut != common_cut
             || self.pins != pins
+            || self.realtime_overlays != realtime_overlays
             || !self.matches_binding(
                 &request.logical,
                 &request.catalog_lineage,
@@ -570,6 +616,56 @@ pub fn query_snapshot_identity(
                 hasher.update(&[0]);
             }
         }
+    }
+    Ok(QuerySnapshotIdentity(*hasher.finalize().as_bytes()))
+}
+
+/// Snapshot identity for the composed complete-prefix base and sparse overlay
+/// vectors. Sparse positions are domain separated and cannot be mistaken for
+/// base freshness evidence.
+pub fn query_snapshot_identity_with_overlays(
+    common_cut: QueryCommonCut,
+    pins: &[PinnedPartitionQueryRoot],
+    overlay_generations: &[(ProjectionPartitionIdentity, [u8; 32])],
+    realtime_overlays: &[PinnedRealtimeOverlayRun],
+) -> Result<QuerySnapshotIdentity, IndexError> {
+    let base = query_snapshot_identity(common_cut, pins)?;
+    if overlay_generations
+        .windows(2)
+        .any(|pair| pair[0].0 >= pair[1].0)
+        || overlay_generations
+            .iter()
+            .any(|(_, generation_hash)| *generation_hash == [0; 32])
+    {
+        return Err(IndexError::InvalidQuery(
+            "real-time overlay generation vector is non-canonical".into(),
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"keldra.index.v1.composed-query-snapshot/v1\0");
+    hasher.update(&base.bytes());
+    for (partition, generation_hash) in overlay_generations {
+        hasher.update(&partition.family_id);
+        hasher.update(&partition.source_node.to_be_bytes());
+        hasher.update(&partition.source_epoch);
+        hasher.update(&partition.producer_node.to_be_bytes());
+        hasher.update(&partition.placement_term.to_be_bytes());
+        hasher.update(&partition.placement_index.to_be_bytes());
+        hasher.update(generation_hash);
+    }
+    for overlay in realtime_overlays {
+        hasher.update(&overlay.partition.family_id);
+        hasher.update(&overlay.partition.source_node.to_be_bytes());
+        hasher.update(&overlay.partition.source_epoch);
+        hasher.update(&overlay.partition.producer_node.to_be_bytes());
+        hasher.update(&overlay.partition.placement_term.to_be_bytes());
+        hasher.update(&overlay.partition.placement_index.to_be_bytes());
+        hasher.update(&overlay.physical_catalog_generation);
+        hasher.update(&overlay.overlay_generation_hash);
+        hasher.update(&overlay.source_position.to_be_bytes());
+        hasher.update(&overlay.atomic_position.to_be_bytes());
+        hasher.update(&overlay.run.hash);
+        hasher.update(&overlay.run.encoded_bytes.to_be_bytes());
     }
     Ok(QuerySnapshotIdentity(*hasher.finalize().as_bytes()))
 }

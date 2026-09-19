@@ -56,6 +56,7 @@ fn batch(
         durability_class: DurabilityClass([2; 32]),
         durability_evidence_hash: DurabilityEvidenceHash([invocation.wrapping_add(3).max(1); 32]),
         participant_manifest_hash: ParticipantManifestHash([invocation.wrapping_add(4).max(1); 32]),
+        indexing_intent: keldra_consensus::AtomicIndexingIntent::Standard,
         proposal_at_unix_millis: 1_000 + u64::from(invocation),
         replay_expires_at_unix_millis: 1_000
             + u64::from(invocation)
@@ -343,6 +344,10 @@ fn commit_is_fenced_by_the_current_executor_and_pins_an_external_program() {
     );
     let committed = commit(&mut state, 7, batch(executor, 4, code, 1, 2)).unwrap();
     assert_eq!(committed.invocation.committed_batch.commit_cursor, 7);
+    assert_eq!(
+        committed.invocation.committed_batch.indexing_intent,
+        keldra_consensus::AtomicIndexingIntent::Standard
+    );
     assert_eq!(state.last_commit_cursor(), Some(7));
     assert_eq!(
         committed.invocation.committed_batch.authority,

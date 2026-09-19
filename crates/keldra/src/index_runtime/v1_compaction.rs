@@ -12,9 +12,10 @@ use keldra_index::v1::{
     ProjectionGeneration, ProjectionPackCredits, ProjectionQueryStreamRoot, QUERY_RUN_PAGE_FANOUT,
     QueryBlockCredits, QueryBlockLimits, QueryRunCompactionLimits, QueryRunCompactionPlan,
     SealedComponentDelta, TombstoneCompactionPolicy, compact_component_runs, pack_component_deltas,
-    prepare_encoded_query_run_compaction, projection_query_run_pack_path,
-    projection_query_run_stream_page_path, projection_stream_page_path,
-    select_component_compaction, select_query_run_compaction, splice_compacted_component_runs,
+    prepare_encoded_query_run_compaction, prepare_encoded_sparse_query_run_compaction,
+    projection_query_run_pack_path, projection_query_run_stream_page_path,
+    projection_stream_page_path, select_component_compaction, select_query_run_compaction,
+    splice_compacted_component_runs,
 };
 use tonic::Status;
 
@@ -759,6 +760,102 @@ fn compact_query_stream(
     prepared
         .finalize(pack_table, |hash| access.page(hash, true))
         .map_err(index_status)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn compact_sparse_overlay_runs(
+    cpu: &IndexCpuPool,
+    publisher: &V1ProjectionPublisher,
+    storage_tenant: String,
+    bucket: String,
+    tenant_id: u64,
+    bucket_id: u64,
+    partition: keldra_index::v1::ProjectionPartitionIdentity,
+    physical_catalog_generation: [u8; 32],
+    source_positions: Vec<u64>,
+    inputs_newest_first: Vec<keldra_index::v1::QueryRunReference>,
+    credits: QueryBlockCredits,
+) -> Result<
+    (
+        keldra_index::v1::ProjectionQueryRunArtifacts,
+        keldra_index::v1::QueryRunReference,
+        QueryBlockCredits,
+    ),
+    Status,
+> {
+    let first = source_positions.first().copied().ok_or_else(|| {
+        Status::invalid_argument("sparse overlay compaction has no source positions")
+    })?;
+    let last = source_positions.last().copied().ok_or_else(|| {
+        Status::invalid_argument("sparse overlay compaction has no source positions")
+    })?;
+    let through_atomic = inputs_newest_first
+        .iter()
+        .map(|run| run.through_atomic_position)
+        .max()
+        .unwrap_or(0);
+    let sequence = inputs_newest_first
+        .first()
+        .map(|run| run.sequence)
+        .ok_or_else(|| Status::invalid_argument("sparse overlay compaction has no runs"))?;
+    let runtime = tokio::runtime::Handle::current();
+    let publisher = publisher.clone();
+    let limits = publisher.query_block_limits();
+    cpu.submit(move || {
+        let failure = Arc::new(Mutex::new(None));
+        let prepared = prepare_encoded_sparse_query_run_compaction(
+            partition,
+            physical_catalog_generation,
+            sequence,
+            first,
+            last.checked_add(1)
+                .ok_or_else(|| Status::resource_exhausted("sparse overlay position overflow"))?,
+            through_atomic,
+            &inputs_newest_first,
+            limits,
+            credits,
+            |hash| {
+                blocking_artifact(
+                    &runtime,
+                    &failure,
+                    &publisher,
+                    &storage_tenant,
+                    &bucket,
+                    tenant_id,
+                    bucket_id,
+                    projection_query_run_pack_path(partition, hash),
+                    hash,
+                    limits.maximum_run_descriptor_bytes,
+                )
+            },
+            |descriptor| {
+                blocking_query_block(
+                    &runtime,
+                    &failure,
+                    &publisher,
+                    &storage_tenant,
+                    &bucket,
+                    tenant_id,
+                    bucket_id,
+                    descriptor,
+                )
+            },
+        )
+        .map_err(|error| {
+            recorded_artifact_failure(&failure).unwrap_or_else(|| index_status(error))
+        })?;
+        let table = runtime.block_on(publisher.publish_query_packs(
+            &storage_tenant,
+            &bucket,
+            tenant_id,
+            bucket_id,
+            partition,
+            prepared.packs(),
+        ))?;
+        prepared.finalize(table).map_err(index_status)
+    })
+    .await
+    .map_err(|error| Status::internal(error.to_string()))?
 }
 
 #[allow(clippy::too_many_arguments)]

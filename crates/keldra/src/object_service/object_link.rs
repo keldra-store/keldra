@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use tonic::{Request, Response, Status};
 
 use super::{
-    ObjectServiceImpl, api_receipt, deadline_remaining, durability, object_key,
+    ObjectServiceImpl, api_program_receipt, deadline_remaining, durability, object_key,
     plugin_object_scope, request_deadline, require_plugin_key_scope, required_command_id,
 };
 use crate::authorization::ObjectPermission;
@@ -252,9 +252,11 @@ fn require_public_version_metadata(version: Option<&Version>) -> Result<(), Stat
 
 pub(super) async fn replay_unlink(
     service: &ObjectServiceImpl,
+    caller: &crate::authentication::Caller,
     link: &ObjectKey,
     command_id: &str,
     durability: keldra_store::Durability,
+    indexing_intent: keldra_store::IndexingIntent,
 ) -> Result<Option<(Response<MutationReceipt>, ObjectKey)>, Status> {
     let fingerprint = object_link_command_fingerprint(link, None, durability);
     let Some(result) = service
@@ -264,6 +266,7 @@ pub(super) async fn replay_unlink(
             OBJECT_LINK_CONTRACT_VERSION,
             crate::programs::builtin_invocation_identity(UNLINK_OBJECT_AUTHORITY_KIND, command_id),
             fingerprint,
+            indexing_intent,
         )
         .await?
     else {
@@ -276,7 +279,7 @@ pub(super) async fn replay_unlink(
         .ok_or_else(|| Status::data_loss("Unlink replay omitted its canonical target"))?;
     let target = ObjectKey::new(&target.tenant, &target.bucket, &target.path)
         .map_err(|error| Status::data_loss(error.to_string()))?;
-    link_response(result, command_id, fingerprint, &link_path)
+    link_response(service, caller, result, command_id, fingerprint, &link_path)
         .map(|response| Some((response, target)))
 }
 
@@ -336,7 +339,16 @@ pub(super) async fn route_or_replay_delete(
         .as_deref()
         .ok_or_else(|| Status::invalid_argument("Delete command ID is required"))?;
     Ok(
-        match replay_unlink(service, &mutation.key, command_id, mutation.durability).await? {
+        match replay_unlink(
+            service,
+            caller,
+            &mutation.key,
+            command_id,
+            mutation.durability,
+            super::indexing_intent(api_request.indexing_intent)?,
+        )
+        .await?
+        {
             Some((response, target)) => {
                 object_path_access::require_key(path_access, &target)?;
                 require_plugin_key_scope(plugin_scope, &target)?;
@@ -400,6 +412,7 @@ pub(super) async fn link_object(
     let plugin_scope = plugin_object_scope(&request);
     let bearer = OriginalBearer::from_metadata(request.metadata())?;
     let api_request = request.into_inner();
+    let indexing_intent = super::indexing_intent(api_request.indexing_intent)?;
     let link = object_key(api_request.link.clone())?;
     let supplied_target = object_key(api_request.target.clone())?;
     if link.tenant() != supplied_target.tenant()
@@ -459,6 +472,7 @@ pub(super) async fn link_object(
             OBJECT_LINK_CONTRACT_VERSION,
             crate::programs::builtin_invocation_identity(LINK_OBJECT_AUTHORITY_KIND, &command_id),
             fingerprint,
+            indexing_intent,
         )
         .await?
     {
@@ -473,7 +487,14 @@ pub(super) async fn link_object(
         service
             .authorize_object(&caller, &target, ObjectPermission::Get)
             .await?;
-        return link_response(result, &command_id, fingerprint, &link_path);
+        return link_response(
+            service,
+            &caller,
+            result,
+            &command_id,
+            fingerprint,
+            &link_path,
+        );
     }
     let target_resolution = resolve_current(service, supplied_target).await?;
     let canonical_target = target_resolution.canonical();
@@ -564,11 +585,13 @@ pub(super) async fn link_object(
     )?;
     invoke_link_plan(
         service,
+        &caller,
         plan,
         LINK_OBJECT_AUTHORITY_KIND,
         &command_id,
         fingerprint,
         durability,
+        indexing_intent,
         deadline_remaining(deadline)?,
         &link_path,
     )
@@ -645,6 +668,7 @@ pub(super) async fn route_or_replay_conditional_delete(
             OBJECT_LINK_CONTRACT_VERSION,
             crate::programs::builtin_invocation_identity(UNLINK_OBJECT_AUTHORITY_KIND, command_id),
             fingerprint,
+            super::indexing_intent(api_request.indexing_intent)?,
         )
         .await?
     else {
@@ -662,7 +686,8 @@ pub(super) async fn route_or_replay_conditional_delete(
     service
         .authorize_object(caller, &target, ObjectPermission::Delete)
         .await?;
-    link_response(result, command_id, fingerprint, &link_path).map(DeleteReplayCheck::Response)
+    link_response(service, caller, result, command_id, fingerprint, &link_path)
+        .map(DeleteReplayCheck::Response)
 }
 
 pub(super) async fn unlink_object(
@@ -679,6 +704,7 @@ pub(super) async fn unlink_object(
     let plugin_scope = plugin_object_scope(&request);
     let bearer = OriginalBearer::from_metadata(request.metadata())?;
     let api_request = request.into_inner();
+    let indexing_intent = super::indexing_intent(api_request.indexing_intent)?;
     let link = object_key(api_request.link.clone())?;
     object_path_access::require_key(&path_access, &link)?;
     require_plugin_key_scope(plugin_scope.as_ref(), &link)?;
@@ -714,7 +740,15 @@ pub(super) async fn unlink_object(
         }
         None => {}
     }
-    if let Some((response, target)) = replay_unlink(service, &link, &command_id, durability).await?
+    if let Some((response, target)) = replay_unlink(
+        service,
+        &caller,
+        &link,
+        &command_id,
+        durability,
+        indexing_intent,
+    )
+    .await?
     {
         object_path_access::require_key(&path_access, &target)?;
         require_plugin_key_scope(plugin_scope.as_ref(), &target)?;
@@ -738,6 +772,7 @@ pub(super) async fn unlink_object(
         .await?;
     unlink_resolved(
         service,
+        &caller,
         &link,
         resolution,
         None,
@@ -745,6 +780,7 @@ pub(super) async fn unlink_object(
         fingerprint,
         durability,
         governance,
+        indexing_intent,
         deadline_remaining(deadline)?,
     )
     .await
@@ -764,6 +800,7 @@ pub(super) async fn delete_if_version_link(
     let plugin_scope = plugin_object_scope(&request);
     let bearer = OriginalBearer::from_metadata(request.metadata())?;
     let api_request = request.into_inner();
+    let indexing_intent = super::indexing_intent(api_request.indexing_intent)?;
     let link = object_key(api_request.address.clone())?;
     object_path_access::require_key(&path_access, &link)?;
     require_plugin_key_scope(plugin_scope.as_ref(), &link)?;
@@ -814,6 +851,7 @@ pub(super) async fn delete_if_version_link(
             OBJECT_LINK_CONTRACT_VERSION,
             crate::programs::builtin_invocation_identity(UNLINK_OBJECT_AUTHORITY_KIND, &command_id),
             fingerprint,
+            indexing_intent,
         )
         .await?
     {
@@ -828,7 +866,14 @@ pub(super) async fn delete_if_version_link(
         service
             .authorize_object(&caller, &target, ObjectPermission::Delete)
             .await?;
-        return link_response(result, &command_id, fingerprint, &link_path);
+        return link_response(
+            service,
+            &caller,
+            result,
+            &command_id,
+            fingerprint,
+            &link_path,
+        );
     }
     let resolution = match resolve_current(service, link.clone()).await? {
         ResolvedAddress::Link(link) => link,
@@ -845,6 +890,7 @@ pub(super) async fn delete_if_version_link(
         .await?;
     unlink_resolved(
         service,
+        &caller,
         &link,
         resolution,
         Some(expected_target_version),
@@ -852,6 +898,7 @@ pub(super) async fn delete_if_version_link(
         fingerprint,
         durability,
         governance,
+        indexing_intent,
         deadline_remaining(deadline)?,
     )
     .await
@@ -878,6 +925,7 @@ pub(super) fn conditional_unlink_fingerprint(
 #[allow(clippy::too_many_arguments)]
 async fn unlink_resolved(
     service: &ObjectServiceImpl,
+    caller: &crate::authentication::Caller,
     link: &ObjectKey,
     resolution: ResolvedObjectLink,
     expected_target_version: Option<keldra_store::VersionId>,
@@ -885,6 +933,7 @@ async fn unlink_resolved(
     fingerprint: [u8; 32],
     durability: keldra_store::Durability,
     governance: ObjectMutationGovernance,
+    indexing_intent: keldra_store::IndexingIntent,
     budget: std::time::Duration,
 ) -> Result<Response<MutationReceipt>, Status> {
     let _placement_guard = service.distribution.enter_mutation()?;
@@ -954,11 +1003,13 @@ async fn unlink_resolved(
     )?;
     invoke_link_plan(
         service,
+        caller,
         plan,
         UNLINK_OBJECT_AUTHORITY_KIND,
         &command_id,
         fingerprint,
         durability,
+        indexing_intent,
         budget,
         &link_path,
     )
@@ -972,6 +1023,7 @@ pub(super) async fn bulk_delete_through_link(
     precondition: Precondition,
     command_id: &str,
     durability: keldra_store::Durability,
+    indexing_intent: keldra_store::IndexingIntent,
     bearer: &str,
     deadline: tokio::time::Instant,
 ) -> Result<MutationReceipt, Status> {
@@ -1008,6 +1060,10 @@ pub(super) async fn bulk_delete_through_link(
                             expected_version: expected_version.0,
                             command_id: command_id.to_owned(),
                             durability: api_durability(durability),
+                            indexing_intent: match indexing_intent {
+                                keldra_store::IndexingIntent::Standard => 0,
+                                keldra_store::IndexingIntent::Realtime => 1,
+                            },
                         },
                         false,
                         deadline_remaining(deadline)?,
@@ -1024,6 +1080,10 @@ pub(super) async fn bulk_delete_through_link(
                             link: Some(super::api_address(&link)),
                             command_id: command_id.to_owned(),
                             durability: api_durability(durability),
+                            indexing_intent: match indexing_intent {
+                                keldra_store::IndexingIntent::Standard => 0,
+                                keldra_store::IndexingIntent::Realtime => 1,
+                            },
                         },
                         deadline_remaining(deadline)?,
                     )
@@ -1041,6 +1101,7 @@ pub(super) async fn bulk_delete_through_link(
             OBJECT_LINK_CONTRACT_VERSION,
             crate::programs::builtin_invocation_identity(UNLINK_OBJECT_AUTHORITY_KIND, command_id),
             fingerprint,
+            indexing_intent,
         )
         .await?
     {
@@ -1053,7 +1114,7 @@ pub(super) async fn bulk_delete_through_link(
         service
             .authorize_object(caller, &target, ObjectPermission::Delete)
             .await?;
-        return link_response(result, command_id, fingerprint, &link_path)
+        return link_response(service, caller, result, command_id, fingerprint, &link_path)
             .map(|response| response.into_inner());
     }
     if !revalidate(service, &ResolvedAddress::Link(expected_link.clone())).await? {
@@ -1070,6 +1131,7 @@ pub(super) async fn bulk_delete_through_link(
         .await?;
     unlink_resolved(
         service,
+        caller,
         &link,
         expected_link,
         expected,
@@ -1077,6 +1139,7 @@ pub(super) async fn bulk_delete_through_link(
         fingerprint,
         durability,
         governance,
+        indexing_intent,
         deadline_remaining(deadline)?,
     )
     .await
@@ -1239,11 +1302,13 @@ fn link_plan(
 
 async fn invoke_link_plan(
     service: &ObjectServiceImpl,
+    caller: &crate::authentication::Caller,
     plan: BuiltInObjectTransactionPlan,
     authority_kind: u16,
     command_id: &str,
     fingerprint: [u8; 32],
     durability: keldra_store::Durability,
+    indexing_intent: keldra_store::IndexingIntent,
     budget: std::time::Duration,
     receipt_path: &ObjectPath,
 ) -> Result<Response<MutationReceipt>, Status> {
@@ -1258,29 +1323,41 @@ async fn invoke_link_plan(
             crate::programs::builtin_invocation_identity(authority_kind, command_id),
             fingerprint,
             durability_class,
+            indexing_intent,
             budget,
         )
         .await?;
-    link_response(result, command_id, fingerprint, receipt_path)
+    link_response(
+        service,
+        caller,
+        result,
+        command_id,
+        fingerprint,
+        receipt_path,
+    )
 }
 
 fn link_response(
+    service: &ObjectServiceImpl,
+    caller: &crate::authentication::Caller,
     result: crate::programs::InvokedProgramResult,
     command_id: &str,
-    fingerprint: [u8; 32],
+    _fingerprint: [u8; 32],
     receipt_path: &ObjectPath,
 ) -> Result<Response<MutationReceipt>, Status> {
     let published = result.published_versions.get(receipt_path).ok_or_else(|| {
         Status::data_loss("object-link transaction omitted its descriptor result")
     })?;
-    Ok(Response::new(api_receipt(keldra_store::MutationReceipt {
-        command_id: Some(command_id.to_owned()),
-        fingerprint,
-        version: published.version,
-        deleted: published.deleted,
-        replayed: result.replayed,
-        replay_guarantee_expires_at_unix_millis: result.replay_guarantee_expires_at_unix_millis,
-    })))
+    Ok(Response::new(api_program_receipt(
+        &service.jwt_manager,
+        caller,
+        command_id.to_owned(),
+        published.version,
+        published.deleted,
+        result.replayed,
+        result.replay_guarantee_expires_at_unix_millis,
+        result.realtime_visibility.as_ref(),
+    )?))
 }
 
 fn aliases_with_inserted(
@@ -1326,6 +1403,7 @@ fn aliases_with_removed(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_through_link(
     service: &ObjectServiceImpl,
+    caller: &crate::authentication::Caller,
     publish: PublishRequest,
     link: ResolvedObjectLink,
     upload_source_node_id: u64,
@@ -1333,6 +1411,7 @@ pub(super) async fn publish_through_link(
     token: PutToken,
     peer_routed: bool,
     deadline: tokio::time::Instant,
+    indexing_intent: keldra_store::IndexingIntent,
 ) -> Result<MutationReceipt, Status> {
     match service.programs.executor_routing_target()? {
         Some(_) if peer_routed => {
@@ -1377,13 +1456,28 @@ pub(super) async fn publish_through_link(
             OBJECT_LINK_CONTRACT_VERSION,
             crate::programs::builtin_invocation_identity(authority_kind, command_id),
             fingerprint,
+            indexing_intent,
         )
         .await?
     {
         return if authority_kind == PUT_IMMUTABLE_THROUGH_LINK_AUTHORITY_KIND {
-            linked_immutable_response(result, command_id, fingerprint, &target_path)
+            linked_immutable_response(
+                service,
+                caller,
+                result,
+                command_id,
+                fingerprint,
+                &target_path,
+            )
         } else {
-            linked_put_response(result, command_id, fingerprint, &target_path)
+            linked_put_response(
+                service,
+                caller,
+                result,
+                command_id,
+                fingerprint,
+                &target_path,
+            )
         };
     }
     let governance = service
@@ -1432,6 +1526,7 @@ pub(super) async fn publish_through_link(
             }
             return publish_immutable_through_link(
                 service,
+                caller,
                 &publish,
                 &link,
                 upload_source_node_id,
@@ -1441,6 +1536,7 @@ pub(super) async fn publish_through_link(
                 descriptor_current.version,
                 target_current.version,
                 target_current.alias_registry,
+                indexing_intent,
                 deadline_remaining(deadline)?,
             )
             .await;
@@ -1519,15 +1615,24 @@ pub(super) async fn publish_through_link(
             ),
             fingerprint,
             durability_class,
+            indexing_intent,
             deadline_remaining(deadline)?,
         )
         .await?;
-    linked_put_response(result, command_id, fingerprint, &target_path)
+    linked_put_response(
+        service,
+        caller,
+        result,
+        command_id,
+        fingerprint,
+        &target_path,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn publish_immutable_through_link(
     service: &ObjectServiceImpl,
+    caller: &crate::authentication::Caller,
     publish: &PublishRequest,
     link: &ResolvedObjectLink,
     upload_source_node_id: u64,
@@ -1537,6 +1642,7 @@ async fn publish_immutable_through_link(
     descriptor_version: Version,
     target_version: Version,
     registry: Option<ObjectAliasRegistry>,
+    indexing_intent: keldra_store::IndexingIntent,
     budget: std::time::Duration,
 ) -> Result<MutationReceipt, Status> {
     let registry =
@@ -1634,16 +1740,26 @@ async fn publish_immutable_through_link(
                 keldra_store::Durability::Local => "local",
                 keldra_store::Durability::Replicated => "replicated",
             },
+            indexing_intent,
             budget,
         )
         .await?;
-    linked_immutable_response(result, command_id, fingerprint, &target_path)
+    linked_immutable_response(
+        service,
+        caller,
+        result,
+        command_id,
+        fingerprint,
+        &target_path,
+    )
 }
 
 fn linked_immutable_response(
+    service: &ObjectServiceImpl,
+    caller: &crate::authentication::Caller,
     result: crate::programs::InvokedProgramResult,
     command_id: &str,
-    fingerprint: [u8; 32],
+    _fingerprint: [u8; 32],
     target_path: &ObjectPath,
 ) -> Result<MutationReceipt, Status> {
     let version = result
@@ -1655,14 +1771,16 @@ fn linked_immutable_response(
             "linked PutImmutable asserted a deleted target",
         ));
     }
-    Ok(api_receipt(keldra_store::MutationReceipt {
-        command_id: Some(command_id.to_owned()),
-        fingerprint,
-        version: version.id,
-        deleted: false,
-        replayed: result.replayed,
-        replay_guarantee_expires_at_unix_millis: result.replay_guarantee_expires_at_unix_millis,
-    }))
+    api_program_receipt(
+        &service.jwt_manager,
+        caller,
+        command_id.to_owned(),
+        version.id,
+        false,
+        result.replayed,
+        result.replay_guarantee_expires_at_unix_millis,
+        result.realtime_visibility.as_ref(),
+    )
 }
 
 fn exact_read_participant(
@@ -1703,9 +1821,11 @@ fn proof_for(
 }
 
 fn linked_put_response(
+    service: &ObjectServiceImpl,
+    caller: &crate::authentication::Caller,
     result: crate::programs::InvokedProgramResult,
     command_id: &str,
-    fingerprint: [u8; 32],
+    _fingerprint: [u8; 32],
     target_path: &ObjectPath,
 ) -> Result<MutationReceipt, Status> {
     let (version, deleted) = result
@@ -1713,17 +1833,21 @@ fn linked_put_response(
         .get(target_path)
         .map(|published| (published.version, published.deleted))
         .ok_or_else(|| Status::data_loss("linked Put published no target version"))?;
-    Ok(api_receipt(keldra_store::MutationReceipt {
-        command_id: Some(command_id.to_owned()),
-        fingerprint,
+    api_program_receipt(
+        &service.jwt_manager,
+        caller,
+        command_id.to_owned(),
         version,
         deleted,
-        replayed: result.replayed,
-        replay_guarantee_expires_at_unix_millis: result.replay_guarantee_expires_at_unix_millis,
-    }))
+        result.replayed,
+        result.replay_guarantee_expires_at_unix_millis,
+        result.realtime_visibility.as_ref(),
+    )
 }
 
 pub(super) fn bulk_replay_result(
+    service: &ObjectServiceImpl,
+    caller: &crate::authentication::Caller,
     result: crate::programs::InvokedProgramResult,
     requested: &ObjectKey,
     command_id: &str,
@@ -1739,15 +1863,31 @@ pub(super) fn bulk_replay_result(
     let target = ObjectKey::new(&target_path.tenant, &target_path.bucket, &target_path.path)
         .map_err(|error| Status::data_loss(error.to_string()))?;
     let receipt = match authority_kind {
-        UNLINK_OBJECT_AUTHORITY_KIND => {
-            link_response(result, command_id, fingerprint, &requested_path)?.into_inner()
-        }
-        PUT_THROUGH_LINK_AUTHORITY_KIND => {
-            linked_put_response(result, command_id, fingerprint, &target_path)?
-        }
-        PUT_IMMUTABLE_THROUGH_LINK_AUTHORITY_KIND => {
-            linked_immutable_response(result, command_id, fingerprint, &target_path)?
-        }
+        UNLINK_OBJECT_AUTHORITY_KIND => link_response(
+            service,
+            caller,
+            result,
+            command_id,
+            fingerprint,
+            &requested_path,
+        )?
+        .into_inner(),
+        PUT_THROUGH_LINK_AUTHORITY_KIND => linked_put_response(
+            service,
+            caller,
+            result,
+            command_id,
+            fingerprint,
+            &target_path,
+        )?,
+        PUT_IMMUTABLE_THROUGH_LINK_AUTHORITY_KIND => linked_immutable_response(
+            service,
+            caller,
+            result,
+            command_id,
+            fingerprint,
+            &target_path,
+        )?,
         _ => return Err(Status::internal("unsupported bulk linked replay authority")),
     };
     Ok((target, receipt))

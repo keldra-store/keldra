@@ -101,6 +101,7 @@ async fn hostile_callers_fail_closed_and_system_recovery_is_exact_and_idempotent
             command_id: "credential-recovery-preserved-object".into(),
             durability: Durability::Local as i32,
             operation: Some(PutOperationValue::Put(PutOperation {})),
+            indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
         },
         [b"preserved".to_vec()],
     )

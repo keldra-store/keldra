@@ -149,6 +149,9 @@ mod tests {
             memory_lease: keldra_index::v1::SegmentMemoryLease::default(),
             identity,
             cut,
+            realtime_runs: Vec::new(),
+            realtime_evidence: Vec::new(),
+            overlay_generation_hashes: vec![None; roots.len()],
             generation_hashes: roots
                 .iter()
                 .map(|root| [root.partition.producer_node as u8; 32])
@@ -192,6 +195,7 @@ mod tests {
             candidate_visibility: Arc::new(UnusedVisibility),
             authorization_revision: 19,
             required_freshness: None,
+            required_visibility: Vec::new(),
             deadline: tokio::time::Instant::now(),
         }
     }

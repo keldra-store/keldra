@@ -14,6 +14,10 @@ pub struct QueryDocumentGate {
     pub material_source_version: u64,
     pub current_source_version: u64,
     pub live: bool,
+    /// Exact sparse journal position for a selective real-time overlay. Base
+    /// projection gates leave this absent and derive contiguous coverage from
+    /// their pinned generation.
+    pub selective_source_position: Option<u64>,
     pub source_path: Option<String>,
     /// Canonical authorization identity when `source_path` is an alias.
     /// Query/result identity deliberately remains the exact source path.
@@ -35,6 +39,13 @@ pub fn encode_document_gate(gate: QueryDocumentGate) -> Result<QueryBlockRecord,
     value.extend_from_slice(&gate.current_source_version.to_be_bytes());
     value.extend_from_slice(&gate.result_version.to_be_bytes());
     value.push(u8::from(gate.live));
+    match gate.selective_source_position {
+        Some(position) => {
+            value.push(1);
+            value.extend_from_slice(&position.to_be_bytes());
+        }
+        None => value.push(0),
+    }
     for path in [
         &gate.source_path,
         &gate.canonical_source_path,
@@ -53,7 +64,7 @@ pub fn encode_document_gate(gate: QueryDocumentGate) -> Result<QueryBlockRecord,
 pub fn decode_document_gate(
     record: QueryBlockRecordRef<'_>,
 ) -> Result<QueryDocumentGate, IndexError> {
-    if record.value.len() < 37 {
+    if record.value.len() < 38 {
         return Err(IndexError::InvalidFormat("v1 document gate"));
     }
     let material_source_version = read_u64(record.value, 0)?;
@@ -64,14 +75,22 @@ pub fn decode_document_gate(
         1 => true,
         _ => return Err(IndexError::InvalidFormat("v1 document gate")),
     };
-    let source_len = read_u32(record.value, 25)? as usize;
+    let (selective_source_position, paths_start) = match record.value[25] {
+        0 => (None, 26usize),
+        1 => (Some(read_u64(record.value, 26)?), 34usize),
+        _ => return Err(IndexError::InvalidFormat("v1 document gate")),
+    };
+    let source_len = read_u32(record.value, paths_start)? as usize;
     if material_source_version == 0
         || current_source_version < material_source_version
         || source_len > MAX_QUERY_DOCUMENT_PATH_BYTES
     {
         return Err(IndexError::InvalidFormat("v1 document gate"));
     }
-    let canonical_length_offset = 29usize
+    let source_start = paths_start
+        .checked_add(4)
+        .ok_or(IndexError::OffsetOverflow)?;
+    let canonical_length_offset = source_start
         .checked_add(source_len)
         .ok_or(IndexError::OffsetOverflow)?;
     let canonical_len = read_u32(record.value, canonical_length_offset)? as usize;
@@ -100,7 +119,8 @@ pub fn decode_document_gate(
         material_source_version,
         current_source_version,
         live,
-        source_path: decode_path(&record.value[29..canonical_length_offset])?,
+        selective_source_position,
+        source_path: decode_path(&record.value[source_start..canonical_length_offset])?,
         canonical_source_path: decode_path(
             &record.value[canonical_length_offset + 4..result_length_offset],
         )?,
@@ -181,6 +201,7 @@ mod tests {
             material_source_version: 3,
             current_source_version: 5,
             live: true,
+            selective_source_position: None,
             source_path: Some(path.clone()),
             canonical_source_path: None,
             result_path: Some(path),

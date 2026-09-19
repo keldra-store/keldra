@@ -553,6 +553,7 @@ fn one_partition_dispatches_independent_gate_blocks_and_merges_in_run_order() {
             material_source_version: version,
             current_source_version: version,
             live,
+            selective_source_position: None,
             source_path: Some("objects/source.json".into()),
             canonical_source_path: None,
             result_path: Some("objects/result.json".into()),
@@ -917,6 +918,42 @@ fn query_snapshot_identity_pins_the_exact_canonical_root_vector() {
         identity
     );
     assert!(query_snapshot_identity(cut, &[second, first]).is_err());
+
+    let no_match_one = query_snapshot_identity_with_overlays(
+        cut,
+        &[first, second],
+        &[(first.partition, [11; 32])],
+        &[],
+    )
+    .unwrap();
+    let no_match_two = query_snapshot_identity_with_overlays(
+        cut,
+        &[first, second],
+        &[(first.partition, [12; 32])],
+        &[],
+    )
+    .unwrap();
+    assert_ne!(no_match_one, no_match_two);
+}
+
+#[test]
+fn partially_absorbed_overlay_filters_old_gate_but_keeps_later_gate() {
+    let gate = |position| QueryDocumentGate {
+        document: StableDocumentKey::from_bytes([position as u8; 32]).unwrap(),
+        material_source_version: position,
+        current_source_version: position,
+        live: true,
+        selective_source_position: Some(position),
+        source_path: Some(format!("objects/{position}")),
+        canonical_source_path: None,
+        result_path: Some(format!("objects/{position}")),
+        result_version: position,
+    };
+    // Base next=8 contains a newer authoritative state for the position-5
+    // document. Every gate-loading path uses this predicate before predicate,
+    // facet, aggregate, or candidate evaluation.
+    assert!(realtime_gate_is_absorbed(&gate(5), 8));
+    assert!(!realtime_gate_is_absorbed(&gate(10), 8));
 }
 
 #[test]
@@ -951,6 +988,7 @@ fn query_snapshot_binding_distinguishes_logical_definitions_on_the_same_roots() 
         identity,
         common_cut: cut,
         pins: vec![pin],
+        realtime_overlays: Vec::new(),
         logical: LogicalProjectionBinding {
             logical_index_id: 1,
             logical_definition_version,
@@ -1047,6 +1085,7 @@ fn repeated_one_page_queries_reuse_the_validated_snapshot_without_artifact_loads
         identity: query_snapshot_identity(cut, &[pin]).unwrap(),
         common_cut: cut,
         pins: vec![pin],
+        realtime_overlays: Vec::new(),
         logical,
         catalog_lineage: vec![[4; 32]],
         recipe_catalog_proofs: vec![proof],
@@ -1322,6 +1361,7 @@ fn absent_predicate_matches_the_live_membership_universe_only() {
         material_source_version: 1,
         current_source_version: 1,
         live,
+        selective_source_position: None,
         source_path: Some("objects/a.json".into()),
         canonical_source_path: None,
         result_path: Some("objects/a.json".into()),

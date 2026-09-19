@@ -458,6 +458,7 @@ impl StateMachine {
                 durability_class: batch.durability_class,
                 durability_evidence_hash: batch.durability_evidence_hash,
                 participant_manifest_hash: batch.participant_manifest_hash,
+                indexing_intent: batch.indexing_intent,
             },
         };
         let invocation_bytes = committed_invocation_entry_bytes(committed_log_index, &invocation)?;

@@ -177,6 +177,7 @@ mod tests {
                     expected_version: 11,
                 },
             )),
+            indexing_intent: super::v1::IndexingIntent::Realtime as i32,
         };
 
         let decoded = CloneObjectRequest::decode(request.encode_to_vec().as_slice()).unwrap();
@@ -199,6 +200,7 @@ mod tests {
             }),
             command_id: "link-1".into(),
             durability: Durability::Replicated as i32,
+            indexing_intent: super::v1::IndexingIntent::Realtime as i32,
         };
         assert_eq!(
             LinkObjectRequest::decode(request.encode_to_vec().as_slice()).unwrap(),
@@ -208,6 +210,7 @@ mod tests {
             link: Some(link),
             command_id: "unlink-1".into(),
             durability: Durability::Local as i32,
+            indexing_intent: super::v1::IndexingIntent::Standard as i32,
         };
         assert_eq!(
             UnlinkObjectRequest::decode(unlink.encode_to_vec().as_slice()).unwrap(),
@@ -580,8 +583,9 @@ mod tests {
         use super::v1::{
             BulkOperation, BulkPutIfVersionRequest, CreateBucketRequest, DeleteIfVersionRequest,
             DeleteRequest, DeleteVersionRequest, DeleteVersionResponse, Durability,
-            ListObjectsRequest, ListObjectsResponse, ObjectAddress, ObjectVersioning, PutHeader,
-            PutIfVersionOperation, PutRequest, PutToken, bulk_operation, put_header,
+            IndexVisibilityToken, IndexingIntent, ListObjectsRequest, ListObjectsResponse,
+            MutationReceipt, ObjectAddress, ObjectVersioning, PutHeader, PutIfVersionOperation,
+            PutRequest, PutToken, QueryIndexRequest, bulk_operation, put_header,
         };
 
         let address = Some(ObjectAddress {
@@ -597,6 +601,7 @@ mod tests {
             operation: Some(put_header::Operation::PutIfVersion(PutIfVersionOperation {
                 expected_version: 8,
             })),
+            indexing_intent: IndexingIntent::Realtime as i32,
         };
         let frame = PutRequest {
             token: Some(PutToken {
@@ -610,6 +615,27 @@ mod tests {
             Some(put_header::Operation::PutIfVersion(_))
         ));
         assert!(frame.chunk.is_empty());
+        assert_eq!(header.indexing_intent, IndexingIntent::Realtime as i32);
+
+        let visibility = IndexVisibilityToken {
+            value: b"opaque-integrity-protected-token".to_vec(),
+            expires_at: Some(prost_types::Timestamp {
+                seconds: 1_900_000_000,
+                nanos: 0,
+            }),
+        };
+        let receipt = MutationReceipt {
+            index_visibility: Some(visibility.clone()),
+            ..Default::default()
+        };
+        let query = QueryIndexRequest {
+            required_visibility_tokens: vec![visibility],
+            ..Default::default()
+        };
+        assert_eq!(
+            receipt.index_visibility,
+            query.required_visibility_tokens.first().cloned()
+        );
 
         let operations = [
             bulk_operation::Operation::Put(Default::default()),
@@ -651,11 +677,42 @@ mod tests {
         let replaced_current = DeleteVersionResponse {
             deleted: true,
             replacement_tombstone_version: Some(9),
+            index_visibility: None,
         };
         assert_eq!(replaced_current.replacement_tombstone_version, Some(9));
         assert_eq!(
             CreateBucketRequest::default().versioning,
             ObjectVersioning::Unversioned as i32
+        );
+        assert_eq!(
+            PutHeader::default().indexing_intent,
+            IndexingIntent::Standard as i32
+        );
+        assert_eq!(IndexingIntent::Realtime as i32, 1);
+        assert!(IndexingIntent::from_str_name("INDEXING_INTENT_REALTIME_WAIT").is_none());
+
+        let set = descriptors();
+        assert_eq!(field_number(&set, "PutHeader", "indexing_intent"), 9);
+        assert_eq!(field_number(&set, "MutationReceipt", "index_visibility"), 6);
+        assert_eq!(
+            field_number(&set, "DeleteVersionRequest", "indexing_intent"),
+            4
+        );
+        assert_eq!(
+            field_number(&set, "DeleteVersionResponse", "index_visibility"),
+            3
+        );
+        assert_eq!(
+            field_number(&set, "InvokeProgramRequest", "indexing_intent"),
+            6
+        );
+        assert_eq!(
+            field_number(&set, "InvokeProgramResponse", "index_visibility"),
+            10
+        );
+        assert_eq!(
+            field_number(&set, "QueryIndexRequest", "required_visibility_tokens"),
+            9
         );
 
         let list_request = ListObjectsRequest {

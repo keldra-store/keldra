@@ -48,6 +48,7 @@ async fn streamed_bytes_are_invisible_until_put_end_and_replay_publishes_once() 
                 command_id: "three-phase-put".into(),
                 durability: Durability::Local as i32,
                 operation: Some(Operation::Put(PutOperation {})),
+                indexing_intent: keldra_api::v1::IndexingIntent::Standard as i32,
             },
             &access_token,
         ))

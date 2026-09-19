@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use keldra_api::v1::{
     IndexAggregateOperation, IndexAggregateResult, IndexFacetBucket, IndexFacetResult,
@@ -15,13 +16,16 @@ use keldra_index::v1::QuerySnapshotIdentity;
 use keldra_index::v1::{
     AuthorizedQueryCandidate, LogicalFieldBinding, LogicalProjectionBinding,
     MAX_QUERY_CANDIDATE_ADMISSION_BATCH, MAX_QUERY_PARTITIONS, PinnedPartitionQueryRoot,
-    ProjectionCatalogActivation, ProjectionFamilyPartitionDirectory, ProjectionGenerationHeader,
-    ProjectionPartitionIdentity, QueryAdmissionContext, QueryBlockCredits, QueryCandidateAdmission,
-    QueryCommonCut, QueryCpuJob, QueryExecutionLimits, QueryFieldBinding, QueryMemoryPermit,
-    QueryPartitionExecutor, QueryPartitionJob, QueryPublicValueEncoder, QueryRootCutProof,
-    RecipeIdentity, StableDocumentKey, TypedJsonQueryRequest, ValidatedQuerySnapshot,
-    decode_projection_generation_header, execute_typed_json_query_with_cursor_and_executor,
-    projection_generation_path, query_snapshot_identity, resolve_query_partition_results,
+    PinnedRealtimeOverlayRun, ProjectionCatalogActivation, ProjectionFamilyPartitionDirectory,
+    ProjectionGenerationHeader, ProjectionPartitionIdentity, QueryAdmissionContext,
+    QueryBlockCredits, QueryCandidateAdmission, QueryCommonCut, QueryCpuJob, QueryExecutionLimits,
+    QueryFieldBinding, QueryMemoryPermit, QueryPartitionExecutor, QueryPartitionJob,
+    QueryPublicValueEncoder, QueryRootCutProof, RealtimeOverlayEvidence, RecipeIdentity,
+    StableDocumentKey, TypedJsonQueryRequest, ValidatedQuerySnapshot,
+    decode_projection_generation_header,
+    execute_typed_json_query_with_realtime_overlays_and_executor, projection_generation_path,
+    query_snapshot_identity, query_snapshot_identity_with_overlays,
+    resolve_query_partition_results,
 };
 use keldra_store::PlacementLogId;
 use tonic::Status;
@@ -111,6 +115,7 @@ impl V1LocalIndexQueryExecutor {
         require_request(&request)?;
         tracing::debug!("v1 query begins catalog resolution");
         let start_fence = self.placement_fence()?;
+        validate_visibility_requirements(&request, start_fence)?;
         let (logical, recipe, schema, activation) = self.resolve_catalog(&request).await?;
         tracing::debug!("v1 query resolved its active catalog");
         let compiled = compile_v1_query(&schema, &request.query).map_err(index_status)?;
@@ -178,24 +183,31 @@ impl V1LocalIndexQueryExecutor {
             ((*cached.pinned).clone(), Some(cached.snapshot.clone()))
         } else {
             let pinned = loop {
-                let pinned = self
+                validate_visibility_requirements(&request, start_fence)?;
+                let mut pinned = self
                     .pin_root_vector(&request, Arc::clone(&recipe), continuation.as_ref())
                     .await?;
+                self.pin_realtime_overlays(&request, continuation.as_ref(), &mut pinned)
+                    .await?;
                 if request.resume.is_some()
-                    || requirement_is_covered(&pinned, request.required_freshness.as_ref())
+                    || (requirement_is_covered(&pinned, request.required_freshness.as_ref())
+                        && visibility_requirements_are_covered(
+                            &pinned,
+                            &request.required_visibility,
+                        ))
                 {
                     break pinned;
                 }
                 if tokio::time::Instant::now() >= request.deadline {
                     return Err(Status::deadline_exceeded(
-                        "no v1 root vector reached the required freshness checkpoint",
+                        "no v1 view reached the required freshness and visibility conditions",
                     ));
                 }
                 tokio::select! {
                     _ = publication_changes.recv() => {}
                     () = tokio::time::sleep_until(request.deadline) => {
                         return Err(Status::deadline_exceeded(
-                            "no v1 root vector reached the required freshness checkpoint",
+                            "no v1 view reached the required freshness and visibility conditions",
                         ));
                     }
                 }
@@ -259,6 +271,7 @@ impl V1LocalIndexQueryExecutor {
         };
         let mut requested_memory = MIN_QUERY_MEMORY_BYTES.min(maximum_memory);
         let mut retries = 0usize;
+        let overlay_generation_vector = pinned.overlay_generation_vector();
         let (result, _credits) = loop {
             tracing::debug!(
                 query.memory_bytes = requested_memory,
@@ -291,11 +304,13 @@ impl V1LocalIndexQueryExecutor {
                 bucket: request.definition.bucket.clone(),
                 authorization_revision: request.authorization_revision,
             };
-            let attempt = execute_typed_json_query_with_cursor_and_executor(
+            let attempt = execute_typed_json_query_with_realtime_overlays_and_executor(
                 &mut loader,
                 &mut admission,
                 pinned.cut,
                 &pinned.roots,
+                &overlay_generation_vector,
+                &pinned.realtime_runs,
                 validated_snapshot.clone(),
                 &query,
                 explicit_search_after,
@@ -406,6 +421,108 @@ impl V1LocalIndexQueryExecutor {
             )?,
             next_position,
         })
+    }
+
+    async fn pin_realtime_overlays(
+        &self,
+        request: &LocalIndexQueryRequest,
+        continuation: Option<&QueryPosition>,
+        pinned: &mut PinnedRootVector,
+    ) -> Result<(), Status> {
+        let mut runs = Vec::new();
+        let mut evidence = Vec::new();
+        let mut generations = Vec::with_capacity(pinned.roots.len());
+        for (ordinal, base) in pinned.roots.iter().enumerate() {
+            let expected = continuation
+                .and_then(|continuation| continuation.roots.get(ordinal))
+                .map(|root| root.realtime_overlay_generation_hash);
+            let loaded = if let Some(expected) = expected {
+                match expected {
+                    Some(hash) => Some(
+                        self.projections
+                            .load_realtime_overlay_generation_by_hash(
+                                &request.storage_tenant,
+                                &request.definition.bucket,
+                                request.tenant_id,
+                                request.bucket_id,
+                                base.partition,
+                                hash,
+                            )
+                            .await?,
+                    ),
+                    None => None,
+                }
+            } else {
+                self.projections
+                    .load_realtime_overlay(
+                        &request.storage_tenant,
+                        &request.definition.bucket,
+                        request.tenant_id,
+                        request.bucket_id,
+                        base.partition,
+                    )
+                    .await?
+            };
+            let Some(loaded) = loaded else {
+                generations.push(None);
+                continue;
+            };
+            if loaded.current.physical_catalog_generation != base.physical_catalog_generation {
+                // Catalog activation is a clean projection boundary. A stale
+                // overlay cannot participate in the new composed snapshot;
+                // visibility waits until the lane publishes the new catalog
+                // overlay or the authoritative base absorbs the requirement.
+                generations.push(None);
+                continue;
+            }
+            generations.push(Some(loaded.current.generation_hash));
+            for entry in loaded
+                .generation
+                .unabsorbed_evidence(base.root.next_offset, base.root.through_atomic_position)
+            {
+                evidence.push((base.partition, entry));
+            }
+            for artifact in loaded
+                .generation
+                .unabsorbed_runs(base.root.next_offset, base.root.through_atomic_position)
+            {
+                let source_position = artifact
+                    .source_positions
+                    .iter()
+                    .copied()
+                    .find(|position| *position >= base.root.next_offset)
+                    .ok_or_else(|| {
+                        Status::data_loss("overlay artifact has no unabsorbed position")
+                    })?;
+                runs.push(PinnedRealtimeOverlayRun {
+                    partition: base.partition,
+                    physical_catalog_generation: base.physical_catalog_generation,
+                    overlay_generation_hash: loaded.current.generation_hash,
+                    source_position,
+                    atomic_position: artifact.query_run.through_atomic_position,
+                    run: artifact.query_run,
+                });
+            }
+        }
+        runs.sort_by_key(|run| {
+            (
+                run.partition,
+                run.source_position,
+                run.atomic_position,
+                run.run.hash,
+            )
+        });
+        pinned.realtime_runs = runs;
+        pinned.realtime_evidence = evidence;
+        pinned.overlay_generation_hashes = generations;
+        pinned.identity = query_snapshot_identity_with_overlays(
+            pinned.cut,
+            &pinned.roots,
+            &pinned.overlay_generation_vector(),
+            &pinned.realtime_runs,
+        )
+        .map_err(index_status)?;
+        Ok(())
     }
 
     fn placement_fence(&self) -> Result<PlacementLogId, Status> {
@@ -651,6 +768,9 @@ impl V1LocalIndexQueryExecutor {
             identity,
             cut: common_cut,
             roots,
+            realtime_runs: Vec::new(),
+            realtime_evidence: Vec::new(),
+            overlay_generation_hashes: Vec::new(),
             generation_hashes,
             directory,
             directory_version,
@@ -910,6 +1030,9 @@ struct PinnedRootVector {
     identity: QuerySnapshotIdentity,
     cut: QueryCommonCut,
     roots: Vec<PinnedPartitionQueryRoot>,
+    realtime_runs: Vec<PinnedRealtimeOverlayRun>,
+    realtime_evidence: Vec<(ProjectionPartitionIdentity, RealtimeOverlayEvidence)>,
+    overlay_generation_hashes: Vec<Option<[u8; 32]>>,
     generation_hashes: Vec<[u8; 32]>,
     directory: ProjectionFamilyPartitionDirectory,
     directory_version: keldra_store::VersionId,
@@ -922,6 +1045,9 @@ impl Clone for PinnedRootVector {
             identity: self.identity,
             cut: self.cut,
             roots: self.roots.clone(),
+            realtime_runs: self.realtime_runs.clone(),
+            realtime_evidence: self.realtime_evidence.clone(),
+            overlay_generation_hashes: self.overlay_generation_hashes.clone(),
             generation_hashes: self.generation_hashes.clone(),
             directory: self.directory.clone(),
             directory_version: self.directory_version,
@@ -930,24 +1056,36 @@ impl Clone for PinnedRootVector {
 }
 
 impl PinnedRootVector {
+    fn overlay_generation_vector(&self) -> Vec<(ProjectionPartitionIdentity, [u8; 32])> {
+        self.roots
+            .iter()
+            .zip(&self.overlay_generation_hashes)
+            .filter_map(|(root, hash)| hash.map(|hash| (root.partition, hash)))
+            .collect()
+    }
+
     fn matches_generation(&self, other: &Self) -> bool {
         self.cut == other.cut
             && self.roots == other.roots
             && self.generation_hashes == other.generation_hashes
+            && self.overlay_generation_hashes == other.overlay_generation_hashes
     }
 
     fn matches_position_roots(&self, roots: &[QueryPositionRoot]) -> bool {
         self.roots.len() == roots.len()
             && self.generation_hashes.len() == roots.len()
+            && self.overlay_generation_hashes.len() == roots.len()
             && self
                 .roots
                 .iter()
                 .zip(&self.generation_hashes)
+                .zip(&self.overlay_generation_hashes)
                 .zip(roots)
-                .all(|((pinned, generation_hash), position)| {
+                .all(|(((pinned, generation_hash), overlay_hash), position)| {
                     generation_hash == &position.generation_hash
                         && pinned.cut_proof.next_newer_through_atomic_position
                             == position.next_newer_through_atomic_position
+                        && *overlay_hash == position.realtime_overlay_generation_hash
                 })
     }
 }
@@ -1184,6 +1322,96 @@ fn requirement_is_covered(
                     && root.root.next_offset >= required.next_offset
             })
         })
+}
+
+fn validate_visibility_requirements(
+    request: &LocalIndexQueryRequest,
+    placement: PlacementLogId,
+) -> Result<(), Status> {
+    let now: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Status::internal("system clock is before the Unix epoch"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| Status::internal("system clock exceeds visibility-token range"))?;
+    for requirement in &request.required_visibility {
+        if requirement.source_journal_position == 0
+            || requirement.source_journal_through_position < requirement.source_journal_position
+            || (requirement.program_commit_cursor.is_some()
+                != requirement.atomic_unit_hash.is_some())
+            || requirement.atomic_unit_hash == Some([0; 32])
+        {
+            return Err(Status::invalid_argument(
+                "index visibility requirement has an invalid source range",
+            ));
+        }
+        if requirement.tenant_id != request.tenant_id || requirement.bucket_id != request.bucket_id
+        {
+            return Err(Status::permission_denied(
+                "index visibility requirement belongs to another bucket",
+            ));
+        }
+        if (
+            requirement.active_placement_term,
+            requirement.active_placement_index,
+        ) != (placement.term, placement.index)
+        {
+            return Err(Status::failed_precondition(
+                "index visibility token belongs to a superseded placement",
+            ));
+        }
+        if requirement.expires_at_unix_millis <= now {
+            return Err(Status::failed_precondition(
+                "index visibility token has expired",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn visibility_requirements_are_covered(
+    pinned: &PinnedRootVector,
+    requirements: &[crate::index_service::IndexVisibilityRequirement],
+) -> bool {
+    requirements.iter().all(|requirement| {
+        let source_node = u64::from(requirement.source_node_id);
+        let base = pinned.roots.iter().find(|root| {
+            root.partition.source_node == source_node
+                && root.partition.source_epoch == requirement.source_epoch
+        });
+        (requirement.source_journal_position..=requirement.source_journal_through_position).all(
+            |position| {
+                let base_covers = base.is_some_and(|root| {
+                    // The base root binds the immutable source incarnation and
+                    // complete prefix containing this exact event position;
+                    // through_atomic proves the dispatcher crossed its
+                    // indivisible cursor. Together those metadata bind the
+                    // sole authoritative batch/hash at that source position.
+                    root.root.next_offset > position
+                        && requirement
+                            .program_commit_cursor
+                            .is_none_or(|atomic| root.root.through_atomic_position >= atomic)
+                });
+                base_covers
+                    || pinned.realtime_evidence.iter().any(|(partition, entry)| {
+                        overlay_evidence_matches(requirement, *partition, *entry, position)
+                    })
+            },
+        )
+    })
+}
+
+fn overlay_evidence_matches(
+    requirement: &crate::index_service::IndexVisibilityRequirement,
+    partition: ProjectionPartitionIdentity,
+    entry: RealtimeOverlayEvidence,
+    position: u64,
+) -> bool {
+    partition.source_node == u64::from(requirement.source_node_id)
+        && partition.source_epoch == requirement.source_epoch
+        && entry.source_position == position
+        && requirement.program_commit_cursor.unwrap_or(0) == entry.atomic_position
+        && requirement.atomic_unit_hash == entry.atomic_unit_hash
 }
 
 fn page_candidates(
@@ -1503,6 +1731,9 @@ mod tests {
                 through_atomic_position: 9,
             },
             roots: vec![predecessor, successor],
+            realtime_runs: Vec::new(),
+            realtime_evidence: Vec::new(),
+            overlay_generation_hashes: vec![None, None],
             generation_hashes: vec![[7; 32], [8; 32]],
             directory: ProjectionFamilyPartitionDirectory {
                 family_id: [1; 32],
@@ -1535,6 +1766,9 @@ mod tests {
                 through_atomic_position: 9,
             },
             roots: vec![root(partition(4, 5), 8)],
+            realtime_runs: Vec::new(),
+            realtime_evidence: Vec::new(),
+            overlay_generation_hashes: vec![None],
             generation_hashes: vec![[7; 32]],
             directory: ProjectionFamilyPartitionDirectory {
                 family_id: [1; 32],
@@ -1557,6 +1791,7 @@ mod tests {
                 roots: vec![QueryPositionRoot {
                     generation_hash: [7; 32],
                     next_newer_through_atomic_position: None,
+                    realtime_overlay_generation_hash: None,
                 }],
             }
         );
@@ -1575,6 +1810,9 @@ mod tests {
                 through_atomic_position: 0,
             },
             roots: vec![genesis_root],
+            realtime_runs: Vec::new(),
+            realtime_evidence: Vec::new(),
+            overlay_generation_hashes: vec![None],
             generation_hashes: vec![[7; 32]],
             directory: ProjectionFamilyPartitionDirectory {
                 family_id: [1; 32],
@@ -1605,6 +1843,7 @@ mod tests {
             candidate_visibility: Arc::new(Visibility),
             authorization_revision: 19,
             required_freshness: None,
+            required_visibility: Vec::new(),
             deadline: tokio::time::Instant::now(),
         };
 
@@ -1624,6 +1863,9 @@ mod tests {
                 through_atomic_position: 9,
             },
             roots: vec![first, second],
+            realtime_runs: Vec::new(),
+            realtime_evidence: Vec::new(),
+            overlay_generation_hashes: vec![None, None],
             generation_hashes: vec![[7; 32], [8; 32]],
             directory: ProjectionFamilyPartitionDirectory {
                 family_id: [1; 32],
@@ -1652,10 +1894,12 @@ mod tests {
                 QueryPositionRoot {
                     generation_hash: [7; 32],
                     next_newer_through_atomic_position: Some(10),
+                    realtime_overlay_generation_hash: None,
                 },
                 QueryPositionRoot {
                     generation_hash: [8; 32],
                     next_newer_through_atomic_position: None,
+                    realtime_overlay_generation_hash: None,
                 },
             ]
         );
@@ -1670,6 +1914,9 @@ mod tests {
                 through_atomic_position: 9,
             },
             roots: vec![root(partition(4, 5), 8)],
+            realtime_runs: Vec::new(),
+            realtime_evidence: Vec::new(),
+            overlay_generation_hashes: vec![None],
             generation_hashes: vec![[7; 32]],
             directory: ProjectionFamilyPartitionDirectory {
                 family_id: [1; 32],
@@ -1683,6 +1930,7 @@ mod tests {
         let original_position = vec![QueryPositionRoot {
             generation_hash: [7; 32],
             next_newer_through_atomic_position: None,
+            realtime_overlay_generation_hash: None,
         }];
 
         assert!(pinned.matches_generation(&pinned));
@@ -1701,6 +1949,9 @@ mod tests {
                 through_atomic_position: 9,
             },
             roots: vec![root(partition(4, 5), 8)],
+            realtime_runs: Vec::new(),
+            realtime_evidence: Vec::new(),
+            overlay_generation_hashes: vec![None],
             generation_hashes: vec![[7; 32]],
             directory: ProjectionFamilyPartitionDirectory {
                 family_id: [1; 32],
@@ -1916,5 +2167,43 @@ mod tests {
         assert_eq!(public.buckets.len(), 2);
         assert_eq!(public.buckets[0].value_json, b"2");
         assert_eq!(public.buckets[1].value_json, b"10");
+    }
+
+    #[test]
+    fn atomic_overlay_evidence_requires_the_exact_unit_hash() {
+        let partition = ProjectionPartitionIdentity::new([1; 32], 2, [3; 32], 4, 5, 6).unwrap();
+        let requirement = crate::index_service::IndexVisibilityRequirement {
+            source_node_id: 2,
+            source_epoch: [3; 32],
+            source_journal_position: 7,
+            source_journal_through_position: 7,
+            tenant_id: 8,
+            bucket_id: 9,
+            exact_path: None,
+            version: None,
+            program_commit_cursor: Some(10),
+            atomic_unit_hash: Some([11; 32]),
+            active_placement_term: 5,
+            active_placement_index: 6,
+            expires_at_unix_millis: u64::MAX,
+        };
+        let mut evidence = RealtimeOverlayEvidence {
+            source_position: 7,
+            atomic_position: 10,
+            atomic_unit_hash: Some([12; 32]),
+        };
+        assert!(!overlay_evidence_matches(
+            &requirement,
+            partition,
+            evidence,
+            7
+        ));
+        evidence.atomic_unit_hash = Some([11; 32]);
+        assert!(overlay_evidence_matches(
+            &requirement,
+            partition,
+            evidence,
+            7
+        ));
     }
 }

@@ -22,7 +22,7 @@ use keldra_storage::v1::{
     FullTextIndexQuery, FullTextIndexSpec, GitSourceIndexQuery, GitSourceIndexSpec,
     HeadObjectRequest, HybridIndexQuery, HybridIndexSpec, IndexField, IndexFieldCapability,
     IndexFieldCardinality, IndexPredicate, IndexPredicateExpression, IndexPredicateOperator,
-    IndexQuery, IndexResultAuthorization, IndexSpecification, KeywordIndexField,
+    IndexQuery, IndexResultAuthorization, IndexSpecification, IndexingIntent, KeywordIndexField,
     MetadataFilterIndexQuery, MetadataFilterIndexSpec, MutationFailureCode, MutationReceipt,
     ObjectAddress, ObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader, PutOperation,
     QueryIndexRequest, TensorIndexQuery, TensorIndexSpec, TypedJsonIndexQuery, TypedJsonIndexSpec,
@@ -785,6 +785,7 @@ async fn put_recovery_document(
                 command_id: format!("{command_id}-payload"),
                 durability: Durability::Local as i32,
                 operation: Some(PutOperationValue::Put(PutOperation {})),
+                indexing_intent: IndexingIntent::Standard as i32,
             },
             [format!("recovery payload for {}\n", document.result_path).into_bytes()],
         )
@@ -826,6 +827,7 @@ async fn put_path(
             command_id: command_id.into(),
             durability: Durability::Local as i32,
             operation: Some(PutOperationValue::Put(PutOperation {})),
+            indexing_intent: IndexingIntent::Standard as i32,
         },
         [bytes.to_vec()],
     )
@@ -850,6 +852,7 @@ async fn bulk_put_attempt(
                 content_type: "application/json".into(),
                 command_id: command_id.into(),
                 durability: Durability::Local as i32,
+                indexing_intent: IndexingIntent::Standard as i32,
             })),
         }],
     });
@@ -907,6 +910,7 @@ async fn bulk_delete_retry(
                 address: Some(address(tenant, bucket, path)),
                 command_id: command_id.into(),
                 durability: Durability::Local as i32,
+                indexing_intent: IndexingIntent::Standard as i32,
             })),
         }],
     };
@@ -1198,6 +1202,7 @@ fn query(bucket: &str) -> QueryIndexRequest {
         tenant: String::new(),
         required_freshness: None,
         authorization_subject: None,
+        required_visibility_tokens: Vec::new(),
     }
 }
 
@@ -1211,6 +1216,7 @@ fn recovery_query(bucket: &str, case: &RecoveryCase) -> QueryIndexRequest {
         tenant: String::new(),
         required_freshness: None,
         authorization_subject: None,
+        required_visibility_tokens: Vec::new(),
     }
 }
 

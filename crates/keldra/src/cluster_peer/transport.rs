@@ -929,6 +929,10 @@ impl ClusterPeerTransport {
                     contract_version: u32::from(lookup.contract_version),
                     invocation_id: lookup.invocation_id.to_vec(),
                     input_fingerprint: lookup.input_fingerprint.to_vec(),
+                    indexing_intent: match lookup.indexing_intent {
+                        keldra_store::IndexingIntent::Standard => 0,
+                        keldra_store::IndexingIntent::Realtime => 1,
+                    },
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;
@@ -1076,6 +1080,7 @@ impl ClusterPeerTransport {
         executor_nomination_log_index: u64,
         commit_cursor: u64,
         stage: &ProgramPathStage,
+        indexing_intent: keldra_store::IndexingIntent,
         remaining: Duration,
     ) -> Result<ProgramPathMutation, Status> {
         let fence = self.placement()?.fence();
@@ -1086,6 +1091,10 @@ impl ClusterPeerTransport {
                 executor_nomination_log_index,
                 commit_cursor,
                 stage_json: encode_json(stage)?,
+                indexing_intent: match indexing_intent {
+                    keldra_store::IndexingIntent::Standard => 0,
+                    keldra_store::IndexingIntent::Realtime => 1,
+                },
             })
             .await?
             .into_inner();

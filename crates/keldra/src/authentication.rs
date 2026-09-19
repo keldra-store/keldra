@@ -30,7 +30,8 @@ use crate::distributed_watch::{
     CHECKPOINT_AUDIENCE, CHECKPOINT_PURPOSE, WatchCheckpointClaims, WatchCheckpointCodec,
 };
 use crate::index_service::{
-    INDEX_PAGE_TOKEN_AUDIENCE, INDEX_PAGE_TOKEN_PURPOSE, IndexPageTokenClaims,
+    INDEX_PAGE_TOKEN_AUDIENCE, INDEX_PAGE_TOKEN_PURPOSE, INDEX_VISIBILITY_TOKEN_AUDIENCE,
+    INDEX_VISIBILITY_TOKEN_PURPOSE, IndexPageTokenClaims, IndexVisibilityTokenClaims,
 };
 
 pub(crate) const ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(60 * 60);
@@ -462,6 +463,7 @@ pub struct JwtManager {
     put_validation: Arc<Validation>,
     watch_checkpoint_validation: Arc<Validation>,
     index_page_validation: Arc<Validation>,
+    index_visibility_validation: Arc<Validation>,
     signing_key_fingerprint: JwtSigningKeyFingerprint,
     credential_envelope_key: Arc<[u8; 32]>,
     personaldb_signing_master: Arc<[u8; 32]>,
@@ -562,6 +564,7 @@ impl JwtManager {
             put_validation: Arc::new(token_validation(PUT_TOKEN_AUDIENCE)),
             watch_checkpoint_validation: Arc::new(watch_checkpoint_validation()),
             index_page_validation: Arc::new(index_page_validation()),
+            index_visibility_validation: Arc::new(index_visibility_validation()),
             signing_key_fingerprint: JwtSigningKeyFingerprint(blake3::derive_key(
                 JWT_SIGNING_KEY_FINGERPRINT_CONTEXT,
                 signing_secret,
@@ -905,6 +908,48 @@ impl JwtManager {
         Ok(claims)
     }
 
+    /// Sign one caller-bound, expiring proof of an exact committed mutation
+    /// selected for the sparse real-time index lane.
+    pub(crate) fn seal_index_visibility_token(
+        &self,
+        claims: &IndexVisibilityTokenClaims,
+    ) -> Result<Vec<u8>, String> {
+        if !claims.has_valid_envelope() {
+            return Err("index visibility claims are invalid".into());
+        }
+        encode(
+            &Header::new(Algorithm::HS256),
+            claims,
+            self.encoding_key.as_ref(),
+        )
+        .map(String::into_bytes)
+        .map_err(|error| format!("index visibility token could not be encoded: {error}"))
+    }
+
+    /// Verify signature, expiry, and the dedicated visibility-token audience.
+    /// Caller and bucket bindings are checked by the index service codec.
+    pub(crate) fn open_index_visibility_token(
+        &self,
+        token: &[u8],
+    ) -> Result<IndexVisibilityTokenClaims, String> {
+        let token = std::str::from_utf8(token)
+            .map_err(|_| "index visibility token is not a UTF-8 JWT".to_owned())?;
+        let claims = decode::<IndexVisibilityTokenClaims>(
+            token,
+            self.decoding_key.as_ref(),
+            self.index_visibility_validation.as_ref(),
+        )
+        .map_err(|error| format!("index visibility token could not be verified: {error}"))?
+        .claims;
+        if claims.aud != INDEX_VISIBILITY_TOKEN_AUDIENCE
+            || claims.purpose != INDEX_VISIBILITY_TOKEN_PURPOSE
+            || !claims.has_valid_envelope()
+        {
+            return Err("index visibility token has the wrong audience, purpose, or format".into());
+        }
+        Ok(claims)
+    }
+
     /// Verifies exactly one bearer token and installs its immutable caller on
     /// the tonic request. Apply this only to protected services; token exchange
     /// remains a separate unauthenticated service boundary.
@@ -1009,6 +1054,10 @@ fn index_page_validation() -> Validation {
     validation.set_required_spec_claims(&["aud"]);
     validation.set_audience(&[INDEX_PAGE_TOKEN_AUDIENCE]);
     validation
+}
+
+fn index_visibility_validation() -> Validation {
+    token_validation(INDEX_VISIBILITY_TOKEN_AUDIENCE)
 }
 
 fn unix_seconds() -> Result<u64, AuthenticationError> {

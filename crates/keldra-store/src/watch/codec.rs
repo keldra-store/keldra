@@ -12,12 +12,13 @@ use super::{
     ObjectHeadChangeKind, RetainedVersionDeletedChange, SourceSequenceGap,
 };
 use crate::{
-    BlobRef, DefinitionKind, DefinitionOperation, DefinitionTransition, ReferenceDelta, VersionId,
+    BlobRef, DefinitionKind, DefinitionOperation, DefinitionTransition, IndexingIntent,
+    ReferenceDelta, VersionId,
 };
 
 const MAGIC: &[u8; 4] = b"ANVJ";
 const FORMAT: u16 = 1;
-const RESERVED: u8 = 0;
+const REALTIME_INDEXING_FLAG: u8 = 1;
 const HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 8 + 8;
 
 const OBJECT_HEAD: u8 = 1;
@@ -46,9 +47,17 @@ pub(crate) enum LocalChangeCodecError {
 pub(crate) struct DecodedLocalChange {
     pub change: LocalChange,
     pub peer_encoded_bytes: u64,
+    pub indexing_intent: IndexingIntent,
 }
 
 pub(crate) fn encode_local_change(change: &LocalChange) -> Result<Vec<u8>, LocalChangeCodecError> {
+    encode_local_change_with_indexing(change, IndexingIntent::Standard)
+}
+
+pub(crate) fn encode_local_change_with_indexing(
+    change: &LocalChange,
+    indexing_intent: IndexingIntent,
+) -> Result<Vec<u8>, LocalChangeCodecError> {
     let peer_encoded_bytes = encoded_change_len(change)?;
     let (kind, body) = encode_body(change)?;
     let body_bytes = u64::try_from(body.len())
@@ -60,7 +69,13 @@ pub(crate) fn encode_local_change(change: &LocalChange) -> Result<Vec<u8>, Local
     encoded.extend_from_slice(MAGIC);
     put_u16(&mut encoded, FORMAT);
     put_u8(&mut encoded, kind);
-    put_u8(&mut encoded, RESERVED);
+    put_u8(
+        &mut encoded,
+        match indexing_intent {
+            IndexingIntent::Standard => 0,
+            IndexingIntent::Realtime => REALTIME_INDEXING_FLAG,
+        },
+    );
     put_u64(&mut encoded, body_bytes);
     put_u64(&mut encoded, peer_encoded_bytes);
     encoded.extend_from_slice(&body);
@@ -83,9 +98,12 @@ pub(crate) fn decode_local_change_with_length(
         return Err(LocalChangeCodecError::UnsupportedFormat(format));
     }
     let kind = input.u8()?;
-    if input.u8()? != RESERVED {
-        return Err(malformed("reserved header byte is non-zero"));
-    }
+    let flags = input.u8()?;
+    let indexing_intent = match flags {
+        0 => IndexingIntent::Standard,
+        REALTIME_INDEXING_FLAG => IndexingIntent::Realtime,
+        _ => return Err(malformed("source-journal indexing flags are invalid")),
+    };
     let body_bytes = input.length("body")?;
     let peer_encoded_bytes = input.u64()?;
     if peer_encoded_bytes == 0 {
@@ -99,6 +117,7 @@ pub(crate) fn decode_local_change_with_length(
     Ok(DecodedLocalChange {
         change,
         peer_encoded_bytes,
+        indexing_intent,
     })
 }
 
@@ -733,6 +752,7 @@ mod tests {
             let encoded = encode_local_change(&change).unwrap();
             let decoded = decode_local_change_with_length(&encoded).unwrap();
             assert_eq!(decoded.change, change);
+            assert_eq!(decoded.indexing_intent, IndexingIntent::Standard);
             assert_eq!(
                 decoded.peer_encoded_bytes,
                 serde_json::to_vec(&change).unwrap().len() as u64
@@ -879,6 +899,15 @@ mod tests {
         ];
         assert_eq!(encode_local_change(&change).unwrap(), expected);
         assert_eq!(decode_local_change(&expected).unwrap(), change);
+    }
+
+    #[test]
+    fn realtime_intent_round_trips_in_the_authoritative_envelope() {
+        let change = object_change();
+        let encoded = encode_local_change_with_indexing(&change, IndexingIntent::Realtime).unwrap();
+        let decoded = decode_local_change_with_length(&encoded).unwrap();
+        assert_eq!(decoded.change, change);
+        assert_eq!(decoded.indexing_intent, IndexingIntent::Realtime);
     }
 
     #[test]

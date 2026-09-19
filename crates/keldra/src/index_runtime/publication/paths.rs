@@ -31,9 +31,12 @@ pub(super) fn parse_artifact_path(
     if path.starts_with("_keldra/index-projections/v1/") {
         if let Ok(parsed) = keldra_index::v1::parse_projection_artifact_path(path) {
             let routing_id = match (parsed.kind, parsed.partition, parsed.content_hash) {
-                (keldra_index::v1::ProjectionArtifactKind::Current, Some(partition), None) => {
-                    keldra_index::v1::projection_routing_id(partition)
-                }
+                (
+                    keldra_index::v1::ProjectionArtifactKind::Current
+                    | keldra_index::v1::ProjectionArtifactKind::RealtimeOverlayCurrent,
+                    Some(partition),
+                    None,
+                ) => keldra_index::v1::projection_routing_id(partition),
                 (kind, None, Some(content_hash)) => {
                     keldra_index::v1::projection_artifact_routing_id(
                         parsed.family_id,
@@ -57,12 +60,16 @@ pub(super) fn parse_artifact_path(
                 keldra_index::v1::ProjectionArtifactKind::Current => {
                     ArtifactPathKind::ProjectionCurrent
                 }
+                keldra_index::v1::ProjectionArtifactKind::RealtimeOverlayCurrent => {
+                    ArtifactPathKind::ProjectionCurrent
+                }
                 keldra_index::v1::ProjectionArtifactKind::Pack
                 | keldra_index::v1::ProjectionArtifactKind::StreamPage
                 | keldra_index::v1::ProjectionArtifactKind::ComponentPage
                 | keldra_index::v1::ProjectionArtifactKind::QueryRunPack
                 | keldra_index::v1::ProjectionArtifactKind::QueryRunStreamPage
-                | keldra_index::v1::ProjectionArtifactKind::Generation => {
+                | keldra_index::v1::ProjectionArtifactKind::Generation
+                | keldra_index::v1::ProjectionArtifactKind::RealtimeOverlayGeneration => {
                     ArtifactPathKind::ProjectionImmutable
                 }
             });

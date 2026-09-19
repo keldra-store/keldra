@@ -375,7 +375,7 @@ impl Store {
         governance.validate()?;
         let mut outcomes = self
             .coordinate_distributed_mutation_batch_with_admission(
-                vec![(operation, governance, None)],
+                vec![(operation, governance, None, crate::IndexingIntent::Standard)],
                 context,
                 SourceJournalAdmission::Bounded,
             )
@@ -407,7 +407,12 @@ impl Store {
         intent.validate().map_err(definition_mutation_error)?;
         let mut outcomes = self
             .coordinate_distributed_mutation_batch_with_admission(
-                vec![(operation, governance, Some(intent))],
+                vec![(
+                    operation,
+                    governance,
+                    Some(intent),
+                    crate::IndexingIntent::Standard,
+                )],
                 context,
                 SourceJournalAdmission::Bounded,
             )
@@ -473,6 +478,32 @@ impl Store {
         changes: &[PendingLocalChange],
         reference_effects: LocalReferenceEffects,
         admission: SourceJournalAdmission,
+        status: WatchJournalStatus,
+        cursor: u64,
+        stage_visibility_settlement: bool,
+        stage_status: bool,
+    ) -> Result<StagedLocalChanges, MutationError> {
+        self.stage_local_changes_from_status_with_realtime(
+            batch,
+            changes,
+            &BTreeSet::new(),
+            reference_effects,
+            admission,
+            status,
+            cursor,
+            stage_visibility_settlement,
+            stage_status,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stage_local_changes_from_status_with_realtime(
+        &self,
+        batch: &mut WriteBatch,
+        changes: &[PendingLocalChange],
+        realtime_change_indices: &BTreeSet<usize>,
+        reference_effects: LocalReferenceEffects,
+        admission: SourceJournalAdmission,
         mut status: WatchJournalStatus,
         cursor: u64,
         stage_visibility_settlement: bool,
@@ -524,14 +555,25 @@ impl Store {
             LocalReferenceEffects::Deferred => None,
         };
         let mut appended = VecDeque::new();
-        for pending in changes {
+        for (change_index, pending) in changes.iter().enumerate() {
             status.tail = status.tail.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation offset is exhausted".into())
             })?;
             let change = pending.at_offset(status.tail);
-            let encoded = encode_local_change(&change).map_err(storage_error)?;
-            let logical_bytes = invalidation_record_bytes(encoded.len())
+            let indexing_intent = if realtime_change_indices.contains(&change_index) {
+                crate::IndexingIntent::Realtime
+            } else {
+                crate::IndexingIntent::Standard
+            };
+            let encoded = encode_local_change_with_indexing(&change, indexing_intent)
+                .map_err(storage_error)?;
+            let mut logical_bytes = invalidation_record_bytes(encoded.len())
                 .saturating_add(super::journal_routes::journal_route_logical_bytes(&change));
+            if indexing_intent == crate::IndexingIntent::Realtime {
+                logical_bytes = logical_bytes.saturating_add(
+                    super::realtime_journal_routes::realtime_journal_route_logical_bytes(&change)?,
+                );
+            }
             if admission == SourceJournalAdmission::Bounded
                 && logical_bytes > self.watch_retention.max_bytes
             {
@@ -546,6 +588,9 @@ impl Store {
                 admission,
                 &change,
             )?;
+            if realtime_change_indices.contains(&change_index) {
+                self.stage_realtime_journal_routes(batch, status.source_id.source_epoch, &change)?;
+            }
             status.retained_entries = status.retained_entries.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation entry count is exhausted".into())
             })?;
@@ -605,6 +650,10 @@ impl Store {
     pub(crate) fn notify_local_invalidations(&self) {
         self.observe_source_journal_progress_debt();
         self.watch_notify.send_replace(());
+    }
+
+    pub(crate) fn notify_realtime_journal_routes(&self) {
+        self.realtime_journal_notify.send_replace(());
     }
 
     pub(super) fn notify_local_invalidations_from_status(&self, status: WatchJournalStatus) {
@@ -946,6 +995,7 @@ impl Store {
                         deleted: existing.deleted,
                         replayed: true,
                         replay_guarantee_expires_at_unix_millis: existing.expires_at_unix_millis,
+                        realtime_visibility: None,
                     },
                     mutation: existing.object_mutation,
                     reference_deltas: Vec::new(),
@@ -1143,6 +1193,7 @@ impl Store {
                         deleted: false,
                         replayed: true,
                         replay_guarantee_expires_at_unix_millis: expires_at,
+                        realtime_visibility: None,
                     },
                     mutation: None,
                     reference_deltas: Vec::new(),
@@ -1477,6 +1528,7 @@ impl Store {
                 deleted,
                 replayed: false,
                 replay_guarantee_expires_at_unix_millis: expires_at,
+                realtime_visibility: None,
             },
             mutation: object_mutation,
             reference_deltas,

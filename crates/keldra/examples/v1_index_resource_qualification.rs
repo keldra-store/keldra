@@ -1074,12 +1074,14 @@ async fn write_worker(
                         content_type: CONTENT_TYPE.into(),
                         command_id: command_id(mode, record_id),
                         durability: Durability::Local as i32,
+                        indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
                     })
                 }
                 MutationMode::Delete => BulkOperationValue::Delete(DeleteRequest {
                     address,
                     command_id: command_id(mode, record_id),
                     durability: Durability::Local as i32,
+                    indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
                 }),
             };
             operations.push(BulkOperation {
@@ -1623,6 +1625,7 @@ async fn query_partition(
             tenant: String::new(),
             required_freshness: None,
             authorization_subject: None,
+            required_visibility_tokens: Vec::new(),
         })
         .await
         .map(tonic::Response::into_inner)

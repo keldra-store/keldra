@@ -395,6 +395,7 @@ async fn put_document(
                 command_id: command_id.into(),
                 durability: Durability::Replicated as i32,
                 operation: Some(PutOperationValue::Put(PutOperation {})),
+                indexing_intent: keldra_storage::v1::IndexingIntent::Standard as i32,
             },
             [br#"{"qualified":true}"#.to_vec()],
         )
@@ -552,6 +553,7 @@ fn query_request(bucket: &str, user: &str, limit: u32, page_token: Vec<u8>) -> Q
         tenant: String::new(),
         required_freshness: None,
         authorization_subject: Some(user_subject(user)),
+        required_visibility_tokens: Vec::new(),
     }
 }
 

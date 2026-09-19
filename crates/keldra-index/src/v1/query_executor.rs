@@ -23,8 +23,8 @@ use super::{
 mod admission;
 pub use admission::{
     AuthorizedQueryCandidate, MAX_QUERY_CANDIDATE_ADMISSION_BATCH, PinnedPartitionQueryRoot,
-    QueryAdmissionCandidate, QueryAdmissionContext, QueryArtifactKind, QueryArtifactLoad,
-    QueryCandidateAdmission, QueryCommonCut, QueryRootCutProof,
+    PinnedRealtimeOverlayRun, QueryAdmissionCandidate, QueryAdmissionContext, QueryArtifactKind,
+    QueryArtifactLoad, QueryCandidateAdmission, QueryCommonCut, QueryRootCutProof,
 };
 #[path = "query_executor_authorization.rs"]
 mod authorization;
@@ -66,10 +66,14 @@ use parallel_blocks::{
 mod snapshot;
 use snapshot::{
     PartitionManifest, PartitionView, load_exact_pre_admitted, load_partition_manifest,
+    load_realtime_overlay_descriptor,
 };
 #[path = "query_executor_validate.rs"]
 mod validate;
-pub use snapshot::{QuerySnapshotIdentity, ValidatedQuerySnapshot, query_snapshot_identity};
+pub use snapshot::{
+    QuerySnapshotIdentity, ValidatedQuerySnapshot, query_snapshot_identity,
+    query_snapshot_identity_with_overlays,
+};
 use validate::validate_request;
 #[path = "query_executor_values.rs"]
 mod values;
@@ -400,17 +404,81 @@ pub async fn execute_typed_json_query_with_cursor_and_executor<
     ),
     IndexError,
 > {
+    execute_typed_json_query_with_realtime_overlays_and_executor(
+        loader,
+        admission,
+        common_cut,
+        pins,
+        &[],
+        &[],
+        validated_snapshot,
+        request,
+        explicit_search_after,
+        public_value_encoder,
+        execution_limits,
+        block_limits,
+        block_credits,
+        partition_executor,
+    )
+    .await
+}
+
+/// Execute over one complete-prefix base vector plus canonical sparse
+/// real-time runs. Sparse evidence participates in snapshot identity and is
+/// merged before candidate authorization, ordering, facets, and aggregates.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_typed_json_query_with_realtime_overlays_and_executor<
+    L: QueryArtifactLoader + 'static,
+    A: QueryCandidateAdmission,
+    E: QueryPublicValueEncoder,
+    X: QueryPartitionExecutor,
+>(
+    loader: &mut L,
+    admission: &mut A,
+    common_cut: QueryCommonCut,
+    pins: &[PinnedPartitionQueryRoot],
+    realtime_overlay_generations: &[(ProjectionPartitionIdentity, [u8; 32])],
+    realtime_overlays: &[PinnedRealtimeOverlayRun],
+    validated_snapshot: Option<Arc<ValidatedQuerySnapshot>>,
+    request: &TypedJsonQueryRequest,
+    explicit_search_after: Option<&ExplicitQuerySearchAfter>,
+    public_value_encoder: &E,
+    execution_limits: QueryExecutionLimits,
+    block_limits: QueryBlockLimits,
+    block_credits: &mut QueryBlockCredits,
+    partition_executor: &X,
+) -> Result<
+    (
+        TypedJsonQueryResult,
+        Arc<ValidatedQuerySnapshot>,
+        Option<ExplicitQuerySearchAfter>,
+    ),
+    IndexError,
+> {
     let execution_limits = execution_limits.validate()?;
     let block_limits = block_limits.validate()?;
     let snapshot_identity = validated_snapshot
         .as_ref()
         .map(|snapshot| snapshot.identity())
         .map_or_else(
-            || query_snapshot_identity(common_cut, pins),
+            || {
+                snapshot::query_snapshot_identity_with_overlays(
+                    common_cut,
+                    pins,
+                    realtime_overlay_generations,
+                    realtime_overlays,
+                )
+            },
             Result::<_, IndexError>::Ok,
         )?;
     if let Some(snapshot) = validated_snapshot.as_ref() {
-        snapshot.validate_for(snapshot_identity, common_cut, pins, request)?;
+        snapshot.validate_for(
+            snapshot_identity,
+            common_cut,
+            pins,
+            realtime_overlays,
+            request,
+        )?;
     }
     let contracts = validate_request(
         common_cut,
@@ -419,6 +487,7 @@ pub async fn execute_typed_json_query_with_cursor_and_executor<
         execution_limits,
         validated_snapshot.is_none(),
     )?;
+    validate_realtime_overlays(pins, realtime_overlays)?;
     if explicit_search_after.is_some() && request.resume_after_document.is_some() {
         return Err(IndexError::InvalidQuery(
             "natural and explicitly ordered continuations cannot be combined".into(),
@@ -432,7 +501,7 @@ pub async fn execute_typed_json_query_with_cursor_and_executor<
     } else {
         let mut manifests = Vec::with_capacity(pins.len());
         for pin in pins.iter().copied() {
-            let (manifest, resident_bytes, index_bytes) = load_partition_manifest(
+            let (mut manifest, resident_bytes, index_bytes) = load_partition_manifest(
                 loader,
                 partition_executor,
                 PartitionView { pin },
@@ -449,6 +518,37 @@ pub async fn execute_typed_json_query_with_cursor_and_executor<
             snapshot_index_bytes = snapshot_index_bytes
                 .checked_add(index_bytes)
                 .ok_or(IndexError::OffsetOverflow)?;
+            let mut overlay_runs = Vec::new();
+            for overlay in realtime_overlays
+                .iter()
+                .rev()
+                .filter(|overlay| overlay.partition == pin.partition)
+            {
+                let (run, overlay_resident) = load_realtime_overlay_descriptor(
+                    loader,
+                    partition_executor,
+                    &PartitionView { pin },
+                    &request.catalog_lineage,
+                    &request.recipe_catalog_proofs,
+                    overlay.run,
+                    block_limits,
+                    block_credits,
+                    &mut budget,
+                    true,
+                )
+                .await?;
+                let overlay_index = std::mem::size_of::<Arc<ProjectionQueryRunDescriptor>>();
+                budget.reserve_heap(block_credits, overlay_index)?;
+                snapshot_resident_bytes = snapshot_resident_bytes
+                    .checked_add(overlay_resident)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                snapshot_index_bytes = snapshot_index_bytes
+                    .checked_add(overlay_index)
+                    .ok_or(IndexError::OffsetOverflow)?;
+                overlay_runs.push(run);
+            }
+            overlay_runs.append(&mut manifest.runs);
+            manifest.runs = overlay_runs;
             manifests.push(manifest);
         }
         Arc::new(ValidatedQuerySnapshot {
@@ -456,6 +556,7 @@ pub async fn execute_typed_json_query_with_cursor_and_executor<
             identity: snapshot_identity,
             common_cut,
             pins: pins.to_vec(),
+            realtime_overlays: realtime_overlays.to_vec(),
             logical: request.logical.clone(),
             catalog_lineage: request.catalog_lineage.clone(),
             recipe_catalog_proofs: request.recipe_catalog_proofs.clone(),
@@ -525,6 +626,45 @@ pub async fn execute_typed_json_query_with_cursor_and_executor<
         snapshot,
         next_search_after,
     ))
+}
+
+fn validate_realtime_overlays(
+    pins: &[PinnedPartitionQueryRoot],
+    overlays: &[PinnedRealtimeOverlayRun],
+) -> Result<(), IndexError> {
+    if overlays.windows(2).any(|pair| {
+        (
+            pair[0].partition,
+            pair[0].source_position,
+            pair[0].atomic_position,
+            pair[0].run.hash,
+        ) >= (
+            pair[1].partition,
+            pair[1].source_position,
+            pair[1].atomic_position,
+            pair[1].run.hash,
+        )
+    }) {
+        return Err(IndexError::InvalidQuery(
+            "real-time overlay vector is not canonical".into(),
+        ));
+    }
+    for overlay in overlays {
+        let base = pins
+            .binary_search_by_key(&overlay.partition, |pin| pin.partition)
+            .ok()
+            .map(|index| pins[index])
+            .ok_or_else(|| {
+                IndexError::InvalidQuery("real-time overlay has no base partition".into())
+            })?;
+        overlay.validate_against(base)?;
+    }
+    Ok(())
+}
+
+fn realtime_gate_is_absorbed(gate: &QueryDocumentGate, base_next_offset: u64) -> bool {
+    gate.selective_source_position
+        .is_some_and(|position| position < base_next_offset)
 }
 
 async fn load_latest_gates<L: QueryArtifactLoader + 'static, X: QueryPartitionExecutor>(
@@ -617,6 +757,10 @@ async fn load_latest_gates<L: QueryArtifactLoader + 'static, X: QueryPartitionEx
     for (_, block_gates) in decoded {
         for gate in block_gates {
             let bytes = resident_gate_bytes(&gate)?;
+            if realtime_gate_is_absorbed(&gate, manifest.view.pin.root.next_offset) {
+                budget.release_heap(credits, bytes)?;
+                continue;
+            }
             if gates.contains_key(&gate.document) {
                 budget.release_heap(credits, bytes)?;
             } else {
@@ -725,6 +869,11 @@ async fn load_latest_gates_for_keys<L: QueryArtifactLoader, X: QueryPartitionExe
                             || (kind == QueryBlockKind::Gate) != gate.source_path.is_some()
                         {
                             return Err(IndexError::Integrity);
+                        }
+                        if realtime_gate_is_absorbed(&gate, manifest.view.pin.root.next_offset) {
+                            records.next();
+                            candidate += 1;
+                            continue;
                         }
                         let dynamic_bytes = resident_gate_dynamic_bytes(&gate)?;
                         budget.reserve_heap(credits, dynamic_bytes)?;

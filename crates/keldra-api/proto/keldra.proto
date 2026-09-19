@@ -701,6 +701,12 @@ message QueryIndexRequest {
   // application-authorized definition. This is an authorization operand, not
   // an authenticated caller and therefore cannot grant storage capability.
   Subject authorization_subject = 8;
+  // Selective real-time visibility is independent of required_freshness:
+  // these opaque tokens require the chosen view to include the named
+  // real-time mutations, but do not claim that every intervening ordinary
+  // source mutation is present. Multiple tokens compose, including receipts
+  // collected from independent BulkWrite outcomes.
+  repeated IndexVisibilityToken required_visibility_tokens = 9;
 }
 
 message IndexRequiredSourceCheckpoint {
@@ -858,6 +864,16 @@ enum Durability {
   DURABILITY_REPLICATED = 1;
 }
 
+// Selects the indexing lane for one object mutation. STANDARD is the compatible
+// default and uses the ordinary asynchronous projection path. REALTIME opts
+// this mutation into the independently scaled real-time lane and returns a
+// visibility token after that work is durably accepted. Visibility waiting is
+// a separate query operation so a deadline cannot obscure mutation success.
+enum IndexingIntent {
+  INDEXING_INTENT_STANDARD = 0;
+  INDEXING_INTENT_REALTIME = 1;
+}
+
 // UNVERSIONED is the meaningful zero/default: replacing or deleting a head
 // does not retain the predecessor for later reads. ENABLED retains versions
 // and is a one-way bucket capability.
@@ -881,6 +897,7 @@ message PutHeader {
     PutIfVersionOperation put_if_version = 7;
     PutImmutableOperation put_immutable = 8;
   }
+  IndexingIntent indexing_intent = 9;
 }
 
 // Unconditional ordinary put: publish the next version of a MUTABLE path.
@@ -912,6 +929,7 @@ message CloneObjectRequest {
     PutIfAbsentOperation put_if_absent = 7;
     PutIfVersionOperation put_if_version = 8;
   }
+  IndexingIntent indexing_intent = 9;
 }
 
 message LinkObjectRequest {
@@ -919,12 +937,14 @@ message LinkObjectRequest {
   ObjectAddress target = 2;
   string command_id = 3;
   Durability durability = 4;
+  IndexingIntent indexing_intent = 5;
 }
 
 message UnlinkObjectRequest {
   ObjectAddress link = 1;
   string command_id = 2;
   Durability durability = 3;
+  IndexingIntent indexing_intent = 4;
 }
 
 // Opaque upload capability returned by StartPut. Clients must not parse
@@ -948,6 +968,7 @@ message DeleteRequest {
   ObjectAddress address = 1;
   string command_id = 2;
   Durability durability = 3;
+  IndexingIntent indexing_intent = 4;
 }
 
 message DeleteIfVersionRequest {
@@ -955,12 +976,14 @@ message DeleteIfVersionRequest {
   string command_id = 2;
   Durability durability = 3;
   uint64 expected_version = 4;
+  IndexingIntent indexing_intent = 5;
 }
 
 message DeleteVersionRequest {
   ObjectAddress address = 1;
   uint64 version = 2;
   Durability durability = 3;
+  IndexingIntent indexing_intent = 4;
 }
 
 message DeleteVersionResponse {
@@ -969,6 +992,10 @@ message DeleteVersionResponse {
   // that payload and publishes this fresh tombstone as the new head. Removing
   // a non-current version never changes the head.
   optional uint64 replacement_tombstone_version = 2;
+  // Present only when a REALTIME request replaced the current live version
+  // with the tombstone above. Deleting a non-current retained version has no
+  // query-visible index mutation and therefore returns no token.
+  IndexVisibilityToken index_visibility = 3;
 }
 
 message MutationReceipt {
@@ -980,6 +1007,23 @@ message MutationReceipt {
   // bounded receipt expires, the caller must reconcile against object state
   // before retrying an operation whose duplicate execution would matter.
   google.protobuf.Timestamp replay_guarantee_expires_at = 5;
+  // Present only for REALTIME. It is opaque and names one exact source event
+  // (or one complete atomic publication unit); clients pass it back through
+  // QueryIndexRequest.required_visibility_tokens without parsing it.
+  IndexVisibilityToken index_visibility = 6;
+}
+
+// Proof of one selectively accelerated mutation. The encoded value is bound
+// to its tenant, bucket, stable object identity, committed object version,
+// source position, and placement. Query admission resolves and pins the
+// applicable current physical projection family; mutations are index-agnostic.
+// It is not a complete source-prefix checkpoint.
+message IndexVisibilityToken {
+  bytes value = 1;
+  // Tokens are retained only for a bounded interval. A query which starts
+  // after this instant rejects the token explicitly rather than weakening it
+  // to ordinary asynchronous visibility.
+  google.protobuf.Timestamp expires_at = 2;
 }
 
 message HeadObjectRequest {
@@ -1074,6 +1118,7 @@ message BulkPutRequest {
   string content_type = 3;
   string command_id = 4;
   Durability durability = 5;
+  IndexingIntent indexing_intent = 6;
 }
 
 message BulkPutIfVersionRequest {
@@ -1084,6 +1129,7 @@ message BulkPutIfVersionRequest {
   string command_id = 4;
   Durability durability = 5;
   uint64 expected_version = 6;
+  IndexingIntent indexing_intent = 7;
 }
 
 message BulkOperation {
@@ -1246,6 +1292,9 @@ message InvokeProgramRequest {
   // validates and canonicalizes it before deriving the invocation fingerprint.
   bytes input_json = 4;
   Durability durability = 5;
+  // REALTIME applies to the complete atomic publication unit. Keldra never
+  // exposes a sparse overlay containing only selected program members.
+  IndexingIntent indexing_intent = 6;
 }
 
 message ProgramPathReceipt {
@@ -1265,6 +1314,9 @@ message InvokeProgramResponse {
   bytes output_json = 7;
   bool replayed = 8;
   google.protobuf.Timestamp replay_guarantee_expires_at = 9;
+  // One aggregate token covering the complete atomic publication unit.
+  // Present only for a REALTIME invocation.
+  IndexVisibilityToken index_visibility = 10;
 }
 
 message ExchangeClientCredentialsRequest {

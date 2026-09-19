@@ -19,12 +19,12 @@ use keldra_storage::v1::{
     HybridIndexSpec, IndexAggregateOperation, IndexAggregateRequest, IndexDefinition,
     IndexFacetRequest, IndexField, IndexFieldCapability, IndexFieldCardinality, IndexFreshness,
     IndexOrder, IndexOrderDirection, IndexPredicate, IndexPredicateExpression,
-    IndexPredicateOperator, IndexQuery, IndexQueryHit, IndexSpecification, KeywordIndexField,
-    MetadataFilterIndexQuery, MetadataFilterIndexSpec, ObjectAddress, ObjectVersioning,
-    PathIndexQuery, PathIndexSpec, PutHeader, PutOperation, QueryIndexRequest, QueryIndexResponse,
-    RebuildIndexRequest, SetBucketPublicReadRequest, SignedIntegerIndexField, TensorIndexQuery,
-    TensorIndexSpec, TextAnalyzer, TextIndexField, TypedJsonIndexQuery, TypedJsonIndexSpec,
-    UnsignedIntegerIndexField, VectorIndexQuery,
+    IndexPredicateOperator, IndexQuery, IndexQueryHit, IndexSpecification, IndexingIntent,
+    KeywordIndexField, MetadataFilterIndexQuery, MetadataFilterIndexSpec, ObjectAddress,
+    ObjectVersioning, PathIndexQuery, PathIndexSpec, PutHeader, PutOperation, QueryIndexRequest,
+    QueryIndexResponse, RebuildIndexRequest, SetBucketPublicReadRequest, SignedIntegerIndexField,
+    TensorIndexQuery, TensorIndexSpec, TextAnalyzer, TextIndexField, TypedJsonIndexQuery,
+    TypedJsonIndexSpec, UnsignedIntegerIndexField, VectorIndexQuery,
 };
 use keldra_storage::{
     BearerToken, RawAdministrationClient, RawClient, administration_client, connect_channel,
@@ -329,6 +329,7 @@ async fn main() -> TestResult<()> {
                 }),
                 command_id: format!("qualification-delete-{case_number}"),
                 durability: source_durability as i32,
+                indexing_intent: IndexingIntent::Standard as i32,
             },
             "index source delete",
         )
@@ -438,6 +439,7 @@ async fn main() -> TestResult<()> {
             }),
             command_id: "qualification-delete-tensor-result".into(),
             durability: source_durability as i32,
+            indexing_intent: IndexingIntent::Standard as i32,
         },
         "tensor index result delete",
     )
@@ -462,6 +464,7 @@ async fn main() -> TestResult<()> {
             }),
             command_id: "qualification-delete-tensor-source".into(),
             durability: source_durability as i32,
+            indexing_intent: IndexingIntent::Standard as i32,
         },
         "tensor index source delete",
     )
@@ -1262,6 +1265,7 @@ async fn put_bytes(
             command_id: command_id.into(),
             durability: durability as i32,
             operation: Some(PutOperationValue::Put(PutOperation {})),
+            indexing_intent: IndexingIntent::Standard as i32,
         },
         [bytes.to_vec()],
     )
@@ -1516,6 +1520,7 @@ fn request(case: &EngineCase) -> QueryIndexRequest {
         tenant: String::new(),
         required_freshness: None,
         authorization_subject: None,
+        required_visibility_tokens: Vec::new(),
     }
 }
 

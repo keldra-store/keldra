@@ -331,7 +331,11 @@ impl ProgramCoordinator {
             }
             let result = self
                 .store
-                .recover_program_bundle(program_commit(applied, batch), mutation_context)
+                .recover_program_bundle_with_indexing(
+                    program_commit(applied, batch),
+                    mutation_context,
+                    super::store_indexing_intent(batch.indexing_intent),
+                )
                 .await
                 .with_context(|| format!("finalize atomic commit {}", batch.commit_cursor))?;
             require_result_matches_consensus(&result, invocation)

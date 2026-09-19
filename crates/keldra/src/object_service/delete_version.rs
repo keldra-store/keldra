@@ -16,6 +16,7 @@ pub(super) async fn delete_version(
     let deadline = request_deadline(request.metadata(), service.atomic_program_timeout)?;
     let mut api_request = request.into_inner();
     let durability = durability(api_request.durability)?;
+    let indexing_intent = indexing_intent(api_request.indexing_intent)?;
     let routed_key = object_key(api_request.address.clone())?;
     let requested_key = routed_alias.as_ref().unwrap_or(&routed_key);
     object_path_access::require_key(&path_access, requested_key)?;
@@ -54,7 +55,7 @@ pub(super) async fn delete_version(
         .await?;
     let original_alias = linked.then(|| api_address(requested_key));
     api_request.address = Some(api_address(&key));
-    let outcome = match service.distribution.routing_target_stable(
+    let (outcome, realtime_visibility) = match service.distribution.routing_target_stable(
         &key,
         governance.tenant_id,
         governance.bucket_id,
@@ -83,15 +84,21 @@ pub(super) async fn delete_version(
                 deadline,
                 service
                     .distribution
-                    .delete_retained_version_with_governance(
+                    .delete_retained_version_with_governance_and_indexing(
                         &key,
                         VersionId(api_request.version),
                         governance,
+                        indexing_intent,
                     ),
                 "delete version deadline exceeded",
             )
             .await?
         }
     };
-    Ok(Response::new(api_delete_version_outcome(outcome)))
+    let mut response = api_delete_version_outcome(outcome);
+    response.index_visibility = realtime_visibility
+        .as_ref()
+        .map(|evidence| api_index_visibility(&service.jwt_manager, &caller, evidence))
+        .transpose()?;
+    Ok(Response::new(response))
 }

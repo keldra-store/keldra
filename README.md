@@ -598,8 +598,10 @@ not a second authority.
 The current operational scale runbook is
 [index contention qualification](docs/qualification/index-contention.md). It
 defines the CPU- and memory-normalized SSD qualification and the v1 telemetry
-required to claim ingestion/index catch-up. The architecture contract is
+required to claim ingestion/index catch-up. The base-projection architecture is
 [KELDRA-0020](docs/rfcs/keldra_0020_logical_index_catalog_and_shared_physical_projections.md).
+Selective per-mutation real-time visibility is defined by
+[KELDRA-0021](docs/rfcs/keldra_0021_selective_realtime_indexing.md).
 
 ### Current v1 resource controls
 

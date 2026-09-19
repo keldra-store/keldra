@@ -16,9 +16,9 @@ use keldra_api::v1::credential_service_client::CredentialServiceClient;
 use keldra_api::v1::object_service_client::ObjectServiceClient;
 use keldra_api::v1::{
     BucketPolicy, BulkOperation, BulkPutRequest, BulkWriteRequest, Durability,
-    ExchangeClientCredentialsRequest, HeadObjectRequest, ListObjectsRequest, ObjectAddress,
-    ObjectVersioning, SetBucketPolicyRequest, SetBucketVersioningRequest, bulk_operation,
-    bulk_outcome, object_head,
+    ExchangeClientCredentialsRequest, HeadObjectRequest, IndexingIntent, ListObjectsRequest,
+    ObjectAddress, ObjectVersioning, SetBucketPolicyRequest, SetBucketVersioningRequest,
+    bulk_operation, bulk_outcome, object_head,
 };
 use keldra_osv_qualification::{
     CorpusReport, ParsingReport, QUALIFICATION_SCHEMA, QualificationReport, ResultReport,
@@ -991,6 +991,7 @@ async fn send_batch(
                 content_type: content_type.into(),
                 command_id: command_id.clone(),
                 durability,
+                indexing_intent: IndexingIntent::Standard as i32,
             })),
         });
         expected_commands.push(command_id.clone());

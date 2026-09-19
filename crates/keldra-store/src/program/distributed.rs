@@ -586,6 +586,22 @@ impl Store {
         commit_cursor: u64,
         context: ObjectMutationContext,
     ) -> Result<CoordinatedProgramPathFinalization, ProgramStoreError> {
+        self.coordinate_program_path_finalization_with_indexing(
+            stage,
+            commit_cursor,
+            context,
+            crate::IndexingIntent::Standard,
+        )
+        .await
+    }
+
+    pub async fn coordinate_program_path_finalization_with_indexing(
+        &self,
+        stage: ProgramPathStage,
+        commit_cursor: u64,
+        context: ObjectMutationContext,
+        indexing_intent: crate::IndexingIntent,
+    ) -> Result<CoordinatedProgramPathFinalization, ProgramStoreError> {
         stage.validate()?;
         self.persist_program_path_stage(&stage).await?;
         loop {
@@ -614,6 +630,7 @@ impl Store {
                         cursor: commit_cursor,
                     })?;
                 let mutation = replayed_program_path_mutation(stage.clone(), commit_cursor, stamp)?;
+                self.ensure_program_path_replay_intent(&mutation, indexing_intent)?;
                 return Ok(CoordinatedProgramPathFinalization {
                     mutation,
                     replayed: true,
@@ -633,7 +650,7 @@ impl Store {
                 source.source_id,
                 offset,
             )?;
-            let attempt = self.apply_program_path_mutation_locked(&mutation, true);
+            let attempt = self.apply_program_path_mutation_locked(&mutation, true, indexing_intent);
             drop(commit_guard);
             match attempt {
                 Ok(_) => {
@@ -669,7 +686,7 @@ impl Store {
             context.active_placement_log_id,
         )
         .map_err(program_mutation_error)?;
-        self.apply_program_path_mutation_locked(mutation, false)
+        self.apply_program_path_mutation_locked(mutation, false, crate::IndexingIntent::Standard)
     }
 
     fn program_path_mutation(
@@ -735,6 +752,7 @@ impl Store {
         &self,
         mutation: &ProgramPathMutation,
         emit_source_change: bool,
+        indexing_intent: crate::IndexingIntent,
     ) -> Result<ReplicaProgramPathApplied, ProgramStoreError> {
         mutation.validate()?;
         let stage = &mutation.stage;
@@ -844,7 +862,7 @@ impl Store {
         self.stage_reference_proof_if_absent(&mut batch, &proof)
             .map_err(program_mutation_error)?;
         if emit_source_change {
-            self.stage_local_changes(
+            self.stage_local_changes_with_indexing(
                 &mut batch,
                 &[PendingLocalChange::ObjectHead {
                     identity,
@@ -857,6 +875,7 @@ impl Store {
                     definition_transition: None,
                 }],
                 LocalReferenceEffects::Deferred,
+                indexing_intent,
             )
             .map_err(program_mutation_error)?;
         }
@@ -868,11 +887,40 @@ impl Store {
         self.clock.observe(stage.version.id);
         if emit_source_change {
             self.notify_local_invalidations();
+            if indexing_intent == crate::IndexingIntent::Realtime {
+                self.notify_realtime_journal_routes();
+            }
         }
         Ok(ReplicaProgramPathApplied {
             version: stage.version.id,
             replayed: false,
         })
+    }
+
+    fn ensure_program_path_replay_intent(
+        &self,
+        mutation: &ProgramPathMutation,
+        indexing_intent: crate::IndexingIntent,
+    ) -> Result<(), ProgramStoreError> {
+        let encoded = self
+            .db
+            .get_cf(
+                self.program_cf(crate::store::CF_LOCAL_INVALIDATIONS)?,
+                crate::watch::invalidation_key(mutation.stamp.source_journal_position),
+            )
+            .map_err(program_storage_error)?
+            .ok_or(ProgramStoreError::CommitCorruption {
+                cursor: mutation.commit_cursor,
+            })?;
+        let decoded = self
+            .decode_local_change_record_with_length(&encoded)
+            .map_err(program_mutation_error)?;
+        if decoded.indexing_intent != indexing_intent {
+            return Err(ProgramStoreError::IndexingIntentConflict {
+                cursor: mutation.commit_cursor,
+            });
+        }
+        Ok(())
     }
 
     fn validate_program_path_policy(
